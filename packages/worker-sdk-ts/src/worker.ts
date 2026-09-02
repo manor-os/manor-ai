@@ -8,6 +8,7 @@ import {
   Lease,
   LeaseKind,
   LeaseResult,
+  LeaseResultFactory,
   NeedHumanInput,
   NoHandlerError,
   WorkerClientError,
@@ -23,11 +24,8 @@ export interface LeaseContext {
   progress(fraction: number): Promise<void>;
 }
 
-export type HandlerReturn =
-  | LeaseResult
-  | Record<string, unknown>
-  | undefined
-  | void;
+// A declared output contract may be any JSON value, not only an object.
+export type HandlerReturn = unknown;
 
 export type LeaseHandler = (
   lease: Lease,
@@ -127,9 +125,13 @@ export class ManorWorker {
       } catch (exc) {
         if (
           exc instanceof WorkerClientError &&
-          (exc.statusCode === 401 || exc.statusCode === 403)
+          exc.requiresOperatorAction
         ) {
-          this.log.error(`auth failed (${exc.statusCode}) — exiting`);
+          this.log.error(
+            exc.statusCode === 426
+              ? "worker protocol registration rejected (426); re-register this worker before restarting"
+              : `auth failed (${exc.statusCode}) — exiting`,
+          );
           this.stop.abort();
           break;
         }
@@ -222,15 +224,23 @@ export class ManorWorker {
         );
       }
       const raw = await handler(lease, ctx);
-      const result = coerceResult(raw);
+      const result = LeaseResultFactory.fromHandlerOutput(raw);
       await this.client.completeLease(lease.lease_id, result);
-      this.completions.push({
+      const completion: HeartbeatCompletedLease = {
         lease_id: lease.lease_id,
         status: "done",
-        result: result.result ?? null,
-        cost: result.cost ?? null,
-        evidence_refs: result.evidence_refs ?? null,
-      });
+        task_output_value_kind: result.task_output_value_kind ?? "task_payload",
+      };
+      if (Object.prototype.hasOwnProperty.call(result, "result")) {
+        completion.result = result.result;
+      }
+      if (Object.prototype.hasOwnProperty.call(result, "cost")) {
+        completion.cost = result.cost;
+      }
+      if (Object.prototype.hasOwnProperty.call(result, "evidence_refs")) {
+        completion.evidence_refs = result.evidence_refs;
+      }
+      this.completions.push(completion);
     } catch (exc) {
       if (exc instanceof NeedHumanInput) {
         try {
@@ -252,6 +262,7 @@ export class ManorWorker {
           lease_id: lease.lease_id,
           status: "failed",
           error: err,
+          task_output_value_kind: "task_payload",
         });
         return;
       }
@@ -266,6 +277,7 @@ export class ManorWorker {
         lease_id: lease.lease_id,
         status: "failed",
         error: err,
+        task_output_value_kind: "task_payload",
       });
     }
   }
@@ -312,26 +324,6 @@ export class ManorWorker {
 
 function handlerKey(kind: LeaseKind, provider: string | null | undefined): string {
   return `${kind}::${provider ?? ""}`;
-}
-
-function coerceResult(raw: HandlerReturn): LeaseResult {
-  if (raw === undefined || raw === null) return {};
-  if (
-    typeof raw === "object" &&
-    !Array.isArray(raw) &&
-    ("result" in raw || "cost" in raw || "evidence_refs" in raw)
-  ) {
-    const r = raw as Record<string, unknown>;
-    return {
-      result: (r.result as Record<string, unknown>) ?? null,
-      cost: (r.cost as LeaseResult["cost"]) ?? null,
-      evidence_refs: (r.evidence_refs as string[]) ?? null,
-    };
-  }
-  if (typeof raw === "object" && !Array.isArray(raw)) {
-    return { result: raw as Record<string, unknown> };
-  }
-  return { result: { value: raw as unknown } };
 }
 
 function sleepOrAbort(ms: number, signal: AbortSignal): Promise<void> {

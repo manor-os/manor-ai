@@ -33,15 +33,20 @@ _SKILLS_ROOT = _REPO_ROOT / "packages" / "core" / "ai" / "skills"
 # a richer in-process module exists (hidden capability, surfaced through
 # other channels). Anything listed here must keep its advertised list
 # empty — otherwise the allowlist rots into a bypass of the guard.
-_INTENTIONALLY_EMPTY = {"local_browser"}
+_INTENTIONALLY_EMPTY: set[str] = set()
 
 
 # ── 1. Deferred MCP schemas ─────────────────────────────────────────────────
 
 def test_every_advertised_mcp_schema_is_dispatchable() -> None:
     problems: list[str] = []
+    remote = _remote_transport_server_keys()
     for server_key in sorted(_SERVER_TOOL_SCHEMAS):
         tools = _SERVER_TOOL_SCHEMAS[server_key]
+        if server_key in remote:
+            # Vendor-hosted MCP servers expose their live tools through the
+            # HTTP tools/list contract; no in-process module is expected.
+            continue
         module = get_module(server_key)
         if module is None:
             problems.append(
@@ -76,6 +81,40 @@ def test_intentionally_empty_allowlist_cannot_rot() -> None:
             f"{server_key} is in _INTENTIONALLY_EMPTY but has no module either — "
             "it is a pure placeholder and should be removed"
         )
+
+
+def test_generic_email_runtime_catalog_matches_dispatch_catalog() -> None:
+    """Factory-selected email action IDs must all exist at runtime."""
+    module = get_module("email")
+    assert module is not None
+    advertised = {tool["name"] for tool in _SERVER_TOOL_SCHEMAS["email"]}
+    dispatchable = {tool["name"] for tool in module.list_tools()}
+    assert advertised == dispatchable
+    assert {
+        "list_threads",
+        "get_thread",
+        "list_attachments",
+        "create_draft",
+        "update_draft",
+    } <= advertised
+
+
+def test_market_data_runtime_catalogs_are_seeded_and_dispatchable() -> None:
+    from packages.core.services.mcp_seed import _MCP_CATALOG
+
+    expected_auth = {
+        "alpaca_market_data": "credentials",
+        "alpha_vantage": "api_key",
+        "twelve_data": "api_key",
+    }
+    seeded_auth = {row[0]: row[5] for row in _MCP_CATALOG}
+    for server_key, auth_type in expected_auth.items():
+        module = get_module(server_key)
+        assert module is not None
+        assert seeded_auth.get(server_key) == auth_type
+        assert {tool["name"] for tool in _SERVER_TOOL_SCHEMAS[server_key]} == {
+            tool["name"] for tool in module.list_tools()
+        }
 
 
 # ── 2. manor composite tool ────────────────────────────────────────────────
@@ -199,3 +238,87 @@ def test_builtin_skills_only_declare_dispatchable_mcp_servers() -> None:
                     "call tools that cannot execute"
                 )
     assert not problems, "\n".join(problems)
+
+
+def test_discord_product_surface_is_available_and_executable() -> None:
+    from packages.core.ai.runtime.integration_skill_registry import (
+        INTEGRATION_SKILL_ROUTES,
+    )
+    from packages.core.services.integration_service import coming_soon_servers
+    from packages.core.services.mcp_seed import _MCP_CATALOG
+
+    module = get_module("discord")
+    assert module is not None
+    assert {tool["name"] for tool in module.list_tools()} == {
+        "get_connection_info",
+        "list_channels",
+        "send_message",
+        "add_reaction",
+    }
+    assert "discord" not in coming_soon_servers()
+    assert INTEGRATION_SKILL_ROUTES["discord"].status == "available"
+
+    catalog_row = next(row for row in _MCP_CATALOG if row[0] == "discord")
+    assert catalog_row[5] == "oauth2"
+
+    skill_config = _SKILLS_ROOT / "mcp_discord" / "config.json"
+    payload = json.loads(skill_config.read_text(encoding="utf-8"))
+    assert set(payload["tools"]) == {
+        "mcp__discord__get_connection_info",
+        "mcp__discord__list_channels",
+        "mcp__discord__send_message",
+        "mcp__discord__add_reaction",
+    }
+
+
+def test_notion_product_surface_is_available_and_executable() -> None:
+    from packages.core.ai.runtime.integration_skill_registry import (
+        INTEGRATION_SKILL_ROUTES,
+    )
+    from packages.core.services.integration_service import coming_soon_servers
+
+    module = get_module("notion")
+    assert module is not None
+    assert {
+        tool["name"] for tool in module.list_tools()
+    } == {
+        "search",
+        "get_page",
+        "query_database",
+        "create_page",
+        "update_page",
+        "append_block_children",
+    }
+    assert "notion" not in coming_soon_servers()
+    assert INTEGRATION_SKILL_ROUTES["notion"].status == "available"
+
+
+def test_webhook_product_surface_is_available_and_executable() -> None:
+    from packages.core.ai.runtime.integration_skill_registry import (
+        INTEGRATION_SKILL_ROUTES,
+    )
+    from packages.core.services.integration_service import coming_soon_servers
+
+    module = get_module("webhook")
+    assert module is not None
+    assert {tool["name"] for tool in module.list_tools()} == {"send"}
+    assert "webhook" not in coming_soon_servers()
+    assert INTEGRATION_SKILL_ROUTES["webhook"].status == "available"
+
+
+def test_twilio_product_surface_is_available_and_executable() -> None:
+    from packages.core.ai.runtime.integration_skill_registry import (
+        INTEGRATION_SKILL_ROUTES,
+    )
+    from packages.core.services.integration_service import coming_soon_servers
+
+    module = get_module("twilio")
+    assert module is not None
+    assert {tool["name"] for tool in module.list_tools()} == {
+        "list_phone_numbers",
+        "send_sms",
+        "make_call",
+        "get_usage",
+    }
+    assert "twilio" not in coming_soon_servers()
+    assert INTEGRATION_SKILL_ROUTES["twilio"].status == "available"

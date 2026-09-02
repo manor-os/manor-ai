@@ -170,11 +170,11 @@ services:
         condition: service_healthy
     restart: "no"
 
-  # ── Backend ──
-  api:
+  # ── Backend API ──
+  manor-api: &api-runtime-service
     image: manor-api:${TAG:-prod}
     build: *api-build
-    container_name: manor-os-api
+    container_name: manor-api
     restart: unless-stopped
     # Mounts JuiceFS (privileged + /dev/fuse via entrypoint.sh). Give the app
     # plus the FUSE layer time to flush cache to MinIO and unmount cleanly on
@@ -185,13 +185,13 @@ services:
     devices:
       - /dev/fuse
     ports:
-      - "8010:8000"
+      - "127.0.0.1:8010:8000"
     volumes:
       - ./docker/entrypoint.sh:/entrypoint.sh
     # NB: --reload removed for stability — Docker Desktop's volume sync
     # generates spurious filesystem events that cause uvicorn to restart
     # mid-request and tear down long-lived connections (WS, SSE). To pick
-    # up code changes during dev, run `docker compose restart api`.
+    # up code changes during dev, run `docker compose restart manor-api`.
     command:
       - uvicorn
       - apps.api.main:app
@@ -200,7 +200,7 @@ services:
       - --port
       - "8000"
       - --proxy-headers
-      - --forwarded-allow-ips=*
+      - --forwarded-allow-ips=${UVICORN_FORWARDED_ALLOW_IPS:-127.0.0.1,${MANOR_DOCKER_NETWORK_PREFIX:-172.30.0}.250,${MANOR_DOCKER_NETWORK_PREFIX:-172.30.0}.251}
       - --workers
       - ${API_WORKERS:-1}
       - --limit-concurrency
@@ -209,13 +209,13 @@ services:
       - ${API_BACKLOG:-256}
       - --timeout-keep-alive
       - ${API_TIMEOUT_KEEP_ALIVE:-5}
-    environment:
+    environment: &api-env
+      MANOR_SERVICE_ROLE: api
+      MANOR_STARTUP_SIDE_EFFECTS_OWNER: ${MANOR_STARTUP_SIDE_EFFECTS_OWNER:-true}
       API_WORKERS: ${API_WORKERS:-1}
       API_LIMIT_CONCURRENCY: ${API_LIMIT_CONCURRENCY:-120}
       API_BACKLOG: ${API_BACKLOG:-256}
       API_TIMEOUT_KEEP_ALIVE: ${API_TIMEOUT_KEEP_ALIVE:-5}
-      RUNTIME_AGENTIC_TOOL_CALL_MAX_TOKENS: ${RUNTIME_AGENTIC_TOOL_CALL_MAX_TOKENS:-16384}
-      RUNTIME_AGENTIC_TEXT_MAX_TOKENS: ${RUNTIME_AGENTIC_TEXT_MAX_TOKENS:-16384}
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-manor}:${POSTGRES_PASSWORD:-manor_secret}@postgres:5432/${POSTGRES_DB:-manor}
       DATABASE_URL_SYNC: postgresql://${POSTGRES_USER:-manor}:${POSTGRES_PASSWORD:-manor_secret}@postgres:5432/${POSTGRES_DB:-manor}
       DATABASE_POOL_SIZE: ${DATABASE_POOL_SIZE:-5}
@@ -226,18 +226,6 @@ services:
       RATE_LIMIT_ENABLED: ${RATE_LIMIT_ENABLED:-false}
       CHAT_RATE_LIMIT_ENABLED: ${CHAT_RATE_LIMIT_ENABLED:-false}
       REDIS_RATE_LIMIT_ENABLED: ${REDIS_RATE_LIMIT_ENABLED:-false}
-      AUTH_RATE_LIMIT_ENABLED: ${AUTH_RATE_LIMIT_ENABLED:-true}
-      AUTH_ACCOUNT_FAILURE_LIMIT: ${AUTH_ACCOUNT_FAILURE_LIMIT:-10}
-      AUTH_ACCOUNT_FAILURE_WINDOW_SECONDS: ${AUTH_ACCOUNT_FAILURE_WINDOW_SECONDS:-900}
-      AUTH_IP_FAILURE_LIMIT: ${AUTH_IP_FAILURE_LIMIT:-80}
-      AUTH_IP_FAILURE_WINDOW_SECONDS: ${AUTH_IP_FAILURE_WINDOW_SECONDS:-3600}
-      PASSWORD_POLICY_ENFORCED: ${PASSWORD_POLICY_ENFORCED:-true}
-      PASSWORD_MIN_LENGTH: ${PASSWORD_MIN_LENGTH:-12}
-      CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-http://localhost:18080}
-      UPLOAD_AV_REQUIRED: ${UPLOAD_AV_REQUIRED:-false}
-      CLAMAV_HOST: ${CLAMAV_HOST:-}
-      CLAMAV_PORT: ${CLAMAV_PORT:-3310}
-      CLAMAV_TIMEOUT_SECONDS: ${CLAMAV_TIMEOUT_SECONDS:-30}
       CHAT_RATE_LIMIT_REQUESTS: ${CHAT_RATE_LIMIT_REQUESTS:-30}
       CHAT_RATE_LIMIT_WINDOW_SECONDS: ${CHAT_RATE_LIMIT_WINDOW_SECONDS:-60}
       API_RATE_LIMIT_REQUESTS: ${API_RATE_LIMIT_REQUESTS:-200}
@@ -252,28 +240,21 @@ services:
       MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}
       MANOR_FS_ENABLED: "true"
       MANOR_FS_ROOT: /mnt/manor
+      MANOR_FS_MOUNT_MANAGED: ${MANOR_FS_MOUNT_MANAGED:-juicefs}
       JUICEFS_META_URL: ${JUICEFS_META_URL:-redis://redis:6379/1}
       JUICEFS_BUCKET: ${JUICEFS_BUCKET:-http://minio:9000/manor-fs}
       JUICEFS_EXPECTED_UUID: ${JUICEFS_EXPECTED_UUID:-}
       JUICEFS_EXPECTED_BUCKET: ${JUICEFS_EXPECTED_BUCKET:-}
       DOCUMENT_FILE_REPAIR_ENABLED: ${DOCUMENT_FILE_REPAIR_ENABLED:-true}
       DOCUMENT_FILE_STALE_HEAL_ENABLED: ${DOCUMENT_FILE_STALE_HEAL_ENABLED:-true}
-      SANDBOX_SERVICE_URL: http://sandbox:8000
+      SANDBOX_SERVICE_URL: http://manor-sandbox:8000
+      SANDBOX_API_TOKEN: ${SANDBOX_API_TOKEN:-manor-local-sandbox-token-change-me}
       SHELL_SANDBOX_ENABLED: "true"
       CELERY_BROKER_URL: redis://redis:6379/2
       CELERY_RESULT_BACKEND: redis://redis:6379/3
       EMBEDDING_BASE_URL: http://ollama:11434/v1
       EMBEDDING_MODEL: ${EMBEDDING_MODEL:-mxbai-embed-large}
       EMBEDDING_DIMENSIONS: ${EMBEDDING_DIMENSIONS:-1024}
-      EMBEDDING_PROCESSING_STALE_SECONDS: ${EMBEDDING_PROCESSING_STALE_SECONDS:-300}
-      EMBEDDING_CACHE_TTL_SECONDS: ${EMBEDDING_CACHE_TTL_SECONDS:-86400}
-      EMBEDDING_PENDING_STALE_SECONDS: ${EMBEDDING_PENDING_STALE_SECONDS:-120}
-      EMBEDDING_MAX_STALE_RECOVERIES: ${EMBEDDING_MAX_STALE_RECOVERIES:-3}
-      EMBEDDING_SWEEP_LIMIT: ${EMBEDDING_SWEEP_LIMIT:-50}
-      KNOWLEDGE_CONTENT_CACHE_TTL_SECONDS: ${KNOWLEDGE_CONTENT_CACHE_TTL_SECONDS:-172800}
-      KNOWLEDGE_THUMBNAIL_CACHE_TTL_SECONDS: ${KNOWLEDGE_THUMBNAIL_CACHE_TTL_SECONDS:-172800}
-      KNOWLEDGE_DOWNLOAD_CACHE_TTL_SECONDS: ${KNOWLEDGE_DOWNLOAD_CACHE_TTL_SECONDS:-172800}
-      KNOWLEDGE_CACHE_MAX_ENTRY_BYTES: ${KNOWLEDGE_CACHE_MAX_ENTRY_BYTES:-1048576}
       DEPLOYMENT_MODE: ${DEPLOYMENT_MODE:-oss}
       OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
       OPENROUTER_AUDIO_TRANSCRIPTION_MODEL: ${OPENROUTER_AUDIO_TRANSCRIPTION_MODEL:-google/gemini-3.1-flash-lite}
@@ -323,6 +304,12 @@ services:
         condition: service_healthy
       ollama-init:
         condition: service_completed_successfully
+      manor-migration:
+        condition: service_completed_successfully
+    networks:
+      default:
+        aliases:
+          - api
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://localhost:8000/health"]
       interval: 10s
@@ -330,36 +317,82 @@ services:
       retries: 12
       start_period: 20s
 
-  # ── Workers ──
-  #
-  # Two Celery workers, one per role, consuming disjoint queues declared in
-  # packages/core/queues.py:
-  #
-  #   worker       -Q celery  — the CONTROL PLANE, and the only one running
-  #                             beat (-B): internal_worker_tick (5s),
-  #                             cleanup_expired_leases (30s), scheduler.tick
-  #                             (60s), ops/monitor beats. Short bounded tasks;
-  #                             small concurrency is enough and it must never
-  #                             be blocked.
-  #   worker-work  -Q work    — long steps (execute_lease and friends, up to
-  #                             the 6h step-deadline ceiling). THIS is the one
-  #                             to scale (WORKER_WORK_CONCURRENCY, or replicas).
-  #
-  # Before the split both roles shared 4 slots in one process, so four
-  # concurrent long steps stalled the entire orchestration loop: no new leases
-  # dispatched, no expired leases reclaimed, no scheduled job fired.
-  #
-  # DEPLOY NOTE: these must come up together. The default queue keeps its
-  # historical name ("celery"), so an old single worker started without -Q
-  # still drains the control plane, but nothing consumes "work" until
-  # worker-work exists. `docker compose up -d` recreates both.
-  worker: &worker-base
+  manor-chat:
+    <<: *api-runtime-service
+    container_name: manor-chat
+    ports:
+      - "127.0.0.1:8011:8000"
+    command:
+      - uvicorn
+      - apps.api.main:app
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+      - --proxy-headers
+      - --forwarded-allow-ips=${UVICORN_FORWARDED_ALLOW_IPS:-127.0.0.1,${MANOR_DOCKER_NETWORK_PREFIX:-172.30.0}.250,${MANOR_DOCKER_NETWORK_PREFIX:-172.30.0}.251}
+      - --workers
+      - ${CHAT_API_WORKERS:-1}
+      - --limit-concurrency
+      - ${CHAT_API_LIMIT_CONCURRENCY:-80}
+      - --backlog
+      - ${CHAT_API_BACKLOG:-128}
+      - --timeout-keep-alive
+      - ${CHAT_API_TIMEOUT_KEEP_ALIVE:-30}
+    environment:
+      <<: *api-env
+      MANOR_SERVICE_ROLE: chat
+      MANOR_STARTUP_SIDE_EFFECTS_OWNER: "false"
+      API_WORKERS: ${CHAT_API_WORKERS:-1}
+      API_LIMIT_CONCURRENCY: ${CHAT_API_LIMIT_CONCURRENCY:-80}
+      API_BACKLOG: ${CHAT_API_BACKLOG:-128}
+      API_TIMEOUT_KEEP_ALIVE: ${CHAT_API_TIMEOUT_KEEP_ALIVE:-30}
+      CHAT_STREAM_CONCURRENCY_ENABLED: ${CHAT_STREAM_CONCURRENCY_ENABLED:-true}
+      CHAT_STREAM_MAX_CONCURRENCY_GLOBAL: ${CHAT_STREAM_MAX_CONCURRENCY_GLOBAL:-20}
+      CHAT_STREAM_MAX_CONCURRENCY_PER_INSTANCE: ${CHAT_STREAM_MAX_CONCURRENCY_PER_INSTANCE:-20}
+      CHAT_STREAM_QUEUE_TIMEOUT_SECONDS: ${CHAT_STREAM_QUEUE_TIMEOUT_SECONDS:-0.5}
+      CHAT_STREAM_SLOT_TTL_SECONDS: ${CHAT_STREAM_SLOT_TTL_SECONDS:-900}
+      OPS_HEALTH_URL: ${OPS_HEALTH_URL:-http://manor-api:8000/health/deep}
+    networks:
+      default:
+        aliases:
+          - chat
+
+  manor-migration:
     image: manor-api:${TAG:-prod}
     build: *api-build
-    container_name: manor-os-worker
+    container_name: manor-migration
+    restart: "no"
+    command: ["true"]
+    environment:
+      <<: *api-env
+      MANOR_SERVICE_ROLE: migration
+      MANOR_RUN_DB_BOOTSTRAP: "true"
+      MANOR_FS_ENABLED: "false"
+      OTEL_ENABLED: "false"
+    env_file:
+      - path: .env
+        required: false
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  # ── Workers ──
+  #
+  # Two Celery worker roles consume the queues declared in packages/core/queues.py:
+  #   manor-worker       -Q celery,interactive,recovery-v2 — control, Chat,
+  #                        and version-isolated settlement recovery
+  #   manor-worker-heavy -Q heavy,work — long work plus one-release legacy drain
+  #
+  # Celery beat stays in manor-beat as a single process, so scaling
+  # manor-worker does not duplicate scheduled dispatch.
+  manor-worker: &worker-runtime-service
+    image: manor-api:${TAG:-prod}
+    build: *api-build
+    container_name: manor-worker
     restart: unless-stopped
-    # Anchored so worker-work below inherits build / env / depends_on verbatim
-    # and only overrides what differs by role (name, command, volumes).
+    # Anchored so manor-worker-heavy and manor-beat inherit build / env /
+    # depends_on verbatim, with only role-specific overrides.
     # Mounts JuiceFS (privileged + /dev/fuse via entrypoint.sh) and runs Celery
     # tasks against it. Give in-flight tasks plus the FUSE layer time to drain,
     # flush cache to MinIO, and unmount cleanly on stop — the default 10s can
@@ -374,10 +407,9 @@ services:
       # ops.log_scan need read access to the Docker daemon to inspect
       # peer containers + tail their stderr. Read-only.
       - /var/run/docker.sock:/var/run/docker.sock:ro
-    command: >-
-      celery -A packages.core.celery_app worker -B -l info
-      -Q celery -c ${WORKER_CONTROL_CONCURRENCY:-2}
-    environment:
+    command: celery -A packages.core.celery_app worker --hostname manor-worker@%h -l info -Q celery,interactive,recovery-v2 -c ${WORKER_CONTROL_CONCURRENCY:-2}
+    environment: &worker-env
+      MANOR_SERVICE_ROLE: worker
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-manor}:${POSTGRES_PASSWORD:-manor_secret}@postgres:5432/${POSTGRES_DB:-manor}
       DATABASE_URL_SYNC: postgresql://${POSTGRES_USER:-manor}:${POSTGRES_PASSWORD:-manor_secret}@postgres:5432/${POSTGRES_DB:-manor}
       DATABASE_POOL_SIZE: ${DATABASE_POOL_SIZE:-5}
@@ -389,6 +421,7 @@ services:
       CELERY_RESULT_BACKEND: redis://redis:6379/3
       MANOR_FS_ENABLED: "true"
       MANOR_FS_ROOT: /mnt/manor
+      MANOR_FS_MOUNT_MANAGED: ${MANOR_FS_MOUNT_MANAGED:-juicefs}
       JUICEFS_META_URL: ${JUICEFS_META_URL:-redis://redis:6379/1}
       JUICEFS_BUCKET: ${JUICEFS_BUCKET:-http://minio:9000/manor-fs}
       JUICEFS_EXPECTED_UUID: ${JUICEFS_EXPECTED_UUID:-}
@@ -398,22 +431,15 @@ services:
       EMBEDDING_BASE_URL: http://ollama:11434/v1
       EMBEDDING_MODEL: ${EMBEDDING_MODEL:-mxbai-embed-large}
       EMBEDDING_DIMENSIONS: ${EMBEDDING_DIMENSIONS:-1024}
-      EMBEDDING_PROCESSING_STALE_SECONDS: ${EMBEDDING_PROCESSING_STALE_SECONDS:-300}
-      EMBEDDING_CACHE_TTL_SECONDS: ${EMBEDDING_CACHE_TTL_SECONDS:-86400}
-      EMBEDDING_PENDING_STALE_SECONDS: ${EMBEDDING_PENDING_STALE_SECONDS:-120}
-      EMBEDDING_MAX_STALE_RECOVERIES: ${EMBEDDING_MAX_STALE_RECOVERIES:-3}
-      EMBEDDING_SWEEP_LIMIT: ${EMBEDDING_SWEEP_LIMIT:-50}
-      # Keep background Task execution on the same local/unlimited plan path
-      # as the API. Without this, workers incorrectly apply Cloud free-plan
-      # credit gates while the local API accepts the same BYOK request.
-      MANOR_ENV: ${MANOR_ENV:-dev}
       DEPLOYMENT_MODE: ${DEPLOYMENT_MODE:-oss}
+      MANOR_ENV: ${MANOR_ENV:-dev}
       OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
       OPENROUTER_AUDIO_TRANSCRIPTION_MODEL: ${OPENROUTER_AUDIO_TRANSCRIPTION_MODEL:-google/gemini-3.1-flash-lite}
       VAULT_ADDR: ${VAULT_ADDR:-http://vault:8200}
       VAULT_TOKEN: ${VAULT_TOKEN:-manor-dev-root-token}
       VAULT_TRANSIT_KEY: ${VAULT_TRANSIT_KEY:-manor-keys}
       CREDENTIAL_BACKEND: ${CREDENTIAL_BACKEND:-vault}
+      APP_URL: ${APP_URL:-http://localhost:18080}
       PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-http://localhost:8010}
       OTEL_ENABLED: ${OTEL_ENABLED:-false}
       OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-http://jaeger:4318}
@@ -426,8 +452,8 @@ services:
       OPS_EMAIL_RECIPIENTS: ${OPS_EMAIL_RECIPIENTS:-}
       # The worker probes the API container's /health/deep, not its own
       # localhost (the worker doesn't run uvicorn). Inside the docker
-      # network, the api service name resolves to the API container.
-      OPS_HEALTH_URL: ${OPS_HEALTH_URL:-http://api:8000/health/deep}
+      # network, the manor-api service name resolves to the API container.
+      OPS_HEALTH_URL: ${OPS_HEALTH_URL:-http://manor-api:8000/health/deep}
     env_file:
       - path: .env
         required: false
@@ -440,24 +466,45 @@ services:
         condition: service_healthy
       juicefs-init:
         condition: service_completed_successfully
+      manor-api:
+        condition: service_healthy
       ollama:
         condition: service_healthy
       ollama-init:
         condition: service_completed_successfully
-      api:
-        condition: service_healthy
+      manor-migration:
+        condition: service_completed_successfully
 
-  # Long-running plan steps. No beat here — beat lives in the control-plane
-  # worker above and merely *enqueues* onto the work queue; the work worker
-  # only consumes. No docker socket either: nothing on the work queue inspects
-  # peer containers, and this is the process that runs user step bodies.
-  worker-work:
-    <<: *worker-base
-    container_name: manor-os-worker-work
+  manor-worker-heavy:
+    <<: *worker-runtime-service
+    container_name: manor-worker-heavy
+    command: celery -A packages.core.celery_app worker --hostname manor-worker-heavy@%h -l info -Q heavy,work -c ${WORKER_HEAVY_CONCURRENCY:-1}
+    environment:
+      <<: *worker-env
+      MANOR_SERVICE_ROLE: worker-heavy
+      OPS_HEALTH_URL: ${OPS_HEALTH_URL:-http://manor-api:8000/health/deep}
+
+  manor-beat:
+    <<: *worker-runtime-service
+    container_name: manor-beat
+    command: celery -A packages.core.celery_app beat -l info
+    privileged: false
+    devices: []
     volumes: []
-    command: >-
-      celery -A packages.core.celery_app worker -l info
-      -Q work -c ${WORKER_WORK_CONCURRENCY:-4}
+    environment:
+      <<: *worker-env
+      MANOR_SERVICE_ROLE: beat
+      MANOR_FS_ENABLED: "false"
+      OPS_HEALTH_URL: ${OPS_HEALTH_URL:-http://manor-api:8000/health/deep}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      vault:
+        condition: service_healthy
+      manor-migration:
+        condition: service_completed_successfully
 
   # ── Sandbox base image ──
   # Builds the image used by sandbox service child containers so public users
@@ -474,32 +521,43 @@ services:
   # ── Sandbox Service ──
   # Manages isolated Docker containers for skill script execution.
   # Talks to the host Docker daemon via the mounted socket.
-  sandbox:
+  manor-sandbox:
     image: manor-sandbox-service:${TAG:-prod}
     build: *sandbox-service-build
-    container_name: manor-os-sandbox
+    container_name: manor-sandbox
     restart: unless-stopped
     # Manages child skill containers via the host docker socket — graceful
     # shutdown can need to wait for in-flight container creates / cleanups
     # to settle. Default 10s sometimes wasn't enough during deploy windows.
     stop_grace_period: 30s
     ports:
-      - "8110:8000"
+      - "127.0.0.1:8110:8000"
     volumes:
       # Sandbox service needs host Docker daemon to spawn skill containers
       - /var/run/docker.sock:/var/run/docker.sock
     environment:
+      MANOR_SERVICE_ROLE: sandbox
       SANDBOX_HOST: "0.0.0.0"
       SANDBOX_PORT: "8000"
+      SANDBOX_API_TOKEN: ${SANDBOX_API_TOKEN:-manor-local-sandbox-token-change-me}
       SANDBOX_IMAGE: ${SANDBOX_IMAGE:-sandbox-skill:latest}
       SANDBOX_NETWORK: ${SANDBOX_NETWORK:-bridge}
+      # The general sandbox uses bridge for managed skill sessions. The
+      # ephemeral Chat bash runner explicitly requests `none` so code-lab
+      # submissions cannot reach the network.
+      SANDBOX_ALLOWED_NETWORKS: ${SANDBOX_ALLOWED_NETWORKS:-bridge,none}
       SANDBOX_MEMORY: ${SANDBOX_MEMORY:-512m}
       SANDBOX_CPUS: ${SANDBOX_CPUS:-1.0}
-      # The self-hosted runtime has a small global container budget. Keep at
-      # most five live sandboxes and release an inactive slot after 10 minutes;
-      # durable tools can recreate a pruned container from saved source.
       SANDBOX_MAX_SANDBOXES: ${SANDBOX_MAX_SANDBOXES:-5}
       SANDBOX_IDLE_TIMEOUT: ${SANDBOX_IDLE_TIMEOUT:-600}
+      SANDBOX_EXEC_TIMEOUT: ${SANDBOX_EXEC_TIMEOUT:-120}
+      SANDBOX_INSTANCE_MAX_EXECUTING: ${SANDBOX_INSTANCE_MAX_EXECUTING:-0}
+      SANDBOX_REDIS_URL: redis://redis:6379/0
+      SANDBOX_GLOBAL_MAX_ACTIVE: ${SANDBOX_GLOBAL_MAX_ACTIVE:-0}
+      SANDBOX_GLOBAL_MAX_EXECUTING: ${SANDBOX_GLOBAL_MAX_EXECUTING:-0}
+      SANDBOX_GATE_TTL_SECONDS: ${SANDBOX_GATE_TTL_SECONDS:-900}
+      SANDBOX_GATE_WAIT_TIMEOUT_SECONDS: ${SANDBOX_GATE_WAIT_TIMEOUT_SECONDS:-0}
+      SANDBOX_GATE_OPERATION_TIMEOUT_SECONDS: ${SANDBOX_GATE_OPERATION_TIMEOUT_SECONDS:-5}
       SANDBOX_DEBUG: ${SANDBOX_DEBUG:-false}
     healthcheck:
       test: ["CMD", "curl", "-sf", "http://localhost:8000/health"]
@@ -510,12 +568,16 @@ services:
     depends_on:
       sandbox-skill-image:
         condition: service_started
+    networks:
+      default:
+        aliases:
+          - sandbox
 
   # ── Frontend (Nginx static — production build) ──
-  web:
+  manor-web:
     image: manor-web:${TAG:-prod}
     build: *web-build
-    container_name: manor-os-web
+    container_name: manor-web
     restart: unless-stopped
     # nginx:alpine sets STOPSIGNAL SIGQUIT (graceful — wait for active
     # connections to drain). Our nginx.conf reverse-proxies /ws (WebSockets)
@@ -531,7 +593,13 @@ services:
     ports:
       - "18080:80"
     depends_on:
-      - api
+      - manor-api
+      - manor-chat
+    networks:
+      default:
+        aliases:
+          - web
+        ipv4_address: ${MANOR_DOCKER_NETWORK_PREFIX:-172.30.0}.251
 
   # ── WeChat Personal sidecar (opt-in via profile=wechat) ──
   # Holds an itchat session against a personal WeChat account and exposes
@@ -549,6 +617,7 @@ services:
       - "8801:8800"
     environment:
       RUNNER_BEARER_TOKEN: ${WECHAT_RUNNER_BEARER_TOKEN:-}
+      MANOR_API_URL: ${MANOR_API_URL:-http://manor-api:8000}
       PUBLIC_QR_BASE: ${WECHAT_RUNNER_PUBLIC_BASE:-}
     volumes:
       - wechat_runner_data:/data
@@ -559,7 +628,7 @@ services:
   # Anything else listed in the Account → Embedding picker (OpenAI text-
   # embedding-3-*) is a remote API call, not a second local model.
   ollama:
-    image: ollama/ollama
+    image: ollama/ollama:0.32.15
     container_name: manor-os-ollama
     restart: unless-stopped
     ports:
@@ -577,7 +646,7 @@ services:
   # Without this, the first /embeddings call 404s and document RAG
   # silently degrades to text-only search.
   ollama-init:
-    image: ollama/ollama
+    image: ollama/ollama:0.32.15
     container_name: manor-os-ollama-init
     depends_on:
       ollama:
@@ -721,3 +790,10 @@ volumes:
   ollama_data:
   wechat_runner_data:
   nango_pg_data:
+
+networks:
+  default:
+    ipam:
+      config:
+        - subnet: ${MANOR_DOCKER_NETWORK_PREFIX:-172.30.0}.0/24
+          ip_range: ${MANOR_DOCKER_NETWORK_PREFIX:-172.30.0}.0/25

@@ -19,12 +19,16 @@ from packages.core.ai.runtime.dashboard_submission import (
     DASHBOARD_SUBMIT_TOOL_NAME,
     runtime_capture_dashboard_submission,
 )
+from packages.core.constants.conversation import ConversationSurfaceKind
 from packages.core.models.user import User
 from packages.core.models.skill import Skill
 from packages.core.services.conversation_lifecycle import (
     get_or_create_conversation,
 )
 from packages.core.services.conversation_messages import add_message
+from packages.core.services.conversation_surfaces import (
+    ConversationSurfaceMetadataFactory,
+)
 
 
 DASHBOARD_MODULE_BUILDER_SKILL = "dashboard-module-builder"
@@ -175,16 +179,17 @@ async def run_dashboard_agent_turn(
         user.id,
         conversation_id=conversation_id,
         title=f"Dashboard module: {module_title or 'New module'}",
+        conversation_surface=ConversationSurfaceKind.DASHBOARD_MODULE,
     )
     meta = dict(conv.meta or {})
     existing_module_id = str(meta.get("dashboard_module_id") or "")
     if module_id and existing_module_id and existing_module_id != module_id:
         raise PermissionError("Dashboard conversation belongs to another module")
-    conv.meta = {
-        **meta,
-        "surface": "dashboard_module",
-        **({"dashboard_module_id": module_id} if module_id else {}),
-    }
+    conv.meta = ConversationSurfaceMetadataFactory.build(
+        ConversationSurfaceKind.DASHBOARD_MODULE,
+        current=meta,
+        extra={"dashboard_module_id": module_id} if module_id else None,
+    )
     await add_message(
         db,
         conv.id,

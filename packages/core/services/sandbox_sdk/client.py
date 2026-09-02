@@ -13,6 +13,7 @@ import httpx
 from typing import Optional
 
 from .exceptions import (
+    SandboxCapacityError,
     SandboxConnectionError,
     SandboxError,
     SandboxNotFoundError,
@@ -20,9 +21,13 @@ from .exceptions import (
     SandboxSecurityError,
 )
 from .models import (
+    CancelExecutionResult,
     ContainerConfig,
     CreateSandboxResult,
     ExecResult,
+    ExecutionEventResult,
+    ExecutionResponseResult,
+    ExecutionStatusResult,
     FileReadBase64Result,
     FileReadResult,
     FileWriteResult,
@@ -69,6 +74,8 @@ def _raise_for_status(resp: httpx.Response) -> None:
         raise SandboxNotFoundError(detail, status_code=404)
     if resp.status_code == 403:
         raise SandboxSecurityError(detail, status_code=403)
+    if resp.status_code == 429:
+        raise SandboxCapacityError(detail, status_code=429)
     if resp.status_code >= 500:
         raise SandboxRuntimeError(detail, status_code=resp.status_code)
     raise SandboxError(detail, status_code=resp.status_code)
@@ -87,6 +94,7 @@ def _parse_sandbox_info(d: dict) -> SandboxInfo:
         last_used_at=d["last_used_at"],
         config=d.get("config", {}),
         active_command=d.get("active_command"),
+        active_execution_id=d.get("active_execution_id"),
         expires_at=d.get("expires_at"),
     )
 
@@ -98,9 +106,20 @@ class SandboxClient:
         self,
         base_url: str = DEFAULT_BASE_URL,
         timeout: float = DEFAULT_TIMEOUT,
+        api_token: str | None = None,
+        transport: httpx.AsyncBaseTransport | None = None,
     ):
         self._base_url = base_url.rstrip("/")
-        self._http = httpx.AsyncClient(base_url=self._base_url, timeout=timeout)
+        headers: dict[str, str] = {}
+        token = (api_token or "").strip()
+        if token:
+            headers["X-Manor-Sandbox-Token"] = token
+        self._http = httpx.AsyncClient(
+            base_url=self._base_url,
+            timeout=timeout,
+            headers=headers,
+            transport=transport,
+        )
 
     async def __aenter__(self) -> "SandboxClient":
         return self
@@ -129,6 +148,7 @@ class SandboxClient:
         allowed_sensitive_keys: list[str] | None = None,
         config: Optional[ContainerConfig | dict] = None,
         auto_install: bool = True,
+        idempotency_key: str | None = None,
     ) -> CreateSandboxResult:
         """Create a sandbox from in-memory file contents (MinIO / workspace skills)."""
         body: dict = {
@@ -142,6 +162,8 @@ class SandboxClient:
         config_payload = _config_payload(config)
         if config_payload:
             body["config_overrides"] = config_payload
+        if idempotency_key is not None:
+            body["idempotency_key"] = idempotency_key
         resp = await self._http.post("/api/v1/sandbox/create-from-files", json=body)
         _raise_for_status(resp)
         data = resp.json()
@@ -162,6 +184,7 @@ class SandboxClient:
         allowed_sensitive_keys: list[str] | None = None,
         config: Optional[ContainerConfig | dict] = None,
         auto_install: bool = True,
+        idempotency_key: str | None = None,
     ) -> CreateSandboxResult:
         """Create a sandbox for a built-in (codebase) skill."""
         body: dict = {
@@ -175,6 +198,8 @@ class SandboxClient:
         config_payload = _config_payload(config)
         if config_payload:
             body["config_overrides"] = config_payload
+        if idempotency_key is not None:
+            body["idempotency_key"] = idempotency_key
         resp = await self._http.post("/api/v1/sandbox/create-from-builtin", json=body)
         _raise_for_status(resp)
         data = resp.json()
@@ -230,6 +255,7 @@ class SandboxClient:
                 last_used_at=d["last_used_at"],
                 config=d.get("config", {}),
                 active_command=d.get("active_command"),
+                active_execution_id=d.get("active_execution_id"),
                 expires_at=d.get("expires_at"),
             )
             for d in resp.json()
@@ -257,10 +283,13 @@ class SandboxClient:
         command: str,
         timeout: int = 60,
         workdir: str | None = None,
+        execution_id: str | None = None,
     ) -> ExecResult:
         body: dict = {"command": command, "timeout": timeout}
         if workdir:
             body["workdir"] = workdir
+        if execution_id is not None:
+            body["execution_id"] = execution_id
         http_timeout = float(timeout) + 30.0
         resp = await self._http.post(
             f"/api/v1/sandbox/{sandbox_id}/exec",
@@ -269,7 +298,120 @@ class SandboxClient:
         )
         _raise_for_status(resp)
         d = resp.json()
-        return ExecResult(stdout=d["stdout"], stderr=d["stderr"], exit_code=d["exit_code"])
+        return ExecResult(
+            stdout=d["stdout"],
+            stderr=d["stderr"],
+            exit_code=d["exit_code"],
+            execution_id=d.get("execution_id"),
+        )
+
+    async def cancel_execution(
+        self,
+        sandbox_id: str,
+        execution_id: str,
+    ) -> CancelExecutionResult:
+        resp = await self._http.post(
+            f"/api/v1/sandbox/{sandbox_id}/executions/{execution_id}/cancel"
+        )
+        _raise_for_status(resp)
+        data = resp.json()
+        return CancelExecutionResult(
+            sandbox_id=data["sandbox_id"],
+            execution_id=data["execution_id"],
+            cancelled=bool(data["cancelled"]),
+        )
+
+    @staticmethod
+    def _parse_execution_status(data: dict) -> ExecutionStatusResult:
+        events = [
+            ExecutionEventResult(
+                sequence=int(event["sequence"]),
+                event_id=event["event_id"],
+                type=event["type"],
+                message=event.get("message", ""),
+                payload=dict(event.get("payload") or {}),
+                requires_response=bool(event.get("requires_response", False)),
+                responded=bool(event.get("responded", False)),
+                created_at=float(event.get("created_at") or 0.0),
+            )
+            for event in data.get("events", [])
+        ]
+        return ExecutionStatusResult(
+            sandbox_id=data["sandbox_id"],
+            execution_id=data["execution_id"],
+            status=data["status"],
+            created_at=data["created_at"],
+            started_at=data.get("started_at"),
+            finished_at=data.get("finished_at"),
+            stdout=data.get("stdout"),
+            stderr=data.get("stderr"),
+            exit_code=data.get("exit_code"),
+            error=data.get("error"),
+            events=events,
+            next_sequence=int(data.get("next_sequence") or 0),
+            waiting_for_response=bool(data.get("waiting_for_response", False)),
+        )
+
+    async def start_exec(
+        self,
+        sandbox_id: str,
+        command: str,
+        timeout: int = 60,
+        workdir: str | None = None,
+        execution_id: str | None = None,
+    ) -> ExecutionStatusResult:
+        body: dict = {"command": command, "timeout": timeout}
+        if workdir:
+            body["workdir"] = workdir
+        if execution_id is not None:
+            body["execution_id"] = execution_id
+        resp = await self._http.post(
+            f"/api/v1/sandbox/{sandbox_id}/exec/start",
+            json=body,
+        )
+        _raise_for_status(resp)
+        return self._parse_execution_status(resp.json())
+
+    async def execution_status(
+        self,
+        sandbox_id: str,
+        execution_id: str,
+        after_sequence: int = 0,
+    ) -> ExecutionStatusResult:
+        params = {"after_sequence": max(0, int(after_sequence))} if after_sequence else None
+        resp = await self._http.get(
+            f"/api/v1/sandbox/{sandbox_id}/executions/{execution_id}",
+            params=params,
+        )
+        _raise_for_status(resp)
+        return self._parse_execution_status(resp.json())
+
+    async def send_execution_response(
+        self,
+        sandbox_id: str,
+        execution_id: str,
+        event_id: str,
+        *,
+        payload: dict | None = None,
+        message: str = "",
+    ) -> ExecutionResponseResult:
+        resp = await self._http.post(
+            f"/api/v1/sandbox/{sandbox_id}/executions/{execution_id}/responses",
+            json={
+                "event_id": event_id,
+                "payload": dict(payload or {}),
+                "message": message,
+            },
+        )
+        _raise_for_status(resp)
+        data = resp.json()
+        return ExecutionResponseResult(
+            sandbox_id=data["sandbox_id"],
+            execution_id=data["execution_id"],
+            event_id=data["event_id"],
+            accepted=bool(data["accepted"]),
+            duplicate=bool(data.get("duplicate", False)),
+        )
 
     async def read_file(
         self,

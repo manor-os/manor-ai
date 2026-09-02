@@ -111,7 +111,7 @@ async def test_idle_pruner_reclaims_ready_sandbox_but_never_active_command(monke
 
 def test_self_hosted_sandbox_defaults_fit_five_slot_capacity():
     compose = (ROOT / "docker-compose.yml").read_text(encoding="utf-8")
-    config_source = (SANDBOX_SERVICE / "config.py").read_text(encoding="utf-8")
+    config_source = (SANDBOX_SERVICE / "sandbox_config.py").read_text(encoding="utf-8")
 
     assert "${SANDBOX_MAX_SANDBOXES:-5}" in compose
     assert "${SANDBOX_IDLE_TIMEOUT:-600}" in compose

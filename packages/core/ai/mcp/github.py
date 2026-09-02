@@ -19,14 +19,16 @@ from __future__ import annotations
 import base64
 import json
 import logging
+import math
+import re
 from typing import Any, Dict, List, Optional
 from urllib.parse import quote, urlencode
 
 import httpx
 
-logger = logging.getLogger(__name__)
-
 from packages.core.external_api_versions import GITHUB as _GITHUB_PIN
+
+logger = logging.getLogger(__name__)
 
 _API = "https://api.github.com"
 _MAX_CHARS = 12_000
@@ -46,18 +48,32 @@ async def call_tool(
     bearer_token: str,
 ) -> Dict[str, Any]:
     """Execute a tool (tools/call format). Returns MCP content result."""
+    token = bearer_token.strip() if isinstance(bearer_token, str) else ""
+    if not token:
+        return _error(
+            "GitHub access token is missing. Reconnect GitHub on the Integration page."
+        )
     handler = _HANDLERS.get(name)
     if not handler:
         return _error(f"Unknown tool: {name}")
 
+    if not isinstance(arguments, dict):
+        return _error("arguments must be an object")
+    arguments = dict(arguments)
     spec = _TOOLS.get(name, {})
-    missing = [p for p in spec.get("required", []) if arguments.get(p) in (None, "")]
+    missing = [p for p in spec.get("required", []) if _is_blank(arguments.get(p))]
     if missing:
         return _error(f"Missing required params: {', '.join(missing)}")
+    try:
+        _validate_arguments(arguments, spec)
+    except ValueError as exc:
+        return _error(str(exc))
 
     try:
-        text = await handler(bearer_token, arguments)
+        text = await handler(token, arguments)
         return {"content": [{"type": "text", "text": text}], "isError": False}
+    except (_GitHubAPIError, ValueError) as e:
+        return _error(str(e))
     except Exception as e:
         logger.exception("GitHub MCP tool %s failed", name)
         return _error(str(e))
@@ -66,11 +82,53 @@ async def call_tool(
 from packages.core.ai.mcp._http import mcp_err as _error  # noqa: E402, F401
 
 
+def _is_blank(value: Any) -> bool:
+    return value is None or (isinstance(value, str) and not value.strip())
+
+
+_POSITIVE_INTEGER_FIELDS = {"number", "comment_id", "run_id", "job_id"}
+
+
+def _validate_repo(value: Any) -> None:
+    if not isinstance(value, str) or not re.fullmatch(r"[^/?#\s]+/[^/?#\s]+", value.strip()):
+        raise ValueError("repo must be an owner/name string")
+
+
+def _validate_integer(field: str, value: Any) -> None:
+    if isinstance(value, bool):
+        raise ValueError(f"{field} must be an integer")
+    if isinstance(value, float) and (not math.isfinite(value) or not value.is_integer()):
+        raise ValueError(f"{field} must be an integer")
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"{field} must be an integer") from exc
+    if field == "per_page" and not 1 <= parsed <= 100:
+        raise ValueError("per_page must be between 1 and 100")
+    if field in _POSITIVE_INTEGER_FIELDS and parsed < 1:
+        raise ValueError(f"{field} must be a positive integer")
+
+
+def _validate_arguments(arguments: Dict[str, Any], spec: Dict[str, Any]) -> None:
+    if "repo" in arguments:
+        _validate_repo(arguments["repo"])
+    for field, property_spec in (spec.get("properties") or {}).items():
+        if field not in arguments or arguments[field] is None:
+            continue
+        value = arguments[field]
+        type_name = property_spec.get("type")
+        if type_name == "string" and not isinstance(value, str):
+            raise ValueError(f"{field} must be a string")
+        if type_name == "boolean" and not isinstance(value, bool):
+            raise ValueError(f"{field} must be a boolean")
+        if type_name == "integer":
+            _validate_integer(field, value)
+
+
 # ── GitHub API client ─────────────────────────────────────────────────────────
 
 class _GitHubAPIError(RuntimeError):
-    """Raised by ``_api_json`` on non-2xx; multi-step handlers catch it
-    to produce a user-friendly string instead of bubbling the exception."""
+    """Propagate GitHub non-2xx responses into the MCP error envelope."""
 
     def __init__(self, status: int, body: str):
         self.status = status
@@ -94,16 +152,8 @@ async def _api(
     async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
         resp = await client.request(method, url, headers=headers, json=body)
 
-    if resp.status_code == 401:
-        return "GitHub authentication failed. Reconnect GitHub on the Integration page."
-    if resp.status_code == 403:
-        return f"GitHub forbidden (rate limit or permissions): {resp.text[:200]}"
-    if resp.status_code == 404:
-        return "Not found."
-    if resp.status_code == 422:
-        return f"GitHub validation error (422): {resp.text[:300]}"
     if not resp.is_success:
-        return f"GitHub API error ({resp.status_code}): {resp.text[:300]}"
+        raise _GitHubAPIError(resp.status_code, resp.text)
 
     if "raw" in accept or "diff" in accept or "patch" in accept:
         text = resp.text
@@ -431,7 +481,9 @@ async def _create_or_update_file(token: str, args: Dict) -> str:
     elif encoding == "base64":
         content_b64 = content
     else:
-        return f"Unsupported content_encoding '{encoding}' (use 'utf-8' or 'base64')"
+        raise ValueError(
+            f"Unsupported content_encoding '{encoding}' (use 'utf-8' or 'base64')"
+        )
     body: Dict[str, Any] = {"message": args["message"], "content": content_b64}
     if args.get("branch"):
         body["branch"] = args["branch"]
@@ -460,7 +512,19 @@ async def _push_files(token: str, args: Dict) -> str:
     message = args["message"]
     files = args.get("files") or []
     if not files:
-        return "files list is empty"
+        raise ValueError("files list is empty")
+    for file_item in files:
+        if not isinstance(file_item, dict):
+            raise ValueError("each files item must be an object")
+        if _is_blank(file_item.get("path")):
+            raise ValueError("each files item requires a path")
+        if "content" not in file_item:
+            raise ValueError("each files item requires content")
+        encoding = file_item.get("encoding", "utf-8")
+        if encoding not in {"utf-8", "base64"}:
+            raise ValueError(
+                f"Unsupported encoding '{encoding}' for {file_item.get('path')}"
+            )
     try:
         ref = await _api_json(token, "GET", f"repos/{repo}/git/refs/heads/{quote(branch)}")
         parent_sha = ref["object"]["sha"]
@@ -474,8 +538,6 @@ async def _push_files(token: str, args: Dict) -> str:
                 blob_content = base64.b64encode(str(f["content"]).encode("utf-8")).decode()
             elif enc == "base64":
                 blob_content = f["content"]
-            else:
-                return f"Unsupported encoding '{enc}' for {f.get('path')}"
             blob = await _api_json(
                 token, "POST", f"repos/{repo}/git/blobs",
                 {"content": blob_content, "encoding": "base64"},
@@ -507,7 +569,9 @@ async def _push_files(token: str, args: Dict) -> str:
             "ref": updated_ref,
         }, ensure_ascii=False, indent=2)
     except _GitHubAPIError as e:
-        return f"push_files failed ({e.status}): {e.body[:300]}"
+        raise RuntimeError(
+            f"push_files failed ({e.status}): {e.body[:300]}"
+        ) from e
 
 
 # ── Branches ──────────────────────────────────────────────────────────────────
@@ -537,9 +601,11 @@ async def _create_branch(token: str, args: Dict) -> str:
             )
             sha = ref["object"]["sha"]
         except _GitHubAPIError as e:
-            return f"create_branch: failed to resolve from_branch ({e.status}): {e.body[:200]}"
+            raise RuntimeError(
+                f"create_branch: failed to resolve from_branch ({e.status}): {e.body[:200]}"
+            ) from e
     else:
-        return "create_branch requires either from_branch or from_sha"
+        raise ValueError("create_branch requires either from_branch or from_sha")
     return await _api(
         token, "POST", f"repos/{repo}/git/refs",
         {"ref": f"refs/heads/{new_branch}", "sha": sha},
@@ -722,12 +788,8 @@ async def _get_job_logs(token: str, args: Dict) -> str:
     }
     async with httpx.AsyncClient(timeout=_TIMEOUT, follow_redirects=True) as client:
         resp = await client.get(url, headers=headers)
-    if resp.status_code == 401:
-        return "GitHub authentication failed. Reconnect GitHub on the Integration page."
-    if resp.status_code == 404:
-        return "Not found (logs expired, or job id invalid)."
     if not resp.is_success:
-        return f"GitHub API error ({resp.status_code}): {resp.text[:300]}"
+        raise _GitHubAPIError(resp.status_code, resp.text)
     text = resp.text
     if len(text) > _MAX_CHARS:
         return "… (truncated, showing tail)\n" + text[-_MAX_CHARS:]
@@ -742,7 +804,9 @@ async def _run_workflow(token: str, args: Dict) -> str:
         try:
             inputs = json.loads(inputs)
         except Exception:
-            return "inputs must be a JSON object (or omitted)."
+            raise ValueError("inputs must be a JSON object (or omitted).")
+    if inputs is not None and not isinstance(inputs, dict):
+        raise ValueError("inputs must be a JSON object (or omitted).")
     if isinstance(inputs, dict) and inputs:
         body["inputs"] = inputs
     wf = quote(str(args["workflow_id"]), safe="")

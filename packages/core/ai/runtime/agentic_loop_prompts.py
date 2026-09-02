@@ -61,9 +61,9 @@ def runtime_agentic_truncated_tool_call_retry_message() -> str:
 
     return (
         "[System: Your last tool call was truncated because it exceeded the output limit. "
-        "Use edit_file with old_text/new_text for targeted edits instead of rewriting "
-        "entire files with write_file. Break large changes into multiple smaller "
-        "edit_file calls.]"
+        "Use patch_file with targeted operations instead of rewriting "
+        "entire files with generate_file. Break large changes into multiple smaller "
+        "patch_file calls.]"
     )
 
 
@@ -83,6 +83,25 @@ def runtime_agentic_max_rounds_final_prompt() -> str:
     return (
         "You've used all available tool rounds. Please provide your final "
         "response based on everything you've gathered so far."
+    )
+
+
+def runtime_agentic_tool_error_final_prompt(*, setup_url: str = "") -> str:
+    """Build the final no-tools prompt after an actionable tool error."""
+
+    setup_instruction = (
+        " Include one Markdown link to the relevant integration settings using "
+        f"this exact destination: {setup_url}."
+        if setup_url
+        else ""
+    )
+    return (
+        "[System: One or more tool calls failed and tool execution cannot safely "
+        "continue in this turn. Give the user a concise final "
+        "answer in the same language as their request. Explain the actionable "
+        "reason from the tool result and what they need to do next. Do not expose "
+        "raw JSON or internal identifiers, do not claim the requested task "
+        f"completed, and do not call another tool.{setup_instruction}]"
     )
 
 

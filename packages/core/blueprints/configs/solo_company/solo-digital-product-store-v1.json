@@ -66,7 +66,12 @@
     ],
     "requires": {
       "manor_min_version": "1.0",
-      "tools": [],
+      "tools": [
+        "read_finance_ledger",
+        "record_finance_ledger",
+        "read_relationship_ledger",
+        "record_relationship_ledger"
+      ],
       "mcp_servers": [],
       "skills": [],
       "agents": []
@@ -79,8 +84,13 @@
         "name": "Digital Product Store Playbook",
         "display_name": "Digital Product Store Playbook",
         "description": "Operating playbook for Digital Product Store OS.",
-        "system_prompt": "Help a store operator improve listings, automate simple fulfillment, answer support, recover abandoned carts, and track contribution margin. Favor clear checklists and small weekly experiments.",
-        "tools": [],
+        "system_prompt": "Help a store operator improve listings, automate simple fulfillment, answer support, recover abandoned carts, and track contribution margin. Read the relationship ledger before customer or vendor follow-up and append confirmed interactions with stable identity keys and evidence references. Use the finance ledger for validated orders, fees, refunds, and payouts, citing Knowledge evidence. Favor clear checklists and small weekly experiments.",
+        "tools": [
+          "read_finance_ledger",
+          "record_finance_ledger",
+          "read_relationship_ledger",
+          "record_relationship_ledger"
+        ],
         "input_schema": {
           "type": "object",
           "properties": {
@@ -143,14 +153,25 @@
         "slug": "solo-digital-product-store-ops",
         "title": "Digital Product Store Ops",
         "purpose": "Store catalog strategy, listing experiments, support patterns, and margin reviews.",
-        "mode": "skeleton",
+        "mode": "inline_text",
         "folder_structure": [
           "catalog/",
           "listing-experiments/",
           "support-patterns/",
-          "margin-reviews/"
+          "margin-reviews/",
+          "relationship-ledger/",
+          "finance-ledger/"
         ],
-        "starter_documents": [],
+        "starter_documents": [
+          {
+            "path": "relationship-ledger/README.md",
+            "body_md": "# Relationship Ledger\n\nUse `read_relationship_ledger` before customer-support follow-up or partner outreach. Record confirmed customer, partner, and vendor interactions with `record_relationship_ledger`, using stable identity keys and evidence references. Do not infer customer intent or resolution from an unverified note.\n"
+          },
+          {
+            "path": "finance-ledger/README.md",
+            "body_md": "# Finance Ledger\n\nUse `read_finance_ledger` for orders, fees, refunds, payouts, and other validated money movements. Record entries with `record_finance_ledger` and cite Knowledge receipts, bills, or provider records as evidence.\n"
+          }
+        ],
         "external_source": null
       }
     ]
@@ -164,7 +185,22 @@
         "timezone": "America/Los_Angeles",
         "blueprint_frozen": true,
         "frozen_at": "2026-06-03",
-        "install_expectation": "simulate_first_then_promote"
+        "install_expectation": "simulate_first_then_promote",
+        "ledger_contracts": [
+          {
+            "contract_id": "manor.relationship_ledger/v1",
+            "schema_version": 1,
+            "directory": "relationship-ledger",
+            "knowledge_path": "relationship-ledger/README.md",
+            "subject_types": ["person", "organization", "customer", "prospect", "lead"]
+          },
+          {
+            "contract_id": "manor.finance_ledger/v1",
+            "schema_version": 1,
+            "directory": "finance-ledger",
+            "knowledge_path": "finance-ledger/README.md"
+          }
+        ]
       },
       "services": [
         {

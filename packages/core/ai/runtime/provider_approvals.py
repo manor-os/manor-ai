@@ -7,8 +7,11 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Callable
 
+from packages.core.services.sensitive_data import sanitize_approval_credentials
 
-_PROVIDER_RETRY_ARGUMENTS_MAX_CHARS = 16_000
+
+_PROVIDER_RETRY_ARGUMENTS_MAX_BYTES = 16_000
+_PROVIDER_CONTINUATION_MAX_BYTES = 64_000
 _TOOL_CONTINUATION_KEY = "__manor_tool_continuation"
 _CHROME_CONFIRMATION_MODES = {
     "always_action_time",
@@ -16,6 +19,22 @@ _CHROME_CONFIRMATION_MODES = {
     "handoff_required",
     "no_confirmation",
 }
+_PROVIDER_TOOL_CONTRACTS = {
+    "chrome": ("mcp__chrome__confirm_action", "mcp__chrome__"),
+}
+
+
+def provider_tool_result_for_persistence(tool_name: str, result: str) -> str:
+    """Keep provider replay output while removing one-time action credentials."""
+
+    normalized_name = str(tool_name or "").strip()
+    if not any(
+        normalized_name == confirmation_tool or normalized_name.startswith(tool_prefix)
+        for confirmation_tool, tool_prefix in _PROVIDER_TOOL_CONTRACTS.values()
+    ):
+        return result
+    sanitized = sanitize_approval_credentials(result)
+    return sanitized if isinstance(sanitized, str) else result
 
 
 @dataclass
@@ -87,7 +106,7 @@ def _json_payload(value: Any) -> dict[str, Any]:
 
 def _retry_arguments(value: Any) -> dict[str, Any] | None:
     if not isinstance(value, dict):
-        return {}
+        return None
     arguments = {
         str(key): item
         for key, item in value.items()
@@ -106,9 +125,87 @@ def _retry_arguments(value: Any) -> dict[str, Any] | None:
         )
     except (TypeError, ValueError):
         return None
-    if len(encoded) > _PROVIDER_RETRY_ARGUMENTS_MAX_CHARS:
+    if len(encoded.encode("utf-8")) > _PROVIDER_RETRY_ARGUMENTS_MAX_BYTES:
         return None
     return json.loads(encoded)
+
+
+def freeze_provider_approval_request(
+    request: Any,
+) -> dict[str, Any] | None:
+    """Freeze one provider gate for deterministic post-approval replay.
+
+    Provider-native approvals use a two-call continuation (confirm, then retry
+    with the returned provider token), but follow the same persistence contract
+    as ordinary runtime tools: exact JSON types, a bounded payload, and no grant
+    when a legacy continuation is incomplete.
+    """
+
+    if not isinstance(request, dict):
+        return None
+    try:
+        encoded = json.dumps(
+            request,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    except (TypeError, ValueError):
+        return None
+    if len(encoded.encode("utf-8")) > _PROVIDER_CONTINUATION_MAX_BYTES:
+        return None
+    frozen = json.loads(encoded)
+    if not isinstance(frozen, dict):
+        return None
+    provider = str(frozen.get("provider") or "").strip()
+    if not provider:
+        return None
+    provider_approval_id = str(frozen.get("provider_approval_id") or "").strip()
+    if not provider_approval_id:
+        return None
+    confirmation_tool = str(frozen.get("confirmation_tool") or "").strip()
+    if not confirmation_tool:
+        return None
+    confirmation_arguments = frozen.get("confirmation_arguments")
+    if not isinstance(confirmation_arguments, dict):
+        return None
+    retry_tool = str(frozen.get("retry_tool") or "").strip()
+    if not retry_tool:
+        return None
+    retry_arguments = frozen.get("retry_arguments")
+    if not isinstance(retry_arguments, dict):
+        return None
+    tool_contract = _PROVIDER_TOOL_CONTRACTS.get(provider)
+    if tool_contract is None:
+        return None
+    expected_confirmation_tool, tool_prefix = tool_contract
+    if confirmation_tool != expected_confirmation_tool:
+        return None
+    if not retry_tool.startswith(tool_prefix) or retry_tool == confirmation_tool:
+        return None
+    confirmation_approval_id = str(
+        confirmation_arguments.get("approvalId")
+        or confirmation_arguments.get("approval_id")
+        or ""
+    ).strip()
+    if confirmation_approval_id != provider_approval_id:
+        return None
+    if any(
+        key in retry_arguments
+        for key in ("approvalToken", "approval_token", _TOOL_CONTINUATION_KEY)
+    ):
+        return None
+    recovery_tool_names = frozen.get("recovery_tool_names")
+    if recovery_tool_names is not None and (
+        not isinstance(recovery_tool_names, list)
+        or any(
+            not isinstance(tool_name, str)
+            or not tool_name.strip().startswith(tool_prefix)
+            for tool_name in recovery_tool_names
+        )
+    ):
+        return None
+    return frozen
 
 
 def _normalize_chrome_approval(
@@ -207,6 +304,11 @@ def _normalize_chrome_approval(
             "policy_category": policy_category,
             "preapproved": payload.get("preapproved") is True,
         })
+    resource_id = str(
+        payload.get("resource_id") or payload.get("resourceId") or ""
+    ).strip()
+    if resource_id:
+        request["resource_id"] = resource_id
     for source_key, target_key in (
         ("next_required_tool", "next_required_tool"),
         ("groupId", "groupId"),
@@ -242,15 +344,24 @@ def normalize_provider_approval(
     for adapter in _PROVIDER_ADAPTERS:
         request = adapter(str(tool_name or "").strip(), arguments, payload)
         if request is not None:
-            return request
+            return freeze_provider_approval_request(request)
     return None
 
 
-def normalize_provider_approval_resolution(
+def provider_approval_confirmation_receipt(
     tool_name: str,
     arguments: dict[str, Any] | None,
     result: str | dict[str, Any],
 ) -> dict[str, Any] | None:
+    """Return the private receipt needed to resume a confirmed provider gate.
+
+    The approval token is intentionally kept out of
+    :func:`normalize_provider_approval_resolution`, whose value is copied into
+    public tool-call history.  Runtime approval state may persist this private
+    receipt so a worker restart does not confirm the same provider request
+    again or lose the exact one-time retry token.
+    """
+
     if tool_name != "mcp__chrome__confirm_action":
         return None
     payload = _json_payload(result)
@@ -271,10 +382,27 @@ def normalize_provider_approval_resolution(
     return {
         "provider": "chrome",
         "provider_approval_id": approval_id,
+        "approval_token": approval_token,
     }
 
 
-def provider_approval_is_expired(request: dict[str, Any]) -> bool:
+def normalize_provider_approval_resolution(
+    tool_name: str,
+    arguments: dict[str, Any] | None,
+    result: str | dict[str, Any],
+) -> dict[str, Any] | None:
+    receipt = provider_approval_confirmation_receipt(tool_name, arguments, result)
+    if receipt is None:
+        return None
+    return {
+        "provider": receipt["provider"],
+        "provider_approval_id": receipt["provider_approval_id"],
+    }
+
+
+def provider_approval_is_expired(request: Any) -> bool:
+    if not isinstance(request, dict):
+        return False
     value = str(request.get("expires_at") or "").strip()
     if not value:
         return False
@@ -292,9 +420,20 @@ def provider_approval_runtime_metadata(
 ) -> dict[str, Any] | None:
     """Build deterministic execution metadata from a stored provider request."""
 
-    continuation = item.get("continuation")
-    if not isinstance(continuation, dict) or provider_approval_is_expired(
-        continuation
+    continuation = freeze_provider_approval_request(item.get("continuation"))
+    if continuation is None or provider_approval_is_expired(continuation):
+        return None
+    item_provider = str(item.get("provider") or "").strip()
+    item_approval_id = str(item.get("provider_approval_id") or "").strip()
+    item_tool = str(item.get("tool") or "").strip()
+    if not item_provider or not item_approval_id or not item_tool:
+        return None
+    if item_provider and str(continuation.get("provider") or "").strip() != item_provider:
+        return None
+    if (
+        item_approval_id
+        and str(continuation.get("provider_approval_id") or "").strip()
+        != item_approval_id
     ):
         return None
     confirmation_tool = str(continuation.get("confirmation_tool") or "").strip()
@@ -308,30 +447,8 @@ def provider_approval_runtime_metadata(
         or not isinstance(retry_arguments, dict)
     ):
         return None
-
-    metadata: dict[str, Any] = {}
-    if (
-        str(item.get("provider") or "").strip().lower() == "chrome"
-        and confirmation_tool == "mcp__chrome__confirm_action"
-    ):
-        from packages.core.ai.runtime.chrome_routing import (
-            runtime_restore_chrome_confirmation_receipt,
-        )
-
-        runtime_restore_chrome_confirmation_receipt(
-            runtime_metadata=metadata,
-            tool_name=retry_tool,
-            approval_id=(
-                item.get("provider_approval_id")
-                or continuation.get("provider_approval_id")
-            ),
-            confirmation_mode=continuation.get("confirmation_mode"),
-            policy_category=continuation.get("policy_category"),
-            preapproved=continuation.get("preapproved"),
-            arguments=retry_arguments,
-            destination=continuation.get("url"),
-            data_summary=continuation.get("data_summary"),
-        )
+    if item_tool and retry_tool != item_tool:
+        return None
 
     arguments = dict(confirmation_arguments)
     arguments[_TOOL_CONTINUATION_KEY] = {
@@ -350,20 +467,23 @@ def provider_approval_runtime_metadata(
             for tool_name in recovery_tool_names
             if isinstance(tool_name, str) and tool_name.strip()
         )
-    metadata.update({
+    return {
         "extra_tool_names": sorted(extra_tool_names),
         "forced_tool_calls": [
             {
                 "name": confirmation_tool,
                 "arguments": arguments,
+                # Confirm + provider-token retry form one approved attempt.
+                # After both calls, the model may summarize but cannot invent
+                # a second side effect or another approval card.
+                "disable_followup_tools": True,
             }
         ],
         "approval_resume_guidance": (
             "Resume the approved provider action using the supplied forced "
             "tool continuation. Do not rediscover or alter the approved action."
         ),
-    })
-    return metadata
+    }
 
 
 def provider_approval_runtime_event_data(
@@ -377,6 +497,7 @@ def provider_approval_runtime_event_data(
         "approval_token": approval_id,
         "approval_id": approval_id,
         "action_key": request.get("action_key"),
+        "resource_id": request.get("resource_id"),
         "matched_rule": request.get("reason"),
         "provider": request.get("provider"),
     }

@@ -6,7 +6,8 @@ posts parsed messages to ``/api/v1/channels/email/callback`` or (b) wire
 an external mail-forward-to-webhook service (Mailgun, Postmark, SendGrid
 inbound parse). Both funnel through ``parse_inbound`` below.
 
-Credentials in ChannelConfig.credentials (mirrors the email MCP bundle):
+Credentials are leased from the ChannelConfig's source Integration (mirrors
+the email MCP bundle):
     {
       smtp_host, smtp_port, use_tls_smtp, use_ssl_smtp,
       imap_host, imap_port, use_ssl_imap,
@@ -15,19 +16,78 @@ Credentials in ChannelConfig.credentials (mirrors the email MCP bundle):
 """
 from __future__ import annotations
 
-import asyncio
+import base64
 import json
 import logging
-import smtplib
 from email.message import EmailMessage
 from typing import Any, Dict, Optional
 
 from packages.core.models.channel import ChannelConfig
 from packages.core.services.channels.base import (
-    ChannelAdapter, NormalizedInbound, register_adapter,
+    ChannelAdapter, ChannelTextSendError, NormalizedInbound, register_adapter,
 )
+from packages.core.services import smtp_transport
 
 logger = logging.getLogger(__name__)
+
+
+def _normalize_inbound_attachments(payload: Dict[str, Any]) -> list[dict[str, Any]]:
+    """Accept bounded inline bytes from an IMAP poller/inbound-mail webhook."""
+
+    from packages.core.services.email_attachments import (
+        EmailAttachmentError,
+        MAX_EMAIL_ATTACHMENTS,
+        MAX_EMAIL_ATTACHMENTS_TOTAL_BYTES,
+        decode_inbound_email_attachment,
+    )
+
+    raw_items = payload.get("attachments")
+    if not isinstance(raw_items, list):
+        return []
+    normalized: list[dict[str, Any]] = []
+    total_bytes = 0
+    for index, raw in enumerate(raw_items[:MAX_EMAIL_ATTACHMENTS]):
+        if not isinstance(raw, dict):
+            continue
+        item = {
+            "filename": raw.get("filename") or f"attachment-{index + 1}",
+            "content_type": raw.get("content_type") or raw.get("mime_type"),
+            "data_base64": raw.get("data_base64") or raw.get("content_base64"),
+            "attachment_id": raw.get("attachment_id") or str(index),
+            "folder": raw.get("folder"),
+            "uid": raw.get("uid"),
+            "message_id": payload.get("message_id"),
+            "from": payload.get("from"),
+            "subject": payload.get("subject"),
+        }
+        try:
+            data, filename, content_type = decode_inbound_email_attachment(item)
+            total_bytes += len(data)
+            if total_bytes > MAX_EMAIL_ATTACHMENTS_TOTAL_BYTES:
+                raise EmailAttachmentError(
+                    "Email attachments exceed the 20 MiB total limit."
+                )
+        except EmailAttachmentError as exc:
+            normalized.append({
+                "filename": str(item["filename"]),
+                "attachment_id": str(item["attachment_id"]),
+                "status": "error",
+                "error": str(exc),
+            })
+            continue
+        normalized.append({
+            **{
+                key: value
+                for key, value in item.items()
+                if key not in {"filename", "content_type", "data_base64"}
+                and value not in (None, "")
+            },
+            "filename": filename,
+            "content_type": content_type,
+            "size": len(data),
+            "data_base64": base64.b64encode(data).decode("ascii"),
+        })
+    return normalized
 
 
 class EmailChannelAdapter(ChannelAdapter):
@@ -36,7 +96,7 @@ class EmailChannelAdapter(ChannelAdapter):
     async def send_text(
         self, cc: ChannelConfig, to: str, text: str, **kwargs: Any,
     ) -> Dict[str, Any]:
-        cfg = cc.credentials or {}
+        cfg = await self.credentials(cc, reason="channel.email.send_text")
         host = cfg.get("smtp_host") or cfg.get("host")
         port = int(cfg.get("smtp_port") or cfg.get("port") or 587)
         username = cfg.get("username")
@@ -48,7 +108,9 @@ class EmailChannelAdapter(ChannelAdapter):
         use_ssl = bool(cfg.get("use_ssl_smtp", port == 465))
 
         if not (host and username and password and from_addr):
-            raise RuntimeError("Email ChannelConfig missing host/username/password/from_address")
+            raise ChannelTextSendError.determinate(
+                "Email ChannelConfig missing host/username/password/from_address"
+            )
 
         msg = EmailMessage()
         msg["From"] = from_addr
@@ -58,20 +120,16 @@ class EmailChannelAdapter(ChannelAdapter):
         if html:
             msg.add_alternative(html, subtype="html")
 
-        def _send_sync() -> None:
-            if use_ssl:
-                with smtplib.SMTP_SSL(host, port, timeout=20) as s:
-                    s.login(username, password)
-                    s.send_message(msg)
-            else:
-                with smtplib.SMTP(host, port, timeout=20) as s:
-                    s.ehlo()
-                    if use_tls:
-                        s.starttls(); s.ehlo()
-                    s.login(username, password)
-                    s.send_message(msg)
-
-        await asyncio.to_thread(_send_sync)
+        await smtp_transport.send_message_async(
+            message=msg,
+            host=host,
+            port=port,
+            username=username,
+            password=password,
+            use_starttls=use_tls,
+            use_ssl=use_ssl,
+            timeout=20,
+        )
         return {"to": to, "subject": subject, "status": "sent"}
 
     async def send_attachment(
@@ -81,7 +139,7 @@ class EmailChannelAdapter(ChannelAdapter):
         """Send an email with a file attachment. Fetches the URL if
         bytes weren't supplied."""
         import httpx
-        cfg = cc.credentials or {}
+        cfg = await self.credentials(cc, reason="channel.email.send_attachment")
         if not url and not data:
             raise RuntimeError("send_attachment needs url or data")
         fname = "attachment"
@@ -117,20 +175,16 @@ class EmailChannelAdapter(ChannelAdapter):
         msg.add_attachment(data, maintype=maintype or "application",
                            subtype=subtype or "octet-stream", filename=fname)
 
-        def _send_sync() -> None:
-            if use_ssl:
-                with smtplib.SMTP_SSL(host, port, timeout=30) as s:
-                    s.login(username, password)
-                    s.send_message(msg)
-            else:
-                with smtplib.SMTP(host, port, timeout=30) as s:
-                    s.ehlo()
-                    if use_tls:
-                        s.starttls(); s.ehlo()
-                    s.login(username, password)
-                    s.send_message(msg)
-
-        await asyncio.to_thread(_send_sync)
+        await smtp_transport.send_message_async(
+            message=msg,
+            host=host,
+            port=port,
+            username=username,
+            password=password,
+            use_starttls=use_tls,
+            use_ssl=use_ssl,
+            timeout=30,
+        )
         return {"to": to, "filename": fname, "status": "sent"}
 
     async def parse_inbound(
@@ -144,7 +198,12 @@ class EmailChannelAdapter(ChannelAdapter):
               "from_name": "Alice",
               "subject": "Hi",
               "text": "...",
-              "message_id": "<abc@example.com>"
+              "message_id": "<abc@example.com>",
+              "attachments": [{
+                "filename": "brief.pdf",
+                "content_type": "application/pdf",
+                "data_base64": "..."
+              }]
             }
         """
         try:
@@ -154,6 +213,8 @@ class EmailChannelAdapter(ChannelAdapter):
         sender = (payload.get("from") or "").strip().lower()
         if not sender:
             return None
+        attachments = _normalize_inbound_attachments(payload)
+        content = payload.get("text") or payload.get("body") or ""
         return NormalizedInbound(
             channel_type="email",
             channel_config_id=cc.id,
@@ -161,8 +222,9 @@ class EmailChannelAdapter(ChannelAdapter):
             source_id=sender,
             sender_name=payload.get("from_name") or sender,
             reply_to=sender,
-            content=payload.get("text") or payload.get("body") or "",
-            message_type="text",
+            content=content,
+            message_type="file" if attachments and not content else "text",
+            attachments=attachments,
             external_message_id=payload.get("message_id"),
             raw=payload,
         )

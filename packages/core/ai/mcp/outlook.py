@@ -14,10 +14,10 @@ re-learning. Calling conventions stay close to Microsoft Graph
 """
 from __future__ import annotations
 
-import base64
 import json
 import logging
 from typing import Any, Dict, List, Optional
+from urllib.parse import quote
 
 import httpx
 
@@ -25,6 +25,11 @@ logger = logging.getLogger(__name__)
 
 _API = "https://graph.microsoft.com/v1.0"
 _MAX_CHARS = 12_000
+
+
+def _path_segment(value: Any) -> str:
+    """Encode an opaque Graph resource id as one URL path segment."""
+    return quote(str(value), safe="")
 
 
 # ── MCP Protocol ─────────────────────────────────────────────────────────────
@@ -214,17 +219,31 @@ async def call_tool(
     arguments: Dict[str, Any],
     bearer_token: str,
 ) -> Dict[str, Any]:
+    token = bearer_token.strip() if isinstance(bearer_token, str) else ""
+    if not token:
+        return _error(
+            "Microsoft Graph access token is missing. Reconnect Microsoft on the Integration page."
+        )
+
     handler = _HANDLERS.get(name)
     if not handler:
         return _error(f"Unknown tool: {name}")
+    if not isinstance(arguments, dict):
+        return _error("arguments must be an object")
+    arguments = dict(arguments)
 
     spec = _TOOLS.get(name, {})
-    missing = [p for p in spec.get("required", []) if arguments.get(p) in (None, "")]
+    missing = [p for p in spec.get("required", []) if _is_blank(arguments.get(p))]
     if missing:
         return _error(f"Missing required params: {', '.join(missing)}")
 
+    for parameter in spec.get("required", []):
+        value = arguments.get(parameter)
+        if isinstance(value, str):
+            arguments[parameter] = value.strip()
+
     try:
-        text = await handler(bearer_token, arguments)
+        text = await handler(token, arguments)
         return {"content": [{"type": "text", "text": text}], "isError": False}
     except Exception as exc:  # noqa: BLE001
         logger.exception("Outlook MCP tool %s failed", name)
@@ -305,6 +324,24 @@ def _build_message(args: Dict[str, Any]) -> Dict[str, Any]:
     return msg
 
 
+def _top(value: Any, *, default: int) -> int:
+    if value is None or value == "":
+        return default
+    if isinstance(value, bool) or isinstance(value, float):
+        raise ValueError("top must be an integer between 1 and 1000")
+    try:
+        count = int(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("top must be an integer between 1 and 1000") from exc
+    if count < 1:
+        raise ValueError("top must be at least 1")
+    return min(count, 1000)
+
+
+def _is_blank(value: Any) -> bool:
+    return value is None or (isinstance(value, str) and not value.strip())
+
+
 # ── Tool handlers ───────────────────────────────────────────────────────────
 
 # Messages: read
@@ -312,7 +349,7 @@ def _build_message(args: Dict[str, Any]) -> Dict[str, Any]:
 async def _list_messages(token: str, args: Dict) -> str:
     folder_id = args.get("folder_id") or "inbox"
     params: Dict[str, Any] = {
-        "$top": min(int(args.get("top") or 25), 1000),
+        "$top": _top(args.get("top"), default=25),
         "$select": args.get("select") or "id,subject,from,toRecipients,receivedDateTime,isRead,bodyPreview,hasAttachments",
         "$orderby": "receivedDateTime DESC",
     }
@@ -324,7 +361,7 @@ async def _list_messages(token: str, args: Dict) -> str:
         params.pop("$orderby", None)
         params["$search"] = f'"{args["search"]}"'
     return await _api(
-        token, "GET", f"me/mailFolders/{folder_id}/messages", params=params,
+        token, "GET", f"me/mailFolders/{_path_segment(folder_id)}/messages", params=params,
     )
 
 
@@ -332,7 +369,9 @@ async def _get_message(token: str, args: Dict) -> str:
     params: Dict[str, Any] = {}
     if args.get("select"):
         params["$select"] = args["select"]
-    return await _api(token, "GET", f"me/messages/{args['message_id']}", params=params)
+    return await _api(
+        token, "GET", f"me/messages/{_path_segment(args['message_id'])}", params=params,
+    )
 
 
 # Messages: write
@@ -345,7 +384,7 @@ async def _send_message(token: str, args: Dict) -> str:
 async def _reply_to_message(token: str, args: Dict) -> str:
     endpoint = "replyAll" if args.get("reply_all") else "reply"
     return await _api(
-        token, "POST", f"me/messages/{args['message_id']}/{endpoint}",
+        token, "POST", f"me/messages/{_path_segment(args['message_id'])}/{endpoint}",
         body={"comment": args["body"]},
     )
 
@@ -355,7 +394,7 @@ async def _forward_message(token: str, args: Dict) -> str:
     if args.get("comment"):
         body["comment"] = args["comment"]
     return await _api(
-        token, "POST", f"me/messages/{args['message_id']}/forward", body=body,
+        token, "POST", f"me/messages/{_path_segment(args['message_id'])}/forward", body=body,
     )
 
 
@@ -382,29 +421,31 @@ async def _update_draft(token: str, args: Dict) -> str:
         body["bccRecipients"] = _to_recipients(args["bcc"])
     if not body:
         return "No fields to update — pass to / subject / body / cc / bcc"
-    return await _api(token, "PATCH", f"me/messages/{args['draft_id']}", body=body)
+    return await _api(
+        token, "PATCH", f"me/messages/{_path_segment(args['draft_id'])}", body=body,
+    )
 
 
 async def _send_draft(token: str, args: Dict) -> str:
-    return await _api(token, "POST", f"me/messages/{args['draft_id']}/send")
+    return await _api(token, "POST", f"me/messages/{_path_segment(args['draft_id'])}/send")
 
 
 async def _delete_draft(token: str, args: Dict) -> str:
-    return await _api(token, "DELETE", f"me/messages/{args['draft_id']}")
+    return await _api(token, "DELETE", f"me/messages/{_path_segment(args['draft_id'])}")
 
 
 # Status
 
 async def _mark_read(token: str, args: Dict) -> str:
     return await _api(
-        token, "PATCH", f"me/messages/{args['message_id']}",
+        token, "PATCH", f"me/messages/{_path_segment(args['message_id'])}",
         body={"isRead": True},
     )
 
 
 async def _mark_unread(token: str, args: Dict) -> str:
     return await _api(
-        token, "PATCH", f"me/messages/{args['message_id']}",
+        token, "PATCH", f"me/messages/{_path_segment(args['message_id'])}",
         body={"isRead": False},
     )
 
@@ -414,7 +455,7 @@ async def _flag_message(token: str, args: Dict) -> str:
     if status not in ("flagged", "complete", "notFlagged"):
         return "status must be flagged | complete | notFlagged"
     return await _api(
-        token, "PATCH", f"me/messages/{args['message_id']}",
+        token, "PATCH", f"me/messages/{_path_segment(args['message_id'])}",
         body={"flag": {"flagStatus": status}},
     )
 
@@ -423,20 +464,20 @@ async def _categorize(token: str, args: Dict) -> str:
     raw = args["categories"]
     cats = raw if isinstance(raw, list) else [c.strip() for c in str(raw).split(",") if c.strip()]
     return await _api(
-        token, "PATCH", f"me/messages/{args['message_id']}",
+        token, "PATCH", f"me/messages/{_path_segment(args['message_id'])}",
         body={"categories": cats},
     )
 
 
 async def _move_message(token: str, args: Dict) -> str:
     return await _api(
-        token, "POST", f"me/messages/{args['message_id']}/move",
+        token, "POST", f"me/messages/{_path_segment(args['message_id'])}/move",
         body={"destinationId": args["destination_folder_id"]},
     )
 
 
 async def _delete_message(token: str, args: Dict) -> str:
-    return await _api(token, "DELETE", f"me/messages/{args['message_id']}")
+    return await _api(token, "DELETE", f"me/messages/{_path_segment(args['message_id'])}")
 
 
 # Folders
@@ -444,7 +485,7 @@ async def _delete_message(token: str, args: Dict) -> str:
 async def _list_folders(token: str, args: Dict) -> str:
     return await _api(
         token, "GET", "me/mailFolders",
-        params={"$top": min(int(args.get("top") or 50), 1000)},
+        params={"$top": _top(args.get("top"), default=50)},
     )
 
 
@@ -452,7 +493,7 @@ async def _create_folder(token: str, args: Dict) -> str:
     body = {"displayName": args["name"]}
     parent = args.get("parent_folder_id")
     path = (
-        f"me/mailFolders/{parent}/childFolders" if parent
+        f"me/mailFolders/{_path_segment(parent)}/childFolders" if parent
         else "me/mailFolders"
     )
     return await _api(token, "POST", path, body=body)
@@ -462,7 +503,7 @@ async def _create_folder(token: str, args: Dict) -> str:
 
 async def _list_attachments(token: str, args: Dict) -> str:
     return await _api(
-        token, "GET", f"me/messages/{args['message_id']}/attachments",
+        token, "GET", f"me/messages/{_path_segment(args['message_id'])}/attachments",
         params={"$select": "id,name,contentType,size,isInline"},
     )
 
@@ -470,7 +511,7 @@ async def _list_attachments(token: str, args: Dict) -> str:
 async def _download_attachment(token: str, args: Dict) -> str:
     return await _api(
         token, "GET",
-        f"me/messages/{args['message_id']}/attachments/{args['attachment_id']}",
+        f"me/messages/{_path_segment(args['message_id'])}/attachments/{_path_segment(args['attachment_id'])}",
     )
 
 

@@ -1,8 +1,8 @@
 """Merchant account — Stripe Connect payout identity for a selling entity.
 
 One row per entity. `charges_enabled` / `payouts_enabled` mirror Stripe's
-`account.updated` webhook; a blueprint can only be priced > 0 when
-`charges_enabled` is true.
+`account.updated` webhook; a blueprint can only be priced > 0 when both are
+true.
 """
 from __future__ import annotations
 

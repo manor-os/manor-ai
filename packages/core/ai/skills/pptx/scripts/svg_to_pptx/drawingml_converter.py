@@ -7,6 +7,7 @@ import re
 from pathlib import Path
 from typing import Any
 from xml.etree import ElementTree as ET
+from defusedxml import ElementTree as SafeET
 
 from .drawingml_context import ConvertContext, ShapeResult
 from .drawingml_utils import (
@@ -443,7 +444,7 @@ def convert_svg_to_slide_shapes(
           semantic groups, in z-order; consumed by the builder's optional
           per-element entrance timing emitter.
     """
-    tree = ET.parse(str(svg_path))
+    tree = SafeET.parse(str(svg_path))
     root = tree.getroot()
     trace_events: list[dict[str, Any]] | None = [] if trace_out is not None else None
     trace_steps: list[dict[str, Any]] = []

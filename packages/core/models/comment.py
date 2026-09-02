@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from typing import Optional
 
-from sqlalchemy import Boolean, Index, String, Text
+from sqlalchemy import Boolean, Index, String, Text, func
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -31,3 +31,10 @@ class Comment(Base, TimestampMixin):
     reactions: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default="{}")
     is_edited: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     status: Mapped[str] = mapped_column(String(20), nullable=False, default="active")
+
+
+Index(
+    "ix_comments_resource_normalized",
+    func.lower(func.trim(Comment.resource_type)),
+    Comment.resource_id,
+)

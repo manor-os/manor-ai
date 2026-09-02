@@ -25,6 +25,8 @@ interface AnchoredPopoverProps {
   align?: "left" | "right";
   width?: number;
   panelClassName?: string;
+  openOnHover?: boolean;
+  onOpenChange?: (open: boolean) => void;
   persistentOnWide?: boolean;
   persistentBreakpoint?: number;
   persistentPlacement?: "align-anchor" | "below-anchor";
@@ -47,6 +49,8 @@ export default function AnchoredPopover({
   align = "right",
   width = 360,
   panelClassName = "",
+  openOnHover = false,
+  onOpenChange,
   persistentOnWide = false,
   persistentBreakpoint = 1280,
   persistentPlacement = "align-anchor",
@@ -63,8 +67,52 @@ export default function AnchoredPopover({
   const panelId = useId();
   const anchorRef = useRef<HTMLSpanElement>(null);
   const panelRef = useRef<HTMLDivElement>(null);
+  const hoverCloseTimerRef = useRef<number | null>(null);
+  const interactionPinnedRef = useRef(false);
+  const openRef = useRef(false);
 
-  const close = useCallback(() => setOpen(false), []);
+  const setPopoverOpen = useCallback((nextOpen: boolean) => {
+    if (openRef.current === nextOpen) return;
+    openRef.current = nextOpen;
+    setOpen(nextOpen);
+    onOpenChange?.(nextOpen);
+  }, [onOpenChange]);
+
+  const clearHoverCloseTimer = useCallback(() => {
+    if (hoverCloseTimerRef.current === null) return;
+    window.clearTimeout(hoverCloseTimerRef.current);
+    hoverCloseTimerRef.current = null;
+  }, []);
+  const close = useCallback(() => {
+    clearHoverCloseTimer();
+    interactionPinnedRef.current = false;
+    setPopoverOpen(false);
+  }, [clearHoverCloseTimer, setPopoverOpen]);
+  const openFromHover = useCallback(() => {
+    if (!openOnHover) return;
+    clearHoverCloseTimer();
+    setPopoverOpen(true);
+  }, [clearHoverCloseTimer, openOnHover, setPopoverOpen]);
+  const closeAfterHover = useCallback(() => {
+    if (!openOnHover || interactionPinnedRef.current) return;
+    clearHoverCloseTimer();
+    hoverCloseTimerRef.current = window.setTimeout(() => {
+      hoverCloseTimerRef.current = null;
+      setPopoverOpen(false);
+    }, 140);
+  }, [clearHoverCloseTimer, openOnHover, setPopoverOpen]);
+  const openFromTrigger = useCallback(() => {
+    clearHoverCloseTimer();
+    interactionPinnedRef.current = true;
+    setPopoverOpen(true);
+    window.requestAnimationFrame(() => {
+      panelRef.current
+        ?.querySelector<HTMLElement>(
+          "button:not(:disabled), a, input:not(:disabled), select:not(:disabled), textarea:not(:disabled), [tabindex]:not([tabindex='-1'])",
+        )
+        ?.focus();
+    });
+  }, [clearHoverCloseTimer, setPopoverOpen]);
   const recomputePosition = useCallback(() => {
     const anchor = anchorRef.current;
     if (!anchor) return;
@@ -125,6 +173,10 @@ export default function AnchoredPopover({
   ]);
 
   useEffect(() => {
+    return clearHoverCloseTimer;
+  }, [clearHoverCloseTimer]);
+
+  useEffect(() => {
     if (!persistentOnWide) {
       setPersistent(false);
       return;
@@ -182,7 +234,13 @@ export default function AnchoredPopover({
       "data-popover-persistent": persistent || undefined,
       onClick: (event: ReactMouseEvent<HTMLElement>) => {
         typedTrigger.props.onClick?.(event);
-        if (!event.defaultPrevented) setOpen((current) => !current);
+        if (!event.defaultPrevented) {
+          if (openOnHover) {
+            openFromTrigger();
+          } else {
+            setPopoverOpen(!openRef.current);
+          }
+        }
       },
       ...(
         typeof typedTrigger.type === "string" && !["button", "a", "input"].includes(typedTrigger.type)
@@ -193,7 +251,11 @@ export default function AnchoredPopover({
               typedTrigger.props.onKeyDown?.(event);
               if (!event.defaultPrevented && (event.key === "Enter" || event.key === " ")) {
                 event.preventDefault();
-                setOpen((current) => !current);
+                if (openOnHover) {
+                  openFromTrigger();
+                } else {
+                  setPopoverOpen(!openRef.current);
+                }
               }
             },
           }
@@ -203,7 +265,12 @@ export default function AnchoredPopover({
     : trigger;
 
   return (
-    <span ref={anchorRef} className="anchored-popover-anchor">
+    <span
+      ref={anchorRef}
+      className="anchored-popover-anchor"
+      onMouseEnter={openOnHover ? openFromHover : undefined}
+      onMouseLeave={openOnHover ? closeAfterHover : undefined}
+    >
       {triggerControl}
       {open && typeof document !== "undefined" && createPortal(
         <div
@@ -211,6 +278,16 @@ export default function AnchoredPopover({
           ref={panelRef}
           role="dialog"
           aria-label={ariaLabel}
+          onMouseEnter={openOnHover ? clearHoverCloseTimer : undefined}
+          onMouseLeave={openOnHover ? closeAfterHover : undefined}
+          onFocusCapture={openOnHover ? () => {
+            clearHoverCloseTimer();
+            interactionPinnedRef.current = true;
+          } : undefined}
+          onMouseDown={openOnHover ? () => {
+            clearHoverCloseTimer();
+            interactionPinnedRef.current = true;
+          } : undefined}
           className={`anchored-popover-panel${persistent ? " anchored-popover-panel--persistent" : ""}${panelClassName ? ` ${panelClassName}` : ""}`}
           style={{
             top: position?.top ?? 0,

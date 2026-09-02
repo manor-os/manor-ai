@@ -1,7 +1,9 @@
 """publish_site — publish a static website folder/file to a public URL."""
 from __future__ import annotations
 
+import asyncio
 import json
+from types import SimpleNamespace
 from typing import Any
 
 PUBLISH_SITE_SCHEMA = {
@@ -71,12 +73,86 @@ async def _publish_site_handler(
         })
     try:
         from packages.core.database import async_session
+        from packages.core.models.site import Site
+        from packages.core.models.user import User
+        from packages.core.services.auth_service import get_user_membership
+        from packages.core.services.site_access import (
+            SitePublishAccessDenied,
+            require_site_publish_access,
+            user_can_manage_site,
+        )
+        from sqlalchemy import select
 
         async with async_session() as session:
-            result = await sp.publish(
-                session, entity_id=entity_id, rel_path=path, name=name
+            target = sp.resolve_publish_target(entity_id, path)
+            if target is None:
+                raise sp.SitePublishError(
+                    f"{path!r} is not publishable: publish a folder whose root contains "
+                    "index.html, or a single .html file"
+                )
+            user = await session.scalar(
+                select(User).where(User.id == user_id, User.status == "active")
             )
-    except sp.SitePublishError as e:
+            if user is None:
+                raise SitePublishAccessDenied(
+                    "An active user context is required to publish this site"
+                )
+            membership = await get_user_membership(
+                session,
+                user=user,
+                entity_id=entity_id,
+            )
+            if membership is None or membership.status != "active":
+                raise SitePublishAccessDenied(
+                    "An active entity membership is required to publish this site"
+                )
+            actor = SimpleNamespace(
+                id=user.id,
+                entity_id=membership.entity_id,
+                role=membership.role,
+                email=user.email,
+                display_name=user.display_name,
+            )
+            prepared = await asyncio.to_thread(
+                sp.prepare_publication,
+                entity_id,
+                target,
+            )
+            try:
+                await require_site_publish_access(
+                    session,
+                    user=actor,
+                    target=target,
+                    included_paths=prepared.included_source_paths,
+                )
+                existing_site = await session.scalar(
+                    select(Site).where(
+                        Site.entity_id == entity_id,
+                        Site.source_path == target.root_rel,
+                    )
+                )
+                if existing_site is not None and not await user_can_manage_site(
+                    session,
+                    user=actor,
+                    site=existing_site,
+                ):
+                    raise SitePublishAccessDenied(
+                        "Site management access is required to republish this site"
+                    )
+                result = await sp.publish(
+                    session,
+                    entity_id=entity_id,
+                    rel_path=target.root_rel,
+                    name=name,
+                    created_by_user_id=user.id,
+                    manage_as_user=actor,
+                    prepared=prepared,
+                )
+                prepared = None
+            finally:
+                if prepared is not None:
+                    await asyncio.to_thread(prepared.cleanup)
+    except (OSError, sp.SitePublishError, PermissionError) as e:
         return json.dumps({"published": False, "error": str(e)})
 
     domain = (get_settings().MANOR_SITES_DOMAIN or "").strip().lower()

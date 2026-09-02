@@ -25,6 +25,8 @@ from __future__ import annotations
 import logging
 from typing import Any, Awaitable, Callable, Iterable, Optional
 
+from celery.exceptions import SoftTimeLimitExceeded
+
 logger = logging.getLogger(__name__)
 
 
@@ -80,6 +82,11 @@ async def dispatch_callback(
         return {"ok": False, "error": "unknown_callback_kind", "kind": kind}
     try:
         return await handler(payload or {}, action_key, context or {})
+    except SoftTimeLimitExceeded:
+        # The channel task owns retry policy for provider-idempotent work.
+        # Converting this signal into a callback result would incorrectly
+        # terminalize the NotificationDelivery instead of retrying it.
+        raise
     except Exception as exc:
         logger.exception(
             "notification_callbacks: handler for kind=%s raised", kind,

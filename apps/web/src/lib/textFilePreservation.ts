@@ -13,6 +13,27 @@ export interface DecodedTextFile {
   format: PreservedTextFormat;
 }
 
+export enum TextFileSaveStrategy {
+  PreserveSource = "preserve-source",
+  NormalizeUtf8 = "normalize-utf8",
+}
+
+export function textFileSaveStrategy(format: PreservedTextFormat): TextFileSaveStrategy {
+  return format.safeToSave
+    ? TextFileSaveStrategy.PreserveSource
+    : TextFileSaveStrategy.NormalizeUtf8;
+}
+
+export function textFileFormatForSave(format: PreservedTextFormat): PreservedTextFormat {
+  if (textFileSaveStrategy(format) === TextFileSaveStrategy.PreserveSource) return format;
+  return {
+    ...format,
+    encoding: "utf-8",
+    bom: false,
+    safeToSave: true,
+  };
+}
+
 function newlineMetadata(text: string) {
   const originalNewlines = (text.match(/\r\n|\r|\n/g) || []) as PreservedTextFormat["originalNewlines"];
   const counts = new Map<PreservedTextFormat["dominantNewline"], number>([["\n", 0], ["\r\n", 0], ["\r", 0]]);
@@ -105,18 +126,16 @@ export function encodeTextFile(
   baselineText: string,
   format: PreservedTextFormat,
 ): Uint8Array {
-  if (!format.safeToSave) {
-    throw new Error("This file is not valid UTF-8 or UTF-16. Saving is disabled to avoid corrupting its original encoding.");
-  }
-  const restored = restoreNewlines(editedText, baselineText, format);
-  const body = format.encoding === "utf-8"
+  const outputFormat = textFileFormatForSave(format);
+  const restored = restoreNewlines(editedText, baselineText, outputFormat);
+  const body = outputFormat.encoding === "utf-8"
     ? new TextEncoder().encode(restored)
-    : encodeUtf16(restored, format.encoding === "utf-16le");
-  const prefix = !format.bom
+    : encodeUtf16(restored, outputFormat.encoding === "utf-16le");
+  const prefix = !outputFormat.bom
     ? new Uint8Array()
-    : format.encoding === "utf-8"
+    : outputFormat.encoding === "utf-8"
       ? Uint8Array.of(0xef, 0xbb, 0xbf)
-      : format.encoding === "utf-16le"
+      : outputFormat.encoding === "utf-16le"
         ? Uint8Array.of(0xff, 0xfe)
         : Uint8Array.of(0xfe, 0xff);
   const output = new Uint8Array(prefix.length + body.length);

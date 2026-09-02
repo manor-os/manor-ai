@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+from enum import Enum
 from typing import Any, Literal
+
+from packages.core.constants.approvals import HitlType
 
 ApprovalChoice = Literal["approve", "always_approve", "revise", "reject"]
 
@@ -83,10 +86,11 @@ def one_time_approval_options(options: list[str] | None = None) -> list[str]:
         if isinstance(options, list) and options
         else list(ONE_TIME_APPROVAL_OPTIONS)
     )
-    return [
+    filtered = [
         opt for opt in chosen
         if normalize_approval_choice(opt) != APPROVAL_CHOICE_ALWAYS_APPROVE
     ]
+    return filtered or list(ONE_TIME_APPROVAL_OPTIONS)
 
 
 #: What a ``hitl_type="error"`` card offers instead of approve/always/reject.
@@ -100,11 +104,176 @@ ERROR_CHOICE_CANCEL = "cancel"
 
 ERROR_CARD_OPTIONS: list[str] = [ERROR_CHOICE_RETRY, ERROR_CHOICE_CANCEL]
 
+#: A review is a verdict on material that already exists. It therefore has
+#: one more honest outcome than an authorization request: the reviewer can
+#: ask for a revised version and explain what should change. ``reject`` is
+#: retained as the terminal "do not continue with this material" decision so
+#: old clients and persisted cards remain wire-compatible.
+REVIEW_CHOICE_REQUEST_CHANGES = "request_changes"
+REVIEW_CARD_OPTIONS: list[str] = [
+    APPROVAL_CHOICE_APPROVE,
+    REVIEW_CHOICE_REQUEST_CHANGES,
+    APPROVAL_CHOICE_REJECT,
+]
+
+
+def human_step_hitl_type(params: dict[str, Any] | None) -> str:
+    """Classify an inline human Step as review or ordinary input."""
+
+    values = params if isinstance(params, dict) else {}
+    pending_action = values.get("pending_action")
+    if isinstance(pending_action, dict):
+        explicit = str(pending_action.get("hitl_type") or "").strip().lower()
+        if explicit in HitlType.values():
+            return explicit
+    explicit = str(values.get("hitl_type") or "").strip().lower()
+    if explicit in HitlType.values():
+        return explicit
+    if any(
+        values.get(key) is not None
+        for key in ("review", "review_artifacts", "artifacts_for_review")
+    ):
+        return HitlType.REVIEW.value
+    return HitlType.INPUT.value
+
+
+class HumanDecisionIntent(str, Enum):
+    """Continuation-neutral meaning of a public HITL choice.
+
+    The producer-specific continuation (resume a Step, replan a Task, resume a
+    Workflow) stays outside this enum. This layer answers only what the human
+    decided, so every surface uses the same semantics.
+    """
+
+    APPROVE = "approve"
+    APPROVE_STANDING = "approve_standing"
+    REQUEST_CHANGES = "request_changes"
+    DENY = "deny"
+    RETRY = "retry"
+    CANCEL = "cancel"
+    OTHER = "other"
+
 
 def error_card_options() -> list[str]:
     """Choices for an ``error`` HITL card."""
 
     return list(ERROR_CARD_OPTIONS)
+
+
+def review_card_options(options: list[str] | None = None) -> list[str]:
+    """Choices for a concrete diff/file/content review.
+
+    Producers may supply a narrower explicit vocabulary (task approval, for
+    example, intentionally has no terminal reject button). A plain review
+    gets the shared approve / request changes / reject contract and can never
+    carry a standing grant.
+    """
+
+    chosen = (
+        list(options)
+        if isinstance(options, list) and options
+        else list(REVIEW_CARD_OPTIONS)
+    )
+    if any(
+        normalize_approval_choice(opt) == APPROVAL_CHOICE_ALWAYS_APPROVE
+        for opt in chosen
+    ):
+        # A standing grant never belonged to a review. Its presence identifies
+        # the pre-typed generic approval vocabulary, so migrate the whole list
+        # instead of merely deleting "always" and losing request-changes.
+        return list(REVIEW_CARD_OPTIONS)
+    filtered = [
+        opt for opt in chosen
+        if normalize_approval_choice(opt) != APPROVAL_CHOICE_ALWAYS_APPROVE
+    ]
+    return filtered or list(REVIEW_CARD_OPTIONS)
+
+
+def decision_options_for_hitl(
+    hitl_type: str | None,
+    options: list[str] | None = None,
+    *,
+    standing_allowed: bool = True,
+) -> list[str]:
+    """Project a typed ``HitlRequest`` into its public decisions.
+
+    This is the common semantic boundary for cards. ``pending_action.kind``
+    still decides which legacy continuation handler runs; it no longer needs
+    to invent button vocabularies independently.
+    """
+
+    normalized = str(hitl_type or HitlType.AUTHORIZE.value).strip().lower()
+    if normalized == HitlType.ERROR.value:
+        return error_card_options()
+    if normalized == HitlType.REVIEW.value:
+        return review_card_options(options)
+    if normalized == HitlType.AUTHORIZE.value:
+        return (
+            approval_options(options)
+            if standing_allowed
+            else one_time_approval_options(options)
+        )
+    return list(options or [])
+
+
+def is_change_request_choice(value: Any) -> bool:
+    """Whether a decision asks for revised material instead of authorizing it."""
+
+    return str(value or "").strip().lower() in {
+        APPROVAL_CHOICE_REVISE,
+        REVIEW_CHOICE_REQUEST_CHANGES,
+    }
+
+
+def decision_intent_for_hitl(
+    hitl_type: str | None,
+    value: Any,
+) -> HumanDecisionIntent:
+    """Classify a wire choice without deciding how its origin resumes.
+
+    Explicit review cards predate the typed vocabulary and may persist
+    ``accept`` / ``revise`` / ``cancel``.  They are still valid public wire
+    choices: a deployment must not strand an already-rendered card merely
+    because the common layer now calls those intentions approve / request
+    changes / cancel.
+    """
+
+    normalized_type = str(hitl_type or HitlType.AUTHORIZE.value).strip().lower()
+    choice = str(value or "").strip().lower()
+    if normalized_type == HitlType.ERROR.value:
+        if choice in {ERROR_CHOICE_RETRY, "retry_now"}:
+            return HumanDecisionIntent.RETRY
+        if choice in {ERROR_CHOICE_CANCEL, "skip"}:
+            return HumanDecisionIntent.CANCEL
+        return HumanDecisionIntent.OTHER
+    if normalized_type in {HitlType.AUTHORIZE.value, HitlType.REVIEW.value}:
+        if choice in {APPROVAL_CHOICE_APPROVE, "accept", "approved", "yes"}:
+            return HumanDecisionIntent.APPROVE
+        if (
+            normalized_type == HitlType.AUTHORIZE.value
+            and choice == APPROVAL_CHOICE_ALWAYS_APPROVE
+        ):
+            return HumanDecisionIntent.APPROVE_STANDING
+        if normalized_type == HitlType.REVIEW.value and is_change_request_choice(choice):
+            return HumanDecisionIntent.REQUEST_CHANGES
+        if choice in {APPROVAL_CHOICE_REJECT, "deny", "decline", "no"}:
+            return HumanDecisionIntent.DENY
+        if normalized_type == HitlType.REVIEW.value and choice in {"cancel", "skip"}:
+            return HumanDecisionIntent.CANCEL
+    return HumanDecisionIntent.OTHER
+
+
+def external_reply_decision_intent(value: Any) -> HumanDecisionIntent:
+    """Map current and legacy external-reply buttons to shared decision intent."""
+
+    choice = str(value or "").strip().lower()
+    if choice == "confirm":
+        return HumanDecisionIntent.APPROVE
+    if choice == "rejected":
+        return HumanDecisionIntent.DENY
+    if choice == "cancel":
+        return HumanDecisionIntent.CANCEL
+    return decision_intent_for_hitl(HitlType.AUTHORIZE.value, choice)
 
 
 def approval_notification_actions() -> list[dict[str, object]]:

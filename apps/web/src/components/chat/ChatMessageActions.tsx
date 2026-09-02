@@ -3,12 +3,18 @@ import { t } from "../../lib/i18n";
 import type { ChatMessage } from "../../lib/chatStream";
 import { IconCheck, IconCopy, IconRefresh, IconThumbDown, IconThumbUp } from "../icons";
 import ChatActionButton from "./ChatActionButton";
+import { ReadAloudButton } from "./ChatVoiceControls";
+import type { ChatVoiceScope } from "../../lib/chatVoice";
+
+export { chatMessageActionText } from "../../lib/chat-message-action-text.mjs";
 
 export type ChatMessageFeedbackRating = "up" | "down";
 
 interface ChatMessageActionsProps {
   align?: "left" | "right";
   copyText?: string;
+  speechText?: string;
+  voiceScope?: ChatVoiceScope;
   copyLabel?: string;
   canRetry?: boolean;
   retryLabel?: string;
@@ -21,6 +27,8 @@ interface ChatMessageActionsProps {
 export default function ChatMessageActions({
   align = "left",
   copyText,
+  speechText,
+  voiceScope,
   copyLabel,
   canRetry = false,
   retryLabel,
@@ -75,10 +83,12 @@ export default function ChatMessageActions({
           )}
         </ChatActionButton>
       )}
+      {speechText?.trim() && <ReadAloudButton text={speechText} scope={voiceScope} disabled={disabled} />}
       {canFeedback && (
         <>
           <ChatActionButton
             active={feedbackValue === "up"}
+            aria-pressed={feedbackValue === "up"}
             disabled={disabled}
             onClick={() => void onFeedback?.("up")}
             title={t("component.chat_message_actions.thumbs_up")}
@@ -88,6 +98,7 @@ export default function ChatMessageActions({
           </ChatActionButton>
           <ChatActionButton
             active={feedbackValue === "down"}
+            aria-pressed={feedbackValue === "down"}
             disabled={disabled}
             onClick={() => void onFeedback?.("down")}
             title={t("component.chat_message_actions.thumbs_down")}

@@ -1,0 +1,33 @@
+{
+  "id": "finance-ledger",
+  "name": "finance-ledger",
+  "display_name": "Finance Ledger",
+  "type": "runtime_guidance",
+  "execution_mode": "instructions_only",
+  "description": "Use the active Workspace Finance Ledger as the durable source for validated financial entries, corrections, evidence, and reporting.",
+  "category": "workspace-ledger",
+  "output_format": "guidance",
+  "tags": [
+    "finance-ledger",
+    "finance",
+    "accounting",
+    "workspace-ledger",
+    "runtime-guidance",
+    "builtin"
+  ],
+  "tools": [
+    "read_finance_ledger",
+    "record_finance_ledger",
+    "query_ledger",
+    "visualize_workspace_ledgers"
+  ],
+  "ledger_contracts": [
+    "manor.finance_ledger/v1"
+  ],
+  "capability_companion": {
+    "tool_names": [
+      "read_finance_ledger",
+      "record_finance_ledger"
+    ]
+  }
+}

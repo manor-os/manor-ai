@@ -7,7 +7,11 @@ from datetime import datetime
 from sqlalchemy import and_, desc, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from packages.core.constants.conversation import HIDDEN_CONVERSATION_SURFACES
 from packages.core.models.task import Conversation, Message
+from packages.core.services.conversation_surfaces import (
+    ConversationSurfaceMetadataFactory,
+)
 
 CHANNEL_HISTORY_CHANNELS: set[str] = {
     "discord",
@@ -104,12 +108,15 @@ async def list_conversations(
         select(Conversation)
         .outerjoin(last_msg, Conversation.id == last_msg.c.conversation_id)
         .where(Conversation.entity_id == entity_id)
-        # Dashboard module conversations are an implementation detail of a
-        # generated module; they surface only through the module's own chat,
-        # never in the user's conversation history.
+        # Host-owned surface conversations appear only inside their editor or
+        # module, never in ordinary Chat history or auto-resume.
         .where(
-            func.coalesce(Conversation.meta["surface"].astext, "")
-            != "dashboard_module"
+            func.coalesce(
+                Conversation.meta[
+                    ConversationSurfaceMetadataFactory.META_KEY
+                ].astext,
+                "",
+            ).notin_([surface.value for surface in HIDDEN_CONVERSATION_SURFACES])
         )
     )
     if user_id:

@@ -16,15 +16,16 @@ from packages.core.constants.execution import (
 )
 from packages.core.constants.pending_actions import PendingActionKind
 from packages.core.database import get_db
+from packages.core.models.task import Task
 from packages.core.models.user import User
 from packages.core.constants.task_actors import TaskActor
-from packages.core.constants.task import TaskLogType, TaskStatus, TASK_STATUSES, TASK_PRIORITIES, TASK_CATEGORIES, TASK_TYPES
+from packages.core.constants.task import TaskLogType, TaskStatus, TaskType, TASK_STATUSES, TASK_PRIORITIES, TASK_CATEGORIES, TASK_TYPES
 from packages.core.constants.task_notifications import (
     task_notification_channels,
     task_notification_events,
 )
 from packages.core.services.task_service import (
-    list_tasks, get_task, create_task, update_task,
+    list_tasks, get_task, create_task, update_task, ensure_workspace_agent_assignment,
     add_task_log, get_task_logs,
     list_categories, create_category, update_category, delete_category,
     get_tasks_by_status, move_task,
@@ -42,11 +43,22 @@ from packages.core.services.task_state_machine import (
 from packages.core.services.settings_service import update_user_preferences
 from apps.api.deps import (
     get_current_user,
+    require_workspace_authority,
     require_workspace_readable,
     require_workspace_writable,
 )
 
 logger = logging.getLogger(__name__)
+
+_TASK_RUNTIME_DETAIL_KEYS = frozenset({
+    "_pending_plan_dispatch",
+    "_replan_context",
+    "customer_context",
+    "proposal_external_authorization",
+    "runtime_context",
+    "workspace_operation_draft_id",
+    "workspace_work_batch_id",
+})
 
 router = APIRouter(prefix="/api/v1/tasks", tags=["tasks"])
 
@@ -154,6 +166,14 @@ def _merge_task_details(existing: dict | None, incoming: dict | None) -> dict:
     return merged
 
 
+def _without_task_runtime_details(details: dict | None) -> dict:
+    return {
+        key: value
+        for key, value in dict(details or {}).items()
+        if key not in _TASK_RUNTIME_DETAIL_KEYS
+    }
+
+
 async def _enqueue_learning_candidate_applies(
     db: AsyncSession,
     *,
@@ -201,6 +221,13 @@ class TaskResponse(BaseModel):
     agent_type: str | None = None
     owner_service_key: str | None = None
     owner_subscription_id: str | None = None
+    session_host_agent_id: str | None = None
+    session_host_subscription_id: str | None = None
+    session_host_name: str | None = None
+    session_host_avatar: str | None = None
+    session_host_role_label: str | None = None
+    session_host_available: bool | None = None
+    session_host_error: str | None = None
     creator_id: str | None = None
     conversation_id: str | None = None
     parent_task_id: str | None = None
@@ -220,6 +247,9 @@ class TaskResponse(BaseModel):
     started_at: str | None = None
     completed_at: str | None = None
     created_at: str | None = None
+    updated_at: str | None = None
+    status_changed_at: str | None = None
+    execution_active: bool = False
     # Resolved display fields (populated by backend, not stored in DB)
     assignee_name: str | None = None
     assignee_avatar: str | None = None
@@ -227,6 +257,9 @@ class TaskResponse(BaseModel):
     agent_avatar: str | None = None
     creator_name: str | None = None
     creator_avatar: str | None = None
+    author_agent_id: str | None = None
+    author_agent_name: str | None = None
+    author_agent_avatar: str | None = None
 
 
 class TaskCreateRequest(BaseModel):
@@ -239,6 +272,8 @@ class TaskCreateRequest(BaseModel):
     assignee_id: str | None = None
     agent_id: str | None = None
     agent_type: str | None = None
+    owner_service_key: str | None = None
+    owner_subscription_id: str | None = None
     details: dict = {}
     deadline: str | None = None
     scheduled_at: str | None = None
@@ -253,6 +288,8 @@ class TaskUpdateRequest(BaseModel):
     assignee_id: str | None = None
     agent_id: str | None = None
     agent_type: str | None = None
+    owner_service_key: str | None = None
+    owner_subscription_id: str | None = None
     category_id: str | None = None
     sla_policy_id: str | None = None
     details: dict | None = None
@@ -349,6 +386,7 @@ class RetryTaskResponse(BaseModel):
 
 
 class HITLResponseRequest(BaseModel):
+    step_id: str | None = None
     response: str | None = None
     choice: str | None = None
     fields: dict = {}
@@ -432,27 +470,54 @@ def _to_checklist_response(item) -> ChecklistItemResponse:
     )
 
 
-async def _resolve_lookups(db: AsyncSession, tasks) -> tuple[dict, dict, dict, dict]:
+async def _resolve_lookups(
+    db: AsyncSession,
+    tasks,
+) -> tuple[
+    dict,
+    dict,
+    dict,
+    dict,
+    dict[str, str | None],
+    dict[str, str | None],
+]:
     """Batch-load scoped user, staff, agent, and workspace display info for tasks."""
     from packages.core.models.staff import Staff
-    from packages.core.models.user import User
-    from packages.core.models.workspace import Agent, Workspace
+    from packages.core.models.user import User, UserMembership
+    from packages.core.models.workspace import Agent, AgentSubscription, Workspace
 
     from packages.core.constants.agents import MANOR_AGENT_IDS
 
     entity_ids = {t.entity_id for t in tasks if getattr(t, "entity_id", None)}
     workspace_ids = {t.workspace_id for t in tasks if getattr(t, "workspace_id", None)}
     assignee_ids = {t.assignee_id for t in tasks if t.assignee_id}
-    creator_ids = {t.creator_id for t in tasks if t.creator_id}
+    from packages.core.services.task_requester_identity import resolve_task_requesters
+
+    requester_resolutions = await resolve_task_requesters(db, tasks)
+    requester_ids = {
+        task_id: resolution.user_id
+        for task_id, resolution in requester_resolutions.items()
+    }
+    author_agent_ids = {
+        task_id: resolution.author_agent_id
+        for task_id, resolution in requester_resolutions.items()
+    }
+    creator_ids = {user_id for user_id in requester_ids.values() if user_id}
     actor_ids = assignee_ids | creator_ids
     user_ids = set(actor_ids)
     # Filter out manor-master — it's not a real DB agent.
     explicit_agent_ids = {t.agent_id for t in tasks if t.agent_id and t.agent_id not in MANOR_AGENT_IDS}
+    owner_subscription_ids = {
+        t.owner_subscription_id
+        for t in tasks
+        if getattr(t, "owner_subscription_id", None)
+    }
 
     users: dict = {}
     agents: dict = {}
     staff: dict = {}
     workspaces: dict = {}
+    subscription_hosts: dict[str, dict] = {}
 
     try:
         if workspace_ids and entity_ids:
@@ -468,11 +533,20 @@ async def _resolve_lookups(db: AsyncSession, tasks) -> tuple[dict, dict, dict, d
 
         if user_ids and entity_ids:
             result = await db.execute(
-                select(User).where(
-                    User.id.in_(user_ids),
-                    User.entity_id.in_(entity_ids),
-                    User.deleted_at.is_(None),
+                select(User)
+                .outerjoin(
+                    UserMembership,
+                    UserMembership.user_id == User.id,
                 )
+                .where(
+                    User.id.in_(user_ids),
+                    User.deleted_at.is_(None),
+                    or_(
+                        User.entity_id.in_(entity_ids),
+                        UserMembership.entity_id.in_(entity_ids),
+                    ),
+                )
+                .distinct()
             )
             for u in result.scalars():
                 users[u.id] = {"name": u.display_name or u.email, "avatar_url": getattr(u, "avatar_url", None)}
@@ -510,10 +584,34 @@ async def _resolve_lookups(db: AsyncSession, tasks) -> tuple[dict, dict, dict, d
                     row = {"name": u.display_name or u.email, "avatar_url": getattr(u, "avatar_url", None)}
                     users.setdefault(u.entity_id, row)
 
+        if owner_subscription_ids and entity_ids:
+            result = await db.execute(
+                select(AgentSubscription).where(
+                    AgentSubscription.id.in_(owner_subscription_ids),
+                    AgentSubscription.entity_id.in_(entity_ids),
+                    AgentSubscription.status == "active",
+                )
+            )
+            for subscription in result.scalars():
+                subscription_hosts[subscription.id] = {
+                    "agent_id": subscription.agent_id,
+                    "workspace_id": subscription.workspace_id,
+                    "role_label": subscription.name or subscription.service_key,
+                }
+
         # Normal agent assignment uses Task.agent_id. Be permissive for older
         # rows that stored an agent id in assignee_id, while still scoping
         # display resolution to this entity or public template agents.
-        possible_agent_ids = (explicit_agent_ids | actor_ids) - MANOR_AGENT_IDS
+        possible_agent_ids = (
+            explicit_agent_ids
+            | actor_ids
+            | {
+                host["agent_id"]
+                for host in subscription_hosts.values()
+                if host.get("agent_id")
+            }
+            | {agent_id for agent_id in author_agent_ids.values() if agent_id}
+        ) - MANOR_AGENT_IDS
         if possible_agent_ids and entity_ids:
             result = await db.execute(
                 select(Agent).where(
@@ -526,11 +624,49 @@ async def _resolve_lookups(db: AsyncSession, tasks) -> tuple[dict, dict, dict, d
                 )
             )
             for a in result.scalars():
-                agents[a.id] = {"name": a.name, "avatar_url": getattr(a, "avatar_url", None)}
+                agents[a.id] = {
+                    "name": a.name,
+                    "avatar_url": getattr(a, "avatar_url", None),
+                    "available": a.status == "active",
+                }
+            for subscription_id, subscription in subscription_hosts.items():
+                agent = agents.get(subscription["agent_id"])
+                if agent:
+                    agents[subscription_id] = {
+                        **agent,
+                        "agent_id": subscription["agent_id"],
+                        "workspace_id": subscription["workspace_id"],
+                        "role_label": subscription["role_label"],
+                    }
     except Exception as e:
         logger.warning("Failed to resolve task lookups: %s", e)
 
-    return users, agents, staff, workspaces
+    return users, agents, staff, workspaces, requester_ids, author_agent_ids
+
+
+async def _active_execution_task_ids(db: AsyncSession, tasks) -> set[str]:
+    """Return Task IDs with a running materialized execution step.
+
+    A business Task in ``in_progress`` can be manually moved there before a
+    plan exists. The board's live indicator must represent executor state,
+    rather than that broad business status.
+    """
+    task_ids = {task.id for task in tasks if getattr(task, "id", None)}
+    if not task_ids:
+        return set()
+    from packages.core.models.execution import ExecutionPlan, ExecutionStep
+
+    rows = await db.execute(
+        select(ExecutionPlan.task_id)
+        .join(ExecutionStep, ExecutionStep.plan_id == ExecutionPlan.id)
+        .where(
+            ExecutionPlan.task_id.in_(task_ids),
+            ExecutionPlan.status == ExecutionPlanStatus.RUNNING.value,
+            ExecutionStep.step_status == ExecutionStepStatus.RUNNING.value,
+        )
+        .distinct()
+    )
+    return {task_id for task_id in rows.scalars() if task_id}
 
 
 def _to_response(
@@ -539,6 +675,10 @@ def _to_response(
     agents: dict | None = None,
     staff: dict | None = None,
     workspaces: dict | None = None,
+    requester_ids: dict[str, str | None] | None = None,
+    author_agent_ids: dict[str, str | None] | None = None,
+    *,
+    execution_active: bool = False,
 ) -> TaskResponse:
     """Convert a Task ORM object to TaskResponse with resolved display names.
 
@@ -546,7 +686,11 @@ def _to_response(
         users: optional {user_id: {name, avatar_url}} lookup
         agents: optional {agent_id: {name, avatar_url}} lookup
     """
-    from packages.core.constants.agents import MANOR_AGENT_NAME, is_master_agent
+    from packages.core.constants.agents import (
+        MANOR_AGENT_ID,
+        MANOR_AGENT_NAME,
+        is_master_agent,
+    )
 
     assignee_name = None
     assignee_avatar = None
@@ -554,7 +698,26 @@ def _to_response(
     agent_avatar = None
     creator_name = None
     creator_avatar = None
+    author_agent_name = None
+    author_agent_avatar = None
+    session_host_agent_id = None
+    session_host_subscription_id = None
+    session_host_name = None
+    session_host_avatar = None
+    session_host_role_label = None
+    session_host_available = None
+    session_host_error = None
     workspace_name = None
+    creator_id = (
+        requester_ids.get(t.id, t.creator_id)
+        if requester_ids is not None
+        else t.creator_id
+    )
+    author_agent_id = (
+        author_agent_ids.get(t.id)
+        if author_agent_ids is not None
+        else None
+    )
 
     if t.workspace_id and workspaces:
         ws = workspaces.get(t.workspace_id)
@@ -579,23 +742,24 @@ def _to_response(
             assignee_name = a.get("name")
             assignee_avatar = a.get("avatar_url")
 
-    if t.creator_id and is_master_agent(t.creator_id):
-        creator_name = MANOR_AGENT_NAME
-    if t.creator_id and not creator_name and users:
-        cu = users.get(t.creator_id)
+    if creator_id and users:
+        cu = users.get(creator_id)
         if cu:
             creator_name = cu.get("name")
             creator_avatar = cu.get("avatar_url")
-    if t.creator_id and not creator_name and staff:
-        cs = staff.get(t.creator_id)
+    if creator_id and not creator_name and staff:
+        cs = staff.get(creator_id)
         if cs:
             creator_name = cs.get("name")
             creator_avatar = cs.get("avatar_url")
-    if t.creator_id and not creator_name and agents:
-        ca = agents.get(t.creator_id)
-        if ca:
-            creator_name = ca.get("name")
-            creator_avatar = ca.get("avatar_url")
+
+    if is_master_agent(author_agent_id):
+        author_agent_name = MANOR_AGENT_NAME
+    elif author_agent_id and agents:
+        author = agents.get(author_agent_id)
+        if author:
+            author_agent_name = author.get("name")
+            author_agent_avatar = author.get("avatar_url")
 
     if is_master_agent(t.agent_id, t.agent_type):
         agent_name = MANOR_AGENT_NAME
@@ -604,6 +768,41 @@ def _to_response(
         if a:
             agent_name = a.get("name")
             agent_avatar = a.get("avatar_url")
+
+    if t.task_type == TaskType.INTERACTIVE.value:
+        session_host_available = False
+        owner_subscription_id = getattr(t, "owner_subscription_id", None)
+        owner_service_key = getattr(t, "owner_service_key", None)
+        if (
+            is_master_agent(t.agent_id, t.agent_type)
+            and not owner_subscription_id
+            and not owner_service_key
+        ):
+            session_host_agent_id = MANOR_AGENT_ID
+            session_host_name = MANOR_AGENT_NAME
+            session_host_available = True
+        elif owner_subscription_id and agents:
+            host = agents.get(owner_subscription_id)
+            if (
+                host
+                and host.get("workspace_id") == t.workspace_id
+                and host.get("available")
+                and (not t.agent_id or host.get("agent_id") == t.agent_id)
+            ):
+                session_host_agent_id = host.get("agent_id")
+                session_host_subscription_id = owner_subscription_id
+                session_host_name = host.get("name")
+                session_host_avatar = host.get("avatar_url")
+                session_host_role_label = host.get("role_label")
+                session_host_available = True
+        if not session_host_available:
+            session_host_error = "host_unavailable"
+
+    # Avoid triggering async lazy loading from synchronous serialization.
+    # ``update_task`` explicitly stamps non-status edits, while list/get
+    # queries load the persisted values normally.
+    updated_at = getattr(t, "__dict__", {}).get("updated_at")
+    status_changed_at = getattr(t, "__dict__", {}).get("status_changed_at")
 
     return TaskResponse(
         id=t.id, entity_id=t.entity_id, title=t.title,
@@ -614,7 +813,14 @@ def _to_response(
         agent_id=t.agent_id, agent_type=t.agent_type,
         owner_service_key=getattr(t, "owner_service_key", None),
         owner_subscription_id=getattr(t, "owner_subscription_id", None),
-        creator_id=t.creator_id,
+        session_host_agent_id=session_host_agent_id,
+        session_host_subscription_id=session_host_subscription_id,
+        session_host_name=session_host_name,
+        session_host_avatar=session_host_avatar,
+        session_host_role_label=session_host_role_label,
+        session_host_available=session_host_available,
+        session_host_error=session_host_error,
+        creator_id=creator_id,
         conversation_id=t.conversation_id,
         parent_task_id=getattr(t, "parent_task_id", None),
         required_skills=list(getattr(t, "required_skills", []) or []),
@@ -633,9 +839,17 @@ def _to_response(
         started_at=t.started_at.isoformat() if t.started_at else None,
         completed_at=t.completed_at.isoformat() if t.completed_at else None,
         created_at=t.created_at.isoformat() if t.created_at else None,
+        updated_at=updated_at.isoformat() if updated_at else None,
+        status_changed_at=(
+            status_changed_at.isoformat() if status_changed_at else None
+        ),
+        execution_active=execution_active,
         assignee_name=assignee_name, assignee_avatar=assignee_avatar,
         agent_name=agent_name, agent_avatar=agent_avatar,
         creator_name=creator_name, creator_avatar=creator_avatar,
+        author_agent_id=author_agent_id,
+        author_agent_name=author_agent_name,
+        author_agent_avatar=author_agent_avatar,
     )
 
 
@@ -803,6 +1017,7 @@ async def list_my_tasks(
     workspace_id_alias: str | None = Query(None, alias="workspaceId"),
     category_id: str | None = Query(None),
     parent_task_id: str | None = Query(None, description="Filter to direct children of this task — used by the Subtasks panel on TaskDetail"),
+    attention: bool = Query(False, description="Return only tasks whose current status needs user attention, ordered by the latest status transition"),
     limit: int = Query(50, ge=1, le=200),
     offset: int = Query(0, ge=0),
     user: User = Depends(get_current_user),
@@ -819,11 +1034,30 @@ async def list_my_tasks(
         status=status, workspace_id=effective_workspace_id,
         category_id=category_id,
         parent_task_id=parent_task_id,
+        attention_only=attention,
         limit=limit, offset=offset,
         readable_workspace_ids=readable_ws,
     )
-    users, agents, staff, workspaces = await _resolve_lookups(db, tasks)
-    return TaskListResponse(items=[_to_response(t, users, agents, staff, workspaces) for t in tasks], total=total)
+    users, agents, staff, workspaces, requester_ids, author_agent_ids = (
+        await _resolve_lookups(db, tasks)
+    )
+    active_execution_ids = await _active_execution_task_ids(db, tasks)
+    return TaskListResponse(
+        items=[
+            _to_response(
+                t,
+                users,
+                agents,
+                staff,
+                workspaces,
+                requester_ids,
+                author_agent_ids,
+                execution_active=t.id in active_execution_ids,
+            )
+            for t in tasks
+        ],
+        total=total,
+    )
 
 
 @router.post("", response_model=TaskResponse, status_code=201)
@@ -833,20 +1067,51 @@ async def create_new_task(
     db: AsyncSession = Depends(get_db),
 ):
     await require_workspace_writable(db, user, req.workspace_id)
-    task = await create_task(
-        db, user.entity_id,
-        title=req.title, description=req.description,
-        priority=req.priority, task_type=req.task_type,
-        workspace_id=req.workspace_id, category_id=req.category_id,
-        assignee_id=req.assignee_id, agent_id=req.agent_id,
-        agent_type=req.agent_type, creator_id=user.id,
-        details=req.details, deadline=req.deadline,
-        scheduled_at=req.scheduled_at, duration_minutes=req.duration_minutes,
-    )
+    if req.task_type == TaskType.INTERACTIVE.value:
+        from packages.core.constants.agents import is_master_agent
+
+        if not req.workspace_id:
+            raise HTTPException(422, "Interactive Tasks must belong to a Workspace")
+        if not (
+            req.agent_id
+            or req.owner_service_key
+            or req.owner_subscription_id
+            or is_master_agent(req.agent_id, req.agent_type)
+        ):
+            raise HTTPException(422, "Interactive Tasks require a Host Agent")
+    try:
+        await ensure_workspace_agent_assignment(
+            db,
+            entity_id=user.entity_id,
+            workspace_id=req.workspace_id,
+            agent_id=req.agent_id,
+        )
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    from packages.core.services.task_session import TaskSessionHostError
+
+    try:
+        task = await create_task(
+            db, user.entity_id,
+            title=req.title, description=req.description,
+            priority=req.priority, task_type=req.task_type,
+            workspace_id=req.workspace_id, category_id=req.category_id,
+            assignee_id=req.assignee_id, agent_id=req.agent_id,
+            agent_type=req.agent_type, creator_id=user.id,
+            owner_service_key=req.owner_service_key,
+            owner_subscription_id=req.owner_subscription_id,
+            details=_without_task_runtime_details(req.details), deadline=req.deadline,
+            scheduled_at=req.scheduled_at, duration_minutes=req.duration_minutes,
+        )
+    except TaskSessionHostError as exc:
+        raise HTTPException(409, str(exc)) from exc
 
     # If assigned to an AI agent (or manor master), dispatch Celery task
     from packages.core.constants.agents import is_master_agent, MANOR_AGENT_ID
-    if req.agent_id or is_master_agent(req.agent_id, req.agent_type):
+    if (
+        req.task_type != TaskType.INTERACTIVE.value
+        and (req.agent_id or is_master_agent(req.agent_id, req.agent_type))
+    ):
         try:
             from packages.core.tasks.ai_tasks import run_agent_task
             dispatch_id = req.agent_id or MANOR_AGENT_ID
@@ -855,8 +1120,12 @@ async def create_new_task(
         except Exception as e:
             logger.warning("Failed to dispatch agent task: %s", e)
 
-    users, agents, staff, workspaces = await _resolve_lookups(db, [task])
-    return _to_response(task, users, agents, staff, workspaces)
+    users, agents, staff, workspaces, requester_ids, author_agent_ids = (
+        await _resolve_lookups(db, [task])
+    )
+    return _to_response(
+        task, users, agents, staff, workspaces, requester_ids, author_agent_ids,
+    )
 
 
 @router.post("/from-template", response_model=TaskResponse, status_code=201)
@@ -868,6 +1137,15 @@ async def create_from_template(
     """Create a new task pre-filled from a task template."""
     overrides = req.model_dump(exclude={"template_id"}, exclude_none=True)
     await require_workspace_writable(db, user, overrides.get("workspace_id"))
+    try:
+        await ensure_workspace_agent_assignment(
+            db,
+            entity_id=user.entity_id,
+            workspace_id=overrides.get("workspace_id"),
+            agent_id=overrides.get("agent_id"),
+        )
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
     from packages.core.services.template_service import instantiate_template
     try:
         task = await instantiate_template(
@@ -876,8 +1154,12 @@ async def create_from_template(
         )
     except ValueError as exc:
         raise HTTPException(404, str(exc))
-    users, agents, staff, workspaces = await _resolve_lookups(db, [task])
-    return _to_response(task, users, agents, staff, workspaces)
+    users, agents, staff, workspaces, requester_ids, author_agent_ids = (
+        await _resolve_lookups(db, [task])
+    )
+    return _to_response(
+        task, users, agents, staff, workspaces, requester_ids, author_agent_ids,
+    )
 
 
 def _normalize_task_board_columns(
@@ -972,8 +1254,26 @@ async def task_board(
     )
     counts = board.pop("_counts", {})
     all_tasks = [t for tasks in board.values() for t in tasks]
-    users, agents, staff, workspaces = await _resolve_lookups(db, all_tasks)
-    result = {status: [_to_response(t, users, agents, staff, workspaces) for t in tasks] for status, tasks in board.items()}
+    users, agents, staff, workspaces, requester_ids, author_agent_ids = (
+        await _resolve_lookups(db, all_tasks)
+    )
+    active_execution_ids = await _active_execution_task_ids(db, all_tasks)
+    result = {
+        status: [
+            _to_response(
+                t,
+                users,
+                agents,
+                staff,
+                workspaces,
+                requester_ids,
+                author_agent_ids,
+                execution_active=t.id in active_execution_ids,
+            )
+            for t in tasks
+        ]
+        for status, tasks in board.items()
+    }
     result["_counts"] = counts
     return result
 
@@ -996,8 +1296,12 @@ async def move_task_endpoint(
         raise HTTPException(409, str(exc)) from exc
     if not task:
         raise HTTPException(404, "Task not found")
-    users, agents, staff, workspaces = await _resolve_lookups(db, [task])
-    return _to_response(task, users, agents, staff, workspaces)
+    users, agents, staff, workspaces, requester_ids, author_agent_ids = (
+        await _resolve_lookups(db, [task])
+    )
+    return _to_response(
+        task, users, agents, staff, workspaces, requester_ids, author_agent_ids,
+    )
 
 
 @router.post("/{task_id}/retry", response_model=RetryTaskResponse)
@@ -1019,6 +1323,7 @@ async def retry_task_endpoint(
     from packages.core.services.task_retry_service import (
         TaskRetryError,
         dispatch_task_retry,
+        mark_task_retry_dispatch_failed,
         prepare_task_retry,
     )
 
@@ -1032,6 +1337,7 @@ async def retry_task_endpoint(
         )
     except TaskRetryError as exc:
         raise HTTPException(exc.status_code, exc.detail) from exc
+    task = retry_result.task
 
     from packages.core.services.task_chat_hitl import resolve_task_hitl
 
@@ -1056,10 +1362,45 @@ async def retry_task_endpoint(
             retry_result.mode,
             exc,
         )
+        try:
+            await mark_task_retry_dispatch_failed(
+                db,
+                result=retry_result,
+                error=exc,
+            )
+            await db.commit()
+            await db.refresh(task)
+        except Exception:
+            await db.rollback()
+            logger.error(
+                "Could not persist Task retry dispatch failure: task=%s",
+                task.id,
+                exc_info=True,
+            )
 
-    users, agents, staff, workspaces = await _resolve_lookups(db, [task])
+    from packages.core.services.realtime import broadcast_task_runtime_update
+
+    await broadcast_task_runtime_update(
+        task.entity_id,
+        task_id=task.id,
+        workspace_id=task.workspace_id,
+        plan_id=retry_result.plan_id,
+        event="task_retry_resolved",
+    )
+
+    users, agents, staff, workspaces, requester_ids, author_agent_ids = (
+        await _resolve_lookups(db, [task])
+    )
     return RetryTaskResponse(
-        task=_to_response(task, users, agents, staff, workspaces),
+        task=_to_response(
+            task,
+            users,
+            agents,
+            staff,
+            workspaces,
+            requester_ids,
+            author_agent_ids,
+        ),
         dispatched=dispatched,
         mode=retry_result.mode,
         plan_id=retry_result.plan_id,
@@ -1072,6 +1413,7 @@ async def _resume_hitl(
     task,
     user: User,
     *,
+    step_id: str | None,
     response_text: str,
     payload: dict,
 ) -> dict:
@@ -1088,119 +1430,268 @@ async def _resume_hitl(
         "submitted_at": now.isoformat(),
     }
 
-    # Plan-based HITL: resume the newest waiting_human step.
+    # Plan-based HITL: resume the exact input Step named by the client. An
+    # approval/review/error card is a different decision surface and must not
+    # be collapsed into this free-form input endpoint.
     try:
         from packages.core.models.execution import ExecutionPlan, ExecutionStep
         from packages.core.services.task_state_machine import apply_task_status_transition
 
-        plan = (await db.execute(
-            select(ExecutionPlan).where(
-                ExecutionPlan.task_id == task.id,
-                ExecutionPlan.entity_id == user.entity_id,
-                ExecutionPlan.status.in_((ExecutionPlanStatus.RUNNING, ExecutionPlanStatus.PAUSED, ExecutionPlanStatus.NEEDS_ATTENTION,)),
-            ).order_by(ExecutionPlan.created_at.desc()).limit(1)
-        )).scalar_one_or_none()
-        if plan:
+        live_plan_statuses = (
+            ExecutionPlanStatus.RUNNING,
+            ExecutionPlanStatus.PAUSED,
+            ExecutionPlanStatus.NEEDS_ATTENTION,
+        )
+        if step_id:
             waiting_step = (await db.execute(
                 select(ExecutionStep).where(
-                    ExecutionStep.plan_id == plan.id,
+                    ExecutionStep.id == step_id,
+                    ExecutionStep.entity_id == user.entity_id,
                     ExecutionStep.step_status == ExecutionStepStatus.WAITING_HUMAN,
-                ).order_by(ExecutionStep.created_at.desc()).limit(1)
-            )).scalar_one_or_none()
-            if waiting_step:
-                # If the step is paused on an approval, the operator's Resume
-                # IS the approval — grant the open unified request so the
-                # dispatcher gate lets the reparked step through instead of
-                # re-pausing it on the same request (#317 loop).
-                try:
-                    from packages.core.governance.approvals import (
-                        grant_open_request_for_step,
-                    )
-                    await grant_open_request_for_step(
-                        db,
-                        entity_id=user.entity_id,
-                        step_id=waiting_step.id,
-                        by_user_id=user.id,
-                        via="task_resume",
-                    )
-                except Exception:
-                    logger.warning(
-                        "task resume: approval grant failed for step %s",
-                        waiting_step.id, exc_info=True,
-                    )
-                waiting_step.human_input_response = {
-                    **meta,
-                    "user": submitted_by,
-                    "payload": payload,
-                }
-                # M9.2 — the human just delivered the awaited input: fulfil
-                # any open commitment rows for this step (best-effort).
-                try:
-                    from packages.core.humans import resolve_commitments_for_step
-                    await resolve_commitments_for_step(
-                        db, waiting_step.id,
-                        {"kind": "hitl_response"},
-                    )
-                except Exception:
-                    logger.warning(
-                        "human commitment resolve failed for step %s (ignored)",
-                        waiting_step.id, exc_info=True,
-                    )
-                waiting_step.step_status = ExecutionStepStatus.PENDING.value
-                waiting_step.human_input_prompt = None
-                waiting_step.current_lease_id = None
-                plan.status = ExecutionPlanStatus.RUNNING.value
-                plan.completed_at = None
-                plan.last_error = None
-                if task.status == TaskStatus.WAITING_ON_CUSTOMER:
-                    await apply_task_status_transition(
-                        task, "in_progress", now=now, db=db,
-                        actor_kind="user", actor_id=user.id,
-                    )
-                await add_task_log(
-                    db,
-                    task.id,
-                    TaskLogType.AI_HITL_RESUMED,
-                    f"Human input received: {response_text[:300]}" if response_text else "Human input received.",
-                    actor=TaskActor.USER,
-                    created_by=submitted_by,
-                    metadata={
-                        **meta,
-                        "mode": "plan",
-                        "plan_id": plan.id,
-                        "step_id": waiting_step.id,
-                    },
                 )
-                await db.commit()
-                dispatched = False
-                try:
-                    from packages.core.tasks.ai_tasks import run_plan
-                    run_plan.delay(plan.id)
-                    dispatched = True
-                except Exception as exc:  # noqa: BLE001
-                    logger.warning("Plan HITL resume dispatch failed: plan=%s error=%s", plan.id, exc)
+            )).scalar_one_or_none()
+            if waiting_step is None:
                 return {
-                    "resumed": True,
-                    "dispatched": dispatched,
-                    "mode": "plan",
+                    "resumed": False,
+                    "dispatched": False,
+                    "mode": None,
+                    "plan_id": None,
+                    "step_id": step_id,
+                    "detail": "The requested input step is no longer waiting.",
+                }
+            plan = (await db.execute(
+                select(ExecutionPlan).where(
+                    ExecutionPlan.id == waiting_step.plan_id,
+                    ExecutionPlan.task_id == task.id,
+                    ExecutionPlan.entity_id == user.entity_id,
+                    ExecutionPlan.status.in_(live_plan_statuses),
+                )
+            )).scalar_one_or_none()
+            if plan is None:
+                return {
+                    "resumed": False,
+                    "dispatched": False,
+                    "mode": None,
+                    "plan_id": waiting_step.plan_id,
+                    "step_id": step_id,
+                    "detail": "The requested input step does not belong to an active Plan for this task.",
+                }
+        else:
+            waiting_step = None
+            plan = (await db.execute(
+                select(ExecutionPlan).where(
+                    ExecutionPlan.task_id == task.id,
+                    ExecutionPlan.entity_id == user.entity_id,
+                    ExecutionPlan.status.in_(live_plan_statuses),
+                ).order_by(ExecutionPlan.created_at.desc()).limit(1)
+            )).scalar_one_or_none()
+            if plan is not None:
+                return {
+                    "resumed": False,
+                    "dispatched": False,
+                    "mode": None,
+                    "plan_id": plan.id,
+                    "step_id": None,
+                    "detail": "step_id is required to answer a Plan input request.",
+                }
+
+        if plan is not None and waiting_step is not None:
+            from packages.core.constants.approvals import HitlType
+            from packages.core.services.hitl_options import human_step_hitl_type
+
+            step_hitl_type = human_step_hitl_type(waiting_step.params)
+            if step_hitl_type != HitlType.INPUT.value:
+                detail = (
+                    "This review requires an explicit approve, request-changes, "
+                    "or reject decision on its Workspace Chat card."
+                    if step_hitl_type == HitlType.REVIEW.value
+                    else (
+                        "This step requires an explicit Workspace Chat decision; "
+                        "respond to its card to continue."
+                    )
+                )
+                return {
+                    "resumed": False,
+                    "dispatched": False,
+                    "mode": None,
+                    "plan_id": plan.id,
+                    "step_id": waiting_step.id,
+                    "detail": detail,
+                }
+            try:
+                from packages.core.governance.approvals import (
+                    ApprovalDecisionRequiredError,
+                    grant_open_request_for_step,
+                )
+                from packages.core.services.step_resume import (
+                    lock_waiting_step_for_decision,
+                )
+                await grant_open_request_for_step(
+                    db,
+                    entity_id=user.entity_id,
+                    step_id=waiting_step.id,
+                    by_user_id=user.id,
+                    via="task_input",
+                    expected_hitl_type=HitlType.INPUT.value,
+                )
+                locked_step = await lock_waiting_step_for_decision(
+                    db,
+                    entity_id=user.entity_id,
+                    workspace_id=plan.workspace_id,
+                    task_id=task.id,
+                    plan_id=plan.id,
+                    step_id=waiting_step.id,
+                )
+            except ApprovalDecisionRequiredError as exc:
+                return {
+                    "resumed": False,
+                    "dispatched": False,
+                    "mode": None,
+                    "plan_id": plan.id,
+                    "step_id": waiting_step.id,
+                    "detail": str(exc),
+                }
+            except Exception:
+                logger.warning(
+                    "task input: request resolution failed for step %s",
+                    waiting_step.id, exc_info=True,
+                )
+                await db.rollback()
+                return {
+                    "resumed": False,
+                    "dispatched": False,
+                    "mode": None,
                     "plan_id": plan.id,
                     "step_id": waiting_step.id,
                 }
+            if locked_step is None:
+                return {
+                    "resumed": False,
+                    "dispatched": False,
+                    "mode": None,
+                    "plan_id": plan.id,
+                    "step_id": waiting_step.id,
+                }
+            waiting_step = locked_step
+            waiting_step.human_input_response = {
+                **meta,
+                "user": submitted_by,
+                "payload": payload,
+            }
+            # M9.2 — the human just delivered the awaited input: fulfil
+            # any open commitment rows for this step (best-effort).
+            try:
+                from packages.core.humans import resolve_commitments_for_step
+                await resolve_commitments_for_step(
+                    db, waiting_step.id,
+                    {"kind": "hitl_response"},
+                )
+            except Exception:
+                logger.warning(
+                    "human commitment resolve failed for step %s (ignored)",
+                    waiting_step.id, exc_info=True,
+                )
+            waiting_step.step_status = ExecutionStepStatus.PENDING.value
+            waiting_step.human_input_prompt = None
+            waiting_step.current_lease_id = None
+            plan.status = ExecutionPlanStatus.RUNNING.value
+            plan.completed_at = None
+            plan.last_error = None
+            if task.status == TaskStatus.WAITING_ON_CUSTOMER:
+                await apply_task_status_transition(
+                    task, "in_progress", now=now, db=db,
+                    actor_kind="user", actor_id=user.id,
+                )
+            await add_task_log(
+                db,
+                task.id,
+                TaskLogType.AI_HITL_RESUMED,
+                f"Human input received: {response_text[:300]}" if response_text else "Human input received.",
+                actor=TaskActor.USER,
+                created_by=submitted_by,
+                metadata={
+                    **meta,
+                    "mode": "plan",
+                    "plan_id": plan.id,
+                    "step_id": waiting_step.id,
+                },
+            )
+            await db.commit()
+            dispatched = False
+            try:
+                from packages.core.tasks.ai_tasks import run_plan
+                run_plan.delay(plan.id)
+                dispatched = True
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Plan HITL resume dispatch failed: plan=%s error=%s", plan.id, exc)
+                try:
+                    from packages.core.services.task_retry_service import (
+                        mark_plan_continuation_dispatch_failed,
+                    )
+
+                    await mark_plan_continuation_dispatch_failed(
+                        db,
+                        plan_id=plan.id,
+                        user_id=user.id,
+                        reason="task_hitl_dispatch_failed",
+                    )
+                    await db.commit()
+                    await db.refresh(task)
+                except Exception:
+                    await db.rollback()
+                    logger.error(
+                        "Could not persist Plan HITL dispatch failure: plan=%s",
+                        plan.id,
+                        exc_info=True,
+                    )
+            from packages.core.services.realtime import broadcast_task_runtime_update
+
+            await broadcast_task_runtime_update(
+                task.entity_id,
+                task_id=task.id,
+                workspace_id=task.workspace_id,
+                plan_id=plan.id,
+                event="task_hitl_resolved",
+            )
+            return {
+                "resumed": True,
+                "dispatched": dispatched,
+                "mode": "plan",
+                "plan_id": plan.id,
+                "step_id": waiting_step.id,
+            }
     except Exception as exc:
         logger.warning("Plan HITL structured response failed: %s", exc)
+        await db.rollback()
+        return {
+            "resumed": False,
+            "dispatched": False,
+            "mode": None,
+            "plan_id": None,
+            "step_id": step_id,
+            "detail": "The Plan input could not be applied safely.",
+        }
 
-    # Agent-run HITL: stash the structured response and re-dispatch.
-    #
-    # This used to require `task.agent_id or is_master_agent(...)`, which is
-    # false for a task with no assigned agent — is_master_agent returns False
-    # when both arguments are None, by design. Plan-driven tasks routinely
-    # have no agent_id (the agent is resolved per step), so replying to one
-    # returned resumed=False and left it in waiting_on_customer forever, even
-    # though the comment thread went on to run the work and finish it.
-    #
-    # Work does not run un-owned: with no assigned agent the master agent
-    # runs it. Resume on the status alone, and dispatch to whichever agent
-    # actually did the work.
+    # Legacy Agent-run HITL has no Plan/Step or Strategist owner. Fail closed
+    # for every Plan-owned task, including pending approval, draft, replanned,
+    # and planning-failure states that are intentionally outside live_plan_statuses.
+    has_plan_origin = (await db.execute(
+        select(ExecutionPlan.id).where(
+            ExecutionPlan.task_id == task.id,
+            ExecutionPlan.entity_id == task.entity_id,
+        ).limit(1)
+    )).scalar_one_or_none() is not None
+    if has_plan_origin or task.owner_subscription_id or task.owner_service_key:
+        return {
+            "resumed": False,
+            "dispatched": False,
+            "mode": None,
+            "plan_id": getattr(plan, "id", None),
+            "step_id": step_id,
+            "detail": "This Task is owned by Planner execution; resolve its Plan approval, input, or recovery action instead.",
+        }
+
+    # Only an origin-free legacy Agent task may resume through run_agent_task.
     from packages.core.constants.agents import MANOR_AGENT_ID
     from packages.core.services.task_service import task_executing_agent_id
 
@@ -1256,6 +1747,7 @@ async def respond_to_hitl(
     task = await get_task(db, task_id, user.entity_id)
     if not task:
         raise HTTPException(404, "Task not found")
+    await require_workspace_writable(db, user, task.workspace_id)
 
     response_text = (req.response or req.note or "").strip()
     fields = req.fields or {}
@@ -1268,9 +1760,19 @@ async def respond_to_hitl(
         "fields": fields,
         "note": req.note,
     }
-    result = await _resume_hitl(db, task, user, response_text=response_text, payload=payload)
+    result = await _resume_hitl(
+        db,
+        task,
+        user,
+        step_id=req.step_id,
+        response_text=response_text,
+        payload=payload,
+    )
     if not result["resumed"]:
-        raise HTTPException(409, "Task is not waiting for structured human input")
+        raise HTTPException(
+            409,
+            result.get("detail") or "Task is not waiting for structured human input",
+        )
 
     queued_learning_ids = await _record_task_user_decision_evidence(
         db,
@@ -1298,9 +1800,19 @@ async def respond_to_hitl(
     )
     await db.flush()
     await db.refresh(task)
-    users, agents, staff, workspaces = await _resolve_lookups(db, [task])
+    users, agents, staff, workspaces, requester_ids, author_agent_ids = (
+        await _resolve_lookups(db, [task])
+    )
     return HITLResponseResponse(
-        task=_to_response(task, users, agents, staff, workspaces),
+        task=_to_response(
+            task,
+            users,
+            agents,
+            staff,
+            workspaces,
+            requester_ids,
+            author_agent_ids,
+        ),
         **result,
     )
 
@@ -1316,6 +1828,12 @@ async def decide_approval_task(
     task = await get_task(db, task_id, user.entity_id)
     if not task:
         raise HTTPException(404, "Task not found")
+    await require_workspace_authority(
+        db,
+        user,
+        task.workspace_id,
+        "approve_tasks",
+    )
     actor = user.display_name or user.email
     from packages.core.services.task_approval_service import (
         TaskApprovalDecisionError,
@@ -1399,6 +1917,14 @@ async def decide_approval_task(
         metrics={"approved": 1 if approved else 0},
     )
     await db.commit()
+    from packages.core.services.realtime import broadcast_task_runtime_update
+
+    await broadcast_task_runtime_update(
+        updated.entity_id,
+        task_id=updated.id,
+        workspace_id=updated.workspace_id,
+        event="task_approval_resolved",
+    )
     await _enqueue_learning_candidate_applies(
         db,
         user=user,
@@ -1418,8 +1944,12 @@ async def decide_approval_task(
             log_id=log.id,
         )
 
-    users, agents, staff, workspaces = await _resolve_lookups(db, [updated])
-    return _to_response(updated, users, agents, staff, workspaces)
+    users, agents, staff, workspaces, requester_ids, author_agent_ids = (
+        await _resolve_lookups(db, [updated])
+    )
+    return _to_response(
+        updated, users, agents, staff, workspaces, requester_ids, author_agent_ids,
+    )
 
 
 @router.get("/{task_id}", response_model=TaskResponse)
@@ -1438,8 +1968,12 @@ async def get_one_task(
         await reconcile_task_from_latest_completed_plan(db, task)
     except Exception:
         logger.debug("Task execution reconciliation skipped for %s", task_id, exc_info=True)
-    users, agents, staff, workspaces = await _resolve_lookups(db, [task])
-    return _to_response(task, users, agents, staff, workspaces)
+    users, agents, staff, workspaces, requester_ids, author_agent_ids = (
+        await _resolve_lookups(db, [task])
+    )
+    return _to_response(
+        task, users, agents, staff, workspaces, requester_ids, author_agent_ids,
+    )
 
 
 @router.delete("/{task_id}", status_code=204)
@@ -1452,6 +1986,43 @@ async def delete_one_task(
     if not task:
         raise HTTPException(404, "Task not found")
     await require_workspace_writable(db, user, task.workspace_id)
+    authorized_workspace_id = task.workspace_id
+
+    if authorized_workspace_id:
+        from packages.core.services.chat_feedback import (
+            lock_completion_feedback_subject,
+        )
+
+        await lock_completion_feedback_subject(db, task_id=task_id)
+
+    # Serialize every Task deletion with thread creation. The interactive
+    # cleanup service takes the same lock again before reading Conversations;
+    # this route-level lock also covers ordinary Task threads.
+    task = (await db.execute(
+        select(Task).where(
+            Task.id == task_id,
+            Task.entity_id == user.entity_id,
+        ).with_for_update().execution_options(populate_existing=True)
+    )).scalar_one_or_none()
+    if not task:
+        raise HTTPException(404, "Task not found")
+    if task.workspace_id != authorized_workspace_id:
+        await require_workspace_writable(db, user, task.workspace_id)
+
+    from packages.core.services.task_session import delete_task_session_conversations
+
+    await delete_task_session_conversations(db, task)
+    if task.workspace_id:
+        from packages.core.services.chat_feedback import (
+            delete_task_completion_feedback,
+        )
+
+        await delete_task_completion_feedback(
+            db,
+            entity_id=user.entity_id,
+            workspace_id=task.workspace_id,
+            task_id=task.id,
+        )
     await db.delete(task)
     await db.flush()
 
@@ -1476,19 +2047,38 @@ async def update_one_task(
     old_agent_type = old_task.agent_type if old_task else None
     old_status = old_task.status if old_task else None
 
+    requested_agent_id = str(req.agent_id or "").strip()
+    if requested_agent_id:
+        try:
+            await ensure_workspace_agent_assignment(
+                db,
+                entity_id=user.entity_id,
+                workspace_id=old_task.workspace_id if old_task else None,
+                agent_id=requested_agent_id,
+            )
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
+
     # Build update payload — empty strings mean "clear this field"
     update_data = {}
     for key, val in req.model_dump(exclude_none=True).items():
         if key in ("scheduled_at", "duration_minutes"):
             continue  # handled below via details merge
-        if isinstance(val, str) and val == "" and key in ("assignee_id", "agent_id", "agent_type", "category_id"):
+        if isinstance(val, str) and val == "" and key in (
+            "assignee_id",
+            "agent_id",
+            "agent_type",
+            "category_id",
+            "owner_service_key",
+            "owner_subscription_id",
+        ):
             update_data[key] = None
         else:
             update_data[key] = val
     if "details" in update_data:
         update_data["details"] = _merge_task_details(
             old_task.details if old_task else None,
-            update_data.get("details"),
+            _without_task_runtime_details(update_data.get("details")),
         )
     # Merge scheduled_at/duration_minutes into details JSONB
     if req.scheduled_at is not None or req.duration_minutes is not None:
@@ -1501,13 +2091,14 @@ async def update_one_task(
         if req.duration_minutes is not None:
             existing_details["duration_minutes"] = req.duration_minutes or None
         update_data["details"] = existing_details
+    from packages.core.services.task_session import TaskSessionHostError
+
     try:
         task = await update_task(db, task_id, user.entity_id, user_id=user.id, **update_data)
-    except TaskStatusTransitionError as exc:
+    except (TaskStatusTransitionError, TaskSessionHostError) as exc:
         raise HTTPException(409, str(exc)) from exc
     if not task:
         raise HTTPException(404, "Task not found")
-
     # If agent assignment changed, dispatch Celery task
     from packages.core.constants.agents import is_master_agent as _is_master, MANOR_AGENT_ID as _MANOR_ID
     new_agent_id = update_data.get("agent_id")
@@ -1515,7 +2106,11 @@ async def update_one_task(
     was_master = _is_master(old_agent_id, old_agent_type)
     now_master = _is_master(new_agent_id, new_agent_type)
     is_new_agent = (new_agent_id and new_agent_id != old_agent_id) or (now_master and not was_master)
-    if is_new_agent and task.status not in (TaskStatus.COMPLETED, TaskStatus.CANCELLED, TaskStatus.FAILED,):
+    if (
+        task.task_type != TaskType.INTERACTIVE.value
+        and is_new_agent
+        and task.status not in (TaskStatus.COMPLETED, TaskStatus.CANCELLED, TaskStatus.FAILED,)
+    ):
         try:
             from packages.core.tasks.ai_tasks import run_agent_task
             dispatch_id = new_agent_id or _MANOR_ID
@@ -1526,7 +2121,8 @@ async def update_one_task(
 
     # HITL resumption: status changed from waiting back to actionable while agent is assigned
     new_status = update_data.get("status")
-    if (old_status == "waiting_on_customer" and new_status in ("pending", "in_progress")
+    if (task.task_type != TaskType.INTERACTIVE.value
+        and old_status == "waiting_on_customer" and new_status in ("pending", "in_progress")
         and (task.agent_id or _is_master(task.agent_id, task.agent_type))):
         try:
             from packages.core.tasks.ai_tasks import run_agent_task
@@ -1553,10 +2149,32 @@ async def update_one_task(
                 "changed_from": "task_detail",
             },
         )
+        if task.workspace_id:
+            from packages.core.services.workspace_service import record_activity
+
+            await record_activity(
+                db,
+                task.workspace_id,
+                user.entity_id,
+                event_type="task.status_changed",
+                summary=f"Task status changed for '{task.title}': {old_status} -> {new_status}",
+                details={
+                    "task_id": task.id,
+                    "old_status": old_status,
+                    "new_status": new_status,
+                },
+                user_id=user.id,
+                agent_id=task.agent_id,
+                dispatch_triggers=False,
+            )
         await db.flush()
 
-    users, agents, staff, workspaces = await _resolve_lookups(db, [task])
-    return _to_response(task, users, agents, staff, workspaces)
+    users, agents, staff, workspaces, requester_ids, author_agent_ids = (
+        await _resolve_lookups(db, [task])
+    )
+    return _to_response(
+        task, users, agents, staff, workspaces, requester_ids, author_agent_ids,
+    )
 
 
 @router.get("/{task_id}/history")

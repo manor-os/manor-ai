@@ -8,6 +8,7 @@ if the vector extension is unavailable.
 from __future__ import annotations
 
 import os
+from datetime import datetime, timezone
 from unittest.mock import AsyncMock, patch, MagicMock
 
 import pytest
@@ -17,6 +18,114 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 
 from packages.core.models.base import Base
 import packages.core.models  # noqa: F401
+
+
+@pytest.mark.asyncio
+async def test_index_document_defers_deleted_workspace_before_read_or_provider(
+    db_session,
+    monkeypatch,
+):
+    session, _has_vector = db_session
+
+    from packages.core.models.base import generate_ulid
+    from packages.core.models.document import Document, DocumentFolder, VectorStatus
+    from packages.core.models.workspace import Workspace
+    from packages.core.services import embedding_service
+
+    entity_id = generate_ulid()
+    root = DocumentFolder(
+        id=generate_ulid(),
+        entity_id=entity_id,
+        name="Deleted Workspace",
+    )
+    workspace = Workspace(
+        id=generate_ulid(),
+        entity_id=entity_id,
+        name="Deleted Workspace",
+        artifact_folder_id=root.id,
+        deleted_at=datetime.now(timezone.utc),
+    )
+    document = Document(
+        id=generate_ulid(),
+        entity_id=entity_id,
+        name="must-not-index.md",
+        folder_id=root.id,
+        file_type="md",
+        mime_type="text/markdown",
+        vector_status=VectorStatus.PENDING,
+        metadata_={"content_text": "private deleted Workspace content"},
+    )
+    session.add_all([root, workspace, document])
+    await session.commit()
+    read_content = AsyncMock(side_effect=AssertionError("deleted Workspace content was read"))
+    monkeypatch.setattr(embedding_service, "_read_document_content", read_content)
+    monkeypatch.setattr(
+        embedding_service,
+        "generate_embeddings_batch",
+        AsyncMock(side_effect=AssertionError("embedding provider was called")),
+    )
+
+    assert await embedding_service.index_document(session, document.id) is True
+    await session.refresh(document)
+    assert document.vector_status == VectorStatus.PENDING
+    assert document.metadata_["indexing"]["blocked_reason"] == "workspace_deleted"
+    read_content.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_index_document_releases_workspace_lock_before_file_and_provider_io(
+    db_session,
+    monkeypatch,
+):
+    session, _has_vector = db_session
+
+    from packages.core.models.base import generate_ulid
+    from packages.core.models.document import Document, DocumentFolder, VectorStatus
+    from packages.core.models.workspace import Workspace
+    from packages.core.services import embedding_service
+
+    entity_id = generate_ulid()
+    root = DocumentFolder(id=generate_ulid(), entity_id=entity_id, name="Active Workspace")
+    workspace = Workspace(
+        id=generate_ulid(),
+        entity_id=entity_id,
+        name="Active Workspace",
+        artifact_folder_id=root.id,
+    )
+    document = Document(
+        id=generate_ulid(),
+        entity_id=entity_id,
+        name="short-transactions.md",
+        folder_id=root.id,
+        file_type="md",
+        mime_type="text/markdown",
+        vector_status=VectorStatus.PENDING,
+    )
+    session.add_all([root, workspace, document])
+    await session.commit()
+
+    async def fake_read(_document):
+        assert session.in_transaction() is False
+        return "A document that should reach the embedding provider."
+
+    async def fake_generate(_chunks, **_kwargs):
+        assert session.in_transaction() is False
+        raise RuntimeError("stop after checking provider transaction scope")
+
+    monkeypatch.setattr(embedding_service, "_read_document_content", fake_read)
+    monkeypatch.setattr(embedding_service, "generate_embeddings_batch", fake_generate)
+    monkeypatch.setattr(
+        embedding_service,
+        "_resolve_embedding_config",
+        AsyncMock(return_value={
+            "api_key": "test",
+            "base_url": "https://embedding.invalid/v1",
+            "model": "test-embedding",
+            "dimensions": 3,
+        }),
+    )
+
+    assert await embedding_service.index_document(session, document.id) is False
 
 
 @pytest.mark.asyncio
@@ -108,7 +217,7 @@ FAKE_EMBEDDING = [0.01 * i for i in range(EMBEDDING_DIMENSIONS)]
 
 
 @pytest_asyncio.fixture
-async def db_session():
+async def db_session(_test_database_guard):
     """Async DB session with vector extension enabled (if available)."""
     engine = create_async_engine(TEST_DATABASE_URL, echo=False)
     session_factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
@@ -651,7 +760,7 @@ async def test_hybrid_search_rolls_back_after_vector_query_error(db_session, mon
     async def lexical_search(*_args, **_kwargs):
         nonlocal lexical_called
         lexical_called = True
-        result = await session.execute(text("SELECT 1 AS ok"))
+        await session.execute(text("SELECT 1 AS ok"))
         return [{"document_id": "doc", "name": "doc", "score": 1.0,
                  "content_preview": "content"}]
 

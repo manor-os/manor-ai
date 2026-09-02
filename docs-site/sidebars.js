@@ -8,8 +8,10 @@ const sidebars = {
       collapsed: false,
       items: [
         "index",
+        "faq",
         "quickstart",
         "installation",
+        "concepts/goal-driven-ai-workspace",
         "concepts/workspaces-knowledge",
         "concepts/agents",
         "concepts/tasks",

@@ -4,6 +4,8 @@ Each provider has a ``test_connection`` function that does ONE cheap API
 call to verify the credentials actually reach the upstream:
 
   - Gmail / Calendar / Drive  → GET /oauth2/v3/userinfo
+  - YouTube                  → GET /youtube/v3/channels?part=id&mine=true
+  - Outlook                  → GET /graph.microsoft.com/v1.0/me
   - Email (IMAP+SMTP)         → IMAP LOGIN + LOGOUT
   - Telegram                  → getMe
   - Slack                     → auth.test
@@ -37,6 +39,7 @@ import json
 import logging
 import time
 from datetime import datetime, timezone
+from enum import Enum
 from typing import Any, Awaitable, Callable, Dict
 
 from packages.core.external_api_versions import META_GRAPH as _META_PIN
@@ -47,6 +50,7 @@ from packages.core.integrations.registry import (
     register_health_checker,
     register_integration,
 )
+from packages.core.services import smtp_transport
 
 # Convenience: every Meta Graph URL in this module pulls its version
 # from the central pin so a bump in external_api_versions.py
@@ -62,6 +66,16 @@ logger = logging.getLogger(__name__)
 
 
 HealthResult = Dict[str, Any]
+
+
+class WhatsAppAccountReadinessCode(str, Enum):
+    READY = "ready"
+    OAUTH_MISSING = "oauth_missing"
+    ASSET_MISMATCH = "asset_mismatch"
+    PHONE_NOT_REGISTERED = "phone_not_registered"
+    APP_NOT_SUBSCRIBED = "app_not_subscribed"
+    CALLBACK_NOT_READY = "callback_not_ready"
+    PROVIDER_UNAVAILABLE = "provider_unavailable"
 
 
 def _now_iso() -> str:
@@ -123,6 +137,24 @@ async def test_google_userinfo(creds: dict) -> HealthResult:
     )
 
 
+async def test_youtube(creds: dict) -> HealthResult:
+    """Validate that the OAuth token can access the authenticated channel."""
+    return await _test_with_bearer(
+        "YouTube",
+        "https://www.googleapis.com/youtube/v3/channels?part=id&mine=true",
+        creds.get("access_token", ""),
+    )
+
+
+async def test_outlook(creds: dict) -> HealthResult:
+    """Validate a delegated Microsoft Graph token without mailbox writes."""
+    return await _test_with_bearer(
+        "Outlook",
+        "https://graph.microsoft.com/v1.0/me",
+        creds.get("access_token", ""),
+    )
+
+
 async def test_facebook(creds: dict) -> HealthResult:
     """Validate the Meta user token without creating or changing content."""
     return await _test_with_bearer(
@@ -162,6 +194,32 @@ def is_credential_rejection(detail: str | None) -> bool:
     """
     text = str(detail or "").lower()
     return any(marker in text for marker in _CREDENTIAL_REJECTION_MARKERS)
+
+
+def classify_nango_health(
+    *,
+    ok: bool | None = None,
+    detail: str | None = None,
+    provider_config_present: bool = True,
+    webhook_configured: bool | None = None,
+    permission_denied: bool = False,
+    disabled: bool = False,
+) -> str:
+    """Map Nango/provider checks to stable operator-facing reason codes."""
+    if disabled:
+        return "disabled"
+    if not provider_config_present:
+        return "provider_config_missing"
+    if webhook_configured is False:
+        return "webhook_config_missing"
+    if permission_denied or "permission" in str(detail or "").lower():
+        return "permission_denied"
+    text = str(detail or "").lower()
+    if is_credential_rejection(detail) or "401" in text or "invalid credential" in text:
+        return "credentials_rejected"
+    if ok is True:
+        return "healthy"
+    return "provider_unavailable"
 
 
 def _auth_failure_hint(exc: Exception, *, host: str, username: str) -> str:
@@ -217,9 +275,9 @@ async def test_email_login(creds: dict) -> HealthResult:
         use_ssl_imap = bool(creds.get("use_ssl_imap", imap_port == 993))
 
         def _imap_login() -> None:
-            import imaplib
-            client = imaplib.IMAP4_SSL(imap_host, imap_port, timeout=10) if use_ssl_imap \
-                else imaplib.IMAP4(imap_host, imap_port, timeout=10)
+            client = smtp_transport.open_imap_client(
+                imap_host, imap_port, use_ssl=use_ssl_imap, timeout=10,
+            )
             client.login(username, password)
             client.logout()
 
@@ -241,17 +299,15 @@ async def test_email_login(creds: dict) -> HealthResult:
         use_ssl_smtp = bool(creds.get("use_ssl_smtp", smtp_port == 465))
 
         def _smtp_login() -> None:
-            import smtplib
-            if use_ssl_smtp:
-                with smtplib.SMTP_SSL(smtp_host, smtp_port, timeout=10) as s:
-                    s.login(username, password)
-            else:
-                with smtplib.SMTP(smtp_host, smtp_port, timeout=10) as s:
+            with smtp_transport.open_smtp_client(
+                smtp_host, smtp_port, use_ssl=use_ssl_smtp, timeout=10,
+            ) as s:
+                if not use_ssl_smtp:
                     s.ehlo()
                     if use_tls_smtp:
                         s.starttls()
                         s.ehlo()
-                    s.login(username, password)
+                s.login(username, password)
 
         try:
             await asyncio.to_thread(_smtp_login)
@@ -411,8 +467,32 @@ async def test_discord(creds: dict, wiring_ctx: dict | None = None) -> HealthRes
         return _fail(f"HTTP {resp.status_code}: {resp.text[:120]}", t0)
 
     user = resp.json() or {}
+    guild_name = str(creds.get("guild_name") or "").strip()
+    guild_id = str(creds.get("guild_id") or "").strip()
+    if guild_id:
+        try:
+            guild_resp = await _http_get(
+                f"https://discord.com/api/v10/guilds/{guild_id}",
+                headers={"Authorization": f"Bot {token}"},
+            )
+        except Exception as e:
+            return _fail(f"Guild check failed: {e}", t0)
+        if guild_resp.status_code != 200:
+            return _fail(
+                f"Discord Bot cannot access guild {guild_id}: "
+                f"HTTP {guild_resp.status_code}",
+                t0,
+            )
+        guild = guild_resp.json() or {}
+        guild_name = str(guild.get("name") or guild_name).strip()
+
+    detail = (
+        f"bot active as {user.get('username', '')}#{user.get('discriminator', '')}"
+    )
+    if guild_name:
+        detail += f" in {guild_name}"
     result = _ok(
-        f"bot active as {user.get('username', '')}#{user.get('discriminator', '')}",
+        detail,
         t0,
     )
     if wiring_ctx:
@@ -470,6 +550,7 @@ async def _test_discord_interactions(token: str, ctx: dict) -> dict:
 async def test_whatsapp(creds: dict, wiring_ctx: dict | None = None) -> HealthResult:
     t0 = time.monotonic()
     phone_id = creds.get("phone_number_id") or creds.get("phone_id")
+    waba_id = creds.get("waba_id") or creds.get("business_account_id")
     token = creds.get("access_token") or creds.get("api_key")
     if not (phone_id and token):
         return _fail("Missing phone_number_id or access_token.", t0)
@@ -485,30 +566,67 @@ async def test_whatsapp(creds: dict, wiring_ctx: dict | None = None) -> HealthRe
 
     result = _ok("Graph API reachable", t0)
     if wiring_ctx:
-        result["wiring"] = await _test_whatsapp_subscriptions(
-            phone_id, token, wiring_ctx,
+        wiring = await _test_whatsapp_subscriptions(
+            waba_id, token, wiring_ctx,
         )
+        result["wiring"] = wiring
+        if wiring.get("ok") is not True:
+            result["ok"] = False
+            result["reason_code"] = "webhook_not_ready"
+            result["detail"] = str(
+                wiring.get("detail")
+                or "WhatsApp Business webhook subscription is not ready."
+            )
     return result
 
 
-async def _test_whatsapp_subscriptions(phone_id: str, token: str, ctx: dict) -> dict:
+async def _test_whatsapp_subscriptions(
+    waba_id: str | None, token: str, ctx: dict,
+) -> dict:
     """Check that the WABA is subscribed to an app so inbound messages
     will actually be delivered. Empty ``subscribed_apps`` means Meta has
-    nothing to send inbound events to.
+    nothing to send inbound events to. The subscription belongs to the WABA,
+    not an individual phone number.
 
     WhatsApp's webhook URL itself isn't queryable via the public API, so
     we compare the callback URL configured on the app only when the
     caller provides it; otherwise we just verify a subscription exists.
     """
+    if not waba_id:
+        return {
+            "ok": None,
+            "mode": "webhook",
+            "detail": (
+                "Webhook subscription status unavailable: WhatsApp Business "
+                "Account ID (waba_id) is missing."
+            ),
+        }
+
     try:
         resp = await _http_get(
-            f"{_META_BASE}/{phone_id}/subscribed_apps",
+            f"{_META_BASE}/{waba_id}/subscribed_apps",
             headers={"Authorization": f"Bearer {token}"},
         )
     except Exception as e:
         return {"ok": False, "mode": "webhook", "detail": f"subscribed_apps failed: {e}"}
     if not resp.is_success:
-        return {"ok": False, "mode": "webhook", "detail": f"HTTP {resp.status_code}"}
+        detail = f"HTTP {resp.status_code}: {resp.text[:120]}"
+        try:
+            error = (resp.json() or {}).get("error") or {}
+        except Exception:
+            error = {}
+        if resp.status_code in (401, 403) or error.get("code") in {10, 100, 200}:
+            return {
+                "ok": None,
+                "mode": "webhook",
+                "detail": (
+                    "Webhook subscription status unavailable: Meta denied "
+                    "WABA access. Assign the app to this WhatsApp Business "
+                    "Account and grant whatsapp_business_management."
+                ),
+                "last_error": detail,
+            }
+        return {"ok": False, "mode": "webhook", "detail": detail}
 
     data = resp.json() or {}
     subs = data.get("data") or []
@@ -517,7 +635,7 @@ async def _test_whatsapp_subscriptions(phone_id: str, token: str, ctx: dict) -> 
             "ok": False,
             "mode": "webhook",
             "detail": (
-                "No app subscribed to this phone number — Meta has nowhere to "
+                "No app subscribed to this WhatsApp Business Account — Meta has nowhere to "
                 "deliver inbound messages. Subscribe your app in the WhatsApp "
                 "Business Account > Webhooks panel."
             ),
@@ -529,19 +647,55 @@ async def _test_whatsapp_subscriptions(phone_id: str, token: str, ctx: dict) -> 
     }
 
 
-async def test_twilio(creds: dict) -> HealthResult:
+def _twilio_voice_wiring_status(ctx: dict) -> dict:
+    from urllib.parse import urlparse
+
+    public_base_url = str(ctx.get("public_base_url") or "").strip()
+    parsed_base_url = urlparse(public_base_url)
+    missing: list[str] = []
+    if parsed_base_url.scheme != "https" or not parsed_base_url.netloc:
+        missing.append("PUBLIC_BASE_URL must be a public HTTPS URL")
+    if not ctx.get("channel_config_id"):
+        missing.append("Voice channel configuration is missing")
+    if not ctx.get("agent_bound"):
+        if ctx.get("binding_state") == "ambiguous":
+            missing.append("Agent binding is ambiguous")
+        else:
+            missing.append("Agent binding is missing")
+    if not ctx.get("realtime_configured"):
+        missing.append(
+            str(ctx.get("realtime_error") or "").strip()
+            or "Realtime voice model/credential route is unavailable"
+        )
+
+    expected_url = str(ctx.get("expected_url") or "").strip() or None
+    if missing:
+        return {
+            "ok": False,
+            "mode": "media_stream",
+            "detail": "Voice not ready: " + "; ".join(missing),
+            "configured_url": None,
+            "expected_url": expected_url,
+        }
+    return {
+        "ok": True,
+        "mode": "media_stream",
+        "detail": "Voice channel, Agent, and Realtime voice route are ready",
+        "configured_url": None,
+        "expected_url": expected_url,
+    }
+
+
+async def test_twilio(
+    creds: dict,
+    wiring_ctx: dict | None = None,
+) -> HealthResult:
     t0 = time.monotonic()
     sid = creds.get("account_sid")
     token = creds.get("auth_token")
     if not (sid and token):
         return _fail("Missing account_sid / auth_token.", t0)
     try:
-        resp = await _http_get(
-            f"https://api.twilio.com/2010-04-01/Accounts/{sid}.json",
-            headers={},  # auth below
-            timeout=10,
-        )
-        # httpx needs auth param; redo with basic auth
         async with httpx.AsyncClient(timeout=10) as client:  # type: ignore[union-attr]
             resp = await client.get(
                 f"https://api.twilio.com/2010-04-01/Accounts/{sid}.json",
@@ -550,13 +704,16 @@ async def test_twilio(creds: dict) -> HealthResult:
     except Exception as e:
         return _fail(f"Network error: {e}", t0)
     if resp.status_code == 200:
-        return _ok("account active", t0)
+        result = _ok("account active", t0)
+        if wiring_ctx is not None:
+            result["wiring"] = _twilio_voice_wiring_status(wiring_ctx)
+        return result
     return _fail(f"HTTP {resp.status_code}: {resp.text[:120]}", t0)
 
 
 async def test_stripe(creds: dict) -> HealthResult:
     t0 = time.monotonic()
-    secret = creds.get("secret_key") or creds.get("api_key")
+    secret = creds.get("access_token") or creds.get("secret_key") or creds.get("api_key")
     if not secret:
         return _fail("No Stripe secret key on record.", t0)
     try:
@@ -574,6 +731,26 @@ async def test_stripe(creds: dict) -> HealthResult:
 
 async def test_github(creds: dict) -> HealthResult:
     return await _test_with_bearer("GitHub", "https://api.github.com/user", creds.get("access_token", ""))
+
+
+async def test_robinhood(creds: dict) -> HealthResult:
+    """Check the user's official MCP grant without invoking a trading tool."""
+    from packages.core.ai.mcp._remote import RemoteMCPClient, RemoteMCPError
+    from packages.core.services.robinhood_oauth import ROBINHOOD_MCP_ENDPOINT
+
+    t0 = time.monotonic()
+    token = creds.get("access_token")
+    if not isinstance(token, str) or not token.strip():
+        return _fail("No Robinhood access token on record; connect your account.", t0)
+    try:
+        client = RemoteMCPClient(ROBINHOOD_MCP_ENDPOINT, token, timeout=10)
+        await asyncio.wait_for(client.list_tools(), timeout=15)
+    except RemoteMCPError as exc:
+        # Do not surface upstream bodies, which can echo account credentials.
+        return _fail(f"Robinhood MCP check failed (code {exc.code}); check account access.", t0)
+    except Exception:
+        return _fail("Robinhood MCP is unreachable; retry the check later.", t0)
+    return _ok("Official MCP reachable and tools/list authorized; no trade executed.", t0)
 
 
 async def test_linkedin(creds: dict) -> HealthResult:
@@ -601,25 +778,46 @@ async def test_notion(creds: dict) -> HealthResult:
 
 
 async def test_quickbooks(creds: dict) -> HealthResult:
-    """QuickBooks /user endpoint needs a realmId, which isn't known at
-    register time. We settle for a token introspection via /connection-info."""
-    return await _test_with_bearer(
-        "QuickBooks",
-        "https://accounts.platform.intuit.com/v1/openid_connect/userinfo",
-        creds.get("access_token", ""),
-    )
+    from urllib.parse import quote
+
+    from packages.core.ai.mcp.quickbooks import quickbooks_base_url
+
+    t0 = time.monotonic()
+    token = str(creds.get("access_token") or "").strip()
+    realm_id = str(creds.get("realm_id") or "").strip()
+    if not token:
+        return _fail("No QuickBooks token on record.", t0)
+    if not realm_id:
+        return _fail("QuickBooks Company/Realm ID is missing; reconnect.", t0)
+    encoded_realm = quote(realm_id, safe="")
+    url = f"{quickbooks_base_url()}/{encoded_realm}/companyinfo/{encoded_realm}"
+    try:
+        resp = await _http_get(
+            url,
+            headers={"Authorization": f"Bearer {token}"},
+        )
+    except Exception as exc:
+        return _fail(f"Network error: {exc}", t0)
+    if resp.status_code == 200:
+        return _ok("company reachable + authorized", t0)
+    if resp.status_code in (401, 403):
+        return _fail(f"{resp.status_code} — token rejected; reconnect.", t0)
+    return _fail(f"HTTP {resp.status_code}: {resp.text[:120]}", t0)
 
 
 async def test_twitter_x(creds: dict) -> HealthResult:
     return await _test_with_bearer("Twitter/X", "https://api.x.com/2/users/me", creds.get("access_token", ""))
 
 
-async def test_wechat_official(creds: dict) -> HealthResult:
+async def test_wechat_official(
+    creds: dict, wiring_ctx: dict | None = None,
+) -> HealthResult:
     t0 = time.monotonic()
     app_id = creds.get("app_id")
     app_secret = creds.get("app_secret")
-    if not (app_id and app_secret):
-        return _fail("Missing app_id / app_secret.", t0)
+    callback_token = creds.get("token")
+    if not (app_id and app_secret and callback_token):
+        return _fail("Missing app_id / app_secret / callback token.", t0)
     try:
         resp = await _http_get(
             "https://api.weixin.qq.com/cgi-bin/token"
@@ -628,9 +826,28 @@ async def test_wechat_official(creds: dict) -> HealthResult:
     except Exception as e:
         return _fail(f"Network error: {e}", t0)
     data = resp.json() if resp.is_success else {}
-    if "access_token" in data:
-        return _ok("token refresh OK", t0)
-    return _fail(f"WeChat error: {data.get('errmsg', data.get('errcode', resp.status_code))}", t0)
+    if "access_token" not in data:
+        return _fail(
+            f"WeChat error: {data.get('errmsg', data.get('errcode', resp.status_code))}",
+            t0,
+        )
+
+    result = _ok("token refresh OK", t0)
+    if wiring_ctx:
+        expected_url = str(wiring_ctx.get("expected_url") or "").strip()
+        result["wiring"] = {
+            "ok": None if expected_url else False,
+            "mode": "webhook",
+            "detail": (
+                "Cannot verify the WeChat callback URL via its API; "
+                "verify the exact URL in the Official Account admin panel."
+                if expected_url
+                else "No WeChat ChannelConfig callback URL is available."
+            ),
+            "configured_url": None,
+            "expected_url": expected_url or None,
+        }
+    return result
 
 
 async def test_wechat_personal(
@@ -737,6 +954,18 @@ async def test_webhook(creds: dict) -> HealthResult:
                 resp = await client.options(url)
     except Exception as e:
         return _fail(f"Network error: {e}", t0)
+    if resp.status_code in (401, 403):
+        result = _fail(f"HTTP {resp.status_code}: webhook credentials rejected", t0)
+        result["reason_code"] = "credentials_rejected"
+        return result
+    if resp.status_code == 404:
+        result = _fail("HTTP 404: webhook endpoint not found", t0)
+        result["reason_code"] = "webhook_endpoint_not_found"
+        return result
+    if 400 <= resp.status_code < 500:
+        result = _fail(f"HTTP {resp.status_code}: webhook endpoint rejected request", t0)
+        result["reason_code"] = "webhook_endpoint_rejected"
+        return result
     if resp.status_code < 500:
         return _ok(f"HTTP {resp.status_code}", t0)
     return _fail(f"HTTP {resp.status_code}", t0)
@@ -804,31 +1033,25 @@ async def test_elevenlabs(creds: dict) -> HealthResult:
 
 
 async def test_tavily(creds: dict) -> HealthResult:
-    """Tavily has no /me endpoint. Run a 1-result throwaway search —
-    the cheapest way to validate the key (~1 credit, free tier covers it)."""
+    """Validate Tavily credentials without consuming search credits."""
     t0 = time.monotonic()
-    api_key = creds.get("api_key", "")
+    raw_api_key = creds.get("api_key", "")
+    api_key = raw_api_key.strip() if isinstance(raw_api_key, str) else ""
     if not api_key:
         return _fail("No Tavily API key on record.", t0)
+    if not api_key.startswith("tvly-"):
+        return _fail("Tavily API key must start with 'tvly-'.", t0)
     try:
-        import httpx  # type: ignore
-        async with httpx.AsyncClient(timeout=10) as client:
-            resp = await client.post(
-                "https://api.tavily.com/search",
-                json={
-                    "api_key": api_key,
-                    "query": "manor health check",
-                    "max_results": 1,
-                    "search_depth": "basic",
-                    "include_answer": False,
-                },
-            )
-    except Exception as e:
-        return _fail(f"Network error: {e}", t0)
+        resp = await _http_get(
+            "https://api.tavily.com/usage",
+            headers={"Authorization": f"Bearer {api_key}"},
+        )
+    except Exception as exc:
+        return _fail(f"Network error: {exc}", t0)
     if resp.status_code == 200:
         return _ok("Tavily key valid", t0)
-    if resp.status_code in (401, 403, 432):
-        return _fail(f"{resp.status_code} — key rejected; verify it starts with 'tvly-'.", t0)
+    if resp.status_code in (401, 403):
+        return _fail(f"{resp.status_code} - key rejected; reconnect.", t0)
     return _fail(f"HTTP {resp.status_code}: {resp.text[:120]}", t0)
 
 
@@ -864,6 +1087,8 @@ _TESTS: Dict[str, Callable[[dict], Awaitable[HealthResult]]] = {
     "gmail":            test_google_userinfo,
     "google_calendar":  test_google_userinfo,
     "google_drive":     test_google_userinfo,
+    "youtube":          test_youtube,
+    "outlook":          test_outlook,
     "facebook":         test_facebook,
     "email":            test_email_login,
     "telegram":         test_telegram,
@@ -872,6 +1097,7 @@ _TESTS: Dict[str, Callable[[dict], Awaitable[HealthResult]]] = {
     "whatsapp":         test_whatsapp,
     "twilio":           test_twilio,
     "stripe":           test_stripe,
+    "robinhood":        test_robinhood,
     "github":           test_github,
     "linkedin":         test_linkedin,
     "notion":           test_notion,
@@ -953,14 +1179,266 @@ def _build_wiring_context(provider: str, integration_id: str) -> dict:
 # ── Persistence helpers ────────────────────────────────────────────────────
 
 
-async def _resolve_nango_runtime_credentials(db, integration_row, leased_creds: dict) -> dict:
-    """For Nango-backed integrations, fetch a fresh access token before test.
+def _whatsapp_readiness_checks() -> dict[str, dict[str, object]]:
+    return {
+        key: {"ok": None, "detail": "Not checked."}
+        for key in (
+            "oauth",
+            "assets",
+            "phone_registration",
+            "app_subscription",
+            "callback",
+        )
+    }
 
-    The stored credential payload for these rows is only an indirection ref:
-    {"via": "nango", "provider_config_key": "...", "connection_id": "..."}.
-    Health checks need a real token to hit provider APIs, so we resolve one
-    just-in-time from Nango's /connection endpoint.
-    """
+
+def _whatsapp_readiness_result(
+    *,
+    code: WhatsAppAccountReadinessCode,
+    detail: str,
+    integration_id: str,
+    channel_config_id: str | None,
+    phone_number_id: str | None,
+    waba_id: str | None,
+    checks: dict[str, dict[str, object]],
+    started_at: float,
+) -> HealthResult:
+    return {
+        "ok": code is WhatsAppAccountReadinessCode.READY,
+        "reason_code": code.value,
+        "detail": detail,
+        "integration_id": integration_id,
+        "channel_config_id": channel_config_id,
+        "phone_number_id": phone_number_id,
+        "waba_id": waba_id,
+        "checks": checks,
+        "latency_ms": round((time.monotonic() - started_at) * 1000, 1),
+        "checked_at": _now_iso(),
+    }
+
+
+async def _test_whatsapp_account_readiness(
+    db,
+    integration_row,
+    leased_creds: dict,
+    resolved_creds: dict,
+    wiring_ctx: dict | None,
+) -> HealthResult:
+    """Prove provider account readiness without consulting Agent Binding."""
+    started_at = time.monotonic()
+    checks = _whatsapp_readiness_checks()
+    config = integration_row.config if isinstance(integration_row.config, dict) else {}
+    nango = config.get("nango") if isinstance(config.get("nango"), dict) else {}
+    whatsapp = (
+        config.get("whatsapp")
+        if isinstance(config.get("whatsapp"), dict)
+        else {}
+    )
+    channel_config_id = str((wiring_ctx or {}).get("channel_config_id") or "").strip() or None
+    phone_number_id = str(whatsapp.get("phone_number_id") or "").strip() or None
+    waba_id = str(whatsapp.get("waba_id") or "").strip() or None
+
+    provider_config_key = str(nango.get("provider_config_key") or "").strip()
+    connection_id = str(nango.get("connection_id") or "").strip()
+    leased_provider_key = str(leased_creds.get("provider_config_key") or "").strip()
+    leased_connection_id = str(leased_creds.get("connection_id") or "").strip()
+    oauth_exact = (
+        leased_creds.get("via") == "nango"
+        and bool(provider_config_key and connection_id)
+        and leased_provider_key == provider_config_key
+        and leased_connection_id == connection_id
+        and bool(resolved_creds.get("access_token"))
+    )
+    if not oauth_exact:
+        detail = "The exact WhatsApp Nango connection or OAuth token is unavailable."
+        checks["oauth"] = {"ok": False, "detail": detail}
+        return _whatsapp_readiness_result(
+            code=WhatsAppAccountReadinessCode.OAUTH_MISSING,
+            detail=detail,
+            integration_id=integration_row.id,
+            channel_config_id=channel_config_id,
+            phone_number_id=phone_number_id,
+            waba_id=waba_id,
+            checks=checks,
+            started_at=started_at,
+        )
+    checks["oauth"] = {
+        "ok": True,
+        "detail": "Exact Nango OAuth connection is available.",
+    }
+
+    resolved_phone_id = str(resolved_creds.get("phone_number_id") or "").strip()
+    resolved_waba_id = str(resolved_creds.get("waba_id") or "").strip()
+    channel_phone_id = str(
+        (wiring_ctx or {}).get("channel_phone_number_id") or ""
+    ).strip()
+    assets_exact = (
+        bool(channel_config_id and phone_number_id and waba_id)
+        and channel_phone_id == phone_number_id
+        and (not resolved_phone_id or resolved_phone_id == phone_number_id)
+        and (not resolved_waba_id or resolved_waba_id == waba_id)
+    )
+    if not assets_exact:
+        detail = "The connected WABA or phone asset does not match the Manor account."
+        checks["assets"] = {"ok": False, "detail": detail}
+        return _whatsapp_readiness_result(
+            code=WhatsAppAccountReadinessCode.ASSET_MISMATCH,
+            detail=detail,
+            integration_id=integration_row.id,
+            channel_config_id=channel_config_id,
+            phone_number_id=phone_number_id,
+            waba_id=waba_id,
+            checks=checks,
+            started_at=started_at,
+        )
+    checks["assets"] = {
+        "ok": True,
+        "detail": "WABA and phone assets match this account.",
+    }
+
+    try:
+        from packages.core.ai.mcp.nango import get_nango_secret
+        from packages.core.services.whatsapp_business_config import (
+            load_whatsapp_business_config,
+        )
+        from packages.core.services.whatsapp_business_provisioning import (
+            WhatsAppPhoneState,
+            inspect_whatsapp_app_callback,
+            inspect_whatsapp_business_number,
+        )
+
+        nango_secret = await get_nango_secret(db, integration_row.entity_id)
+        deployment = load_whatsapp_business_config()
+        if not nango_secret:
+            raise RuntimeError("Nango is unavailable")
+        provisioning = await inspect_whatsapp_business_number(
+            nango_secret=nango_secret,
+            provider_config_key=provider_config_key,
+            connection_id=connection_id,
+            phone_number_id=phone_number_id,
+            waba_id=waba_id,
+            expected_app_id=deployment.app_id,
+        )
+    except Exception:
+        logger.warning(
+            "WhatsApp readiness provider inspection failed for integration=%s",
+            integration_row.id,
+            exc_info=True,
+        )
+        detail = "WhatsApp Business provider readiness is temporarily unavailable."
+        checks["phone_registration"] = {"ok": False, "detail": detail}
+        return _whatsapp_readiness_result(
+            code=WhatsAppAccountReadinessCode.PROVIDER_UNAVAILABLE,
+            detail=detail,
+            integration_id=integration_row.id,
+            channel_config_id=channel_config_id,
+            phone_number_id=phone_number_id,
+            waba_id=waba_id,
+            checks=checks,
+            started_at=started_at,
+        )
+
+    if provisioning.phone_state is not WhatsAppPhoneState.CONNECTED:
+        if provisioning.phone_state is WhatsAppPhoneState.REGISTRATION_REQUIRED:
+            code = WhatsAppAccountReadinessCode.PHONE_NOT_REGISTERED
+            detail = "The WhatsApp Business phone number is not registered."
+        else:
+            code = WhatsAppAccountReadinessCode.PROVIDER_UNAVAILABLE
+            detail = "Meta did not return a known phone registration state."
+        checks["phone_registration"] = {"ok": False, "detail": detail}
+        return _whatsapp_readiness_result(
+            code=code,
+            detail=detail,
+            integration_id=integration_row.id,
+            channel_config_id=channel_config_id,
+            phone_number_id=phone_number_id,
+            waba_id=waba_id,
+            checks=checks,
+            started_at=started_at,
+        )
+    checks["phone_registration"] = {
+        "ok": True,
+        "detail": "Phone number is registered with Cloud API.",
+    }
+
+    if not provisioning.exact_app_subscribed:
+        detail = "This deployment's Meta App is not subscribed to the WABA."
+        checks["app_subscription"] = {"ok": False, "detail": detail}
+        return _whatsapp_readiness_result(
+            code=WhatsAppAccountReadinessCode.APP_NOT_SUBSCRIBED,
+            detail=detail,
+            integration_id=integration_row.id,
+            channel_config_id=channel_config_id,
+            phone_number_id=phone_number_id,
+            waba_id=waba_id,
+            checks=checks,
+            started_at=started_at,
+        )
+    checks["app_subscription"] = {
+        "ok": True,
+        "detail": "This deployment's Meta App is subscribed to the WABA.",
+    }
+
+    try:
+        callback = await inspect_whatsapp_app_callback(
+            app_id=deployment.app_id,
+            app_secret=deployment.app_secret,
+            expected_callback_url=deployment.callback_url,
+        )
+    except Exception:
+        logger.warning(
+            "WhatsApp callback inspection failed for integration=%s",
+            integration_row.id,
+            exc_info=True,
+        )
+        detail = "WhatsApp Business callback readiness is temporarily unavailable."
+        checks["callback"] = {"ok": False, "detail": detail}
+        return _whatsapp_readiness_result(
+            code=WhatsAppAccountReadinessCode.PROVIDER_UNAVAILABLE,
+            detail=detail,
+            integration_id=integration_row.id,
+            channel_config_id=channel_config_id,
+            phone_number_id=phone_number_id,
+            waba_id=waba_id,
+            checks=checks,
+            started_at=started_at,
+        )
+
+    checks["callback"] = {
+        "ok": callback.ok,
+        "detail": callback.detail,
+        "configured_url": callback.configured_url,
+        "expected_url": callback.expected_url,
+    }
+    if not callback.ok:
+        return _whatsapp_readiness_result(
+            code=WhatsAppAccountReadinessCode.CALLBACK_NOT_READY,
+            detail=callback.detail,
+            integration_id=integration_row.id,
+            channel_config_id=channel_config_id,
+            phone_number_id=phone_number_id,
+            waba_id=waba_id,
+            checks=checks,
+            started_at=started_at,
+        )
+    return _whatsapp_readiness_result(
+        code=WhatsAppAccountReadinessCode.READY,
+        detail="WhatsApp Business account is ready.",
+        integration_id=integration_row.id,
+        channel_config_id=channel_config_id,
+        phone_number_id=phone_number_id,
+        waba_id=waba_id,
+        checks=checks,
+        started_at=started_at,
+    )
+
+
+async def _resolve_nango_runtime_credentials(
+    db,
+    integration_row,
+    leased_creds: dict,
+) -> dict:
+    """Resolve a Nango indirection to a fresh provider token just in time."""
     if (leased_creds or {}).get("via") != "nango":
         return leased_creds or {}
 
@@ -1006,6 +1484,62 @@ async def _resolve_nango_runtime_credentials(db, integration_row, leased_creds: 
 
         resolved = dict(leased_creds or {})
         resolved["access_token"] = access_token
+        if str(getattr(integration_row, "provider", "")).lower() in {
+            "whatsapp", "whatsapp_cloud",
+        }:
+            for source in (
+                creds_block,
+                body,
+                body.get("metadata") if isinstance(body, dict) else None,
+                body.get("profile") if isinstance(body, dict) else None,
+            ):
+                if not isinstance(source, dict):
+                    continue
+                phone_id = source.get("phone_number_id") or source.get("phone_id")
+                if phone_id and not resolved.get("phone_number_id"):
+                    resolved["phone_number_id"] = phone_id
+                waba_id = source.get("waba_id") or source.get("business_account_id")
+                if waba_id and not resolved.get("waba_id"):
+                    resolved["waba_id"] = waba_id
+                if resolved.get("phone_number_id") and resolved.get("waba_id"):
+                    break
+            if not resolved.get("phone_number_id"):
+                config = getattr(integration_row, "config", {})
+                whatsapp_config = (
+                    config.get("whatsapp")
+                    if isinstance(config, dict)
+                    else None
+                )
+                if isinstance(whatsapp_config, dict):
+                    phone_id = (
+                        whatsapp_config.get("phone_number_id")
+                        or whatsapp_config.get("phone_id")
+                    )
+                    if phone_id:
+                        resolved["phone_number_id"] = phone_id
+            if not resolved.get("waba_id"):
+                config = getattr(integration_row, "config", {})
+                whatsapp_config = (
+                    config.get("whatsapp")
+                    if isinstance(config, dict)
+                    else None
+                )
+                if isinstance(whatsapp_config, dict):
+                    waba_id = (
+                        whatsapp_config.get("waba_id")
+                        or whatsapp_config.get("business_account_id")
+                    )
+                    if waba_id:
+                        resolved["waba_id"] = waba_id
+            from packages.core.services.whatsapp_business_config import (
+                load_whatsapp_business_config,
+            )
+
+            deployment = load_whatsapp_business_config()
+            resolved["app_id"] = deployment.app_id
+            resolved["app_secret"] = deployment.app_secret
+            resolved["verify_token"] = deployment.verify_token
+            resolved["callback_url"] = deployment.callback_url
         return resolved
     except Exception:
         logger.debug("Nango runtime credential resolution failed", exc_info=True)
@@ -1034,6 +1568,15 @@ async def run_and_persist_integration(db, integration_id: str) -> HealthResult:
     )).scalar_one_or_none()
     if not row:
         return {"ok": False, "detail": "integration not found", "latency_ms": 0.0, "checked_at": _now_iso()}
+
+    if str(getattr(row, "status", "active") or "active").lower() != "active":
+        return {
+            "ok": False,
+            "reason_code": "disabled",
+            "detail": "Integration is disabled.",
+            "latency_ms": 0.0,
+            "checked_at": _now_iso(),
+        }
 
     try:
         creds = get_credential_service().lease_integration(
@@ -1068,14 +1611,61 @@ async def run_and_persist_integration(db, integration_id: str) -> HealthResult:
 
     resolved_creds = await _resolve_nango_runtime_credentials(db, row, creds or {})
     wiring_ctx = await _wiring_ctx_for_integration(db, row)
+    provider_key = canonical_integration_key(row.provider)
     # A persisted connection is a known Integration identity even when an
     # extension/Nango provider has no first-party checker.
-    register_integration(canonical_integration_key(row.provider))
-    result = await run_test(
-        row.provider, resolved_creds or {}, wiring_ctx=wiring_ctx,
+    register_integration(provider_key)
+    if provider_key == "whatsapp":
+        result = await _test_whatsapp_account_readiness(
+            db,
+            row,
+            creds or {},
+            resolved_creds or {},
+            wiring_ctx,
+        )
+    else:
+        result = await run_test(
+            row.provider, resolved_creds or {}, wiring_ctx=wiring_ctx,
+        )
+
+    nango_meta = (
+        (row.config or {}).get("nango")
+        if isinstance(row.config, dict)
+        else None
     )
+    if isinstance(nango_meta, dict) and provider_key != "whatsapp":
+        result["reason_code"] = classify_nango_health(
+            ok=result.get("ok"),
+            detail=result.get("detail"),
+            provider_config_present=bool(
+                nango_meta.get("provider_config_key")
+                and nango_meta.get("connection_id")
+            ),
+            webhook_configured=nango_meta.get("webhook_configured"),
+        )
 
     cfg = dict(row.config or {})
+    if provider_key == "whatsapp":
+        whatsapp = dict(cfg.get("whatsapp") or {})
+        readiness_code = str(result.get("reason_code") or "provider_unavailable")
+        if readiness_code == WhatsAppAccountReadinessCode.READY.value:
+            provisioning_status = "ready"
+        elif readiness_code == WhatsAppAccountReadinessCode.PHONE_NOT_REGISTERED.value:
+            provisioning_status = "registration_required"
+        else:
+            provisioning_status = "failed"
+        whatsapp["readiness_code"] = readiness_code
+        whatsapp["provisioning_status"] = provisioning_status
+        whatsapp["subscription_status"] = (
+            "ready" if provisioning_status == "ready" else "failed"
+        )
+        if provisioning_status in {"ready", "registration_required"}:
+            whatsapp.pop("provisioning_error", None)
+            whatsapp.pop("subscription_error", None)
+        else:
+            whatsapp["provisioning_error"] = str(result.get("detail") or "")
+            whatsapp["subscription_error"] = str(result.get("detail") or "")
+        cfg["whatsapp"] = whatsapp
     cfg["last_health_check"] = result
     row.config = cfg
     await db.flush()
@@ -1083,13 +1673,15 @@ async def run_and_persist_integration(db, integration_id: str) -> HealthResult:
 
 
 _PROVIDERS_WITH_WIRING: set[str] = {
-    "telegram", "discord", "whatsapp", "wechat_personal",
+    "telegram", "discord", "whatsapp", "twilio", "wechat_official",
+    "wechat_personal",
 }
 
 
 async def _wiring_ctx_for_integration(db, integration_row) -> dict | None:
     """Resolve the expected inbound URL for providers that have one."""
-    provider = integration_row.provider
+    raw_provider = integration_row.provider
+    provider = canonical_integration_key(raw_provider)
     if provider not in _PROVIDERS_WITH_WIRING:
         return None
 
@@ -1097,32 +1689,123 @@ async def _wiring_ctx_for_integration(db, integration_row) -> dict | None:
     from packages.core.models.channel import ChannelConfig
     from packages.core.config import get_settings
 
+    if provider == "wechat_official":
+        channel_type = "wechat"
+    elif provider == "twilio":
+        channel_type = "twilio_voice"
+    else:
+        channel_type = provider
     cc = (await db.execute(
         select(ChannelConfig).where(
             ChannelConfig.entity_id == integration_row.entity_id,
-            ChannelConfig.channel_type == provider,
-            ChannelConfig.config["integration_id"].astext == integration_row.id,
+            ChannelConfig.channel_type == channel_type,
+            ChannelConfig.credential_source_kind == "integration",
+            ChannelConfig.credential_source_id == integration_row.id,
         )
     )).scalar_one_or_none()
     base = get_settings().PUBLIC_BASE_URL.rstrip("/")
     if not cc:
-        return {"expected_url": "", "channel_config_id": None}
+        if provider == "twilio":
+            return {
+                "public_base_url": base,
+                "channel_config_id": None,
+                "agent_bound": False,
+                "binding_state": "missing",
+                "realtime_configured": False,
+                "expected_url": "",
+            }
+        context = {"expected_url": "", "channel_config_id": None}
+        if provider == "whatsapp":
+            context["channel_phone_number_id"] = None
+        return context
+    if provider == "wechat_official" and not base:
+        return {"expected_url": "", "channel_config_id": cc.id}
 
+    if provider == "twilio":
+        from packages.core.services.channel_bindings import (
+            load_channel_binding_scopes_for_config,
+        )
+
+        binding_scopes = await load_channel_binding_scopes_for_config(db, cc)
+        callable_scopes = [scope for scope in binding_scopes if scope.agent_id]
+        if len(callable_scopes) == 1:
+            binding_state = "ready"
+        elif len(callable_scopes) > 1:
+            binding_state = "ambiguous"
+        elif binding_scopes:
+            binding_state = "invalid"
+        else:
+            binding_state = "missing"
+
+        realtime_error: str | None = None
+        try:
+            from packages.core.services.voice.realtime import resolve_realtime_route
+
+            await resolve_realtime_route(
+                integration_row.entity_id,
+                user_id=integration_row.owner_user_id,
+            )
+            realtime_configured = True
+        except Exception as exc:
+            logger.debug(
+                "Twilio Realtime route lookup failed for entity=%s",
+                integration_row.entity_id,
+                exc_info=True,
+            )
+            realtime_configured = False
+            realtime_error = str(exc).strip() or None
+
+        expected = (
+            f"{base}/api/v1/channels/twilio/voice?config_id={cc.id}"
+            if base
+            else ""
+        )
+        context = {
+            "public_base_url": base,
+            "channel_config_id": cc.id,
+            "agent_bound": binding_state == "ready",
+            "binding_state": binding_state,
+            "realtime_configured": realtime_configured,
+            "expected_url": expected,
+        }
+        if realtime_error:
+            context["realtime_error"] = realtime_error
+        return context
     if provider == "telegram":
         import hashlib
-        token = (cc.credentials or {}).get("bot_token", "")
+        from packages.core.services.channel_credentials import lease_channel_credentials
+
+        try:
+            credentials = await lease_channel_credentials(
+                db, cc, reason="integration_health.telegram_wiring",
+            )
+        except ValueError:
+            return {"expected_url": "", "channel_config_id": cc.id}
+        token = credentials.get("bot_token", "")
         bot_hash = hashlib.sha256(token.encode()).hexdigest() if token else ""
         expected = f"{base}/api/v1/channels/telegram/webhook/{bot_hash}?config_id={cc.id}"
     elif provider == "discord":
         expected = f"{base}/api/v1/channels/discord/callback?config_id={cc.id}"
     elif provider == "wechat_personal":
         expected = f"{base}/api/v1/channels/wechat_personal/callback?config_id={cc.id}"
+    elif provider == "wechat_official":
+        expected = f"{base}/api/v1/channels/wechat/callback?config_id={cc.id}"
     elif provider == "whatsapp":
-        expected = ""
+        from packages.core.services.whatsapp_business_config import (
+            load_whatsapp_business_config,
+        )
+
+        expected = load_whatsapp_business_config().callback_url
     else:
         expected = ""
 
-    return {"expected_url": expected, "channel_config_id": cc.id}
+    context = {"expected_url": expected, "channel_config_id": cc.id}
+    if provider == "whatsapp":
+        context["channel_phone_number_id"] = (
+            str(getattr(cc, "whatsapp_phone_number_id", "") or "").strip()
+            or None
+        )
+    return context
 
 
 async def run_and_persist_oauth(db, oauth_account_id: str) -> HealthResult:
@@ -1130,7 +1813,11 @@ async def run_and_persist_oauth(db, oauth_account_id: str) -> HealthResult:
     its ``profile.last_health_check``."""
     from sqlalchemy import select
     from packages.core.models.user import OAuthAccount
-    from packages.core.services.oauth_account_credentials import lease_oauth_account_tokens
+    from packages.core.credentials import CredentialDecryptError
+    from packages.core.services.oauth_account_credentials import (
+        lease_oauth_account_tokens,
+        mark_oauth_account_credential_reconnect_required,
+    )
 
     row = (await db.execute(
         select(OAuthAccount).where(OAuthAccount.id == oauth_account_id)
@@ -1138,16 +1825,62 @@ async def run_and_persist_oauth(db, oauth_account_id: str) -> HealthResult:
     if not row:
         return {"ok": False, "detail": "oauth account not found", "latency_ms": 0.0, "checked_at": _now_iso()}
 
-    # Feed the access_token (+ any extras already on profile) into the
-    # test. Providers like email/webhook don't use oauth_accounts, so
-    # they're unreachable here — fine.
-    creds = lease_oauth_account_tokens(
-        row,
-        requester_id="integration_health",
-        reason="oauth.integration_health",
-    )
-    register_integration(canonical_integration_key(row.provider))
-    result = await run_test(row.provider, creds)
+    # Lease only stored token credentials here. Provider-specific profile
+    # metadata is merged explicitly below so arbitrary profile fields never
+    # become credential material.
+    try:
+        creds = lease_oauth_account_tokens(
+            row,
+            requester_id="integration_health",
+            reason="oauth.integration_health",
+        )
+    except CredentialDecryptError:
+        result = mark_oauth_account_credential_reconnect_required(
+            row,
+            provider=canonical_integration_key(row.provider),
+            checked_at=_now_iso(),
+        )
+        await db.flush()
+        logger.warning(
+            "OAuth health check %s: stored credentials could not be decrypted; "
+            "marked for reconnect",
+            oauth_account_id,
+        )
+        return {**result, "needs_reconnect": True}
+
+    provider_key = canonical_integration_key(row.provider)
+    if provider_key == "quickbooks":
+        profile = row.profile if isinstance(row.profile, dict) else {}
+        realm_id = str(profile.get("realm_id") or "").strip()
+        if realm_id:
+            creds = {**(creds or {}), "realm_id": realm_id}
+
+    wiring_ctx = None
+    if provider_key == "discord":
+        from packages.core.config import get_settings
+        from packages.core.services.discord_app_config import (
+            resolve_discord_app_config,
+        )
+
+        app = await resolve_discord_app_config(db)
+        profile = row.profile if isinstance(row.profile, dict) else {}
+        profile_application_id = str(profile.get("application_id") or "").strip()
+        guild_id = str(profile.get("guild_id") or "").strip()
+        if app is not None and profile_application_id == app.application_id:
+            creds = {
+                **(creds or {}),
+                "bot_token": app.bot_token,
+                "application_id": app.application_id,
+                "guild_id": guild_id,
+                "guild_name": str(profile.get("guild_name") or "").strip(),
+            }
+        base = get_settings().PUBLIC_BASE_URL.rstrip("/")
+        wiring_ctx = {
+            "expected_url": f"{base}/api/v1/channels/discord/interactions",
+        }
+
+    register_integration(provider_key)
+    result = await run_test(row.provider, creds, wiring_ctx=wiring_ctx)
 
     profile = dict(row.profile or {})
     profile["last_health_check"] = result

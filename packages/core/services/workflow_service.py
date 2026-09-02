@@ -10,6 +10,7 @@ from sqlalchemy.orm import load_only, with_expression
 
 from packages.core.ai.workflow_import import import_workflow
 from packages.core.ai.workflow_import.model import CANONICAL_NODE_TYPES
+from packages.core.contracts.json_schema import SchemaContractValidatorFactory
 from packages.core.models.base import generate_ulid
 from packages.core.models.permission import Visibility
 from packages.core.models.user import User
@@ -21,13 +22,34 @@ from packages.core.models.workflow import (
     WorkflowTemplateInstallation,
 )
 from packages.core.models.workspace import Workspace
+from packages.core.workspaces import is_sandbox_workspace
 from packages.core.services.workflow_run_trace import (
+    WORKFLOW_IMPORT_PROOF_TAG_PREFIX,
+    WORKFLOW_IMPORT_SOURCE_TAG_PREFIX,
     DEFINITION_CHANGED_ERROR,
     append_execution_trace,
     build_definition_snapshot,
+    build_execution_snapshot,
+    execution_snapshot_for_run,
     summarize_trace_text,
+    trusted_workflow_import_source,
+    workflow_import_provenance_tags,
     workflow_definition_changed,
+    workflow_execution_view,
     workflow_definition_fingerprint,
+)
+from packages.core.services.reusable_resource_locks import (
+    RESOURCE_WORKFLOW,
+    lock_reusable_resource_lifecycle,
+    lock_reusable_resource_payload_reference_delta,
+    lock_reusable_resource_payload_references,
+    lock_reusable_resource_reference,
+    lock_reusable_resource_references,
+)
+from packages.core.constants.workflow import (
+    WORKFLOW_RUN_TERMINAL_STATUSES,
+    WORKFLOW_TERMINAL_EFFECTS_TRIGGER_FIELD,
+    WorkflowRunStatus,
 )
 
 logger = logging.getLogger(__name__)
@@ -40,7 +62,81 @@ RUN_RESERVED_TRIGGER_FIELDS = {
     "retry_from_step_id",
     "attempt_number",
     "_workflow_history_summary",
+    WORKFLOW_TERMINAL_EFFECTS_TRIGGER_FIELD,
 }
+
+
+async def _assert_workspace_workflow_execution_ready(
+    db: AsyncSession,
+    *,
+    workspace_id: str | None,
+    entity_id: str,
+) -> None:
+    if not workspace_id:
+        return
+    workspace = (await db.execute(
+        select(Workspace).where(
+            Workspace.id == workspace_id,
+            Workspace.entity_id == entity_id,
+            Workspace.deleted_at.is_(None),
+        )
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )).scalar_one_or_none()
+    if workspace is None:
+        raise ValueError("Workspace not found")
+    if workspace.status != "active":
+        raise ValueError("Workflow execution requires an active Workspace")
+    if is_sandbox_workspace(workspace):
+        raise ValueError("Workspace simulation cannot start an ordinary Workflow run")
+    from packages.core.services.workspace_readiness import (
+        evaluate_workspace_blocking_setup,
+    )
+
+    setup_status = await evaluate_workspace_blocking_setup(db, workspace)
+    if setup_status is not None and setup_status.blocks_work:
+        raise ValueError(
+            "Workspace setup is incomplete; normal Workflow runs are suspended"
+        )
+
+
+async def _lock_workspace_workflow_configuration_scope(
+    db: AsyncSession,
+    *,
+    workspace_id: str | None,
+    entity_id: str,
+) -> None:
+    """Require one live owning Workspace before persisting a deployment."""
+
+    if not workspace_id:
+        return
+    workspace = (await db.execute(
+        select(Workspace.id)
+        .where(
+            Workspace.id == workspace_id,
+            Workspace.entity_id == entity_id,
+            Workspace.deleted_at.is_(None),
+        )
+        .with_for_update()
+    )).scalar_one_or_none()
+    if workspace is None:
+        raise ValueError("Workspace not found")
+
+
+class WorkflowInUseError(ValueError):
+    """A definition still has deployment or automation references."""
+
+    def __init__(
+        self,
+        *,
+        binding_ids: list[str],
+        scheduled_job_ids: list[str],
+    ) -> None:
+        super().__init__(
+            "Remove workflow deployments and scheduled automations before deleting it"
+        )
+        self.binding_ids = binding_ids
+        self.scheduled_job_ids = scheduled_job_ids
 
 
 def _run_summary_options():
@@ -260,6 +356,16 @@ def _step_outgoing_targets(
         defaults = config.get("default_next", [])
         if isinstance(defaults, list):
             outgoing.extend(str(target) for target in defaults if str(target).strip())
+    error_targets = config.get("error_next", [])
+    if isinstance(error_targets, list):
+        outgoing.extend(
+            str(target) for target in error_targets if str(target).strip()
+        )
+    elif "error_next" in config:
+        errors.append({
+            "code": "invalid_edge_list",
+            "message": f"Node '{step_id}' field 'config.error_next' must be a list",
+        })
     return list(dict.fromkeys(outgoing))
 
 
@@ -411,7 +517,125 @@ def _validate_stage_config(
     return list(dict.fromkeys(route_targets))
 
 
-def validate_workflow_steps(steps: list[dict] | None) -> dict:
+def _validate_workflow_schema_contracts(
+    nodes: object,
+    errors: list[dict[str, str]],
+    *,
+    parent_id: str = "",
+) -> None:
+    """Validate top-level and nested executable node contracts before a run."""
+
+    if not isinstance(nodes, list):
+        return
+    for index, node in enumerate(nodes):
+        if not isinstance(node, dict):
+            continue
+        node_id = str(node.get("id") or index)
+        qualified_id = f"{parent_id}.{node_id}" if parent_id else node_id
+        config = node.get("config") if isinstance(node.get("config"), dict) else {}
+        for side in ("input", "output"):
+            key = f"{side}_schema"
+            schema = config.get(key)
+            if schema is None:
+                continue
+            try:
+                SchemaContractValidatorFactory.build(schema)
+            except Exception as exc:
+                errors.append({
+                    "code": f"invalid_{side}_schema",
+                    "message": (
+                        f"Node '{qualified_id}' has invalid config.{key}: {exc}"
+                    ),
+                })
+        run_inputs = config.get("run_inputs")
+        if isinstance(run_inputs, list):
+            for input_index, run_input in enumerate(run_inputs):
+                if not isinstance(run_input, dict) or "schema" not in run_input:
+                    continue
+                schema = run_input.get("schema")
+                if schema is None:
+                    continue
+                input_key = str(
+                    run_input.get("key") or run_input.get("name") or input_index
+                )
+                try:
+                    SchemaContractValidatorFactory.build(schema)
+                except Exception as exc:
+                    errors.append({
+                        "code": "invalid_input_schema",
+                        "message": (
+                            f"Node '{qualified_id}' run input '{input_key}' has "
+                            f"an invalid schema: {exc}"
+                        ),
+                    })
+        for nested_key in ("operations", "steps"):
+            _validate_workflow_schema_contracts(
+                config.get(nested_key),
+                errors,
+                parent_id=qualified_id,
+            )
+
+
+def _public_workflow_tags(tags: object) -> list[str]:
+    values = tags if isinstance(tags, list) else []
+    return [
+        normalized
+        for tag in values
+        if (normalized := str(tag).strip())
+        and not normalized.lower().startswith(
+            (
+                WORKFLOW_IMPORT_SOURCE_TAG_PREFIX,
+                WORKFLOW_IMPORT_PROOF_TAG_PREFIX,
+            )
+        )
+    ]
+
+
+def _imported_workflow_source(workflow: object) -> str | None:
+    return trusted_workflow_import_source(workflow)
+
+
+def _is_imported_unmapped_node(step: dict, source: str) -> bool:
+    meta = step.get("meta") if isinstance(step.get("meta"), dict) else {}
+    return (
+        meta.get("unmapped") is True
+        and str(meta.get("source_tool") or "").strip().lower() == source
+    )
+
+
+_DERIVE_IMPORT_SOURCE = object()
+
+
+def _require_runtime_workflow(
+    workflow: object,
+    *,
+    steps: list[dict] | None = None,
+    imported_source: str | None | object = _DERIVE_IMPORT_SOURCE,
+) -> None:
+    """Require a safe graph while preserving imported-node skip semantics."""
+
+    runtime_steps = steps if steps is not None else getattr(workflow, "steps", None)
+    trusted_source = (
+        _imported_workflow_source(workflow)
+        if imported_source is _DERIVE_IMPORT_SOURCE
+        else imported_source
+    )
+    validation = validate_workflow_steps(
+        runtime_steps,
+        imported_source=(
+            str(trusted_source).strip().lower() if trusted_source else None
+        ),
+    )
+    if not validation["valid"]:
+        messages = "; ".join(error["message"] for error in validation["errors"])
+        raise ValueError(f"Workflow is invalid: {messages}")
+
+
+def validate_workflow_steps(
+    steps: list[dict] | None,
+    *,
+    imported_source: str | None = None,
+) -> dict:
     """Validate a workflow graph for authoring, deployment, and execution.
 
     Errors make the graph unsafe to run. Warnings describe incomplete but
@@ -431,6 +655,8 @@ def validate_workflow_steps(steps: list[dict] | None) -> dict:
             "node_count": 0,
             "edge_count": 0,
         }
+
+    _validate_workflow_schema_contracts(nodes, errors)
 
     ids: list[str] = []
     seen: set[str] = set()
@@ -466,7 +692,10 @@ def validate_workflow_steps(steps: list[dict] | None) -> dict:
                 "code": "unsupported_node_type",
                 "message": f"Node '{step_id}' has unsupported type '{step_type or 'missing'}'",
             })
-        elif step_type == "unsupported":
+        elif step_type == "unsupported" and not (
+            imported_source
+            and _is_imported_unmapped_node(step, imported_source)
+        ):
             errors.append({
                 "code": "unmapped_node",
                 "message": f"Node '{step_id}' must be replaced with a runnable Manor node",
@@ -539,6 +768,15 @@ def validate_workflow_steps(steps: list[dict] | None) -> dict:
     }
 
 
+def validate_workflow_definition(workflow: object) -> dict:
+    """Validate a persisted definition with its server-owned provenance."""
+
+    return validate_workflow_steps(
+        getattr(workflow, "steps", None),
+        imported_source=_imported_workflow_source(workflow),
+    )
+
+
 async def list_workflows(db: AsyncSession, entity_id: str) -> list[WorkflowDefinition]:
     result = await db.execute(
         select(WorkflowDefinition)
@@ -570,9 +808,17 @@ async def create_workflow(
     variables: dict | None = None,
     category: str | None = None,
     tags: list[str] | None = None,
+    import_source: str | None = None,
     workspace_id: str | None = None,
     visibility: str | None = None,
 ) -> WorkflowDefinition:
+    await lock_reusable_resource_payload_references(
+        db,
+        entity_id=entity_id,
+        payload=steps,
+    )
+    workflow_tags = _public_workflow_tags(tags)
+    normalized_import_source = str(import_source or "").strip().lower()
     wf = WorkflowDefinition(
         id=generate_ulid(),
         entity_id=entity_id,
@@ -587,8 +833,13 @@ async def create_workflow(
         trigger_config=trigger_config or {},
         variables=variables or {},
         category=category,
-        tags=tags or [],
+        tags=workflow_tags,
     )
+    if normalized_import_source:
+        wf.tags = [
+            *workflow_tags,
+            *workflow_import_provenance_tags(wf, normalized_import_source),
+        ]
     db.add(wf)
     await db.flush()
     await db.refresh(wf)
@@ -703,14 +954,49 @@ _WORKFLOW_CONTENT_REVISION_FIELDS = ("steps", "name", "variables")
 
 
 async def update_workflow(
-    db: AsyncSession, workflow_id: str, entity_id: str, **kwargs
+    db: AsyncSession,
+    workflow_id: str,
+    entity_id: str,
+    *,
+    require_valid_steps: bool = False,
+    **kwargs,
 ) -> WorkflowDefinition | None:
     wf = await get_workflow(db, workflow_id, entity_id)
     if not wf:
         return None
+    imported_source = _imported_workflow_source(wf)
+    if require_valid_steps and kwargs.get("steps") is not None:
+        _require_runtime_workflow(
+            wf,
+            steps=kwargs["steps"],
+            imported_source=imported_source,
+        )
+    steps_changed = (
+        kwargs.get("steps") is not None
+        and kwargs["steps"] != (wf.steps or [])
+    )
+    if kwargs.get("steps") is not None:
+        await lock_reusable_resource_payload_reference_delta(
+            db,
+            entity_id=entity_id,
+            before=wf.steps,
+            after=kwargs["steps"],
+        )
     content_patch: dict = {}
     for key, value in kwargs.items():
         if value is not None and hasattr(wf, key):
+            if key == "tags":
+                import_tags = [
+                    tag
+                    for tag in (wf.tags or [])
+                    if str(tag).strip().lower().startswith(
+                        (
+                            WORKFLOW_IMPORT_SOURCE_TAG_PREFIX,
+                            WORKFLOW_IMPORT_PROOF_TAG_PREFIX,
+                        )
+                    )
+                ]
+                value = [*_public_workflow_tags(value), *import_tags]
             if (
                 key in _WORKFLOW_CONTENT_REVISION_FIELDS
                 and getattr(wf, key) != value
@@ -719,6 +1005,14 @@ async def update_workflow(
             setattr(wf, key, value)
     if kwargs:
         wf.version = int(wf.version or 1) + 1
+    if imported_source:
+        public_tags = _public_workflow_tags(wf.tags)
+        provenance_tags = (
+            workflow_import_provenance_tags(wf, imported_source)
+            if not steps_changed
+            else [f"{WORKFLOW_IMPORT_SOURCE_TAG_PREFIX}{imported_source}"]
+        )
+        wf.tags = [*public_tags, *provenance_tags]
     if content_patch:
         # M11: real content changes bump the config revision + audit row.
         from packages.core.revisions import bump_revision
@@ -729,10 +1023,54 @@ async def update_workflow(
     return wf
 
 
+async def workflow_definition_references(
+    db: AsyncSession,
+    workflow_id: str,
+    entity_id: str,
+) -> dict[str, list[str]]:
+    binding_ids = list((await db.execute(
+        select(WorkflowBinding.id).where(
+            WorkflowBinding.entity_id == entity_id,
+            WorkflowBinding.workflow_id == workflow_id,
+        )
+    )).scalars())
+
+    from packages.core.models.scheduler import ScheduledJob
+
+    scheduled_jobs = list((await db.execute(
+        select(ScheduledJob).where(
+            ScheduledJob.entity_id == entity_id,
+            ScheduledJob.execution_type == "workflow",
+        )
+    )).scalars())
+    scheduled_job_ids = [
+        job.id
+        for job in scheduled_jobs
+        if str((job.execution_target or {}).get("workflow_id") or "") == workflow_id
+    ]
+    return {
+        "binding_ids": sorted(binding_ids),
+        "scheduled_job_ids": sorted(scheduled_job_ids),
+    }
+
+
 async def delete_workflow(db: AsyncSession, workflow_id: str, entity_id: str) -> bool:
     wf = await get_workflow(db, workflow_id, entity_id)
     if not wf:
         return False
+    await lock_reusable_resource_reference(
+        db,
+        entity_id=entity_id,
+        resource_type=RESOURCE_WORKFLOW,
+        resource_id=workflow_id,
+    )
+    references = await workflow_definition_references(
+        db,
+        workflow_id,
+        entity_id,
+    )
+    if references["binding_ids"] or references["scheduled_job_ids"]:
+        raise WorkflowInUseError(**references)
     sources = list((await db.execute(
         select(WorkflowTemplateInstallation).where(
             WorkflowTemplateInstallation.entity_id == entity_id,
@@ -775,6 +1113,17 @@ async def create_workflow_binding(
     if trigger_type == "webhook" and not cfg.get("webhook_token"):
         cfg["webhook_token"] = generate_ulid()
 
+    await lock_reusable_resource_reference(
+        db,
+        entity_id=entity_id,
+        resource_type=RESOURCE_WORKFLOW,
+        resource_id=workflow_id,
+    )
+    await _lock_workspace_workflow_configuration_scope(
+        db,
+        workspace_id=workspace_id,
+        entity_id=entity_id,
+    )
     binding = WorkflowBinding(
         id=generate_ulid(),
         entity_id=entity_id,
@@ -855,6 +1204,27 @@ async def update_binding(
     binding = await get_binding(db, binding_id, entity_id)
     if not binding:
         return None
+    workflow_ids: set[str] = set()
+    if (
+        "workflow_id" in changes
+        and changes["workflow_id"] is not None
+        and str(changes["workflow_id"]) != str(binding.workflow_id)
+    ):
+        workflow_ids.add(str(changes["workflow_id"]))
+    if "workspace_id" in changes:
+        await lock_reusable_resource_lifecycle(db, entity_id=entity_id)
+    if workflow_ids:
+        await lock_reusable_resource_references(
+            db,
+            entity_id=entity_id,
+            workflow_ids=workflow_ids,
+        )
+    if "workspace_id" in changes:
+        await _lock_workspace_workflow_configuration_scope(
+            db,
+            workspace_id=changes.get("workspace_id"),
+            entity_id=entity_id,
+        )
     for key in (
         "workflow_id", "workspace_id", "business_line", "name", "trigger_type",
         "trigger_config", "variables", "config", "enabled", "status",
@@ -952,14 +1322,13 @@ async def schedule_workflow(
         cron_expr=str(cron),
         timezone_str=timezone_str,
         execution_type="workflow",
+        execution_target={
+            "workflow_id": workflow_id,
+            **({"workspace_id": workspace_id} if workspace_id else {}),
+        },
         workspace_id=workspace_id,
         user_id=created_by,
     )
-    job.execution_target = {
-        "workflow_id": workflow_id,
-        **({"workspace_id": workspace_id} if workspace_id else {}),
-    }
-    await db.flush()
     return job
 
 
@@ -994,7 +1363,7 @@ async def import_workflow_definition(
         steps=defn["steps"],
         variables=defn["variables"],
         category=business_line,
-        tags=[f"imported:{report.source_tool}"],
+        import_source=report.source_tool,
         description=(
             f"Imported from {report.source_tool} — "
             f"{report.mapped}/{report.node_count} nodes mapped "
@@ -1058,22 +1427,8 @@ def _attempt_trigger_data(
     return data
 
 
-def _selected_step_targets(step: dict, result: dict | None) -> list[str]:
-    if result is not None and "next_override" in result:
-        value = result.get("next_override")
-        if value in (None, ""):
-            return []
-        return [str(item) for item in (value if isinstance(value, list) else [value])]
-    if result is not None:
-        value = step.get("next") or []
-        return [str(item) for item in (value if isinstance(value, list) else [value])]
-
-    # A checkpoint retry can target a node beyond an intermediate condition
-    # that never persisted a result (for example, when the process restarted
-    # immediately after its producer completed).  Follow every declared branch
-    # while discovering ancestors; filtering below still inherits only steps
-    # with completed receipts.  Using only ``next`` here loses ``true_next`` in
-    # normalized graphs where ``next`` contains the fallback branch.
+def _declared_step_targets(step: dict) -> list[str]:
+    """Return every declared target for retry ancestor discovery only."""
     targets: list[str] = []
     for key in ("next", "true_next", "false_next"):
         value = step.get(key) or []
@@ -1087,7 +1442,36 @@ def _selected_step_targets(step: dict, result: dict | None) -> list[str]:
             targets.extend(value if isinstance(value, list) else [value])
         value = config.get("default_next") or []
         targets.extend(value if isinstance(value, list) else [value])
+    config = step.get("config") if isinstance(step.get("config"), dict) else {}
+    value = config.get("error_next") or []
+    targets.extend(value if isinstance(value, list) else [value])
     return list(dict.fromkeys(str(item) for item in targets if item))
+
+
+def _selected_step_targets(step: dict, result: dict | None) -> list[str]:
+    if result is not None and "next_override" in result:
+        value = result.get("next_override")
+        if value in (None, ""):
+            return []
+        return [str(item) for item in (value if isinstance(value, list) else [value])]
+    if result is not None and step.get("type") == "condition":
+        condition_result = result.get("condition_result", result.get("output"))
+        if isinstance(condition_result, bool):
+            key = "true_next" if condition_result else "false_next"
+            value = step.get(key, step.get("next", []) if condition_result else [])
+            return [str(item) for item in (value if isinstance(value, list) else [value])]
+        return _declared_step_targets(step)
+    if result is not None:
+        value = step.get("next") or []
+        return [str(item) for item in (value if isinstance(value, list) else [value])]
+
+    # A checkpoint retry can target a node beyond an intermediate condition
+    # that never persisted a result (for example, when the process restarted
+    # immediately after its producer completed).  Follow every declared branch
+    # while discovering ancestors; filtering below still inherits only steps
+    # with completed receipts.  Using only ``next`` here loses ``true_next`` in
+    # normalized graphs where ``next`` contains the fallback branch.
+    return _declared_step_targets(step)
 
 
 def retry_inherited_step_ids(
@@ -1283,8 +1667,24 @@ def _retry_variables(
         config = step.get("config") if isinstance(step.get("config"), dict) else {}
         output_var = str(config.get("output_var") or "").strip()
         result = prior_results.get(step_id) or {}
-        if output_var and result.get("status") == "completed" and "output" in result:
-            updated[output_var] = deepcopy(result["output"])
+        if result.get("status") == "completed" and "output" in result:
+            step_output = deepcopy(result["output"])
+            updated[step_id] = step_output
+            if output_var:
+                updated[output_var] = deepcopy(step_output)
+            for item in config.get("outputs") or []:
+                if not isinstance(item, dict):
+                    continue
+                key = str(item.get("key") or item.get("name") or "").strip()
+                if not key:
+                    continue
+                value = resolve_inherited_named_output(
+                    step_id,
+                    step_output,
+                    item.get("value"),
+                )
+                if value is not missing_output:
+                    updated[key] = deepcopy(value)
         if step.get("type") != "stage":
             continue
         inherited_stage_state = stage_execution.get(step_id)
@@ -1498,11 +1898,22 @@ async def start_workflow(
     trigger_source: str = "manual",
 ) -> WorkflowRun:
     """Start a new workflow run."""
+    await lock_reusable_resource_reference(
+        db,
+        entity_id=entity_id,
+        resource_type=RESOURCE_WORKFLOW,
+        resource_id=workflow_id,
+    )
     wf = await get_workflow(db, workflow_id, entity_id)
     if not wf:
         raise ValueError("Workflow not found")
     if not wf.is_active or wf.status != "active":
         raise ValueError("Workflow is inactive")
+    await _assert_workspace_workflow_execution_ready(
+        db,
+        workspace_id=workspace_id,
+        entity_id=entity_id,
+    )
     await _validate_workspace_service_dependencies(
         db, workflow=wf, workspace_id=workspace_id,
     )
@@ -1514,6 +1925,7 @@ async def start_workflow(
 
     steps = wf.steps or []
     first_step_id = require_entry_step_id(steps)
+    _require_runtime_workflow(wf)
     attempt_trigger_data = _attempt_trigger_data(wf, trigger_data)
 
     run_id = generate_ulid()
@@ -1533,6 +1945,10 @@ async def start_workflow(
         step_results={},
         trigger_data=attempt_trigger_data,
         definition_snapshot=build_definition_snapshot(
+            wf,
+            fingerprint=attempt_trigger_data["_workflow_definition_fingerprint"],
+        ),
+        execution_snapshot=build_execution_snapshot(
             wf,
             fingerprint=attempt_trigger_data["_workflow_definition_fingerprint"],
         ),
@@ -1562,6 +1978,12 @@ async def start_workflow_from_binding(
     ``trigger_source`` so the engine resolves the right workspace connectors,
     RAG, approvers and budget (see docs/design/workflow-engine.md §4.1).
     """
+    await lock_reusable_resource_reference(
+        db,
+        entity_id=binding.entity_id,
+        resource_type=RESOURCE_WORKFLOW,
+        resource_id=binding.workflow_id,
+    )
     wf = await get_workflow(db, binding.workflow_id, binding.entity_id)
     if not wf:
         raise ValueError("Workflow not found for binding")
@@ -1576,6 +1998,11 @@ async def start_workflow_from_binding(
     ):
         raise ValueError("Workflow binding belongs to another workspace")
     effective_workspace_id = binding.workspace_id or execution_workspace_id
+    await _assert_workspace_workflow_execution_ready(
+        db,
+        workspace_id=effective_workspace_id,
+        entity_id=binding.entity_id,
+    )
     await _validate_workspace_service_dependencies(
         db, workflow=wf, workspace_id=effective_workspace_id,
     )
@@ -1592,6 +2019,7 @@ async def start_workflow_from_binding(
 
     steps = wf.steps or []
     first_step_id = require_entry_step_id(steps)
+    _require_runtime_workflow(wf)
     attempt_trigger_data = _attempt_trigger_data(wf, trigger_data)
 
     run_id = generate_ulid()
@@ -1611,6 +2039,10 @@ async def start_workflow_from_binding(
         step_results={},
         trigger_data=attempt_trigger_data,
         definition_snapshot=build_definition_snapshot(
+            wf,
+            fingerprint=attempt_trigger_data["_workflow_definition_fingerprint"],
+        ),
+        execution_snapshot=build_execution_snapshot(
             wf,
             fingerprint=attempt_trigger_data["_workflow_definition_fingerprint"],
         ),
@@ -1653,6 +2085,7 @@ async def dispatch_trigger(
     trigger_type: str,
     event_name: str | None = None,
     workspace_id: str | None = None,
+    require_workspace_match: bool = False,
     trigger_data: dict | None = None,
     started_by: str | None = None,
 ) -> list[WorkflowRun]:
@@ -1662,6 +2095,7 @@ async def dispatch_trigger(
       - binding.enabled is True
       - binding.trigger_type == trigger_type
       - if workspace_id given, binding.workspace_id == workspace_id
+      - if require_workspace_match, ``None`` also means only entity-level bindings
       - if event_name given, binding.trigger_config["event"] == event_name
 
     Returns the started runs (one per matched binding).
@@ -1677,7 +2111,7 @@ async def dispatch_trigger(
         WorkflowDefinition.is_active.is_(True),
         WorkflowDefinition.status == "active",
     )
-    if workspace_id is not None:
+    if require_workspace_match or workspace_id is not None:
         q = q.where(WorkflowBinding.workspace_id == workspace_id)
     bindings = list((await db.execute(q)).scalars().all())
 
@@ -1856,6 +2290,18 @@ async def retry_workflow_run(
     prior = await get_run(db, run_id, entity_id)
     if prior is None:
         raise ValueError("Workflow run not found")
+    await lock_reusable_resource_reference(
+        db,
+        entity_id=entity_id,
+        resource_type=RESOURCE_WORKFLOW,
+        resource_id=prior.workflow_id,
+    )
+    if prior.workspace_id:
+        await _assert_workspace_workflow_execution_ready(
+            db,
+            workspace_id=prior.workspace_id,
+            entity_id=entity_id,
+        )
     latest_family_attempt = await latest_workflow_run_family_attempt(
         db,
         prior,
@@ -1870,6 +2316,21 @@ async def retry_workflow_run(
     )
     if prior.status not in {"failed", "cancelled"} and not retryable_business_outcome:
         raise ValueError("Workflow run is not retryable")
+    blocked_step_id = next(
+        (
+            str(step_id)
+            for step_id, result in (prior.step_results or {}).items()
+            if isinstance(result, dict)
+            and result.get("producer_completed") is True
+            and result.get("retry_blocked") is True
+        ),
+        None,
+    )
+    if blocked_step_id is not None:
+        raise ValueError(
+            f"Workflow retry is blocked: producer already completed at step "
+            f"'{blocked_step_id}', but its output failed the contract"
+        )
 
     workflow = await get_workflow(db, prior.workflow_id, entity_id)
     if workflow is None:
@@ -1885,10 +2346,37 @@ async def retry_workflow_run(
         or ""
     )
     current_fingerprint = workflow_definition_fingerprint(workflow)
-    if stored_fingerprint and stored_fingerprint != current_fingerprint:
-        raise ValueError("Workflow definition changed since the failed attempt")
+    prior_execution_snapshot = execution_snapshot_for_run(workflow, prior)
+    if prior_execution_snapshot is None:
+        if not stored_fingerprint or stored_fingerprint != current_fingerprint:
+            raise ValueError(
+                "Workflow definition changed since the failed attempt; this legacy "
+                "run has no immutable execution snapshot"
+            )
+        execution_workflow = workflow
+        prior_execution_snapshot = build_execution_snapshot(
+            workflow,
+            fingerprint=current_fingerprint,
+        )
+    else:
+        execution_workflow = workflow_execution_view(workflow, prior)
 
-    normalized_variables = _validate_retry_variable_patch(workflow, prior, variables)
+    _require_runtime_workflow(
+        workflow,
+        steps=execution_workflow.steps or [],
+        imported_source=prior_execution_snapshot.get("import_source"),
+    )
+    await _validate_workspace_service_dependencies(
+        db,
+        workflow=execution_workflow,
+        workspace_id=prior.workspace_id,
+    )
+
+    normalized_variables = _validate_retry_variable_patch(
+        execution_workflow,
+        prior,
+        variables,
+    )
     retry_step_id = str(
         from_step_id
         or retry_state.get("retry_from_step_id")
@@ -1897,14 +2385,14 @@ async def retry_workflow_run(
     ).strip()
     step_ids = {
         str(step.get("id"))
-        for step in workflow.steps or []
+        for step in execution_workflow.steps or []
         if step.get("id")
     }
     if retry_step_id not in step_ids:
         raise ValueError("Retry step is not part of the workflow")
 
     inherited_ids = retry_inherited_step_ids(
-        workflow.steps or [],
+        execution_workflow.steps or [],
         prior.step_results or {},
         retry_step_id,
     )
@@ -1928,12 +2416,12 @@ async def retry_workflow_run(
         prior.effective_attempt_number,
         latest_family_attempt.effective_attempt_number,
     ) + 1
-    retry_trigger = _attempt_trigger_data(workflow, prior_trigger)
+    retry_trigger = _attempt_trigger_data(execution_workflow, prior_trigger)
     if prior_snapshot:
         retry_trigger.update(_snapshot_display_metadata(prior_snapshot))
     retry_trigger["input_patch"] = deepcopy(variables or {})
     retry_variables = _retry_variables(
-        workflow,
+        execution_workflow,
         prior,
         inherited_ids,
         normalized_variables,
@@ -1944,6 +2432,8 @@ async def retry_workflow_run(
         prior,
         retry_variables,
     )
+
+    retry_execution_snapshot = deepcopy(prior_execution_snapshot)
 
     retry = WorkflowRun(
         id=generate_ulid(),
@@ -1966,10 +2456,11 @@ async def retry_workflow_run(
             deepcopy(prior_snapshot)
             if prior_snapshot
             else build_definition_snapshot(
-                workflow,
-                fingerprint=current_fingerprint,
+                execution_workflow,
+                fingerprint=prior_execution_snapshot["fingerprint"],
             )
         ),
+        execution_snapshot=retry_execution_snapshot,
         execution_trace=[],
         started_by=started_by,
         started_at=datetime.now(timezone.utc),
@@ -2020,28 +2511,123 @@ async def execute_workflow_step(db: AsyncSession, run_id: str, entity_id: str) -
     The manual ``/step`` API used to duplicate a small subset of runner logic,
     which made newer nodes (code, HTTP, media, loop, subworkflow, etc.) appear to
     succeed without executing. Reusing ``WorkflowRunner`` keeps full-run,
-    single-node, and step-by-step behavior identical.
+    single-node, and step-by-step behavior identical. This function owns the
+    commit so the execution claim is held until the node checkpoint is durable.
     """
+    from packages.core.ai.workflow_runner import (
+        WorkflowRunner,
+        mark_workflow_terminal_effects_pending,
+    )
+    from packages.core.services.workflow_run_execution_claim import (
+        WorkflowRunExecutionClaimLost,
+        commit_fenced_execution_boundary,
+        workflow_run_execution_claim,
+    )
+
+    try:
+        async with workflow_run_execution_claim(run_id) as claim:
+            if not claim:
+                return {"error": "Run is already executing"}
+            result = await _execute_claimed_workflow_step(
+                db,
+                run_id,
+                entity_id,
+            )
+            run = await get_run(db, run_id, entity_id)
+            settled_statuses = {
+                "completed",
+                "failed",
+                "paused",
+                "cancelled",
+            }
+            if (
+                run is not None
+                and run.status in settled_statuses
+                and result.get("status") in settled_statuses
+            ):
+                from packages.core.ledger.adapters import record_workflow_run_status
+                from packages.core.services.workflow_chat_projection import (
+                    project_workflow_run_status,
+                )
+
+                await project_workflow_run_status(db, run=run)
+                if run.status == WorkflowRunStatus.PAUSED:
+                    await record_workflow_run_status(db, run)
+                else:
+                    mark_workflow_terminal_effects_pending(run)
+            await commit_fenced_execution_boundary(
+                db.commit,
+                before_commit=claim.raise_if_lost,
+                after_commit=claim.mark_terminal_committed,
+                execution_claim=claim,
+                session=db,
+            )
+            if (
+                run is not None
+                and run.status in WORKFLOW_RUN_TERMINAL_STATUSES
+                and result.get("status") in WORKFLOW_RUN_TERMINAL_STATUSES
+            ):
+                from packages.core.ai.workflow_runner import (
+                    finalize_workflow_terminal_effects_best_effort,
+                )
+
+                await finalize_workflow_terminal_effects_best_effort(
+                    run,
+                    db,
+                    context="manual workflow step",
+                )
+            return result
+    except WorkflowRunExecutionClaimLost:
+        # A canceled asyncpg operation can leave the request transaction
+        # unusable. Roll it back before settling the run through a fresh
+        # session, matching the full-run fail-closed path.
+        await db.rollback()
+        settled_status = await WorkflowRunner._fail_lost_execution_claim(run_id)
+        if settled_status is None:
+            return {
+                "status": "running",
+                "error": "Workflow execution ownership changed; the current owner is still running",
+            }
+        return {
+            "status": settled_status,
+            "error": (
+                "Workflow execution claim was lost"
+                if settled_status == "failed"
+                else None
+            ),
+        }
+
+
+async def _execute_claimed_workflow_step(
+    db: AsyncSession,
+    run_id: str,
+    entity_id: str,
+) -> dict:
+    """Execute one node while ``execute_workflow_step`` holds the run claim."""
     run = await get_run(db, run_id, entity_id)
     if not run or run.status not in ("running", "pending"):
         return {"error": "Run not active"}
 
     workflow = await get_workflow(db, run.workflow_id, entity_id)
-    if not workflow:
+    execution_workflow = workflow_execution_view(workflow, run)
+    if not execution_workflow:
         return {"error": "Workflow not found"}
-    if workflow_definition_changed(workflow, run):
+    if workflow is not None and workflow_definition_changed(workflow, run):
         run.status = "failed"
         run.error = DEFINITION_CHANGED_ERROR
         run.completed_at = datetime.now(timezone.utc)
         await db.flush()
         return {"status": "failed", "error": DEFINITION_CHANGED_ERROR}
 
-    from packages.core.ai.workflow_runner import WorkflowRunner, _continues_on_error
+    from packages.core.ai.workflow_runner import (
+        WorkflowRunner,
+        _continue_failed_result,
+    )
 
     runner = WorkflowRunner()
-    runnable = runner._find_runnable_steps(workflow, run)
+    runnable = runner._find_runnable_steps(execution_workflow, run)
     if not runnable:
-        if runner._all_steps_done(workflow, run):
+        if runner._all_steps_done(execution_workflow, run):
             run.status = "completed"
             run.completed_at = datetime.now(timezone.utc)
             await db.flush()
@@ -2051,8 +2637,7 @@ async def execute_workflow_step(db: AsyncSession, run_id: str, entity_id: str) -
     step = runnable[0]
     append_execution_trace(run, node=step, status="running")
     result = await runner._execute_step_safe(step, run, db)
-    if result.get("status") == "failed" and _continues_on_error(step):
-        result["continued"] = True
+    _continue_failed_result(step, result, run)
     runner._record_step_result(step, result, run)
     append_execution_trace(
         run,
@@ -2071,10 +2656,10 @@ async def execute_workflow_step(db: AsyncSession, run_id: str, entity_id: str) -
         )
         run.completed_at = datetime.now(timezone.utc)
     else:
-        next_steps = runner._find_runnable_steps(workflow, run)
+        next_steps = runner._find_runnable_steps(execution_workflow, run)
         if next_steps:
             run.current_step_id = next_steps[0]["id"]
-        elif runner._all_steps_done(workflow, run):
+        elif runner._all_steps_done(execution_workflow, run):
             run.status = "completed"
             run.completed_at = datetime.now(timezone.utc)
 

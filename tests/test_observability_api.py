@@ -472,6 +472,24 @@ async def test_automation_health_aggregates(client: AsyncClient):
     assert binding["active_experiment"] is None
 
 
+async def test_automation_health_excludes_paused_workspace(client: AsyncClient):
+    seed = await _seed(client, "obs_health_paused")
+    import packages.core.database as dbmod
+
+    async with dbmod.async_session() as db:
+        workspace = await db.get(Workspace, seed["workspace_id"])
+        workspace.status = "paused"
+        await db.commit()
+
+    resp = await client.get(
+        f"/api/v1/workspaces/{seed['workspace_id']}/automation-health",
+        headers=seed["headers"],
+    )
+
+    assert resp.status_code == 200
+    assert resp.json() == {"automations": []}
+
+
 # ── task provenance ───────────────────────────────────────────────────
 
 async def _provenance(client: AsyncClient, seed: dict, task_id: str):

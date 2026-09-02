@@ -57,6 +57,7 @@ from packages.core.constants.execution import (
 )
 from packages.core.constants.approvals import HitlType
 from packages.core.constants.pending_actions import PendingActionKind
+from packages.core.services.hitl_options import review_card_options
 from packages.core.constants.supervisor import (
     SUPERVISOR_STEP_RETRY_FLAG,
     SUPERVISOR_VERDICT_LOG_TYPE,
@@ -73,6 +74,8 @@ from packages.core.contracts.envelope import (
 from packages.core.database import async_session
 from packages.core.ai.runtime import (
     RUNTIME_PLAN_EXECUTOR_SOURCE,
+    approval_args_hash,
+    approval_stable_target_hash,
     runtime_emit_plan_executor_task_event,
     runtime_ensure_plan_executor_billing_context,
     runtime_ensure_task_billing_context,
@@ -144,7 +147,7 @@ def _human_step_pending_action(params: dict[str, Any] | None) -> dict[str, Any] 
             "why": prompt or f"{review_title} needs a human verdict.",
         },
         # A review is a verdict on this exact material, never a standing grant.
-        "options": values.get("options") or ["approve", "reject"],
+        "options": review_card_options(values.get("options")),
     }
 
 
@@ -412,6 +415,16 @@ def _task_requires_artifact(task: Any | None) -> bool:
         return False
 
     details = getattr(task, "details", None) or {}
+    from packages.core.plans.task_constraints import (
+        binding_constraints_forbid_artifact_writes,
+    )
+
+    # The runtime_context block is the user's verbatim task contract. It must
+    # win over an inferred or stale machine-authored artifact requirement;
+    # otherwise missing-artifact recovery creates an impossible write step and
+    # retries it until the Plan budget is exhausted.
+    if binding_constraints_forbid_artifact_writes(details):
+        return False
     expected = getattr(task, "expected_output", None) or {}
     if isinstance(details, dict):
         if details.get("requires_artifact") is True:
@@ -828,7 +841,9 @@ def _task_output_contract_issue(
     asking the model supervisor to infer JSON Schema compliance from prose.
     """
     from packages.core.contracts.task_output import (
-        is_task_output_contract_schema,
+        OutputContractKind,
+        output_contract_for_schema,
+        terminal_agent_step_key,
         task_expected_output_json_schema,
     )
 
@@ -836,7 +851,14 @@ def _task_output_contract_issue(
     if expected is None:
         return None
 
-    bound = [step for step in steps if is_task_output_contract_schema(step.expected_output_schema)]
+    terminal_key = terminal_agent_step_key(steps)
+    bound = [
+        step
+        for step in steps
+        if step.step_key == terminal_key
+        if output_contract_for_schema(step.expected_output_schema).kind
+        is OutputContractKind.TASK_ENVELOPE
+    ]
     if len(bound) != 1:
         return (
             "The task declares a structured expected_output, but the plan did not "
@@ -850,6 +872,140 @@ def _task_output_contract_issue(
     if not isinstance(outputs, dict) or "data" not in outputs:
         return f"The structured deliverable step {step.step_key!r} completed without outputs.data."
     return None
+
+
+def _execution_output_contract_issue(
+    plan: ExecutionPlan,
+    steps: list[ExecutionStep],
+    task: Any | None = None,
+) -> str | None:
+    """Prove Plan declarations, materialized Step contracts, and results agree.
+
+    The Dispatcher is the primary lease-boundary validator.  This second,
+    deterministic gate protects finalization from legacy rows, manual data
+    repair, and materialization drift: the model supervisor is never asked to
+    infer JSON Schema compatibility from result prose.
+    """
+    from packages.core.contracts.task_output import (
+        task_output_envelope_schema,
+        terminal_agent_step_key,
+    )
+    from packages.core.dispatcher.validation import (
+        SchemaError,
+        output_schema_is_advisory,
+        validate_step_output,
+    )
+    from packages.core.plans.schema import Plan
+    from packages.core.plans.service import (
+        _expected_output_schema_for_plan_step,
+        _resolve_output_shapes,
+    )
+
+    materialized_by_key = {step.step_key: step for step in steps}
+    try:
+        declared_plan = Plan.model_validate(plan.plan_dag or {})
+    except Exception:  # Legacy Plans may predate the typed DAG contract.
+        declared_plan = None
+
+    if declared_plan is not None:
+        declared_keys = {step.key for step in declared_plan.steps}
+        unexpected = sorted(set(materialized_by_key) - declared_keys)
+        if unexpected:
+            return (
+                "Materialized execution contains Step(s) not declared by the Plan: "
+                + ", ".join(unexpected)
+            )
+
+        shape_by_key = _resolve_output_shapes(declared_plan.topo_order())
+        task_contract = task_output_envelope_schema(
+            getattr(task, "expected_output", None) if task is not None else None
+        )
+        terminal_key = (
+            terminal_agent_step_key(declared_plan.steps)
+            if task_contract is not None
+            else None
+        )
+        for declared in declared_plan.topo_order():
+            materialized = materialized_by_key.get(declared.key)
+            if materialized is None:
+                return f"Plan Step {declared.key!r} has no materialized execution Step."
+            expected = _expected_output_schema_for_plan_step(
+                declared,
+                output_shape=shape_by_key.get(declared.key),
+                task_output_contract_schema=(
+                    task_contract if declared.key == terminal_key else None
+                ),
+            )
+            # A provider may hydrate a previously undeclared action contract
+            # at dispatch time.  That is an additional runtime guarantee, not
+            # drift.  Any contract the Plan did declare must remain identical.
+            if expected is not None and materialized.expected_output_schema != expected:
+                return (
+                    f"Step {declared.key!r} materialized output contract differs "
+                    "from the Plan contract."
+                )
+
+    for step in steps:
+        schema = getattr(step, "expected_output_schema", None)
+        if (
+            step.step_status != ExecutionStepStatus.DONE
+            or schema is None
+            or output_schema_is_advisory(step.kind, schema)
+        ):
+            continue
+        try:
+            validate_step_output(step, step.result)
+        except SchemaError as exc:
+            detail = exc.errors[0]["message"] if exc.errors else str(exc)
+            return (
+                f"Step {step.step_key!r} delivered result does not satisfy its "
+                f"output contract: {detail}"
+            )
+    return None
+
+
+def _validated_terminal_task_output(
+    task: Any | None,
+    steps: list[ExecutionStep],
+) -> tuple[str, Any] | None:
+    """Return the one schema-valid terminal Task deliverable candidate.
+
+    This proves execution facts only: the unique terminal producer is DONE,
+    carries the current Task-authored envelope, did not report a failed
+    control status, and its stored result still validates.  The caller must
+    separately decide whether the Supervisor accepted that candidate as the
+    Task's formal result.
+    """
+    from packages.core.contracts.envelope import envelope_indicates_failure
+    from packages.core.contracts.task_output import (
+        task_output_envelope_schema,
+        task_output_payload,
+        terminal_agent_step_key,
+    )
+    from packages.core.dispatcher.validation import SchemaError, validate_step_output
+
+    authoritative_schema = task_output_envelope_schema(
+        getattr(task, "expected_output", None) if task is not None else None
+    )
+    terminal_key = terminal_agent_step_key(steps)
+    if authoritative_schema is None or terminal_key is None:
+        return None
+
+    candidates = [step for step in steps if step.step_key == terminal_key]
+    if len(candidates) != 1:
+        return None
+    step = candidates[0]
+    if (
+        step.step_status != ExecutionStepStatus.DONE
+        or step.expected_output_schema != authoritative_schema
+        or envelope_indicates_failure(step.result)
+    ):
+        return None
+    try:
+        validate_step_output(step, step.result)
+    except SchemaError:
+        return None
+    return step.step_key, task_output_payload(step.result, step.expected_output_schema)
 
 
 def _structured_status_value(value: Any) -> str:
@@ -1025,6 +1181,21 @@ def _plain_language_blocker(issue: str) -> str:
     return f"the “{step}” step did not complete." if step else "a step did not complete."
 
 
+def _failed_step_issue(steps: list[ExecutionStep]) -> str | None:
+    """Keep the execution failure ahead of consequential missing-output checks."""
+    failed = [step for step in steps if step.step_status == ExecutionStepStatus.FAILED]
+    if not failed:
+        return None
+    human_issue = _human_required_failure_issue(failed)
+    if human_issue:
+        return human_issue
+    return "; ".join(
+        f"{(step.step_key or 'step').replace('_', ' ')}: "
+        f"{str((step.error or {}).get('message') or (step.error or {}).get('type') or 'failed')[:500]}"
+        for step in failed[:3]
+    )
+
+
 def _hitl_request_message(
     task: Any | None,
     steps: list[ExecutionStep],
@@ -1048,31 +1219,28 @@ def _hitl_request_message(
         lines.append("")
         lines.append("**Produced so far:** " + ", ".join(produced))
 
-    if artifact_issue:
+    failure_issue = _failed_step_issue(failed_steps)
+    if failure_issue:
         lines.append("")
-        lines.append(
-            "**Missing:** the deliverable file this task was asked to produce. "
-            "No saved file path or document was recorded by any step."
-        )
+        lines.append(f"**Failed:** {failure_issue}")
     elif structured_issue:
         lines.append("")
         lines.append(
             "**Incomplete:** "
             f"{_plain_language_blocker(structured_issue)}"
         )
-    elif failed_steps:
-        detail = "; ".join(
-            f"{(fs.step_key or 'step').replace('_', ' ')}: "
-            f"{(fs.error or {}).get('message', 'failed')[:120]}"
-            for fs in failed_steps[:3]
-        )
-        lines.append("")
-        lines.append(f"**Failed:** {detail}")
-    else:
+    elif not artifact_issue:
         lines.append("")
         lines.append(
             "**Unverified:** every step reported done, but the supervisor "
             "could not confirm the task objective was met."
+        )
+
+    if artifact_issue:
+        lines.append("")
+        lines.append(
+            "**Missing:** the deliverable file this task was asked to produce. "
+            "No saved file path or document was recorded by any step."
         )
 
     said = _agent_summaries(steps)
@@ -1101,6 +1269,44 @@ def _structured_blocking_issue(task: Any | None, steps: list[ExecutionStep]) -> 
         if issue:
             label = (getattr(step, "step_key", None) or "step").replace("_", " ")
             return f"{label}: {issue}"
+    return None
+
+
+def _human_required_failure_issue(steps: list[ExecutionStep]) -> str | None:
+    """Return a durable blocker that another Step or Plan attempt cannot fix."""
+    human_error_types = {
+        "CreditExhaustedError",
+        "PermissionError",
+        "AuthenticationError",
+    }
+    for step in steps:
+        if step.step_status != ExecutionStepStatus.FAILED:
+            continue
+        error = step.error if isinstance(step.error, dict) else {}
+        failure = error.get("failure")
+        if not isinstance(failure, dict) and isinstance(step.result, dict):
+            failure = step.result.get("failure")
+        requires_human = (
+            isinstance(failure, dict) and failure.get("requires_human") is True
+        )
+        if not requires_human and str(error.get("type") or "") not in human_error_types:
+            continue
+        reason = (
+            str(failure.get("reason") or "").strip()
+            if isinstance(failure, dict)
+            else ""
+        )
+        reason = reason or str(error.get("message") or "").strip()
+        reason = reason or "the run requires a permission, credential, or human decision"
+        blockers = failure.get("blockers") if isinstance(failure, dict) else None
+        blocker_text = ", ".join(
+            str(value).strip()
+            for value in blockers or []
+            if str(value or "").strip()
+        )
+        label = (getattr(step, "step_key", None) or "step").replace("_", " ")
+        suffix = f" (blocked by: {blocker_text})" if blocker_text else ""
+        return f"{label}: {reason}{suffix}"
     return None
 
 
@@ -1157,6 +1363,56 @@ def _supervisor_review_infos(verdict_logs: list) -> list[dict]:
     return infos
 
 
+def _supervisor_actual_result(
+    steps: list[Any],
+    *,
+    acceptance_contract: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Return only step evidence explicitly named by task acceptance criteria."""
+    criteria = (
+        acceptance_contract.get("criteria")
+        if isinstance(acceptance_contract, dict)
+        else None
+    )
+    criteria = [item for item in (criteria or []) if isinstance(item, dict)]
+    evidence_keys: list[str] = []
+    criteria_evidence: list[dict[str, Any]] = []
+    for criterion in criteria:
+        keys = [
+            str(key) for key in (criterion.get("evidence_step_keys") or [])
+            if str(key or "").strip()
+        ]
+        for key in keys:
+            if key not in evidence_keys:
+                evidence_keys.append(key)
+        criteria_evidence.append({
+            "criterion_key": criterion.get("key"),
+            "deliverable_name": criterion.get("deliverable_name"),
+            "description": criterion.get("description"),
+            "evidence_step_keys": keys,
+        })
+
+    by_key = {str(getattr(step, "step_key", "")): step for step in steps}
+    selected_steps = []
+    for key in evidence_keys:
+        step = by_key.get(key)
+        if step is None:
+            continue
+        selected_steps.append({
+            "key": key,
+            "step_key": key,
+            "kind": getattr(step, "kind", None),
+            "status": getattr(step, "step_status", None),
+            "result": getattr(step, "result", None),
+            "evidence_refs": getattr(step, "evidence_refs", None) or [],
+            "error": getattr(step, "error", None),
+        })
+    return {
+        "criteria_evidence": criteria_evidence,
+        "steps": selected_steps,
+    }
+
+
 def _supervisor_step_infos(plan: ExecutionPlan, steps: list[ExecutionStep]) -> list[dict]:
     """What the supervisor gets to see about each step.
 
@@ -1178,6 +1434,9 @@ def _supervisor_step_infos(plan: ExecutionPlan, steps: list[ExecutionStep]) -> l
         if isinstance(entry, dict) and entry.get("key"):
             dag_steps[str(entry["key"])] = entry
 
+    from packages.core.contracts.task_output import output_contract_for_schema
+    from packages.core.dispatcher.validation import output_schema_is_advisory
+
     infos: list[dict] = []
     for s in steps:
         dag = dag_steps.get(s.step_key, {})
@@ -1193,6 +1452,9 @@ def _supervisor_step_infos(plan: ExecutionPlan, steps: list[ExecutionStep]) -> l
         error = ""
         if s.error:
             error = f"{s.error.get('type', '')}: {s.error.get('message', '')}".strip(": ")
+        contract = output_contract_for_schema(
+            getattr(s, "expected_output_schema", None)
+        )
         infos.append({
             "key": s.step_key,
             "kind": s.kind,
@@ -1201,6 +1463,16 @@ def _supervisor_step_infos(plan: ExecutionPlan, steps: list[ExecutionStep]) -> l
             "attempts": s.attempt_count,
             "instruction": " — ".join(part for part in instruction_parts if part),
             "result": _supervisor_result_preview(s.result, max_chars=4000) if s.result else "",
+            "output_contract": contract.payload_schema or contract.schema,
+            "contract_check": (
+                "passed"
+                if (
+                    s.step_status == ExecutionStepStatus.DONE
+                    and contract.has_schema
+                    and not output_schema_is_advisory(s.kind, contract.schema)
+                )
+                else ("advisory" if contract.has_schema else "not_declared")
+            ),
             "artifacts": artifacts,
             "error": error,
         })
@@ -1213,9 +1485,6 @@ def _supervisor_result_preview(result: Any, *, max_chars: int = 1200) -> str:
     if isinstance(result, dict):
         outputs = result.get("outputs")
         if isinstance(outputs, dict):
-            output_text = outputs.get("text")
-            if isinstance(output_text, str) and output_text.strip():
-                return output_text.strip()[:max_chars]
             if "data" in outputs:
                 # ``outputs.data`` is the canonical home of a task-authored
                 # structured deliverable.  Falling through to the envelope's
@@ -1226,6 +1495,9 @@ def _supervisor_result_preview(result: Any, *, max_chars: int = 1200) -> str:
                     summary = str(result.get("summary") or "").strip()
                     parts = [part for part in (summary, data_preview) if part]
                     return "\n".join(parts)[:max_chars]
+            output_text = outputs.get("text")
+            if isinstance(output_text, str) and output_text.strip():
+                return output_text.strip()[:max_chars]
         priority_keys = (
             "result_summary", "summary", "message", "text", "value",
             "content", "answer", "output", "result", "error", "errors",
@@ -1270,6 +1542,45 @@ class PlanExecutor:
                 return {"plan_id": plan_id, "status": "not_found", "next_action": "stop"}
             task_title = await self._load_task_title(db, plan)
 
+            if plan.status in (
+                ExecutionPlanStatus.COMPLETED,
+                ExecutionPlanStatus.FAILED,
+                ExecutionPlanStatus.CANCELLED,
+                ExecutionPlanStatus.REPLANNED,
+            ):
+                return {"plan_id": plan_id, "status": plan.status, "next_action": "stop"}
+
+            if plan.status == ExecutionPlanStatus.PENDING_APPROVAL:
+                return {
+                    "plan_id": plan_id,
+                    "status": "pending_approval",
+                    "next_action": "wait_for_approval",
+                }
+
+            if plan.workspace_id:
+                from packages.core.services.workspace_readiness import (
+                    evaluate_current_workspace_blocking_setup,
+                )
+
+                setup_status = await evaluate_current_workspace_blocking_setup(
+                    db,
+                    workspace_id=str(plan.workspace_id),
+                    entity_id=str(plan.entity_id) if plan.entity_id else None,
+                )
+                if setup_status is not None and setup_status.blocks_work:
+                    if setup_status.missing_setup_key == "workspace_unavailable":
+                        return {
+                            "plan_id": plan_id,
+                            "status": "workspace_unavailable",
+                            "next_action": "stop",
+                        }
+                    return {
+                        "plan_id": plan_id,
+                        "status": "blocked_setup",
+                        "next_action": "schedule_self",
+                        "delay_seconds": 30,
+                    }
+
             if plan.task_id:
                 await runtime_ensure_task_billing_context(
                     db,
@@ -1279,16 +1590,6 @@ class PlanExecutor:
                 )
             else:
                 runtime_ensure_plan_executor_billing_context(plan)
-
-            if plan.status in (ExecutionPlanStatus.COMPLETED, ExecutionPlanStatus.FAILED, ExecutionPlanStatus.CANCELLED,):
-                return {"plan_id": plan_id, "status": plan.status, "next_action": "stop"}
-
-            if plan.status == ExecutionPlanStatus.PENDING_APPROVAL:
-                return {
-                    "plan_id": plan_id,
-                    "status": "pending_approval",
-                    "next_action": "wait_for_approval",
-                }
 
             if plan.status == ExecutionPlanStatus.DRAFT:
                 plan.status = ExecutionPlanStatus.RUNNING.value
@@ -1318,11 +1619,11 @@ class PlanExecutor:
             if terminal == "completed":
                 replanned = await self._maybe_replan_for_missing_artifact(db, plan, steps)
                 if replanned:
-                    await db.commit()
+                    await self._commit_and_dispatch_replan(db, plan.task_id, plan.id)
                     return {"plan_id": plan_id, "status": "replanned", "next_action": "stop"}
                 task_event = await self._finalize(db, plan, "completed")
                 if plan.status == ExecutionPlanStatus.REPLANNED:
-                    await db.commit()
+                    await self._commit_and_dispatch_replan(db, plan.task_id, plan.id)
                     return {"plan_id": plan_id, "status": "replanned", "next_action": "stop"}
                 if plan.status == ExecutionPlanStatus.RUNNING:
                     # The supervisor sent a step back for a re-run — the plan
@@ -1330,7 +1631,7 @@ class PlanExecutor:
                     await db.commit()
                     return {"plan_id": plan_id, "status": "supervisor_step_retry", "next_action": "stop"}
                 await db.commit()
-                self._emit_task_event(task_event)
+                await self._emit_task_event(task_event)
                 await self._announce(
                     chat_entity, chat_ws, chat_plan_id,
                     task_id=chat_task_id,
@@ -1354,11 +1655,11 @@ class PlanExecutor:
                 # Try replanning before giving up
                 replanned = await self._maybe_replan(db, plan, steps)
                 if replanned:
-                    await db.commit()
+                    await self._commit_and_dispatch_replan(db, plan.task_id, plan.id)
                     return {"plan_id": plan_id, "status": "replanned", "next_action": "stop"}
                 task_event = await self._finalize(db, plan, "failed")
                 if plan.status == ExecutionPlanStatus.REPLANNED:
-                    await db.commit()
+                    await self._commit_and_dispatch_replan(db, plan.task_id, plan.id)
                     return {"plan_id": plan_id, "status": "replanned", "next_action": "stop"}
                 if plan.status == ExecutionPlanStatus.RUNNING:
                     # The supervisor sent a step back for a re-run — the plan
@@ -1366,7 +1667,7 @@ class PlanExecutor:
                     await db.commit()
                     return {"plan_id": plan_id, "status": "supervisor_step_retry", "next_action": "stop"}
                 await db.commit()
-                self._emit_task_event(task_event)
+                await self._emit_task_event(task_event)
                 await self._announce(
                     chat_entity, chat_ws, chat_plan_id,
                     task_id=chat_task_id,
@@ -1499,17 +1800,17 @@ class PlanExecutor:
             if terminal == "failed":
                 replanned = await self._maybe_replan(db, plan, steps)
                 if replanned:
-                    await db.commit()
+                    await self._commit_and_dispatch_replan(db, plan.task_id, plan.id)
                     return {"plan_id": plan_id, "status": "replanned", "next_action": "stop"}
             if terminal in ("completed", "failed"):
                 if terminal == "completed":
                     replanned = await self._maybe_replan_for_missing_artifact(db, plan, steps)
                     if replanned:
-                        await db.commit()
+                        await self._commit_and_dispatch_replan(db, plan.task_id, plan.id)
                         return {"plan_id": plan_id, "status": "replanned", "next_action": "stop"}
                 task_event = await self._finalize(db, plan, terminal)
                 if plan.status == ExecutionPlanStatus.REPLANNED:
-                    await db.commit()
+                    await self._commit_and_dispatch_replan(db, plan.task_id, plan.id)
                     return {"plan_id": plan_id, "status": "replanned", "next_action": "stop"}
                 if plan.status == ExecutionPlanStatus.RUNNING:
                     # The supervisor sent a step back for a re-run — the plan
@@ -1517,7 +1818,7 @@ class PlanExecutor:
                     await db.commit()
                     return {"plan_id": plan_id, "status": "supervisor_step_retry", "next_action": "stop"}
                 await db.commit()
-                self._emit_task_event(task_event)
+                await self._emit_task_event(task_event)
                 await self._announce(
                     chat_entity, chat_ws, chat_plan_id,
                     task_id=chat_task_id,
@@ -1540,7 +1841,7 @@ class PlanExecutor:
 
             inline_hitl_event = self._build_inline_hitl_event(plan, chat_events)
             await db.commit()
-            self._emit_task_event(inline_hitl_event)
+            await self._emit_task_event(inline_hitl_event)
 
             # Decide re-enqueue cadence.
             if any(s.step_status == ExecutionStepStatus.WAITING_HUMAN for s in steps):
@@ -1615,7 +1916,18 @@ class PlanExecutor:
     @staticmethod
     def _mark_done(step: ExecutionStep, result: Any, cost: Optional[dict]) -> None:
         step.step_status = ExecutionStepStatus.DONE.value
-        step.result = result if isinstance(result, dict) else {"value": result}
+        # Explicit PlanStep contracts are bare payloads. Keep their native
+        # JSON value (including null) so downstream whole-result refs see the
+        # same value that passed dispatcher validation; schema-less and
+        # envelope rows keep the historical value wrapper.
+        from packages.core.contracts.task_output import output_contract_for_schema
+
+        contract = output_contract_for_schema(step.expected_output_schema)
+        step.result = (
+            result
+            if contract.preserves_native_payload
+            else (result if isinstance(result, dict) else {"value": result})
+        )
         if cost:
             step.cost = cost
         step.finished_at = datetime.now(timezone.utc)
@@ -1688,11 +2000,25 @@ class PlanExecutor:
 
     @staticmethod
     def _collect_prior_results(steps: list[ExecutionStep]) -> dict[str, Any]:
-        return {
-            s.step_key: s.result
-            for s in steps
-            if s.step_status == ExecutionStepStatus.DONE and s.result is not None
-        }
+        from packages.core.contracts.task_output import output_contract_for_schema
+
+        prior: dict[str, Any] = {}
+        for step in steps:
+            if step.step_status != ExecutionStepStatus.DONE:
+                continue
+            # A nullable bare contract's successful result is intentionally
+            # ``None``; omitting it would turn a valid downstream ref into a
+            # spurious ReferenceError. Legacy/no-schema null rows remain
+            # omitted for backwards-compatible semantics.
+            contract = output_contract_for_schema(step.expected_output_schema)
+            # Provider/action schemas can be unmarked legacy rows but are
+            # still native payload contracts at runtime.  Preserve an
+            # explicit JSON ``null`` for those rows just like marked PlanStep
+            # payloads; only schema-less/envelope rows retain the historical
+            # omission behavior.
+            if step.result is not None or contract.preserves_native_payload:
+                prior[step.step_key] = step.result
+        return prior
 
     @staticmethod
     def _terminal_summary(steps: list[ExecutionStep]) -> Optional[str]:
@@ -1709,6 +2035,137 @@ class PlanExecutor:
         return "completed"
 
     MAX_REPLANS = 2
+
+    @staticmethod
+    async def _commit_and_dispatch_replan(
+        db: AsyncSession,
+        task_id: str | None,
+        plan_id: str | None = None,
+    ) -> bool:
+        """Publish a replan only after its task context is durable."""
+        await db.commit()
+        if not task_id:
+            return False
+        try:
+            from packages.core.tasks.ai_tasks import plan_and_run_task
+
+            plan_and_run_task.delay(task_id)
+            return True
+        except Exception as exc:
+            logger.warning(
+                "Replan dispatch failed after commit for task %s",
+                task_id,
+                exc_info=True,
+            )
+            try:
+                from packages.core.models.task import Task
+                from packages.core.services.task_service import add_task_log
+                from packages.core.services.task_state_machine import (
+                    TERMINAL_STATUSES,
+                    apply_task_status_transition,
+                )
+
+                plan_snapshot = None
+                if plan_id:
+                    plan_snapshot = (await db.execute(
+                        select(ExecutionPlan).where(
+                            ExecutionPlan.id == plan_id,
+                            ExecutionPlan.task_id == task_id,
+                        )
+                    )).scalar_one_or_none()
+                # Task-bound recovery always owns Task before Plan. This is the
+                # same order used by Chat and manual Retry, so queue-failure
+                # repair cannot deadlock a concurrent retry.
+                task_stmt = select(Task).where(Task.id == task_id)
+                if plan_snapshot is not None:
+                    task_stmt = task_stmt.where(
+                        Task.entity_id == plan_snapshot.entity_id,
+                    )
+                task = (await db.execute(
+                    task_stmt
+                    .with_for_update()
+                    .execution_options(populate_existing=True)
+                )).scalar_one_or_none()
+                if task is not None and task.status in TERMINAL_STATUSES:
+                    await db.commit()
+                    return False
+                plan = None
+                if plan_id:
+                    plan_stmt = select(ExecutionPlan).where(
+                        ExecutionPlan.id == plan_id,
+                        ExecutionPlan.task_id == task_id,
+                    )
+                    if task is not None:
+                        plan_stmt = plan_stmt.where(
+                            ExecutionPlan.entity_id == task.entity_id,
+                        )
+                    plan = (await db.execute(
+                        plan_stmt
+                        .with_for_update()
+                        .execution_options(populate_existing=True)
+                    )).scalar_one_or_none()
+                error_message = str(exc)[:1000] or exc.__class__.__name__
+                if plan is not None:
+                    plan.last_error = {
+                        "type": "ReplanDispatchFailed",
+                        "message": error_message,
+                    }
+                if task is not None:
+                    details = dict(task.details or {})
+                    context = details.get("_replan_context")
+                    context = dict(context) if isinstance(context, dict) else {}
+                    context["dispatch_status"] = "failed"
+                    context["dispatch_error"] = error_message
+                    context["dispatch_plan_id"] = plan_id
+                    details["_replan_context"] = context
+                    task.details = details
+                    await apply_task_status_transition(
+                        task,
+                        TaskStatus.FAILED.value,
+                        db=db,
+                        actor_kind=TaskActor.SYSTEM.value,
+                    )
+                    await add_task_log(
+                        db,
+                        task.id,
+                        TaskLogType.AI_EXECUTION_FAILED,
+                        "Replacement planning could not be queued; retry the task.",
+                        actor=TaskActor.SYSTEM,
+                        created_by="system",
+                        metadata={
+                            "plan_id": plan_id,
+                            "error": error_message,
+                            "mode": "replan_dispatch",
+                        },
+                    )
+                    if task.workspace_id:
+                        from packages.core.services.task_chat_hitl import (
+                            ensure_task_recovery_hitl,
+                        )
+
+                        try:
+                            async with db.begin_nested():
+                                await ensure_task_recovery_hitl(
+                                    db,
+                                    task,
+                                    plan_id=plan_id,
+                                    prompt="Replacement planning could not be queued.",
+                                    issue=error_message,
+                                )
+                        except Exception:
+                            logger.exception(
+                                "Could not create replan dispatch recovery card: task=%s",
+                                task.id,
+                            )
+                await db.commit()
+            except Exception:
+                await db.rollback()
+                logger.error(
+                    "Could not persist replan dispatch failure for task %s",
+                    task_id,
+                    exc_info=True,
+                )
+            return False
 
     @staticmethod
     async def _maybe_replan_for_missing_artifact(
@@ -1754,13 +2211,23 @@ class PlanExecutor:
           1. Replan budget not exhausted (max 2 replans per task)
           2. Failure is actionable (not a credit/permission issue)
 
-        If replanning: creates a new ExecutionPlan with parent_plan_id,
-        dispatches run_plan, and returns True. Caller should NOT finalize
-        the current plan as "failed" — instead mark it "replanned".
+        If replanning: records the replacement context and returns True.
+        Caller commits that state and dispatches the next planning cycle;
+        it should NOT finalize the current plan as "failed" — instead mark
+        it "replanned".
 
         Returns False if replanning is not possible/advisable.
         """
         if not plan.task_id:
+            return False
+
+        human_issue = _human_required_failure_issue(steps)
+        if human_issue:
+            logger.info(
+                "Plan %s will not replan a human-required blocker: %s",
+                plan.id,
+                human_issue,
+            )
             return False
 
         # Count prior plans for this task
@@ -1775,7 +2242,8 @@ class PlanExecutor:
             logger.info("Replan budget exhausted for task %s (%d prior plans)", plan.task_id, len(prior_count))
             return False
 
-        # Don't replan on non-actionable errors (credits, permissions)
+        # Don't replan on legacy non-actionable errors that predate the
+        # structured failure.requires_human contract.
         failed_steps = [s for s in steps if s.step_status == ExecutionStepStatus.FAILED]
         for fs in failed_steps:
             err_type = (fs.error or {}).get("type", "")
@@ -1798,6 +2266,9 @@ class PlanExecutor:
             failure_context.append({
                 "step_key": fs.step_key,
                 "kind": fs.kind,
+                "action_key": getattr(fs, "action_key", None),
+                "capability_id": getattr(fs, "capability_id", None),
+                "requires_approval": bool(getattr(fs, "requires_approval", False)),
                 "error": fs.error,
                 "params_summary": str(fs.params)[:300] if fs.params else None,
             })
@@ -1816,6 +2287,12 @@ class PlanExecutor:
 
             # Append replan context to task details so planner sees it
             details = dict(task.details or {})
+            prior_replan_context = details.get("_replan_context")
+            prior_approval_constraints = (
+                prior_replan_context.get("approval_constraints")
+                if isinstance(prior_replan_context, dict)
+                else None
+            )
             details["_replan_context"] = {
                 "prior_plan_id": plan.id,
                 "reason": reason,
@@ -1824,6 +2301,39 @@ class PlanExecutor:
                 "succeeded_steps": succeeded,
                 "attempt": len(prior_count) + 1,
             }
+            # A human denial/change request is not an ordinary tool failure.
+            # The replacement plan may change the approach, but it must not
+            # silently turn the same rejected/reviewed operation into an
+            # un-gated step. The planner consumes the prose/error context;
+            # planner.py consumes this structural boundary after normalizing
+            # planner-authored approval guesses.
+            approval_constraints = [
+                dict(row)
+                for row in (prior_approval_constraints or [])
+                if isinstance(row, dict)
+            ]
+            for fs in failed_steps:
+                step_error = fs.error if isinstance(fs.error, dict) else {}
+                if step_error.get("type") not in {
+                    "UserDeniedApproval",
+                    "UserRequestedChanges",
+                }:
+                    continue
+                constraint = {
+                    "step_key": fs.step_key,
+                    "kind": fs.kind,
+                    "provider": getattr(fs, "provider", None),
+                    "action_key": getattr(fs, "action_key", None),
+                    "capability_id": getattr(fs, "capability_id", None),
+                    "integration_id": getattr(fs, "integration_id", None),
+                    "params_fingerprint": approval_args_hash(fs.params or {}),
+                    "target_fingerprint": approval_stable_target_hash(fs.params or {}),
+                    "decision": step_error.get("human_decision"),
+                }
+                if constraint not in approval_constraints:
+                    approval_constraints.append(constraint)
+            if approval_constraints:
+                details["_replan_context"]["approval_constraints"] = approval_constraints
             if reason == "missing_artifact":
                 details["_replan_context"]["artifact_recovery"] = {
                     "default_action": "materialize_saved_workspace_file",
@@ -1867,10 +2377,6 @@ class PlanExecutor:
                     exc_info=True,
                 )
             await db.flush()
-
-            # Dispatch new planning cycle
-            from packages.core.tasks.ai_tasks import plan_and_run_task
-            plan_and_run_task.delay(plan.task_id)
 
             logger.info(
                 "Replanning task %s (attempt %d, reason=%s) — %d steps failed",
@@ -2057,6 +2563,11 @@ class PlanExecutor:
         task_desc = (task.description or "")[:2000] if task else ""
 
         from packages.core.constants.supervisor import MAX_EVIDENCE_CHARS
+        from packages.core.contracts.task_output import task_expected_output_json_schema
+        from packages.core.plans.completion_contracts import (
+            completion_contract_issue,
+            hydrate_completion_artifacts,
+        )
 
         def gate(verdict: SupervisorVerdict, evidence: str) -> SupervisorDecision:
             return SupervisorDecision(
@@ -2065,6 +2576,24 @@ class PlanExecutor:
                 source=SupervisorDecisionSource.GATE,
             )
 
+        await hydrate_completion_artifacts(db, task, steps)
+        task_completion_issue = await completion_contract_issue(db, task)
+        if task_completion_issue and plan_status == ExecutionPlanStatus.COMPLETED:
+            logger.info(
+                "Supervisor requested replan for plan %s completion contract gap: %s",
+                plan.id,
+                task_completion_issue,
+            )
+            return gate(SupervisorVerdict.NEEDS_REPLAN, task_completion_issue)
+
+        execution_contract_issue = _execution_output_contract_issue(plan, steps, task)
+        if execution_contract_issue and plan_status == ExecutionPlanStatus.COMPLETED:
+            logger.info(
+                "Supervisor requested replan for plan %s execution contract gap: %s",
+                plan.id,
+                execution_contract_issue,
+            )
+            return gate(SupervisorVerdict.NEEDS_REPLAN, execution_contract_issue)
         task_output_issue = _task_output_contract_issue(task, steps)
         if task_output_issue and plan_status == ExecutionPlanStatus.COMPLETED:
             logger.info(
@@ -2080,6 +2609,14 @@ class PlanExecutor:
                 plan.id, structured_issue,
             )
             return gate(SupervisorVerdict.NEEDS_HUMAN, structured_issue)
+        human_failure_issue = _human_required_failure_issue(steps)
+        if human_failure_issue:
+            logger.info(
+                "Supervisor held plan %s for a human-required failure: %s",
+                plan.id,
+                human_failure_issue,
+            )
+            return gate(SupervisorVerdict.NEEDS_HUMAN, human_failure_issue)
         artifact_issue = _missing_artifact_issue(task, steps)
         if artifact_issue and plan_status == ExecutionPlanStatus.COMPLETED:
             logger.info(
@@ -2117,6 +2654,29 @@ class PlanExecutor:
         # result in context before the task status changes.
         try:
             step_infos = _supervisor_step_infos(plan, steps)
+            acceptance_contract = (
+                ((plan.plan_dag or {}).get("metadata") or {}).get(
+                    "acceptance_contract"
+                )
+            )
+            actual_result = (
+                _supervisor_actual_result(
+                    steps,
+                    acceptance_contract=acceptance_contract,
+                )
+                if isinstance(acceptance_contract, dict)
+                else None
+            )
+            if actual_result is not None:
+                evidence_keys = {
+                    str(item.get("step_key") or "")
+                    for item in actual_result.get("steps", [])
+                    if isinstance(item, dict)
+                }
+                step_infos = [
+                    info for info in step_infos
+                    if str(info.get("key") or "") in evidence_keys
+                ]
             plan_rationale = str(
                 ((plan.plan_dag or {}).get("metadata") or {}).get("rationale") or ""
             )
@@ -2164,6 +2724,13 @@ class PlanExecutor:
             completion = await runtime_execute_plan_supervisor_completion(
                 task_title=task_title,
                 task_description=task_desc,
+                task_output_contract=(
+                    task_expected_output_json_schema(getattr(task, "expected_output", None))
+                    if task is not None
+                    else None
+                ),
+                acceptance_contract=acceptance_contract,
+                actual_result=actual_result,
                 done_count=done_count,
                 failed_count=failed_count,
                 skipped_count=skipped_count,
@@ -2270,6 +2837,7 @@ class PlanExecutor:
         plan.status = status
         plan.completed_at = datetime.now(timezone.utc)
         task_event: Optional[dict] = None
+        replan_dispatch_task_id: str | None = None
 
         # The plan is now terminal — no step will resume to consume its approval
         # request — so expire any still-open HitlRequest attached to it.
@@ -2336,6 +2904,8 @@ class PlanExecutor:
                         reason="supervisor_review",
                         issue=decision.evidence,
                     )
+                    if supervisor_replanned:
+                        replan_dispatch_task_id = plan.task_id
                     note = (
                         "a fresh plan was dispatched to address the supervisor's finding"
                         if supervisor_replanned
@@ -2381,7 +2951,13 @@ class PlanExecutor:
                             artifact_issue=artifact_issue,
                             failed_steps=failed_steps,
                         )
-                        attention_issue = structured_issue or artifact_issue or message
+                        attention_issue = (
+                            _failed_step_issue(failed_steps)
+                            or structured_issue
+                            or artifact_issue
+                            or decision.evidence
+                            or message
+                        )
                         await add_task_log(db, task.id, TaskLogType.AI_HITL_REQUESTED,
                             message,
                             actor=TaskActor.SUPERVISOR,
@@ -2429,10 +3005,32 @@ class PlanExecutor:
                 # Build step summaries with file/document references
                 step_summaries = []
                 all_files: list[dict] = []
-                structured_results: list[Any] = []
                 from packages.core.contracts.task_output import (
-                    is_task_output_contract_schema,
-                    task_output_payload,
+                    OutputContractKind,
+                    TASK_OUTPUT_CONTRACT_SOURCE,
+                    output_contract_for_schema,
+                )
+
+                previous_actual_output = (
+                    task.actual_output if isinstance(task.actual_output, dict) else {}
+                )
+                previous_supervisor_verdict = previous_actual_output.get(
+                    "supervisor_verdict"
+                )
+                supervisor_accepted = (
+                    supervisor_decision is not None
+                    and supervisor_decision.verdict is SupervisorVerdict.COMPLETED
+                ) or (
+                    supervisor_decision is None
+                    and task.status == TaskStatus.COMPLETED
+                    and previous_actual_output.get("plan_id") == plan.id
+                    and previous_supervisor_verdict
+                    == SupervisorVerdict.COMPLETED.value
+                )
+                accepted_task_output = (
+                    _validated_terminal_task_output(task, steps)
+                    if supervisor_accepted
+                    else None
                 )
 
                 for s in steps:
@@ -2455,15 +3053,8 @@ class PlanExecutor:
                             entry["document_id"] = s.result["document_id"]
                         if s.result.get("fs_path"):
                             entry["fs_path"] = s.result["fs_path"]
-                        if is_task_output_contract_schema(s.expected_output_schema):
-                            outputs = s.result.get("outputs")
-                            if isinstance(outputs, dict) and "data" in outputs:
-                                payload = task_output_payload(
-                                    s.result,
-                                    s.expected_output_schema,
-                                )
-                                entry["data"] = payload
-                                structured_results.append(payload)
+                        if accepted_task_output and s.step_key == accepted_task_output[0]:
+                            entry["data"] = accepted_task_output[1]
                     elif s.result:
                         entry["result_summary"] = str(s.result)[:500]
                     if s.error:
@@ -2482,14 +3073,14 @@ class PlanExecutor:
                         entity_id=plan.entity_id,
                     ) if all_files else None,
                 }
-                if len(structured_results) == 1:
+                if accepted_task_output is not None:
                     # Preserve the exact machine-readable deliverable.  The
                     # old aggregate kept only a 500-char summary and URLs,
                     # which made a structurally correct worker result disappear
                     # before downstream tasks or the UI could consume it.
-                    actual_output["result"] = structured_results[0]
-                elif structured_results:
-                    actual_output["results"] = structured_results
+                    actual_output["result"] = accepted_task_output[1]
+                    actual_output["result_step_key"] = accepted_task_output[0]
+                    actual_output["result_contract_source"] = TASK_OUTPUT_CONTRACT_SOURCE
                 if supervisor_decision is not None:
                     actual_output["supervisor_verdict"] = supervisor_decision.verdict.value
                     actual_output["supervisor_evidence"] = supervisor_decision.evidence
@@ -2611,7 +3202,10 @@ class PlanExecutor:
                             text = ""
                             if isinstance(s.result, dict):
                                 text = step_result_output_text(s.result)
-                                if is_task_output_contract_schema(s.expected_output_schema):
+                                if (
+                                    output_contract_for_schema(s.expected_output_schema).kind
+                                    is OutputContractKind.TASK_ENVELOPE
+                                ):
                                     outputs = s.result.get("outputs")
                                     if isinstance(outputs, dict) and "data" in outputs:
                                         text = json.dumps(
@@ -2669,6 +3263,7 @@ class PlanExecutor:
                         "payload": {
                             "task_id": task.id,
                             "title": task.title,
+                            "workspace_id": plan.workspace_id,
                             "plan_id": plan.id,
                             "plan_status": status,
                             "task_status": task.status,
@@ -2717,6 +3312,12 @@ class PlanExecutor:
                             exc_info=True,
                         )
 
+        if replan_dispatch_task_id:
+            await PlanExecutor._commit_and_dispatch_replan(
+                db,
+                replan_dispatch_task_id,
+                plan.id,
+            )
         return task_event
 
     @staticmethod
@@ -2732,6 +3333,7 @@ class PlanExecutor:
             "event_type": "task.hitl_requested",
             "payload": {
                 "task_id": plan.task_id,
+                "workspace_id": plan.workspace_id,
                 "plan_id": plan.id,
                 "plan_status": plan.status,
                 "task_status": "in_progress",
@@ -2741,11 +3343,31 @@ class PlanExecutor:
         }
 
     @staticmethod
-    def _emit_task_event(task_event: Optional[dict]) -> None:
+    async def _emit_task_event(task_event: Optional[dict]) -> None:
+        if not task_event:
+            return
         try:
             runtime_emit_plan_executor_task_event(task_event)
         except Exception:
             logger.debug("PlanExecutor: task event emit failed", exc_info=True)
+        payload = task_event.get("payload") or {}
+        task_id = payload.get("task_id")
+        if task_id:
+            from packages.core.services.realtime import broadcast_task_runtime_update
+
+            await broadcast_task_runtime_update(
+                task_event.get("entity_id") or "",
+                task_id=str(task_id),
+                workspace_id=(
+                    str(payload["workspace_id"])
+                    if payload.get("workspace_id")
+                    else None
+                ),
+                plan_id=str(payload["plan_id"]) if payload.get("plan_id") else None,
+                status=str(payload["task_status"]) if payload.get("task_status") else None,
+                title=str(payload["title"]) if payload.get("title") else None,
+                event=str(task_event.get("event_type") or "runtime_updated"),
+            )
 
     @staticmethod
     async def _task_log(db: AsyncSession, plan: ExecutionPlan, log_type: str, content: str, metadata: dict | None = None) -> None:

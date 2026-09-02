@@ -1,0 +1,109 @@
+.embedded-chat-header-actions {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 8px;
+}
+
+.workspace-intro-launcher.ai-edit-button {
+  min-width: 0;
+}
+
+.workspace-intro-dialog .manor-dialog-header {
+  margin-bottom: 14px;
+  padding: 20px 22px 0;
+}
+
+.workspace-intro-dialog-body {
+  display: grid;
+  gap: 14px;
+  padding: 0 22px 8px;
+}
+
+.workspace-intro-dialog .manor-dialog-footer {
+  padding: 8px 22px 20px;
+}
+
+.workspace-intro-dialog .manor-dialog-close:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 3px var(--accent-ring);
+}
+
+.workspace-intro-dialog-video-frame {
+  position: relative;
+  aspect-ratio: 16 / 9;
+  overflow: hidden;
+  border-radius: var(--radius-control);
+  background: var(--surface-muted);
+}
+
+.workspace-intro-dialog-video {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  background: var(--surface-muted);
+}
+
+.workspace-intro-dialog-copy {
+  min-width: 0;
+}
+
+.workspace-intro-dialog-copy h3 {
+  margin: 0 0 6px;
+  color: var(--text-strong);
+  font-size: 20px;
+  font-weight: 750;
+  letter-spacing: -0.02em;
+  line-height: 1.25;
+}
+
+.workspace-intro-dialog-copy p {
+  margin: 0;
+  color: var(--text-muted);
+  font-size: 12.5px;
+  line-height: 1.55;
+}
+
+@media (max-width: 540px) {
+  .workspace-intro-launcher.ai-edit-button {
+    width: 32px;
+    min-width: 32px;
+    min-height: 32px;
+    padding: 0;
+  }
+
+  .workspace-intro-launcher .ai-edit-button__label {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip: rect(0 0 0 0);
+    clip-path: inset(50%);
+    white-space: nowrap;
+  }
+
+  .workspace-intro-dialog-video-frame {
+    aspect-ratio: 16 / 9;
+  }
+}
+
+@media (max-width: 640px) {
+  .workspace-intro-dialog .manor-dialog-header {
+    margin-bottom: 12px;
+    padding: 20px 20px 0;
+  }
+
+  .workspace-intro-dialog-body {
+    padding: 0 20px 8px;
+  }
+
+  .workspace-intro-dialog .manor-dialog-footer {
+    padding: 10px 20px 20px;
+  }
+
+  .workspace-intro-dialog-copy h3 {
+    font-size: 19px;
+  }
+
+}

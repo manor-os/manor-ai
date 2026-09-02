@@ -8,15 +8,32 @@ Handles:
 - Marking messages as read
 
 Configuration:
-  Credentials are stored in ChannelConfig.credentials:
+  Credentials are leased from the ChannelConfig's source Integration:
     phone_number_id  — WhatsApp Business phone number ID
     access_token     — Meta Graph API access token (permanent or system user)
     verify_token     — Webhook verification token (arbitrary string you choose)
+    app_secret       — Meta app secret used to verify webhook POST signatures
 """
 from __future__ import annotations
 
+import hashlib
+import hmac
+import json as _json
 import logging
-from typing import Any
+from typing import Any, Optional as _Optional
+
+from packages.core.external_api_versions import META_GRAPH as _META_PIN
+from packages.core.models.channel import ChannelConfig as _CC
+from packages.core.services.channel_credentials import lease_channel_config_credentials
+from packages.core.services.whatsapp_business_config import (
+    load_whatsapp_business_config,
+)
+from packages.core.services.channels.base import (
+    ChannelAdapter,
+    ChannelTextSendError,
+    NormalizedInbound,
+    register_adapter,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -30,12 +47,11 @@ except ImportError:
 # Constants
 # ---------------------------------------------------------------------------
 
-from packages.core.external_api_versions import META_GRAPH as _META_PIN
-
 GRAPH_API_BASE = "https://graph.facebook.com"
 # Centralized in packages/core/external_api_versions.py — keep in sync
 # with facebook.py + integration_health.py via the same pin.
 DEFAULT_API_VERSION = _META_PIN.value
+WHATSAPP_TEMPLATE_REQUIRED_REASON_CODE = "whatsapp_template_required"
 
 
 class WhatsAppAdapter:
@@ -50,11 +66,13 @@ class WhatsAppAdapter:
         phone_number_id: str,
         access_token: str,
         verify_token: str,
+        app_secret: str = "",
         api_version: str = DEFAULT_API_VERSION,
     ):
         self.phone_number_id = phone_number_id
         self.access_token = access_token
         self.verify_token = verify_token
+        self.app_secret = app_secret
         self.api_version = api_version
         self.messages_url = f"{GRAPH_API_BASE}/{api_version}/{phone_number_id}/messages"
 
@@ -79,6 +97,19 @@ class WhatsAppAdapter:
             return challenge
         logger.warning("WhatsApp webhook verification failed: mode=%s token_match=%s", mode, token == self.verify_token)
         return None
+
+    def verify_inbound_signature(self, *, headers, body: bytes) -> bool:
+        """Verify Meta's HMAC over the exact webhook payload bytes."""
+        if not self.app_secret:
+            logger.warning("WhatsApp webhook rejected because app_secret is missing")
+            return False
+        signature = headers.get("X-Hub-Signature-256", "")
+        if not signature.startswith("sha256="):
+            return False
+        expected = hmac.new(
+            self.app_secret.encode(), body, hashlib.sha256,
+        ).hexdigest()
+        return hmac.compare_digest(f"sha256={expected}", signature)
 
     # ------------------------------------------------------------------
     # Inbound webhook handling (POST)
@@ -323,7 +354,9 @@ class WhatsAppAdapter:
         Sends a read receipt to the sender so they see blue check marks.
         """
         if httpx is None:
-            raise RuntimeError("httpx is not installed. Run: pip install httpx")
+            raise ChannelTextSendError.determinate(
+                "httpx is not installed. Run: pip install httpx"
+            )
 
         payload = {
             "messaging_product": "whatsapp",
@@ -370,10 +403,29 @@ class WhatsAppAdapter:
             data = resp.json()
 
         if resp.status_code >= 400:
-            error_msg = data.get("error", {}).get("message", resp.text)
-            error_code = data.get("error", {}).get("code", resp.status_code)
-            logger.error("WhatsApp API error: code=%s message=%s", error_code, error_msg)
-            raise RuntimeError(f"WhatsApp API error {error_code}: {error_msg}")
+            error = data.get("error") if isinstance(data, dict) else None
+            error = error if isinstance(error, dict) else {}
+            error_msg = str(error.get("message") or resp.text)
+            error_code = error.get("code", resp.status_code)
+            error_subcode = error.get("error_subcode")
+            error_type = error.get("type")
+            logger.error(
+                "WhatsApp API rejected message: status=%s code=%s subcode=%s type=%s",
+                resp.status_code,
+                error_code,
+                error_subcode,
+                error_type,
+            )
+            if str(error_code).strip() == "131047":
+                raise ChannelTextSendError.determinate(
+                    "An approved WhatsApp template is required outside the "
+                    "24-hour customer-service window.",
+                    reason_code=WHATSAPP_TEMPLATE_REQUIRED_REASON_CODE,
+                )
+            raise ChannelTextSendError.from_http_status(
+                f"WhatsApp API error {error_code}: {error_msg}",
+                status_code=resp.status_code,
+            )
 
         # Extract wamid from response
         messages = data.get("messages", [])
@@ -388,31 +440,86 @@ class WhatsAppAdapter:
 
 # ── Polymorphic ChannelAdapter wrapper ──────────────────────────────────────
 
-import json as _json
-from typing import Optional as _Optional
-
-from packages.core.models.channel import ChannelConfig as _CC
-from packages.core.services.channels.base import (
-    ChannelAdapter, NormalizedInbound, register_adapter,
-)
-
 
 class WhatsAppChannelAdapter(ChannelAdapter):
     channel_type = "whatsapp"
 
-    def _build(self, cc: _CC) -> WhatsAppAdapter:
-        creds = cc.credentials or {}
+    def webhook_path(self, cc: _CC) -> str:
+        # Meta app callbacks are fixed per app; routing uses the signed
+        # payload's metadata.phone_number_id.
+        return "/api/v1/channels/whatsapp/webhook"
+
+    async def _build(self, cc: _CC, *, reason: str) -> WhatsAppAdapter:
+        try:
+            creds = await lease_channel_config_credentials(
+                cc,
+                reason=reason,
+                resolve_nango=True,
+            )
+        except ValueError:
+            # Keep compatibility with adapters/tests that provide the base
+            # credential hook while source-linked configs are being resolved.
+            creds = await self.credentials(cc, reason=reason)
         phone_id = creds.get("phone_number_id") or creds.get("phone_id")
         token = creds.get("access_token") or creds.get("api_key")
-        verify = creds.get("verify_token", "")
+        verify = str(creds.get("verify_token") or "").strip()
+        app_secret = str(creds.get("app_secret") or "").strip()
+        if "verify_inbound" in reason:
+            deployment = load_whatsapp_business_config()
+            verify = deployment.verify_token
+            app_secret = deployment.app_secret
         if not (phone_id and token):
-            raise RuntimeError("WhatsApp ChannelConfig missing phone_number_id / access_token")
+            raise ChannelTextSendError.determinate(
+                "WhatsApp ChannelConfig missing phone_number_id / access_token"
+            )
+        if "verify_inbound" in reason and not app_secret:
+            raise RuntimeError(
+                "WhatsApp ChannelConfig missing app_secret for webhook verification"
+            )
         return WhatsAppAdapter(
-            phone_number_id=phone_id, access_token=token, verify_token=verify,
+            phone_number_id=phone_id,
+            access_token=token,
+            verify_token=verify,
+            app_secret=app_secret,
         )
 
+    async def register_webhook(self, cc: _CC) -> dict[str, Any]:
+        if httpx is None:
+            raise RuntimeError("httpx is required — pip install httpx")
+        creds = await lease_channel_config_credentials(
+            cc,
+            reason="channel.whatsapp.register_webhook",
+            resolve_nango=True,
+        )
+        waba_id = str(
+            creds.get("waba_id")
+            or creds.get("whatsapp_business_account_id")
+            or creds.get("business_account_id")
+            or ""
+        ).strip()
+        token = str(creds.get("access_token") or creds.get("api_key") or "").strip()
+        if not waba_id or not token:
+            return {
+                "registered": False,
+                "reason": "missing_waba_or_access_token",
+                "detail": "WhatsApp Business requires waba_id and access_token.",
+            }
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            response = await client.post(
+                f"{GRAPH_API_BASE}/{DEFAULT_API_VERSION}/{waba_id}/subscribed_apps",
+                headers={"Authorization": f"Bearer {token}"},
+                json={},
+            )
+            response.raise_for_status()
+        return {
+            "registered": True,
+            "waba_id": waba_id,
+            "detail": "WhatsApp Business webhook subscription confirmed.",
+        }
+
     async def send_text(self, cc: _CC, to: str, text: str, **kwargs: Any) -> dict[str, Any]:
-        return await self._build(cc).send_text(to, text)
+        adapter = await self._build(cc, reason="channel.whatsapp.send_text")
+        return await adapter.send_text(to, text)
 
     async def send_attachment(
         self, cc: _CC, to: str, *, url=None, data=None,
@@ -429,7 +536,7 @@ class WhatsAppChannelAdapter(ChannelAdapter):
                 "WhatsApp send_attachment needs an HTTPS URL (bytes upload via "
                 "/media not implemented yet)."
             )
-        adapter = self._build(cc)
+        adapter = await self._build(cc, reason="channel.whatsapp.send_attachment")
         # Map manor-os kinds to WhatsApp's msgtype
         kind_map = {
             "image": "image", "document": "document",
@@ -455,27 +562,29 @@ class WhatsAppChannelAdapter(ChannelAdapter):
             )
         if not resp.is_success:
             raise RuntimeError(f"WhatsApp API error {resp.status_code}: {resp.text[:200]}")
-        return {"to": to, "status": "sent", "raw": resp.json()}
+        data = resp.json()
+        messages = data.get("messages", [])
+        external_id = messages[0].get("id", "") if messages else ""
+        return {
+            "to": to,
+            "external_id": external_id,
+            "status": "sent",
+            "raw": data,
+        }
 
     async def verify_inbound(self, cc: _CC, *, headers, query, body) -> bool:
         # GET handshake handled at router level (hub.mode=subscribe). POST
         # signature from Meta uses X-Hub-Signature-256 HMAC-SHA256.
-        import hashlib, hmac
-        secret = (cc.credentials or {}).get("app_secret", "")
-        if not secret:
-            return True  # not enforced when secret absent
-        sig = headers.get("X-Hub-Signature-256", "")
-        if not sig.startswith("sha256="):
-            return False
-        expected = hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
-        return hmac.compare_digest(f"sha256={expected}", sig)
+        adapter = await self._build(cc, reason="channel.whatsapp.verify_inbound")
+        return adapter.verify_inbound_signature(headers=headers, body=body)
 
     async def parse_inbound(self, cc: _CC, *, headers, query, body) -> _Optional[NormalizedInbound]:
         try:
             payload = _json.loads(body.decode("utf-8")) if body else {}
         except Exception:
             return None
-        events = await self._build(cc).handle_webhook(payload)
+        adapter = await self._build(cc, reason="channel.whatsapp.parse_inbound")
+        events = await adapter.handle_webhook(payload)
         msg_events = [e for e in events if e.get("message_type") not in (None, "status")]
         if not msg_events:
             return None

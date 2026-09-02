@@ -1,6 +1,6 @@
 import { useState, useCallback, useEffect, useMemo } from "react";
 import { Link, useLocation, useParams, useNavigate, useSearchParams } from "react-router-dom";
-import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
+import { useInfiniteQuery, useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import {
   api,
   type AutomationHealthEntry,
@@ -18,7 +18,7 @@ import {
 } from "../lib/api";
 import { useToastStore } from "../stores/toast";
 import type { AgentLearningCandidate, RuntimeEvidence, Workspace, WorkspaceStaff, WorkspaceActivity } from "../lib/types";
-import { canManageWorkspace } from "../lib/permissions";
+import { canManageWorkspace, canWriteWorkspace } from "../lib/permissions";
 import { useAuthStore } from "../stores/auth";
 import { usePreviewFeatureAccess } from "../lib/previewFeatureAccess";
 import { openAgentEditModal } from "../stores/agentEditModal";
@@ -40,6 +40,8 @@ import Select from "../components/ui/Select";
 import Toggle from "../components/ui/Toggle";
 import UserAvatar from "../components/ui/UserAvatar";
 import AgentAvatar from "../components/ui/AgentAvatar";
+import WebchatPageEditor from "../components/webchat/WebchatPageEditor";
+import { webchatWorkspaceDisplayName } from "../lib/webchatPage";
 import { PeoplePicker, type StaffOption } from "../components/permissions";
 import {
   IconChat,
@@ -52,11 +54,15 @@ import {
 import WorkspaceGoalGraph from "../components/ui/WorkspaceGoalGraph";
 import WorkspaceWorkflows from "../components/workflows/WorkspaceWorkflows";
 import WorkspaceStatsPanel from "../components/workspaces/WorkspaceStatsPanel";
+import WorkspaceConnectionNotice from "../components/workspaces/WorkspaceConnectionNotice";
 import ScheduledJobs from "./ScheduledJobs";
 import ExportBlueprintModal from "../components/blueprints/ExportBlueprintModal";
+import BlueprintUpgradeDialog from "../components/blueprints/BlueprintUpgradeDialog";
 import { SUPPORTED_LOCALES, t } from "../lib/i18n";
 import { inferRuntimeRuleFromText, runtimeCapabilitiesForActionPatterns, uniqueActionPatterns } from "../lib/runtimeRules";
 import { formatUserFacingLabel, formatUserFacingText } from "../lib/taskDisplay";
+import { goalIdentityDedupeKey } from "../lib/goalIdentity";
+import { formatGoalNumber, goalProgressPercent } from "../lib/goalNumbers";
 
 /* ---- style constants ---- */
 
@@ -174,6 +180,25 @@ const DEFAULT_AGENT_FORM: WorkspaceAgentForm = {
   runtime_display_name: "",
 };
 
+function filterWorkspaceAgentMappingOptions(agents: any[], workspaceId?: string): any[] {
+  const visibleAgents = agents.filter((agent) => (
+    !agent.workspace_id || agent.workspace_id === workspaceId
+  ));
+  const seenLegacyTemplateRoles = new Set<string>();
+  return visibleAgents.filter((agent) => {
+    if (agent.workspace_id || agent.source !== "marketplace_template") return true;
+    const identity = JSON.stringify({
+      name: agent.name || "",
+      category: agent.category || "",
+      system_prompt: agent.system_prompt || "",
+      config: agent.config || {},
+    });
+    if (seenLegacyTemplateRoles.has(identity)) return false;
+    seenLegacyTemplateRoles.add(identity);
+    return true;
+  });
+}
+
 const AGENT_SOURCE_OPTIONS: Array<{ key: WorkspaceAgentSource; title: string; body: string }> = [
   {
     key: "hosted",
@@ -202,6 +227,16 @@ const KPI_CARD: React.CSSProperties = {
 
 type Tab = "overview" | "staff" | "agents" | "capabilities" | "channels" | "documents" | "rules" | "goals" | "workflows" | "automations" | "learning" | "activity" | "settings";
 type PrimaryTab = "overview" | "configure" | "activity" | "settings";
+
+function blueprintSetupDestination(check: { todo_kind?: string; kind?: string }): Tab | "/integrations" {
+  const kind = check.todo_kind || check.kind || "";
+  if (["missing_integration", "browser_session"].includes(kind)) return "/integrations";
+  if (kind === "channel") return "channels";
+  if (kind === "missing_agent") return "agents";
+  if (kind === "knowledge_pack_content") return "documents";
+  if (["mcp_server", "mcp_configuration", "missing_skill"].includes(kind)) return "capabilities";
+  return "settings";
+}
 
 type EvaluationDimensionKey =
   | "goal_impact"
@@ -446,13 +481,6 @@ function _goalLabel(g: { title?: string; name?: string; goal_key?: string; key?:
   return g.title || g.name || _humanize(g.goal_key || g.key) || t("page.workspace_detail.goal_fallback");
 }
 
-function _goalDedupeKey(g: any): string {
-  const title = String(g?.title || g?.name || "").trim().toLowerCase();
-  if (title) return `title:${title}`;
-  const metric = String(g?.metric_key || g?.goal_key || g?.key || g?.id || "").trim().toLowerCase();
-  return `metric:${metric}`;
-}
-
 function _goalCompletenessScore(g: any): number {
   let score = 0;
   if (g?.id) score += 1;
@@ -466,19 +494,10 @@ function _goalCompletenessScore(g: any): number {
   return score;
 }
 
-function _goalProgressPercent(g: any): number {
-  const current = Number(g?.current_value ?? 0);
-  const target = Number(g?.target_value ?? 1);
-  const baseline = Number(g?.baseline_value ?? 0);
-  if (!Number.isFinite(current) || !Number.isFinite(target) || !Number.isFinite(baseline)) return 0;
-  if (target === baseline) return current === target ? 100 : 0;
-  return Math.min(100, Math.max(0, ((current - baseline) / (target - baseline)) * 100));
-}
-
 function _dedupeGoals(goals: any[]): any[] {
   const byKey = new Map<string, any>();
   for (const goal of goals || []) {
-    const key = _goalDedupeKey(goal);
+    const key = goalIdentityDedupeKey(goal);
     const existing = byKey.get(key);
     if (!existing || _goalCompletenessScore(goal) > _goalCompletenessScore(existing)) {
       byKey.set(key, goal);
@@ -998,11 +1017,11 @@ const SETUP_TAB_ITEMS: { key: Tab; label: string }[] = [
 // and notification_workspace_callbacks.notify_workspace_hitl_approvers.
 
 const _NOTIF_SUPPORTED_CHANNELS = [
-  "inapp", "email", "telegram", "wechat", "whatsapp", "slack", "discord", "twilio_sms",
+  "inapp", "email", "telegram", "wechat", "slack", "discord", "twilio_sms",
 ];
 const _NOTIF_CHANNEL_LABELS: Record<string, string> = {
   inapp: "In-app", email: "Email", telegram: "Telegram", wechat: "WeChat",
-  whatsapp: "WhatsApp", slack: "Slack", discord: "Discord", twilio_sms: "SMS",
+  slack: "Slack", discord: "Discord", twilio_sms: "SMS",
 };
 const _NOTIF_EVENTS = [
   { kind: "task_hitl_requested", label: "Task needs input" },
@@ -1467,6 +1486,7 @@ export default function WorkspaceDetail() {
 
   const [showChannelModal, setShowChannelModal] = useState(false);
   const [editingChannel, setEditingChannel] = useState<any | null>(null);
+  const [pageChannel, setPageChannel] = useState<any | null>(null);
   const [channelForm, setChannelForm] = useState({
     mode: "existing",
     channel_config_id: "",
@@ -1511,6 +1531,13 @@ export default function WorkspaceDetail() {
     enabled: !!workspaceId,
   });
 
+  const { data: setupStatus } = useQuery({
+    queryKey: ["workspace-setup-status", workspaceId],
+    queryFn: () => api.workspaces.setupStatus(workspaceId!),
+    enabled: !!workspaceId && tab === "overview",
+    staleTime: 10_000,
+  });
+
   const { data: dashboardStats } = useQuery({
     queryKey: ["workspace-dashboard", workspaceId],
     queryFn: () => api.workspaces.dashboard(workspaceId!),
@@ -1536,7 +1563,15 @@ export default function WorkspaceDetail() {
     staleTime: 30_000,
   });
   const canManageWs = canManageWorkspace(currentUser, staffList || []);
+  const canWriteWs = canWriteWorkspace(currentUser, staffList || []);
   const [showBlueprintUpgrade, setShowBlueprintUpgrade] = useState(false);
+
+  useEffect(() => {
+    if (canManageWs) return;
+    setShowChannelModal(false);
+    setEditingChannel(null);
+    setConfirmRemoveChannel(null);
+  }, [canManageWs]);
 
   // Pool of staff members in the entity that can be picked for assignment.
   // Only fetched when the assign modal is open to avoid a hot query on tab load.
@@ -1568,10 +1603,36 @@ export default function WorkspaceDetail() {
     enabled: !!workspaceId && tab === "channels",
   });
 
+  const {
+    data: webchatResourcePages,
+    isLoading: webchatResourcesLoading,
+    isError: webchatResourcesFailed,
+    fetchNextPage: fetchNextWebchatResourcePage,
+    hasNextPage: hasMoreWebchatDocuments,
+    isFetchingNextPage: loadingMoreWebchatDocuments,
+  } = useInfiniteQuery({
+    queryKey: ["workspace-webchat-resources", workspaceId],
+    queryFn: ({ pageParam }) => api.workspaces.webchatResources(workspaceId!, pageParam),
+    initialPageParam: 0,
+    getNextPageParam: lastPage => lastPage.documents_next_cursor ?? undefined,
+    enabled: !!workspaceId && !!pageChannel && canManageWs,
+    staleTime: 10_000,
+  });
+  const webchatResources = useMemo(() => {
+    const pages = webchatResourcePages?.pages;
+    if (!pages?.length) return undefined;
+    const documents = new Map(pages.flatMap(page => page.documents).map(document => [document.id, document]));
+    return {
+      ...pages[0],
+      documents: [...documents.values()],
+      documents_next_cursor: pages.at(-1)?.documents_next_cursor ?? null,
+    };
+  }, [webchatResourcePages]);
+
   const { data: availableChannels } = useQuery({
     queryKey: ["workspace-available-channels", workspaceId],
     queryFn: () => api.workspaces.availableChannels(workspaceId!),
-    enabled: !!workspaceId && showChannelModal,
+    enabled: !!workspaceId && canManageWs && showChannelModal,
   });
 
   const { data: workspaceCapabilities } = useQuery({
@@ -1682,6 +1743,20 @@ export default function WorkspaceDetail() {
     queryKey: ["workspace-budget", workspaceId],
     queryFn: () => api.workspaces.budget.get(workspaceId!),
     enabled: !!workspaceId && (tab === "overview" || tab === "settings"),
+  });
+
+  const { data: workspaceAutomationSummary } = useQuery({
+    queryKey: ["workspace-scheduled-job-summary", workspaceId],
+    queryFn: () => api.jobs.list({ workspace_id: workspaceId!, include_workflows: true, limit: 1 }),
+    enabled: !!workspaceId && tab === "settings",
+    staleTime: 30_000,
+  });
+
+  const { data: workspaceAutomationBindings } = useQuery({
+    queryKey: ["workspace-automation-bindings-summary", workspaceId],
+    queryFn: () => api.workflows.listBindings({ workspace_id: workspaceId! }),
+    enabled: !!workspaceId && tab === "settings" && flowsAvailable,
+    staleTime: 30_000,
   });
 
   // The /operating-model endpoint wraps the model:
@@ -1831,7 +1906,7 @@ export default function WorkspaceDetail() {
             max_risk_level: "medium",
             uses_manor_credentials: false,
             deployment: "remote",
-            protocol_version: 1,
+            protocol_version: 2,
             runtime: "https",
             endpoint_url: endpoint,
             agent_id: created.id,
@@ -2613,6 +2688,62 @@ export default function WorkspaceDetail() {
           </div>
         )}
 
+        {setupStatus && !setupStatus.ready && (
+          <GlassCard hoverable={false} className="workspace-overview-card workspace-overview-setup-card">
+            <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: 16 }}>
+              <div style={{ minWidth: 0 }}>
+                <div style={{ display: "flex", alignItems: "center", flexWrap: "wrap", gap: 8, marginBottom: 6 }}>
+                  <div style={{ ...SECTION_TITLE, color: "var(--text-strong)", marginBottom: 0 }}>
+                    {t("page.workspace_detail.blueprint_setup_title")}
+                  </div>
+                  <StatusBadge type="warning" dot>
+                    {setupStatus.incomplete_checks.length}
+                  </StatusBadge>
+                </div>
+                <p style={{ fontSize: 12.5, color: "var(--text-muted)", lineHeight: 1.55, margin: 0 }}>
+                  {t("page.workspace_detail.blueprint_setup_body").replace(
+                    "{count}",
+                    String(setupStatus.incomplete_checks.length),
+                  )}
+                </p>
+              </div>
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => {
+                  const target = blueprintSetupDestination(setupStatus.incomplete_checks[0] || {});
+                  if (target === "/integrations") navigate(target);
+                  else handleTabChange(target);
+                }}
+              >
+                {t("page.workspace_detail.review_setup")}
+              </Button>
+            </div>
+            <div style={{ display: "grid", gap: 8, marginTop: 14 }}>
+              {setupStatus.incomplete_checks.slice(0, 4).map((check, index) => (
+                <div
+                  key={String(check.key || `${check.todo_kind || check.kind || "setup"}-${index}`)}
+                  style={{
+                    display: "flex",
+                    alignItems: "flex-start",
+                    gap: 9,
+                    padding: "9px 11px",
+                    borderRadius: 10,
+                    background: "var(--surface-muted)",
+                    border: "1px solid var(--border-subtle)",
+                    color: "var(--text-default)",
+                    fontSize: 12,
+                    lineHeight: 1.45,
+                  }}
+                >
+                  <IconInfo size={14} />
+                  <span>{String(check.reason || t("page.workspace_detail.setup_item_incomplete"))}</span>
+                </div>
+              ))}
+            </div>
+          </GlassCard>
+        )}
+
         {ws.blueprint_update?.status === "update_available" && (
           <GlassCard hoverable={false}>
             <div style={{ display: "flex", gap: 12, alignItems: "flex-start" }}>
@@ -2863,99 +2994,6 @@ export default function WorkspaceDetail() {
           );
         })()}
 
-        {/* Missing integrations — flagged by the architect during creation */}
-        {(() => {
-          const flagged = (((ws.settings as any)?.flagged_integrations) || []) as any[];
-          if (!flagged || flagged.length === 0) return null;
-          return (
-            <GlassCard hoverable={false} className="workspace-overview-card workspace-overview-setup-card">
-              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
-                <div className="workspace-overview-setup-title" style={{ ...SECTION_TITLE, color: "var(--text-default)" }}>
-                  {t("page.workspace_detail.needs_setup")} {flagged.length} {t("page.apps.integration")}{flagged.length === 1 ? "" : "s"}
-                </div>
-                <div style={{ display: "flex", gap: 6 }}>
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    onClick={async () => {
-                      try {
-                        const result = await api.workspaces.resolveIntegrations(workspaceId!);
-                        if (result.resolved.length > 0) {
-                          toast.success(`${t("page.workspace_detail.connected")}: ${result.resolved.join(", ")}`);
-                          queryClient.invalidateQueries({ queryKey: ["workspace", workspaceId] });
-                          queryClient.invalidateQueries({ queryKey: ["workspace-channels", workspaceId] });
-                        } else {
-                          toast.info(t("page.workspace_detail.no_new_integrations_found_set_them_up_first"));
-                        }
-                      } catch {
-                        toast.error(t("page.workspace_detail.failed_to_check_integrations"));
-                      }
-                    }}
-                  >
-                    {t("page.workspace_detail.check_again")}
-                  </Button>
-                  <Button variant="outline" size="sm" onClick={() => navigate("/integrations")}>
-                    {t("page.workspace_detail.open_integrations")}
-                  </Button>
-                </div>
-              </div>
-              <p className="workspace-overview-setup-copy" style={{ fontSize: 12, color: "var(--text-muted)", margin: "0 0 12px", lineHeight: 1.5 }}>
-                {t("page.workspace_detail.these_integrations_were_referenced_when_the_work")}
-              </p>
-              <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(min(100%, 240px), 1fr))", gap: 10 }}>
-                {flagged.map((f: any, i: number) => {
-                  const source = String(f.source || "");
-                  const providerKey = String(f.provider || "").toLowerCase();
-                  const legacyChannelProviders = new Set([
-                    "telegram", "slack", "discord", "whatsapp", "email", "wechat",
-                    "wechat_official", "wechat_personal", "twilio", "twilio_sms",
-                    "twilio_voice", "facebook", "webchat", "in_app", "inapp",
-                  ]);
-                  const isChannelSetup = source === "channel_setup" || (!source && legacyChannelProviders.has(providerKey));
-                  return (
-                    <div className="workspace-overview-setup-item" key={i} style={{
-                      padding: "10px 12px",
-                      borderRadius: 10,
-                      background: "var(--surface-muted)",
-                      border: "1px solid var(--border-subtle)",
-                    }}>
-                      <div style={{ display: "flex", alignItems: "center", gap: 6, justifyContent: "space-between" }}>
-                        <span className="workspace-overview-setup-item-title" style={{ fontSize: 13, fontWeight: 700, color: "var(--text-strong)" }}>
-                          {String(f.provider || "").replace(/[_\-]+/g, " ").replace(/\b\w/g, (c: string) => c.toUpperCase())}
-                        </span>
-                        <div style={{ display: "flex", gap: 4 }}>
-                          <Chip variant="slate" size="sm">
-                            {isChannelSetup ? t("page.workspace_detail.channel") : t("page.workspace_detail.capability")}
-                          </Chip>
-                          {f.setup_kind === "browser_extension" && (
-                            <Chip variant="slate" size="sm">
-                              {t("page.integrations.local_browser_setup_required")}
-                            </Chip>
-                          )}
-                          {f.required && <Chip variant="slate" size="sm">{t("page.login.required")}</Chip>}
-                        </div>
-                      </div>
-                      {f.purpose && (
-                        <div className="workspace-overview-setup-item-copy" style={{ fontSize: 11, color: "var(--text-muted)", marginTop: 4, lineHeight: 1.4 }}>
-                          {f.purpose}
-                        </div>
-                      )}
-                      {Array.isArray(f.linked_service_keys) && f.linked_service_keys.length > 0 && (
-                        <div className="workspace-overview-setup-chip-row" style={{ display: "flex", flexWrap: "wrap", gap: 4, marginTop: 6 }}>
-                          {f.linked_service_keys.map((sk: string) => (
-                            <Chip key={sk} variant="slate" size="sm">
-                              {_serviceLabelFromKey(sk, (operatingModel?.services as any[]) || [])}
-                            </Chip>
-                          ))}
-                        </div>
-                      )}
-                    </div>
-                  );
-                })}
-              </div>
-            </GlassCard>
-          );
-        })()}
 
         {/* Goal progress — compact inline cards */}
         {(() => {
@@ -2980,7 +3018,7 @@ export default function WorkspaceDetail() {
               </div>
               <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
                 {activeGoals.slice(0, 5).map((g: any) => {
-                  const pct = _goalProgressPercent(g);
+                  const pct = goalProgressPercent(g);
                   const pace = g.pace_status || "unknown";
                   const pc = paceColors[pace] || paceColors.unknown;
                   return (
@@ -3154,7 +3192,8 @@ export default function WorkspaceDetail() {
           <EmptyState title={t("page.workspace_detail.no_staff_assigned")} description={t("page.workspace_detail.assign_staff_members_to_this_workspace")} />
         ) : (
           <GlassCard hoverable={false} className="!p-0 overflow-hidden">
-            <table style={{ width: "100%", borderCollapse: "collapse" }}>
+            <div style={{ overflowX: "auto" }}>
+            <table style={{ width: "100%", minWidth: 497, borderCollapse: "collapse" }}>
               <thead>
                 <tr style={{ background: "#fafbfc" }}>
                   <th style={TABLE_HEADER}>{t("page.workspace_detail.staff")}</th>
@@ -3203,6 +3242,7 @@ export default function WorkspaceDetail() {
                 })}
               </tbody>
             </table>
+            </div>
           </GlassCard>
         )}
 
@@ -3686,7 +3726,8 @@ export default function WorkspaceDetail() {
           />
         ) : (
           <GlassCard hoverable={false} className="!p-0 overflow-hidden">
-            <table style={{ width: "100%", borderCollapse: "collapse" }}>
+            <div style={{ overflowX: "auto" }}>
+            <table style={{ width: "100%", minWidth: 458, borderCollapse: "collapse" }}>
               <thead>
                 <tr style={{ background: "#fafbfc" }}>
                   <th style={TABLE_HEADER}>{t("page.workspace_detail.service")}</th>
@@ -3762,6 +3803,7 @@ export default function WorkspaceDetail() {
                 })}
               </tbody>
             </table>
+            </div>
           </GlassCard>
         )}
 
@@ -3869,7 +3911,7 @@ export default function WorkspaceDetail() {
                   onChange={(v) => setAgentForm({ ...agentForm, agent_id: v })}
                   placeholder={entityAgents ? t("page.workspace_detail.select_an_agent") : t("page.workspace_detail.loading_agents")}
                   filterable
-                  options={(entityAgents || []).map((a: any) => ({
+                  options={filterWorkspaceAgentMappingOptions(entityAgents || [], workspaceId).map((a: any) => ({
                     value: a.id,
                     label: _agentLabel(a),
                   }))}
@@ -4273,14 +4315,15 @@ export default function WorkspaceDetail() {
       (channelForm.mode !== "existing" || !!channelForm.channel_config_id);
     const isEditingChannel = !!editingChannel;
     const canSaveChannel =
-      isEditingChannel
+      canManageWs && (isEditingChannel
         ? !updateChannel.isPending
-        : canAttachChannel;
+        : canAttachChannel);
     const closeChannelModal = () => {
       setShowChannelModal(false);
       setEditingChannel(null);
     };
     const openAddChannel = () => {
+      if (!canManageWs) return;
       setEditingChannel(null);
       setChannelForm({
         mode: "existing",
@@ -4295,6 +4338,7 @@ export default function WorkspaceDetail() {
       setShowChannelModal(true);
     };
     const openEditChannel = (ch: any) => {
+      if (!canManageWs) return;
       const cfg = ch.config || {};
       const linkedServiceKey = cfg.linked_service_key || cfg.service_key || "";
       setEditingChannel(ch);
@@ -4324,9 +4368,11 @@ export default function WorkspaceDetail() {
             <Button variant="outline" size="sm" onClick={() => navigate("/integrations")}>
               {t("page.workspace_detail.manage_integrations")}
             </Button>
-            <Button variant="primary" size="sm" onClick={openAddChannel}>
-              {t("page.workspace_detail.add_channel")}
-            </Button>
+            {canManageWs && (
+              <Button variant="primary" size="sm" onClick={openAddChannel}>
+                {t("page.workspace_detail.add_channel")}
+              </Button>
+            )}
           </div>
         </div>
 
@@ -4437,11 +4483,11 @@ export default function WorkspaceDetail() {
           <EmptyState
             title={t("page.workspace_detail.no_channels")}
             description={t("page.workspace_detail.attach_a_ready_integration_or_create_a_public_we")}
-            action={
+            action={canManageWs ? (
               <Button variant="primary" onClick={openAddChannel}>
                 {t("page.workspace_detail.add_channel")}
               </Button>
-            }
+            ) : undefined}
           />
         ) : (
           <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(min(100%, 360px), 1fr))", gap: 16, alignItems: "start" }}>
@@ -4739,7 +4785,7 @@ export default function WorkspaceDetail() {
                     )}
                   </div>
 
-                  {ch.channel_binding_id && (
+                  {canManageWs && ch.channel_binding_id && (
                     <div style={{
                       marginTop: 12,
                       display: "flex",
@@ -4755,6 +4801,9 @@ export default function WorkspaceDetail() {
                       >
                         {t("action.edit")}
                       </Button>
+                      {isWebchat && <Button variant="outline" size="sm" onClick={() => setPageChannel(ch)}>
+                        {t("webchat_page.page_title")}
+                      </Button>}
                       <Button
                         variant="ghost"
                         size="sm"
@@ -4774,7 +4823,7 @@ export default function WorkspaceDetail() {
         )}
 
         <Modal
-          open={showChannelModal}
+          open={canManageWs && showChannelModal}
           onClose={closeChannelModal}
           title={isEditingChannel ? t("page.workspace_detail.edit_channel") : t("page.workspace_detail.add_channel")}
           maxWidth="560px"
@@ -4786,6 +4835,7 @@ export default function WorkspaceDetail() {
                 disabled={!canSaveChannel}
                 loading={isEditingChannel ? updateChannel.isPending : attachChannel.isPending}
                 onClick={() => {
+                  if (!canManageWs) return;
                   if (isEditingChannel) updateChannel.mutate();
                   else attachChannel.mutate();
                 }}
@@ -4927,6 +4977,32 @@ export default function WorkspaceDetail() {
             />
           </div>
         </Modal>
+        {pageChannel && <WebchatPageEditor
+          key={pageChannel.channel_binding_id}
+          initialPage={pageChannel.config?.public_page}
+          workspaceName={webchatWorkspaceDisplayName(ws)}
+          agentName={pageChannel.bound_agent?.name || pageChannel.name || "Chat"}
+          agentAvatar={pageChannel.bound_agent?.avatar_url}
+          welcomeMessage={pageChannel.config?.welcome_message}
+          resources={canManageWs ? webchatResources : undefined}
+          resourceState={!canManageWs ? "ready" : webchatResourcesFailed ? "error" : webchatResourcesLoading || !webchatResources ? "loading" : "ready"}
+          hasMoreDocuments={hasMoreWebchatDocuments}
+          loadingMoreDocuments={loadingMoreWebchatDocuments}
+          onLoadMoreDocuments={() => { void fetchNextWebchatResourcePage(); }}
+          canEdit={canManageWs}
+          onClose={() => setPageChannel(null)}
+          onReview={(publicPage) => canManageWs
+            ? api.workspaces.reviewWebchatPage(workspaceId!, publicPage)
+            : api.workspaces.reviewSavedWebchatPage(workspaceId!, pageChannel.channel_binding_id)}
+          onSave={async (publicPage) => {
+            await api.workspaces.updateChannel(workspaceId!, pageChannel.channel_binding_id, {
+              config: { public_page: publicPage },
+            });
+            await queryClient.invalidateQueries({ queryKey: ["workspace-channels", workspaceId] });
+            queryClient.invalidateQueries({ queryKey: ["workspace-activity", workspaceId] });
+            toast.success(t("webchat_page.saved"));
+          }}
+        />}
       </div>
     );
   }
@@ -5820,13 +5896,10 @@ export default function WorkspaceDetail() {
     const measurementStatById = new Map(availableStats.map((stat) => [stat.id, stat]));
 
     const formatMeasurementValue = (value: unknown, stat?: (typeof availableStats)[number]) => {
-      if (value === null || value === undefined || !Number.isFinite(Number(value))) {
+      const formatted = formatGoalNumber(value);
+      if (formatted === null) {
         return t("page.workspace_detail.not_measured_yet");
       }
-      const number = Number(value);
-      const formatted = number.toLocaleString(undefined, {
-        maximumFractionDigits: Number.isInteger(number) ? 0 : 2,
-      });
       if (stat?.value_type === "percent") return `${formatted}%`;
       if (stat?.value_type === "currency") return `${stat.unit || ""}${formatted}`;
       return stat?.unit ? `${formatted} ${stat.unit}` : formatted;
@@ -5847,7 +5920,7 @@ export default function WorkspaceDetail() {
     };
 
     const computeProgress = (g: any) => {
-      return _goalProgressPercent(g);
+      return goalProgressPercent(g);
     };
 
     return (
@@ -6036,7 +6109,6 @@ export default function WorkspaceDetail() {
                             options={[
                               { value: "active", label: t("page.workspaces.filter_active") },
                               { value: "paused", label: t("page.workspaces.filter_paused") },
-                              { value: "achieved", label: t("page.workspace_detail.achieved") },
                               { value: "abandoned", label: t("page.workspace_detail.abandoned") },
                             ]}
                             ariaLabel={t("page.agent_dashboard.status")}
@@ -6051,7 +6123,7 @@ export default function WorkspaceDetail() {
                             const payload: any = {};
                             if (goalForm.title !== g.title) payload.title = goalForm.title;
                             if (goalForm.description !== (g.description || "")) payload.description = goalForm.description;
-                            if (String(goalForm.target_value) !== String(g.target_value ?? "")) payload.target_value = Number(goalForm.target_value);
+                            if (String(goalForm.target_value) !== String(g.target_value ?? "")) payload.target_value = String(goalForm.target_value).trim();
                             if (goalForm.deadline !== (g.deadline || "")) payload.deadline = goalForm.deadline || null;
                             if (goalForm.status !== g.status) payload.status = goalForm.status;
                             if ((goalForm.stat_id || "") !== (g.stat_id || "")) payload.stat_id = goalForm.stat_id || null;
@@ -7568,7 +7640,13 @@ export default function WorkspaceDetail() {
               { label: t("page.workspace_detail.services"), value: settingsServices.length },
               { label: t("nav.goals"), value: settingsGoals.length },
               { label: t("page.workspace_detail.rule_copy.rule_count"), value: settingsRules.length },
-              { label: t("page.scheduled_jobs.automations"), value: settingsAutomations.length },
+              {
+                label: t("page.scheduled_jobs.automations"),
+                value: workspaceAutomationSummary
+                  ? (workspaceAutomationSummary.summary_total || 0)
+                    + ((workspaceAutomationBindings || []).filter((binding: any) => binding.trigger_type !== "manual").length)
+                  : settingsAutomations.length,
+              },
             ].map((item) => (
               <div key={item.label} style={{ padding: "10px 12px", borderRadius: 12, background: "#fafaf9", border: "1px solid #e7e5e4" }}>
                 <div style={LABEL}>{item.label}</div>
@@ -7648,11 +7726,11 @@ export default function WorkspaceDetail() {
     documents: renderDocuments,
     rules: renderRules,
     goals: renderGoals,
-    workflows: () => flowsAvailable ? <WorkspaceWorkflows workspaceId={workspaceId!} canManage={canManageWs} /> : null,
+    workflows: () => flowsAvailable ? <WorkspaceWorkflows workspaceId={workspaceId!} canManage={canWriteWs} /> : null,
     automations: () => (
       <div style={{ display: "flex", flexDirection: "column", gap: 18 }}>
         {renderAutomationHealthCard()}
-        <ScheduledJobs workspaceId={workspaceId!} workflowsEnabled={flowsAvailable} />
+        <ScheduledJobs workspaceId={workspaceId!} workspaceStatus={ws.status} workflowsEnabled={flowsAvailable} canWriteWorkspace={canWriteWs} />
       </div>
     ),
     learning: renderLearning,
@@ -7711,6 +7789,8 @@ export default function WorkspaceDetail() {
           </Button>
         )}
       </PageHeader>
+
+      <WorkspaceConnectionNotice workspaceId={ws.id} />
 
       {canManageWs && (
         <ExportBlueprintModal
@@ -7820,42 +7900,32 @@ export default function WorkspaceDetail() {
         </form>
       </Modal>
 
-      <div style={{ marginBottom: 18, display: "flex", flexDirection: "column", gap: 10, overflowX: "auto" }}>
-        <TabSwitcher
-          tabs={PRIMARY_TABS}
-          value={primaryTab}
-          onChange={handlePrimaryTabChange}
-          className="w-full sm:w-auto"
-        />
+      <div className="workspace-detail-tab-navigation">
+        <div className="workspace-detail-primary-tabs">
+          <TabSwitcher
+            tabs={PRIMARY_TABS}
+            value={primaryTab}
+            onChange={handlePrimaryTabChange}
+            ariaLabel={ws.name}
+            className="w-full sm:w-auto"
+          />
+        </div>
         {primaryTab === "configure" && (
-          <div
-            style={{
-              display: "flex",
-              alignItems: "center",
-              gap: 12,
-              flexWrap: "wrap",
-              padding: "10px 12px",
-              borderRadius: 14,
-              border: "1px solid rgba(28,25,23,0.06)",
-              background: "rgba(255,255,255,0.58)",
-            }}
-          >
-            <div style={{ minWidth: 140 }}>
-              <div style={{ ...LABEL, marginBottom: 2 }}>
-                {t("page.workspace_detail.detailed_configuration")}
-              </div>
-              <div style={{ fontSize: 12, color: "#78716c", lineHeight: 1.35 }}>
-                {t("page.workspace_detail.configure_hint")}
-              </div>
+          <nav className="workspace-detail-config-tabs" aria-label={t("page.workspace_detail.detailed_configuration")}>
+            <span className="workspace-detail-config-label">
+              {t("page.workspace_detail.detailed_configuration")}
+            </span>
+            <div className="workspace-detail-config-tab-scroll">
+              <TabSwitcher
+                tabs={setupTabItems}
+                value={tab}
+                onChange={handleTabChange}
+                size="sm"
+                appearance="minimal"
+                ariaLabel={t("page.workspace_detail.detailed_configuration")}
+              />
             </div>
-            <TabSwitcher
-              tabs={setupTabItems}
-              value={tab}
-              onChange={handleTabChange}
-              size="sm"
-              wrap
-            />
-          </div>
+          </nav>
         )}
       </div>
 
@@ -7885,9 +7955,9 @@ export default function WorkspaceDetail() {
       />
 
       <ConfirmDialog
-        open={!!confirmRemoveChannel}
+        open={canManageWs && !!confirmRemoveChannel}
         onClose={() => setConfirmRemoveChannel(null)}
-        onConfirm={() => { if (confirmRemoveChannel) removeChannel.mutate(confirmRemoveChannel.id); }}
+        onConfirm={() => { if (canManageWs && confirmRemoveChannel) removeChannel.mutate(confirmRemoveChannel.id); }}
         title={t("page.workspace_detail.remove_channel")}
         message={t("page.workspace_detail.remove_channel_message").replace("{name}", confirmRemoveChannel?.name || t("page.workspace_detail.this_channel"))}
         confirmLabel={t("page.task_detail.runtime.remove_rule")}

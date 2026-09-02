@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Any, Optional
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -24,12 +24,121 @@ from packages.core.constants.task import (
 from packages.core.constants.execution import (
     ExecutionPlanStatus,
     ExecutionStepStatus,
+    PLAN_TERMINAL_STATUSES,
 )
 from packages.core.models.base import generate_ulid
 from packages.core.models.execution import ExecutionPlan, ExecutionStep
 from packages.core.plans.schema import Plan, PlanStep
 
 logger = logging.getLogger(__name__)
+
+
+class ActiveTaskPlanError(Exception):
+    """A Task already owns a non-terminal execution Plan.
+
+    Task row locking in ``create_plan_from_dag`` makes this check the shared
+    persistence boundary for Planner, worker, and manual API callers.  Keep the
+    existing Plan identity on the exception so background duplicate deliveries
+    can finish idempotently without dispatching a second execution.
+    """
+
+    def __init__(self, task_id: str, plan_id: str, status: str) -> None:
+        self.task_id = task_id
+        self.plan_id = plan_id
+        self.status = status
+        super().__init__(
+            f"task {task_id} already has active plan {plan_id} ({status})"
+        )
+
+
+async def get_active_task_plan(
+    db: AsyncSession,
+    *,
+    task_id: str,
+    entity_id: str,
+) -> ExecutionPlan | None:
+    """Return the newest non-terminal Plan currently owned by a Task."""
+
+    terminal_statuses = [status.value for status in PLAN_TERMINAL_STATUSES]
+    return (
+        await db.execute(
+            select(ExecutionPlan)
+            .where(
+                ExecutionPlan.task_id == task_id,
+                ExecutionPlan.entity_id == entity_id,
+                ExecutionPlan.status.notin_(terminal_statuses),
+            )
+            .order_by(ExecutionPlan.created_at.desc(), ExecutionPlan.id.desc())
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+
+
+async def raise_for_active_task_plan(
+    db: AsyncSession,
+    *,
+    task_id: str,
+    entity_id: str,
+) -> None:
+    """Raise with the reusable Plan identity when a Task is already planned."""
+
+    active_plan = await get_active_task_plan(
+        db,
+        task_id=task_id,
+        entity_id=entity_id,
+    )
+    if active_plan is not None:
+        raise ActiveTaskPlanError(
+            task_id,
+            str(active_plan.id),
+            str(active_plan.status),
+        )
+
+
+def bind_task_output_contract(plan: Plan, task_expected_output: Any) -> Plan:
+    """Make the Task deliverable the persisted terminal Plan contract.
+
+    Materialization used to replace a Planner-authored terminal shape only on
+    ``ExecutionStep``.  That left ``ExecutionPlan.plan_dag`` claiming one
+    output while the worker and dispatcher enforced another.  Bind the
+    runtime-owned Task contract before persistence so Plan, Step, downstream
+    aggregation, and supervision all read the same schema.
+
+    Ambiguous terminal producers are intentionally left unchanged; the shared
+    ``plan_contract_gaps`` gate reports that structural error and blocks the
+    Plan instead of guessing which result is final.
+    """
+    from packages.core.contracts.task_output import (
+        task_output_envelope_schema,
+        terminal_agent_step_key,
+    )
+
+    contract_schema = task_output_envelope_schema(task_expected_output)
+    if contract_schema is None:
+        return plan
+    terminal_key = terminal_agent_step_key(plan.steps)
+    if terminal_key is None:
+        return plan
+
+    changed = False
+    steps: list[PlanStep] = []
+    for step in plan.steps:
+        if step.key != terminal_key:
+            steps.append(step)
+            continue
+        if step.output_shape is None and step.expected_output_schema == contract_schema:
+            steps.append(step)
+            continue
+        steps.append(
+            step.model_copy(
+                update={
+                    "output_shape": None,
+                    "expected_output_schema": contract_schema,
+                }
+            )
+        )
+        changed = True
+    return Plan(steps=steps, metadata=plan.metadata) if changed else plan
 
 
 # ── Plan CRUD ─────────────────────────────────────────────────────────
@@ -46,6 +155,7 @@ async def create_plan_from_dag(
     parent_plan_id: Optional[str] = None,
     execution_mode: str = "live",
     approval_required: bool = False,
+    enforce_contract: bool = False,
 ) -> ExecutionPlan:
     """Persist a validated Plan as ExecutionPlan + ExecutionStep rows.
 
@@ -54,6 +164,49 @@ async def create_plan_from_dag(
     approval is enforced by the Dispatcher when that step becomes
     runnable, so safe predecessor work can still proceed.
     """
+    task_expected_output = None
+    if task_id:
+        from packages.core.models.task import Task
+
+        # Serialize every Task-bound Plan creation at the final persistence
+        # boundary.  Planner releases this lock during provider I/O, so a
+        # caller that wins meanwhile is observed here before any new Plan or
+        # Step row is written.
+        task = (
+            await db.execute(
+                select(Task)
+                .where(
+                    Task.id == task_id,
+                    Task.entity_id == entity_id,
+                )
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+        ).scalar_one_or_none()
+        if task is None:
+            raise ValueError(f"task {task_id} not found in entity {entity_id}")
+
+        await raise_for_active_task_plan(
+            db,
+            task_id=task_id,
+            entity_id=entity_id,
+        )
+
+        task_expected_output = task.expected_output
+        plan = bind_task_output_contract(plan, task_expected_output)
+
+    if enforce_contract:
+        # Keep every persistence entrypoint on the same contract gate as the
+        # Planner.  The Planner already performs this check before calling us;
+        # manual/API callers do not, so the materializer is the final boundary.
+        gaps = plan_contract_gaps(
+            plan.topo_order(),
+            task_expected_output=task_expected_output,
+            require_explicit_agent_outputs=True,
+        )
+        if gaps:
+            raise PlanContractError(gaps)
+
     # Plan-level approval is an explicit operator/API choice. Do not promote
     # every approval-gated/high-risk step into a full-plan gate; the
     # Dispatcher pauses those steps at execution time.
@@ -236,15 +389,26 @@ class PlanContractError(Exception):
 
 
 def _linker_lite_steps(steps: list[PlanStep]) -> list[dict]:
-    """Project plan steps onto the minimal shape the contract linker reads."""
-    from packages.core.plans.refs import extract_step_refs
+    """Project plan steps onto the contract fields the linker reads."""
+    from packages.core.plans.refs import extract_step_ref_paths, extract_step_refs
 
     return [
         {
             "key": s.key,
             "kind": s.kind,
             "output_shape": s.output_shape,
+            # Agent receipt fields are downgraded from required during
+            # materialization because only runtime evidence can prove them.
+            # Link against that same effective schema; otherwise planning can
+            # promise a downstream ref that the persisted contract explicitly
+            # allows the producer to omit.
+            "expected_output_schema": (
+                _strip_receipt_required_fields(s.expected_output_schema)
+                if s.kind in ("llm", "subagent")
+                else s.expected_output_schema
+            ),
             "input_refs": extract_step_refs(s.params),
+            "input_ref_paths": extract_step_ref_paths(s.params),
         }
         for s in steps
     ]
@@ -253,40 +417,74 @@ def _linker_lite_steps(steps: list[PlanStep]) -> list[dict]:
 def plan_contract_gaps(
     steps: list[PlanStep],
     *,
-    task_expected_output: dict | None = None,
+    task_expected_output: Any = None,
     require_explicit_agent_outputs: bool = False,
 ) -> list:
     """Return the contract linker's unfixable gaps (``LinkIssue`` list) for a
     plan, after auto-repair. Empty list means the plan is contract-clean (every
     consumed value is producible, every produced value is shaped). Pure — no
     side effects; callers decide whether to enforce."""
-    from packages.core.contracts.linker import repair_plan
+    from packages.core.contracts.linker import LinkIssue, repair_plan
 
     _repaired, remaining = repair_plan(_linker_lite_steps(steps))
     gaps = list(remaining)
 
     from packages.core.contracts.task_output import (
+        task_expected_output_declares_schema,
         task_expected_output_json_schema,
         terminal_agent_step_key,
+        is_concrete_output_contract_schema,
+        validate_schema_contract,
     )
 
+    # Every persisted schema is part of the execution contract, regardless
+    # of producer kind or whether this is a new-plan strict pass.  In
+    # particular, ``Draft202012Validator.check_schema`` accepts a dangling
+    # local ``$ref`` and jsonschema only raises when a lease validates a
+    # value.  Keep the same fail-closed validation on retry/migration paths,
+    # which intentionally call this function without strict agent-output
+    # enforcement.
+    for step in steps:
+        if step.expected_output_schema is None:
+            continue
+        try:
+            validate_schema_contract(step.expected_output_schema)
+        except Exception as exc:  # noqa: BLE001
+            gaps.append(
+                LinkIssue(
+                    "invalid_output_contract",
+                    step.key,
+                    f"invalid expected_output_schema: {exc}",
+                )
+            )
+
     task_schema_declared = task_expected_output_json_schema(task_expected_output) is not None
+    if (
+        task_expected_output_declares_schema(task_expected_output)
+        and task_schema_declared is False
+    ):
+        gaps.append(
+            LinkIssue(
+                "invalid_task_output_contract",
+                "task_expected_output",
+                "Task.expected_output contains an invalid or unresolved JSON Schema",
+            )
+        )
     task_terminal_key = terminal_agent_step_key(steps) if task_schema_declared else None
     if task_schema_declared and task_terminal_key is None:
-        from packages.core.contracts.linker import LinkIssue
-
         gaps.append(
             LinkIssue(
                 "task_output_contract",
                 "task_expected_output",
-                ("structured Task.expected_output requires exactly one terminal llm/subagent deliverable step"),
+                (
+                    "structured Task.expected_output requires exactly one "
+                    "terminal llm/subagent deliverable step"
+                ),
             )
         )
 
     if require_explicit_agent_outputs:
-        from packages.core.contracts.linker import LinkIssue
         from packages.core.contracts.shapes import get_shape
-        from jsonschema import Draft202012Validator
 
         for step in steps:
             if step.kind not in ("llm", "subagent") or step.key == task_terminal_key:
@@ -319,14 +517,13 @@ def plan_contract_gaps(
                 )
                 continue
             if has_schema:
-                try:
-                    Draft202012Validator.check_schema(step.expected_output_schema)
-                except Exception as exc:
+                if not is_concrete_output_contract_schema(step.expected_output_schema):
                     gaps.append(
                         LinkIssue(
-                            "invalid_output_contract",
+                            "empty_output_contract",
                             step.key,
-                            f"invalid expected_output_schema: {exc}",
+                            "expected_output_schema must constrain a concrete payload; "
+                            "an empty/open schema is not an explicit output contract",
                         )
                     )
                 continue
@@ -352,6 +549,89 @@ def plan_contract_gaps(
                         f"unknown canonical output_shape {step.output_shape!r}",
                     )
                 )
+    return gaps
+
+
+def persisted_plan_contract_gaps(
+    plan_dag: object,
+    *,
+    task_expected_output: Any = None,
+) -> list:
+    """Lint a JSONB plan snapshot before re-dispatching it.
+
+    A plan may have been materialized by an older planner version whose
+    references used the StepResult ``outputs`` wrapper even though its
+    producer now has a bare explicit payload.  Retry paths must not blindly
+    replay that snapshot.  Legacy unshaped agent steps remain compatible via
+    ``repair_plan``'s StepResult inference; only actual unresolved contracts
+    are returned here.
+    """
+    from packages.core.contracts.linker import LinkIssue
+
+    try:
+        snapshot = Plan.model_validate(plan_dag)
+    except Exception as exc:  # noqa: BLE001
+        return [
+            LinkIssue(
+                "invalid_plan",
+                "plan",
+                f"persisted plan snapshot is invalid and must be replanned: {exc}",
+            )
+        ]
+    # A pre-contract plan with no producer declaration was materialized as the
+    # legacy StepResult envelope. Do not let the current repair heuristic infer
+    # a new bare canonical shape from a direct field reference while auditing
+    # that persisted snapshot; its stored execution step still produces
+    # ``result.outputs.*``.
+    legacy_steps = [
+        step.model_copy(update={"output_shape": "StepResult"})
+        if (
+            step.kind in ("llm", "subagent")
+            and not step.output_shape
+            and step.expected_output_schema is None
+        )
+        else step
+        for step in snapshot.topo_order()
+    ]
+    gaps = plan_contract_gaps(
+        legacy_steps,
+        task_expected_output=task_expected_output,
+        require_explicit_agent_outputs=False,
+    )
+    # A structured Task.expected_output introduced after a legacy plan was
+    # persisted is not represented by the old DAG's generic StepResult row.
+    # Replaying that snapshot would silently drop ``outputs.data`` and defeat
+    # the hard task contract. Only a materialized task-envelope marker proves
+    # the persisted DAG already carries the binding; otherwise force a fresh
+    # planner/materialization pass.
+    from packages.core.contracts.task_output import (
+        OutputContractKind,
+        terminal_agent_step_key,
+        task_expected_output_json_schema,
+        output_contract_for_schema,
+    )
+
+    if task_expected_output_json_schema(task_expected_output) is not None:
+        terminal_key = terminal_agent_step_key(legacy_steps)
+        has_task_envelope = any(
+            step.key == terminal_key
+            and output_contract_for_schema(step.expected_output_schema).kind
+            is OutputContractKind.TASK_ENVELOPE
+            for step in legacy_steps
+        )
+        if not has_task_envelope:
+            from packages.core.contracts.linker import LinkIssue
+
+            gaps.append(
+                LinkIssue(
+                    "task_output_contract",
+                    "task_expected_output",
+                    (
+                        "persisted plan lacks the task-output envelope binding; "
+                        "replan before retrying so outputs.data is enforced"
+                    ),
+                )
+            )
     return gaps
 
 
@@ -393,14 +673,13 @@ def _strip_receipt_required_fields(schema: dict | None) -> dict | None:
     return out
 
 
-def _step_from_pydantic(
-    plan_row: ExecutionPlan,
+def _expected_output_schema_for_plan_step(
     ps: PlanStep,
     *,
-    max_attempts: int | None = None,
     output_shape: str | None = None,
     task_output_contract_schema: dict | None = None,
-) -> ExecutionStep:
+) -> dict | None:
+    """Return the one effective output contract materialization must persist."""
     # When a step resolves to a canonical shape (declared or linker-inferred),
     # derive expected_output_schema from the shape so producer/normalizer/
     # validator share one vocabulary. For free-form kinds (llm/subagent) the
@@ -409,15 +688,19 @@ def _step_from_pydantic(
     # OutputSchemaError source. Structured kinds keep an explicit schema: it's a
     # real contract with an external system, not a guess.
     from packages.core.contracts.task_output import (
+        OutputContractKind,
         PLAN_SCHEMA_OUTPUT_CONTRACT_SOURCE,
-        is_task_output_contract_schema,
+        output_contract_for_schema,
         plan_output_contract_schema,
     )
 
     expected_output_schema = ps.expected_output_schema
     shape_schema_applied = False
     embedded_task_contract = (
-        ps.expected_output_schema if is_task_output_contract_schema(ps.expected_output_schema) else None
+        ps.expected_output_schema
+        if output_contract_for_schema(ps.expected_output_schema).kind
+        is OutputContractKind.TASK_ENVELOPE
+        else None
     )
     if (task_output_contract_schema is not None or embedded_task_contract is not None) and ps.kind in (
         "llm",
@@ -438,7 +721,11 @@ def _step_from_pydantic(
             expected_output_schema is None or ps.kind in ("llm", "subagent")
         ):
             expected_output_schema = shape_schema
-            if ps.kind in ("llm", "subagent") and ps.output_shape:
+            if (
+                ps.kind in ("llm", "subagent")
+                and ps.output_shape
+                and ps.output_shape != "StepResult"
+            ):
                 expected_output_schema = plan_output_contract_schema(shape_schema)
             shape_schema_applied = True
     elif ps.expected_output_schema is not None and ps.kind in ("llm", "subagent"):
@@ -465,6 +752,22 @@ def _step_from_pydantic(
         # A planner-authored custom schema survived (no shape resolved):
         # de-fang its receipt requirements before it can OutputSchemaError.
         expected_output_schema = _strip_receipt_required_fields(expected_output_schema)
+    return expected_output_schema
+
+
+def _step_from_pydantic(
+    plan_row: ExecutionPlan,
+    ps: PlanStep,
+    *,
+    max_attempts: int | None = None,
+    output_shape: str | None = None,
+    task_output_contract_schema: dict | None = None,
+) -> ExecutionStep:
+    expected_output_schema = _expected_output_schema_for_plan_step(
+        ps,
+        output_shape=output_shape,
+        task_output_contract_schema=task_output_contract_schema,
+    )
     return ExecutionStep(
         id=generate_ulid(),
         plan_id=plan_row.id,

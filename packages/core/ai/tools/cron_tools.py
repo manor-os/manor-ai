@@ -67,10 +67,12 @@ async def _cancel_job_handler(entity_id: str = "", job_id: str = "", **kwargs):
 
 async def _toggle_job_handler(entity_id: str = "", job_id: str = "", enabled: bool = True, **kwargs):
     """Enable or disable a scheduled job."""
+    runtime_context = runtime_tool_call_context_from_kwargs(kwargs)
     return await runtime_toggle_scheduled_job_action(
         entity_id=entity_id,
         job_id=job_id,
         enabled=enabled,
+        actor_id=runtime_context.agent_id,
     )
 
 

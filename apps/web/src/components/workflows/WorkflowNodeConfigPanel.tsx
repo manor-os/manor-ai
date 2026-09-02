@@ -13,6 +13,16 @@ import Toggle from "../ui/Toggle";
 import MediaPreview from "./MediaPreview";
 import { extractMediaRefs } from "../../lib/workflowMedia";
 import { inferredWorkflowInputs, workflowStepOutputs } from "../../lib/workflowBindings";
+import {
+  ConnectorAccountSelectionMode,
+  ConnectorServerKind,
+  connectorAccountError,
+  connectorAccountSelectionOptions,
+  connectorOperationInputSchema,
+  connectorOperationOutputSchema,
+  connectorOperationSupportsAllAccounts,
+  resolveConnectorServerKind,
+} from "../../lib/workflow-connector-accounts.mjs";
 
 /* Node detail view — edit a node's config (prompt / model / params), like
    n8n's NDV. Renders type-appropriate fields; unknown types fall back to a
@@ -393,14 +403,6 @@ export default function WorkflowNodeConfigPanel({
     enabled: step?.type === "agent",
     staleTime: 0,
   });
-  // Ready-made marketplace agents — so a workspace with no agents of its own
-  // can still pick one to run.
-  const { data: marketplaceAgents = [] } = useQuery({
-    queryKey: ["agents", "marketplace"],
-    queryFn: () => api.agents.marketplace(),
-    enabled: step?.type === "agent",
-    staleTime: 60_000,
-  });
   const { data: skills = [] } = useQuery({
     queryKey: ["skills"],
     queryFn: () => api.skills.list(),
@@ -478,6 +480,62 @@ export default function WorkflowNodeConfigPanel({
   if (!step) return null;
   const m = meta(step.type);
   const fields = SCHEMA[step.type];
+  const connectorServerInfo = (integrationServers as IntegrationMCPServer[])
+    .find((item) => item.server_key === connectorServer);
+  const connectorArgs = config.args && typeof config.args === "object" && !Array.isArray(config.args)
+    ? config.args as Record<string, any>
+    : {};
+  const selectedConnectorAccountId = String(connectorArgs.integration_account_id || "");
+  const catalogSelectedOperation = connectorCatalog?.server_key === connectorServer
+    ? connectorCatalog.operations.find((item) => (
+      item.tool_name === String(config.tool || "")
+      || item.name === parsedConnectorTool.operation
+    ))
+    : undefined;
+  const operationAccountIds = new Set(catalogSelectedOperation?.account_ids || []);
+  const callableConnectorAccountIds = new Set([
+    ...(connectorServerInfo?.connections || []),
+    ...(connectorServerInfo?.entity_accounts || []),
+  ].filter((account) => (
+    account.runtime_callable !== false
+    && (!operationAccountIds.size || operationAccountIds.has(account.id))
+  )).map((account) => account.id));
+  const connectorServerKind = resolveConnectorServerKind({
+    serverKey: connectorServer,
+    operationCatalogKind: connectorCatalog?.server_key === connectorServer
+      ? connectorCatalog.server_kind
+      : undefined,
+    operationCatalogSource: connectorCatalog?.server_key === connectorServer
+      ? connectorCatalog.source
+      : undefined,
+    serverCatalogKind: connectorServerInfo?.server_kind,
+    persistedKind: config.connector_server_kind,
+  });
+  const accountCatalogStatus = integrationServersLoading
+    ? "loading"
+    : integrationServersError
+      ? "error"
+      : "ready";
+  const connectorAccountValidationError = step.type !== "connector" || !connectorServer
+    ? ""
+    : connectorAccountError({
+        serverKey: connectorServer,
+        serverKind: connectorServerKind,
+        accountCatalogStatus,
+        serverCatalogPresent: Boolean(connectorServerInfo),
+        requiresExplicitAccount: (
+          connectorServerInfo?.requires_explicit_account
+          || catalogSelectedOperation?.requires_explicit_account
+        ),
+        selectedAccountId: selectedConnectorAccountId,
+        selectedAccountSelection: String(
+          connectorArgs.integration_account_selection || "",
+        ),
+        callableAccountIds: [...callableConnectorAccountIds],
+        operation: catalogSelectedOperation,
+      });
+  const connectorAccountInvalid = Boolean(connectorAccountValidationError);
+  const connectorOperationInvalid = step.type === "connector" && !String(config.tool || "").trim();
   const setKey = (k: string, v: any) => setConfig((c) => ({ ...c, [k]: v }));
   const isEntryNode = ["trigger", "webhook"].includes(step.type);
   const entryInputRows: WorkflowRunInputBinding[] = Array.isArray(config.run_inputs)
@@ -524,10 +582,18 @@ export default function WorkflowNodeConfigPanel({
           ))
         : v;
     }
+    if (step.type === "connector") {
+      if (connectorServerKind === ConnectorServerKind.UNKNOWN) {
+        delete clean.connector_server_kind;
+      } else {
+        clean.connector_server_kind = connectorServerKind;
+      }
+    }
     return clean;
   };
 
   const save = () => {
+    if (connectorAccountInvalid || connectorOperationInvalid) return;
     onSave({ ...step!, name, config: cleanConfig() });
     close();
   };
@@ -535,7 +601,7 @@ export default function WorkflowNodeConfigPanel({
   // Test this node with explicit, ephemeral input values. Test values replace
   // the saved mappings only in this request; Save still persists cleanConfig().
   const runNode = async () => {
-    if (!step || running) return;
+    if (!step || running || connectorAccountInvalid || connectorOperationInvalid) return;
     const cleaned = cleanConfig();
     const inputs: Binding[] = Array.isArray(cleaned.inputs) ? cleaned.inputs : [];
     const errors: Record<string, string> = {};
@@ -602,13 +668,13 @@ export default function WorkflowNodeConfigPanel({
           <Button
             variant="outline"
             onClick={runNode}
-            disabled={running || step.type === "stage" || !!rawErr || hasBindingValueErrors || Object.keys(jsonErrs).length > 0}
+            disabled={running || step.type === "stage" || !!rawErr || hasBindingValueErrors || connectorAccountInvalid || connectorOperationInvalid || Object.keys(jsonErrs).length > 0}
           >
             {running ? "Testing…" : "Test node"}
           </Button>
           <div className="workflow-node-dialog-primary-actions">
             <Button variant="ghost" onClick={close}>Cancel</Button>
-            <Button onClick={save} disabled={!!rawErr || hasBindingValueErrors || Object.keys(jsonErrs).length > 0}>Save</Button>
+            <Button onClick={save} disabled={!!rawErr || hasBindingValueErrors || connectorAccountInvalid || connectorOperationInvalid || Object.keys(jsonErrs).length > 0}>Save</Button>
           </div>
         </div>
       }
@@ -669,9 +735,6 @@ export default function WorkflowNodeConfigPanel({
                 options={[
                   { value: "", label: "— None (configure inline) —" },
                   ...(agents as { id: string; name: string }[]).map((a) => ({ value: a.id, label: a.name })),
-                  ...(marketplaceAgents as { id: string; name: string }[])
-                    .filter((m) => !(agents as { id: string }[]).some((a) => a.id === m.id))
-                    .map((m) => ({ value: m.id, label: `${m.name} · marketplace` })),
                 ]}
               />
               {config.agent_id && <OpenLink label="Open agent" onClick={() => goResource(`/agents/${config.agent_id}`)} />}
@@ -766,7 +829,7 @@ export default function WorkflowNodeConfigPanel({
             const operation = parsedConnectorTool.operation;
             const servers = integrationServers as IntegrationMCPServer[];
             const selectableServers = servers.filter((item) => item.agent_can_use || item.server_key === server);
-            const serverInfo = servers.find((item) => item.server_key === server);
+            const serverInfo = connectorServerInfo;
             const serverOptions = [
               ...selectableServers.map((item) => ({
                 value: item.server_key,
@@ -779,7 +842,9 @@ export default function WorkflowNodeConfigPanel({
             const operations = connectorCatalog?.server_key === server
               ? connectorCatalog.operations
               : [];
-            const selectedOperation = operations.find((item) => item.name === operation);
+            const selectedOperation = operations.find((item) => (
+              item.tool_name === tool || item.name === operation
+            ));
             const resources = [...new Set(operations.map((item) => item.resource))].sort();
             const hasResourceFilter = Object.prototype.hasOwnProperty.call(config, "__connector_resource");
             const resourceFilter = hasResourceFilter
@@ -790,30 +855,55 @@ export default function WorkflowNodeConfigPanel({
               : operations;
             const operationOptions = [
               ...visibleOperations.map((item) => ({
-                value: item.name,
+                value: item.tool_name,
                 label: resourceFilter ? item.label : `${item.resource} · ${item.label}`,
               })),
-              ...(operation && !visibleOperations.some((item) => item.name === operation)
-                ? [{ value: operation, label: `${connectorArgumentLabel(operation)} (custom)` }]
+              ...(tool && !visibleOperations.some((item) => item.tool_name === tool)
+                ? [{ value: tool, label: `${connectorArgumentLabel(operation)} (custom)` }]
                 : []),
             ];
-            const args = config.args && typeof config.args === "object" && !Array.isArray(config.args)
-              ? config.args as Record<string, any>
-              : {};
+            const args = connectorArgs;
+            const accountOwnershipLabel = (account: { ownership: "mine" | "shared" }) => (
+              account.ownership === "shared" ? "Shared" : "Mine"
+            );
+            const supportedAccountIds = new Set(selectedOperation?.account_ids || []);
             const accounts = [
-              ...(serverInfo?.connections || []).map((account) => ({
+              ...(serverInfo?.connections || []).filter((account) => account.runtime_callable !== false).map((account) => ({
                 value: account.id,
-                label: `${account.display_name || `Account ${account.id.slice(-6)}`} · Personal${account.is_default ? " · Default" : ""}`,
+                label: `${account.display_name || `Account ${account.id.slice(-6)}`} · ${accountOwnershipLabel(account)} · Personal${account.is_default ? " · Default" : ""}`,
               })),
-              ...(serverInfo?.entity_accounts || []).map((account) => ({
+              ...(serverInfo?.entity_accounts || []).filter((account) => account.runtime_callable !== false).map((account) => ({
                 value: account.id,
-                label: `${account.display_name || account.name || `Account ${account.id.slice(-6)}`} · Shared${account.is_default ? " · Default" : ""}`,
+                label: `${account.display_name || account.name || `Account ${account.id.slice(-6)}`} · ${accountOwnershipLabel(account)} · Entity${account.is_default ? " · Default" : ""}`,
               })),
-            ];
-            const selectedAccount = String(args.integration_account_id || "");
-            if (selectedAccount && !accounts.some((account) => account.value === selectedAccount)) {
-              accounts.push({ value: selectedAccount, label: `Unavailable account · ${selectedAccount.slice(-6)}` });
+            ].filter((account) => (
+              !supportedAccountIds.size || supportedAccountIds.has(account.value)
+            ));
+            const requiresExplicitAccount = Boolean(
+              serverInfo?.requires_explicit_account
+              || selectedOperation?.requires_explicit_account
+            );
+            const selectedAccountId = String(args.integration_account_id || "");
+            const selectedAccountSelection = String(
+              args.integration_account_selection || "",
+            );
+            const selectedAccountSelectionMode = selectedAccountSelection === ConnectorAccountSelectionMode.ALL
+              ? ConnectorAccountSelectionMode.ALL
+              : selectedAccountId
+                ? ConnectorAccountSelectionMode.EXACT
+                : ConnectorAccountSelectionMode.DEFAULT;
+            const selectedAccount = selectedAccountSelectionMode === ConnectorAccountSelectionMode.ALL
+              ? ConnectorAccountSelectionMode.ALL
+              : selectedAccountId;
+            if (selectedAccountId && !accounts.some((account) => account.value === selectedAccountId)) {
+              accounts.push({ value: selectedAccountId, label: `Unavailable account · ${selectedAccountId.slice(-6)}` });
             }
+            const accountSelectionOptions = connectorAccountSelectionOptions({
+              accounts,
+              requiresExplicitAccount,
+              selectedAccountSelection: selectedAccountSelectionMode,
+              operation: selectedOperation,
+            });
 
             const clearArgumentErrors = () => setJsonErrs((current) => Object.fromEntries(
               Object.entries(current).filter(([key]) => key !== "args" && !key.startsWith("args.")),
@@ -824,37 +914,83 @@ export default function WorkflowNodeConfigPanel({
                 const next = { ...current };
                 delete next.tool;
                 delete next.args;
+                delete next.output_schema;
                 delete next.__connector_resource;
+                delete next.connector_server_kind;
                 if (nextServer) next.__connector_server = nextServer;
                 else delete next.__connector_server;
                 return next;
               });
             };
-            const selectOperation = (nextOperation: string) => {
+            const selectOperation = (nextToolName: string) => {
               clearArgumentErrors();
               setConfig((current) => {
                 const previousArgs = current.args && typeof current.args === "object" && !Array.isArray(current.args)
                   ? current.args as Record<string, any>
                   : {};
-                const nextDefinition = operations.find((item) => item.name === nextOperation);
-                const allowed = new Set(Object.keys(nextDefinition?.input_schema?.properties || {}));
+                const nextDefinition = operations.find((item) => (
+                  item.tool_name === nextToolName || item.name === nextToolName
+                ));
+                const nextInputSchema = connectorOperationInputSchema(
+                  nextDefinition,
+                  String(previousArgs.integration_account_id || ""),
+                );
+                const allowed = new Set(Object.keys(nextInputSchema.properties || {}));
                 const nextArgs: Record<string, any> = {};
-                if (previousArgs.integration_account_id) {
+                const nextAccountIds = new Set(nextDefinition?.account_ids || []);
+                if (
+                  previousArgs.integration_account_id
+                  && (
+                    !nextAccountIds.size
+                    || nextAccountIds.has(String(previousArgs.integration_account_id))
+                  )
+                ) {
                   nextArgs.integration_account_id = previousArgs.integration_account_id;
+                }
+                const nextRequiresExplicitAccount = Boolean(
+                  serverInfo?.requires_explicit_account
+                  || nextDefinition?.requires_explicit_account
+                );
+                if (
+                  previousArgs.integration_account_selection === ConnectorAccountSelectionMode.ALL
+                  && connectorOperationSupportsAllAccounts(
+                    nextDefinition,
+                    nextRequiresExplicitAccount,
+                  )
+                ) {
+                  nextArgs.integration_account_selection = ConnectorAccountSelectionMode.ALL;
                 }
                 if (!operations.length || !nextDefinition) {
                   Object.assign(nextArgs, previousArgs);
                 } else {
                   for (const [key, value] of Object.entries(previousArgs)) {
-                    if (allowed.has(key)) nextArgs[key] = value;
+                    if (
+                      key !== "integration_account_id"
+                      && key !== "integration_account_selection"
+                      && allowed.has(key)
+                    ) nextArgs[key] = value;
                   }
                 }
-                return {
+                const nextOutputSchema = connectorOperationOutputSchema(
+                  nextDefinition,
+                  String(nextArgs.integration_account_id || ""),
+                );
+                const next: Record<string, any> = {
                   ...current,
                   __connector_server: server,
-                  tool: nextOperation ? `mcp__${server}__${nextOperation}` : undefined,
+                  tool: nextToolName
+                    ? (
+                      nextDefinition?.tool_name
+                      || (nextToolName.startsWith("mcp__")
+                        ? nextToolName
+                        : `mcp__${server}__${nextToolName}`)
+                    )
+                    : undefined,
                   args: Object.keys(nextArgs).length ? nextArgs : undefined,
                 };
+                if (nextOutputSchema) next.output_schema = nextOutputSchema;
+                else delete next.output_schema;
+                return next;
               });
             };
             const selectResource = (nextResource: string) => {
@@ -863,21 +999,56 @@ export default function WorkflowNodeConfigPanel({
                 const next: Record<string, any> = { ...current, __connector_resource: nextResource };
                 if (nextResource && selectedOperation && selectedOperation.resource !== nextResource) {
                   delete next.tool;
+                  delete next.output_schema;
                   const accountId = args.integration_account_id;
                   next.args = accountId ? { integration_account_id: accountId } : undefined;
                 }
                 return next;
               });
             };
-            const selectAccount = (accountId: string) => setConfig((current) => {
-              const previousArgs = current.args && typeof current.args === "object" && !Array.isArray(current.args)
-                ? current.args as Record<string, any>
-                : {};
-              const nextArgs = { ...previousArgs };
-              if (accountId) nextArgs.integration_account_id = accountId;
-              else delete nextArgs.integration_account_id;
-              return { ...current, args: Object.keys(nextArgs).length ? nextArgs : undefined };
-            });
+            const selectAccount = (accountSelection: string) => {
+              clearArgumentErrors();
+              setConfig((current) => {
+                const previousArgs = current.args && typeof current.args === "object" && !Array.isArray(current.args)
+                  ? current.args as Record<string, any>
+                  : {};
+                const nextArgs: Record<string, any> = {};
+                const allAccounts = (
+                  accountSelection === ConnectorAccountSelectionMode.ALL
+                );
+                const accountId = allAccounts ? "" : accountSelection;
+                const nextInputSchema = connectorOperationInputSchema(
+                  selectedOperation,
+                  accountId,
+                );
+                const allowed = new Set(Object.keys(nextInputSchema.properties || {}));
+                for (const [key, value] of Object.entries(previousArgs)) {
+                  if (
+                    key !== "integration_account_id"
+                    && key !== "integration_account_selection"
+                    && allowed.has(key)
+                  ) {
+                    nextArgs[key] = value;
+                  }
+                }
+                if (allAccounts) {
+                  nextArgs.integration_account_selection = ConnectorAccountSelectionMode.ALL;
+                } else if (accountId) {
+                  nextArgs.integration_account_id = accountId;
+                }
+                const next: Record<string, any> = {
+                  ...current,
+                  args: Object.keys(nextArgs).length ? nextArgs : undefined,
+                };
+                const nextOutputSchema = connectorOperationOutputSchema(
+                  selectedOperation,
+                  accountId,
+                );
+                if (nextOutputSchema) next.output_schema = nextOutputSchema;
+                else delete next.output_schema;
+                return next;
+              });
+            };
             const setArgument = (key: string, value: any) => setConfig((current) => {
               const previousArgs = current.args && typeof current.args === "object" && !Array.isArray(current.args)
                 ? current.args as Record<string, any>
@@ -887,8 +1058,12 @@ export default function WorkflowNodeConfigPanel({
               else nextArgs[key] = value;
               return { ...current, args: Object.keys(nextArgs).length ? nextArgs : undefined };
             });
-            const properties = selectedOperation?.input_schema?.properties || {};
-            const required = new Set(selectedOperation?.input_schema?.required || []);
+            const selectedInputSchema = connectorOperationInputSchema(
+              selectedOperation,
+              selectedAccount,
+            );
+            const properties = selectedInputSchema.properties || {};
+            const required = new Set(selectedInputSchema.required || []);
             return (
               <>
                 <Field label="Integration" hint="Resolved against this entity / workspace's connected accounts.">
@@ -910,16 +1085,27 @@ export default function WorkflowNodeConfigPanel({
                   )}
                   <OpenLink label={serverOptions.length ? "Manage integrations" : "Connect an integration"} onClick={() => goResource("/integrations")} />
                 </Field>
-                {accounts.length > 1 && (
-                  <Field label="Account" hint="Choose a connected account, or leave this on the provider default.">
+                {(accountSelectionOptions.length > 2
+                  || selectedAccountSelectionMode !== ConnectorAccountSelectionMode.DEFAULT
+                  || requiresExplicitAccount
+                  || Boolean(connectorAccountValidationError)) && (
+                  <Field
+                    label="Account"
+                    hint={requiresExplicitAccount
+                      ? "Choose an exact connected account because the provider default is unavailable."
+                      : "Use the default, choose one account, or query all connected accounts for compatible read operations."}
+                  >
                     <Select
                       value={selectedAccount}
                       onChange={selectAccount}
-                      placeholder="Default account"
-                      options={[{ value: "", label: "Default account" }, ...accounts]}
+                      placeholder={requiresExplicitAccount ? "Select an account" : "Default account"}
+                      options={accountSelectionOptions}
                       filterable
                       ariaLabel="Integration account"
                     />
+                    {connectorAccountValidationError && (
+                      <span role="alert" className="workflow-connector-error">{connectorAccountValidationError}</span>
+                    )}
                   </Field>
                 )}
                 {server && resources.length > 1 && (
@@ -942,14 +1128,14 @@ export default function WorkflowNodeConfigPanel({
                 >
                   {server && (connectorCatalogError || (!connectorCatalogLoading && operations.length === 0)) ? (
                     <Input
-                      value={operation}
+                      value={tool}
                       onChange={(event) => selectOperation(event.target.value)}
                       placeholder="e.g. send_message"
                       ariaLabel="Integration operation"
                     />
                   ) : (
                     <Select
-                      value={operation}
+                      value={tool}
                       onChange={selectOperation}
                       placeholder={!server
                         ? "Select an integration first"
@@ -967,6 +1153,9 @@ export default function WorkflowNodeConfigPanel({
                   )}
                   {server && !connectorCatalogLoading && !connectorCatalogError && operations.length === 0 && (
                     <span className="workflow-connector-help">No discovered operations yet. Enter the exact MCP operation name.</span>
+                  )}
+                  {connectorOperationInvalid && (
+                    <span role="alert" className="workflow-connector-error">Select an operation before saving or testing this connector.</span>
                   )}
                 </Field>
                 {selectedOperation?.effect !== "read" && selectedOperation && (

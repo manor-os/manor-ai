@@ -11,6 +11,7 @@ from packages.core.ai.runtime.prompt_tools import (
 from packages.core.ai.runtime.requests import AIRuntimeRequest
 from packages.core.ai.runtime.resolver import ResolvedRuntimeToolSurface, RuntimeResolver
 from packages.core.ai.runtime.surfaces import ChatSurface
+from packages.core.ai.runtime.tool_bindings import RuntimeMCPProviderToolScope
 
 
 def runtime_public_agent_tool_surface(
@@ -49,6 +50,8 @@ def runtime_prepare_tool_surface_for_turn(
     tool_schemas: Iterable[dict[str, Any]] | None = None,
     allowed_tool_names: Iterable[str] | None = None,
     blocked_tool_names: Iterable[str] | None = None,
+    mcp_provider_scopes: Iterable[RuntimeMCPProviderToolScope] = (),
+    mcp_scope_unrestricted: bool = False,
     skill_refs: Iterable[dict[str, Any]] | None = None,
 ) -> ResolvedRuntimeToolSurface:
     """Resolve the tool surface for one Manor AI runtime turn.
@@ -64,6 +67,8 @@ def runtime_prepare_tool_surface_for_turn(
         tool_schemas=tool_schemas,
         allowed_tool_names=allowed_tool_names,
         blocked_tool_names=blocked_tool_names,
+        mcp_provider_scopes=mcp_provider_scopes,
+        mcp_scope_unrestricted=mcp_scope_unrestricted,
         skill_refs=skill_refs,
     )
 
@@ -125,6 +130,8 @@ def runtime_prepare_agent_tool_surface_for_turn(
     bound_tool_names: set[str] | None = None,
     is_master: bool = False,
     mcp_allowed_names: set[str] | None = None,
+    mcp_provider_scopes: Iterable[RuntimeMCPProviderToolScope] = (),
+    mcp_scope_unrestricted: bool = False,
     tool_profile: str | None = None,
     blocked_tool_names: Iterable[str] | None = None,
     skill_refs: Iterable[dict[str, Any]] | None = None,
@@ -153,6 +160,8 @@ def runtime_prepare_agent_tool_surface_for_turn(
         tool_schemas=tools,
         allowed_tool_names=allowed_tool_names,
         blocked_tool_names=blocked_tool_names,
+        mcp_provider_scopes=mcp_provider_scopes,
+        mcp_scope_unrestricted=mcp_scope_unrestricted,
         skill_refs=skill_refs,
     )
 
@@ -164,6 +173,8 @@ def runtime_prepare_trace_envelope_for_turn(
     tool_schemas: Iterable[dict[str, Any]] | None = None,
     allowed_tool_names: Iterable[str] | None = None,
     blocked_tool_names: Iterable[str] | None = None,
+    mcp_provider_scopes: Iterable[RuntimeMCPProviderToolScope] = (),
+    mcp_scope_unrestricted: bool = False,
     skill_refs: Iterable[dict[str, Any]] | None = None,
 ) -> RuntimeEnvelope:
     """Resolve a runtime envelope for turns that do not expose tools."""
@@ -174,5 +185,7 @@ def runtime_prepare_trace_envelope_for_turn(
         tool_schemas=tool_schemas,
         allowed_tool_names=allowed_tool_names,
         blocked_tool_names=blocked_tool_names,
+        mcp_provider_scopes=mcp_provider_scopes,
+        mcp_scope_unrestricted=mcp_scope_unrestricted,
         skill_refs=skill_refs,
     )

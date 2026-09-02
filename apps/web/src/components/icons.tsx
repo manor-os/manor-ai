@@ -11,6 +11,7 @@
  */
 
 import type { MouseEvent } from "react";
+import { resolveIntegrationBrand } from "../lib/brands/catalog";
 
 /* ── Shared prop interface ────────────────────────────────────── */
 
@@ -977,51 +978,51 @@ export function IconComment(props: IconProps) {
 
 /* ═══════════════════════════════════════════════════════════════
    Integration / brand icons (filled, not stroke-based)
-   Uses fill="currentColor" — apply color via className or parent color
+   Monochrome paths inherit currentColor; full-color assets retain their artwork.
    ═══════════════════════════════════════════════════════════════ */
 
-function BrandSvg({ size = 20, className, onClick, style, children }: IconProps & { children: React.ReactNode }) {
+function BrandSvg({ brandKey, size = 20, className, onClick, style }: IconProps & { brandKey: string }) {
+  const icon = resolveIntegrationBrand(brandKey)?.icon;
+  if (icon?.src) {
+    return <img src={icon.src} width={size} height={size} alt="" aria-hidden="true"
+      draggable={false} className={className} onClick={onClick}
+      style={{ objectFit: "contain", flexShrink: 0, ...style, ...(onClick ? { cursor: "pointer" } : {}) }} />;
+  }
   return (
-    <svg xmlns="http://www.w3.org/2000/svg" width={size} height={size} viewBox="0 0 24 24"
-      fill="currentColor" className={className} onClick={onClick}
+    <svg xmlns="http://www.w3.org/2000/svg" width={size} height={size}
+      viewBox={icon?.viewBox || "0 0 24 24"} fill="currentColor"
+      className={className} onClick={onClick}
       style={onClick ? { ...style, cursor: "pointer" } : style}
-    >{children}</svg>
+    >{icon?.path ? <path d={icon.path} /> : null}</svg>
   );
 }
 
 export function IconTelegram(props: IconProps) {
-  return (<BrandSvg {...props}><path d="M11.944 0A12 12 0 000 12a12 12 0 0012 12 12 12 0 0012-12A12 12 0 0012 0a12 12 0 00-.056 0zm4.962 7.224c.1-.002.321.023.465.14a.506.506 0 01.171.325c.016.093.036.306.02.472-.18 1.898-.962 6.502-1.36 8.627-.168.9-.499 1.201-.82 1.23-.696.065-1.225-.46-1.9-.902-1.056-.693-1.653-1.124-2.678-1.8-1.185-.78-.417-1.21.258-1.91.177-.184 3.247-2.977 3.307-3.23.007-.032.014-.15-.056-.212s-.174-.041-.249-.024c-.106.024-1.793 1.14-5.061 3.345-.48.33-.913.49-1.302.48-.428-.008-1.252-.241-1.865-.44-.752-.245-1.349-.374-1.297-.789.027-.216.325-.437.893-.663 3.498-1.524 5.83-2.529 6.998-3.014 3.332-1.386 4.025-1.627 4.476-1.635z" /></BrandSvg>);
+  return <BrandSvg brandKey="telegram" {...props} />;
 }
 export function IconWhatsApp(props: IconProps) {
-  return (<BrandSvg {...props}><path d="M17.472 14.382c-.297-.149-1.758-.867-2.03-.967-.273-.099-.471-.148-.67.15-.197.297-.767.966-.94 1.164-.173.199-.347.223-.644.075-.297-.15-1.255-.463-2.39-1.475-.883-.788-1.48-1.761-1.653-2.059-.173-.297-.018-.458.13-.606.134-.133.298-.347.446-.52.149-.174.198-.298.298-.497.099-.198.05-.371-.025-.52-.075-.149-.669-1.612-.916-2.207-.242-.579-.487-.5-.669-.51-.173-.008-.371-.01-.57-.01-.198 0-.52.074-.792.372-.272.297-1.04 1.016-1.04 2.479 0 1.462 1.065 2.875 1.213 3.074.149.198 2.096 3.2 5.077 4.487.709.306 1.262.489 1.694.625.712.227 1.36.195 1.871.118.571-.085 1.758-.719 2.006-1.413.248-.694.248-1.289.173-1.413-.074-.124-.272-.198-.57-.347m-5.421 7.403h-.004a9.87 9.87 0 01-5.031-1.378l-.361-.214-3.741.982.998-3.648-.235-.374a9.86 9.86 0 01-1.51-5.26c.001-5.45 4.436-9.884 9.888-9.884 2.64 0 5.122 1.03 6.988 2.898a9.825 9.825 0 012.893 6.994c-.003 5.45-4.437 9.884-9.885 9.884m8.413-18.297A11.815 11.815 0 0012.05 0C5.495 0 .16 5.335.157 11.892c0 2.096.547 4.142 1.588 5.945L.057 24l6.305-1.654a11.882 11.882 0 005.683 1.448h.005c6.554 0 11.89-5.335 11.893-11.893a11.821 11.821 0 00-3.48-8.413z" /></BrandSvg>);
+  return <BrandSvg brandKey="whatsapp" {...props} />;
 }
 export function IconWeChat(props: IconProps) {
-  return (<BrandSvg {...props}><path d="M8.691 2.188C3.891 2.188 0 5.476 0 9.53c0 2.212 1.17 4.203 3.002 5.55a.59.59 0 01.213.665l-.39 1.48c-.019.07-.048.141-.048.213 0 .163.13.295.29.295a.326.326 0 00.167-.054l1.903-1.114a.864.864 0 01.717-.098 10.16 10.16 0 002.837.403c.276 0 .543-.027.811-.05-.857-2.578.157-4.972 1.932-6.446 1.703-1.415 3.882-1.98 5.853-1.838-.576-3.583-4.196-6.348-8.596-6.348z" /></BrandSvg>);
+  return <BrandSvg brandKey="wechat" {...props} />;
 }
 export function IconSlack(props: IconProps) {
-  return (<BrandSvg {...props}><path d="M5.042 15.165a2.528 2.528 0 01-2.52 2.523A2.528 2.528 0 010 15.165a2.527 2.527 0 012.522-2.52h2.52v2.52zM6.313 15.165a2.527 2.527 0 012.521-2.52 2.527 2.527 0 012.521 2.52v6.313A2.528 2.528 0 018.834 24a2.528 2.528 0 01-2.521-2.522v-6.313zM8.834 5.042a2.528 2.528 0 01-2.521-2.52A2.528 2.528 0 018.834 0a2.528 2.528 0 012.521 2.522v2.52H8.834zM8.834 6.313a2.528 2.528 0 012.521 2.521 2.528 2.528 0 01-2.521 2.521H2.522A2.528 2.528 0 010 8.834a2.528 2.528 0 012.522-2.521h6.312zM18.956 8.834a2.528 2.528 0 012.522-2.521A2.528 2.528 0 0124 8.834a2.528 2.528 0 01-2.522 2.521h-2.522V8.834zM17.688 8.834a2.528 2.528 0 01-2.523 2.521 2.527 2.527 0 01-2.52-2.521V2.522A2.527 2.527 0 0115.165 0a2.528 2.528 0 012.523 2.522v6.312zM15.165 18.956a2.528 2.528 0 012.523 2.522A2.528 2.528 0 0115.165 24a2.527 2.527 0 01-2.52-2.522v-2.522h2.52zM15.165 17.688a2.527 2.527 0 01-2.52-2.523 2.526 2.526 0 012.52-2.52h6.313A2.527 2.527 0 0124 15.165a2.528 2.528 0 01-2.522 2.523h-6.313z" /></BrandSvg>);
+  return <BrandSvg brandKey="slack" {...props} />;
 }
 export function IconGitHub(props: IconProps) {
-  return (<BrandSvg {...props}><path d="M12 .297c-6.63 0-12 5.373-12 12 0 5.303 3.438 9.8 8.205 11.385.6.113.82-.258.82-.577 0-.285-.01-1.04-.015-2.04-3.338.724-4.042-1.61-4.042-1.61C4.422 18.07 3.633 17.7 3.633 17.7c-1.087-.744.084-.729.084-.729 1.205.084 1.838 1.236 1.838 1.236 1.07 1.835 2.809 1.305 3.495.998.108-.776.417-1.305.76-1.605-2.665-.3-5.466-1.332-5.466-5.93 0-1.31.465-2.38 1.235-3.22-.135-.303-.54-1.523.105-3.176 0 0 1.005-.322 3.3 1.23.96-.267 1.98-.399 3-.405 1.02.006 2.04.138 3 .405 2.28-1.552 3.285-1.23 3.285-1.23.645 1.653.24 2.873.12 3.176.765.84 1.23 1.91 1.23 3.22 0 4.61-2.805 5.625-5.475 5.92.42.36.81 1.096.81 2.22 0 1.606-.015 2.896-.015 3.286 0 .315.21.69.825.57C20.565 22.092 24 17.592 24 12.297c0-6.627-5.373-12-12-12" /></BrandSvg>);
+  return <BrandSvg brandKey="github" {...props} />;
 }
 export function IconGoogle(props: IconProps) {
-  return (
-    <svg xmlns="http://www.w3.org/2000/svg" width={props.size || 20} height={props.size || 20} viewBox="0 0 24 24" className={props.className}>
-      <path fill="#4285F4" d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92a5.06 5.06 0 01-2.2 3.32v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.1z" />
-      <path fill="#34A853" d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z" />
-      <path fill="#FBBC05" d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l2.85-2.22.81-.62z" />
-      <path fill="#EA4335" d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z" />
-    </svg>
-  );
+  return <BrandSvg brandKey="google" {...props} />;
 }
 export function IconStripe(props: IconProps) {
-  return (<BrandSvg {...props}><path d="M13.976 9.15c-2.172-.806-3.356-1.426-3.356-2.409 0-.831.683-1.305 1.901-1.305 2.227 0 4.515.858 6.09 1.631l.89-5.494C18.252.975 15.697 0 12.165 0 9.667 0 7.589.654 6.104 1.872 4.56 3.147 3.757 4.992 3.757 7.218c0 4.039 2.467 5.76 6.476 7.219 2.585.92 3.445 1.574 3.445 2.583 0 .98-.84 1.545-2.354 1.545-1.875 0-4.965-.921-6.99-2.109l-.9 5.555C5.175 22.99 8.385 24 11.714 24c2.641 0 4.843-.624 6.328-1.813 1.664-1.305 2.525-3.236 2.525-5.732 0-4.128-2.524-5.851-6.591-7.305z" /></BrandSvg>);
+  return <BrandSvg brandKey="stripe" {...props} />;
 }
 export function IconPayPal(props: IconProps) {
-  return (<BrandSvg {...props}><path d="M7.076 21.337H2.47a.641.641 0 0 1-.633-.74L4.944.901C5.026.382 5.474 0 5.998 0h7.46c2.57 0 4.578.543 5.69 1.81 1.01 1.15 1.304 2.42 1.012 4.287-.023.143-.047.288-.077.437-.983 5.05-4.349 6.797-8.647 6.797h-2.19c-.524 0-.968.382-1.05.9l-1.12 7.106zm14.146-14.42a3.35 3.35 0 0 0-.607-.541c-.013.076-.026.175-.041.254-.93 4.778-4.005 7.201-9.138 7.201h-2.19a.563.563 0 0 0-.556.479l-1.187 7.527h-.506l-.24 1.516a.56.56 0 0 0 .554.647h3.882c.46 0 .85-.334.922-.788.06-.26.76-4.852.816-5.09a.932.932 0 0 1 .923-.788h.58c3.76 0 6.705-1.528 7.565-5.946.36-1.847.174-3.388-.777-4.471z" /></BrandSvg>);
+  return <BrandSvg brandKey="paypal" {...props} />;
 }
 export function IconTwilio(props: IconProps) {
-  return (<BrandSvg {...props}><path d="M12 0C5.381 0 0 5.381 0 12s5.381 12 12 12 12-5.381 12-12S18.619 0 12 0zm0 20.25c-4.556 0-8.25-3.694-8.25-8.25S7.444 3.75 12 3.75s8.25 3.694 8.25 8.25-3.694 8.25-8.25 8.25zm3.075-11.325a1.725 1.725 0 110 3.45 1.725 1.725 0 010-3.45zm0 4.65a1.725 1.725 0 110 3.45 1.725 1.725 0 010-3.45zm-6.15-4.65a1.725 1.725 0 110 3.45 1.725 1.725 0 010-3.45zm0 4.65a1.725 1.725 0 110 3.45 1.725 1.725 0 010-3.45z" /></BrandSvg>);
+  return <BrandSvg brandKey="twilio" {...props} />;
 }
 export function IconEmail(props: IconProps) {
   return (<Svg {...props}><path d="M21.75 6.75v10.5a2.25 2.25 0 01-2.25 2.25h-15a2.25 2.25 0 01-2.25-2.25V6.75m19.5 0A2.25 2.25 0 0019.5 4.5h-15a2.25 2.25 0 00-2.25 2.25m19.5 0v.243a2.25 2.25 0 01-1.07 1.916l-7.5 4.615a2.25 2.25 0 01-2.36 0L3.32 8.91a2.25 2.25 0 01-1.07-1.916V6.75" /></Svg>);
@@ -1030,46 +1031,22 @@ export function IconSMS(props: IconProps) {
   return (<Svg {...props}><path d="M20 2H4c-1.1 0-2 .9-2 2v18l4-4h14c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2zm0 14H5.17L4 17.17V4h16v12z" /></Svg>);
 }
 export function IconLinkedIn(props: IconProps) {
-  return (<BrandSvg {...props}><path d="M20.447 20.452h-3.554v-5.569c0-1.328-.027-3.037-1.852-3.037-1.853 0-2.136 1.445-2.136 2.939v5.667H9.351V9h3.414v1.561h.046c.477-.9 1.637-1.85 3.37-1.85 3.601 0 4.267 2.37 4.267 5.455v6.286zM5.337 7.433a2.062 2.062 0 01-2.063-2.065 2.064 2.064 0 112.063 2.065zm1.782 13.019H3.555V9h3.564v11.452zM22.225 0H1.771C.792 0 0 .774 0 1.729v20.542C0 23.227.792 24 1.771 24h20.451C23.2 24 24 23.227 24 22.271V1.729C24 .774 23.2 0 22.222 0h.003z" /></BrandSvg>);
+  return <BrandSvg brandKey="linkedin" {...props} />;
 }
 export function IconTwitter(props: IconProps) {
-  return (<BrandSvg {...props}><path d="M18.244 2.25h3.308l-7.227 8.26 8.502 11.24H16.17l-5.214-6.817L4.99 21.75H1.68l7.73-8.835L1.254 2.25H8.08l4.713 6.231zm-1.161 17.52h1.833L7.084 4.126H5.117z" /></BrandSvg>);
+  return <BrandSvg brandKey="x" {...props} />;
 }
 export function IconFacebook(props: IconProps) {
-  return (<BrandSvg {...props}><path d="M24 12.073c0-6.627-5.373-12-12-12s-12 5.373-12 12c0 5.99 4.388 10.954 10.125 11.854v-8.385H7.078v-3.47h3.047V9.43c0-3.007 1.792-4.669 4.533-4.669 1.312 0 2.686.235 2.686.235v2.953H15.83c-1.491 0-1.956.925-1.956 1.874v2.25h3.328l-.532 3.47h-2.796v8.385C19.612 23.027 24 18.062 24 12.073z" /></BrandSvg>);
+  return <BrandSvg brandKey="facebook" {...props} />;
 }
 export function IconYouTube(props: IconProps) {
-  return (<BrandSvg {...props}><path d="M23.498 6.186a3.016 3.016 0 0 0-2.122-2.136C19.505 3.545 12 3.545 12 3.545s-7.505 0-9.377.505A3.017 3.017 0 0 0 .502 6.186C0 8.07 0 12 0 12s0 3.93.502 5.814a3.016 3.016 0 0 0 2.122 2.136c1.871.505 9.376.505 9.376.505s7.505 0 9.377-.505a3.015 3.015 0 0 0 2.122-2.136C24 15.93 24 12 24 12s0-3.93-.502-5.814zM9.545 15.568V8.432L15.818 12l-6.273 3.568z" /></BrandSvg>);
+  return <BrandSvg brandKey="youtube" {...props} />;
 }
 export function IconTikTok(props: IconProps) {
-  return (<BrandSvg {...props}><path d="M12.525.02c1.31-.02 2.61-.01 3.91-.02.08 1.53.63 3.09 1.75 4.17 1.12 1.11 2.7 1.62 4.24 1.79v4.03c-1.44-.05-2.89-.35-4.2-.97-.57-.26-1.1-.59-1.62-.93-.01 2.92.01 5.84-.02 8.75-.08 1.4-.54 2.79-1.35 3.94-1.31 1.92-3.58 3.17-5.91 3.21-1.43.08-2.86-.31-4.08-1.03-2.02-1.19-3.44-3.37-3.65-5.71-.02-.5-.03-1-.01-1.49.18-1.9 1.12-3.72 2.58-4.96 1.66-1.44 3.98-2.13 6.15-1.72.02 1.48-.04 2.96-.04 4.44-.99-.32-2.15-.23-3.02.37-.63.41-1.11 1.04-1.36 1.75-.21.51-.15 1.08-.14 1.62.24 1.64 1.82 3.02 3.5 2.87 1.12-.01 2.19-.66 2.77-1.61.19-.33.4-.67.41-1.06.1-1.79.06-3.57.07-5.36.01-4.03-.01-8.05.02-12.07z" /></BrandSvg>);
+  return <BrandSvg brandKey="tiktok" {...props} />;
 }
 export function IconXiaohongshu(props: IconProps) {
-  // Real Xiaohongshu (小红书 / RedNote) wordmark: rounded red square
-  // with the 小红书 text in white, mirroring the platform's app icon.
-  // BrandSvg's currentColor carries the red — the wrapper sets it via
-  // ``style={{ color: '#FF2741' }}`` in MCP_LOGO_COLOR. Text is white
-  // and uses a Chinese-capable font stack so the chars render on
-  // every platform Manor runs on.
-  return (
-    <BrandSvg {...props}>
-      <path d="M5 0h14a5 5 0 015 5v14a5 5 0 01-5 5H5a5 5 0 01-5-5V5a5 5 0 015-5z" />
-      <text
-        x="12"
-        y="16"
-        textAnchor="middle"
-        fontSize="9.5"
-        fontWeight="700"
-        fontFamily='"PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", "Source Han Sans SC", "Noto Sans SC", sans-serif'
-        fill="white"
-        // Tighten letter-spacing so 3 glyphs fit comfortably; the
-        // app icon's wordmark is very compact.
-        letterSpacing="-0.5"
-      >
-        小红书
-      </text>
-    </BrandSvg>
-  );
+  return <BrandSvg brandKey="xiaohongshu" {...props} />;
 }
 export function IconDatabase(props: IconProps) {
   return (<Svg {...props}><path d="M20.25 6.375c0 2.278-3.694 4.125-8.25 4.125S3.75 8.653 3.75 6.375m16.5 0c0-2.278-3.694-4.125-8.25-4.125S3.75 4.097 3.75 6.375m16.5 0v11.25c0 2.278-3.694 4.125-8.25 4.125s-8.25-1.847-8.25-4.125V6.375m16.5 0v3.75m-16.5-3.75v3.75m16.5 0v3.75C20.25 16.153 16.556 18 12 18s-8.25-1.847-8.25-4.125v-3.75m16.5 0c0 2.278-3.694 4.125-8.25 4.125s-8.25-1.847-8.25-4.125" /></Svg>);
@@ -1084,7 +1061,7 @@ export function IconQRCode(props: IconProps) {
 // ── Microsoft 365 brand icons ──────────────────────────────────────────────
 // The Outlook / OneDrive / MS Calendar / MS Teams cards reuse generic icons
 // (IconEmail / IconCloud / IconCalendar / IconChat) — color comes from the
-// MCP_LOGO_COLOR registry. Excel gets its own dedicated grid mark since the
+// shared brand catalog. Excel gets its own dedicated grid mark since the
 // closest generic (IconDatabase) renders as cylinders, which doesn't read as
 // "spreadsheet" at 16-20px.
 

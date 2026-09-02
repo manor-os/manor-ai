@@ -19,6 +19,12 @@ from typing import Optional
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from packages.core.constants.proposal import (
+    ProposalDecisionKind,
+    ProposalItemKind,
+    ProposalItemStatus,
+    ProposalStatus,
+)
 from packages.core.models.proposal import ProposalItemRecord, ProposalRecord
 from packages.core.proposals.constants import (
     EXTERNAL_TASK_ACTION_KEY,
@@ -27,6 +33,7 @@ from packages.core.proposals.constants import (
     HUMAN_REQUEST_ACTION_KEY,
     REASON_CODES,
     TASK_ACTION_KEY,
+    WORKFLOW_RUN_EXTERNAL_ACTION_KEY,
     WORKFLOW_RUN_ACTION_KEY,
     change_action_key,
     change_risk_level,
@@ -67,7 +74,7 @@ async def create_proposal_with_items(
         review_id=review_id,
         summary=summary,
         notes=notes,
-        status="open",
+        status=ProposalStatus.OPEN,
     )
     db.add(record)
     await db.flush()
@@ -111,14 +118,14 @@ async def create_proposal_with_items(
             entity_id=entity_id,
             workspace_id=workspace_id,
             item_key=item_key,
-            kind="task",
+            kind=ProposalItemKind.TASK,
             payload=payload,
             basis=basis,
             correlation_key=getattr(proposed, "correlation_key", None),
             risk_level="high" if external else "low",
             action_key=EXTERNAL_TASK_ACTION_KEY if external else TASK_ACTION_KEY,
             depends_on_item_keys=deps or None,
-            status="proposed",
+            status=ProposalItemStatus.PROPOSED,
         )
         db.add(item)
         persisted_items.append((proposed, task, item))
@@ -169,11 +176,11 @@ async def create_human_request_items(
             entity_id=record.entity_id,
             workspace_id=record.workspace_id,
             item_key=key,
-            kind="human_request",
+            kind=ProposalItemKind.HUMAN_REQUEST,
             payload=proposed.model_dump(mode="json"),
             risk_level="low",
             action_key=HUMAN_REQUEST_ACTION_KEY,
-            status="approved",
+            status=ProposalItemStatus.APPROVED,
             decided_at=now,
             decision={
                 "decided_by": None,
@@ -201,6 +208,10 @@ async def create_workflow_run_items(
         )
     )).scalars().all())
     items: list[ProposalItemRecord] = []
+    workspace = None
+    from packages.core.models.workspace import Workspace
+
+    workspace = await db.get(Workspace, record.workspace_id)
     for proposed in proposed_runs:
         key = _normalize_item_key(f"wr_{proposed.run_key}", fallback="wr")
         suffix_n = 1
@@ -211,17 +222,54 @@ async def create_workflow_run_items(
             key = base_key[: _ITEM_KEY_MAX - len(suffix)] + suffix
         existing_keys.add(key)
         payload = proposed.model_dump(mode="json")
+        risk_level = "medium"
+        action_key = WORKFLOW_RUN_ACTION_KEY
+        if workspace is not None and workspace.entity_id == record.entity_id:
+            workflow_ref = payload.get("workflow_ref") or {}
+            try:
+                from packages.core.services.workspace_flow_catalog import (
+                    WorkspaceFlowCatalogError,
+                    resolve_workspace_flow,
+                )
+                from packages.core.services.workflow_action_grant_service import (
+                    proposal_workflow_authorization_for_inputs,
+                )
+
+                flow = await resolve_workspace_flow(
+                    db,
+                    workspace=workspace,
+                    blueprint_slug=str(workflow_ref.get("blueprint_slug") or ""),
+                    workflow_slug=str(workflow_ref.get("workflow_slug") or ""),
+                )
+                declaration = proposal_workflow_authorization_for_inputs(
+                    (flow.binding.config or {}).get("proposal_authorization"),
+                    payload.get("inputs"),
+                    workflow_steps=flow.workflow.steps,
+                )
+                if declaration is not None:
+                    risk_level = "high"
+                    action_key = WORKFLOW_RUN_EXTERNAL_ACTION_KEY
+                    payload["_proposal_authorization_binding"] = {
+                        "binding_id": flow.binding.id,
+                        "workflow_id": flow.workflow.id,
+                        "revision": flow.binding.revision,
+                        "declaration": declaration,
+                    }
+            except WorkspaceFlowCatalogError:
+                logger.debug(
+                    "Proposal Workflow authorization declaration could not be resolved",
+                )
         item = ProposalItemRecord(
             proposal_id=record.id,
             entity_id=record.entity_id,
             workspace_id=record.workspace_id,
             item_key=key,
-            kind="workflow_run",
+            kind=ProposalItemKind.WORKFLOW_RUN,
             payload=payload,
             basis=payload.get("basis"),
-            risk_level="medium",
-            action_key=WORKFLOW_RUN_ACTION_KEY,
-            status="proposed",
+            risk_level=risk_level,
+            action_key=action_key,
+            status=ProposalItemStatus.PROPOSED,
         )
         db.add(item)
         items.append(item)
@@ -276,12 +324,12 @@ async def create_experiment_items(
             entity_id=record.entity_id,
             workspace_id=record.workspace_id,
             item_key=key,
-            kind="experiment",
+            kind=ProposalItemKind.EXPERIMENT,
             payload=payload,
             basis=None,
             risk_level=experiment_risk_level(payload.get("guardrails")),
             action_key=EXPERIMENT_ACTION_KEY,
-            status="proposed",
+            status=ProposalItemStatus.PROPOSED,
         )
         db.add(item)
         items.append(item)
@@ -353,7 +401,7 @@ async def create_change_items(
             risk_level=change_risk_level(proposed.operation),
             action_key=change_action_key(kind, proposed.operation),
             expected_revision=proposed.expected_revision,
-            status="proposed",
+            status=ProposalItemStatus.PROPOSED,
         )
         db.add(item)
         items.append(item)
@@ -392,7 +440,7 @@ async def decide_items(
     *,
     review_id: str,
     task_ids: Optional[list[str]] = None,
-    decision: str,
+    decision: ProposalDecisionKind | str,
     actor_id: Optional[str] = None,
     reason_code: Optional[str] = None,
     comment: Optional[str] = None,
@@ -407,8 +455,12 @@ async def decide_items(
     resolves the parent proposal when no items remain ``proposed``.
     Idempotent: already-decided items are left untouched.
     """
-    if decision not in ("approved", "rejected"):
-        raise ValueError(f"decision must be approved|rejected, got {decision!r}")
+    try:
+        decision = ProposalDecisionKind(decision)
+    except ValueError:
+        raise ValueError(
+            f"decision must be approved|rejected, got {decision!r}"
+        ) from None
     if reason_code is not None and reason_code not in REASON_CODES:
         raise ValueError(
             f"unknown reason_code {reason_code!r}; must be one of {sorted(REASON_CODES)}"
@@ -420,7 +472,7 @@ async def decide_items(
     now = datetime.now(timezone.utc)
     selected: list[ProposalItemRecord] = []
     for item in items:
-        if item.status != "proposed":
+        if item.status != ProposalItemStatus.PROPOSED:
             continue
         if task_ids is not None:
             task_id = (item.payload or {}).get("task_id")
@@ -435,7 +487,7 @@ async def decide_items(
             "comment": comment,
             "decided_at": now.isoformat(),
         }
-        if execution_root_id and decision == "approved":
+        if execution_root_id and decision is ProposalDecisionKind.APPROVED:
             item.execution_root_id = execution_root_id
         selected.append(item)
 
@@ -444,13 +496,14 @@ async def decide_items(
     for proposal_id in proposal_ids:
         remaining = [
             i for i in items
-            if i.proposal_id == proposal_id and i.status == "proposed"
+            if i.proposal_id == proposal_id
+            and i.status == ProposalItemStatus.PROPOSED
         ]
         if remaining:
             continue
         record = await db.get(ProposalRecord, proposal_id)
-        if record is not None and record.status == "open":
-            record.status = "resolved"
+        if record is not None and record.status == ProposalStatus.OPEN:
+            record.status = ProposalStatus.RESOLVED
             record.resolved_at = now
     await db.flush()
     return selected

@@ -1,4 +1,4 @@
-FROM node:20-alpine AS build
+FROM node:22.13-alpine AS build
 
 ARG VITE_GOOGLE_CLIENT_ID
 ARG VITE_GOOGLE_DRIVE_API_KEY
@@ -23,6 +23,11 @@ COPY apps/web/ .
 RUN npm run build
 
 FROM nginx:alpine
+ENV NGINX_ENTRYPOINT_LOCAL_RESOLVERS=1
+ENV MANOR_API_UPSTREAM=manor-api:8000
+ENV MANOR_CHAT_UPSTREAM=manor-chat:8000
+ENV MANOR_WEB_LISTEN_PORT=80
 COPY --from=build /app/dist /usr/share/nginx/html
-COPY docker/nginx.conf /etc/nginx/conf.d/default.conf
+COPY docker/nginx-app-security-headers.conf /etc/nginx/snippets/manor-app-security-headers.conf
+COPY docker/nginx.conf /etc/nginx/templates/default.conf.template
 EXPOSE 80

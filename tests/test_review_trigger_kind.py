@@ -14,6 +14,7 @@ it cannot.
 from __future__ import annotations
 
 import asyncio
+from contextlib import asynccontextmanager
 import json
 import logging
 from types import SimpleNamespace
@@ -340,6 +341,54 @@ async def test_workflow_only_proposal_blocks_duplicate_review(
 
 
 # ── 3. supersede=true → cohort rejected, review runs ──────────────────
+
+
+async def test_human_requested_review_is_not_enqueued_for_paused_workspace(
+    db_session, monkeypatch,
+):
+    from packages.core import database
+    from packages.core.ai.runtime.workspace_task_actions import (
+        runtime_workspace_request_strategist_review_action,
+    )
+
+    workspace = await _seed_workspace(db_session)
+    workspace.status = "paused"
+    await db_session.commit()
+    enqueued: list[dict] = []
+
+    class _FakeTask:
+        @staticmethod
+        def apply_async(*args, **kwargs):
+            enqueued.append({"args": args, "kwargs": kwargs})
+            return SimpleNamespace(id="should-not-be-enqueued")
+
+    @asynccontextmanager
+    async def _current_test_session():
+        yield db_session
+
+    monkeypatch.setattr(database, "async_session", _current_test_session)
+    monkeypatch.setattr(ai_tasks, "run_strategist_review", _FakeTask)
+
+    result = json.loads(await runtime_workspace_request_strategist_review_action(
+        entity_id=workspace.entity_id,
+        workspace_id=workspace.id,
+        params={"reason": "What should we do next?"},
+    ))
+
+    assert result == {
+        "requested": False,
+        "blocked": True,
+        "reason": "workspace_inactive",
+        "workspace_id": workspace.id,
+        "workspace_status": "paused",
+        "next_step": (
+            "Tell the user the Strategist review did not start because the workspace "
+            "is paused. Do not claim that the review was requested or is running. "
+            "Ask them to start the workspace first, then request the review again."
+        ),
+    }
+    assert enqueued == []
+
 
 async def test_supersede_rejects_open_cohort_then_runs_the_review(
     db_session, monkeypatch,

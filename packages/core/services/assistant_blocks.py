@@ -1,12 +1,51 @@
 from __future__ import annotations
 
 import json
+from collections import Counter
+from collections.abc import Mapping
 from pathlib import PurePath
 from typing import Any
+
+from packages.core.ai.runtime.composite_tools import RuntimeCompositeToolCallFactory
 
 
 ASSISTANT_BLOCKS_SCHEMA = "v1"
 ASSISTANT_PROCESS_TOOL_KEY_PREFIX = "component.assistant_process.tool"
+ASSISTANT_STRUCTURED_RESULT_TOOLS = frozenset({
+    "query_ledger",
+    "visualize_workspace_ledgers",
+    "render_response_surface",
+})
+_LEDGER_COUNT_METRICS = {"count"}
+_LEDGER_FINANCE_METRICS = _LEDGER_COUNT_METRICS | {
+    "sum_amount_minor",
+    "sum_tax_minor",
+    "sum_fee_minor",
+    "sum_inflow_minor",
+    "sum_outflow_minor",
+}
+
+
+def assistant_tool_uses_structured_result(name: str, arguments: Any = None) -> bool:
+    """Return whether a tool result must bypass the lossy preview path."""
+
+    args = arguments if isinstance(arguments, dict) else {}
+    canonical_call = RuntimeCompositeToolCallFactory.create(name, args)
+    if canonical_call.tool_name in ASSISTANT_STRUCTURED_RESULT_TOOLS:
+        return True
+    return (
+        canonical_call.tool_name == "workspace_agent"
+        and str(canonical_call.arguments.get("action") or "").strip().lower()
+        == "visualize_ledgers"
+    )
+
+
+def _ledger_metric_types(contract_id: Any) -> set[str]:
+    return (
+        _LEDGER_FINANCE_METRICS
+        if contract_id == "manor.finance_ledger/v1"
+        else _LEDGER_COUNT_METRICS
+    )
 
 
 def _compact_text(value: Any, *, max_chars: int = 240) -> str:
@@ -39,6 +78,270 @@ def _parse_preview_json(value: Any) -> Any:
         return json.loads(value)
     except Exception:
         return None
+
+
+def _valid_ledger_presentation(
+    value: Any,
+    *,
+    contract_id: Any,
+    group_by: Any,
+    date_granularity: Any,
+) -> bool:
+    if value is None:
+        return True
+    if not isinstance(value, dict) or value.get("version") != 1:
+        return False
+    title = value.get("title")
+    subtitle = value.get("subtitle")
+    if (
+        (title is not None and (not isinstance(title, str) or len(title) > 160))
+        or (subtitle is not None and (not isinstance(subtitle, str) or len(subtitle) > 240))
+    ):
+        return False
+    sections = value.get("sections")
+    if not isinstance(sections, list) or not 1 <= len(sections) <= 4:
+        return False
+    section_types = {"metrics", "chart", "records", "profile", "projection"}
+    chart_types = {"bar", "line", "area", "pie", "donut"}
+    metric_types = _ledger_metric_types(contract_id)
+    for section in sections:
+        if not isinstance(section, dict):
+            return False
+        section_type = section.get("type")
+        if not isinstance(section_type, str) or section_type not in section_types:
+            return False
+        if section_type == "projection" and (
+            not isinstance(group_by, list)
+            or len(group_by) != 1
+            or not isinstance(group_by[0], str)
+            or group_by[0] not in {"recorded_at", "occurred_at"}
+            or not isinstance(date_granularity, str)
+            or date_granularity not in {"day", "week", "month"}
+        ):
+            return False
+        if (
+            section.get("title") is not None
+            and (
+                not isinstance(section["title"], str)
+                or len(section["title"]) > 120
+            )
+        ):
+            return False
+        chart = section.get("chart")
+        if chart is not None and (
+            not isinstance(chart, str) or chart not in chart_types
+        ):
+            return False
+        if (
+            section.get("metric") is not None
+            and (
+                not isinstance(section["metric"], str)
+                or section["metric"] not in metric_types
+            )
+        ):
+            return False
+        for field, limit in (("metrics", 4), ("columns", 10)):
+            items = section.get(field)
+            if items is not None and (
+                not isinstance(items, list)
+                or len(items) > limit
+                or any(not isinstance(item, str) or len(item) > 160 for item in items)
+                or (field == "metrics" and any(item not in metric_types for item in items))
+            ):
+                return False
+        periods = section.get("forecast_periods")
+        if periods is not None and (
+            not isinstance(periods, int)
+            or isinstance(periods, bool)
+            or not 1 <= periods <= 12
+        ):
+            return False
+    return True
+
+
+def _workspace_ledger_visualization(
+    value: Any,
+    *,
+    expected_kind: str,
+) -> dict[str, Any] | None:
+    """Extract a bounded server-owned Ledger visualization envelope."""
+
+    parsed = _parse_preview_json(value) if isinstance(value, str) else value
+    if not isinstance(parsed, dict) or parsed.get("ok") is not True:
+        return None
+    visualization = parsed.get("visualization")
+    if not isinstance(visualization, dict):
+        return None
+    if visualization.get("kind") != expected_kind:
+        return None
+    data = visualization.get("data")
+    if not isinstance(data, dict):
+        return None
+    if expected_kind == "workspace_ledger_overview":
+        if not isinstance(data.get("ledgers"), list) or len(data["ledgers"]) > 16:
+            return None
+    elif expected_kind == "ledger_query_result":
+        contract_id = data.get("contract_id")
+        metric_types = _ledger_metric_types(contract_id)
+        query_fingerprint = data.get("query_fingerprint")
+        coalesce_previous = data.get("coalesce_previous_visualization")
+        group_count = data.get("group_count")
+        groups_truncated = data.get("groups_truncated")
+        layout = data.get("layout")
+        date_granularity = data.get("date_granularity")
+        if (
+            not isinstance(contract_id, str)
+            or not isinstance(layout, str)
+            or layout not in {"metrics", "bar", "timeline", "table", "empty"}
+            or not (
+                date_granularity is None
+                or (
+                    isinstance(date_granularity, str)
+                    and date_granularity in {"day", "week", "month"}
+                )
+            )
+            or not isinstance(data.get("metrics"), list)
+            or any(
+                not isinstance(metric, str) or metric not in metric_types
+                for metric in data["metrics"]
+            )
+            or not isinstance(data.get("aggregates"), dict)
+            or any(metric not in metric_types for metric in data["aggregates"])
+            or not isinstance(data.get("groups"), list)
+            or len(data["groups"]) > 24
+            or (
+                group_count is not None
+                and (
+                    not isinstance(group_count, int)
+                    or isinstance(group_count, bool)
+                    or group_count < len(data["groups"])
+                )
+            )
+            or (
+                groups_truncated is not None
+                and not isinstance(groups_truncated, bool)
+            )
+            or not isinstance(data.get("rows"), list)
+            or len(data["rows"]) > 20
+            or not isinstance(data.get("columns"), list)
+            or len(data["columns"]) > 10
+            or any(
+                not isinstance(group, dict)
+                or not isinstance(group.get("aggregates"), dict)
+                or any(metric not in metric_types for metric in group["aggregates"])
+                for group in data["groups"]
+            )
+            or not _valid_ledger_presentation(
+                data.get("presentation"),
+                contract_id=contract_id,
+                group_by=data.get("group_by"),
+                date_granularity=date_granularity,
+            )
+            or (
+                query_fingerprint is not None
+                and (
+                    not isinstance(query_fingerprint, str)
+                    or len(query_fingerprint) != 64
+                    or any(character not in "0123456789abcdef" for character in query_fingerprint)
+                )
+            )
+            or (
+                coalesce_previous is not None
+                and not isinstance(coalesce_previous, bool)
+            )
+        ):
+            return None
+    else:
+        return None
+    try:
+        if len(json.dumps(data, ensure_ascii=False, default=str)) > 100_000:
+            return None
+    except Exception:
+        return None
+    return {
+        "kind": expected_kind,
+        "data": data,
+    }
+
+
+def _ledger_table_row_relation(
+    existing: dict[str, Any],
+    incoming: dict[str, Any],
+) -> str | None:
+    """Compare Ledger table rows without trusting display order."""
+
+    if existing.get("layout") != "table" or incoming.get("layout") != "table":
+        return None
+    existing_columns = existing.get("columns")
+    incoming_columns = incoming.get("columns")
+    existing_rows = existing.get("rows")
+    incoming_rows = incoming.get("rows")
+    if (
+        not isinstance(existing_columns, list)
+        or not isinstance(incoming_columns, list)
+        or not isinstance(existing_rows, list)
+        or not isinstance(incoming_rows, list)
+        or not existing_rows
+        or not incoming_rows
+        or not all(isinstance(row, dict) for row in [*existing_rows, *incoming_rows])
+    ):
+        return None
+    common_columns = sorted(
+        set(column for column in existing_columns if isinstance(column, str))
+        & set(column for column in incoming_columns if isinstance(column, str))
+    )
+    if not common_columns:
+        return None
+
+    def row_counts(rows: list[dict[str, Any]]) -> Counter[str]:
+        return Counter(
+            json.dumps(
+                [row.get(column) for column in common_columns],
+                ensure_ascii=False,
+                separators=(",", ":"),
+                default=str,
+            )
+            for row in rows
+        )
+
+    existing_counts = row_counts(existing_rows)
+    incoming_counts = row_counts(incoming_rows)
+    if all(count <= existing_counts[token] for token, count in incoming_counts.items()):
+        return "incoming_subset"
+    if all(count <= incoming_counts[token] for token, count in existing_counts.items()):
+        return "incoming_superset"
+    return None
+
+
+def _ledger_query_relation(
+    existing: dict[str, Any],
+    incoming: dict[str, Any],
+) -> str | None:
+    """Compare query identity before considering a row-level replacement."""
+
+    if any(
+        existing.get(field) != incoming.get(field)
+        for field in ("contract_id", "view")
+    ):
+        return None
+    existing_fingerprint = existing.get("query_fingerprint")
+    incoming_fingerprint = incoming.get("query_fingerprint")
+    if isinstance(existing_fingerprint, str) and isinstance(incoming_fingerprint, str):
+        if existing_fingerprint == incoming_fingerprint:
+            return "incoming_replacement"
+        if incoming.get("coalesce_previous_visualization") is not True:
+            return None
+        if existing.get("layout") != incoming.get("layout"):
+            return "incoming_replacement"
+        if existing.get("layout") != "table":
+            return "incoming_replacement"
+        return _ledger_table_row_relation(existing, incoming) or "incoming_replacement"
+    if existing_fingerprint is not None or incoming_fingerprint is not None:
+        return None
+
+    # Historical blocks predate query identity. Keep their narrowly bounded
+    # table-only behavior so already-persisted duplicate cards still collapse.
+    return _ledger_table_row_relation(existing, incoming)
 
 
 def _path_basename(value: Any) -> str:
@@ -195,7 +498,7 @@ def _mcp_display_metadata(
             "display_params": {"target": display_target},
         }
 
-    if lower_server in {"chrome", "local_browser"} or "browser" in lower_server:
+    if lower_server == "chrome" or "browser" in lower_server:
         if any(token in lower_tool for token in ("open", "goto", "navigate")):
             key = "browser.open"
         elif lower_tool in {"read_page", "get_interactive_elements"}:
@@ -374,10 +677,14 @@ def _tool_display_metadata(
     *,
     result: Any = None,
     summary: str = "",
+    skill_display_names: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
     normalized_name = (name or "tool").strip()
-    lower_name = normalized_name.lower()
     args = arguments if isinstance(arguments, dict) else {}
+    canonical_call = RuntimeCompositeToolCallFactory.create(normalized_name, args)
+    normalized_name = canonical_call.tool_name
+    lower_name = normalized_name.lower()
+    args = canonical_call.arguments
     target = summary
 
     if lower_name == "manor":
@@ -451,9 +758,10 @@ def _tool_display_metadata(
 
     if lower_name == "invoke_skill":
         skill = _param_text(_first_argument(args, "slug", "skill", "name") or target)
+        display_skill = (skill_display_names or {}).get(skill.casefold(), skill)
         return {
             "display_key": f"{ASSISTANT_PROCESS_TOOL_KEY_PREFIX}.skill",
-            "display_params": {"target": skill or "skill"},
+            "display_params": {"target": display_skill or "skill"},
         }
     if lower_name == "search_tools":
         return {
@@ -495,23 +803,40 @@ def _tool_display_metadata(
             "display_params": {"target": _tool_target(args, fallback=target or "workspace")},
         }
     if lower_name.startswith("workspace_"):
-        if lower_name in {"workspace_search", "workspace_list_knowledge"} or lower_name == "rag":
+        workspace_action = (
+            str(args.get("action") or "").strip().lower()
+            if lower_name == "workspace_agent"
+            else ""
+        )
+        workspace_args = (
+            args.get("params")
+            if workspace_action and isinstance(args.get("params"), dict)
+            else args
+        )
+        if lower_name in {"workspace_search", "workspace_list_knowledge"} or workspace_action in {
+            "search",
+            "list_knowledge",
+            "get_goal_status",
+            "visualize_ledgers",
+        }:
             key = "workspace.search"
-        elif lower_name == "workspace_create_task":
+        elif lower_name == "workspace_create_task" or workspace_action == "create_task":
             key = "workspace.create_task"
-        elif lower_name == "workspace_update_task_runtime":
+        elif lower_name == "workspace_update_task_runtime" or workspace_action == "update_task_runtime":
             key = "workspace.update_task"
-        elif "knowledge" in lower_name:
+        elif "knowledge" in lower_name or "knowledge" in workspace_action:
             key = "workspace.knowledge"
-        elif "rule" in lower_name:
+        elif "rule" in lower_name or "rule" in workspace_action:
             key = "workspace.rule"
-        elif "review" in lower_name:
+        elif "review" in lower_name or "review" in workspace_action:
             key = "workspace.review"
         else:
             key = "workspace.operate"
         return {
             "display_key": f"{ASSISTANT_PROCESS_TOOL_KEY_PREFIX}.{key}",
-            "display_params": {"target": _tool_target(args, fallback=target or "workspace")},
+            "display_params": {
+                "target": _tool_target(workspace_args, fallback=target or "workspace")
+            },
         }
     if lower_name.startswith("ws_"):
         if "search" in lower_name:
@@ -740,11 +1065,18 @@ def _tool_summary(name: str, arguments: Any) -> str:
 class AssistantBlocksBuilder:
     """Build UI-oriented assistant content blocks from stream text and tool events."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, skill_display_names: Mapping[str, str] | None = None) -> None:
         self._blocks: list[dict[str, Any]] = []
+        self._skill_display_names = {
+            str(key).strip().casefold(): str(value).strip()
+            for key, value in (skill_display_names or {}).items()
+            if str(key or "").strip() and str(value or "").strip()
+        }
         self._text_seq = 0
         self._process_seq = 0
         self._step_seq = 0
+        self._visualization_seq = 0
+        self._surface_seq = 0
         self._active_text: dict[str, Any] | None = None
         self._process: dict[str, Any] | None = None
         self._bound_opening_text_chars = 0
@@ -809,7 +1141,14 @@ class AssistantBlocksBuilder:
         bound_assistant_text = assistant_text.strip() if assistant_text else ""
         if bound_assistant_text:
             step["assistant_text"] = bound_assistant_text
-        step.update(_tool_display_metadata(name or "tool", arguments, summary=summary))
+        step.update(
+            _tool_display_metadata(
+                name or "tool",
+                arguments,
+                summary=summary,
+                skill_display_names=self._skill_display_names,
+            )
+        )
         if now_ms is not None:
             step["started_at_ms"] = int(now_ms)
         process["steps"].append({key: value for key, value in step.items() if value not in ("", None)})
@@ -820,6 +1159,7 @@ class AssistantBlocksBuilder:
         name: str,
         *,
         result: Any = None,
+        structured_result: Any = None,
         status: str | None = None,
         duration_ms: int | float | None = None,
         arguments: Any = None,
@@ -849,13 +1189,128 @@ class AssistantBlocksBuilder:
                 display_arguments,
                 result=result,
                 summary=str(summary or ""),
+                skill_display_names=self._skill_display_names,
             )
         )
         if duration_ms is not None:
             step["duration_ms"] = int(duration_ms)
         if now_ms is not None:
             step["ended_at_ms"] = int(now_ms)
+        canonical_call = RuntimeCompositeToolCallFactory.create(
+            wanted,
+            display_arguments if isinstance(display_arguments, dict) else {},
+        )
+        expected_visualization_kind = {
+            "visualize_workspace_ledgers": "workspace_ledger_overview",
+            "query_ledger": "ledger_query_result",
+        }.get(canonical_call.tool_name)
+        if (
+            canonical_call.tool_name == "workspace_agent"
+            and str(canonical_call.arguments.get("action") or "").strip().lower()
+            == "visualize_ledgers"
+        ):
+            expected_visualization_kind = "workspace_ledger_overview"
+        if expected_visualization_kind:
+            visualization = _workspace_ledger_visualization(
+                structured_result if structured_result is not None else result,
+                expected_kind=expected_visualization_kind,
+            )
+            if visualization is not None:
+                coalesced = (
+                    expected_visualization_kind == "ledger_query_result"
+                    and self._coalesce_ledger_query_visualization(visualization)
+                )
+                if not coalesced:
+                    self._visualization_seq += 1
+                    self._blocks.append(
+                        {
+                            "id": f"blk_visualization_{self._visualization_seq}",
+                            "type": "visualization",
+                            **visualization,
+                        }
+                    )
+                self._active_text = None
+        if wanted == "render_response_surface":
+            from packages.core.services.response_surfaces import (
+                response_surface_from_tool_result,
+            )
+
+            surface = response_surface_from_tool_result(
+                structured_result if structured_result is not None else result
+            )
+            if surface is not None:
+                self._surface_seq += 1
+                self._blocks.append({
+                    "id": f"blk_surface_{self._surface_seq}",
+                    "type": "surface",
+                    **surface,
+                })
+                self._active_text = None
         self._refresh_process_status()
+
+    def _coalesce_ledger_query_visualization(
+        self,
+        visualization: dict[str, Any],
+    ) -> bool:
+        incoming_data = visualization.get("data")
+        if not isinstance(incoming_data, dict):
+            return False
+        if incoming_data.get("coalesce_previous_visualization") is True:
+            for index in range(len(self._blocks) - 1, -1, -1):
+                block = self._blocks[index]
+                existing_data = block.get("data")
+                if (
+                    block.get("type") != "visualization"
+                    or block.get("kind") != "ledger_query_result"
+                    or not isinstance(existing_data, dict)
+                    or any(
+                        existing_data.get(field) != incoming_data.get(field)
+                        for field in ("contract_id", "view")
+                    )
+                ):
+                    continue
+                relation = _ledger_query_relation(existing_data, incoming_data)
+                if relation == "incoming_subset":
+                    return True
+                if relation in {"incoming_replacement", "incoming_superset"}:
+                    self._blocks[index] = {
+                        "id": block["id"],
+                        "type": "visualization",
+                        **visualization,
+                    }
+                    return True
+                return False
+            return False
+
+        superseded_indices: list[int] = []
+        for index, block in enumerate(self._blocks):
+            if (
+                block.get("type") != "visualization"
+                or block.get("kind") != "ledger_query_result"
+                or not isinstance(block.get("data"), dict)
+            ):
+                continue
+            relation = _ledger_query_relation(block["data"], incoming_data)
+            if relation == "incoming_subset":
+                return True
+            if relation in {"incoming_replacement", "incoming_superset"}:
+                superseded_indices.append(index)
+        if not superseded_indices:
+            return False
+
+        target_index = superseded_indices[0]
+        replacement = {
+            "id": self._blocks[target_index]["id"],
+            "type": "visualization",
+            **visualization,
+        }
+        superseded = set(superseded_indices)
+        self._blocks = [
+            replacement if index == target_index else block
+            for index, block in enumerate(self._blocks)
+            if index == target_index or index not in superseded
+        ]
+        return True
 
     def set_final_text(self, text: str) -> None:
         if not text:

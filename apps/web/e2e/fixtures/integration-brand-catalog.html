@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="en">
+  <head><meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" /><title>Integration brand catalog</title></head>
+  <body>
+    <div id="root"></div>
+    <script type="module">
+      import React from "react";
+      import { createRoot } from "react-dom/client";
+      import { MemoryRouter } from "react-router-dom";
+      import IntegrationLogo from "/src/components/IntegrationLogo.tsx";
+      import InlineIntegrationLink from "/src/components/InlineIntegrationLink.tsx";
+      import { INTEGRATION_BRANDS } from "/src/lib/brands/catalog.ts";
+      import "/src/index.css";
+      const h = React.createElement;
+      const googleProducts = [
+        ["google", "Search"], ["google_maps", "Maps"], ["youtube", "YouTube"],
+        ["google_play", "Play"], ["gmail", "Gmail"], ["google_contacts", "Contacts"],
+        ["google_drive", "Drive"], ["google_calendar", "Calendar"],
+        ["google_business_profile", "Business Profile"], ["gemini", "Gemini"],
+        ["google_news", "News"], ["chrome", "Chrome"], ["google_docs", "Docs"],
+        ["google_sheets", "Sheets"], ["google_tasks", "Tasks"],
+      ];
+      createRoot(document.getElementById("root")).render(h(MemoryRouter, {},
+        h("main", { style: { padding: 24, maxWidth: 1100, margin: "auto" } },
+          h("h1", { style: { fontSize: 22, marginBottom: 12 } }, "Shared integration brands"),
+          h("p", { style: { color: "var(--text-muted)", marginBottom: 16 } }, "Real shared components · local assets · no mocked API"),
+          h("button", { className: "btn-manor-outline", onClick: () => document.documentElement.dataset.theme = document.documentElement.dataset.theme === "dark" ? "light" : "dark" }, "Toggle theme"),
+          h("section", { "aria-label": "Google color logos", style: { display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(100px, 1fr))", gap: 20, marginTop: 24, marginBottom: 24, padding: 20, background: "var(--surface-muted)", borderRadius: "var(--radius-panel)" } },
+            ...googleProducts.map(([provider, label]) => h("div", { key: provider, "data-google-provider": provider, style: { display: "flex", flexDirection: "column", alignItems: "center", gap: 10, textAlign: "center" } },
+              h(IntegrationLogo, { provider, size: 36 }),
+              h("span", {}, label),
+            )),
+          ),
+          h("p", { style: { display: "flex", flexWrap: "wrap", alignItems: "center", gap: 8 } },
+            "Chat links:", ...["gmail", "google_drive", "google_calendar", "chrome"].map(provider => h(InlineIntegrationLink, { key: provider, provider })),
+          ),
+          h("section", { style: { display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))", gap: 14, marginTop: 20 } },
+            ...[...Object.keys(INTEGRATION_BRANDS), "custom-mcp"].sort().map(provider => h("article", { key: provider, "data-provider": provider, style: { display: "flex", alignItems: "center", gap: 8, minWidth: 0, padding: 8, background: "var(--surface-muted)", borderRadius: 10 } },
+              h(IntegrationLogo, { provider, size: 28 }),
+              h(InlineIntegrationLink, { provider }),
+            )),
+          ),
+        ),
+      ));
+    </script>
+  </body>
+</html>

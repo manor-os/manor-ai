@@ -98,12 +98,42 @@ def test_cloud_cors_defaults_to_the_first_party_app(monkeypatch):
     assert _cors_allowed_origins() == ["https://app.manorai.xyz"]
 
 
-@pytest.mark.parametrize("origin", ["*", "null", "https://*.example.com", "http://app.example.com"])
+@pytest.mark.parametrize(
+    "origin",
+    [
+        "*",
+        "null",
+        "https://*.example.com",
+        "http://app.example.com",
+        "http://127.0.0.1",
+        "http://10.0.0.1",
+    ],
+)
 def test_cloud_cors_rejects_unsafe_configured_origins(monkeypatch, origin):
     monkeypatch.setenv("DEPLOYMENT_MODE", "cloud")
     monkeypatch.setenv("CORS_ALLOWED_ORIGINS", origin)
     with pytest.raises(RuntimeError, match="CORS|HTTPS"):
         _cors_allowed_origins()
+
+
+def test_cloud_cors_allows_a_hostless_public_ipv4_for_lb_bootstrap(monkeypatch):
+    monkeypatch.setenv("DEPLOYMENT_MODE", "cloud")
+    monkeypatch.setenv("CORS_ALLOWED_ORIGINS", "http://146.190.0.195")
+    assert _cors_allowed_origins() == ["http://146.190.0.195"]
+
+
+def test_local_k8s_cloud_cors_allows_loopback_http(monkeypatch):
+    monkeypatch.setenv("DEPLOYMENT_MODE", "cloud")
+    monkeypatch.setenv("MANOR_ENV", "local-k8s")
+    monkeypatch.setenv(
+        "CORS_ALLOWED_ORIGINS",
+        "http://localhost:18080,http://127.0.0.1:18082,http://[::1]:18082",
+    )
+    assert _cors_allowed_origins() == [
+        "http://127.0.0.1:18082",
+        "http://[::1]:18082",
+        "http://localhost:18080",
+    ]
 
 
 def test_active_content_is_forced_to_download(tmp_path):
@@ -189,6 +219,81 @@ async def test_login_rate_limit_uses_account_failure_budget(monkeypatch):
     decision = await auth_rate_limit.check_login_allowed("user@example.com", "192.0.2.1")
     assert not decision.allowed
     assert decision.retry_after > 0
+
+
+@pytest.mark.asyncio
+async def test_login_rate_limit_redis_increment_keeps_ttl_after_lost_reply(monkeypatch):
+    from packages.core import cache
+
+    class LostReplyRedis:
+        def __init__(self):
+            self.values: dict[str, int] = {}
+            self.expires: dict[str, int] = {}
+            self.lose_reply = True
+
+        async def eval(self, _script: str, key_count: int, key: str, seconds: int):
+            assert key_count == 1
+            if "INCR" in _script:
+                self.values[key] = self.values.get(key, 0) + 1
+            if self.expires.get(key, -1) < 0:
+                self.expires[key] = int(seconds)
+            if self.lose_reply and "INCR" in _script:
+                self.lose_reply = False
+                raise RuntimeError("connection lost after script execution")
+            return [self.values.get(key, 0), self.expires.get(key, -2)]
+
+        async def get(self, key: str):
+            return self.values.get(key)
+
+        async def ttl(self, key: str) -> int:
+            return self.expires.get(key, -1)
+
+    redis = LostReplyRedis()
+
+    async def get_redis():
+        return redis
+
+    monkeypatch.setattr(cache, "_get_redis", get_redis)
+
+    first = await auth_rate_limit._redis_increment("account:test", limit=2, window=60)
+    second = await auth_rate_limit._redis_increment("account:test", limit=2, window=60)
+    decision = await auth_rate_limit._redis_check("account:test", limit=2, window=60)
+
+    assert first is None
+    assert second is not None and second.allowed
+    assert decision is not None and not decision.allowed
+    assert decision.retry_after == 60
+    assert redis.expires == {"auth:fail:account:test": 60}
+
+
+@pytest.mark.asyncio
+async def test_login_rate_limit_repairs_existing_counter_without_ttl(monkeypatch):
+    from packages.core import cache
+
+    class OrphanRedis:
+        def __init__(self):
+            self.values = {"auth:fail:account:locked": 2}
+            self.expires: dict[str, int] = {}
+
+        async def eval(self, _script: str, key_count: int, key: str, seconds: int):
+            assert key_count == 1
+            count = self.values.get(key, 0)
+            if count and self.expires.get(key, -1) < 0:
+                self.expires[key] = int(seconds)
+            return [count, self.expires.get(key, -2)]
+
+    redis = OrphanRedis()
+
+    async def get_redis():
+        return redis
+
+    monkeypatch.setattr(cache, "_get_redis", get_redis)
+
+    decision = await auth_rate_limit._redis_check("account:locked", limit=2, window=60)
+
+    assert decision is not None and not decision.allowed
+    assert decision.retry_after == 60
+    assert redis.expires == {"auth:fail:account:locked": 60}
 
 
 def test_login_rate_limit_fallback_has_bounded_cardinality(monkeypatch):

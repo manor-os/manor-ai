@@ -17,7 +17,7 @@ Outbound (Manor → Meta):
   We keep both paths in this adapter; the channel_gateway picks
   ``reply_to`` from the parsed inbound and the adapter routes from there.
 
-Credentials in ``ChannelConfig.credentials``::
+Credentials are leased from the ChannelConfig's source Integration::
 
     {
       "access_token":   "<user-or-page access token>",   # required
@@ -32,15 +32,21 @@ import hashlib
 import hmac
 import json
 import logging
+import os
 from typing import Any, Optional
 
 from packages.core.config import get_settings
 from packages.core.models.channel import ChannelConfig
 from packages.core.services.meta_graph import (
-    MetaGraphClient, MetaGraphError, graph as _graph,
+    MetaGraphClient, MetaGraphError,
 )
 from packages.core.services.channels.base import (
-    ChannelAdapter, NormalizedInbound, register_adapter,
+    ChannelAdapter,
+    ChannelTextSendError,
+    ChannelTextSendResultStatus,
+    NormalizedInbound,
+    channel_text_send_result,
+    register_adapter,
 )
 
 logger = logging.getLogger(__name__)
@@ -59,18 +65,26 @@ class FacebookChannelAdapter(ChannelAdapter):
 
     # ── Helpers ────────────────────────────────────────────────────────
 
-    def _creds(self, cc: ChannelConfig) -> dict:
-        return cc.credentials or {}
+    async def _creds(self, cc: ChannelConfig, *, reason: str) -> dict:
+        return await self.credentials(cc, reason=reason)
 
-    def _token(self, cc: ChannelConfig) -> str:
-        c = self._creds(cc)
-        token = c.get("page_access_token") or c.get("access_token")
+    @staticmethod
+    def _token(credentials: dict) -> str:
+        token = credentials.get("page_access_token") or credentials.get("access_token")
         if not token:
-            raise RuntimeError(
+            raise ChannelTextSendError.determinate(
                 "Facebook ChannelConfig missing access_token. Connect "
                 "Facebook in Integrations first."
             )
         return token
+
+    @staticmethod
+    def _accepted_result(result: dict) -> dict:
+        return channel_text_send_result(
+            ChannelTextSendResultStatus.SENT,
+            details=result,
+            external_id=result.get("id") or result.get("message_id"),
+        )
 
     # ── Inbound ────────────────────────────────────────────────────────
 
@@ -83,7 +97,10 @@ class FacebookChannelAdapter(ChannelAdapter):
         production deployments should always set it. The signature
         header is ``X-Hub-Signature-256: sha256=<hex>``.
         """
-        secret = self._creds(cc).get("app_secret", "")
+        credentials = await self._creds(cc, reason="channel.facebook.verify_inbound")
+        secret = credentials.get("app_secret", "")
+        if not secret:
+            secret = os.environ.get("FACEBOOK_APP_SECRET", "")
         if not secret:
             logger.debug("facebook: app_secret missing — skipping HMAC check")
             return True
@@ -187,21 +204,21 @@ class FacebookChannelAdapter(ChannelAdapter):
           * a bare numeric id is treated as a Messenger PSID for the
             default page (legacy / direct invocation)
         """
-        token = self._token(cc)
-        creds = self._creds(cc)
+        creds = await self._creds(cc, reason="channel.facebook.send_text")
+        token = self._token(creds)
         default_page = creds.get("page_id", "")
 
         if to.startswith("comment:"):
             _, _page_id, comment_id, _post_id = (to.split(":", 3) + ["", "", ""])[:4]
-            return await _post(
+            return self._accepted_result(await _post(
                 f"/{comment_id}/comments",
                 {"message": text},
                 token=token,
-            )
+            ))
 
         if to.startswith("messenger:"):
             _, page_id, psid = (to.split(":", 2) + ["", ""])[:3]
-            return await _post(
+            return self._accepted_result(await _post(
                 f"/{page_id or default_page}/messages",
                 {
                     "recipient": {"id": psid},
@@ -210,15 +227,15 @@ class FacebookChannelAdapter(ChannelAdapter):
                 },
                 token=token,
                 json_body=True,
-            )
+            ))
 
         # Bare PSID fallback — assume Messenger to the default page.
         if not default_page:
-            raise RuntimeError(
+            raise ChannelTextSendError.determinate(
                 f"Facebook send_text called with bare target {to!r} but "
                 "no default page_id on the ChannelConfig."
             )
-        return await _post(
+        return self._accepted_result(await _post(
             f"/{default_page}/messages",
             {
                 "recipient": {"id": to},
@@ -227,7 +244,7 @@ class FacebookChannelAdapter(ChannelAdapter):
             },
             token=token,
             json_body=True,
-        )
+        ))
 
     async def send_attachment(
         self, cc: ChannelConfig, to: str, *, url=None, data=None,
@@ -252,9 +269,9 @@ class FacebookChannelAdapter(ChannelAdapter):
 
         Idempotent: re-running just refreshes the subscription.
         """
-        creds = self._creds(cc)
+        creds = await self._creds(cc, reason="channel.facebook.register_webhook")
         page_id = creds.get("page_id")
-        token = self._token(cc)
+        token = self._token(creds)
         if not page_id:
             return {"registered": False, "reason": "page_id missing on ChannelConfig"}
 

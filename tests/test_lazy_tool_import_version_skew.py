@@ -42,3 +42,31 @@ def test_agent_provisioning_tools_survives_stale_runtime_package(monkeypatch):
 
     assert callable(mod.runtime_query_entity_agents_action)
     assert callable(mod.runtime_provision_agent_action)
+
+
+def test_agent_provisioning_tools_survives_stale_agents_constants(monkeypatch):
+    import packages.core.constants.agents as real_agents
+
+    # A worker may still have the pre-limit constants module cached while a
+    # newly deployed lazy tool module is imported from disk. Capability limits
+    # live in a dedicated cold-importable module so that mixed state is safe.
+    stale = types.ModuleType("packages.core.constants.agents")
+    for name, value in vars(real_agents).items():
+        if not name.startswith("__"):
+            setattr(stale, name, value)
+    assert not hasattr(stale, "AGENT_CAPABILITY_SELECTION_LIMIT")
+
+    monkeypatch.setitem(sys.modules, "packages.core.constants.agents", stale)
+    monkeypatch.delitem(
+        sys.modules, "packages.core.constants.agent_capabilities", raising=False
+    )
+    monkeypatch.delitem(
+        sys.modules, "packages.core.ai.tools.agent_provisioning_tools", raising=False
+    )
+
+    mod = importlib.import_module("packages.core.ai.tools.agent_provisioning_tools")
+
+    capability_schema = mod.PROVISION_AGENT_SCHEMA["function"]["parameters"][
+        "properties"
+    ]["capability_ids"]
+    assert capability_schema["maxItems"] == 200

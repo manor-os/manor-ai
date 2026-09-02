@@ -121,6 +121,22 @@ test("a new Manor draft resolves to its real conversation URL", () => {
   assert.match(appLayout, /navigate\(`\/chat\?conversation=/);
 });
 
+test("starting a new Manor chat cannot be replaced by a stale auto-resume", () => {
+  assert.match(
+    embeddedChat,
+    /isNewManorConversationId\(conversationId\)[\s\S]*?currentSessionKeyRef\.current = sessionKey/,
+  );
+  assert.match(
+    embeddedChat,
+    /Auto-resume most recent conversation[\s\S]*?let cancelled = false[\s\S]*?if \(cancelled\) return undefined/,
+  );
+  assert.match(
+    embeddedChat,
+    /loadConversationMessages\(latest\.id, \{[\s\S]*?onlyIfStillCurrent: true/,
+  );
+  assert.match(embeddedChat, /return \(\) => \{\s*cancelled = true;\s*\}/);
+});
+
 test("a running Manor session can continue in the background while another session opens", () => {
   assert.doesNotMatch(
     embeddedChat,

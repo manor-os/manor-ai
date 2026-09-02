@@ -49,7 +49,14 @@ def _payload() -> dict:
             "prompts": [],
             "subscriptions": [],
             "scheduled_jobs": [],
-            "workflows": [{"name": "Produce the approved video", "description": "Create and verify an MP4."}],
+            "workflows": [
+                {
+                    "slug": "produce-approved-video",
+                    "name": "Produce the approved video",
+                    "description": "Create and verify an MP4.",
+                    "steps": [{"id": "start", "kind": "trigger"}],
+                }
+            ],
             "goals": [{"metric_key": "video_complete", "title": "Complete one approved video", "target_value": 1}],
             "task_categories": [],
             "custom_fields": [],
@@ -137,6 +144,33 @@ async def test_simulation_run_persists_chat_stages_and_continues_to_goal(
     assert "Goal completed" in (runtime_messages[-1].content or "")
     assert workspace.settings["simulation_run"]["next_stage_index"] == 13
     assert len(workspace.settings["simulation_run"]["decisions"]) == 6
+
+
+async def test_simulation_start_ignores_live_setup_blockers(
+    db_session: AsyncSession,
+):
+    payload = _payload()
+    payload["recipe"]["operating_model"]["settings"] = {
+        "blocking_setup": {
+            "checks": [{
+                "key": "live_connection",
+                "kind": "unknown_live_requirement",
+                "blocking": True,
+            }],
+        },
+    }
+    installed = await install_blueprint(
+        db_session,
+        entity_id=generate_ulid(),
+        payload=payload,
+        mode=InstallMode.SIMULATE,
+    )
+    workspace = await db_session.get(Workspace, installed.workspace_id)
+    assert workspace is not None
+
+    state = await start_simulation_run(db_session, workspace=workspace)
+
+    assert state["status"] == "waiting"
 
 
 async def test_start_repairs_a_legacy_name_only_sandbox_and_restart_keeps_audit(

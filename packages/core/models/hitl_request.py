@@ -137,7 +137,9 @@ class HitlRequest(Base, TimestampMixin):
     consumed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     resolved_reason: Mapped[Optional[str]] = mapped_column(String(120), nullable=True)  # why it left pending (approved / origin_terminal / superseded)
 
-    # audit/render payload (args preview, prompt, plane, etc.) — never load-bearing
+    # Audit/render payload plus bounded typed continuation for runtime tool-call
+    # approvals. Public cards expose only their preview; exact continuation data
+    # is consumed by the trusted approval resume path.
     context: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
 
     hitl_type: Mapped[str] = mapped_column(

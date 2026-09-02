@@ -141,6 +141,27 @@ def test_sandbox_higher_is_better_measurement_does_not_regress_to_baseline():
     assert Decimal("28") < value < Decimal("40")
 
 
+def test_simulated_goal_measurement_preserves_large_decimal_range():
+    goal = Goal(
+        id="goal_exact_simulation_01",
+        entity_id="ent_goal_direction",
+        workspace_id="ws_goal_direction",
+        title="Preserve exact simulated progress",
+        metric_key="exact_progress",
+        baseline_value=Decimal("9999999999999999.9998"),
+        current_value=None,
+        target_value=Decimal("9999999999999999.9999"),
+        deadline=None,
+        status="active",
+        pace_status="unknown",
+    )
+
+    value = simulate_goal_value(goal)
+
+    assert value == Decimal("9999999999999999.9998")
+    assert abs(value) < Decimal("10000000000000000")
+
+
 @pytest.mark.asyncio
 async def test_operation_goal_sync_preserves_runtime_measurement_fields(db_session):
     entity_id = generate_ulid()

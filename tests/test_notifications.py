@@ -1,5 +1,7 @@
 """E2E tests: notifications CRUD, read/unread, isolation."""
 
+import asyncio
+
 import pytest
 from httpx import AsyncClient
 from sqlalchemy import select
@@ -7,6 +9,8 @@ from sqlalchemy import select
 from packages.core.models.base import generate_ulid
 from packages.core.models.notification import Notification
 from packages.core.models.user import Entity, User, UserMembership
+from packages.core.services import realtime
+from packages.core.services.notification_service import create_notification
 
 
 async def _auth(client: AsyncClient, username: str = "notifuser") -> dict:
@@ -137,25 +141,22 @@ async def test_notifications_include_active_company_memberships(
     user = (await db_session.execute(select(User).where(User.id == data["user_id"]))).scalar_one()
     company = Entity(id=generate_ulid(), name="Notif Secondary", settings={})
     db_session.add(company)
-    db_session.add(
-        UserMembership(
-            id=generate_ulid(),
-            user_id=user.id,
-            entity_id=company.id,
-            role="member",
-            status="active",
-        )
+    membership = UserMembership(
+        id=generate_ulid(),
+        user_id=user.id,
+        entity_id=company.id,
+        role="member",
+        status="active",
     )
-    db_session.add(
-        Notification(
-            id=generate_ulid(),
-            entity_id=company.id,
-            user_id=user.id,
-            type="system",
-            title="Company-side notice",
-            content="This notification belongs to another active company.",
-        )
+    notification = Notification(
+        id=generate_ulid(),
+        entity_id=company.id,
+        user_id=user.id,
+        type="system",
+        title="Company-side notice",
+        content="This notification belongs to another active company.",
     )
+    db_session.add_all([membership, notification])
     await db_session.commit()
 
     resp = await client.get("/api/v1/notifications", headers=headers)
@@ -170,6 +171,20 @@ async def test_notifications_include_active_company_memberships(
 
     after = await client.get("/api/v1/notifications", headers=headers)
     assert after.json()["unread_count"] == 0
+
+    membership.status = "inactive"
+    await db_session.commit()
+
+    mark_after_revocation = await client.post(
+        f"/api/v1/notifications/{notification.id}/read",
+        headers=headers,
+    )
+    assert mark_after_revocation.status_code == 404
+    delete_after_revocation = await client.delete(
+        f"/api/v1/notifications/{notification.id}",
+        headers=headers,
+    )
+    assert delete_after_revocation.status_code == 404
 
 
 @pytest.mark.asyncio
@@ -266,3 +281,103 @@ async def test_notification_isolation(client: AsyncClient):
     # B cannot delete it
     resp3 = await client.delete(f"/api/v1/notifications/{nid}", headers=headers_b)
     assert resp3.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_realtime_push_happens_only_after_commit(
+    client: AsyncClient,
+    db_session,
+    monkeypatch,
+):
+    register = await client.post(
+        "/api/v1/auth/register",
+        json={
+            "username": "notif_after_commit",
+            "email": "notif_after_commit@test.com",
+            "password": "pass123",
+            "entity_name": "After Commit Corp",
+        },
+    )
+    data = register.json()
+    pushed: list[dict] = []
+
+    async def fake_push(user_id: str, notification: dict, *, entity_id: str):
+        pushed.append({"user_id": user_id, "entity_id": entity_id, **notification})
+
+    monkeypatch.setattr(realtime, "push_notification", fake_push)
+    await create_notification(
+        db_session,
+        data["entity_id"],
+        data["user_id"],
+        "system",
+        "Committed notification",
+    )
+    assert pushed == []
+
+    await db_session.commit()
+    await asyncio.sleep(0)
+    assert [item["title"] for item in pushed] == ["Committed notification"]
+
+
+@pytest.mark.asyncio
+async def test_realtime_push_is_discarded_on_rollback(
+    client: AsyncClient,
+    db_session,
+    monkeypatch,
+):
+    register = await client.post(
+        "/api/v1/auth/register",
+        json={
+            "username": "notif_rollback",
+            "email": "notif_rollback@test.com",
+            "password": "pass123",
+            "entity_name": "Rollback Corp",
+        },
+    )
+    data = register.json()
+    pushed: list[dict] = []
+
+    async def fake_push(user_id: str, notification: dict, *, entity_id: str):
+        pushed.append(notification)
+
+    monkeypatch.setattr(realtime, "push_notification", fake_push)
+    await create_notification(
+        db_session,
+        data["entity_id"],
+        data["user_id"],
+        "system",
+        "Rolled back notification",
+    )
+    await db_session.rollback()
+    await asyncio.sleep(0)
+    assert pushed == []
+
+
+@pytest.mark.asyncio
+async def test_notification_rejects_conflicting_workspace_scopes(
+    client: AsyncClient,
+    db_session,
+):
+    register = await client.post(
+        "/api/v1/auth/register",
+        json={
+            "username": "notif_scope_conflict",
+            "email": "notif_scope_conflict@test.com",
+            "password": "pass123",
+            "entity_name": "Scope Conflict Corp",
+        },
+    )
+    data = register.json()
+
+    with pytest.raises(ValueError, match="workspace scope"):
+        await create_notification(
+            db_session,
+            data["entity_id"],
+            data["user_id"],
+            "system",
+            "Conflicting scope",
+            workspace_id="workspace-a",
+            meta={"workspace_id": "workspace-b"},
+        )
+
+    assert (await db_session.execute(select(Notification))).scalars().all() == []

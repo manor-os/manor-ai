@@ -63,6 +63,7 @@ async def runtime_workspace_answer_task_blocker_action(
                 confirm=bool(confirm) if confirm is not None else None,
                 refuse=refuse,
             )
+            plan_to_run = result.pop("_plan_to_run", None)
             await db.commit()
         except Exception:
             await db.rollback()
@@ -71,4 +72,36 @@ async def runtime_workspace_answer_task_blocker_action(
                 "error": "answer_task_blocker_failed",
                 "request_id": request_id,
             })
+        if plan_to_run:
+            try:
+                from packages.core.tasks.ai_tasks import run_plan
+
+                run_plan.delay(plan_to_run)
+                result["dispatched"] = True
+            except Exception:
+                logger.warning(
+                    "Task blocker continuation dispatch failed: plan=%s",
+                    plan_to_run,
+                    exc_info=True,
+                )
+                result["dispatched"] = False
+                try:
+                    from packages.core.services.task_retry_service import (
+                        mark_plan_continuation_dispatch_failed,
+                    )
+
+                    await mark_plan_continuation_dispatch_failed(
+                        db,
+                        plan_id=plan_to_run,
+                        user_id=user_id,
+                        reason="task_blocker_dispatch_failed",
+                    )
+                    await db.commit()
+                except Exception:
+                    await db.rollback()
+                    logger.error(
+                        "Could not persist task blocker dispatch failure: plan=%s",
+                        plan_to_run,
+                        exc_info=True,
+                    )
     return _dumps(result)

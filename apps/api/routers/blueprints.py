@@ -1,9 +1,9 @@
 """Workspace Blueprint endpoints — export / list / install / promote.
 
-The list/detail/install endpoints serve both entity-owned blueprints and
-code-shipped marketplace blueprints. Entity-owned blueprints live in
-``workspace_blueprints``; built-ins are frozen JSON configs addressed as
-``builtin:<slug>``.
+Marketplace blueprints, including platform-owned built-ins, are served from
+``workspace_blueprints``. Platform configs are published into that table by
+the startup seeder; historical ``builtin:<slug>`` and slug-only handles resolve
+to the same canonical row.
 
 Endpoints:
 
@@ -13,12 +13,13 @@ Endpoints:
   PUT    /api/v1/blueprints/{id}                     edit metadata
   DELETE /api/v1/blueprints/{id}                     delete
   POST   /api/v1/blueprints/{id}/install             install (mode=simulate|live)
-  POST   /api/v1/workspaces/{id}/promote             sandbox → live
+  POST   /api/v1/workspaces/{id}/promote             Workspace simulation → live
   POST   /api/v1/workspaces/{id}/promote/preflight   read-only check
 """
 from __future__ import annotations
 
 import logging
+import json
 import os
 import secrets
 import tempfile
@@ -26,13 +27,17 @@ from datetime import datetime, timezone
 from typing import Any, Literal, Optional
 
 from fastapi import APIRouter, Body, Depends, File, Form, HTTPException, Query, UploadFile
-from pydantic import BaseModel, Field, model_validator
-from sqlalchemy import delete, func, select
+from pydantic import BaseModel, Field, JsonValue, field_validator, model_validator
+from sqlalchemy import case, delete, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from apps.api.deps import get_current_user, require_workspace_writable
+from apps.api.deps import get_current_user, require_workspace_readable, require_workspace_writable
 from packages.core.constants.blueprints import (
     BLUEPRINT_EDITABLE_STATUSES,
+    BLUEPRINT_KNOWLEDGE_MAX_DOCUMENTS,
+    BLUEPRINT_KNOWLEDGE_LIST_PAGE_SIZE,
+    BLUEPRINT_KNOWLEDGE_LIST_MAX_PAGE_SIZE,
+    BlueprintPurchaseStatus,
     BlueprintStatus,
 )
 from packages.core.blueprints import (
@@ -41,7 +46,6 @@ from packages.core.blueprints import (
     InstallMode,
     InstallResult,
     PromoteError,
-    SOLO_COMPANY_BLUEPRINTS_FROZEN_AT,
     SimulationReport,
     export_workspace,
     get_solo_company_blueprint,
@@ -50,7 +54,22 @@ from packages.core.blueprints import (
     promote_workspace,
     simulate_report,
 )
-from packages.core.blueprints.exporter import ExportContext
+from packages.core.blueprints.exporter import (
+    ExportContext,
+    list_exportable_knowledge_documents,
+)
+from packages.core.blueprints.freshness import blueprint_content_fingerprint
+from packages.core.blueprints.installer import resolve_install_variables
+from packages.core.blueprints.payload import PayloadError, migrate_payload
+from packages.core.blueprints.setup_preflight import (
+    BlueprintSetupPreflight,
+    BlueprintSetupPreflightError,
+    BlueprintSetupPreflightFactory,
+)
+from packages.core.blueprints.seed import (
+    platform_blueprint_id,
+    resolve_blueprint_row,
+)
 from packages.core.governance.presets import list_presets
 from packages.core.database import get_db
 from packages.core.models.base import generate_ulid
@@ -58,7 +77,10 @@ from packages.core.models.blueprint import (
     BlueprintFavorite,
     WorkspaceBlueprint,
 )
+from packages.core.models.blueprint_purchase import BlueprintPurchase
 from packages.core.models.user import User
+from packages.core.models.workspace import Workspace
+from packages.core.permissions import Permission, check_effective_user_permission
 from packages.core.services.blueprint_cover_service import (
     build_blueprint_cover_template,
 )
@@ -69,7 +91,12 @@ from packages.core.services.entity_fs import (
     resolve_path,
 )
 from packages.core.services.entity_service import get_workspace
+from packages.core.services.workspace_access import user_can_manage_workspace
 from packages.core.services.merchant_service import get_merchant_account
+from packages.core.services.marketplace_billing import (
+    blueprint_delivery_requires_paid_plan,
+    blueprint_delivery_source,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -79,19 +106,47 @@ blueprint_router = APIRouter(prefix="/api/v1/blueprints", tags=["blueprints"])
 workspace_router = APIRouter(prefix="/api/v1/workspaces", tags=["blueprints"])
 
 _BUILTIN_BLUEPRINT_PREFIX = "builtin:"
-_BUILTIN_CREATED_AT = datetime.fromisoformat(
-    f"{SOLO_COMPANY_BLUEPRINTS_FROZEN_AT}T12:00:00+00:00"
-).astimezone(timezone.utc)
 BLUEPRINT_SHOWCASE_MAX_ASSETS = 6
 BLUEPRINT_SHOWCASE_IMAGE_MAX_BYTES = 12 * 1024 * 1024
 BLUEPRINT_SHOWCASE_VIDEO_MAX_BYTES = 100 * 1024 * 1024
 _SHOWCASE_IMAGE_EXTENSIONS = {".avif", ".gif", ".jpeg", ".jpg", ".png", ".webp"}
 _SHOWCASE_VIDEO_EXTENSIONS = {".m4v", ".mov", ".mp4", ".webm"}
+_BLUEPRINT_CONFIGURATION_INVALID_DETAIL = (
+    "Blueprint configuration or personalization is invalid."
+)
+_BLUEPRINT_PREFLIGHT_INVALID_DETAIL = (
+    "Blueprint setup requirements could not be evaluated."
+)
 
 
 # ── Models ────────────────────────────────────────────────────────────
 
+class BlueprintInstallVariableDeclaration(BaseModel):
+    key: str = Field(
+        ...,
+        pattern=r"^[A-Za-z_][A-Za-z0-9_.-]{0,99}$",
+    )
+    label: str = Field(..., min_length=1, max_length=160)
+    purpose: Optional[str] = Field(None, max_length=500)
+    required: bool = False
+    default: Optional[JsonValue] = None
+    materialize: bool = True
+
+    @field_validator("default")
+    @classmethod
+    def validate_default_size(cls, value: JsonValue | None) -> JsonValue | None:
+        if value is None:
+            return value
+        encoded = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+        if len(encoded.encode("utf-8")) > 2000:
+            raise ValueError("default must be at most 2000 UTF-8 bytes")
+        return value
+
+
 class ExportBlueprintRequest(BaseModel):
+    # Exact Marketplace counterpart when editing a previously published
+    # Workspace. Omit for the first export; the server records the minted id.
+    marketplace_blueprint_id: Optional[str] = Field(None, max_length=160)
     slug: str = Field(..., pattern=r"^[a-z0-9][a-z0-9_-]{1,118}[a-z0-9]$")
     title: str = Field(..., min_length=1, max_length=200)
     summary: Optional[str] = Field(None, max_length=500)
@@ -100,6 +155,12 @@ class ExportBlueprintRequest(BaseModel):
     cover_image_url: Optional[str] = None
     author_handle: Optional[str] = None
     author_display_name: Optional[str] = None
+    # Personalization schema is authored by the Blueprint creator. Installer
+    # values are supplied later and never become Marketplace credentials.
+    install_variables: Optional[list[BlueprintInstallVariableDeclaration]] = Field(
+        None,
+        max_length=50,
+    )
     # Section toggles — pass overrides only if you want to drop something
     include_subscriptions: bool = True
     include_goals: bool = True
@@ -118,9 +179,56 @@ class ExportBlueprintRequest(BaseModel):
     # Deprecated alias retained for existing clients. True maps to
     # knowledge_pack_mode=inline_text when the explicit mode is omitted.
     include_memory_files: bool = False
+    # Request-only local Document ids. They select exact safe Markdown bodies
+    # and are never persisted in the portable Blueprint payload.
+    knowledge_document_ids: Optional[list[str]] = Field(
+        None,
+        max_length=BLUEPRINT_KNOWLEDGE_MAX_DOCUMENTS,
+    )
     # Re-freeze the editable Blueprint with this slug when it came from the
     # same Workspace. Reviewed/published payloads remain immutable.
     replace_existing: bool = False
+
+    @model_validator(mode="after")
+    def validate_knowledge_document_selection(self):
+        if self.install_variables is not None:
+            keys = [item.key for item in self.install_variables]
+            if len(keys) != len(set(keys)):
+                raise ValueError("install_variables keys must be unique")
+        if self.knowledge_document_ids is None:
+            return self
+        normalized = [str(value).strip() for value in self.knowledge_document_ids]
+        if any(not value for value in normalized):
+            raise ValueError("knowledge_document_ids cannot contain empty values")
+        self.knowledge_document_ids = list(dict.fromkeys(normalized))
+        if not self.knowledge_document_ids:
+            return self
+        if not self.include_knowledge_packs:
+            raise ValueError(
+                "knowledge_document_ids requires include_knowledge_packs"
+            )
+        effective_mode = self.knowledge_pack_mode or (
+            "inline_text" if self.include_memory_files else "skeleton"
+        )
+        if effective_mode != "inline_text":
+            raise ValueError(
+                "knowledge_document_ids requires knowledge_pack_mode='inline_text'"
+            )
+        return self
+
+
+class BlueprintExportKnowledgeGroup(BaseModel):
+    id: str
+    name: str
+
+
+class BlueprintExportKnowledgeDocument(BaseModel):
+    id: str
+    name: str
+    path: str
+    file_size: int
+    groups: list[BlueprintExportKnowledgeGroup] = Field(default_factory=list)
+    groups_truncated: bool = False
 
 
 class BlueprintSetupItem(BaseModel):
@@ -129,7 +237,7 @@ class BlueprintSetupItem(BaseModel):
     kind: Optional[str] = None
     required: bool = False
     purpose: Optional[str] = None
-    default: Optional[str] = None
+    default: Any = None
 
 
 class BlueprintSetupPreview(BaseModel):
@@ -267,6 +375,8 @@ class InstallBlueprintRequest(BaseModel):
     workspace_name: Optional[str] = Field(None, max_length=200)
     share_token: Optional[str] = None
     create_missing_agents: bool = False
+    variable_values: dict[str, Any] = Field(default_factory=dict)
+    channel_config_ids: dict[str, str] = Field(default_factory=dict)
     governance_preset: str = Field(
         "standard",
         pattern="^(safe|standard|aggressive)$",
@@ -301,6 +411,44 @@ class InstallResponse(BaseModel):
     governance_applied: bool
     todos: list[InstallTodoResponse]
     notes: list[str]
+
+
+class InstallPreflightResourceOptionResponse(BaseModel):
+    id: str
+    label: str
+
+
+class InstallPreflightRequirementResponse(BaseModel):
+    kind: str
+    provider: str
+    label: str
+    required: bool
+    blocking: bool
+    ready: bool
+    reason: str
+    purpose: Optional[str] = None
+    setup_kind: Optional[str] = None
+    scope: Optional[str] = None
+    config_fields_to_set: list[str] = Field(default_factory=list)
+    requirement_key: Optional[str] = None
+    resource_id: Optional[str] = None
+    resource_options: list[InstallPreflightResourceOptionResponse] = Field(
+        default_factory=list,
+    )
+
+
+class InstallPreflightResponse(BaseModel):
+    ready: bool
+    blocking_count: int
+    requirements: list[InstallPreflightRequirementResponse] = Field(
+        default_factory=list,
+    )
+
+
+class BlueprintStartupReconcileResponse(BaseModel):
+    state: str
+    dispatched_job_ids: list[str] = Field(default_factory=list)
+    blocking_check_keys: list[str] = Field(default_factory=list)
 
 
 class UnmetRequirementResponse(BaseModel):
@@ -396,13 +544,13 @@ def _setup_item_from_variable(item: Any) -> BlueprintSetupItem | None:
     label = _string_or_none(row.get("label")) or _string_or_none(row.get("key"))
     if not label:
         return None
-    default = row.get("default")
     return BlueprintSetupItem(
         label=label,
         key=_string_or_none(row.get("key")),
         kind="variable",
         required=bool(row.get("required", False)),
-        default=str(default) if default is not None else None,
+        purpose=_string_or_none(row.get("purpose")),
+        default=row.get("default"),
     )
 
 
@@ -644,6 +792,14 @@ def _builtin_id(slug: str) -> str:
     return f"{_BUILTIN_BLUEPRINT_PREFIX}{slug}"
 
 
+def _marketplace_identity_ids(row: WorkspaceBlueprint) -> set[str]:
+    """All durable and historical handles naming one Marketplace row."""
+    identities = {row.id}
+    if row.entity_id is None:
+        identities.update({row.slug, _builtin_id(row.slug)})
+    return {identity for identity in identities if identity}
+
+
 def _builtin_payload_for_id(blueprint_id: str) -> tuple[str, dict[str, Any]] | None:
     slug = (
         blueprint_id[len(_BUILTIN_BLUEPRINT_PREFIX):]
@@ -654,75 +810,6 @@ def _builtin_payload_for_id(blueprint_id: str) -> tuple[str, dict[str, Any]] | N
         return slug, get_solo_company_blueprint(slug)
     except KeyError:
         return None
-
-
-def _builtin_summary(payload: dict[str, Any]) -> BlueprintSummary:
-    manifest = _manifest(payload)
-    slug = str(manifest.get("slug") or "")
-    raw_tags = manifest.get("tags")
-    tags = [str(tag) for tag in raw_tags] if isinstance(raw_tags, list) else []
-    cover_image_url = manifest.get("cover_image_url")
-    author = manifest.get("author") if isinstance(manifest.get("author"), dict) else {}
-    return BlueprintSummary(
-        id=_builtin_id(slug),
-        slug=slug,
-        title=str(manifest.get("title") or slug),
-        summary=(
-            str(manifest["summary"])
-            if isinstance(manifest.get("summary"), str)
-            else None
-        ),
-        tags=tags,
-        status=BlueprintStatus.PUBLISHED.value,
-        install_count=0,
-        payload_version=str(manifest.get("blueprint_version") or "1.1"),
-        source_workspace_id=None,
-        cover_image_url=(
-            str(cover_image_url)
-            if isinstance(cover_image_url, str) and cover_image_url
-            else None
-        ),
-        showcase_assets=_showcase_assets(manifest.get("showcase_assets")),
-        cover_template=_cover_template(
-            title=str(manifest.get("title") or slug),
-            description=(
-                str(manifest["description"])
-                if isinstance(manifest.get("description"), str)
-                else (
-                    str(manifest["summary"])
-                    if isinstance(manifest.get("summary"), str)
-                    else None
-                )
-            ),
-            tags=tags,
-            identity=_builtin_id(slug),
-        ),
-        author_handle=_string_or_none(author.get("handle")),
-        author_display_name=(
-            _string_or_none(author.get("display_name")) or "Manor"
-        ),
-        remixed_from_id=_string_or_none(manifest.get("forked_from_id")),
-        setup_preview=_payload_setup_preview(payload),
-        created_at=_BUILTIN_CREATED_AT,
-        updated_at=_BUILTIN_CREATED_AT,
-        published_at=_BUILTIN_CREATED_AT,
-        price_cents=None,
-        list_price_cents=None,
-        currency="usd",
-        purchase_count=0,
-        has_share_token=False,
-        is_owner=False,
-    )
-
-
-def _builtin_detail(payload: dict[str, Any]) -> BlueprintDetail:
-    manifest = _manifest(payload)
-    description = manifest.get("description")
-    return BlueprintDetail(
-        **_builtin_summary(payload).model_dump(),
-        description=str(description) if isinstance(description, str) else None,
-        payload=payload,
-    )
 
 
 def _user_display_name(user: User | None) -> str:
@@ -738,9 +825,13 @@ def _user_display_name(user: User | None) -> str:
 
 async def _marketplace_signals(
     db: AsyncSession,
-    blueprint_ids: list[str],
+    blueprints: list[WorkspaceBlueprint | str],
     viewer_user_id: str | None = None,
 ) -> dict[str, dict[str, Any]]:
+    blueprint_ids = [
+        blueprint.id if isinstance(blueprint, WorkspaceBlueprint) else blueprint
+        for blueprint in blueprints
+    ]
     signals = {
         blueprint_id: {
             "favorite_count": 0,
@@ -752,34 +843,107 @@ async def _marketplace_signals(
     if not blueprint_ids:
         return signals
 
+    rows_by_signal_id = {
+        blueprint.id: blueprint
+        for blueprint in blueprints
+        if isinstance(blueprint, WorkspaceBlueprint)
+    }
+    unresolved_ids = [
+        blueprint_id
+        for blueprint_id in blueprint_ids
+        if blueprint_id not in rows_by_signal_id
+    ]
+    if unresolved_ids:
+        exact_rows = list((await db.execute(
+            select(WorkspaceBlueprint).where(
+                WorkspaceBlueprint.id.in_(unresolved_ids),
+            )
+        )).scalars().all())
+        exact_by_id = {row.id: row for row in exact_rows}
+        rows_by_signal_id.update(exact_by_id)
+
+        unresolved_slugs = {
+            blueprint_id[len(_BUILTIN_BLUEPRINT_PREFIX):]
+            if blueprint_id.startswith(_BUILTIN_BLUEPRINT_PREFIX)
+            else blueprint_id
+            for blueprint_id in unresolved_ids
+            if blueprint_id not in exact_by_id
+        }
+        if unresolved_slugs:
+            platform_rows = list((await db.execute(
+                select(WorkspaceBlueprint).where(
+                    WorkspaceBlueprint.entity_id.is_(None),
+                    WorkspaceBlueprint.slug.in_(unresolved_slugs),
+                )
+            )).scalars().all())
+            platform_by_slug = {row.slug: row for row in platform_rows}
+            for blueprint_id in unresolved_ids:
+                slug = (
+                    blueprint_id[len(_BUILTIN_BLUEPRINT_PREFIX):]
+                    if blueprint_id.startswith(_BUILTIN_BLUEPRINT_PREFIX)
+                    else blueprint_id
+                )
+                if row := platform_by_slug.get(slug):
+                    rows_by_signal_id[blueprint_id] = row
+
+    canonical_by_alias = {
+        blueprint_id: blueprint_id
+        for blueprint_id in blueprint_ids
+    }
+    for blueprint_id, row in rows_by_signal_id.items():
+        for alias in _marketplace_identity_ids(row):
+            canonical_by_alias.setdefault(alias, blueprint_id)
+    for blueprint_id in blueprint_ids:
+        if blueprint_id in rows_by_signal_id:
+            continue
+        if _builtin_payload_for_id(blueprint_id) is not None:
+            slug = (
+                blueprint_id[len(_BUILTIN_BLUEPRINT_PREFIX):]
+                if blueprint_id.startswith(_BUILTIN_BLUEPRINT_PREFIX)
+                else blueprint_id
+            )
+            canonical_by_alias.setdefault(slug, blueprint_id)
+            canonical_by_alias.setdefault(_builtin_id(slug), blueprint_id)
+    identity_ids = list(canonical_by_alias)
+    canonical_favorite_id = case(
+        canonical_by_alias,
+        value=BlueprintFavorite.blueprint_id,
+    )
     favorite_rows = (await db.execute(
         select(
-            BlueprintFavorite.blueprint_id,
-            func.count(BlueprintFavorite.id),
+            canonical_favorite_id,
+            func.count(func.distinct(BlueprintFavorite.user_id)),
         ).where(
-            BlueprintFavorite.blueprint_id.in_(blueprint_ids),
-        ).group_by(BlueprintFavorite.blueprint_id)
+            BlueprintFavorite.blueprint_id.in_(identity_ids),
+        ).group_by(canonical_favorite_id)
     )).all()
     for blueprint_id, count in favorite_rows:
-        signals[blueprint_id]["favorite_count"] = int(count or 0)
+        if blueprint_id in signals:
+            signals[blueprint_id]["favorite_count"] = int(count or 0)
 
     if viewer_user_id:
         viewer_favorites = (await db.execute(
             select(BlueprintFavorite.blueprint_id).where(
-                BlueprintFavorite.blueprint_id.in_(blueprint_ids),
+                BlueprintFavorite.blueprint_id.in_(identity_ids),
                 BlueprintFavorite.user_id == viewer_user_id,
             )
         )).scalars().all()
         for blueprint_id in viewer_favorites:
-            signals[blueprint_id]["is_favorited"] = True
+            canonical_id = canonical_by_alias.get(blueprint_id)
+            if canonical_id in signals:
+                signals[canonical_id]["is_favorited"] = True
 
+    canonical_remix_id = case(
+        canonical_by_alias,
+        value=WorkspaceBlueprint.remixed_from_id,
+    )
     remix_rows = (await db.execute(
         select(
-            WorkspaceBlueprint.remixed_from_id,
+            canonical_remix_id,
             func.count(WorkspaceBlueprint.id),
         ).where(
-            WorkspaceBlueprint.remixed_from_id.in_(blueprint_ids),
-        ).group_by(WorkspaceBlueprint.remixed_from_id)
+            WorkspaceBlueprint.remixed_from_id.in_(identity_ids),
+        ).group_by(canonical_remix_id)
     )).all()
     for blueprint_id, count in remix_rows:
         if blueprint_id in signals:
@@ -807,7 +971,7 @@ async def _summary_with_signals(
     viewer_user_id: str | None = None,
 ) -> BlueprintSummary:
     signals = (
-        await _marketplace_signals(db, [row.id], viewer_user_id)
+        await _marketplace_signals(db, [row], viewer_user_id)
     )[row.id]
     author_avatar_url = None
     if row.author_user_id:
@@ -936,27 +1100,125 @@ def _remove_showcase_file(row: WorkspaceBlueprint, asset: dict[str, Any]) -> Non
 async def _require_published_blueprint(
     db: AsyncSession,
     blueprint_id: str,
-) -> WorkspaceBlueprint | None:
-    if _builtin_payload_for_id(blueprint_id) is not None:
-        return None
-    row = await db.get(WorkspaceBlueprint, blueprint_id)
+) -> WorkspaceBlueprint:
+    row = await _find_blueprint_row(db, blueprint_id)
     if row is None or row.status != BlueprintStatus.PUBLISHED:
         raise HTTPException(404, "Published Blueprint not found")
     return row
+
+
+async def _completed_purchase(
+    db: AsyncSession, blueprint_id: str, entity_id: str,
+) -> BlueprintPurchase | None:
+    """Return the live purchase entitlement held by ``entity_id``."""
+    return (await db.execute(
+        select(BlueprintPurchase).where(
+            BlueprintPurchase.blueprint_id == blueprint_id,
+            BlueprintPurchase.buyer_entity_id == entity_id,
+            BlueprintPurchase.status == BlueprintPurchaseStatus.COMPLETED.value,
+        )
+    )).scalar_one_or_none()
 
 
 async def _has_completed_purchase(
     db: AsyncSession, blueprint_id: str, entity_id: str,
 ) -> bool:
     """True when ``entity_id`` holds a live (completed) entitlement."""
-    from packages.core.models.blueprint_purchase import BlueprintPurchase
-    return (await db.execute(
-        select(BlueprintPurchase.id).where(
-            BlueprintPurchase.blueprint_id == blueprint_id,
-            BlueprintPurchase.buyer_entity_id == entity_id,
-            BlueprintPurchase.status == "completed",
+    return await _completed_purchase(db, blueprint_id, entity_id) is not None
+
+
+async def _paid_purchase_matching_payload(
+    db: AsyncSession,
+    payload: dict[str, Any],
+    entity_id: str,
+) -> tuple[BlueprintPurchase, WorkspaceBlueprint, str | None] | None:
+    """Return paid provenance for an exact owned snapshot/current release.
+
+    This match is provenance metadata only. Cloud raw imports are plan-gated
+    independently because client-supplied JSON cannot prove it was not copied
+    from or trivially modified from paid Marketplace content.
+    """
+    rows = (await db.execute(
+        select(BlueprintPurchase, WorkspaceBlueprint)
+        .join(
+            WorkspaceBlueprint,
+            WorkspaceBlueprint.id == BlueprintPurchase.blueprint_id,
         )
-    )).scalar_one_or_none() is not None
+        .where(
+            BlueprintPurchase.buyer_entity_id == entity_id,
+            BlueprintPurchase.status == BlueprintPurchaseStatus.COMPLETED.value,
+            BlueprintPurchase.amount_cents > 0,
+        )
+    )).all()
+    matches: dict[
+        str,
+        tuple[BlueprintPurchase, WorkspaceBlueprint, str | None],
+    ] = {}
+    # Prefer the current published release for each Blueprint when it also
+    # equals the receipt. Provenance is attached only when the payload resolves
+    # to exactly one owned Blueprint identity.
+    for purchase, blueprint in rows:
+        if (
+            blueprint.status == BlueprintStatus.PUBLISHED
+            and blueprint.payload == payload
+        ):
+            matches[blueprint.id] = (
+                purchase,
+                blueprint,
+                blueprint.content_version,
+            )
+    for purchase, blueprint in rows:
+        if (
+            blueprint.id not in matches
+            and purchase.payload_snapshot == payload
+        ):
+            matches[blueprint.id] = (
+                purchase,
+                blueprint,
+                purchase.blueprint_content_version,
+            )
+    return next(iter(matches.values())) if len(matches) == 1 else None
+
+
+async def _find_blueprint_row(
+    db: AsyncSession,
+    blueprint_id: str,
+) -> WorkspaceBlueprint | None:
+    """Resolve a durable id or a historical platform slug to one DB row."""
+    slug = (
+        blueprint_id[len(_BUILTIN_BLUEPRINT_PREFIX):]
+        if blueprint_id.startswith(_BUILTIN_BLUEPRINT_PREFIX)
+        else blueprint_id
+    )
+    return await resolve_blueprint_row(
+        db,
+        blueprint_id=blueprint_id,
+        blueprint_slug=slug or None,
+    )
+
+
+async def _published_platform_blueprint_matching_payload(
+    db: AsyncSession,
+    payload: dict[str, Any],
+) -> WorkspaceBlueprint | None:
+    """Return the official row only when its installable content is exact."""
+    payload_slug = str(_manifest(payload).get("slug") or "").strip()
+    if not payload_slug:
+        return None
+    row = await resolve_blueprint_row(
+        db,
+        blueprint_id=platform_blueprint_id(payload_slug),
+        blueprint_slug=payload_slug,
+    )
+    if (
+        row is None
+        or row.entity_id is not None
+        or row.status != BlueprintStatus.PUBLISHED
+        or blueprint_content_fingerprint(row.payload)
+        != blueprint_content_fingerprint(payload)
+    ):
+        return None
+    return row
 
 
 async def _load_blueprint(
@@ -972,9 +1234,7 @@ async def _load_blueprint(
     The token/purchase grants apply only to ``allow_published=True`` loads:
     ``allow_published=False`` marks owner-mutation contexts (update, delete,
     pricing, share-token), where non-owners must always 404."""
-    row = (await db.execute(
-        select(WorkspaceBlueprint).where(WorkspaceBlueprint.id == blueprint_id)
-    )).scalar_one_or_none()
+    row = await _find_blueprint_row(db, blueprint_id)
     if row is None:
         raise HTTPException(404, "blueprint not found")
     if row.entity_id != entity_id:
@@ -1037,6 +1297,7 @@ async def _commit_and_start_installed_workspace(
     committed by the time a broker or worker failure can occur.
     """
     await db.commit()
+    blocking_todos = [todo for todo in result.todos if todo.blocking]
     if result.mode == InstallMode.SIMULATE:
         from packages.core.blueprints.simulation_runtime import (
             start_simulation_run,
@@ -1065,6 +1326,42 @@ async def _commit_and_start_installed_workspace(
             result.notes.append(
                 "Simulation installed; open Workspace Chat to retry the run."
             )
+        return
+
+    startup = None
+    try:
+        from packages.core.services.blueprint_startup_service import (
+            reconcile_blueprint_startup,
+        )
+
+        startup = await reconcile_blueprint_startup(
+            db,
+            workspace_id=result.workspace_id,
+            trigger="install",
+        )
+        if startup is not None and startup.dispatched_job_ids:
+            result.notes.append(
+                "Blueprint startup queued: "
+                + ", ".join(startup.dispatched_job_ids)
+                + "."
+            )
+    except Exception:  # noqa: BLE001
+        await db.rollback()
+        logger.exception(
+            "workspace %s was installed but Blueprint startup reconciliation failed",
+            result.workspace_id,
+        )
+        result.notes.append(
+            "Workspace installed; Blueprint startup will retry from readiness monitoring."
+        )
+
+    if blocking_todos:
+        result.notes.append(
+            f"Normal Workspace startup deferred until {len(blocking_todos)} blocking "
+            "setup item(s) are complete."
+        )
+        return
+    if startup is None or startup.state != "not_configured":
         return
 
     from packages.core.services.workspace_setup_service import (
@@ -1104,7 +1401,45 @@ async def _commit_and_start_installed_workspace(
             )
 
 
+async def _increment_blueprint_install_count(
+    db: AsyncSession,
+    blueprint_id: str,
+) -> None:
+    """Increment in SQL so concurrent successful installs cannot overwrite."""
+    await db.execute(
+        update(WorkspaceBlueprint)
+        .where(WorkspaceBlueprint.id == blueprint_id)
+        .values(install_count=WorkspaceBlueprint.install_count + 1)
+        .execution_options(synchronize_session=False)
+    )
+
+
 # ── Export (workspace → draft blueprint row) ──────────────────────────
+
+@workspace_router.get(
+    "/{workspace_id}/blueprint-export/knowledge-documents",
+    response_model=list[BlueprintExportKnowledgeDocument],
+)
+async def list_blueprint_export_knowledge_documents(
+    workspace_id: str,
+    limit: int = Query(BLUEPRINT_KNOWLEDGE_LIST_PAGE_SIZE, ge=1, le=BLUEPRINT_KNOWLEDGE_LIST_MAX_PAGE_SIZE),
+    offset: int = Query(0, ge=0),
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """List safe Workspace Knowledge files eligible as starter content."""
+    ws = await get_workspace(db, workspace_id, user.entity_id)
+    if not ws:
+        raise HTTPException(404, "Workspace not found")
+    await require_workspace_writable(db, user, workspace_id)
+    return await list_exportable_knowledge_documents(
+        db,
+        entity_id=user.entity_id,
+        workspace_id=workspace_id,
+        limit=limit,
+        offset=offset,
+    )
+
 
 @workspace_router.post(
     "/{workspace_id}/export-blueprint",
@@ -1123,17 +1458,101 @@ async def export_workspace_as_blueprint(
     if not ws:
         raise HTTPException(404, "Workspace not found")
     await require_workspace_writable(db, user, workspace_id)
+    # Serialize first export/refreeze for this local Workspace. Without a row
+    # lock, two requests can both observe no counterpart and mint two distinct
+    # Marketplace ids before the provenance link exists.
+    locked_ws = (await db.execute(
+        select(Workspace).where(
+            Workspace.id == workspace_id,
+            Workspace.entity_id == user.entity_id,
+            Workspace.deleted_at.is_(None),
+        ).with_for_update()
+    )).scalar_one_or_none()
+    if locked_ws is None:
+        raise HTTPException(404, "Workspace not found")
+    ws = locked_ws
 
-    # Slug uniqueness — or an explicit re-freeze of an editable Blueprint
-    # previously exported from this same Workspace.
-    existing = (await db.execute(
+    from packages.core.services.marketplace_resource_links import (
+        RELATIONSHIP_PUBLISHED_AS,
+        RESOURCE_WORKSPACE,
+        RESOURCE_WORKSPACE_BLUEPRINT,
+        SCOPE_WORKSPACE,
+        marketplace_link_for_local_resource,
+        record_marketplace_resource_link,
+    )
+
+    # Resolve the Marketplace counterpart by exact id. Historical exports can
+    # be backfilled from source_workspace_id because it is itself an exact
+    # local id; slug remains only a separately validated display locator.
+    existing = None
+    if req.marketplace_blueprint_id:
+        existing = (await db.execute(
+            select(WorkspaceBlueprint).where(
+                WorkspaceBlueprint.id == req.marketplace_blueprint_id,
+                WorkspaceBlueprint.entity_id == user.entity_id,
+                WorkspaceBlueprint.source_workspace_id == workspace_id,
+            )
+        )).scalar_one_or_none()
+        if existing is None:
+            raise HTTPException(
+                404,
+                "Marketplace Blueprint counterpart not found for this Workspace",
+            )
+    else:
+        counterpart = await marketplace_link_for_local_resource(
+            db,
+            entity_id=user.entity_id,
+            local_resource_type=RESOURCE_WORKSPACE,
+            local_resource_id=workspace_id,
+            relationship=RELATIONSHIP_PUBLISHED_AS,
+        )
+        if counterpart is not None:
+            existing = (await db.execute(
+                select(WorkspaceBlueprint).where(
+                    WorkspaceBlueprint.id == counterpart.marketplace_resource_id,
+                    WorkspaceBlueprint.entity_id == user.entity_id,
+                    WorkspaceBlueprint.source_workspace_id == workspace_id,
+                )
+            )).scalar_one_or_none()
+            if existing is None:
+                # A draft Blueprint could have been deleted before provenance
+                # links were cleaned transactionally. Remove only this stale
+                # published-as edge so the same Workspace can mint a new exact
+                # counterpart below.
+                await db.delete(counterpart)
+                await db.flush()
+
+    if existing is None:
+        historical = list((await db.execute(
+            select(WorkspaceBlueprint).where(
+                WorkspaceBlueprint.entity_id == user.entity_id,
+                WorkspaceBlueprint.source_workspace_id == workspace_id,
+            )
+        )).scalars().all())
+        if len(historical) == 1:
+            existing = historical[0]
+        elif len(historical) > 1:
+            raise HTTPException(
+                409,
+                "This Workspace has multiple historical Marketplace Blueprints; "
+                "retry with marketplace_blueprint_id",
+            )
+
+    slug_owner = (await db.execute(
         select(WorkspaceBlueprint).where(
             WorkspaceBlueprint.entity_id == user.entity_id,
             WorkspaceBlueprint.slug == req.slug,
         )
     )).scalar_one_or_none()
-    if existing is not None and not req.replace_existing:
+    if slug_owner is not None and (
+        existing is None or slug_owner.id != existing.id
+    ):
         raise HTTPException(409, f"blueprint slug {req.slug!r} already used")
+    if existing is not None and not req.replace_existing:
+        raise HTTPException(
+            409,
+            f"Workspace is already published as Blueprint {existing.id!r}",
+        )
     if existing is not None:
         _require_blueprint_content_editable(existing)
         if existing.source_workspace_id != workspace_id:
@@ -1141,6 +1560,22 @@ async def export_workspace_as_blueprint(
                 409,
                 "an existing blueprint with this slug came from another workspace",
             )
+
+    install_variables = None
+    if req.install_variables is not None:
+        install_variables = tuple(
+            item.model_dump(exclude_none=True)
+            for item in req.install_variables
+        )
+    elif existing is not None:
+        install_variables = tuple(
+            dict(item)
+            for item in ((existing.payload or {}).get("contract") or {}).get(
+                "variables",
+                [],
+            )
+            if isinstance(item, dict)
+        )
 
     ctx = ExportContext(
         include_subscriptions=req.include_subscriptions,
@@ -1156,8 +1591,14 @@ async def export_workspace_as_blueprint(
         include_embedded_skills=req.include_embedded_skills,
         include_knowledge_packs=req.include_knowledge_packs,
         knowledge_pack_mode=req.knowledge_pack_mode,
+        knowledge_document_ids=(
+            frozenset(req.knowledge_document_ids)
+            if req.knowledge_document_ids is not None
+            else None
+        ),
         include_starter_memory=req.include_starter_memory,
         include_memory_files=req.include_memory_files,
+        install_variables=install_variables,
     )
     author_display_name = req.author_display_name or _user_display_name(user)
     try:
@@ -1223,6 +1664,8 @@ async def export_workspace_as_blueprint(
         db.add(row)
     else:
         row = existing
+        row.slug = req.slug
+        row.source_workspace_id = workspace_id
         row.title = req.title
         row.summary = req.summary
         row.description = req.description
@@ -1236,6 +1679,20 @@ async def export_workspace_as_blueprint(
         row.status = BlueprintStatus.DRAFT.value
         row.published_at = None
     await db.flush()
+    await record_marketplace_resource_link(
+        db,
+        entity_id=user.entity_id,
+        marketplace_resource_type=RESOURCE_WORKSPACE_BLUEPRINT,
+        marketplace_resource_id=row.id,
+        relationship=RELATIONSHIP_PUBLISHED_AS,
+        scope_type=SCOPE_WORKSPACE,
+        scope_id=workspace_id,
+        local_resource_type=RESOURCE_WORKSPACE,
+        local_resource_id=workspace_id,
+        marketplace_version=row.content_version,
+        linked_by=user.id,
+        metadata={"source_slug": row.slug},
+    )
     await db.refresh(row)
     detail = BlueprintDetail(
         **_summary(row, user.entity_id).model_dump(),
@@ -1283,8 +1740,7 @@ async def list_blueprints(
     # Platform blueprints are seeded into workspace_blueprints at startup.
     # Appending the frozen configs here as well returns every platform entry
     # twice (with the same id), so the table is the list's single source.
-    blueprint_ids = [row.id for row in rows]
-    signals = await _marketplace_signals(db, blueprint_ids, user.id)
+    signals = await _marketplace_signals(db, rows, user.id)
     author_avatars = await _author_avatars(db, rows)
     summaries = [
         _summary(
@@ -1327,18 +1783,34 @@ async def resolve_shared_blueprint(
     )).scalar_one_or_none()
     if row is None:
         raise HTTPException(404, "share link not found or revoked")
-    purchased = False
+    purchase = None
     if row.entity_id != user.entity_id:
-        purchased = await _has_completed_purchase(db, row.id, user.entity_id)
+        purchase = await _completed_purchase(db, row.id, user.entity_id)
+    purchased = purchase is not None
     # The payload IS the paid product — a share token grants VIEWING only.
-    # Hide it from non-purchasers; summary/setup_preview stay for the buy page.
-    payload = row.payload
-    if (row.price_cents or 0) > 0 and row.entity_id != user.entity_id and not purchased:
-        payload = {}
+    # A completed purchase unlocks it only while the buyer's paid Manor plan
+    # is active; summary/setup_preview stay available for the buy page.
+    source_payload, _source_version = blueprint_delivery_source(row, purchase)
+    payload = source_payload
+    if (
+        row.entity_id != user.entity_id
+        and blueprint_delivery_requires_paid_plan(row, purchase)
+    ):
+        from packages.core.services.marketplace_billing import (
+            has_paid_marketplace_plan,
+        )
+        if not purchased or not await has_paid_marketplace_plan(
+            db,
+            entity_id=user.entity_id,
+        ):
+            payload = {}
+    summary = (
+        await _summary_with_signals(db, row, user.entity_id, user.id)
+    ).model_dump()
+    if purchase is not None:
+        summary["setup_preview"] = _payload_setup_preview(source_payload)
     return BlueprintDetail(
-        **(
-            await _summary_with_signals(db, row, user.entity_id, user.id)
-        ).model_dump(),
+        **summary,
         description=row.description,
         payload=payload,
         purchased=purchased,
@@ -1352,30 +1824,36 @@ async def get_blueprint(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    builtin = _builtin_payload_for_id(blueprint_id)
-    if builtin is not None:
-        _, payload = builtin
-        detail = _builtin_detail(payload)
-        signals = (
-            await _marketplace_signals(db, [detail.id], user.id)
-        )[detail.id]
-        return detail.model_copy(update=signals)
-
     row = await _load_blueprint(
         db, blueprint_id, user.entity_id, share_token=share_token,
     )
-    purchased = False
+    purchase = None
     if row.entity_id != user.entity_id:
-        purchased = await _has_completed_purchase(db, row.id, user.entity_id)
-    # The payload IS the paid product — hide it from non-purchasers.
-    # summary/setup_preview stay intact for the buy page.
-    payload = row.payload
-    if (row.price_cents or 0) > 0 and row.entity_id != user.entity_id and not purchased:
-        payload = {}
+        purchase = await _completed_purchase(db, row.id, user.entity_id)
+    purchased = purchase is not None
+    # The payload IS the paid product — expose it only to owners or buyers
+    # whose paid Manor plan is active. Metadata stays intact for the buy page.
+    source_payload, _source_version = blueprint_delivery_source(row, purchase)
+    payload = source_payload
+    if (
+        row.entity_id != user.entity_id
+        and blueprint_delivery_requires_paid_plan(row, purchase)
+    ):
+        from packages.core.services.marketplace_billing import (
+            has_paid_marketplace_plan,
+        )
+        if not purchased or not await has_paid_marketplace_plan(
+            db,
+            entity_id=user.entity_id,
+        ):
+            payload = {}
+    summary = (
+        await _summary_with_signals(db, row, user.entity_id, user.id)
+    ).model_dump()
+    if purchase is not None:
+        summary["setup_preview"] = _payload_setup_preview(source_payload)
     detail = BlueprintDetail(
-        **(
-            await _summary_with_signals(db, row, user.entity_id, user.id)
-        ).model_dump(),
+        **summary,
         description=row.description,
         payload=payload,
         purchased=purchased,
@@ -1530,27 +2008,51 @@ async def toggle_blueprint_favorite(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    await _require_published_blueprint(db, blueprint_id)
-    favorite = (await db.execute(
+    slug = (
+        blueprint_id[len(_BUILTIN_BLUEPRINT_PREFIX):]
+        if blueprint_id.startswith(_BUILTIN_BLUEPRINT_PREFIX)
+        else blueprint_id
+    )
+    row = await db.get(WorkspaceBlueprint, blueprint_id)
+    if row is None and slug:
+        row = (await db.execute(
+            select(WorkspaceBlueprint).where(
+                WorkspaceBlueprint.entity_id.is_(None),
+                WorkspaceBlueprint.slug == slug,
+            )
+        )).scalars().first()
+    if row is None:
+        row = await _require_published_blueprint(db, blueprint_id)
+    elif row.status != BlueprintStatus.PUBLISHED:
+        raise HTTPException(404, "Published Blueprint not found")
+
+    identity_ids = (
+        _marketplace_identity_ids(row)
+        if row is not None
+        else {blueprint_id, slug, _builtin_id(slug)}
+    )
+    canonical_id = row.id if row is not None else blueprint_id
+    favorites = list((await db.execute(
         select(BlueprintFavorite).where(
-            BlueprintFavorite.blueprint_id == blueprint_id,
+            BlueprintFavorite.blueprint_id.in_(identity_ids),
             BlueprintFavorite.user_id == user.id,
         )
-    )).scalar_one_or_none()
-    if favorite is None:
+    )).scalars().all())
+    if not favorites:
         db.add(BlueprintFavorite(
-            blueprint_id=blueprint_id,
+            blueprint_id=canonical_id,
             entity_id=user.entity_id,
             user_id=user.id,
         ))
         is_favorited = True
     else:
-        await db.delete(favorite)
+        for favorite in favorites:
+            await db.delete(favorite)
         is_favorited = False
     await db.commit()
     favorite_count = int((await db.execute(
-        select(func.count(BlueprintFavorite.id)).where(
-            BlueprintFavorite.blueprint_id == blueprint_id,
+        select(func.count(func.distinct(BlueprintFavorite.user_id))).where(
+            BlueprintFavorite.blueprint_id.in_(identity_ids),
         )
     )).scalar_one())
     return BlueprintFavoriteResponse(
@@ -1569,18 +2071,24 @@ async def set_blueprint_pricing(
     """Set the current checkout price and optional higher list price.
 
     Free (0) works everywhere; a paid checkout price requires cloud mode and
-    a charges-enabled merchant account. Pricing does not touch review status.
+    a charges- and payouts-enabled merchant account. Pricing does not touch
+    review status.
     """
     if _builtin_payload_for_id(blueprint_id) is not None:
         raise HTTPException(409, "built-in marketplace blueprints cannot be priced")
 
     row = await _load_blueprint(db, blueprint_id, user.entity_id, allow_published=False)
+    await check_effective_user_permission(db, user, Permission.ADMIN_BILLING)
 
     if req.price_cents > 0:
         if os.getenv("DEPLOYMENT_MODE", "oss") != "cloud":
             raise HTTPException(403, "Paid blueprints are only available in cloud mode")
         merchant = await get_merchant_account(db, user.entity_id)
-        if merchant is None or not merchant.charges_enabled:
+        if (
+            merchant is None
+            or not merchant.charges_enabled
+            or not merchant.payouts_enabled
+        ):
             raise HTTPException(
                 409,
                 "Connect a payout account before setting a price "
@@ -1670,18 +2178,193 @@ async def delete_blueprint(
         raise HTTPException(409, "built-in marketplace blueprints cannot be deleted")
 
     row = await _load_blueprint(db, blueprint_id, user.entity_id, allow_published=False)
+    row = (await db.execute(
+        select(WorkspaceBlueprint)
+        .where(
+            WorkspaceBlueprint.id == row.id,
+            WorkspaceBlueprint.entity_id == user.entity_id,
+        )
+        .with_for_update()
+    )).scalar_one_or_none()
+    if row is None:
+        raise HTTPException(404, "blueprint not found")
     _require_blueprint_content_editable(row)
+    purchase_id = (await db.execute(
+        select(BlueprintPurchase.id)
+        .where(BlueprintPurchase.blueprint_id == row.id)
+        .limit(1)
+    )).scalar_one_or_none()
+    if purchase_id is not None:
+        raise HTTPException(
+            409,
+            "Blueprints with purchase history cannot be deleted; archive it instead.",
+        )
     for asset in row.showcase_assets or []:
         if isinstance(asset, dict):
             _remove_showcase_file(row, asset)
     await db.execute(
-        delete(BlueprintFavorite).where(BlueprintFavorite.blueprint_id == blueprint_id)
+        delete(BlueprintFavorite).where(BlueprintFavorite.blueprint_id == row.id)
+    )
+    from packages.core.models.marketplace_resource_link import MarketplaceResourceLink
+    from packages.core.services.marketplace_resource_links import (
+        RELATIONSHIP_PUBLISHED_AS,
+        RESOURCE_WORKSPACE_BLUEPRINT,
+    )
+
+    await db.execute(
+        delete(MarketplaceResourceLink).where(
+            MarketplaceResourceLink.entity_id == user.entity_id,
+            MarketplaceResourceLink.marketplace_resource_type
+            == RESOURCE_WORKSPACE_BLUEPRINT,
+            MarketplaceResourceLink.marketplace_resource_id == row.id,
+            MarketplaceResourceLink.relationship == RELATIONSHIP_PUBLISHED_AS,
+        )
     )
     await db.delete(row)
     await db.commit()
 
 
 # ── Install ───────────────────────────────────────────────────────────
+
+def _install_preflight_response(
+    result: BlueprintSetupPreflight,
+    *,
+    mode: InstallMode = InstallMode.LIVE,
+) -> InstallPreflightResponse:
+    blocking_requirements = result.blocking_requirements_for_mode(mode)
+    return InstallPreflightResponse(
+        ready=result.ready_for_mode(mode),
+        blocking_count=len(blocking_requirements),
+        requirements=[
+            InstallPreflightRequirementResponse(
+                kind=requirement.kind.value,
+                provider=requirement.provider,
+                label=requirement.label,
+                required=requirement.required,
+                blocking=requirement in blocking_requirements,
+                ready=requirement.ready,
+                reason=requirement.reason,
+                purpose=requirement.purpose,
+                setup_kind=requirement.setup_kind,
+                scope=requirement.scope,
+                config_fields_to_set=list(requirement.config_fields_to_set),
+                requirement_key=requirement.requirement_key,
+                resource_id=requirement.resource_id,
+                resource_options=[
+                    InstallPreflightResourceOptionResponse(
+                        id=option.id,
+                        label=option.label,
+                    )
+                    for option in requirement.resource_options
+                ],
+            )
+            for requirement in result.requirements
+        ],
+    )
+
+
+async def _require_install_preflight(
+    db: AsyncSession,
+    *,
+    payload: dict[str, Any],
+    entity_id: str,
+    user_id: str,
+    mode: InstallMode = InstallMode.LIVE,
+    selected_channel_config_ids: dict[str, str] | None = None,
+    variable_values: dict[str, Any] | None = None,
+) -> BlueprintSetupPreflight:
+    try:
+        setup_payload, _ = resolve_install_variables(
+            migrate_payload(payload),
+            variable_values,
+        )
+    except PayloadError as exc:
+        logger.warning("Blueprint setup preflight rejected a payload", exc_info=True)
+        raise HTTPException(400, _BLUEPRINT_PREFLIGHT_INVALID_DETAIL) from exc
+    except InstallError as exc:
+        logger.warning(
+            "Blueprint install rejected invalid configuration",
+            exc_info=True,
+        )
+        raise HTTPException(
+            400,
+            _BLUEPRINT_CONFIGURATION_INVALID_DETAIL,
+        ) from exc
+    try:
+        result = await BlueprintSetupPreflightFactory.from_payload(
+            db,
+            payload=setup_payload,
+            entity_id=entity_id,
+            user_id=user_id,
+            selected_channel_config_ids=selected_channel_config_ids,
+        )
+    except BlueprintSetupPreflightError as exc:
+        logger.warning("Blueprint setup preflight rejected a payload", exc_info=True)
+        raise HTTPException(400, _BLUEPRINT_PREFLIGHT_INVALID_DETAIL) from exc
+    if not result.ready_for_mode(mode):
+        response = _install_preflight_response(result, mode=mode)
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "blueprint_setup_required",
+                "message": (
+                    "Connect all required Blueprint integrations, channels, and sessions "
+                    "before creating the Workspace."
+                ),
+                "preflight": response.model_dump(),
+            },
+        )
+    return result
+
+
+@blueprint_router.get(
+    "/{blueprint_id}/install-preflight",
+    response_model=InstallPreflightResponse,
+)
+async def install_preflight(
+    blueprint_id: str,
+    share_token: Optional[str] = Query(None),
+    variable_values: Optional[str] = Query(None),
+    mode: InstallMode = Query(InstallMode.LIVE),
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Resolve creator-declared account dependencies without writing state."""
+    row = await _load_blueprint(
+        db,
+        blueprint_id,
+        user.entity_id,
+        share_token=share_token,
+    )
+    purchase = None
+    if row.entity_id != user.entity_id:
+        purchase = await _completed_purchase(db, row.id, user.entity_id)
+    payload, _source_version = blueprint_delivery_source(row, purchase)
+    try:
+        parsed_variable_values = json.loads(variable_values) if variable_values else {}
+        if not isinstance(parsed_variable_values, dict):
+            raise ValueError("variable_values must be an object")
+        setup_payload, _ = resolve_install_variables(
+            migrate_payload(payload),
+            parsed_variable_values,
+        )
+        result = await BlueprintSetupPreflightFactory.from_payload(
+            db,
+            payload=setup_payload,
+            entity_id=user.entity_id,
+            user_id=user.id,
+        )
+    except (
+        BlueprintSetupPreflightError,
+        InstallError,
+        PayloadError,
+        ValueError,
+        json.JSONDecodeError,
+    ) as exc:
+        logger.warning("Blueprint install preflight rejected a payload", exc_info=True)
+        raise HTTPException(400, _BLUEPRINT_PREFLIGHT_INVALID_DETAIL) from exc
+    return _install_preflight_response(result, mode=mode)
+
 
 @blueprint_router.post(
     "/{blueprint_id}/install",
@@ -1694,74 +2377,44 @@ async def install(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    builtin = _builtin_payload_for_id(blueprint_id)
-    if builtin is not None:
-        slug, payload = builtin
-        # Platform blueprints are published rows now. The compatibility
-        # branch still accepts their historical ``builtin:<slug>`` handles,
-        # but it must record that durable id and the row's content version;
-        # otherwise the installed workspace can never discover an update.
-        from packages.core.blueprints.freshness import FIRST_CONTENT_VERSION
-        from packages.core.blueprints.seed import platform_blueprint_id
-
-        durable_id = platform_blueprint_id(slug)
-        published = await db.get(WorkspaceBlueprint, durable_id)
-        if published is None:
-            published = (await db.execute(
-                select(WorkspaceBlueprint).where(
-                    WorkspaceBlueprint.entity_id.is_(None),
-                    WorkspaceBlueprint.slug == slug,
-                )
-            )).scalars().first()
-        if published is not None:
-            durable_id = published.id
-        if published is not None and isinstance(published.payload, dict):
-            payload = published.payload
-        try:
-            result = await install_blueprint(
-                db,
-                entity_id=user.entity_id,
-                payload=payload,
-                mode=req.mode,
-                workspace_name=req.workspace_name,
-                user_id=user.id,
-                blueprint_id=durable_id,
-                blueprint_slug=slug,
-                blueprint_version=(
-                    published.content_version if published is not None
-                    else FIRST_CONTENT_VERSION
-                ),
-                create_missing_agents=req.create_missing_agents,
-                governance_preset=req.governance_preset,
-            )
-        except InstallError as exc:
-            raise HTTPException(400, str(exc))
-
-        await _commit_and_start_installed_workspace(
-            db,
-            result=result,
-            entity_id=user.entity_id,
-        )
-        return _install_response(result)
-
     row = await _load_blueprint(
         db, blueprint_id, user.entity_id, share_token=req.share_token,
     )
-    payload = row.payload
-    if (row.price_cents or 0) > 0 and row.entity_id != user.entity_id:
-        from packages.core.models.blueprint_purchase import BlueprintPurchase
-        purchase = (await db.execute(
-            select(BlueprintPurchase).where(
-                BlueprintPurchase.blueprint_id == row.id,
-                BlueprintPurchase.buyer_entity_id == user.entity_id,
-                BlueprintPurchase.status == "completed",
+    purchase = None
+    if row.entity_id != user.entity_id:
+        purchase = await _completed_purchase(db, row.id, user.entity_id)
+    if (
+        row.entity_id != user.entity_id
+        and blueprint_delivery_requires_paid_plan(row, purchase)
+    ):
+        from packages.core.services.marketplace_billing import (
+            MarketplacePaidPlanRequiredError,
+            require_paid_marketplace_plan,
+        )
+        try:
+            await require_paid_marketplace_plan(
+                db,
+                entity_id=user.entity_id,
+                blueprint_id=row.id,
             )
-        )).scalar_one_or_none()
+        except MarketplacePaidPlanRequiredError as exc:
+            raise HTTPException(402, detail=exc.detail) from exc
+
         if purchase is None:
             raise HTTPException(402, "purchase required to install this blueprint")
-        # Install the snapshot the buyer paid for — immune to later
-        # seller edits of the live row.
-        payload = purchase.payload_snapshot
+    # Published installs follow the current supported release.  A completed
+    # purchase snapshot remains the fallback when that release is no longer
+    # published, so archival cannot destroy the product the buyer paid for.
+    payload, source_version = blueprint_delivery_source(row, purchase)
+    setup_preflight = await _require_install_preflight(
+        db,
+        payload=payload,
+        entity_id=user.entity_id,
+        user_id=user.id,
+        mode=req.mode,
+        selected_channel_config_ids=req.channel_config_ids,
+        variable_values=req.variable_values,
+    )
     try:
         result = await install_blueprint(
             db,
@@ -1772,20 +2425,28 @@ async def install(
             user_id=user.id,
             blueprint_id=row.id,
             blueprint_slug=row.slug,
-            blueprint_version=row.content_version,
+            blueprint_version=source_version,
             create_missing_agents=req.create_missing_agents,
             governance_preset=req.governance_preset,
+            variable_values=req.variable_values,
+            channel_config_ids={
+                requirement.requirement_key: requirement.resource_id
+                for requirement in setup_preflight.requirements
+                if requirement.requirement_key and requirement.resource_id
+            } | req.channel_config_ids,
         )
     except InstallError as exc:
-        raise HTTPException(400, str(exc))
+        logger.warning("Blueprint install rejected invalid configuration", exc_info=True)
+        raise HTTPException(400, _BLUEPRINT_CONFIGURATION_INVALID_DETAIL) from exc
 
-    row.install_count += 1
+    await _increment_blueprint_install_count(db, row.id)
     await _commit_and_start_installed_workspace(
         db,
         result=result,
         entity_id=user.entity_id,
     )
-    return _install_response(result)
+    response = _install_response(result)
+    return response
 
 
 # ── Install from raw payload (no DB row required) ─────────────────────
@@ -1793,10 +2454,9 @@ async def install(
 # generates blueprints externally without round-tripping through the
 # blueprint table.
 #
-# Paid-content note: this endpoint installs CALLER-SUPPLIED payloads only.
-# It grants nothing the caller doesn't already possess — the detail/resolve
-# endpoints hide paid payloads from non-purchasers, so a non-purchaser can
-# never obtain a paid payload through the API to feed in here.
+# Cloud raw imports require an active paid plan. Unlike canonical installs,
+# arbitrary client-supplied JSON has no server-verifiable Marketplace origin,
+# so structural or exact-payload matching cannot enforce paid entitlements.
 
 @blueprint_router.post(
     "/install-payload",
@@ -1809,23 +2469,46 @@ async def install_from_payload(
     workspace_name: Optional[str] = Body(None),
     create_missing_agents: bool = Body(False),
     governance_preset: str = Body("standard"),
+    variable_values: dict[str, Any] = Body(default_factory=dict),
+    channel_config_ids: dict[str, str] = Body(default_factory=dict),
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    # Identity comes from the published row this payload belongs to, when
-    # there is one — the platform's own blueprints are rows now, so a
-    # caller-supplied payload that matches one installs as that blueprint
-    # rather than as an anonymous copy nothing can later update.
-    from packages.core.blueprints.seed import platform_blueprint_id
-
     payload_slug = str(_manifest(payload).get("slug") or "").strip()
-    matched = None
-    if payload_slug:
-        matched = (await db.execute(
-            select(WorkspaceBlueprint).where(
-                WorkspaceBlueprint.id == platform_blueprint_id(payload_slug),
-            )
-        )).scalar_one_or_none()
+    paid_source = await _paid_purchase_matching_payload(
+        db,
+        payload,
+        user.entity_id,
+    )
+    paid_purchase = paid_source[0] if paid_source else None
+    paid_blueprint_id = paid_purchase.blueprint_id if paid_purchase else None
+    from packages.core.services.marketplace_billing import (
+        MarketplacePaidPlanRequiredError,
+        require_paid_marketplace_plan,
+    )
+    try:
+        await require_paid_marketplace_plan(
+            db,
+            entity_id=user.entity_id,
+            blueprint_id=paid_blueprint_id,
+        )
+    except MarketplacePaidPlanRequiredError as exc:
+        raise HTTPException(402, detail=exc.detail) from exc
+
+    matched = (
+        paid_source[1]
+        if paid_source
+        else await _published_platform_blueprint_matching_payload(db, payload)
+    )
+    setup_preflight = await _require_install_preflight(
+        db,
+        payload=payload,
+        entity_id=user.entity_id,
+        user_id=user.id,
+        mode=mode,
+        selected_channel_config_ids=channel_config_ids,
+        variable_values=variable_values,
+    )
     try:
         result = await install_blueprint(
             db,
@@ -1836,18 +2519,92 @@ async def install_from_payload(
             user_id=user.id,
             blueprint_id=matched.id if matched else None,
             blueprint_slug=(matched.slug if matched else payload_slug) or None,
-            blueprint_version=matched.content_version if matched else None,
+            blueprint_version=(
+                paid_source[2]
+                if paid_source is not None
+                else matched.content_version if matched else None
+            ),
             create_missing_agents=create_missing_agents,
             governance_preset=governance_preset,
+            variable_values=variable_values,
+            channel_config_ids={
+                requirement.requirement_key: requirement.resource_id
+                for requirement in setup_preflight.requirements
+                if requirement.requirement_key and requirement.resource_id
+            } | channel_config_ids,
         )
     except InstallError as exc:
-        raise HTTPException(400, str(exc))
+        logger.warning("Blueprint payload install rejected invalid configuration", exc_info=True)
+        raise HTTPException(400, _BLUEPRINT_CONFIGURATION_INVALID_DETAIL) from exc
     await _commit_and_start_installed_workspace(
         db,
         result=result,
         entity_id=user.entity_id,
     )
     return _install_response(result)
+
+
+# ── Blueprint startup repair ──────────────────────────────────────────
+
+@workspace_router.post(
+    "/{workspace_id}/blueprint-startup/reconcile",
+    response_model=BlueprintStartupReconcileResponse,
+)
+async def reconcile_workspace_blueprint_startup(
+    workspace_id: str,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Idempotently resume startup declared by this Workspace's Blueprint."""
+    ws = await get_workspace(db, workspace_id, user.entity_id)
+    if not ws:
+        raise HTTPException(404, "Workspace not found")
+    await require_workspace_writable(db, user, workspace_id)
+
+    from packages.core.services.blueprint_startup_service import (
+        reconcile_missing_blueprint_startup_contract,
+        reconcile_blueprint_startup,
+    )
+
+    blueprint_record = (
+        (ws.settings or {}).get("_blueprint")
+        if isinstance(ws.settings, dict)
+        else None
+    )
+    installed_blueprint_id = str(
+        (blueprint_record or {}).get("blueprint_id") or ""
+    ).strip()
+    builtin = (
+        _builtin_payload_for_id(installed_blueprint_id)
+        if installed_blueprint_id
+        else None
+    )
+    if builtin is not None:
+        contract = await reconcile_missing_blueprint_startup_contract(
+            db,
+            workspace=ws,
+            payload=builtin[1],
+            source_blueprint_id=_builtin_id(builtin[0]),
+        )
+        if contract.state == "materialized":
+            await db.commit()
+        elif contract.state == "jobs_missing":
+            return BlueprintStartupReconcileResponse(
+                state="contract_jobs_missing",
+                dispatched_job_ids=[],
+                blocking_check_keys=list(contract.missing_job_ids),
+            )
+
+    result = await reconcile_blueprint_startup(
+        db,
+        workspace_id=workspace_id,
+        trigger="api_repair",
+    )
+    return BlueprintStartupReconcileResponse(
+        state=result.state,
+        dispatched_job_ids=list(result.dispatched_job_ids),
+        blocking_check_keys=list(result.blocking_check_keys),
+    )
 
 
 # ── Simulation report (M12.4) ─────────────────────────────────────────
@@ -1864,6 +2621,7 @@ async def get_simulation_report(
     """Activity + cost + counterfactual + goal-pace digest of what the
     workspace did during simulation. Read-only — safe to call repeatedly
     while the operator is deciding whether to promote."""
+    await require_workspace_readable(db, user, workspace_id)
     ws = await get_workspace(db, workspace_id, user.entity_id)
     if not ws:
         raise HTTPException(404, "Workspace not found")
@@ -1939,6 +2697,7 @@ async def promote_preflight(
     db: AsyncSession = Depends(get_db),
 ):
     """Read-only — returns the unmet requirements for promotion."""
+    await require_workspace_readable(db, user, workspace_id)
     ws = await get_workspace(db, workspace_id, user.entity_id)
     if not ws:
         raise HTTPException(404, "Workspace not found")
@@ -1962,6 +2721,13 @@ async def promote(
     ws = await get_workspace(db, workspace_id, user.entity_id)
     if not ws:
         raise HTTPException(404, "Workspace not found")
+    if not await user_can_manage_workspace(
+        db,
+        workspace_id=workspace_id,
+        user_id=user.id,
+        entity_role=user.role,
+    ):
+        raise HTTPException(403, "You do not have permission to promote this workspace")
     try:
         result = await promote_workspace(
             db, workspace_id, user_id=user.id, force=req.force,

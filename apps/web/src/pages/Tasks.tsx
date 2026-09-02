@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback, useRef, useMemo, type DragEvent, type KeyboardEvent, type ReactNode } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
-import { useParams, useNavigate, useSearchParams } from "react-router-dom";
+import { useNavigate, useSearchParams } from "react-router-dom";
 import { api } from "../lib/api";
 import { useToastStore } from "../stores/toast";
 import { useAuthStore } from "../stores/auth";
@@ -27,7 +27,8 @@ import WorkspaceIconTile from "../components/ui/WorkspaceIcon";
 import StatusPill from "../components/ui/StatusPill";
 import { FilterBar, FilterSelect } from "../components/ui/FilterBar";
 import { MANOR_AGENT_ID, MANOR_AGENT_TYPE, MANOR_AGENT_NAME, isMasterAgent } from "../lib/constants";
-import TaskPropertiesPanel from "../components/task/TaskPropertiesPanel";
+import { TaskType } from "../lib/taskTypes";
+import TaskPropertiesPanel, { filterWorkspaceScopedAgents } from "../components/task/TaskPropertiesPanel";
 import TaskLogItem from "../components/task/TaskLogItem";
 import TaskRecoveryPanel from "../components/task/TaskRecoveryPanel";
 import ChatMarkdown from "../components/ChatMarkdown";
@@ -42,6 +43,11 @@ import { t } from "../lib/i18n";
 import { getAgentDescription } from "../lib/localizedContent";
 import { inferRuntimeRuleFromText, shouldFallbackToWildcardRule } from "../lib/runtimeRules";
 import { formatTaskDescriptionForDisplay, formatTaskOutputSummary, formatUserFacingLabel, formatUserFacingStructuredText, formatUserFacingText, friendlyPersonName } from "../lib/taskDisplay";
+import {
+  canResumeLegacyAgentInput,
+  hasPendingPlanDecision,
+  resumablePlanInputStep,
+} from "../lib/taskHitl";
 import {
   ADD_SELECTION_TO_TASK_EVENT,
   SELECTED_TEXT_TASK_DRAFT_KEY,
@@ -92,6 +98,7 @@ type BoardColumnKey = typeof BOARD_COLUMNS[number];
 const TASK_BOARD_VISIBLE_COLUMNS_STORAGE_KEY = "manor_tasks_board_visible_columns_v1";
 const TASK_BOARD_COLUMN_ORDER_STORAGE_KEY = "manor_tasks_board_column_order_v1";
 const TASK_BOARD_MODE_STORAGE_KEY = "manor_tasks_board_mode_v1";
+const EXTERNAL_CALENDAR_REFRESH_INTERVAL_MS = 30_000;
 
 type LocalTaskBoardPreferences = {
   mode: "kanban" | "list";
@@ -689,8 +696,7 @@ function BoardTaskCard({ task, onClick, onOpenFull, agents, dimmed, compact, wsN
   const checkDone = (task.details as any)?.checklist_done || 0;
   const checkTotal = (task.details as any)?.checklist_total || 0;
   const dependencyInfo = _taskDependencyInfo(task);
-  const isWorkspaceTask = Boolean(task.workspace_id || task.workspace_name || wsName || workspaceScoped);
-  const isProcessingGlow = (isAI || isWorkspaceTask) && task.status === "in_progress" && !dimmed;
+  const isProcessingGlow = task.execution_active === true && !dimmed;
   const scopeName = wsName || task.workspace_name || (!task.workspace_id ? "Entity-level" : "");
   const scopeIsEntityLevel = !task.workspace_id;
   const statusConfig = TASK_STATUSES[task.status];
@@ -1084,7 +1090,12 @@ function TaskDependencySummary({ task }: { task: Task }) {
   );
 }
 
-function TaskOutputSummary({ task }: { task: Task }) {
+function taskOutputFileAnchorId(taskId: string, identity: string, index: number) {
+  const value = identity || `index-${index}`;
+  return `task-output-file-${taskId}-${value}`.replace(/[^A-Za-z0-9_-]/g, "-");
+}
+
+function TaskOutputSummary({ task, returnTo }: { task: Task; returnTo?: string }) {
   const output = (task.actual_output || null) as Record<string, any> | null;
   const details = (task.details || {}) as Record<string, any>;
   const batchId = typeof details.workspace_work_batch_id === "string" ? details.workspace_work_batch_id : "";
@@ -1131,11 +1142,14 @@ function TaskOutputSummary({ task }: { task: Task }) {
           {files.slice(0, 4).map((file: any, i: number) => {
             const reference = generatedFileOpenReference(file);
             const label = generatedFileLabel(file, `File ${i + 1}`);
+            const identity = generatedFileIdentity(file) || `index-${i}`;
             return reference ? (
               <InlineFileReferenceCard
-                key={generatedFileIdentity(file) || i}
+                key={identity}
                 reference={String(reference)}
                 label={String(label)}
+                returnTo={returnTo}
+                sourceAnchorId={taskOutputFileAnchorId(task.id, identity, i)}
                 fileType={file.file_type || file.fileType}
                 mimeType={file.mime_type || file.mimeType}
                 compact
@@ -1214,8 +1228,8 @@ function calendarVisibleRangeForMonth(month: Date): { start: string; end: string
   const start = new Date(year, mo, 1 - startDow);
   const last = new Date(year, mo + 1, 0);
   const endDow = last.getDay() === 0 ? 6 : last.getDay() - 1;
-  const end = new Date(year, mo + 1, 6 - endDow);
-  return { start: localDateKey(start), end: localDateKey(end) };
+  const endExclusive = new Date(year, mo + 1, 7 - endDow);
+  return { start: localDateKey(start), end: localDateKey(endExclusive) };
 }
 
 function bookingLocationLabel(booking: BookingRecord): string | null {
@@ -1324,9 +1338,10 @@ function CalendarOpsRail({
 
 
 /* ── Inline Task Detail Panel (matches standalone TaskDetail page) ── */
-function InlineTaskDetail({ task: initialTask, agents, statusTransitions, onClose, onOpenFull, onUpdate, onDelete }: {
+function InlineTaskDetail({ task: initialTask, agents, statusTransitions, returnTo, onClose, onOpenFull, onUpdate, onDelete }: {
   task: Task; agents: any[];
   statusTransitions?: Record<string, string[]>;
+  returnTo: string;
   onClose: () => void; onOpenFull: () => void;
   onUpdate: (data: Partial<Task>) => void;
   onDelete: () => void;
@@ -1348,6 +1363,11 @@ function InlineTaskDetail({ task: initialTask, agents, statusTransitions, onClos
     queryKey: ["entity-staff-for-assignee"],
     queryFn: () => api.staff.list(),
   });
+  const { data: workspaceAssignableAgents } = useQuery({
+    queryKey: ["workspace-assignable-agents", initialTask.workspace_id],
+    queryFn: () => api.workspaces.agents.assignable(initialTask.workspace_id!),
+    enabled: !!initialTask.workspace_id,
+  });
 
   // Subscribe to the same task cache key the rest of the app uses so
   // mutations + WebSocket task_update events flow into this drawer
@@ -1359,11 +1379,57 @@ function InlineTaskDetail({ task: initialTask, agents, statusTransitions, onClos
     initialData: initialTask,
   });
   const task: Task = (liveTask as Task) || initialTask;
+  const workspaceAgentIds = task.workspace_id
+    ? workspaceAssignableAgents?.agent_ids || []
+    : undefined;
 
   const { data: logs = [] } = useQuery({
     queryKey: ["task-logs", task.id],
     queryFn: () => api.tasks.logs(task.id),
   });
+  const { data: taskPlans = [], isSuccess: taskPlansResolved } = useQuery({
+    queryKey: ["task-plans", task.id],
+    queryFn: () => api.plans.list({ task_id: task.id, limit: 5 }),
+  });
+  const latestPlan = taskPlans[0] || null;
+  const { data: planSteps = [], isSuccess: planStepsResolved } = useQuery({
+    queryKey: ["plan-steps", latestPlan?.id],
+    queryFn: () => api.plans.steps(latestPlan!.id),
+    enabled: !!latestPlan?.id,
+  });
+  const pendingPlanInputStep = resumablePlanInputStep(latestPlan, planSteps);
+  const canRespondToInput = Boolean(pendingPlanInputStep)
+    || canResumeLegacyAgentInput(task, latestPlan, taskPlansResolved);
+  const RECOVERY_EVENT_TYPES = new Set([
+    "ai_hitl_requested",
+    "step_needs_human",
+    "ai_execution_failed",
+    "ai_needs_replan",
+  ]);
+  const hasTaskRecoveryOrigin = Boolean(latestPlan)
+    || canRespondToInput
+    || (logs as any[]).some((log: any) => RECOVERY_EVENT_TYPES.has(log?.log_type));
+  const hasPendingTypedDecision = hasPendingPlanDecision(
+    planSteps,
+    pendingPlanInputStep?.id,
+  );
+  const planDecisionStateResolved = taskPlansResolved
+    && (!latestPlan || planStepsResolved);
+
+  useEffect(() => {
+    if (typeof window === "undefined" || !window.location.hash) return;
+    let anchorId = window.location.hash.slice(1);
+    try {
+      anchorId = decodeURIComponent(anchorId);
+    } catch {
+      // Keep the raw hash when it is not valid percent-encoded text.
+    }
+    if (!anchorId.startsWith("task-")) return;
+    const frame = window.requestAnimationFrame(() => {
+      document.getElementById(anchorId)?.scrollIntoView({ block: "center", inline: "nearest" });
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [task.id, logs.length]);
 
   const updateMut = useMutation({
     mutationFn: (data: Partial<Task>) => api.tasks.update(task.id, data),
@@ -1385,6 +1451,10 @@ function InlineTaskDetail({ task: initialTask, agents, statusTransitions, onClos
       queryClient.invalidateQueries({ queryKey: ["tasks"] });
       queryClient.invalidateQueries({ queryKey: ["task", task.id] });
       queryClient.invalidateQueries({ queryKey: ["task-logs", task.id] });
+      queryClient.invalidateQueries({ queryKey: ["task-plans", task.id] });
+      if (result.plan_id) {
+        queryClient.invalidateQueries({ queryKey: ["plan-steps", result.plan_id] });
+      }
       toast.success(
         result.dispatched ? t("page.tasks.retry_started") : t("page.tasks.retry_queued"),
         `${t("page.tasks.mode")}: ${result.mode}`,
@@ -1394,13 +1464,17 @@ function InlineTaskDetail({ task: initialTask, agents, statusTransitions, onClos
   });
 
   const hitlMut = useMutation({
-    mutationFn: ({ response, fields }: { response: string; fields?: Record<string, string> }) => api.tasks.respondHITL(task.id, { response, fields }),
+    mutationFn: ({ stepId, response, fields }: { stepId?: string; response: string; fields?: Record<string, string> }) => api.tasks.respondHITL(task.id, { step_id: stepId, response, fields }),
     onSuccess: (result) => {
       queryClient.setQueryData(["task", task.id], result.task);
       queryClient.invalidateQueries({ queryKey: ["taskBoard"] });
       queryClient.invalidateQueries({ queryKey: ["tasks"] });
       queryClient.invalidateQueries({ queryKey: ["task", task.id] });
       queryClient.invalidateQueries({ queryKey: ["task-logs", task.id] });
+      queryClient.invalidateQueries({ queryKey: ["task-plans", task.id] });
+      if (result.plan_id) {
+        queryClient.invalidateQueries({ queryKey: ["plan-steps", result.plan_id] });
+      }
       window.dispatchEvent(new CustomEvent("manor:workspace-actions-refresh", { detail: { workspaceId: result.task.workspace_id } }));
       setComment("");
       toast.success(
@@ -1502,6 +1576,8 @@ function InlineTaskDetail({ task: initialTask, agents, statusTransitions, onClos
         <TaskPropertiesPanel
           task={task}
           agents={(agents || []) as any[]}
+          workspaceAgentIds={workspaceAgentIds}
+          workspaceAgentSubscriptions={workspaceAssignableAgents?.subscriptions || []}
           users={(usersList as any[]) || []}
           staff={(staffList as any[]) || []}
           currentUser={currentUser as any}
@@ -1526,27 +1602,44 @@ function InlineTaskDetail({ task: initialTask, agents, statusTransitions, onClos
           {showMore ? t("page.tasks.hide_details") : t("page.tasks.more_details")}
         </button>
 
-        <TaskRecoveryPanel
-          key={`${task.id}:${task.status}`}
-          status={task.status}
-          logs={logs}
-          comment={comment}
-          isPending={retryMut.isPending || hitlMut.isPending}
-          variant="compact"
-          onRetry={(note) => retryMut.mutate(note)}
-          onRespond={(response, fields) => hitlMut.mutate({ response, fields })}
-        />
+        {planDecisionStateResolved && hasTaskRecoveryOrigin && (
+          task.status !== "waiting_on_customer"
+          || !hasPendingTypedDecision
+          || canRespondToInput
+        ) && (
+          <TaskRecoveryPanel
+            key={`${task.id}:${task.status}`}
+            status={task.status}
+            logs={logs}
+            comment={comment}
+            inputStepId={pendingPlanInputStep?.id}
+            inputPrompt={String(pendingPlanInputStep?.human_input_prompt || "")}
+            isPending={retryMut.isPending || hitlMut.isPending}
+            variant="compact"
+            onRetry={(note) => retryMut.mutate(note)}
+            onRespond={canRespondToInput
+              ? (response, fields) => hitlMut.mutate({
+                  stepId: pendingPlanInputStep?.id,
+                  response,
+                  fields,
+                })
+              : undefined}
+          />
+        )}
 
         <TaskDependencySummary task={task} />
 
-        <TaskOutputSummary task={task} />
+        <TaskOutputSummary task={task} returnTo={returnTo} />
 
         {/* Description */}
         {task.description && (
-          <div>
+          <div id={`task-description-${task.id}`}>
             <span style={{ fontSize: 11, fontWeight: 700, color: "#57534e", textTransform: "uppercase", letterSpacing: "0.04em" }}>{t("page.task_collections.description")}</span>
             <div style={{ fontSize: 13, color: "#44403c", margin: "4px 0 0", lineHeight: 1.6 }}>
-              <ChatMarkdown content={formatTaskDescriptionForDisplay(task.description)} />
+              <ChatMarkdown
+                content={formatTaskDescriptionForDisplay(task.description)}
+                returnTo={`${returnTo.split("#")[0]}#task-description-${task.id}`}
+              />
             </div>
           </div>
         )}
@@ -1671,6 +1764,7 @@ function InlineTaskDetail({ task: initialTask, agents, statusTransitions, onClos
               variant="compact"
               formatTime={formatDateLong}
               task={task}
+              returnTo={returnTo}
               users={(usersList as any[]) || []}
               agents={(agents as any[]) || []}
               staff={(staffList as any[]) || []}
@@ -2226,9 +2320,9 @@ function TaskListView({
 /* ── main component ─────────────────────────────────────── */
 
 export default function Tasks() {
-  const { id: taskId } = useParams<{ id: string }>();
   const navigate = useNavigate();
   const [searchParams, setSearchParams] = useSearchParams();
+  const drawerTaskId = searchParams.get("task") || "";
   const queryClient = useQueryClient();
   const toast = useToastStore();
   const currentUser = useAuthStore((s) => s.user);
@@ -2356,9 +2450,11 @@ export default function Tasks() {
   const [formWorkspace, setFormWorkspace] = useState<string | null>(null);
   const [formAssigneeTab, setFormAssigneeTab] = useState<"self" | "ai" | "agent" | "staff">("self");
   const [formSelectedAgentId, setFormSelectedAgentId] = useState("");
+  const [formSelectedAgentSubscriptionId, setFormSelectedAgentSubscriptionId] = useState("");
   const [formSelectedStaffUserId, setFormSelectedStaffUserId] = useState("");
   const [formRuntimeRequirement, setFormRuntimeRequirement] = useState("");
   const [formRequiredRefs, setFormRequiredRefs] = useState("");
+  const [formTaskType, setFormTaskType] = useState<TaskType>(TaskType.GENERAL);
 
   /* ── queries ──────────────────────────────────────── */
 
@@ -2423,7 +2519,6 @@ export default function Tasks() {
     setSearchParams(next, { replace: true });
   }, [searchParams, setSearchParams]);
 
-  const tasksPath = wsFilter ? `/tasks?workspaceId=${encodeURIComponent(wsFilter)}` : "/tasks";
   const displayedBoardColumns = useMemo(
     () => boardColumnOrder.filter((key) => visibleBoardColumns.has(key)),
     [boardColumnOrder, visibleBoardColumns],
@@ -2511,14 +2606,22 @@ export default function Tasks() {
   }, [workspaces]);
 
   const { data: taskDetail } = useQuery({
-    queryKey: ["task", taskId],
-    queryFn: () => api.tasks.get(taskId!),
-    enabled: !!taskId,
+    queryKey: ["task", drawerTaskId],
+    queryFn: () => api.tasks.get(drawerTaskId),
+    enabled: !!drawerTaskId,
   });
 
   const { data: agentsList } = useQuery({
     queryKey: ["agents-list"],
     queryFn: () => api.agents.list(),
+  });
+  const {
+    data: formWorkspaceAssignableAgents,
+    isLoading: formWorkspaceAssignableAgentsLoading,
+  } = useQuery({
+    queryKey: ["workspace-assignable-agents", formWorkspace],
+    queryFn: () => api.workspaces.agents.assignable(formWorkspace!),
+    enabled: showCreateModal && formStep === 3 && formAssigneeTab === "agent" && !!formWorkspace,
   });
   const { data: entityUsersForCreate = [], isLoading: entityUsersLoading } = useQuery({
     queryKey: ["entity-users-for-create-task-assignee", "directory"],
@@ -2628,9 +2731,63 @@ export default function Tasks() {
   }, [workspaceStaff, assigneeLookupMaps]);
 
   const staffAssigneeOptions: StaffAssigneeOption[] = formWorkspace ? workspacePeopleOptions : entityPeopleOptions;
+  const interactiveAssigneeOptions: StaffAssigneeOption[] = [];
+  const interactiveAssigneeIds = new Set<string>();
+  if (currentUser?.id) {
+    interactiveAssigneeIds.add(currentUser.id);
+    interactiveAssigneeOptions.push({
+      id: currentUser.id,
+      name: currentUser.display_name || currentUser.email || t("page.tasks.myself"),
+      meta: t("page.tasks.myself"),
+      avatarUrl: currentUser.avatar_url,
+    });
+  }
+  for (const option of staffAssigneeOptions) {
+    if (interactiveAssigneeIds.has(option.id)) continue;
+    interactiveAssigneeIds.add(option.id);
+    interactiveAssigneeOptions.push(option);
+  }
   const staffAssigneeLoading = formWorkspace
     ? (workspaceStaffLoading || entityStaffLoading || entityUsersLoading)
     : (entityStaffLoading || entityUsersLoading);
+  const formAssignableAgents = useMemo(
+    () => filterWorkspaceScopedAgents(
+      (agentsList || []) as any[],
+      formWorkspace,
+      formWorkspaceAssignableAgents?.agent_ids,
+    ),
+    [agentsList, formWorkspace, formWorkspaceAssignableAgents?.agent_ids],
+  );
+  const formAssignableHostOptions = useMemo(() => {
+    const agentsById = new Map(
+      formAssignableAgents.map((agent: any) => [agent.id, agent]),
+    );
+    const subscriptions = formWorkspaceAssignableAgents?.subscriptions || [];
+    if (formTaskType === TaskType.INTERACTIVE && subscriptions.length > 0) {
+      return subscriptions.flatMap((subscription) => {
+        const agent: any = agentsById.get(subscription.agent_id);
+        if (!agent) return [];
+        return [{
+          key: subscription.id,
+          agent,
+          subscriptionId: subscription.id,
+          roleLabel: subscription.role_label
+            ? formatUserFacingLabel(subscription.role_label)
+            : "",
+        }];
+      });
+    }
+    return formAssignableAgents.map((agent: any) => ({
+      key: agent.id,
+      agent,
+      subscriptionId: "",
+      roleLabel: "",
+    }));
+  }, [
+    formAssignableAgents,
+    formTaskType,
+    formWorkspaceAssignableAgents?.subscriptions,
+  ]);
 
   /* ── mutations ────────────────────────────────────── */
 
@@ -2670,7 +2827,9 @@ export default function Tasks() {
       queryClient.invalidateQueries({ queryKey: ["tasks"] });
       queryClient.invalidateQueries({ queryKey: ["taskBoard"] });
       setSelectedTask(null);
-      navigate(tasksPath);
+      const next = new URLSearchParams(searchParams);
+      next.delete("task");
+      setSearchParams(next, { replace: true });
       toast.success(t("page.tasks.task_deleted"));
     },
   });
@@ -2695,9 +2854,11 @@ export default function Tasks() {
     setFormWorkspace(null);
     setFormAssigneeTab("self");
     setFormSelectedAgentId("");
+    setFormSelectedAgentSubscriptionId("");
     setFormSelectedStaffUserId("");
     setFormRuntimeRequirement("");
     setFormRequiredRefs("");
+    setFormTaskType(TaskType.GENERAL);
   };
 
   const openCreateModal = (deadline?: string, draft?: Partial<SelectedTextTaskDraft>) => {
@@ -2749,7 +2910,12 @@ export default function Tasks() {
 
   useEffect(() => {
     setFormSelectedStaffUserId("");
-  }, [formWorkspace, formAssigneeTab]);
+  }, [formWorkspace]);
+
+  useEffect(() => {
+    setFormSelectedAgentId("");
+    setFormSelectedAgentSubscriptionId("");
+  }, [formWorkspace]);
 
   const buildRuntimeContextFromForm = () => {
     const requirement = formRuntimeRequirement.trim();
@@ -2789,9 +2955,25 @@ export default function Tasks() {
       deadline: formDeadline || undefined,
       workspace_id: formWorkspace || undefined,
       category_id: formCategory || undefined,
+      task_type: formTaskType,
     };
-    // Assignee from step 3
-    if (formAssigneeTab === "ai") {
+    // Interactive Tasks have two distinct roles: one Agent Host for the
+    // conversation and an optional human assignee accountable for the Task.
+    if (formTaskType === TaskType.INTERACTIVE) {
+      if (formAssigneeTab === "ai") {
+        payload.agent_id = MANOR_AGENT_ID;
+        payload.agent_type = MANOR_AGENT_TYPE;
+      } else if (formAssigneeTab === "agent" && formSelectedAgentId) {
+        payload.agent_id = formSelectedAgentId;
+        payload.agent_type = "agent";
+        if (formSelectedAgentSubscriptionId) {
+          payload.owner_subscription_id = formSelectedAgentSubscriptionId;
+        }
+      }
+      if (formSelectedStaffUserId) {
+        payload.assignee_id = formSelectedStaffUserId;
+      }
+    } else if (formAssigneeTab === "ai") {
       payload.agent_id = MANOR_AGENT_ID;
       payload.agent_type = MANOR_AGENT_TYPE;
     } else if (formAssigneeTab === "agent" && formSelectedAgentId) {
@@ -2812,7 +2994,18 @@ export default function Tasks() {
 
   const taskCreateDisabled = !formTitle.trim()
     || createMutation.isPending
-    || (formAssigneeTab === "staff" && !formSelectedStaffUserId);
+    || (formAssigneeTab === "staff" && !formSelectedStaffUserId)
+    || (
+      formTaskType === TaskType.INTERACTIVE
+      && (
+        !formWorkspace
+        || !["ai", "agent"].includes(formAssigneeTab)
+        || (
+          formAssigneeTab === "agent"
+          && (!formSelectedAgentId || !formSelectedAgentSubscriptionId)
+        )
+      )
+    );
 
   const setTaskBoardMode = useCallback((mode: "kanban" | "list") => {
     setBoardMode(mode);
@@ -2862,7 +3055,17 @@ export default function Tasks() {
 
   const handleCardClick = useCallback((task: Task) => {
     setSelectedTask(task);
-  }, []);
+    const next = new URLSearchParams(searchParams);
+    next.set("task", task.id);
+    setSearchParams(next);
+  }, [searchParams, setSearchParams]);
+
+  const closeTaskDrawer = useCallback(() => {
+    setSelectedTask(null);
+    const next = new URLSearchParams(searchParams);
+    next.delete("task");
+    setSearchParams(next, { replace: true });
+  }, [searchParams, setSearchParams]);
 
   const handleExportCsv = async () => {
     try {
@@ -2888,7 +3091,14 @@ export default function Tasks() {
   /* ── derived data ─────────────────────────────────── */
 
   const allTasks: Task[] = taskList?.items ?? [];
-  const activeDetail = taskDetail ?? selectedTask;
+  const selectedTaskForDrawer = selectedTask?.id === drawerTaskId ? selectedTask : null;
+  const activeDetail = drawerTaskId ? (taskDetail ?? selectedTaskForDrawer) : null;
+  const taskDrawerReturnTo = useMemo(() => {
+    const next = new URLSearchParams(searchParams);
+    if (activeDetail?.id) next.set("task", activeDetail.id);
+    const query = next.toString();
+    return `/tasks${query ? `?${query}` : ""}`;
+  }, [activeDetail?.id, searchParams]);
   const agentById = useMemo(() => {
     const map = new Map<string, any>();
     for (const agent of (agentsList || []) as any[]) {
@@ -3013,12 +3223,32 @@ export default function Tasks() {
     enabled: view === "calendar",
     staleTime: 60_000,
   });
+  const externalCalendarSettingsKey = calendarSettingsData
+    ? [
+        calendarSettingsData.settings.provider || "",
+        calendarSettingsData.settings.connection_id || "",
+        ...(calendarSettingsData.settings.visible_calendar_ids || []),
+      ].join("|")
+    : null;
   const calendarVisibleRange = useMemo(() => calendarVisibleRangeForMonth(calendarMonth), [calendarMonth]);
-  const { data: externalCalendarData } = useQuery({
-    queryKey: ["calendar-settings-events", calendarVisibleRange.start, calendarVisibleRange.end],
+  const {
+    data: externalCalendarData,
+    isError: externalCalendarSyncFailed,
+    isFetching: externalCalendarSyncing,
+    refetch: refetchExternalCalendar,
+  } = useQuery({
+    queryKey: [
+      "calendar-settings-events",
+      externalCalendarSettingsKey,
+      calendarVisibleRange.start,
+      calendarVisibleRange.end,
+    ],
     queryFn: () => api.calendarSettings.events(calendarVisibleRange.start, calendarVisibleRange.end),
-    enabled: view === "calendar",
-    staleTime: 120_000,
+    enabled: view === "calendar" && externalCalendarSettingsKey !== null,
+    staleTime: EXTERNAL_CALENDAR_REFRESH_INTERVAL_MS,
+    refetchInterval: EXTERNAL_CALENDAR_REFRESH_INTERVAL_MS,
+    refetchIntervalInBackground: false,
+    refetchOnWindowFocus: true,
   });
   const taskCalendarEvents = useMemo(
     () =>
@@ -3076,7 +3306,7 @@ export default function Tasks() {
         status: event.status ?? undefined,
         scheduled_at: event.starts_at,
         duration_minutes: eventDurationMinutes(event),
-        timezone: event.timezone || externalCalendarData?.timezone,
+        timezone: externalCalendarData?.timezone || event.timezone || undefined,
         location_label: event.location,
         calendar_event_url: event.calendar_event_url,
         meeting_url: event.meeting_url,
@@ -3460,6 +3690,41 @@ export default function Tasks() {
                 onOpenTask={(id) => navigate(`/tasks/${id}`)}
                 onManageBookingLinks={() => navigate("/settings?tab=calendar")}
               />
+              {externalCalendarSyncFailed && (
+                <div
+                  role="alert"
+                  style={{
+                    display: "flex",
+                    alignItems: "center",
+                    justifyContent: "space-between",
+                    flexWrap: "wrap",
+                    gap: 10,
+                    marginBottom: 12,
+                    padding: "10px 12px",
+                    borderRadius: "var(--radius-control)",
+                    background: "var(--surface-muted)",
+                    color: "var(--text-muted)",
+                    fontSize: 12,
+                  }}
+                >
+                  <div style={{ display: "flex", alignItems: "center", flexWrap: "wrap", gap: 8 }}>
+                    <StatusPill status="failed" label="Calendar sync unavailable" size="sm" />
+                    <span>
+                      {externalCalendarData
+                        ? "Showing the last successfully synced external events."
+                        : "External calendar events could not be loaded."}
+                    </span>
+                  </div>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    disabled={externalCalendarSyncing}
+                    onClick={() => void refetchExternalCalendar()}
+                  >
+                    {externalCalendarSyncing ? "Retrying..." : "Retry"}
+                  </Button>
+                </div>
+              )}
               <Calendar
                 month={calendarMonth}
                 events={calendarEvents}
@@ -3487,7 +3752,8 @@ export default function Tasks() {
           task={activeDetail}
           agents={agentsList || []}
           statusTransitions={taskConstants?.status_transitions}
-          onClose={() => { setSelectedTask(null); navigate(tasksPath); }}
+          returnTo={taskDrawerReturnTo}
+          onClose={closeTaskDrawer}
           onOpenFull={() => navigate(`/tasks/${activeDetail.id}`)}
           onUpdate={(data) => statusMutation.mutate({ id: activeDetail.id, status: data.status || activeDetail.status })}
           onDelete={() => deleteMutation.mutate(activeDetail.id)}
@@ -3625,6 +3891,64 @@ export default function Tasks() {
             <Input label={t("page.tasks.title")} value={formTitle} onChange={(e) => setFormTitle(e.target.value)} placeholder={t("page.tasks.task_title")} />
             <Textarea label={t("page.task_collections.description")} value={formDesc} onChange={(e) => setFormDesc(e.target.value)} rows={3} placeholder={t("page.task_collections.optional_description")} />
             <div>
+              <label className="manor-label">{t("page.tasks.task_mode")}</label>
+              <div style={{ display: "grid", gridTemplateColumns: "repeat(2, minmax(0, 1fr))", gap: 8 }}>
+                {([
+                  {
+                    value: TaskType.GENERAL,
+                    title: t("page.tasks.deliverable_task"),
+                    description: t("page.tasks.deliverable_task_description"),
+                  },
+                  {
+                    value: TaskType.INTERACTIVE,
+                    title: t("page.tasks.interactive_session"),
+                    description: formWorkspace
+                      ? t("page.tasks.interactive_session_description")
+                      : t("page.tasks.interactive_session_workspace_required"),
+                  },
+                ] as const).map((option) => {
+                  const selected = formTaskType === option.value;
+                  const disabled = option.value === TaskType.INTERACTIVE && !formWorkspace;
+                  return (
+                    <button
+                      key={option.value}
+                      type="button"
+                      disabled={disabled}
+                      onClick={() => {
+                        if (
+                          option.value === TaskType.INTERACTIVE
+                          && formTaskType !== TaskType.INTERACTIVE
+                        ) {
+                          setFormSelectedAgentId("");
+                          setFormSelectedAgentSubscriptionId("");
+                        }
+                        setFormTaskType(option.value);
+                        if (option.value === TaskType.INTERACTIVE && !["ai", "agent"].includes(formAssigneeTab)) {
+                          setFormAssigneeTab("agent");
+                        }
+                      }}
+                      style={{
+                        padding: 12,
+                        borderRadius: 12,
+                        border: selected ? "2px solid #4f7d75" : "1px solid #e7e5e4",
+                        background: selected ? "rgba(79,125,117,0.04)" : "#fff",
+                        textAlign: "left",
+                        cursor: disabled ? "not-allowed" : "pointer",
+                        opacity: disabled ? 0.55 : 1,
+                      }}
+                    >
+                      <span style={{ display: "block", fontSize: 13, fontWeight: 650, color: selected ? "#315f57" : "#292524" }}>
+                        {option.title}
+                      </span>
+                      <span style={{ display: "block", marginTop: 3, fontSize: 11, lineHeight: 1.45, color: "#a8a29e" }}>
+                        {option.description}
+                      </span>
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+            <div>
               <label className="manor-label">{t("page.tasks.deadline")}</label>
               <DateTimePicker value={formDeadline} onChange={setFormDeadline} placeholder={t("page.tasks.no_deadline")} />
             </div>
@@ -3686,7 +4010,11 @@ export default function Tasks() {
                 { key: "ai" as const, label: t("page.chat_history.manor_ai") },
                 { key: "agent" as const, label: t("page.workspace_detail.agent") },
                 { key: "staff" as const, label: t("page.workspace_detail.staff") },
-              ]).map((tab) => {
+              ]).filter((tab) => (
+                formTaskType !== TaskType.INTERACTIVE
+                || tab.key === "ai"
+                || tab.key === "agent"
+              )).map((tab) => {
                 const isActive = formAssigneeTab === tab.key;
                 return (
                   <button
@@ -3733,33 +4061,71 @@ export default function Tasks() {
               </div>
             )}
 
-            {formAssigneeTab === "agent" && (
+                {formAssigneeTab === "agent" && (
+                  <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+                    <p style={{ fontSize: 12, color: "#a8a29e", margin: 0 }}>{t("page.tasks.select_an_agent_to_assign_this_task_to")}</p>
+                    {formWorkspace && formWorkspaceAssignableAgentsLoading ? (
+                      <div role="status" style={{ padding: 16, borderRadius: 12, border: "1px solid rgba(28,25,23,0.06)", background: "#fafaf9", textAlign: "center", fontSize: 13, color: "#a8a29e" }}>
+                        {t("page.tasks.workspace_agents_loading")}
+                      </div>
+                    ) : (
+                      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(min(100%, 240px), 1fr))", gap: 8 }}>
+                        {formAssignableHostOptions.map((option) => {
+                          const { agent } = option;
+                          const isActive = option.subscriptionId
+                            ? formSelectedAgentSubscriptionId === option.subscriptionId
+                            : formSelectedAgentId === agent.id;
+                          const description = [
+                            option.roleLabel,
+                            getAgentDescription(agent),
+                          ].filter(Boolean).join(" · ");
+                          return (
+                            <button
+                              key={option.key}
+                              type="button"
+                              onClick={() => {
+                                setFormSelectedAgentId(agent.id);
+                                setFormSelectedAgentSubscriptionId(option.subscriptionId);
+                              }}
+                              style={{
+                                display: "flex", alignItems: "center", gap: 10, padding: 12, borderRadius: 12,
+                                border: isActive ? "2px solid #4f7d75" : "1px solid #e7e5e4",
+                                background: isActive ? "rgba(79,125,117,0.04)" : "#ffffff",
+                                cursor: "pointer", textAlign: "left" as const, transition: "all 0.2s",
+                              }}>
+                              <div style={{ width: 32, height: 32, borderRadius: "50%", background: "linear-gradient(135deg, #dceae3, #c4dfd2)", display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>
+                                <IconAgent size={16} style={{ color: "#437f6b" }} />
+                              </div>
+                              <div style={{ minWidth: 0 }}>
+                                <p style={{ fontSize: 13, fontWeight: 600, color: "#292524", margin: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{agent.name}</p>
+                                {description && <p style={{ fontSize: 11, color: "#a8a29e", margin: "2px 0 0", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{description}</p>}
+                              </div>
+                            </button>
+                          );
+                        })}
+                        {formAssignableHostOptions.length === 0 && <p style={{ fontSize: 12, color: "#a8a29e", margin: 0, gridColumn: "1/-1", textAlign: "center", padding: 12 }}>{t("page.tasks.no_agents_available")}</p>}
+                      </div>
+                    )}
+                  </div>
+                )}
+
+            {formTaskType === TaskType.INTERACTIVE && (
               <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-                <p style={{ fontSize: 12, color: "#a8a29e", margin: 0 }}>{t("page.tasks.select_an_agent_to_assign_this_task_to")}</p>
-                <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(min(100%, 240px), 1fr))", gap: 8 }}>
-                  {(agentsList || []).map((agent: any) => {
-                    const isActive = formSelectedAgentId === agent.id;
-                    const description = getAgentDescription(agent);
-                    return (
-                      <button key={agent.id} onClick={() => setFormSelectedAgentId(agent.id)}
-                        style={{
-                          display: "flex", alignItems: "center", gap: 10, padding: 12, borderRadius: 12,
-                          border: isActive ? "2px solid #4f7d75" : "1px solid #e7e5e4",
-                          background: isActive ? "rgba(79,125,117,0.04)" : "#ffffff",
-                          cursor: "pointer", textAlign: "left" as const, transition: "all 0.2s",
-                        }}>
-                        <div style={{ width: 32, height: 32, borderRadius: "50%", background: "linear-gradient(135deg, #dceae3, #c4dfd2)", display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>
-                          <IconAgent size={16} style={{ color: "#437f6b" }} />
-                        </div>
-                        <div style={{ minWidth: 0 }}>
-                          <p style={{ fontSize: 13, fontWeight: 600, color: "#292524", margin: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{agent.name}</p>
-                          {description && <p style={{ fontSize: 11, color: "#a8a29e", margin: "2px 0 0", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{description}</p>}
-                        </div>
-                      </button>
-                    );
-                  })}
-                  {(agentsList || []).length === 0 && <p style={{ fontSize: 12, color: "#a8a29e", margin: 0, gridColumn: "1/-1", textAlign: "center", padding: 12 }}>{t("page.tasks.no_agents_available")}</p>}
-                </div>
+                <label className="manor-label">
+                  {t("component.embedded_chat.assignee")} · {t("page.task_detail.runtime.optional")}
+                </label>
+                <Select
+                  value={formSelectedStaffUserId}
+                  onChange={setFormSelectedStaffUserId}
+                  options={[
+                    { value: "", label: t("component.task_properties_panel.unassigned") },
+                    ...interactiveAssigneeOptions.filter((option) => !option.disabled).map((option) => ({
+                      value: option.id,
+                      label: option.meta ? `${option.name} · ${option.meta}` : option.name,
+                    })),
+                  ]}
+                  placeholder={t("component.task_properties_panel.unassigned")}
+                />
               </div>
             )}
 

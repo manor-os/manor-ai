@@ -105,6 +105,8 @@ await build({
               currentUserId: "U1",
               onResolve: () => {},
               onFeedback: () => {},
+              onMessageFeedback: () => {},
+              onArtifactOpen: () => {},
               ...props,
             }),
           ),
@@ -120,7 +122,7 @@ await build({
   outfile: bundlePath.pathname,
   logLevel: "silent",
   define: BUILD_DEFINE,
-  loader: { ".css": "empty", ".png": "empty", ".svg": "text" },
+  loader: { ".css": "empty", ".png": "empty", ".webp": "empty", ".svg": "text" },
 });
 
 const { renderRow } = await import(bundlePath.href);
@@ -195,7 +197,7 @@ await build({
   outfile: stubBundlePath.pathname,
   logLevel: "silent",
   define: BUILD_DEFINE,
-  loader: { ".css": "empty", ".png": "empty", ".svg": "text" },
+  loader: { ".css": "empty", ".png": "empty", ".webp": "empty", ".svg": "text" },
   plugins: [cardStubPlugin],
 });
 
@@ -293,8 +295,38 @@ test("each card resolves its own id when a message carries several", () => {
   assert.deepEqual(seen, [["BBB", "approve"], ["AAA", "reject"]]);
 });
 
-test("a card is not clickable while a turn is streaming", () => {
+test("a tool-call HITL stays blocked while its chat turn is streaming", () => {
   const [card] = cardPropsFor(emailMessage(), { streaming: true });
+  assert.equal(card.disabled, true);
+});
+
+function proposalMessage() {
+  return emailMessage({
+    hitl_requests: null,
+    message_kind: "proposal",
+    body: "Prepare the diagnostic assessment.",
+    pending_action: {
+      kind: "approve_proposals",
+      task_ids: ["TASK-1"],
+      task_titles: ["Diagnostic assessment"],
+    },
+  });
+}
+
+test("independent proposal approval stays available during a chat reply", () => {
+  const seen = [];
+  const [card] = cardPropsFor(proposalMessage(), {
+    streaming: true,
+    onResolve: (...args) => seen.push(args),
+  });
+  assert.equal(Boolean(card.disabled), false);
+  card.onResolve("approve");
+  assert.equal(seen[0][0], "M1");
+  assert.equal(seen[0][1], "approve");
+});
+
+test("paused workspaces still disable independent proposal approval", () => {
+  const [card] = cardPropsFor(proposalMessage(), { workspacePaused: true });
   assert.equal(card.disabled, true);
 });
 
@@ -356,4 +388,95 @@ test("the pending_action channel still renders — the fix adds, never replaces"
     }),
   );
   assert.deepEqual(buttonLabels(html), ["Approve", "Always", "Reject"]);
+});
+
+test("structured workspace messages keep timestamp, copy, and rating actions", () => {
+  const html = renderRow({
+    ...emailMessage({ hitl_requests: null }),
+    body: null,
+    message_kind: "text",
+    assistant_blocks: [
+      {
+        id: "structured-final",
+        type: "text",
+        phase: "final",
+        text: "Rendered from the structured assistant block.",
+      },
+    ],
+  });
+
+  assert.match(html, /Rendered from the structured assistant block/);
+  assert.match(html, /chat-timestamp-button/);
+  assert.match(html, /aria-label="Good response"/);
+  assert.match(html, /aria-label="Needs improvement"/);
+  assert.match(html, /aria-label="Copy response"/);
+});
+
+test("attachment-only workspace requests keep their timestamp without inventing copy text", () => {
+  const html = renderRow({
+    ...emailMessage({ hitl_requests: null }),
+    body: null,
+    author_kind: "user",
+    author_user_id: "U1",
+    message_kind: "text",
+    assistant_blocks: null,
+    attachments: [
+      {
+        kind: "knowledge_document",
+        name: "brief.md",
+        document_id: "DOC1",
+      },
+    ],
+  });
+
+  assert.match(html, /brief\.md/);
+  assert.match(html, /chat-timestamp-button/);
+  assert.doesNotMatch(html, /aria-label="Copy request"/);
+});
+
+function taskReferenceMessage(overrides = {}) {
+  return {
+    ...emailMessage({ hitl_requests: null }),
+    body: "Task reference projection",
+    message_kind: "text",
+    refs: [
+      { type: "task", id: "TASK-CURRENT", title: "Current interview" },
+      { type: "task", id: "TASK-RELATED", title: "Related follow-up" },
+    ],
+    ...overrides,
+  };
+}
+
+test("ordinary Workspace Chat renders every linked Task", () => {
+  const html = renderRow(taskReferenceMessage());
+
+  assert.match(html, /href="\/tasks\/TASK-CURRENT"/);
+  assert.match(html, /Current interview/);
+  assert.match(html, /href="\/tasks\/TASK-RELATED"/);
+  assert.match(html, /Related follow up/);
+});
+
+test("Task Session suppresses only the current Task and keeps related Tasks", () => {
+  const html = renderRow(taskReferenceMessage(), {
+    suppressedTaskReferenceId: "TASK-CURRENT",
+  });
+
+  assert.doesNotMatch(html, /href="\/tasks\/TASK-CURRENT"/);
+  assert.doesNotMatch(html, /Current interview/);
+  assert.match(html, /href="\/tasks\/TASK-RELATED"/);
+  assert.match(html, /Related follow up/);
+});
+
+test("Task Session suppresses its current Task completion link", () => {
+  const html = renderRow(
+    taskReferenceMessage({
+      message_kind: "agent_update",
+      meta: { feedback_target_kind: "task_completion" },
+      refs: [{ type: "task", id: "TASK-CURRENT", title: "Current interview" }],
+    }),
+    { suppressedTaskReferenceId: "TASK-CURRENT" },
+  );
+
+  assert.doesNotMatch(html, /task-completion-actions/);
+  assert.doesNotMatch(html, /href="\/tasks\/TASK-CURRENT"/);
 });

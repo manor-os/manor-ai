@@ -1,3 +1,6 @@
+import type { ManualSkillReference } from "./manualSkillRefs";
+import type { ResponseSurfaceSubmissionReceipt } from "./chatStream";
+
 export interface PendingChatRetry {
   message: string;
   conversationId?: string;
@@ -6,8 +9,10 @@ export interface PendingChatRetry {
   localWorkerId?: string;
   workspaceId?: string;
   manualSkillIds?: string[];
+  manualSkillRefs?: ManualSkillReference[];
   chatMode?: string;
   chatModePayload?: Record<string, unknown>;
+  responseSurfaceSubmission?: ResponseSurfaceSubmissionReceipt;
   createdAt: number;
 }
 

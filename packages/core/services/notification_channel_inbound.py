@@ -10,7 +10,8 @@ Recipients are resolved with the same precedence as the HITL fan-out:
 
   1. ``workspace.settings.notification_policy.inbound_notify_user_ids``
      — explicit operator opt-in. Empty list = nobody (suppress).
-  2. Fallback to entity owners + admins.
+  2. The user-owned ``ChannelConfig`` owner.
+  3. Legacy unowned channels fall back to entity owners + admins.
 
 Throttling is per ``(recipient_user_id, conversation_id)``. The first
 inbound message on a fresh conversation pings every recipient; follow-up
@@ -29,14 +30,13 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime, timedelta, timezone
-from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import and_, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from packages.core.database import async_session
 from packages.core.models.notification import Notification
-from packages.core.models.user import User
+from packages.core.models.user import User, UserMembership
 from packages.core.models.workspace import Workspace
 from packages.core.services.notify import notify
 
@@ -55,6 +55,7 @@ async def notify_channel_inbound_recipients(
     *,
     entity_id: str,
     workspace_id: str | None,
+    owner_user_id: str | None = None,
     channel_type: str,
     channel_contact_id: str,
     conversation_id: str,
@@ -71,7 +72,11 @@ async def notify_channel_inbound_recipients(
     Returns the number of recipients that actually received a fresh
     notification (i.e. were past their cooldown window).
     """
-    user_ids = await _resolve_recipients(entity_id=entity_id, workspace_id=workspace_id)
+    user_ids = await _resolve_recipients(
+        entity_id=entity_id,
+        workspace_id=workspace_id,
+        owner_user_id=owner_user_id,
+    )
     if not user_ids:
         return 0
 
@@ -125,14 +130,14 @@ async def notify_channel_inbound_recipients(
 # ── Recipient resolution ────────────────────────────────────────────────────
 
 async def _resolve_recipients(
-    *, entity_id: str, workspace_id: str | None,
+    *, entity_id: str, workspace_id: str | None, owner_user_id: str | None = None,
 ) -> list[str]:
     """Look up who should hear about new inbound messages.
 
-    Mirrors ``notify_workspace_hitl_approvers`` semantics: an explicit
-    empty list at the workspace level opts the workspace out; a missing
-    list falls back to entity owners + admins so we never silently drop
-    a customer touch."""
+    An explicit workspace list opts the workspace into the requested fan-out;
+    an empty list suppresses it. User-owned channels default to their source
+    owner, while unowned legacy channels retain the entity owner/admin fallback.
+    """
     explicit_empty = False
 
     if workspace_id:
@@ -157,6 +162,29 @@ async def _resolve_recipients(
 
     if explicit_empty:
         return []
+
+    if owner_user_id:
+        async with async_session() as db:
+            owner_id = (await db.execute(
+                select(User.id).outerjoin(
+                    UserMembership,
+                    and_(
+                        UserMembership.user_id == User.id,
+                        UserMembership.entity_id == entity_id,
+                        UserMembership.status == "active",
+                        UserMembership.deleted_at.is_(None),
+                    ),
+                ).where(
+                    User.id == owner_user_id,
+                    User.status == "active",
+                    User.deleted_at.is_(None),
+                    or_(
+                        User.entity_id == entity_id,
+                        UserMembership.id.is_not(None),
+                    ),
+                )
+            )).scalar_one_or_none()
+        return [owner_id] if owner_id else []
 
     async with async_session() as db:
         rows = (await db.execute(

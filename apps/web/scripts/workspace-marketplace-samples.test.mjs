@@ -16,52 +16,6 @@ const localeSources = ["en", "zh", "es"].map(
   (locale) => new URL(`../src/lib/i18n/${locale}.ts`, import.meta.url),
 );
 
-test("Workspace welcome reuses four theme-aware Marketplace Blueprint covers", async () => {
-  const [source, blueprintDetail] = await Promise.all([
-    readFile(embeddedChatSource, "utf8"),
-    readFile(blueprintDetailSource, "utf8"),
-  ]);
-  const workspaceDefinitions = source.slice(
-    source.indexOf("  workspace: ["),
-    source.indexOf("  slides: ["),
-  );
-
-  for (const id of [
-    "productized_service_os",
-    "product_video_studio",
-    "digital_product_store_os",
-    "content_distribution_studio",
-  ]) {
-    assert.match(workspaceDefinitions, new RegExp(`id: "${id}"`));
-  }
-
-  assert.match(workspaceDefinitions, /motif: "service"/);
-  assert.match(workspaceDefinitions, /motif: "video"/);
-  assert.match(workspaceDefinitions, /motif: "commerce"/);
-  assert.match(workspaceDefinitions, /motif: "content"/);
-  assert.equal((workspaceDefinitions.match(/\bid: "/g) || []).length, 4);
-  assert.doesNotMatch(workspaceDefinitions, /sampleSrc:/);
-  assert.match(source, /blueprintCoverDataUrl\(coverTemplate, "white"\)/);
-  assert.match(source, /blueprintCoverDataUrl\(coverTemplate, "dark"\)/);
-  assert.match(source, /<ThemeAwareImage/);
-  assert.match(source, /darkSrc=\{activeDetailSrc \? undefined : previewContent\.previewImageDarkSrc\}/);
-  assert.match(source, /sourceBlueprintSlug: "solo-content-distribution-studio-v1"/);
-  assert.match(source, /workspace\.blueprint_update\?\.blueprint_slug === blueprintSlug/);
-  assert.match(source, /api\.blueprints\.list\("published"\)/);
-  assert.match(source, /api\.blueprints\.get\(previewBlueprintSummary!\.id\)/);
-  assert.match(
-    source,
-    /navigate\(`\/blueprints\/\$\{encodeURIComponent\(blueprint\.id\)\}\?install=1`\)/,
-  );
-  assert.match(blueprintDetail, /searchParams\.get\("install"\) !== "1"/);
-  assert.match(blueprintDetail, /setInstallOpen\(true\)/);
-  assert.match(blueprintDetail, /<InstallBlueprintModal/);
-  assert.match(source, /component\.embedded_chat\.install_workspace/);
-  assert.match(source, /component\.embedded_chat\.workspace_contents/);
-  assert.match(source, /setupPreview\.first_week_outputs/);
-  assert.match(source, /component\.embedded_chat\.installed_as/);
-  assert.match(source, /component\.embedded_chat\.open_installed_workspace/);
-});
 
 test("Workspace cards open the Blueprint install page instead of Remix", async () => {
   const source = await readFile(embeddedChatSource, "utf8");

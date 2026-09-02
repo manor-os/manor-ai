@@ -49,12 +49,21 @@ async def generate_proposal(
     ``briefing_markdown`` (strategist_review_v2 only) swaps the legacy
     context sections for the deterministic ReviewBriefing markdown (M5/M6).
     ``None`` keeps the legacy prompt byte-identical.
+
+    The optional DB session is used only to resolve the Strategist prompt
+    Skill. That read phase is committed before the external model call so a
+    slow completion cannot leave the PostgreSQL connection idle in a
+    transaction (staging enforces a 60-second idle transaction timeout).
     """
     override = (ctx.strategist_template or {}).get("system_prompt_override")
     if isinstance(override, str) and override.strip():
         preamble = override
     else:
         preamble = await _load_skill_preamble(db, ctx.workspace.entity_id)
+
+    if db is not None and db.in_transaction():
+        await db.commit()
+
     system_prompt = runtime_strategist_system_prompt(
         ctx,
         preamble=preamble,

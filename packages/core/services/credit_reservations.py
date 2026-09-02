@@ -15,7 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from packages.core.models.base import generate_ulid
 from packages.core.models.billing import CreditReservation
 from packages.core.models.user import Entity
-from packages.core.constants.plans import is_cloud
+from packages.core.constants.plans import ai_credit_limits_enabled
 
 
 RESERVATION_STATUS_ACTIVE = "active"
@@ -156,7 +156,7 @@ async def reserve_credits(
             f"active reservation already exists for {source_kind}:{source_id}"
         )
 
-    if is_cloud():
+    if ai_credit_limits_enabled():
         pass
 
     now = _now()
@@ -250,7 +250,7 @@ async def resize_reservation_by_source(
     if row is None:
         return None
 
-    if not allow_overdraft and is_cloud():
+    if not allow_overdraft and ai_credit_limits_enabled():
         pass
 
     row.amount_credits = amount

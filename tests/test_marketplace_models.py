@@ -1,10 +1,69 @@
 """Model roundtrips for marketplace tables. DB schema comes from
 Base.metadata.create_all in conftest, so this also proves the models load."""
+from types import SimpleNamespace
+
 import pytest
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
 from packages.core.models.base import generate_ulid
+
+
+def test_blueprint_delivery_source_uses_current_published_release():
+    from packages.core.services.marketplace_billing import blueprint_delivery_source
+
+    blueprint = SimpleNamespace(
+        status="published",
+        payload={"release": "current"},
+        content_version="2.0.0",
+    )
+    purchase = SimpleNamespace(
+        payload_snapshot={"release": "purchased"},
+        blueprint_content_version="1.0.0",
+    )
+
+    assert blueprint_delivery_source(blueprint, purchase) == (
+        {"release": "current"},
+        "2.0.0",
+    )
+
+
+def test_blueprint_delivery_source_falls_back_when_release_is_archived():
+    from packages.core.services.marketplace_billing import blueprint_delivery_source
+
+    blueprint = SimpleNamespace(
+        status="archived",
+        payload={"release": "unpublished-edit"},
+        content_version="2.0.0",
+    )
+    purchase = SimpleNamespace(
+        payload_snapshot={"release": "purchased"},
+        blueprint_content_version="1.0.0",
+    )
+
+    assert blueprint_delivery_source(blueprint, purchase) == (
+        {"release": "purchased"},
+        "1.0.0",
+    )
+
+
+def test_blueprint_delivery_plan_gate_follows_the_delivered_release():
+    from packages.core.services.marketplace_billing import (
+        blueprint_delivery_requires_paid_plan,
+    )
+
+    purchase = SimpleNamespace(amount_cents=4900)
+    free_published_release = SimpleNamespace(status="published", price_cents=0)
+    archived_paid_release = SimpleNamespace(status="archived", price_cents=0)
+
+    assert not blueprint_delivery_requires_paid_plan(
+        free_published_release,
+        purchase,
+    )
+    assert blueprint_delivery_requires_paid_plan(
+        archived_paid_release,
+        purchase,
+    )
 
 
 @pytest.mark.asyncio
@@ -55,6 +114,7 @@ async def test_blueprint_purchase_roundtrip_and_pricing_columns(db_session):
         platform_fee_cents=0,
         seller_amount_cents=4900,
         payload_snapshot=bp.payload,
+        blueprint_content_version="1.2.3",
         blueprint_title=bp.title,
         stripe_checkout_session_id="cs_test_abc",
     )
@@ -65,7 +125,11 @@ async def test_blueprint_purchase_roundtrip_and_pricing_columns(db_session):
         select(BlueprintPurchase).where(BlueprintPurchase.blueprint_id == bp.id)
     )).scalar_one()
     assert got.status == "pending"
+    assert got.refunded_amount_cents == 0
+    assert got.transfer_reversed_amount_cents == 0
+    assert got.platform_fee_refunded_amount_cents == 0
     assert got.payload_snapshot == {"manifest": {}}
+    assert got.blueprint_content_version == "1.2.3"
 
 
 @pytest.mark.asyncio

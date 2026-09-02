@@ -10,6 +10,8 @@ from fastapi import APIRouter
 from sqlalchemy import text
 
 import packages.core.database as db_module
+from packages.core.constants.plans import ai_credit_limits_enabled
+from packages.core.service_role import normalize_service_role
 
 router = APIRouter(tags=["health"])
 
@@ -50,7 +52,11 @@ def _ensure_fs_marker(fs_root: str, marker: str) -> tuple[bool, str | None]:
 @router.get("/health")
 async def health():
     """Quick health check — returns 200 if the API is running."""
-    return {"status": "ok", "timestamp": datetime.now(timezone.utc).isoformat()}
+    return {
+        "status": "ok",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "service_role": normalize_service_role(os.getenv("MANOR_SERVICE_ROLE")),
+    }
 
 
 @router.get("/config")
@@ -65,6 +71,7 @@ async def client_config():
         "fs_enabled": os.getenv("MANOR_FS_ENABLED", "false").lower() in ("true", "1"),
         "flows_available": _feature_available("FLOWS_AVAILABLE", environment),
         "flows_released": _feature_available("FLOWS_RELEASED", environment),
+        "ai_credits_unlimited": not ai_credit_limits_enabled(),
         "support_tickets_enabled": deployment_mode.lower() == "cloud",
     }
     return config
@@ -152,20 +159,19 @@ async def deep_health():
         "platform": platform.platform(),
         "uptime_seconds": round(uptime_seconds),
         "deployment_mode": os.getenv("DEPLOYMENT_MODE", "oss"),
+        "service_role": normalize_service_role(os.getenv("MANOR_SERVICE_ROLE")),
         "pid": os.getpid(),
     }
 
     from fastapi.responses import JSONResponse
     status_code = 200 if all_ok else 503
-    return JSONResponse(
-        status_code=status_code,
-        content={
-            "status": "ok" if all_ok else "degraded",
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "checks": checks,
-            "system": system,
-        },
-    )
+    content = {
+        "status": "ok" if all_ok else "degraded",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+    if os.getenv("DEPLOYMENT_MODE", "oss").strip().lower() != "cloud":
+        content.update({"checks": checks, "system": system})
+    return JSONResponse(status_code=status_code, content=content)
 
 
 @router.get("/health/ready")

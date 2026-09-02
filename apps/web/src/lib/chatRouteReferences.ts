@@ -1,3 +1,5 @@
+import { fromMarkdown } from "mdast-util-from-markdown";
+
 const ROUTE_REF_SCHEME = "manor-route:";
 const ULID_PATTERN = "[0-9A-HJKMNP-TV-Z]{26}";
 const ROUTE_REF_RE = new RegExp(
@@ -11,6 +13,15 @@ const TASK_ID_FIELD_RE = new RegExp(
 const MARKDOWN_LINK_OR_IMAGE_RE = /!?\[[^\]]*\]\([^)]*\)/g;
 const FENCED_CODE_RE = /(```[\s\S]*?```|~~~[\s\S]*?~~~)/g;
 const INLINE_CODE_RE = /(`[^`\n]+`)/g;
+
+type PositionedMarkdownNode = {
+  type: string;
+  children?: PositionedMarkdownNode[];
+  position?: {
+    start: { offset?: number };
+    end: { offset?: number };
+  };
+};
 
 export type ChatRouteReferenceKind = "task" | "viewer";
 
@@ -113,13 +124,43 @@ function processOutsideMarkdownLinks(segment: string): string {
   return output;
 }
 
+function processOutsideMarkdownDefinitions(segment: string): string {
+  const root = fromMarkdown(segment) as PositionedMarkdownNode;
+  const definitionRanges: Array<readonly [number, number]> = [];
+  const collectDefinitions = (node: PositionedMarkdownNode) => {
+    const start = node.position?.start.offset;
+    const end = node.position?.end.offset;
+    if (
+      node.type === "definition"
+      && typeof start === "number"
+      && typeof end === "number"
+    ) {
+      definitionRanges.push([start, end]);
+    }
+    node.children?.forEach(collectDefinitions);
+  };
+  collectDefinitions(root);
+  definitionRanges.sort(([left], [right]) => left - right);
+  if (!definitionRanges.length) return processOutsideMarkdownLinks(segment);
+
+  let cursor = 0;
+  let output = "";
+  definitionRanges.forEach(([start, end]) => {
+    output += processOutsideMarkdownLinks(segment.slice(cursor, start));
+    output += segment.slice(start, end);
+    cursor = end;
+  });
+  output += processOutsideMarkdownLinks(segment.slice(cursor));
+  return output;
+}
+
 export function linkifyChatRouteReferencesInMarkdown(source: string): string {
   if (!source || !/(\/tasks\/|\/viewer\/|任务\s*(?:ID|编号)|task(?:[\s_-]*id)?)/i.test(source)) return source;
   return source
     .split(FENCED_CODE_RE)
     .map((part) => {
       const isFence = part.startsWith("```") || part.startsWith("~~~");
-      return isFence ? part : processOutsideMarkdownLinks(part);
+      return isFence ? part : processOutsideMarkdownDefinitions(part);
     })
     .join("");
 }

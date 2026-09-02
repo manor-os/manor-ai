@@ -8,6 +8,7 @@ trigger / end (passthrough), unsupported (graceful skip), switch
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 from types import SimpleNamespace
 
@@ -36,6 +37,16 @@ class _CheckpointDb:
 
     async def commit(self) -> None:
         self.commit_count += 1
+
+
+class _RunLoopDb:
+    """Minimal AsyncSession protocol used by run-loop unit tests."""
+
+    async def flush(self) -> None:
+        return None
+
+    async def commit(self) -> None:
+        return None
 
 
 @pytest.mark.asyncio
@@ -179,6 +190,80 @@ async def test_stage_failure_checkpoints_only_the_failed_operation_as_pending(ru
 
 
 @pytest.mark.asyncio
+async def test_foreach_subworkflow_cancelled_child_fails_parent_barrier(
+    runner,
+    monkeypatch,
+):
+    scenes = [{"scene_id": "scene-1"}]
+    fingerprint = hashlib.sha256(
+        json.dumps(scenes, sort_keys=True, default=str).encode("utf-8")
+    ).hexdigest()
+    progress_key = "__foreach_subworkflow__capture"
+    run = _run(
+        {
+            "scenes": scenes,
+            progress_key: {
+                "input_fingerprint": fingerprint,
+                "concurrency": 1,
+                "items": [
+                    {
+                        "key": "scene-1",
+                        "index": 0,
+                        "item": scenes[0],
+                        "status": "cancelled",
+                        "subrun_id": "child-run-1",
+                        "attempts": 1,
+                        "output": None,
+                        "error": "foreach_subworkflow child cancelled",
+                    }
+                ],
+            },
+        }
+    )
+    target = SimpleNamespace(
+        id="child-workflow",
+        entity_id=run.entity_id,
+        steps=[{"id": "start", "type": "trigger", "next": []}],
+    )
+
+    class Result:
+        def scalar_one_or_none(self):
+            return target
+
+    class FakeDB:
+        async def execute(self, _statement):
+            return Result()
+
+    async def lock_reference(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(
+        "packages.core.services.reusable_resource_locks."
+        "lock_reusable_resource_reference",
+        lock_reference,
+    )
+
+    result = await runner._execute_foreach_subworkflow_step(
+        {
+            "id": "capture",
+            "type": "foreach_subworkflow",
+            "config": {
+                "workflow_id": target.id,
+                "over": "scenes",
+                "item_key": "scene_id",
+            },
+        },
+        run.variables,
+        run,
+        FakeDB(),
+    )
+
+    assert result["status"] == "failed"
+    assert result["error"] == "foreach_subworkflow child cancelled"
+    assert result["items"][0]["status"] == "cancelled"
+
+
+@pytest.mark.asyncio
 async def test_trigger_and_end_are_passthrough(runner):
     trigger = await runner._execute_step(
         {"id": "trigger", "type": "trigger", "name": "trigger"}, _run(), None,
@@ -260,10 +345,6 @@ async def test_run_loop_appends_trace_before_best_effort_chat_projection(
         "next": [],
     }])
 
-    class Db:
-        async def commit(self):
-            return None
-
     async def execute_step(_step, _run, _db):
         return {
             "status": "completed",
@@ -283,7 +364,7 @@ async def test_run_loop_appends_trace_before_best_effort_chat_projection(
     monkeypatch.setattr(runner, "_execute_step_safe", execute_step)
     monkeypatch.setattr(workflow_runner_module, "_project_workflow_chat_safely", project)
 
-    await runner._run_loop(workflow, run, Db())
+    await runner._run_loop(workflow, run, _RunLoopDb())
 
     assert trace_seen_by_projection == [["running"], ["running", "completed"]]
     assert [entry["status"] for entry in run.execution_trace] == [
@@ -295,7 +376,262 @@ async def test_run_loop_appends_trace_before_best_effort_chat_projection(
 
 
 @pytest.mark.asyncio
-async def test_parallel_terminal_trace_uses_actual_completion_order_without_dataflow_reorder(
+async def test_run_loop_fences_and_closes_its_terminal_commit(runner):
+    run = _run()
+    run.status = "running"
+    run.step_results = {"start": {"status": "completed"}}
+    workflow = SimpleNamespace(steps=[{
+        "id": "start",
+        "type": "trigger",
+        "next": [],
+    }])
+    events: list[str] = []
+
+    class Db:
+        async def flush(self):
+            return None
+
+        async def commit(self):
+            events.append("commit")
+
+    db = Db()
+
+    async def terminal_commit():
+        events.append("before")
+        await db.commit()
+        events.append("after")
+
+    await runner._run_loop(
+        workflow,
+        run,
+        db,
+        terminal_commit=terminal_commit,
+    )
+
+    assert run.status == "completed"
+    assert events == ["before", "commit", "after"]
+
+
+@pytest.mark.asyncio
+async def test_terminal_run_redelivery_drains_post_commit_effects(monkeypatch):
+    run = _run()
+    run.status = "failed"
+    events = []
+
+    class Result:
+        def scalar_one_or_none(self):
+            return run
+
+    class Session:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        async def execute(self, _statement):
+            return Result()
+
+    class Factory:
+        def __call__(self):
+            return Session()
+
+    terminal_runner = WorkflowRunner(session_factory=Factory())
+
+    async def finalize(settled, _db):
+        events.append(("effects", settled.id))
+
+    monkeypatch.setattr(terminal_runner, "_finalize_run_effects", finalize)
+
+    await terminal_runner._run_claimed(
+        run.id,
+        after_terminal_commit=lambda: events.append(("marker", run.id)),
+    )
+
+    assert events == [("marker", run.id), ("effects", run.id)]
+
+
+@pytest.mark.asyncio
+async def test_terminal_effects_complete_only_after_every_effect_succeeds(
+    runner,
+    monkeypatch,
+):
+    from packages.core.ledger import adapters as ledger_adapters
+
+    run = _run()
+    run.status = "failed"
+    events: list[str] = []
+
+    class FakeDB:
+        async def commit(self):
+            events.append("commit")
+
+    async def record(_db, _run):
+        events.append("ledger")
+
+    async def dispatch(_run, _db):
+        events.append("error_handlers")
+
+    async def propagate(_run, _db):
+        events.append("propagate")
+
+    monkeypatch.setattr(ledger_adapters, "record_workflow_run_status", record)
+    monkeypatch.setattr(runner, "_dispatch_error_handlers", dispatch)
+    monkeypatch.setattr(runner, "_propagate_subworkflow_result", propagate)
+
+    await runner._finalize_run_effects(run, FakeDB())
+
+    assert events == [
+        "commit",
+        "ledger",
+        "commit",
+        "error_handlers",
+        "propagate",
+        "commit",
+    ]
+    assert run.terminal_effects_completed_at is not None
+    assert run.terminal_effects_next_attempt_at is None
+
+
+@pytest.mark.asyncio
+async def test_terminal_effect_failure_keeps_recovery_intent(
+    runner,
+    monkeypatch,
+):
+    from packages.core.ledger import adapters as ledger_adapters
+
+    run = _run()
+    run.status = "failed"
+
+    class FakeDB:
+        async def commit(self):
+            return None
+
+    async def record(_db, _run):
+        return None
+
+    async def fail_dispatch(_run, _db):
+        raise RuntimeError("broker unavailable")
+
+    monkeypatch.setattr(ledger_adapters, "record_workflow_run_status", record)
+    monkeypatch.setattr(runner, "_dispatch_error_handlers", fail_dispatch)
+
+    with pytest.raises(RuntimeError, match="broker unavailable"):
+        await runner._finalize_run_effects(run, FakeDB())
+
+    assert run.terminal_effects_completed_at is None
+    assert run.terminal_effects_next_attempt_at is not None
+
+
+@pytest.mark.asyncio
+async def test_interactive_terminal_effect_failure_returns_committed_outcome(
+    runner,
+    monkeypatch,
+):
+    run = _run()
+    run.status = "cancelled"
+    workflow_runner_module.mark_workflow_terminal_effects_pending(run)
+    rollbacks: list[bool] = []
+
+    class FakeDB:
+        async def rollback(self):
+            rollbacks.append(True)
+
+    async def fail_finalize(_run, _db):
+        raise RuntimeError("projection unavailable")
+
+    monkeypatch.setattr(runner, "_finalize_run_effects", fail_finalize)
+
+    completed = await (
+        workflow_runner_module.finalize_workflow_terminal_effects_best_effort(
+            run,
+            FakeDB(),
+            runner=runner,
+            context="test cancellation",
+        )
+    )
+
+    assert completed is False
+    assert rollbacks == [True]
+    assert run.status == "cancelled"
+    assert run.terminal_effects_completed_at is None
+    assert run.terminal_effects_next_attempt_at is not None
+
+
+@pytest.mark.asyncio
+async def test_workflow_tool_cancel_returns_state_when_effects_are_deferred(
+    monkeypatch,
+):
+    from packages.core.ai.tools import workflow_tools
+    from packages.core.services import workflow_chat_projection
+    from packages.core.services import workflow_service
+
+    run = _run()
+    run.status = "running"
+    run.workspace_id = None
+    run.binding_id = None
+    run.trigger_source = "tool"
+    run.current_step_id = "work"
+    run.error = None
+    run.started_at = None
+    run.completed_at = None
+    run.trigger_data = {}
+    rollbacks: list[bool] = []
+
+    class FakeDB:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        async def commit(self):
+            return None
+
+        async def rollback(self):
+            rollbacks.append(True)
+
+    async def get_run(*_args):
+        return run
+
+    async def can_control(*_args, **_kwargs):
+        return True
+
+    async def no_project(*_args, **_kwargs):
+        return None
+
+    async def fail_effects(_runner, _run, _db):
+        raise RuntimeError("projection unavailable")
+
+    monkeypatch.setattr(workflow_tools, "async_session", lambda: FakeDB())
+    monkeypatch.setattr(workflow_service, "get_run", get_run)
+    monkeypatch.setattr(
+        workflow_tools,
+        "_user_can_control_workflow_run",
+        can_control,
+    )
+    monkeypatch.setattr(
+        workflow_chat_projection,
+        "project_workflow_run_status",
+        no_project,
+    )
+    monkeypatch.setattr(WorkflowRunner, "_finalize_run_effects", fail_effects)
+
+    response = json.loads(await workflow_tools._cancel_workflow_run(
+        entity_id="ent1",
+        user_id="user1",
+        run_id=run.id,
+    ))
+
+    assert response["ok"] is True
+    assert response["run"]["status"] == "cancelled"
+    assert run.status == "cancelled"
+    assert run.terminal_effects_next_attempt_at is not None
+    assert rollbacks == [True]
+
+
+@pytest.mark.asyncio
+async def test_parallel_frontier_does_not_share_db_session_concurrently(
     runner,
     monkeypatch,
 ):
@@ -312,27 +648,187 @@ async def test_parallel_terminal_trace_uses_actual_completion_order_without_data
         {"id": "fast", "type": "tool", "next": []},
     ])
 
-    class Db:
-        async def commit(self):
-            return None
+    active = 0
+    max_active = 0
 
     async def execute(step, _run, _db):
-        if step["id"] == "slow":
-            await asyncio.sleep(0.03)
+        nonlocal active, max_active
+        active += 1
+        max_active = max(max_active, active)
+        await asyncio.sleep(0)
+        active -= 1
         return {"status": "completed", "output": step["id"]}
 
     monkeypatch.setattr(runner, "_execute_step", execute)
 
-    await runner._run_loop(workflow, run, Db())
+    await runner._run_loop(workflow, run, _RunLoopDb())
 
     terminal_ids = [
         entry["node_id"]
         for entry in run.execution_trace
         if entry["status"] == "completed"
     ]
-    assert terminal_ids == ["start", "fast", "slow"]
+    assert terminal_ids == ["start", "slow", "fast"]
     assert list(run.step_results) == ["start", "slow", "fast"]
-    assert run.step_results["fast"]["completed_at"] < run.step_results["slow"]["completed_at"]
+    assert max_active == 1
+
+
+@pytest.mark.asyncio
+async def test_run_loop_routes_handled_failure_only_to_error_output(
+    runner,
+    monkeypatch,
+):
+    run = _run()
+    run.status = "running"
+    run.trigger_data = {"attempt_number": 1}
+    run.definition_snapshot = {
+        "nodes": [
+            {"id": node_id}
+            for node_id in ("start", "request", "success", "recover")
+        ]
+    }
+    run.execution_trace = []
+    workflow = SimpleNamespace(steps=[
+        {"id": "start", "type": "trigger", "next": ["request"]},
+        {
+            "id": "request",
+            "type": "http",
+            "config": {
+                "on_error": "continue_error",
+                "error_next": ["recover"],
+            },
+            "next": ["success"],
+        },
+        {"id": "success", "type": "transform", "next": []},
+        {"id": "recover", "type": "transform", "next": []},
+    ])
+
+    executed: list[str] = []
+
+    async def execute(step, _run, _db):
+        executed.append(step["id"])
+        if step["id"] == "request":
+            return {"status": "failed", "error": "upstream unavailable"}
+        return {"status": "completed", "output": step["id"]}
+
+    monkeypatch.setattr(runner, "_execute_step_safe", execute)
+
+    await runner._run_loop(workflow, run, _RunLoopDb())
+
+    assert run.status == "completed"
+    assert executed == ["start", "request", "recover"]
+    assert run.step_results["request"]["continued"] is True
+    assert run.step_results["request"]["next_override"] == ["recover"]
+    assert run.step_results["request"]["output"] == {
+        "error": {"message": "upstream unavailable"}
+    }
+    assert "success" not in run.step_results
+
+
+@pytest.mark.asyncio
+async def test_run_loop_executes_item_routes_with_branch_local_inputs(runner):
+    items = [
+        {"tier": "vip", "id": 1},
+        {"tier": "free", "id": 2},
+        {"tier": "vip", "id": 3},
+    ]
+    run = _run()
+    run.status = "running"
+    run.trigger_data = {"items": items}
+    run.definition_snapshot = {
+        "nodes": [
+            {"id": node_id}
+            for node_id in ("start", "switch", "vip", "free")
+        ]
+    }
+    run.execution_trace = []
+    workflow = SimpleNamespace(steps=[
+        {"id": "start", "type": "trigger", "next": ["switch"]},
+        {
+            "id": "switch",
+            "type": "switch",
+            "config": {
+                "cases": [{"expression": 'tier == "vip"', "next": ["vip"]}],
+                "default_next": ["free"],
+                "inputs": [{"key": "input", "value": "{{start.items}}"}],
+                "pass_input": True,
+            },
+            "next": ["vip", "free"],
+        },
+        {
+            "id": "vip",
+            "type": "transform",
+            "config": {
+                "inputs": [{"key": "input", "value": "{{switch}}"}],
+                "pass_input": True,
+            },
+            "next": [],
+        },
+        {
+            "id": "free",
+            "type": "transform",
+            "config": {
+                "inputs": [{"key": "input", "value": "{{switch}}"}],
+                "pass_input": True,
+            },
+            "next": [],
+        },
+    ])
+
+    await runner._run_loop(workflow, run, _RunLoopDb())
+
+    assert run.status == "completed"
+    assert run.step_results["vip"]["output"] == [items[0], items[2]]
+    assert run.step_results["free"]["output"] == [items[1]]
+
+
+def test_continue_regular_output_forwards_last_valid_input(runner):
+    run = _run({"source": {"id": 7, "name": "Ada"}})
+    step = {
+        "id": "request",
+        "type": "http",
+        "config": {
+            "on_error": "continue",
+            "inputs": [{"key": "input", "value": "{{source}}"}],
+        },
+        "next": ["after"],
+    }
+    result = {"status": "failed", "error": "upstream unavailable"}
+
+    assert workflow_runner_module._continue_failed_result(step, result, run) is True
+    runner._record_step_result(step, result, run)
+
+    assert result["output"] == {"id": 7, "name": "Ada"}
+    assert run.variables["request"] == {"id": 7, "name": "Ada"}
+
+
+def test_continue_error_output_merges_error_with_input_item(runner):
+    run = _run({"source": {"id": 7, "name": "Ada"}})
+    step = {
+        "id": "request",
+        "type": "http",
+        "config": {
+            "on_error": "continue_error",
+            "error_next": ["recover"],
+            "inputs": [{"key": "input", "value": "{{source}}"}],
+        },
+        "next": ["success"],
+    }
+    result = {
+        "status": "failed",
+        "error": {"message": "upstream unavailable", "code": "EHOSTUNREACH"},
+    }
+
+    assert workflow_runner_module._continue_failed_result(step, result, run) is True
+    runner._record_step_result(step, result, run)
+
+    assert result["next_override"] == ["recover"]
+    assert result["output"] == {
+        "id": 7,
+        "name": "Ada",
+        "error": {"message": "upstream unavailable", "code": "EHOSTUNREACH"},
+    }
+    assert run.variables["request"] == result["output"]
 
 
 @pytest.mark.asyncio
@@ -401,9 +897,14 @@ def test_transform_recursively_resolves_nested_bindings(runner):
 @pytest.mark.asyncio
 async def test_unsupported_node_skips_by_default(runner):
     run = _run()
+    run.execution_snapshot = {"import_source": "comfyui"}
     step = {
         "id": "ks", "type": "unsupported", "name": "KSampler",
-        "meta": {"source_tool": "comfyui", "original_type": "KSampler"},
+        "meta": {
+            "source_tool": "comfyui",
+            "original_type": "KSampler",
+            "unmapped": True,
+        },
     }
     res = await runner._execute_step(step, run, None)
     assert res["status"] == "completed"
@@ -414,10 +915,15 @@ async def test_unsupported_node_skips_by_default(runner):
 @pytest.mark.asyncio
 async def test_unsupported_node_can_fail_when_configured(runner):
     run = _run()
+    run.execution_snapshot = {"import_source": "comfyui"}
     step = {
         "id": "ks", "type": "unsupported", "name": "KSampler",
         "config": {"on_unsupported": "fail"},
-        "meta": {"original_type": "KSampler"},
+        "meta": {
+            "source_tool": "comfyui",
+            "original_type": "KSampler",
+            "unmapped": True,
+        },
     }
     res = await runner._execute_step(step, run, None)
     assert res["status"] == "failed"
@@ -452,6 +958,216 @@ async def test_switch_falls_back_to_default(runner):
     }
     res = await runner._execute_step(step, run, None)
     assert res["next_override"] == ["c"]
+
+
+@pytest.mark.asyncio
+async def test_switch_expression_mode_routes_index_and_passes_input(runner):
+    item = {"route": 1, "payload": "keep me"}
+    run = _run({"source": item})
+    step = {
+        "id": "sw",
+        "type": "switch",
+        "config": {
+            "switch_mode": "expression",
+            "output_index": "{{input.route}}",
+            "output_next": [["zero"], ["one"], ["two"]],
+            "inputs": [{"key": "input", "value": "{{source}}"}],
+            "pass_input": True,
+        },
+    }
+
+    res = await runner._execute_step(step, run, None)
+
+    assert res["status"] == "completed"
+    assert res["next_override"] == ["one"]
+    assert res["output"] == item
+
+
+@pytest.mark.asyncio
+async def test_switch_expression_mode_allows_an_unconnected_output(runner):
+    run = _run({"input": {"route": 2}})
+    step = {
+        "id": "sw",
+        "type": "switch",
+        "config": {
+            "switch_mode": "expression",
+            "output_index": "{{input.route}}",
+            "output_next": [["zero"], [], []],
+            "pass_input": True,
+        },
+    }
+
+    res = await runner._execute_step(step, run, None)
+
+    assert res["status"] == "completed"
+    assert res["next_override"] == []
+    assert res["output"] == {"route": 2}
+
+
+@pytest.mark.asyncio
+async def test_switch_partitions_item_stream_into_branch_local_inputs(runner):
+    items = [
+        {"tier": "vip", "id": 1},
+        {"tier": "free", "id": 2},
+        {"tier": "vip", "id": 3},
+    ]
+    run = _run({"source": items})
+    switch = {
+        "id": "sw",
+        "type": "switch",
+        "config": {
+            "cases": [{"expression": 'tier == "vip"', "next": ["vip"]}],
+            "default_next": ["free"],
+            "inputs": [{"key": "input", "value": "{{source}}"}],
+            "pass_input": True,
+        },
+        "next": ["vip", "free"],
+    }
+
+    result = await runner._execute_step(switch, run, None)
+    runner._record_step_result(switch, result, run)
+
+    assert result["next_override"] == ["vip", "free"]
+    assert result["route_outputs"] == {
+        "vip": [{"tier": "vip", "id": 1}, {"tier": "vip", "id": 3}],
+        "free": [{"tier": "free", "id": 2}],
+    }
+
+    vip = await runner._execute_step({
+        "id": "vip",
+        "type": "transform",
+        "config": {
+            "inputs": [{"key": "input", "value": "{{sw}}"}],
+            "pass_input": True,
+        },
+    }, run, None)
+    free = await runner._execute_step({
+        "id": "free",
+        "type": "transform",
+        "config": {
+            "inputs": [{"key": "input", "value": "{{sw}}"}],
+            "pass_input": True,
+        },
+    }, run, None)
+
+    assert vip["output"] == [items[0], items[2]]
+    assert free["output"] == [items[1]]
+
+
+@pytest.mark.asyncio
+async def test_switch_can_send_one_item_to_all_matching_outputs(runner):
+    item = {"score": 10}
+    result = await runner._execute_step({
+        "id": "sw",
+        "type": "switch",
+        "config": {
+            "cases": [
+                {"expression": "score > 5", "next": ["high"]},
+                {"expression": "score > 0", "next": ["positive"]},
+            ],
+            "all_matching_outputs": True,
+            "inputs": [{"key": "input", "value": "{{source}}"}],
+            "pass_input": True,
+        },
+    }, _run({"source": item}), None)
+
+    assert result["next_override"] == ["high", "positive"]
+    assert result["route_outputs"] == {"high": item, "positive": item}
+
+
+@pytest.mark.asyncio
+async def test_condition_partitions_item_stream_into_both_outputs(runner):
+    items = [{"active": True, "id": 1}, {"active": False, "id": 2}]
+    run = _run({"source": items})
+    condition = {
+        "id": "if",
+        "type": "condition",
+        "config": {
+            "expression": "active == true",
+            "inputs": [{"key": "input", "value": "{{source}}"}],
+            "pass_input": True,
+        },
+        "true_next": ["active"],
+        "false_next": ["inactive"],
+        "next": ["active", "inactive"],
+    }
+
+    result = await runner._execute_step(condition, run, None)
+    runner._record_step_result(condition, result, run)
+
+    assert result["next_override"] == ["active", "inactive"]
+    assert result["route_outputs"] == {
+        "active": [items[0]],
+        "inactive": [items[1]],
+    }
+    inactive = await runner._execute_step({
+        "id": "inactive",
+        "type": "transform",
+        "config": {
+            "inputs": [{"key": "input", "value": "{{if}}"}],
+            "pass_input": True,
+        },
+    }, run, None)
+    assert inactive["output"] == [items[1]]
+
+
+@pytest.mark.asyncio
+async def test_execute_once_limits_an_item_stream_to_the_first_item(runner):
+    run = _run({"source": [{"value": 1}, {"value": 2}]})
+    step = {
+        "id": "set",
+        "type": "transform",
+        "config": {
+            "execute_once": True,
+            "items": "{{source}}",
+            "set": {"copied": "{{value}}"},
+        },
+    }
+
+    res = await runner._execute_step(step, run, None)
+
+    assert res["output"] == [{"copied": 1}]
+
+
+@pytest.mark.asyncio
+async def test_execute_once_limits_each_merge_input_stream(runner):
+    run = _run({
+        "left": [{"left": 1}, {"left": 2}],
+        "right": [{"right": "a"}, {"right": "b"}],
+    })
+    step = {
+        "id": "merge",
+        "type": "merge",
+        "config": {
+            "execute_once": True,
+            "mode": "combine_by_position",
+            "sources": ["left", "right"],
+        },
+    }
+
+    res = await runner._execute_step(step, run, None)
+
+    assert res["output"] == [{"left": 1, "right": "a"}]
+
+
+@pytest.mark.asyncio
+async def test_always_output_data_emits_empty_item_for_empty_output(runner, monkeypatch):
+    async def empty(_step, _run, _db):
+        return {"status": "completed", "output": []}
+
+    monkeypatch.setattr(runner, "_execute_step", empty)
+    result = await runner._execute_step_safe(
+        {
+            "id": "empty",
+            "type": "transform",
+            "config": {"always_output_data": True},
+        },
+        _run(),
+        None,
+    )
+
+    assert result["status"] == "completed"
+    assert result["output"] == [{}]
 
 
 @pytest.mark.asyncio
@@ -518,6 +1234,10 @@ class _FakeResp:
         return self._payload
 
 
+async def _allow_public_http(_url: str) -> None:
+    return None
+
+
 @pytest.mark.asyncio
 async def test_http_node_success(runner, monkeypatch):
     async def fake_request(self, method, url, **kwargs):
@@ -525,6 +1245,7 @@ async def test_http_node_success(runner, monkeypatch):
         return _FakeResp(200, {"echo": url, "method": method})
 
     monkeypatch.setattr("httpx.AsyncClient.request", fake_request)
+    monkeypatch.setattr(workflow_runner_module, "_resolve_workflow_http_host", _allow_public_http)
     run = _run({"host": "example.com"})
     step = {
         "id": "h", "type": "http",
@@ -547,6 +1268,7 @@ async def test_http_node_can_return_binary_for_extract_from_file(runner, monkeyp
         )
 
     monkeypatch.setattr("httpx.AsyncClient.request", fake_request)
+    monkeypatch.setattr(workflow_runner_module, "_resolve_workflow_http_host", _allow_public_http)
     res = await runner._execute_step({
         "id": "download", "type": "http",
         "config": {"url": "https://example.com/leads.xlsx", "response_format": "binary"},
@@ -570,8 +1292,9 @@ async def test_http_node_4xx_marks_failed(runner, monkeypatch):
         return _FakeResp(404, {"error": "nope"})
 
     monkeypatch.setattr("httpx.AsyncClient.request", fake_request)
+    monkeypatch.setattr(workflow_runner_module, "_resolve_workflow_http_host", _allow_public_http)
     run = _run()
-    step = {"id": "h", "type": "http", "config": {"url": "https://x/y"}}
+    step = {"id": "h", "type": "http", "config": {"url": "https://example.com/y"}}
     res = await runner._execute_step(step, run, None)
     assert res["status"] == "failed"
     assert "404" in res["error"]
@@ -586,6 +1309,7 @@ async def test_http_batch_renders_each_item_and_query(runner, monkeypatch):
         return _FakeResp(200, {"url": url})
 
     monkeypatch.setattr("httpx.AsyncClient.request", fake_request)
+    monkeypatch.setattr(workflow_runner_module, "_resolve_workflow_http_host", _allow_public_http)
     res = await runner._execute_step({
         "id": "pages", "type": "http", "config": {
             "url": "https://example.com/{{slug}}", "batch": True,
@@ -598,6 +1322,110 @@ async def test_http_batch_renders_each_item_and_query(runner, monkeypatch):
         ("https://example.com/two", {"page": "2"}),
     ]
     assert len(res["output"]) == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://127.0.0.1/admin",
+        "http://[::1]/admin",
+        "http://localhost/admin",
+        "http://metadata.internal/latest",
+        "file:///etc/passwd",
+    ],
+)
+async def test_http_node_blocks_non_public_destinations_before_request(
+    runner,
+    monkeypatch,
+    url,
+):
+    called = False
+
+    async def fake_request(*_args, **_kwargs):
+        nonlocal called
+        called = True
+        return _FakeResp()
+
+    monkeypatch.setattr("httpx.AsyncClient.request", fake_request)
+    result = await runner._execute_step(
+        {"id": "h", "type": "http", "config": {"url": url}},
+        _run(),
+        None,
+    )
+
+    assert result["status"] == "failed"
+    assert "public" in result["error"].lower()
+    assert called is False
+
+
+@pytest.mark.asyncio
+async def test_http_node_blocks_redirect_to_private_network(runner, monkeypatch):
+    calls: list[str] = []
+
+    async def fake_request(_self, _method, url, **_kwargs):
+        calls.append(url)
+        return _FakeResp(302, headers={"location": "http://127.0.0.1/admin"})
+
+    monkeypatch.setattr("httpx.AsyncClient.request", fake_request)
+    monkeypatch.setattr(workflow_runner_module, "_resolve_workflow_http_host", _allow_public_http)
+
+    result = await runner._execute_step(
+        {"id": "h", "type": "http", "config": {"url": "https://example.com/start"}},
+        _run(),
+        None,
+    )
+
+    assert result["status"] == "failed"
+    assert "public" in result["error"].lower()
+    assert calls == ["https://example.com/start"]
+
+
+@pytest.mark.asyncio
+async def test_http_node_blocks_hostname_resolving_to_private_network(runner, monkeypatch):
+    monkeypatch.setattr(
+        workflow_runner_module.socket,
+        "getaddrinfo",
+        lambda *_args, **_kwargs: [(2, 1, 6, "", ("10.0.0.4", 443))],
+    )
+
+    result = await runner._execute_step(
+        {"id": "h", "type": "http", "config": {"url": "https://example.test/data"}},
+        _run(),
+        None,
+    )
+
+    assert result["status"] == "failed"
+    assert "private network" in result["error"].lower()
+
+
+@pytest.mark.asyncio
+async def test_parallel_node_does_not_share_db_session_concurrently(runner, monkeypatch):
+    active = 0
+    max_active = 0
+
+    async def execute(_step, _run, _db):
+        nonlocal active, max_active
+        active += 1
+        max_active = max(max_active, active)
+        await asyncio.sleep(0)
+        active -= 1
+        return {"status": "completed", "output": "ok"}
+
+    monkeypatch.setattr(runner, "_execute_step_safe", execute)
+    result = await runner._execute_parallel_step(
+        {
+            "id": "parallel",
+            "config": {"steps": [{"id": "one"}, {"id": "two"}]},
+        },
+        {},
+        "ent1",
+        _run(),
+        object(),
+    )
+
+    assert result["status"] == "completed"
+    assert max_active == 1
 
 
 @pytest.mark.asyncio
@@ -671,6 +1499,8 @@ async def test_agent_provider_failure_is_not_reparsed_as_invalid_json(runner, mo
         "Model provider request failed before producing a response. ConnectError:"
     )
     assert "valid JSON" not in result["error"]
+
+
 
 
 @pytest.mark.asyncio
@@ -999,6 +1829,75 @@ async def test_retry_on_fail_retries_until_success(runner, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_output_contract_failure_does_not_repeat_completed_effect(
+    runner,
+    monkeypatch,
+):
+    calls = 0
+
+    async def published(step, run, db):
+        nonlocal calls
+        calls += 1
+        return {"status": "completed", "output": {"published": "yes"}}
+
+    monkeypatch.setattr(runner, "_execute_step", published)
+    result = await runner._execute_step_safe(
+        {
+            "id": "publish",
+            "type": "tool",
+            "config": {
+                "retry_on_fail": True,
+                "max_tries": 3,
+                "retry_wait_ms": 0,
+                "output_schema": {
+                    "type": "object",
+                    "properties": {"published": {"type": "boolean"}},
+                    "required": ["published"],
+                    "additionalProperties": False,
+                },
+            },
+        },
+        _run(),
+        None,
+    )
+
+    assert calls == 1
+    assert result["status"] == "failed"
+    assert result["code"] == "output_schema_validation_failed"
+    assert result["attempts"] == 1
+    assert result["producer_completed"] is True
+    assert result["retry_blocked"] is True
+    assert result["output"] == {"published": "yes"}
+
+
+@pytest.mark.asyncio
+async def test_imported_output_contract_failure_is_not_converted_to_skip(
+    runner,
+    monkeypatch,
+):
+    async def imported_effect(step, run, db):
+        return {"status": "completed", "output": "wrong shape"}
+
+    monkeypatch.setattr(runner, "_execute_step", imported_effect)
+    result = await runner._execute_step_safe(
+        {
+            "id": "imported",
+            "type": "tool",
+            "config": {
+                "n8n": {"type": "vendor.node"},
+                "output_schema": {"type": "object"},
+            },
+        },
+        _run(),
+        None,
+    )
+
+    assert result["status"] == "failed"
+    assert result["code"] == "output_schema_validation_failed"
+    assert result.get("skipped") is not True
+
+
+@pytest.mark.asyncio
 async def test_no_retry_by_default(runner, monkeypatch):
     """Without retry_on_fail a step runs exactly once."""
     calls = {"n": 0}
@@ -1076,6 +1975,255 @@ async def test_step_output_schema_rejects_invalid_completed_output(runner, monke
 
 
 @pytest.mark.asyncio
+async def test_step_output_schema_enforces_registered_formats(runner, monkeypatch):
+    async def fake_execute(step, run, db):
+        return {"status": "completed", "output": "not a uri"}
+
+    monkeypatch.setattr(runner, "_execute_step", fake_execute)
+    result = await runner._execute_step_safe(
+        {
+            "id": "checked",
+            "type": "tool",
+            "config": {
+                "output_schema": {"type": "string", "format": "uri"},
+            },
+        },
+        _run(),
+        None,
+    )
+
+    assert result["status"] == "failed"
+    assert result["code"] == "output_schema_validation_failed"
+    assert "uri" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_step_output_schema_rejects_unsupported_dialect(runner, monkeypatch):
+    calls = 0
+
+    async def fake_execute(step, run, db):
+        nonlocal calls
+        calls += 1
+        return {"status": "completed", "output": {}}
+
+    monkeypatch.setattr(runner, "_execute_step", fake_execute)
+    result = await runner._execute_step_safe(
+        {
+            "id": "checked",
+            "type": "tool",
+            "config": {
+                "output_schema": {
+                    "$schema": "http://json-schema.org/draft-07/schema#",
+                    "type": "object",
+                },
+            },
+        },
+        _run(),
+        None,
+    )
+
+    assert result["status"] == "failed"
+    assert result["code"] == "output_schema_validation_failed"
+    assert "unsupported JSON Schema dialect" in result["error"]
+    assert calls == 0
+
+
+@pytest.mark.asyncio
+async def test_step_output_schema_rejects_non_object_before_execution(
+    runner,
+    monkeypatch,
+):
+    calls = 0
+
+    async def fake_execute(step, run, db):
+        nonlocal calls
+        calls += 1
+        return {"status": "completed", "output": {}}
+
+    monkeypatch.setattr(runner, "_execute_step", fake_execute)
+    result = await runner._execute_step_safe(
+        {
+            "id": "checked",
+            "type": "tool",
+            "config": {"output_schema": False},
+        },
+        _run(),
+        None,
+    )
+
+    assert result["status"] == "failed"
+    assert result["code"] == "output_schema_validation_failed"
+    assert "must be an object" in result["error"]
+    assert calls == 0
+
+
+def test_workflow_validation_checks_nested_step_schema_contracts() -> None:
+    from packages.core.services.workflow_service import validate_workflow_steps
+
+    validation = validate_workflow_steps(
+        [
+            {
+                "id": "start",
+                "type": "trigger",
+                "config": {},
+                "next": ["loop"],
+            },
+            {
+                "id": "loop",
+                "type": "loop",
+                "config": {
+                    "steps": [
+                        {
+                            "id": "effect",
+                            "type": "tool",
+                            "config": {"output_schema": False},
+                        }
+                    ]
+                },
+                "next": [],
+            },
+        ]
+    )
+
+    assert validation["valid"] is False
+    assert any(
+        error["code"] == "invalid_output_schema"
+        and "loop.effect" in error["message"]
+        for error in validation["errors"]
+    )
+
+
+def test_workflow_validation_checks_entry_run_input_schema_contracts() -> None:
+    from packages.core.services.workflow_service import validate_workflow_steps
+
+    validation = validate_workflow_steps(
+        [
+            {
+                "id": "start",
+                "type": "trigger",
+                "config": {
+                    "run_inputs": [
+                        {"key": "request", "type": "json", "schema": False}
+                    ]
+                },
+                "next": [],
+            }
+        ]
+    )
+
+    assert validation["valid"] is False
+    assert any(
+        error["code"] == "invalid_input_schema"
+        and "run input 'request'" in error["message"]
+        for error in validation["errors"]
+    )
+
+
+def test_runtime_contract_preflight_preserves_imported_graph_compatibility() -> None:
+    from packages.core.services.workflow_service import (
+        _require_runtime_workflow,
+        validate_workflow_definition,
+    )
+    from packages.core.services.workflow_run_trace import (
+        build_execution_snapshot,
+        workflow_import_provenance_tags,
+    )
+
+    imported = SimpleNamespace(
+        id="wf-imported",
+        version=1,
+        tags=[],
+        steps=[
+            {
+                "id": "start",
+                "type": "trigger",
+                "config": {},
+                "next": ["legacy"],
+            },
+            {
+                "id": "legacy",
+                "type": "unsupported",
+                "config": {},
+                "meta": {
+                    "source_tool": "n8n",
+                    "original_type": "vendor.node",
+                    "unmapped": True,
+                },
+                "next": [],
+            },
+        ],
+    )
+    imported.tags = workflow_import_provenance_tags(imported, "n8n")
+    _require_runtime_workflow(imported)
+    assert validate_workflow_definition(imported)["valid"] is True
+    assert build_execution_snapshot(imported)["import_source"] == "n8n"
+
+    ambiguous = SimpleNamespace(
+        id=imported.id,
+        version=imported.version,
+        steps=imported.steps,
+        tags=[
+            *imported.tags,
+            *workflow_import_provenance_tags(imported, "dify"),
+        ],
+    )
+    with pytest.raises(ValueError, match="must be replaced"):
+        _require_runtime_workflow(ambiguous)
+    assert "import_source" not in build_execution_snapshot(ambiguous)
+
+    edited = SimpleNamespace(
+        id=imported.id,
+        version=imported.version,
+        tags=imported.tags,
+        steps=[*imported.steps, {"id": "edited", "type": "end", "next": []}],
+    )
+    with pytest.raises(ValueError, match="must be replaced"):
+        _require_runtime_workflow(edited)
+    assert validate_workflow_definition(edited)["valid"] is False
+    assert "import_source" not in build_execution_snapshot(edited)
+    _require_runtime_workflow(
+        edited,
+        steps=build_execution_snapshot(imported)["steps"],
+        imported_source="n8n",
+    )
+
+    with pytest.raises(ValueError, match="must be replaced"):
+        _require_runtime_workflow(
+            SimpleNamespace(tags=[], steps=imported.steps)
+        )
+
+    with pytest.raises(ValueError, match="non-consuming recursive"):
+        _require_runtime_workflow(
+            SimpleNamespace(tags=[], steps=[
+                {
+                    "id": "start",
+                    "type": "trigger",
+                    "config": {},
+                    "next": ["effect"],
+                },
+                {
+                    "id": "effect",
+                    "type": "tool",
+                    "config": {"output_schema": {"$ref": "#"}},
+                    "next": [],
+                },
+            ])
+        )
+
+    with pytest.raises(ValueError, match="missing node 'missing'"):
+        _require_runtime_workflow(
+            SimpleNamespace(tags=[], steps=[
+                {
+                    "id": "start",
+                    "type": "trigger",
+                    "config": {},
+                    "next": ["missing"],
+                }
+            ])
+        )
+
+
+@pytest.mark.asyncio
 async def test_step_output_schema_accepts_valid_output(runner, monkeypatch):
     async def fake_execute(step, run, db):
         return {"status": "completed", "output": {"ready": True}}
@@ -1132,12 +2280,65 @@ async def test_cache_reuses_unchanged_step(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_invalid_cached_output_fails_without_reexecuting(monkeypatch):
+    step = {
+        "id": "x",
+        "type": "llm",
+        "next": [],
+        "config": {
+            "cache_policy": "cache",
+            "prompt": "hi {{a}}",
+            "output_schema": {"type": "object"},
+        },
+    }
+    run = _run({"a": 1})
+    fingerprint = _step_fingerprint(step, dict(run.variables or {}))
+    prior = {
+        "x": {
+            "status": "completed",
+            "output": "invalid cached output",
+            "fingerprint": fingerprint,
+        }
+    }
+    runner = WorkflowRunner(
+        cache_index=WorkflowRunner.prime_cache_from_results(prior)
+    )
+    calls = 0
+
+    async def should_not_execute(step, run, db):
+        nonlocal calls
+        calls += 1
+        return {"status": "completed", "output": {"fresh": True}}
+
+    monkeypatch.setattr(runner, "_execute_step", should_not_execute)
+
+    result = await runner._execute_step_safe(step, run, None)
+
+    assert calls == 0
+    assert result["status"] == "failed"
+    assert result["code"] == "output_schema_validation_failed"
+    assert result["cached"] is True
+    assert result["producer_completed"] is True
+    assert result["retry_blocked"] is True
+    assert result["output"] == "invalid cached output"
+
+
+@pytest.mark.asyncio
 async def test_error_trigger_dispatch_and_recursion_guard(runner, monkeypatch):
     """A failed run dispatches error-handler bindings; an error-sourced run does
     not (so a failing handler can't recurse)."""
     import packages.core.services.workflow_service as svc
 
     calls = []
+
+    class FakeDB:
+        def __init__(self):
+            self.commits = 0
+
+        async def commit(self):
+            self.commits += 1
+
+    db = FakeDB()
 
     async def fake_dispatch(db, entity_id, **kw):
         calls.append({"entity_id": entity_id, **kw})
@@ -1149,17 +2350,113 @@ async def test_error_trigger_dispatch_and_recursion_guard(runner, monkeypatch):
     failed.status = "failed"
     failed.error = "boom"
     failed.trigger_source = None
-    await runner._dispatch_error_handlers(failed, db=None)
+    failed.workspace_id = "ws-1"
+    await runner._dispatch_error_handlers(failed, db=db)
     assert len(calls) == 1
     assert calls[0]["trigger_type"] == "error"
+    assert calls[0]["workspace_id"] == "ws-1"
+    assert calls[0]["require_workspace_match"] is True
     assert calls[0]["trigger_data"]["error"] == "boom"
+    assert failed.trigger_data["_workflow_terminal_effects"] == {
+        "error_handler_run_ids": [],
+        "error_handlers_enqueued": True,
+    }
 
     calls.clear()
     handler = _run()
     handler.status = "failed"
     handler.trigger_source = "error"          # an error-handler that itself failed
-    await runner._dispatch_error_handlers(handler, db=None)
+    await runner._dispatch_error_handlers(handler, db=db)
     assert calls == []                         # no recursion
+
+
+@pytest.mark.asyncio
+async def test_error_trigger_retries_same_handler_runs_after_enqueue_failure(
+    runner,
+    monkeypatch,
+):
+    import packages.core.services.workflow_service as svc
+
+    dispatches = []
+    enqueues = []
+
+    async def fake_dispatch(*_args, **_kwargs):
+        dispatches.append(True)
+        return [SimpleNamespace(id="handler-run-1")]
+
+    class FakeDB:
+        async def commit(self):
+            return None
+
+    outcomes = iter([False, True])
+
+    def fake_enqueue(run_id):
+        enqueues.append(run_id)
+        return next(outcomes)
+
+    monkeypatch.setattr(svc, "dispatch_trigger", fake_dispatch)
+    monkeypatch.setattr(runner, "enqueue", fake_enqueue)
+
+    failed = _run()
+    failed.status = "failed"
+    failed.workspace_id = "ws-1"
+    with pytest.raises(RuntimeError, match="failed to enqueue"):
+        await runner._dispatch_error_handlers(failed, FakeDB())
+
+    await runner._dispatch_error_handlers(failed, FakeDB())
+
+    assert dispatches == [True]
+    assert enqueues == ["handler-run-1", "handler-run-1"]
+    assert failed.trigger_data["_workflow_terminal_effects"][
+        "error_handlers_enqueued"
+    ] is True
+
+
+@pytest.mark.asyncio
+async def test_subworkflow_terminal_redelivery_repairs_committed_parent_resume(
+    runner,
+    monkeypatch,
+):
+    child = _run()
+    child.id = "child-run"
+    child.status = "completed"
+    child.trigger_data = {
+        "parent_run_id": "parent-run",
+        "parent_step_id": "nested-step",
+    }
+    parent = _run()
+    parent.id = "parent-run"
+    parent.status = "running"
+    parent.current_step_id = "nested-step"
+    parent.step_results = {
+        "nested-step": {
+            "status": "completed",
+            "subrun_id": child.id,
+            "resumed": True,
+        }
+    }
+    resumed = []
+
+    class Result:
+        def scalar_one_or_none(self):
+            return parent
+
+    class FakeDB:
+        async def execute(self, _statement):
+            return Result()
+
+        async def commit(self):
+            return None
+
+    async def fake_run(self, run_id, progress=None):
+        resumed.append(run_id)
+        return "executed"
+
+    monkeypatch.setattr(WorkflowRunner, "run", fake_run)
+
+    await runner._propagate_subworkflow_result(child, FakeDB())
+
+    assert resumed == [parent.id]
 
 
 def test_workflow_tools_exposed():
@@ -1355,6 +2652,60 @@ def test_set_include_other_fields_preserves_marketing_customer_data(runner):
     assert result["output"] == [{
         "Email": "ada@example.com", "Feedback": "Great", "Campaign Target": "Retention",
     }]
+
+
+def test_set_selected_and_excluded_fields_match_n8n_include_modes(runner):
+    source = [{
+        "id": 7,
+        "secret": "remove",
+        "profile": {"name": "Before", "city": "Paris"},
+    }]
+    selected = runner._execute_transform_step({
+        "id": "selected",
+        "config": {
+            "items": "{{rows}}",
+            "include_mode": "selected",
+            "include_fields": ["id"],
+            "set": {"status": "ready"},
+        },
+    }, {"rows": source}, _run())
+    excluded = runner._execute_transform_step({
+        "id": "excluded",
+        "config": {
+            "items": "{{rows}}",
+            "include_mode": "except",
+            "exclude_fields": ["secret"],
+            "set": {"profile.name": "After"},
+            "dot_notation": True,
+        },
+    }, {"rows": source}, _run())
+
+    assert selected["output"] == [{"id": 7, "status": "ready"}]
+    assert excluded["output"] == [{
+        "id": 7,
+        "profile": {"name": "After", "city": "Paris"},
+    }]
+
+
+def test_set_raw_json_mode_resolves_each_item(runner):
+    result = runner._execute_transform_step({
+        "id": "raw",
+        "config": {
+            "items": "{{rows}}",
+            "include_mode": "none",
+            "raw_json": '{"fullName":"{{first}} {{last}}","active":true}',
+        },
+    }, {
+        "rows": [
+            {"first": "Ada", "last": "Lovelace"},
+            {"first": "Grace", "last": "Hopper"},
+        ]
+    }, _run())
+
+    assert result["output"] == [
+        {"fullName": "Ada Lovelace", "active": True},
+        {"fullName": "Grace Hopper", "active": True},
+    ]
 
 
 def test_datetime_node_now_and_offset(runner):
@@ -1704,12 +3055,13 @@ async def test_wait_timer_completes_inline(runner):
 
 @pytest.mark.asyncio
 async def test_wait_long_timer_pauses_and_schedules_resume(runner, monkeypatch):
-    """A timer beyond the inline cap pauses and schedules its own resume."""
-    scheduled = {}
+    """A long timer records durable resume intent without broker I/O."""
     monkeypatch.setattr(
         runner,
         "enqueue_resume",
-        lambda run_id, delay: scheduled.update(run_id=run_id, delay=delay) or True,
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("timer intent must commit before broker publication")
+        ),
     )
     step = {"id": "w", "type": "wait", "name": "Pause",
             "config": {"wait_type": "timer", "duration_seconds": 100000}}
@@ -1718,7 +3070,9 @@ async def test_wait_long_timer_pauses_and_schedules_resume(runner, monkeypatch):
     assert res["status"] == "paused"
     assert res["auto_resume_scheduled"] is True
     assert res["resume_at"]
-    assert scheduled == {"run_id": "run1", "delay": 100000.0}
+    assert run.continuation_token
+    assert run.continuation_due_at.isoformat() == res["resume_at"]
+    assert run.continuation_next_attempt_at == run.continuation_due_at
 
 
 @pytest.mark.asyncio
@@ -1730,6 +3084,27 @@ async def test_wait_approval_pauses(runner):
     res = await runner._execute_step(step, run, None)
     assert res["status"] == "paused"
     assert run.status == "paused"
+
+
+def test_paused_tool_continuation_becomes_runnable_without_false_completion(runner):
+    workflow = SimpleNamespace(steps=[{
+        "id": "fanout",
+        "type": "connector",
+        "config": {},
+    }])
+    run = _run()
+    run.current_step_id = "fanout"
+    run.step_results = {
+        "fanout": {
+            "status": "paused",
+            "resume_strategy": "reexecute",
+        }
+    }
+
+    assert [
+        step["id"] for step in runner._find_runnable_steps(workflow, run)
+    ] == ["fanout"]
+    assert runner._all_steps_done(workflow, run) is False
 
 
 # ── notify ───────────────────────────────────────────────────────────────
@@ -1789,16 +3164,68 @@ def test_resolve_binding_preserves_type_for_single_ref():
 
 
 @pytest.mark.asyncio
-async def test_unconfigured_connector_skips_not_fails(runner):
-    """A freshly-imported connector with no integration bound should SKIP so the
-    rest of the run completes — not hard-fail the whole workflow. A bare tool
-    node the user added with no tool is still a real error."""
-    imported = {"id": "c", "type": "connector", "config": {"n8n": {"type": "n8n-nodes-base.slack"}}}
-    res = await runner._execute_tool_step(imported, {}, "e", "u", {})
+async def test_unconfigured_connector_skips_only_with_trusted_import_provenance(runner):
+    """Only a connector proven to belong to an imported snapshot may skip."""
+    imported = {
+        "id": "c",
+        "type": "connector",
+        "config": {"n8n": {"type": "n8n-nodes-base.slack"}},
+        "meta": {"source_tool": "n8n"},
+    }
+    imported_run = _run({})
+    imported_run.execution_snapshot = {"import_source": "n8n"}
+    res = await runner._execute_step(imported, imported_run, None)
     assert res["status"] == "completed" and res.get("skipped") is True
+
+    spoofed = await runner._execute_step(imported, _run({}), None)
+    assert spoofed["status"] == "failed"
+    assert spoofed.get("skipped") is not True
+
+    native_connector = {"id": "c2", "type": "connector", "config": {}}
+    native = await runner._execute_step(native_connector, _run({}), None)
+    assert native["status"] == "failed"
+
     bare_tool = {"id": "t", "type": "tool", "config": {}}
     res2 = await runner._execute_tool_step(bare_tool, {}, "e", "u", {})
     assert res2["status"] == "failed"
+
+
+@pytest.mark.asyncio
+async def test_connector_output_contract_parses_structured_tool_result(runner, monkeypatch):
+    async def fake_execute_tool_step(**_kwargs):
+        return SimpleNamespace(
+            output=json.dumps({"updated": True}),
+            envelope=None,
+        )
+
+    monkeypatch.setattr(
+        workflow_runner_module,
+        "runtime_execute_workflow_tool_step",
+        fake_execute_tool_step,
+    )
+
+    result = await runner._execute_tool_step(
+        {
+            "id": "update_record",
+            "type": "connector",
+            "config": {
+                "tool": "mcp__records__update_record",
+                "args": {"record_id": "rec-1"},
+                "output_schema": {
+                    "type": "object",
+                    "required": ["updated"],
+                    "properties": {"updated": {"type": "boolean"}},
+                },
+            },
+        },
+        {},
+        "entity-1",
+        "user-1",
+        {"workspace_id": "workspace-1"},
+    )
+
+    assert result["status"] == "completed"
+    assert result["output"] == {"updated": True}
 
 
 @pytest.mark.asyncio
@@ -1842,33 +3269,58 @@ async def test_imported_node_failure_skips_and_continues(runner, monkeypatch):
     """An *imported* node that fails (live endpoint/credential absent here) is
     converted to a skip so the whole workflow still runs through. A user-built
     node still fails; an imported ``stop`` keeps its deliberate halt."""
-    run = _run({})
     async def boom(step, _run, _db):
         return {"status": "failed", "error": "boom"}
     monkeypatch.setattr(runner, "_execute_step", boom)
 
-    imported = {"id": "a", "type": "http", "config": {"n8n": {"type": "n8n-nodes-base.httpRequest"}}}
-    res = await runner._execute_step_safe(imported, run, None)
+    n8n_run = _run({})
+    n8n_run.execution_snapshot = {"import_source": "n8n"}
+    imported = {
+        "id": "a",
+        "type": "http",
+        "config": {"n8n": {"type": "n8n-nodes-base.httpRequest"}},
+        "meta": {"source_tool": "n8n"},
+    }
+    res = await runner._execute_step_safe(imported, n8n_run, None)
     assert res["status"] == "completed" and res.get("skipped") is True and res.get("error") == "boom"
+
+    spoofed = await runner._execute_step_safe(imported, _run({}), None)
+    assert spoofed["status"] == "failed"
+    assert spoofed.get("skipped") is not True
 
     # ComfyUI/Dify imports mark provenance via meta.source_tool (no config.n8n)
     comfy = {"id": "d", "type": "image", "config": {}, "meta": {"source_tool": "comfyui"}}
-    res_c = await runner._execute_step_safe(comfy, run, None)
+    comfy_run = _run({})
+    comfy_run.execution_snapshot = {"import_source": "comfyui"}
+    res_c = await runner._execute_step_safe(comfy, comfy_run, None)
     assert res_c["status"] == "completed" and res_c.get("skipped") is True
 
     user_built = {"id": "b", "type": "http", "config": {}}
-    res2 = await runner._execute_step_safe(user_built, run, None)
+    res2 = await runner._execute_step_safe(user_built, _run({}), None)
     assert res2["status"] == "failed"
 
     imported_stop = {"id": "c", "type": "stop", "config": {"n8n": {"type": "x"}}}
-    res3 = await runner._execute_step_safe(imported_stop, run, None)
+    res3 = await runner._execute_step_safe(imported_stop, n8n_run, None)
     assert res3["status"] == "failed"  # stop still halts
 
     strict = {"id": "s", "type": "http", "config": {
         "n8n": {"type": "n8n-nodes-base.httpRequest"}, "strict_execution": True,
     }}
-    res4 = await runner._execute_step_safe(strict, run, None)
+    res4 = await runner._execute_step_safe(strict, n8n_run, None)
     assert res4["status"] == "failed" and res4.get("skipped") is not True
+
+    async def partial_fanout(step, _run, _db):
+        return {
+            "status": "paused",
+            "code": "tool_fanout_partial",
+            "error": "Connector account fan-out returned partial results",
+            "resume_strategy": "reexecute",
+        }
+
+    monkeypatch.setattr(runner, "_execute_step", partial_fanout)
+    partial = await runner._execute_step_safe(imported, n8n_run, None)
+    assert partial["status"] == "paused"
+    assert partial.get("skipped") is not True
 
 
 def test_template_resolves_refs_with_spaces():
@@ -2127,6 +3579,60 @@ def test_graph_routes_win_when_steps_also_include_dependency_metadata(runner):
     assert [step["id"] for step in runner._find_runnable_steps(workflow, run)] == ["produce"]
     run.step_results["produce"] = {"status": "completed"}
     assert [step["id"] for step in runner._find_runnable_steps(workflow, run)] == ["done"]
+
+
+def test_graph_recovers_a_missing_condition_receipt_from_completed_inputs(runner):
+    """A legacy condition receipt must not activate both normalized branches."""
+    workflow = SimpleNamespace(steps=[
+        {"id": "start", "type": "trigger", "next": ["produce"]},
+        {"id": "produce", "type": "agent", "next": ["check"]},
+        {
+            "id": "check",
+            "type": "condition",
+            "config": {"expression": 'produce.status == "completed"'},
+            # Frozen workflow graphs can materialize both branches in ``next``.
+            "next": ["blocked", "publish"],
+            "true_next": ["publish"],
+            "false_next": ["blocked"],
+        },
+        {"id": "blocked", "type": "stop", "next": []},
+        {"id": "publish", "type": "agent", "next": []},
+    ])
+    run = _run()
+    run.step_results = {
+        "start": {"status": "completed"},
+        "produce": {"status": "completed", "output": {"status": "completed"}},
+        # A historical recovery wrote output but dropped the branch receipt.
+        "check": {"status": "completed", "output": {"status": "completed"}},
+    }
+
+    assert [step["id"] for step in runner._find_runnable_steps(workflow, run)] == ["publish"]
+
+
+def test_checkpoint_retry_starts_at_the_requested_step(runner):
+    """A retry must not re-enter an ambiguous upstream condition branch."""
+    workflow = SimpleNamespace(steps=[
+        {"id": "start", "type": "trigger", "next": ["check"]},
+        {
+            "id": "check",
+            "type": "condition",
+            "config": {"expression": "ready == true"},
+            "next": ["blocked", "publish"],
+            "true_next": ["publish"],
+            "false_next": ["blocked"],
+        },
+        {"id": "blocked", "type": "stop", "next": []},
+        {"id": "publish", "type": "agent", "next": []},
+    ])
+    run = _run({"ready": False})
+    run.current_step_id = "publish"
+    run.retry_from_step_id = "publish"
+    run.step_results = {
+        "start": {"status": "completed"},
+        "check": {"status": "completed", "output": {"legacy": True}},
+    }
+
+    assert [step["id"] for step in runner._find_runnable_steps(workflow, run)] == ["publish"]
 
 
 def test_hybrid_workflow_uses_dependency_edges_until_an_explicit_branch(runner):

@@ -1,13 +1,9 @@
-"""Installing a blueprint must not fork a skill the entity already has.
+"""Blueprint component identity must not be inferred from an entity slug.
 
-Staging: the entity owned ``stickman_video_creator`` (4664-character
-production prompt). The blueprint embedded the same capability spelled
-``stickman-video-creator`` with a 636-character starter prompt. The exact
-(entity_id, slug) lookup missed, so the installer created a SECOND row and
-bound all five agents to the thin copy. The mature skill sat active and
-unreferenced. The Stickman Video Producer then spent three replans calling
-``search_tools`` eleven times, never invoking a media tool, and produced no
-MP4 — nothing in the logs said a near-duplicate skill existed.
+Slug normalization remains useful only for controlled historical repair.
+Fresh installs use ``(Marketplace Blueprint id, Workspace id, component
+key)`` and mint a Workspace-scoped local Skill, so two Marketplace authors
+may publish the same display slug without either claiming the other's row.
 """
 from __future__ import annotations
 
@@ -58,18 +54,17 @@ def test_normalization_handles_empty_input():
     assert normalize_skill_slug("---") == ""
 
 
-def test_installer_looks_up_through_the_normalizer():
-    """A future edit that goes back to an exact-slug query reintroduces the
-    fork, so pin the call."""
+def test_installer_uses_source_component_links_instead_of_slug_adoption():
     source = Path("packages/core/blueprints/installer.py").read_text(encoding="utf-8")
-    assert "_find_installed_skill(" in source
+    assert "_find_installed_skill(" not in source
     assert "normalize_skill_slug" in source
     install_body = source.split("async def _install_embedded_skill(")[1].split(
         "async def _install_embedded_agent("
     )[0]
-    assert "_find_installed_skill(" in install_body, (
-        "embedded skill install must go through the normalizing lookup"
-    )
+    assert "_find_installed_skill(" not in install_body
+    assert "get_marketplace_resource_link(" in install_body
+    assert "source_blueprint_id" in install_body
+    assert "scope_id=workspace_id" in install_body
 
 
 # ── The blueprint ships the definition that actually works ────────────

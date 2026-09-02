@@ -11,11 +11,17 @@ from packages.core.tasks.ai_tasks import (
     run_agent_task,
     run_workflow,
 )
+from packages.core.services.workflow_run_execution_claim import (
+    TASK_PLAN_EXECUTION_LEASE_TTL_SECONDS,
+    TASK_PLAN_EXECUTION_RECHECK_SECONDS,
+)
 
 
 def test_plan_and_run_task_time_limits():
     assert plan_and_run_task.soft_time_limit and plan_and_run_task.soft_time_limit >= 900
     assert plan_and_run_task.time_limit and plan_and_run_task.time_limit > plan_and_run_task.soft_time_limit
+    assert TASK_PLAN_EXECUTION_LEASE_TTL_SECONDS > plan_and_run_task.time_limit
+    assert TASK_PLAN_EXECUTION_RECHECK_SECONDS > TASK_PLAN_EXECUTION_LEASE_TTL_SECONDS
 
 
 def test_run_agent_task_time_limits():

@@ -1,8 +1,11 @@
 """Comment endpoints — threaded comments on tasks, documents, etc."""
 from __future__ import annotations
 
+import json
+from typing import Literal
+
 from fastapi import APIRouter, Depends, HTTPException, Query
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -10,10 +13,13 @@ from packages.core.database import get_db
 from packages.core.models.comment import Comment
 from packages.core.models.permission import Capability, ResourceType
 from packages.core.models.user import User
+from packages.core.permissions import user_is_effective_entity_admin
 from packages.core.services.document_access import (
     effective_document_capabilities_for_user,
     get_visible_document,
+    user_can_read_document,
 )
+from packages.core.services.document_service import get_document_for_update
 from packages.core.services.comment_service import (
     create_comment,
     list_comments,
@@ -21,6 +27,7 @@ from packages.core.services.comment_service import (
     delete_comment,
     add_reaction,
     get_comment_count,
+    normalize_comment_resource_type,
 )
 from apps.api.deps import get_current_user
 
@@ -28,6 +35,9 @@ router = APIRouter(prefix="/api/v1/comments", tags=["comments"])
 
 
 # ── Schemas ──
+
+_COMMENT_CONTENT_MAX_LENGTH = 10_000
+
 
 class CommentResponse(BaseModel):
     id: str
@@ -41,31 +51,96 @@ class CommentResponse(BaseModel):
     user_display_name: str | None = None
     user_avatar_url: str | None = None
     content: str
-    mentions: list = []
-    anchor: dict = {}
-    reactions: dict = {}
+    mentions: list = Field(default_factory=list)
+    anchor: dict = Field(default_factory=dict)
+    reactions: dict = Field(default_factory=dict)
     is_edited: bool = False
     status: str = "active"
     created_at: str | None = None
     updated_at: str | None = None
-    replies: list = []
+    replies: list = Field(default_factory=list)
+
+
+class CommentAnchorRequest(BaseModel):
+    """Validated anchor fields while preserving future viewer-specific metadata."""
+
+    model_config = ConfigDict(extra="allow")
+
+    type: str | None = Field(default=None, max_length=50)
+    mode: str | None = Field(default=None, max_length=50)
+    label: str | None = Field(default=None, max_length=500)
+    source: str | None = Field(default=None, max_length=500)
+    line: int | None = Field(default=None, ge=1)
+    line_end: int | None = Field(default=None, ge=1)
+    start: int | None = Field(default=None, ge=0)
+    end: int | None = Field(default=None, ge=0)
+    quote: str | None = Field(default=None, max_length=500)
+    quote_occurrence: int | None = Field(default=None, ge=0)
+
+    @field_validator("type", "mode", "label", "source", "quote")
+    @classmethod
+    def normalize_optional_text(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip()
+        return normalized or None
+
+    @model_validator(mode="after")
+    def validate_ranges(self) -> "CommentAnchorRequest":
+        if (self.start is None) != (self.end is None):
+            raise ValueError("anchor start and end must be provided together")
+        if self.start is not None and self.end is not None and self.end <= self.start:
+            raise ValueError("anchor end must be greater than start")
+        if self.line is not None and self.line_end is not None and self.line_end < self.line:
+            raise ValueError("anchor line_end must not precede line")
+        if len(json.dumps(self.model_dump(), ensure_ascii=False, default=str)) > 4_000:
+            raise ValueError("anchor metadata is too large")
+        return self
 
 
 class CommentCreateRequest(BaseModel):
-    resource_type: str
-    resource_id: str
-    content: str
-    parent_id: str | None = None
-    mentions: list | None = None
-    anchor: dict | None = None
+    resource_type: str = Field(min_length=1, max_length=50)
+    resource_id: str = Field(min_length=1, max_length=26)
+    content: str = Field(min_length=1, max_length=_COMMENT_CONTENT_MAX_LENGTH)
+    parent_id: str | None = Field(default=None, max_length=26)
+    mentions: list[str] = Field(default_factory=list, max_length=50)
+    anchor: CommentAnchorRequest | None = None
+
+    @field_validator("resource_type", "resource_id", "content", "parent_id", mode="before")
+    @classmethod
+    def strip_text(cls, value):
+        return value.strip() if isinstance(value, str) else value
+
+    @field_validator("resource_type")
+    @classmethod
+    def normalize_resource_type(cls, value: str) -> str:
+        return normalize_comment_resource_type(value)
+
+    @field_validator("mentions")
+    @classmethod
+    def normalize_mentions(cls, mentions: list[str]) -> list[str]:
+        normalized = [mention.strip() for mention in mentions if mention.strip()]
+        if any(len(mention) > 255 for mention in normalized):
+            raise ValueError("mentions must be at most 255 characters")
+        return list(dict.fromkeys(normalized))
 
 
 class CommentUpdateRequest(BaseModel):
-    content: str
+    content: str = Field(min_length=1, max_length=_COMMENT_CONTENT_MAX_LENGTH)
+
+    @field_validator("content", mode="before")
+    @classmethod
+    def strip_content(cls, value):
+        return value.strip() if isinstance(value, str) else value
 
 
 class ReactionRequest(BaseModel):
-    reaction: str
+    reaction: Literal["thumbsup"]
+
+    @field_validator("reaction", mode="before")
+    @classmethod
+    def normalize_reaction(cls, value):
+        return value.strip().lower() if isinstance(value, str) else value
 
 
 class CommentCountResponse(BaseModel):
@@ -82,6 +157,7 @@ async def list_resource_comments(
     db: AsyncSession = Depends(get_db),
 ):
     """List threaded comments for a resource."""
+    resource_type = normalize_comment_resource_type(resource_type)
     await _require_resource_access(
         db,
         user,
@@ -117,7 +193,7 @@ async def create_new_comment(
             user_email=user.email,
             parent_id=body.parent_id,
             mentions=body.mentions,
-            anchor=body.anchor,
+            anchor=body.anchor.model_dump(exclude_none=True) if body.anchor else None,
         )
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
@@ -180,7 +256,7 @@ async def toggle_reaction(
         db,
         user,
         comment_id=comment_id,
-        require_comment=False,
+        require_comment=True,
     )
     reactions = await add_reaction(db, comment_id, user.entity_id, user.id, body.reaction)
     if reactions is None:
@@ -196,6 +272,7 @@ async def count_comments(
     db: AsyncSession = Depends(get_db),
 ):
     """Get comment count for a resource."""
+    resource_type = normalize_comment_resource_type(resource_type)
     await _require_resource_access(
         db,
         user,
@@ -210,16 +287,19 @@ async def count_comments(
 # ── Helpers ──
 
 def _is_document_resource(resource_type: str) -> bool:
-    return resource_type in {ResourceType.DOCUMENT, "documents"}
+    return normalize_comment_resource_type(resource_type) == ResourceType.DOCUMENT
 
 
-def _user_is_document_manager(user: User, doc) -> bool:
-    if user.role in {"owner", "admin"}:
+async def _user_is_document_manager(
+    db: AsyncSession,
+    user: User,
+    doc,
+) -> bool:
+    if await user_is_effective_entity_admin(db, user):
         return True
     if getattr(doc, "owner_id", None) == user.id:
         return True
-    created_by = getattr(doc, "created_by", None)
-    return bool(created_by and created_by in {user.id, user.email, user.display_name})
+    return getattr(doc, "created_by", None) == user.id
 
 
 async def _require_resource_access(
@@ -236,18 +316,34 @@ async def _require_resource_access(
     if not _is_document_resource(resource_type):
         return
 
-    doc = await get_visible_document(
-        db,
-        resource_id,
-        user.entity_id,
-        user_id=user.id,
-        role=user.role,
-    )
+    if require_comment:
+        # Document hard-delete paths take this same row lock before removing
+        # comments. Whichever transaction arrives first therefore completes
+        # atomically: a committed comment is cleaned by the deleter, or a
+        # completed delete makes this mutation return 404.
+        doc = await get_document_for_update(db, resource_id, user.entity_id)
+        can_read = await user_can_read_document(
+            db,
+            doc,
+            entity_id=user.entity_id,
+            user_id=user.id,
+            role=user.role,
+        )
+        if not can_read:
+            doc = None
+    else:
+        doc = await get_visible_document(
+            db,
+            resource_id,
+            user.entity_id,
+            user_id=user.id,
+            role=user.role,
+        )
     if not doc:
         raise HTTPException(status_code=404, detail="Document not found")
     if not require_comment:
         return
-    if _user_is_document_manager(user, doc):
+    if await _user_is_document_manager(db, user, doc):
         return
 
     capabilities = await effective_document_capabilities_for_user(

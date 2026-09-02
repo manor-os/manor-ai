@@ -48,7 +48,7 @@ async function bundle(contents, { toFile } = {}) {
       "process.env.NODE_ENV": '"production"',
       "import.meta.env.DEV": "false",
     },
-    loader: { ".css": "empty", ".png": "empty", ".svg": "text" },
+    loader: { ".css": "empty", ".png": "empty", ".webp": "empty", ".svg": "text" },
   });
   const text = built.outputFiles[0].text;
   if (!toFile) {

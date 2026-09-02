@@ -43,36 +43,56 @@ async def _async_purge_workspaces():
     from packages.core.services.entity_service import (
         list_workspaces_due_for_purge, purge_workspace,
     )
+    from packages.core.services.workspace_artifact_purge import (
+        drain_workspace_artifact_purge_jobs,
+    )
 
     purged = 0
     failed = 0
     async with create_worker_session()() as db:
-        candidates = await list_workspaces_due_for_purge(db)
-        for ws in candidates:
+        candidates = [
+            (workspace.id, workspace.entity_id, workspace.deleted_at)
+            for workspace in await list_workspaces_due_for_purge(db)
+        ]
+        for workspace_id, entity_id, deleted_at in candidates:
             try:
-                ok = await purge_workspace(db, ws.id)
+                ok = await purge_workspace(
+                    db,
+                    workspace_id,
+                    expected_deleted_at=deleted_at,
+                )
                 if ok:
+                    await db.commit()
                     purged += 1
                     logger.info(
                         "ops.purge_workspaces: purged workspace=%s entity=%s "
                         "deleted_at=%s",
-                        ws.id, ws.entity_id, ws.deleted_at,
+                        workspace_id, entity_id, deleted_at,
                     )
+                else:
+                    await db.rollback()
             except Exception as exc:  # noqa: BLE001
                 failed += 1
                 logger.exception(
                     "ops.purge_workspaces: workspace=%s purge failed: %s",
-                    ws.id, exc,
+                    workspace_id, exc,
                 )
                 # Don't poison the loop — let the next workspace try.
                 await db.rollback()
                 continue
-        if purged or failed:
-            await db.commit()
 
-    if purged or failed:
+        artifact_cleaned, artifact_failed = (
+            await drain_workspace_artifact_purge_jobs(db)
+        )
+
+    if purged or failed or artifact_cleaned or artifact_failed:
         logger.info(
-            "ops.purge_workspaces: done — purged=%d failed=%d", purged, failed,
+            "ops.purge_workspaces: done — purged=%d failed=%d "
+            "artifact_cleaned=%d artifact_failed=%d",
+            purged,
+            failed,
+            artifact_cleaned,
+            artifact_failed,
         )
 
 
@@ -85,27 +105,31 @@ async def _async_purge_users():
     purged = 0
     failed = 0
     async with create_worker_session()() as db:
-        candidates = await list_users_due_for_purge(db)
-        for user in candidates:
+        candidates = [
+            (user.id, user.entity_id, user.deleted_at)
+            for user in await list_users_due_for_purge(db)
+        ]
+        for user_id, entity_id, deleted_at in candidates:
             try:
-                ok = await purge_user(db, user.id)
+                ok = await purge_user(db, user_id)
                 if ok:
+                    await db.commit()
                     purged += 1
                     logger.info(
                         "ops.purge_users: purged user=%s entity=%s "
                         "deleted_at=%s",
-                        user.id, user.entity_id, user.deleted_at,
+                        user_id, entity_id, deleted_at,
                     )
+                else:
+                    await db.rollback()
             except Exception as exc:  # noqa: BLE001
                 failed += 1
                 logger.exception(
                     "ops.purge_users: user=%s purge failed: %s",
-                    user.id, exc,
+                    user_id, exc,
                 )
                 await db.rollback()
                 continue
-        if purged or failed:
-            await db.commit()
 
     if purged or failed:
         logger.info(

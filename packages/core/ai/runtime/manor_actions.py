@@ -99,11 +99,13 @@ _TASK_CREATE_ALLOWED_FIELDS = frozenset({
     "assignee_id",
     "category_id",
     "conversation_id",
-    "creator_id",
     "deadline",
     "description",
     "details",
+    "delegate_service_keys",
     "duration_minutes",
+    "owner_service_key",
+    "owner_subscription_id",
     "priority",
     "scheduled_at",
     "task_type",
@@ -132,7 +134,6 @@ _WORKSPACE_UPDATE_ALLOWED_FIELDS = frozenset({
     "pms_unit_id",
     "primary_work",
     "property_type",
-    "settings",
     "status",
 })
 _CLIENT_FIELDS = frozenset({
@@ -187,7 +188,6 @@ _RUNTIME_MANOR_CACHE_NAMESPACE_BY_ACTION = {
     "list_integrations": "integrations",
     "list_ready_integrations": "integrations",
 }
-
 
 @dataclass(frozen=True)
 class _TaskAssignmentInput:
@@ -1000,14 +1000,30 @@ async def runtime_manor_list_tasks(
         ).isoformat()
 
     allowed_filters = {
+        "query",
         "status",
+        "statuses",
         "workspace_id",
+        "workspace_ids",
+        "category_id",
+        "category_ids",
         "assignee_id",
+        "assignee_ids",
+        "task_type",
+        "task_types",
+        "priority",
+        "priorities",
+        "priority_min",
+        "priority_max",
+        "created_after",
+        "created_before",
+        "updated_after",
+        "updated_before",
         "completed_after",
         "completed_before",
+        "deadline_after",
+        "deadline_before",
         "parent_task_id",
-        "limit",
-        "offset",
         "include_automations",
     }
     service_params = {
@@ -1015,10 +1031,32 @@ async def runtime_manor_list_tasks(
         for key, value in raw_params.items()
         if key in allowed_filters and value not in (None, "", [], ())
     }
+    try:
+        limit = max(1, min(int(raw_params.get("limit") or 50), 100))
+        offset = max(0, int(raw_params.get("offset") or 0))
+    except (TypeError, ValueError):
+        return json.dumps({
+            "error": "invalid_task_filters",
+            "message": "limit and offset must be integers",
+        })
+    service_params.update({"limit": limit, "offset": offset})
 
-    tasks, total = await list_tasks(db, entity_id, **service_params)
+    try:
+        tasks, total = await list_tasks(db, entity_id, **service_params)
+    except (TypeError, ValueError) as exc:
+        return json.dumps({
+            "error": "invalid_task_filters",
+            "message": str(exc),
+        })
+    next_offset = offset + len(tasks)
+    has_more = next_offset < total
     return json.dumps({
         "total": total,
+        "count": len(tasks),
+        "limit": limit,
+        "offset": offset,
+        "has_more": has_more,
+        "next_offset": next_offset if has_more else None,
         "tasks": [
             {
                 "id": t.id,
@@ -1093,6 +1131,8 @@ async def runtime_manor_create_task(
     entity_id: str,
     params: Mapping[str, Any] | None = None,
     workspace_id: str = "",
+    user_id: str | None = None,
+    actor_agent_id: str | None = None,
 ) -> str:
     """Create a task via the Runtime Manor task boundary."""
 
@@ -1128,7 +1168,17 @@ async def runtime_manor_create_task(
         create_params.update(assignment_fields)
     _remove_task_assignment_aliases(create_params)
     create_params = _runtime_filter_params(create_params, _TASK_CREATE_ALLOWED_FIELDS)
-    task = await create_task(db, entity_id, **create_params)
+    if create_params.get("task_type") == "interactive":
+        # The injected conversation is the request's source chat, not the
+        # Task-owned session Conversation created on the first Task turn.
+        create_params["conversation_id"] = None
+    task = await create_task(
+        db,
+        entity_id,
+        **create_params,
+        creator_id=user_id,
+        creator_agent_id=actor_agent_id,
+    )
     await db.commit()
     result = {
         "id": task.id,
@@ -1285,9 +1335,12 @@ async def runtime_manor_add_task_comment(
     )
     log = await add_task_log(
         db,
-        raw_params.get("task_id", ""),
-        TaskLogType.coerce(raw_params.get("action_type"), default=TaskLogType.COMMENT),
-        raw_params.get("content") or raw_params.get("comment", ""),
+        task_id=raw_params.get("task_id", ""),
+        log_type=TaskLogType.coerce(
+            raw_params.get("action_type"),
+            default=TaskLogType.COMMENT,
+        ),
+        content=raw_params.get("content") or raw_params.get("comment", ""),
         actor=actor,
         created_by=created_by,
         metadata=meta,
@@ -1456,7 +1509,7 @@ async def runtime_manor_list_workspace_artifacts(
         artifact = metadata_artifact(meta)
         document_reference = _runtime_doc_summary(doc, details=True)
         document_reference.update({
-            "id": doc.id,
+            "document_id": doc.id,
             "name": doc.name,
             "source": doc.source,
             "file_type": doc.file_type,
@@ -1501,7 +1554,7 @@ async def runtime_manor_get_document(
     workspace_scope = str(raw_params.get("workspace_id") or workspace_id or "").strip() or None
     doc = await get_visible_document(
         db,
-        raw_params.get("document_id") or raw_params.get("doc_id") or raw_params.get("id") or "",
+        raw_params.get("document_id") or "",
         entity_id,
         user_id=user_id,
         workspace_id=workspace_scope,
@@ -1630,97 +1683,172 @@ async def runtime_manor_upload_document(
     workspace_id: str = "",
     conversation_id: str | None = None,
     task_id: str | None = None,
+    agent_id: str | None = None,
     approval_token: str | None = None,
+    runtime_envelope: Any | None = None,
 ) -> str:
     """Upload a file into Knowledge via the Runtime Manor document boundary."""
 
-    import shutil
+    import hashlib
+    import stat
+    import tempfile
 
-    from packages.core.config import get_settings
-    from packages.core.services.ai_file_permissions import guard_ai_file_mutation
-    from packages.core.services.knowledge_sync import sync_file_to_knowledge
+    from packages.core.ai.runtime.file_actions import (
+        RuntimeFileCommitError,
+        RuntimeFileProjectionError,
+        RuntimeFileProjectionTransactionFactory,
+        runtime_entity_file_root,
+        runtime_entity_filesystem_mutation_lock,
+        runtime_guard_file_read_access,
+        runtime_guard_file_mutation,
+    )
+    from packages.core.ai.runtime.file_contracts import FileMutationAction
+    from packages.core.services.generated_media_naming import collision_safe_artifact_path
     from packages.core.services.knowledge_visibility import is_user_visible_path, normalize_rel_path
 
-    settings = get_settings()
     raw_params = params or {}
-    file_path = raw_params.get("file_path") or raw_params.get("path", "")
+    file_path = str(raw_params.get("file_path") or raw_params.get("path", "")).strip()
     name = normalize_rel_path(raw_params.get("name") or os.path.basename(file_path))
     if not file_path:
         return json.dumps({"error": "file_path is required"})
     if not is_user_visible_path(name):
         return json.dumps({"error": "Cannot upload hidden/system document path"})
-
-    blocked = await guard_ai_file_mutation(
-        entity_id=entity_id,
-        user_id=user_id,
-        conversation_id=conversation_id,
-        tool_name="manor",
-        action="upload_document",
-        paths=[name],
-        approval_token=approval_token or raw_params.get("approval_token"),
-        content_preview={"upload": name, "source": file_path},
-    )
-    if blocked:
-        return blocked
-
-    if not os.path.isfile(file_path):
-        entity_cwd = (
-            os.path.join(settings.MANOR_FS_ROOT, entity_id)
-            if settings.MANOR_FS_ENABLED
-            else "/tmp"
-        )
-        alt = os.path.join(entity_cwd, file_path)
-        if os.path.isfile(alt):
-            file_path = alt
-        else:
-            return json.dumps({"error": f"File not found: {file_path}"})
-
-    target = None
-    entity_root = None
-    if settings.MANOR_FS_ENABLED:
-        import time as _time
-
-        entity_root = os.path.join(settings.MANOR_FS_ROOT, entity_id)
-        os.makedirs(entity_root, exist_ok=True)
-        target = os.path.normpath(os.path.join(entity_root, name))
-        if not target.startswith(os.path.normpath(entity_root)):
-            return json.dumps({"error": "Path traversal detected"})
-        os.makedirs(os.path.dirname(target), exist_ok=True)
-        if os.path.exists(target):
-            base, ext_part = os.path.splitext(os.path.basename(target))
-            target = os.path.join(os.path.dirname(target), f"{base}_{int(_time.time())}{ext_part}")
-        shutil.copy2(file_path, target)
-
-    if not target or not entity_root:
+    entity_root = runtime_entity_file_root(entity_id)
+    if not entity_root:
         return json.dumps({"error": "Entity filesystem is not enabled"})
+    entity_root = os.path.abspath(entity_root)
+    os.makedirs(entity_root, exist_ok=True)
+    source_candidate = file_path if os.path.isabs(file_path) else os.path.join(entity_root, file_path)
+    source_path = os.path.realpath(source_candidate)
+    try:
+        source_in_entity = os.path.commonpath([entity_root, source_path]) == entity_root
+    except ValueError:
+        source_in_entity = False
+    if not source_in_entity:
+        return json.dumps({
+            "error": "Upload source must be a user-visible file inside the Entity filesystem",
+        })
+    source_rel = normalize_rel_path(os.path.relpath(source_path, entity_root))
+    if not source_rel or not is_user_visible_path(source_rel):
+        return json.dumps({"error": "Cannot upload a hidden/system source file"})
 
-    sync = await sync_file_to_knowledge(
-        entity_id=entity_id,
-        abs_path=target,
-        entity_root=entity_root,
-        source="agent",
-        created_by=user_id or "ai-agent",
-        force=True,
-        workspace_id=workspace_id or raw_params.get("workspace_id"),
-        task_id=task_id or raw_params.get("task_id"),
-        agent_id=raw_params.get("agent_id"),
-        conversation_id=conversation_id,
-        user_id=user_id,
-        tool_name="manor.save_file",
-    )
+    staged_path: str | None = None
+    try:
+        async with runtime_entity_filesystem_mutation_lock(entity_root):
+            source_blocked = await runtime_guard_file_read_access(
+                entity_id=entity_id,
+                user_id=user_id,
+                workspace_id=workspace_id or None,
+                runtime_envelope=runtime_envelope,
+                tool_name="manor",
+                paths=[source_rel],
+            )
+            if source_blocked:
+                return source_blocked
+
+            try:
+                source_fd = os.open(source_path, os.O_RDONLY | os.O_NOFOLLOW)
+            except OSError:
+                return json.dumps({"error": f"File not found: {file_path}"})
+            digest = hashlib.sha256()
+            try:
+                source_stat = os.fstat(source_fd)
+                if not stat.S_ISREG(source_stat.st_mode):
+                    return json.dumps({"error": f"File not found: {file_path}"})
+                with tempfile.NamedTemporaryFile(prefix="manor-upload-", delete=False) as staged:
+                    staged_path = staged.name
+                    while chunk := os.read(source_fd, 1024 * 1024):
+                        digest.update(chunk)
+                        staged.write(chunk)
+                    staged.flush()
+                    os.fsync(staged.fileno())
+            finally:
+                os.close(source_fd)
+
+            content_sha256 = digest.hexdigest()
+            target_rel = collision_safe_artifact_path(entity_root, name)
+            blocked = await runtime_guard_file_mutation(
+                entity_id=entity_id,
+                user_id=user_id,
+                conversation_id=conversation_id,
+                workspace_id=workspace_id or None,
+                task_id=task_id,
+                runtime_envelope=runtime_envelope,
+                tool_name="manor",
+                action=FileMutationAction.UPLOAD_DOCUMENT,
+                paths=[target_rel],
+                approval_token=approval_token or raw_params.get("approval_token"),
+                content_preview={
+                    "upload": target_rel,
+                    "source": os.path.basename(file_path),
+                    "bytes": source_stat.st_size,
+                },
+                approval_payload={
+                    "target": target_rel,
+                    "content_sha256": content_sha256,
+                    "bytes": source_stat.st_size,
+                },
+            )
+            if blocked:
+                return blocked
+
+            try:
+                async with RuntimeFileProjectionTransactionFactory.create(
+                    entity_id,
+                ) as transaction:
+                    target = transaction.copy_file(
+                        target_rel,
+                        staged_path,
+                        expected_content_sha256=content_sha256,
+                        expected_size=source_stat.st_size,
+                        allow_empty=False,
+                        require_missing=True,
+                    )
+                    sync = await transaction.project_file(
+                        abs_path=target,
+                        entity_root=entity_root,
+                        source="agent",
+                        created_by=user_id or "ai-agent",
+                        force=True,
+                        workspace_id=workspace_id or None,
+                        task_id=task_id,
+                        agent_id=agent_id,
+                        conversation_id=conversation_id,
+                        user_id=user_id,
+                        tool_name="manor.save_file",
+                        expected_content_sha256=content_sha256,
+                    )
+                    await transaction.commit()
+            except RuntimeFileCommitError as exc:
+                return json.dumps({
+                    "error": f"Entity filesystem is not available: {exc}",
+                    "uploaded": False,
+                })
+            except RuntimeFileProjectionError as exc:
+                return json.dumps({
+                    "error": (
+                        "Upload could not be registered in Knowledge; the new "
+                        f"file was rolled back: {exc.reason}"
+                    ),
+                    "uploaded": False,
+                    "knowledge_sync_reason": exc.reason,
+                })
+            except Exception as exc:  # noqa: BLE001
+                return json.dumps({
+                    "error": f"Upload was not committed: {exc}",
+                    "uploaded": False,
+                })
+    finally:
+        if staged_path:
+            try:
+                os.unlink(staged_path)
+            except FileNotFoundError:
+                pass
     await _runtime_manor_invalidate_read_cache(
         entity_id,
         "list_documents",
         "search_documents",
     )
-
-    try:
-        from packages.core.tasks.ai_tasks import process_document_embeddings
-
-        if sync.document_id:
-            process_document_embeddings.delay(sync.document_id)
-    except Exception:
-        pass
 
     from packages.core.ai.runtime.document_actions import (
         runtime_document_markdown_link,
@@ -1730,7 +1858,7 @@ async def runtime_manor_upload_document(
     uploaded_name = os.path.basename(target)
     return json.dumps(
         {
-            "id": sync.document_id,
+            "document_id": sync.document_id,
             "name": uploaded_name,
             "viewer_url": runtime_document_viewer_url(sync.document_id),
             "markdown_link": runtime_document_markdown_link(uploaded_name, sync.document_id),
@@ -1754,7 +1882,7 @@ async def runtime_manor_delete_document(
     raw_params = params or {}
     ok = await delete_document(
         db,
-        raw_params.get("document_id") or raw_params.get("doc_id") or raw_params.get("id") or "",
+        raw_params.get("document_id") or "",
         entity_id,
     )
     await db.commit()
@@ -1971,9 +2099,12 @@ async def runtime_manor_delete_document_folder(
         select(Document.id).where(
             Document.entity_id == entity_id,
             Document.folder_id.in_(folder_id_list),
-        )
+        ).order_by(Document.id).with_for_update()
     )).scalars().all())
     if doc_ids:
+        from packages.core.services.comment_service import delete_resource_comments
+
+        await delete_resource_comments(db, entity_id, "document", doc_ids)
         await db.execute(
             DocumentGroupMember.__table__.delete()
             .where(DocumentGroupMember.document_id.in_(doc_ids))
@@ -2209,6 +2340,7 @@ async def runtime_manor_start_workspace_draft(
     entity_id: str,
     user_id: str = "",
     params: Mapping[str, Any] | None = None,
+    runtime_envelope: Any | None = None,
 ) -> str:
     """Start a workspace draft via the Runtime Manor action boundary."""
 
@@ -2218,6 +2350,28 @@ async def runtime_manor_start_workspace_draft(
         entity_id=entity_id,
         user_id=user_id or "",
         initial_brief=dict(params or {}).get("initial_brief"),
+        runtime_envelope=runtime_envelope,
+    )
+
+
+async def runtime_manor_continue_workspace_draft(
+    *,
+    entity_id: str,
+    user_id: str = "",
+    params: Mapping[str, Any] | None = None,
+) -> str:
+    """Continue a workspace draft via the Runtime Manor action boundary."""
+
+    from packages.core.ai.runtime.workspace_drafts import (
+        runtime_continue_workspace_draft_action,
+    )
+
+    values = dict(params or {})
+    return await runtime_continue_workspace_draft_action(
+        entity_id=entity_id,
+        user_id=user_id or "",
+        draft_id=str(values.get("draft_id") or ""),
+        message=str(values.get("message") or ""),
     )
 
 
@@ -2482,13 +2636,17 @@ async def runtime_manor_list_integrations(
 
     from packages.core.models.mcp import MCPServer
     from packages.core.services.agent_permission_service import can_use_mcp_server
+    from packages.core.services.agent_permission_service import (
+        provider_requires_integration_account_registry,
+    )
     from packages.core.services.integration_account_service import (
-        list_runtime_integration_accounts,
+        try_load_runtime_integration_registry,
     )
     from packages.core.services.integration_service import (
         coming_soon_servers,
         get_integration_inventory,
     )
+    from packages.core.services.provider_keys import canonical_provider_key
 
     raw_params = params or {}
     ready_only = (
@@ -2504,7 +2662,11 @@ async def runtime_manor_list_integrations(
     )
     provider_filter = str(provider_filter).strip().lower() if provider_filter else None
 
-    inventory = await get_integration_inventory(db, entity_id)
+    inventory = await get_integration_inventory(
+        db,
+        entity_id,
+        user_id=user_id or None,
+    )
     configured_integrations = []
     for item in inventory.get("integrations", []):
         provider = str(item.get("provider") or "")
@@ -2546,6 +2708,30 @@ async def runtime_manor_list_integrations(
     )
     server_rows = list((await db.execute(query)).scalars().all())
     coming_soon = coming_soon_servers()
+    non_account_decisions = {}
+    for server in server_rows:
+        if (
+            server.server_key not in coming_soon
+            and not provider_requires_integration_account_registry(server.server_key)
+        ):
+            non_account_decisions[server.server_key] = await can_use_mcp_server(
+                db,
+                user_id=user_id or "",
+                entity_id=entity_id,
+                server_key=server.server_key,
+                allow_env_fallback=False,
+            )
+    registry_result = await try_load_runtime_integration_registry(
+        db,
+        user_id=user_id or "",
+        entity_id=entity_id,
+        provider_keys=[provider_filter] if provider_filter else None,
+    )
+    integration_registry = registry_result.registry
+    registry_unavailable_reason = (
+        "Integration account registry could not be loaded; refusing to infer "
+        "account availability. Retry the query."
+    )
     mcp_servers = []
     for server in server_rows:
         if server.server_key == "nango" and not include_infra:
@@ -2561,37 +2747,100 @@ async def runtime_manor_list_integrations(
                 "reason": "Coming soon",
                 "coming_soon": True,
             }
-        else:
-            accounts = await list_runtime_integration_accounts(
-                db,
-                user_id=user_id or "",
-                entity_id=entity_id,
-                provider=server.server_key,
-            )
-            decision = await can_use_mcp_server(
-                db,
-                user_id=user_id or "",
-                entity_id=entity_id,
-                server_key=server.server_key,
-                allow_env_fallback=False,
-            )
+        elif (
+            integration_registry is None
+            and provider_requires_integration_account_registry(server.server_key)
+        ):
             item = {
                 "server_key": server.server_key,
                 "name": server.name,
                 "auth_type": server.auth_type,
-                "ready": bool(decision.allowed),
-                "agent_can_use": bool(decision.allowed),
-                "scope": decision.scope,
-                "reason": decision.reason,
+                "ready": False,
+                "agent_can_use": False,
+                "scope": "none",
+                "reason": registry_unavailable_reason,
                 "coming_soon": False,
-                "default_account_id": decision.account_id,
+                "default_account_id": None,
+                "account_options": [],
+                "registry_status": registry_result.status.value,
+            }
+        else:
+            accounts = (
+                list(integration_registry.accounts_for(server.server_key))
+                if integration_registry is not None
+                else []
+            )
+            binding = (
+                integration_registry.integration(server.server_key)
+                if integration_registry is not None
+                else None
+            )
+            requires_explicit_account = bool(
+                binding is not None and binding.requires_explicit_account
+            )
+            decision = non_account_decisions.get(server.server_key)
+            if decision is None and not requires_explicit_account:
+                decision = await can_use_mcp_server(
+                    db,
+                    user_id=user_id or "",
+                    entity_id=entity_id,
+                    server_key=server.server_key,
+                    integration_registry=integration_registry,
+                    allow_env_fallback=False,
+                )
+            if requires_explicit_account:
+                scopes = {account.scope.value for account in accounts}
+                ready = True
+                scope = next(iter(scopes)) if len(scopes) == 1 else "mixed"
+                reason = (
+                    f"The {server.server_key} account registry is incomplete. "
+                    "Select one exact known account; implicit default selection "
+                    "remains blocked."
+                )
+                default_account_id = None
+            else:
+                ready = bool(decision.allowed)
+                scope = decision.scope
+                reason = decision.reason
+                default_account_id = getattr(decision, "account_id", None)
+            item = {
+                "server_key": server.server_key,
+                "name": server.name,
+                "auth_type": server.auth_type,
+                "ready": ready,
+                "agent_can_use": ready,
+                "scope": scope,
+                "reason": reason,
+                "coming_soon": False,
+                "default_account_id": default_account_id,
                 "account_options": [
                     account.public_option() for account in accounts
                 ],
+                "registry_status": registry_result.status.value,
             }
+            if requires_explicit_account:
+                item["requires_explicit_account"] = True
         if ready_only and not item["ready"]:
             continue
         mcp_servers.append(item)
+
+    callable_provider_keys = {
+        canonical_provider_key(str(item.get("server_key") or ""))
+        for item in mcp_servers
+        if item.get("ready")
+    }
+    callable_provider_keys.update(
+        canonical_provider_key(str(item.get("required_provider") or ""))
+        for item in channels
+        if item.get("ready") and item.get("required_provider")
+    )
+    if ready_only:
+        configured_integrations = [
+            item
+            for item in configured_integrations
+            if canonical_provider_key(str(item.get("provider") or ""))
+            in callable_provider_keys
+        ]
 
     return json.dumps({
         "ready_only": ready_only,
@@ -2606,9 +2855,42 @@ async def runtime_manor_list_integrations(
         },
         "configured_integrations": configured_integrations,
         "mcp_servers": mcp_servers,
+        "account_registry_status": registry_result.status.value,
+        "account_registry_errors": list(registry_result.errors),
+        "account_registry": [
+            {
+                "provider": integration.provider,
+                "default_account_id": integration.default_account_id,
+                **(
+                    {"requires_explicit_account": True}
+                    if integration.requires_explicit_account
+                    else {}
+                ),
+                "account_count": len(integration.accounts),
+                "account_options": [
+                    account.public_option() for account in integration.accounts
+                ],
+            }
+            for integration in (
+                integration_registry.integrations
+                if integration_registry is not None
+                else ()
+            )
+            if integration.connected
+            and (
+                not ready_only
+                or integration.provider in callable_provider_keys
+            )
+        ],
         "channels": channels,
         "note": (
-            "MCP readiness is scoped to the current user/entity and does not use shared env fallback."
+            "MCP readiness and account_registry are scoped to the current "
+            "user/entity and do not use shared env fallback. account_registry "
+            "lists connected accounts; defaults are priority only. When "
+            "requires_explicit_account is true, omission is blocked because "
+            "the registry snapshot is incomplete. When "
+            "ready_only is true, only providers proven ready by an MCP or "
+            "registered channel call path are included."
         ),
     }, ensure_ascii=False, default=str)
 
@@ -2717,15 +2999,33 @@ async def runtime_manor_list_notifications(
     """List notifications via the Runtime Manor communication boundary."""
 
     from packages.core.services.notification_service import list_notifications
+    from packages.core.permissions import resolve_effective_user_role_name
+    from packages.core.services.workspace_access import (
+        readable_workspace_ids_for_user,
+    )
 
     if not user_id:
         return json.dumps({"error": "user_id_required"})
     raw_params = _runtime_filter_params(params, _NOTIFICATION_LIST_ALLOWED_FIELDS)
+    role = await resolve_effective_user_role_name(
+        db,
+        user_id=user_id,
+        entity_id=entity_id,
+    )
+    readable_workspace_ids = await readable_workspace_ids_for_user(
+        db,
+        entity_id=entity_id,
+        user_id=user_id,
+        role=role,
+    )
+    if readable_workspace_ids is not None:
+        raw_params["restricted_workspace_entity_ids"] = [entity_id]
+        raw_params["readable_workspace_ids"] = sorted(readable_workspace_ids)
     notifs, total = await list_notifications(db, entity_id, user_id, **raw_params)
     return json.dumps({
         "total": total,
         "notifications": [
-        {"id": n.id, "title": n.title, "read": n.read}
+        {"id": n.id, "title": n.title, "read": n.read_at is not None}
         for n in notifs
         ],
     }, default=str)
@@ -2911,12 +3211,14 @@ async def runtime_manor_send_email(
     }, default=str)
 
 
-async def runtime_manor_list_channel_bindings(db: Any, *, entity_id: str) -> str:
+async def runtime_manor_list_channel_bindings(
+    db: Any, *, entity_id: str, user_id: str,
+) -> str:
     """List channel bindings via the Runtime Manor communication boundary."""
 
     from packages.core.services.integration_service import list_channel_bindings
 
-    rows = await list_channel_bindings(db, entity_id)
+    rows = await list_channel_bindings(db, entity_id, user_id)
     return json.dumps(rows, default=str)
 
 
@@ -2924,6 +3226,7 @@ async def runtime_manor_bind_channel(
     db: Any,
     *,
     entity_id: str,
+    user_id: str,
     params: Mapping[str, Any] | None = None,
 ) -> str:
     """Bind a channel to an agent via the Runtime Manor boundary."""
@@ -2938,6 +3241,7 @@ async def runtime_manor_bind_channel(
         ch = await upsert_channel_binding(
             db,
             entity_id=entity_id,
+            user_id=user_id,
             channel_config_id=cc_id,
             agent_id=raw_params.get("agent_id"),
         )
@@ -2956,6 +3260,7 @@ async def runtime_manor_unbind_channel(
     db: Any,
     *,
     entity_id: str,
+    user_id: str,
     params: Mapping[str, Any] | None = None,
 ) -> str:
     """Remove a channel binding via the Runtime Manor boundary."""
@@ -2965,7 +3270,7 @@ async def runtime_manor_unbind_channel(
     ch_id = (params or {}).get("channel_id")
     if not ch_id:
         return json.dumps({"error": "channel_id is required"})
-    removed = await delete_channel_binding(db, entity_id, ch_id)
+    removed = await delete_channel_binding(db, entity_id, user_id, ch_id)
     if not removed:
         return json.dumps({"error": "Channel binding not found"})
     await db.commit()

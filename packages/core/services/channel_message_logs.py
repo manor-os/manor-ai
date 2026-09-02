@@ -40,7 +40,7 @@ async def create_channel_outbound_log(
 
 def normalize_channel_outbound_status(raw: str) -> str:
     status = (raw or "").strip().lower()
-    if status in {"queued", "sent", "delivered", "failed"}:
+    if status in {"queued", "sent", "delivered", "failed", "unknown"}:
         return status
     if status == "deferred":
         # Voice adapters may defer transport to a live websocket path.

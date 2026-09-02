@@ -35,7 +35,7 @@ from typing import Awaitable, Callable, Optional
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from packages.core.constants.plans import is_cloud
+from packages.core.constants.plans import ai_credit_limits_enabled, is_cloud
 
 # ---------------------------------------------------------------------------
 # Types
@@ -55,6 +55,20 @@ class GateResult:
     plan: str = ""
     overage: bool = False
     resets_at: str | None = None
+
+
+class WorkspacePlanLimitError(ValueError):
+    """Raised when a transactional Workspace materialization exceeds plan."""
+
+    def __init__(self, result: GateResult) -> None:
+        super().__init__(result.message)
+        self.detail = {
+            "message": result.message,
+            "limit": result.limit,
+            "current": result.current,
+            "plan": result.plan,
+            "kind": "workspaces",
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -172,7 +186,11 @@ def invalidate_gate_cache(entity_id: Optional[str] = None) -> None:
 
 
 async def check(
-    db: AsyncSession, entity_id: str, resource: str,
+    db: AsyncSession,
+    entity_id: str,
+    resource: str,
+    *,
+    use_cache: bool = True,
 ) -> GateResult:
     """Check if entity can use/create a resource under their plan.
 
@@ -181,8 +199,10 @@ async def check(
     """
     if not is_cloud():
         return GateResult(allowed=True)
+    if resource == "ai_budget_usd" and not ai_credit_limits_enabled():
+        return GateResult(allowed=True)
 
-    cacheable = resource != "ai_budget_usd"
+    cacheable = use_cache and resource != "ai_budget_usd"
 
     # Cache lookup — positive results only, TTL gated.
     key = _cache_key(entity_id, resource)
@@ -241,3 +261,34 @@ async def check(
     if cacheable:
         _gate_cache[key] = (result, time.monotonic() + _GATE_CACHE_TTL)
     return result
+
+
+async def enforce_workspace_capacity(
+    db: AsyncSession,
+    entity_id: str,
+) -> None:
+    """Serialize Workspace count checks with creation/restoration.
+
+    The entity row is the tenant-scoped mutex. The count must be live while
+    that lock is held; a cached positive result is not safe for a quota write.
+    OSS/local mode remains unlimited.
+    """
+    if not is_cloud():
+        return
+
+    from packages.core.models.user import Entity
+
+    locked_entity_id = (await db.execute(
+        select(Entity.id).where(Entity.id == entity_id).with_for_update()
+    )).scalar_one_or_none()
+    if locked_entity_id is None:
+        raise ValueError("Entity not found")
+
+    result = await check(
+        db,
+        entity_id,
+        "workspaces",
+        use_cache=False,
+    )
+    if not result.allowed:
+        raise WorkspacePlanLimitError(result)

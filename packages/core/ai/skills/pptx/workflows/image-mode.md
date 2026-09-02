@@ -77,7 +77,7 @@ sub-agents, do NOT batch):
      --filename page_<NN>.png
    ```
    (`import_system_image.py` polls the read-only `/workspace` mount with backoff
-   for older deployments that lack in-band delivery.)
+   only for local/legacy deployments that still provide that mount.)
 5. Glance at the result. If the text is broken or the composition is wrong,
    rewrite the prompt and regenerate that page before moving on.
 

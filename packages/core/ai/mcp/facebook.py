@@ -63,13 +63,10 @@ from typing import Any, Dict, List, Optional  # noqa: F401
 
 import httpx  # noqa: F401
 
-logger = logging.getLogger(__name__)
-
-
 from packages.core.external_api_versions import META_GRAPH as _META_PIN
-from packages.core.services.meta_graph import (
-    MetaGraphClient, MetaGraphError, graph as _graph,
-)
+from packages.core.services.meta_graph import MetaGraphError, graph as _graph
+
+logger = logging.getLogger(__name__)
 
 # Kept for back-compat with anything that still reads the literal.
 _API_VERSION = _META_PIN.value
@@ -616,13 +613,13 @@ async def _get_page(user_token: str, args: Dict[str, Any]) -> Dict[str, Any]:
 
 async def _update_page(user_token: str, args: Dict[str, Any]) -> Dict[str, Any]:
     page_id = args["page_id"]
-    page_token = await _resolve_page_token(user_token, page_id)
     body: Dict[str, Any] = {}
     for k in ("about", "website", "phone"):
         if args.get(k) is not None:
             body[k] = args[k]
     if not body:
-        return {"error": "no fields to update — pass about / website / phone"}
+        raise ValueError("no fields to update - pass about / website / phone")
+    page_token = await _resolve_page_token(user_token, page_id)
     return await _graph_post(f"/{page_id}", body, token=page_token)
 
 
@@ -666,10 +663,10 @@ async def _create_post(user_token: str, args: Dict[str, Any]) -> Dict[str, Any]:
 
 async def _create_multi_photo_post(user_token: str, args: Dict[str, Any]) -> Dict[str, Any]:
     page_id = args["page_id"]
-    page_token = await _resolve_page_token(user_token, page_id)
     image_urls = args["image_urls"] or []
     if not (2 <= len(image_urls) <= 10):
-        return {"error": "image_urls must contain 2-10 URLs"}
+        raise ValueError("image_urls must contain 2-10 URLs")
+    page_token = await _resolve_page_token(user_token, page_id)
 
     # 1. Upload each photo as unpublished, collect the photo ids.
     media_ids: List[str] = []
@@ -680,7 +677,8 @@ async def _create_multi_photo_post(user_token: str, args: Dict[str, Any]) -> Dic
             token=page_token,
         )
         if not photo.get("id"):
-            return {"error": "photo upload failed", "detail": photo}
+            detail = json.dumps(photo, ensure_ascii=False, default=str)[:300]
+            raise RuntimeError(f"photo upload failed: {detail}")
         media_ids.append(photo["id"])
 
     # 2. Attach all photos to a single feed post.
@@ -1091,13 +1089,13 @@ async def _get_instagram_media(user_token: str, args: Dict[str, Any]) -> Dict[st
 
 
 async def _create_instagram_media(user_token: str, args: Dict[str, Any]) -> Dict[str, Any]:
-    page_token = await _resolve_page_token(user_token, args["page_id"])
     image_url = args.get("image_url")
     video_url = args.get("video_url")
     if not (image_url or video_url):
-        return {"error": "provide image_url or video_url"}
+        raise ValueError("provide image_url or video_url")
     if image_url and video_url:
-        return {"error": "image_url and video_url are mutually exclusive"}
+        raise ValueError("image_url and video_url are mutually exclusive")
+    page_token = await _resolve_page_token(user_token, args["page_id"])
 
     body: Dict[str, Any] = {}
     media_type = args.get("media_type")
@@ -1268,6 +1266,8 @@ async def call_tool(
     try:
         return _ok(await handler(bearer_token, args))
     except _GraphError as exc:
+        return _err(str(exc))
+    except ValueError as exc:
         return _err(str(exc))
     except Exception as exc:  # noqa: BLE001
         logger.exception("facebook tool %s failed", name)

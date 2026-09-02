@@ -17,22 +17,35 @@ Permission gating follows the effective-capability model in
 
   1. Cross-entity isolation — you cannot touch a document outside your
      own entity, period.
-  2. Owner + admin only for write actions (grant/share).
+  2. ACL writes require owner/admin or the exact operation capability;
+     delegated grants may never exceed the grantor's effective capabilities.
 """
 from __future__ import annotations
 
 import hashlib
+import asyncio
+import logging
+import os
 import secrets
+import urllib.parse
+from contextlib import AbstractAsyncContextManager
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Literal
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import desc, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from apps.api.deps import get_current_user
 from apps.api.errors import CodedError
+from apps.api.file_responses import (
+    EntitySnapshotFileResponse,
+    entity_filesystem_read_boundary,
+)
+from apps.api.middleware.rate_limit import RateLimiter, client_ip
 from apps.api.web_base import public_web_base
 from packages.core.database import get_db
 from packages.core.models import (
@@ -50,45 +63,143 @@ from packages.core.models.base import generate_ulid
 from packages.core.models.document import Document
 from packages.core.models.staff import Staff
 from packages.core.models.user import User, UserMembership
-from packages.core.permissions import Permission, has_permission
-from packages.core.services.document_access import user_has_document_capability
+from packages.core.permissions import effective_user_has_permission, Permission
+from packages.core.services.document_access import (
+    document_is_owned_by_deleted_workspace,
+    document_grant_capabilities_for_user,
+    document_grants_for_user,
+    effective_document_folder_policy,
+    lock_folder_policy_rows,
+    lock_workspace_policy_rows,
+    resolve_document_policy_lock_scope,
+    user_can_read_document,
+    user_has_document_capability,
+)
+from packages.core.services.entity_fs import get_entity_root, resolve_path
+from packages.core.services.resource_grant_policy import (
+    ResourceGrantPolicyError,
+    ResourceGrantPolicyFactory,
+    revoke_resource_grant_family,
+    upsert_manual_resource_grant,
+)
+from packages.core.services.share_access import (
+    ShareAccessError,
+    create_otp_challenge_record,
+    create_share_view_session,
+    discard_otp_challenge,
+    share_requires_verification,
+    verify_otp_challenge,
+    verify_share_access,
+    verify_share_view_session,
+)
 
 router = APIRouter(prefix="/api/v1/documents", tags=["document-permissions"])
+logger = logging.getLogger(__name__)
+
+_SHARE_ACCESS_COOKIE = "manor_share_access"
+_SHARE_VIEW_COOKIE = "manor_share_view"
+_SHARE_VIEW_SESSION_SECONDS = 60 * 60
+_SHARE_OTP_LIMITER = RateLimiter()
 
 
 # ── Shared helpers ────────────────────────────────────────────────────────
 
 
 async def _load_doc(
-    db: AsyncSession, doc_id: str, entity_id: str
+    db: AsyncSession,
+    doc_id: str,
+    entity_id: str,
+    *,
+    for_update: bool = False,
 ) -> Document:
     """Fetch a document scoped to the actor's entity; 404 otherwise."""
-    doc = (
-        await db.execute(
-            select(Document).where(
-                Document.id == doc_id,
-                Document.entity_id == entity_id,
+    stmt = select(Document).where(
+        Document.id == doc_id,
+        Document.entity_id == entity_id,
+    )
+    if not for_update:
+        doc = (await db.execute(stmt)).scalar_one_or_none()
+        if not doc or await document_is_owned_by_deleted_workspace(db, doc):
+            raise CodedError(
+                404,
+                code="permissions.error.doc.not_found",
+                message="Document not found",
             )
-        )
-    ).scalar_one_or_none()
-    if not doc:
-        raise CodedError(
-            404,
-            code="permissions.error.doc.not_found",
-            message="Document not found",
-        )
-    return doc
+        return doc
+
+    for _attempt in range(3):
+        savepoint = await db.begin_nested()
+        try:
+            doc = (await db.execute(stmt)).scalar_one_or_none()
+            if not doc:
+                raise CodedError(
+                    404,
+                    code="permissions.error.doc.not_found",
+                    message="Document not found",
+                )
+            scope = await resolve_document_policy_lock_scope(db, doc)
+            workspaces = await lock_workspace_policy_rows(
+                db,
+                entity_id=entity_id,
+                workspace_ids=scope.workspace_ids,
+                read=True,
+            )
+            if any(workspace.deleted_at is not None for workspace in workspaces):
+                raise CodedError(
+                    404,
+                    code="permissions.error.doc.not_found",
+                    message="Document not found",
+                )
+            await lock_folder_policy_rows(
+                db,
+                entity_id=entity_id,
+                folder_id=doc.folder_id,
+                folder_ids=scope.folder_ids,
+                read=True,
+            )
+            doc = (await db.execute(
+                stmt.with_for_update().execution_options(populate_existing=True)
+            )).scalar_one_or_none()
+            if not doc:
+                raise CodedError(
+                    404,
+                    code="permissions.error.doc.not_found",
+                    message="Document not found",
+                )
+            if await resolve_document_policy_lock_scope(db, doc) != scope:
+                await savepoint.rollback()
+                continue
+            await savepoint.commit()
+            return doc
+        except Exception:
+            if savepoint.is_active:
+                await savepoint.rollback()
+            raise
+
+    raise CodedError(
+        409,
+        code="permissions.error.doc.changed_during_request",
+        message="Document changed during the request; please retry",
+    )
 
 
-def _is_owner_or_admin(doc: Document, user: User) -> bool:
+async def _is_owner_or_admin(
+    db: AsyncSession,
+    doc: Document,
+    user: User,
+) -> bool:
     """P3 minimum gate: doc owner OR tenant admin can mutate ACL."""
     if doc.owner_id and doc.owner_id == user.id:
         return True
-    return has_permission(user.role, Permission.ADMIN_SETTINGS)
+    return await effective_user_has_permission(db, user, Permission.ADMIN_SETTINGS)
 
 
-async def _can_manage_internal_acl(db: AsyncSession, doc: Document, user: User) -> bool:
-    if _is_owner_or_admin(doc, user):
+async def _can_create_internal_grant(
+    db: AsyncSession,
+    doc: Document,
+    user: User,
+) -> bool:
+    if await _is_owner_or_admin(db, doc, user):
         return True
     return await user_has_document_capability(
         db,
@@ -98,14 +209,29 @@ async def _can_manage_internal_acl(db: AsyncSession, doc: Document, user: User) 
     )
 
 
-async def _can_manage_external_share(db: AsyncSession, doc: Document, user: User) -> bool:
-    if _is_owner_or_admin(doc, user):
+async def _can_administer_internal_acl(
+    db: AsyncSession,
+    doc: Document,
+    user: User,
+) -> bool:
+    if await _is_owner_or_admin(db, doc, user):
         return True
     return await user_has_document_capability(
         db,
         document=doc,
         user_id=user.id,
-        capabilities={Capability.SHARE_EXTERNAL, Capability.GRANT_ACCESS},
+        capabilities={Capability.GRANT_ACCESS},
+    )
+
+
+async def _can_manage_external_share(db: AsyncSession, doc: Document, user: User) -> bool:
+    if await _is_owner_or_admin(db, doc, user):
+        return True
+    return await user_has_document_capability(
+        db,
+        document=doc,
+        user_id=user.id,
+        capabilities={Capability.SHARE_EXTERNAL},
     )
 
 
@@ -135,34 +261,35 @@ async def _write_access_log(
     try:
         ip = request.client.host if (request and request.client) else None
         ua = request.headers.get("user-agent") if request else None
-        await db.execute(
-            text(
-                "INSERT INTO document_access_log "
-                "(id, entity_id, document_id, workspace_id, actor_type, "
-                " actor_id, action, classification_at_access, ip, user_agent, "
-                " share_id, redacted) "
-                "VALUES (:id, :entity_id, :document_id, :workspace_id, "
-                "        :actor_type, :actor_id, :action, "
-                "        :classification, :ip, :ua, :share_id, :redacted)"
-            ),
-            {
-                "id": generate_ulid(),
-                "entity_id": doc.entity_id,
-                "document_id": doc.id,
-                "workspace_id": None,  # populate when we have workspace doc link
-                "actor_type": actor_type,
-                "actor_id": actor_id,
-                "action": action,
-                "classification": cls,
-                "ip": ip,
-                "ua": ua,
-                "share_id": share_id,
-                "redacted": redacted,
-            },
-        )
+        async with db.begin_nested():
+            await db.execute(
+                text(
+                    "INSERT INTO document_access_log "
+                    "(id, entity_id, document_id, workspace_id, actor_type, "
+                    " actor_id, action, classification_at_access, ip, user_agent, "
+                    " share_id, redacted) "
+                    "VALUES (:id, :entity_id, :document_id, :workspace_id, "
+                    "        :actor_type, :actor_id, :action, "
+                    "        :classification, :ip, :ua, :share_id, :redacted)"
+                ),
+                {
+                    "id": generate_ulid(),
+                    "entity_id": doc.entity_id,
+                    "document_id": doc.id,
+                    "workspace_id": None,  # populate when we have workspace doc link
+                    "actor_type": actor_type,
+                    "actor_id": actor_id,
+                    "action": action,
+                    "classification": cls,
+                    "ip": ip,
+                    "ua": ua,
+                    "share_id": share_id,
+                    "redacted": redacted,
+                },
+            )
     except Exception:
         # Audit must never fail the request.
-        pass
+        logger.warning("Failed to append document access log", exc_info=True)
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -370,7 +497,7 @@ async def list_doc_grants(
     db: AsyncSession = Depends(get_db),
 ):
     doc = await _load_doc(db, doc_id, user.entity_id)
-    if not await _can_manage_internal_acl(db, doc, user):
+    if not await _can_administer_internal_acl(db, doc, user):
         raise CodedError(
             403,
             code="permissions.error.doc.grant_view_forbidden",
@@ -405,32 +532,59 @@ async def create_doc_grant(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    doc = await _load_doc(db, doc_id, user.entity_id)
-    if not await _can_manage_internal_acl(db, doc, user):
+    doc = await _load_doc(db, doc_id, user.entity_id, for_update=True)
+    owner_or_admin = await _is_owner_or_admin(db, doc, user)
+    if not owner_or_admin and not await _can_create_internal_grant(db, doc, user):
         raise CodedError(
             403,
             code="permissions.error.doc.grant_owner_only",
-            message="Only the document owner/admin or a user with grant access can grant access",
+            message="Only the document owner/admin or a user with internal share access can grant access",
+        )
+    if req.subject_type != SubjectType.USER:
+        raise HTTPException(
+            400,
+            "Document grants currently support only user subjects",
         )
 
-    # Validate capability strings against the canonical Capability set.
-    _ALLOWED_CAPS = {
-        Capability.VIEW, Capability.VIEW_REDACTED, Capability.COMMENT,
-        Capability.EDIT, Capability.MANAGE_METADATA, Capability.SHARE_INTERNAL,
-        Capability.SHARE_EXTERNAL, Capability.DOWNLOAD, Capability.PRINT,
-        Capability.RECLASSIFY, Capability.DELETE, Capability.GRANT_ACCESS,
-    }
-    unknown = set(req.capabilities) - _ALLOWED_CAPS
-    if unknown:
-        raise HTTPException(400, f"Unknown capabilities: {sorted(unknown)}")
+    grantor_capabilities = None
+    if not owner_or_admin:
+        grantor_capabilities = await document_grant_capabilities_for_user(
+            db,
+            document=doc,
+            user_id=user.id,
+        )
+    expires_at = req.expires_at
+    try:
+        policy = ResourceGrantPolicyFactory.create(
+            ResourceType.DOCUMENT
+        )
+        capabilities = policy.validate(
+            req.capabilities,
+            grantor_capabilities=grantor_capabilities,
+        )
+        if not owner_or_admin:
+            expires_at = policy.delegated_expiry(
+                capabilities,
+                grants=await document_grants_for_user(db, document=doc, user_id=user.id),
+                expires_at=expires_at,
+            )
+    except ResourceGrantPolicyError as exc:
+        raise HTTPException(
+            403 if grantor_capabilities is not None else 400,
+            str(exc),
+        ) from exc
 
     # Invariant 7: agents can never receive share_external on confidential+
     # (this endpoint serves human grants but defense-in-depth)
     if (
-        Capability.SHARE_EXTERNAL in req.capabilities
-        and getattr(doc, "classification", None) in {Classification.CONFIDENTIAL, Classification.RESTRICTED}
+        Capability.SHARE_EXTERNAL in capabilities
+        and getattr(doc, "classification", None)
+        in {Classification.CONFIDENTIAL, Classification.RESTRICTED}
     ):
-        raise HTTPException(400, "share_external requires the per-share approval path on confidential+ docs")
+        raise HTTPException(
+            400,
+            "share_external requires the per-share approval path on confidential+ docs",
+        )
 
     subject_id = req.subject_id
     existing_subject_ids = [subject_id]
@@ -442,40 +596,18 @@ async def create_doc_grant(
         )
         existing_subject_ids = list(dict.fromkeys([subject_id, req.subject_id]))
 
-    # Idempotent: upsert (resource, subject) — replace capabilities on existing.
-    existing = (
-        await db.execute(
-            select(ResourceGrant).where(
-                ResourceGrant.resource_type == ResourceType.DOCUMENT,
-                ResourceGrant.resource_id == doc.id,
-                ResourceGrant.subject_type == req.subject_type,
-                ResourceGrant.subject_id.in_(existing_subject_ids),
-                ResourceGrant.status == GrantStatus.ACTIVE,
-            ).limit(1)
-        )
-    ).scalar_one_or_none()
-    if existing:
-        existing.subject_id = subject_id
-        existing.capabilities = req.capabilities
-        existing.expires_at = req.expires_at
-        existing.granted_by = user.id
-        existing.granted_at = datetime.now(timezone.utc)
-        grant = existing
-    else:
-        grant = ResourceGrant(
-            id=generate_ulid(),
-            entity_id=user.entity_id,
-            resource_type=ResourceType.DOCUMENT,
-            resource_id=doc.id,
-            subject_type=req.subject_type,
-            subject_id=subject_id,
-            capabilities=req.capabilities,
-            granted_by=user.id,
-            granted_at=datetime.now(timezone.utc),
-            expires_at=req.expires_at,
-            status=GrantStatus.ACTIVE,
-        )
-        db.add(grant)
+    grant = await upsert_manual_resource_grant(
+        db,
+        entity_id=user.entity_id,
+        resource_type=ResourceType.DOCUMENT,
+        resource_id=doc.id,
+        subject_type=req.subject_type,
+        subject_id=subject_id,
+        equivalent_subject_ids=existing_subject_ids,
+        capabilities=capabilities,
+        granted_by=user.id,
+        expires_at=expires_at,
+    )
     await db.commit()
     await db.refresh(grant)
     return await _grant_to_response(db, grant)
@@ -488,8 +620,8 @@ async def revoke_doc_grant(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    doc = await _load_doc(db, doc_id, user.entity_id)
-    if not await _can_manage_internal_acl(db, doc, user):
+    doc = await _load_doc(db, doc_id, user.entity_id, for_update=True)
+    if not await _can_administer_internal_acl(db, doc, user):
         raise CodedError(
             403,
             code="permissions.error.doc.grant_revoke_owner_only",
@@ -502,7 +634,7 @@ async def revoke_doc_grant(
                 ResourceGrant.resource_type == ResourceType.DOCUMENT,
                 ResourceGrant.resource_id == doc.id,
                 ResourceGrant.entity_id == user.entity_id,
-            )
+            ).with_for_update()
         )
     ).scalar_one_or_none()
     if not grant:
@@ -511,9 +643,25 @@ async def revoke_doc_grant(
             code="permissions.error.doc.grant_not_found",
             message="Grant not found",
         )
-    grant.status = GrantStatus.REVOKED
-    grant.revoked_at = datetime.now(timezone.utc)
-    grant.revoked_by = user.id
+    equivalent_subject_ids = [grant.subject_id]
+    if grant.subject_type == SubjectType.USER:
+        canonical_subject_id, _subject_user, subject_staff = (
+            await _resolve_user_grant_subject(
+                db,
+                entity_id=user.entity_id,
+                subject_id=grant.subject_id,
+            )
+        )
+        equivalent_subject_ids.extend([
+            canonical_subject_id,
+            subject_staff.id if subject_staff else canonical_subject_id,
+        ])
+    await revoke_resource_grant_family(
+        db,
+        target=grant,
+        equivalent_subject_ids=equivalent_subject_ids,
+        revoked_by=user.id,
+    )
     await db.commit()
 
 
@@ -548,9 +696,9 @@ class CreateShareRequest(BaseModel):
     audience_type: Literal["anonymous", "email", "domain"] = "anonymous"
     audience_value: str | None = None
     capabilities: list[str] = Field(default_factory=lambda: ["view"])
-    expires_in_days: int = Field(default=7, ge=1, le=90)
+    expires_in_days: int | None = Field(default=7, ge=1, le=90)
     watermark: bool = True
-    require_otp: bool = True
+    require_otp: bool = False
     allow_download: bool = False
 
 
@@ -614,16 +762,22 @@ def _normalize_share_config(req: CreateShareRequest) -> str:
             400,
             f"External shares only support {sorted(_EXTERNAL_CAPS)}; got {sorted(unknown)}",
         )
+    if Capability.VIEW not in req.capabilities:
+        raise HTTPException(400, "External shares must include the view capability")
     if req.audience_type == "anonymous":
         return "anonymous"
     if req.audience_type == "email":
         if not req.audience_value:
             raise HTTPException(400, "audience_value required for email audience")
+        if not req.require_otp:
+            raise HTTPException(400, "Email audience shares require OTP verification")
         return f"email:{req.audience_value.strip().lower()}"
     if req.audience_type == "domain":
         if not req.audience_value:
             raise HTTPException(400, "audience_value required for domain audience")
-        return f"domain:{req.audience_value.strip().lower()}"
+        if not req.require_otp:
+            raise HTTPException(400, "Domain audience shares require OTP verification")
+        return f"domain:{req.audience_value.strip().lower().lstrip('@')}"
     raise HTTPException(400, f"Invalid audience_type: {req.audience_type}")
 
 
@@ -635,13 +789,41 @@ async def _materialize_share(
     req: CreateShareRequest,
     audience: str,
     request: Request,
+    approved_external_share: bool = False,
+    delegated_expires_at: datetime | None = None,
 ) -> tuple[Share, str, str]:
     """Persist a new Share row + write the audit entry; return (share, raw_token, url).
 
     Caller is responsible for ``await db.commit()`` and ``await db.refresh(share)``.
     """
+    effective_classification, _visibility, _client_visible = (
+        await effective_document_folder_policy(db, doc)
+    )
+    if effective_classification == Classification.RESTRICTED:
+        raise CodedError(
+            400,
+            code="permissions.error.doc.restricted_no_external",
+            message="Restricted documents cannot be shared externally",
+        )
+    if (
+        effective_classification == Classification.CONFIDENTIAL
+        and not approved_external_share
+    ):
+        raise CodedError(
+            409,
+            code="permissions.error.doc.confidential_needs_approval",
+            message="Confidential documents require approval",
+        )
+    if effective_classification == Classification.CONFIDENTIAL and (
+        req.audience_type == "anonymous" or not req.require_otp
+    ):
+        raise HTTPException(
+            400,
+            "Confidential external shares require an OTP-protected email or domain audience",
+        )
     raw_token = secrets.token_urlsafe(32)
     token_hash = _hash_token(raw_token)
+    now = datetime.now(timezone.utc)
     share = Share(
         id=generate_ulid(),
         entity_id=doc.entity_id,
@@ -654,11 +836,17 @@ async def _materialize_share(
         watermark=req.watermark,
         allow_download=req.allow_download and (Capability.DOWNLOAD in req.capabilities),
         created_by=creator_user_id,
-        created_at=datetime.now(timezone.utc),
-        expires_at=datetime.now(timezone.utc) + timedelta(days=req.expires_in_days),
+        created_at=now,
+        expires_at=delegated_expires_at or (
+            now + timedelta(days=req.expires_in_days) if req.expires_in_days is not None else None
+        ),
         max_uses=None,
         use_count=0,
         status="active",
+        metadata_={
+            "classification_at_creation": str(effective_classification or ""),
+            "approved_external_share": approved_external_share,
+        },
     )
     db.add(share)
     await _write_access_log(
@@ -704,7 +892,7 @@ async def create_doc_share(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    doc = await _load_doc(db, doc_id, user.entity_id)
+    doc = await _load_doc(db, doc_id, user.entity_id, for_update=True)
     if not await _can_manage_external_share(db, doc, user):
         raise CodedError(
             403,
@@ -712,7 +900,9 @@ async def create_doc_share(
             message="Only the document owner/admin or a user with external share access can share externally",
         )
 
-    cls = getattr(doc, "classification", None)
+    cls, _visibility, _client_visible = await effective_document_folder_policy(
+        db, doc
+    )
     # RFC §13.14 invariants
     if cls == Classification.RESTRICTED:
         raise CodedError(
@@ -731,9 +921,32 @@ async def create_doc_share(
         )
 
     audience = _normalize_share_config(req)
+    delegated_expires_at = None
+    if not await _is_owner_or_admin(db, doc, user):
+        policy = ResourceGrantPolicyFactory.create(ResourceType.DOCUMENT)
+        grants = await document_grants_for_user(db, document=doc, user_id=user.id)
+        implicit_view = await user_can_read_document(
+            db, doc, entity_id=user.entity_id, user_id=user.id, role=user.role,
+            allow_redacted=False, include_grants=False,
+        )
+        try:
+            delegated_expires_at = policy.delegated_expiry(
+                req.capabilities,
+                grants=grants,
+                expires_at=(
+                    datetime.now(timezone.utc) + timedelta(days=req.expires_in_days)
+                    if req.expires_in_days is not None else None
+                ),
+                authority_capabilities=(Capability.SHARE_EXTERNAL,),
+                clamp_expiry="expires_in_days" not in req.model_fields_set,
+                implicit_capabilities=(Capability.VIEW,) if implicit_view else (),
+            )
+        except ResourceGrantPolicyError as exc:
+            raise HTTPException(403, str(exc)) from exc
     share, raw_token, url = await _materialize_share(
         db, doc=doc, creator_user_id=user.id,
         req=req, audience=audience, request=request,
+        delegated_expires_at=delegated_expires_at,
     )
     await db.commit()
     await db.refresh(share)
@@ -747,7 +960,7 @@ async def revoke_doc_share(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    doc = await _load_doc(db, doc_id, user.entity_id)
+    doc = await _load_doc(db, doc_id, user.entity_id, for_update=True)
     if not await _can_manage_external_share(db, doc, user):
         raise CodedError(
             403,
@@ -794,67 +1007,530 @@ class SharedDocResponse(BaseModel):
 
 public_router = APIRouter(prefix="/api/v1/shared-doc", tags=["public-share"])
 
+_PUBLIC_CLASS_RANK = {
+    Classification.PUBLIC: 0,
+    Classification.INTERNAL: 1,
+    Classification.CONFIDENTIAL: 2,
+    Classification.RESTRICTED: 3,
+}
 
-@public_router.get("/{token}", response_model=SharedDocResponse)
-async def view_shared_doc(
+
+async def _load_public_document_share(
+    db: AsyncSession,
     token: str,
-    request: Request,
-    db: AsyncSession = Depends(get_db),
-):
-    """Unauthenticated. Look up a share by hashed token; enforce expiry &
-    use-count; bump counters; write access log."""
+    *,
+    share_for_update: bool = False,
+    allow_use_limit_reached: bool = False,
+) -> tuple[Share, Document, datetime]:
     token_hash = _hash_token(token)
-    share = (
-        await db.execute(
-            select(Share).where(
-                Share.token_hash == token_hash,
-                Share.status == "active",
+    for _attempt in range(3):
+        savepoint = await db.begin_nested()
+        try:
+            share_scope = (await db.execute(
+                select(Share).where(
+                    Share.token_hash == token_hash,
+                    Share.status == "active",
+                )
+            )).scalar_one_or_none()
+            if not share_scope:
+                raise CodedError(
+                    404,
+                    code="permissions.error.share.not_found_or_revoked",
+                    message="Share not found or revoked",
+                )
+            if share_scope.resource_type != ResourceType.DOCUMENT:
+                raise HTTPException(404, "Not a document share")
+
+            doc_stmt = select(Document).where(
+                Document.id == share_scope.resource_id,
+                Document.entity_id == share_scope.entity_id,
             )
+            doc = (await db.execute(doc_stmt)).scalar_one_or_none()
+            if not doc:
+                raise HTTPException(404, "Underlying document not found")
+            scope = await resolve_document_policy_lock_scope(db, doc)
+            workspaces = await lock_workspace_policy_rows(
+                db,
+                entity_id=doc.entity_id,
+                workspace_ids=scope.workspace_ids,
+                read=True,
+            )
+            if any(workspace.deleted_at is not None for workspace in workspaces):
+                raise CodedError(
+                    410,
+                    code="permissions.error.share.revoked_by_workspace_lifecycle",
+                    message="Share is no longer available",
+                )
+            await lock_folder_policy_rows(
+                db,
+                entity_id=doc.entity_id,
+                folder_id=doc.folder_id,
+                folder_ids=scope.folder_ids,
+                read=True,
+            )
+            doc = (await db.execute(
+                doc_stmt.with_for_update(read=True).execution_options(
+                    populate_existing=True
+                )
+            )).scalar_one_or_none()
+            if not doc:
+                raise HTTPException(404, "Underlying document not found")
+            if await resolve_document_policy_lock_scope(db, doc) != scope:
+                await savepoint.rollback()
+                continue
+
+            share = (await db.execute(
+                select(Share)
+                .where(
+                    Share.id == share_scope.id,
+                    Share.token_hash == token_hash,
+                    Share.status == "active",
+                    Share.resource_type == ResourceType.DOCUMENT,
+                    Share.resource_id == doc.id,
+                    Share.entity_id == doc.entity_id,
+                )
+                .with_for_update(read=not share_for_update)
+                .execution_options(populate_existing=True)
+            )).scalar_one_or_none()
+            if not share:
+                raise CodedError(
+                    404,
+                    code="permissions.error.share.not_found_or_revoked",
+                    message="Share not found or revoked",
+                )
+            now = datetime.now(timezone.utc)
+            if share.expires_at and share.expires_at < now:
+                raise CodedError(410, code="permissions.error.share.expired", message="Share link has expired")
+            if (
+                share.max_uses is not None
+                and (share.use_count or 0) >= share.max_uses
+                and not allow_use_limit_reached
+            ):
+                raise CodedError(
+                    410,
+                    code="permissions.error.share.use_limit_reached",
+                    message="Share link reached use limit",
+                )
+            if Capability.VIEW not in set(share.capabilities or []):
+                raise CodedError(403, code="permissions.error.share.view_not_allowed", message="Share does not allow viewing")
+            if bool(getattr(doc, "is_trashed", False)):
+                raise HTTPException(404, "Underlying document not found")
+            if getattr(doc, "quarantine_status", None) in {"quarantined", "rejected"}:
+                raise HTTPException(404, "Underlying document not found")
+            current_classification, _effective_visibility, _client_visible = (
+                await effective_document_folder_policy(db, doc)
+            )
+            if current_classification == Classification.RESTRICTED:
+                raise CodedError(410, code="permissions.error.share.revoked_by_policy", message="Share is no longer available")
+            metadata = dict(getattr(share, "metadata_", {}) or {})
+            created_classification = metadata.get("classification_at_creation")
+            if created_classification in _PUBLIC_CLASS_RANK and (
+                _PUBLIC_CLASS_RANK.get(current_classification, 1)
+                > _PUBLIC_CLASS_RANK[created_classification]
+            ):
+                raise CodedError(410, code="permissions.error.share.revoked_by_policy", message="Share is no longer available")
+            if current_classification == Classification.CONFIDENTIAL and not metadata.get(
+                "approved_external_share"
+            ):
+                raise CodedError(410, code="permissions.error.share.revoked_by_policy", message="Share is no longer available")
+            await savepoint.commit()
+            return share, doc, now
+        except Exception:
+            if savepoint.is_active:
+                await savepoint.rollback()
+            raise
+
+    raise CodedError(
+        409,
+        code="permissions.error.share.resource_changed",
+        message="Shared document changed during the request; please retry",
+    )
+
+
+async def _acquire_public_document_file_boundary(
+    db: AsyncSession,
+    token: str,
+    *,
+    expected_entity_id: str,
+    share_for_update: bool = False,
+) -> tuple[AbstractAsyncContextManager[None], Share, Document, datetime]:
+    """Authorize again under the filesystem read lock used by the response."""
+    await db.rollback()
+    for _attempt in range(3):
+        read_boundary = entity_filesystem_read_boundary(
+            get_entity_root(expected_entity_id)
         )
-    ).scalar_one_or_none()
-    if not share:
+        await read_boundary.__aenter__()
+        try:
+            share, doc, now = await _load_public_document_share(
+                db,
+                token,
+                share_for_update=share_for_update,
+                allow_use_limit_reached=True,
+            )
+            if str(doc.entity_id) != expected_entity_id:
+                expected_entity_id = str(doc.entity_id)
+                await db.rollback()
+                await read_boundary.__aexit__(None, None, None)
+                continue
+            return read_boundary, share, doc, now
+        except BaseException:
+            await read_boundary.__aexit__(None, None, None)
+            raise
+
+    raise CodedError(
+        409,
+        code="permissions.error.share.resource_changed",
+        message="Shared document changed during the request; please retry",
+    )
+
+
+def _require_public_share_access(share: Share, access_token: str | None) -> str | None:
+    try:
+        return verify_share_access(share, access_token)
+    except ShareAccessError as exc:
         raise CodedError(
-            404,
-            code="permissions.error.share.not_found_or_revoked",
-            message="Share not found or revoked",
-        )
-    now = datetime.now(timezone.utc)
-    if share.expires_at and share.expires_at < now:
-        raise CodedError(
-            410,
-            code="permissions.error.share.expired",
-            message="Share link has expired",
-        )
-    if share.max_uses is not None and share.use_count >= share.max_uses:
+            401,
+            code="permissions.error.share.verification_required",
+            message=str(exc),
+        ) from exc
+
+
+def _require_public_share_view_session(share: Share, session_token: str | None) -> None:
+    if share.max_uses is None:
+        return
+    if not verify_share_view_session(share, session_token):
         raise CodedError(
             410,
             code="permissions.error.share.use_limit_reached",
             message="Share link reached use limit",
         )
-    if share.resource_type != ResourceType.DOCUMENT:
-        raise HTTPException(404, "Not a document share")
 
-    doc = (
-        await db.execute(
-            select(Document).where(Document.id == share.resource_id)
+
+def _require_public_share_download_access(
+    share: Share,
+    *,
+    request: Request,
+    access_token: str | None,
+) -> str | None:
+    verified_email = _require_public_share_access(
+        share,
+        access_token or request.cookies.get(_SHARE_ACCESS_COOKIE),
+    )
+    _require_public_share_view_session(
+        share,
+        request.cookies.get(_SHARE_VIEW_COOKIE),
+    )
+    if "download" not in set(share.capabilities or []) or not getattr(
+        share,
+        "allow_download",
+        False,
+    ):
+        raise CodedError(
+            403,
+            code="permissions.error.share.download_not_allowed",
+            message="This share link does not allow downloading the file",
         )
-    ).scalar_one_or_none()
-    if not doc:
-        raise HTTPException(404, "Underlying document not found")
+    return verified_email
+
+
+def _require_public_document_file_path(
+    doc: Document,
+    *,
+    unavailable_message: str,
+) -> str:
+    if not getattr(doc, "fs_path", None):
+        raise CodedError(
+            404,
+            code="permissions.error.share.file_unavailable",
+            message=unavailable_message,
+        )
+    full_path = resolve_path(doc.entity_id, str(doc.fs_path))
+    if not full_path:
+        raise HTTPException(403, "Access denied")
+    if not os.path.isfile(full_path):
+        raise CodedError(
+            404,
+            code="permissions.error.share.file_unavailable",
+            message=unavailable_message,
+        )
+    return full_path
+
+
+async def _load_shared_preview_source(
+    db: AsyncSession,
+    token: str,
+    request: Request,
+    access_token: str | None,
+    expected_kind: Literal["docx", "pptx"],
+) -> tuple[Document, str]:
+    """Resolve one token-authorized Office source without exposing its identity."""
+    from apps.api.routers import documents
+    from packages.core.config import get_settings
+
+    share, doc, _now = await _load_public_document_share(
+        db,
+        token,
+        allow_use_limit_reached=True,
+    )
+    _require_public_share_access(
+        share,
+        access_token or request.cookies.get(_SHARE_ACCESS_COOKIE),
+    )
+    _require_public_share_view_session(share, request.cookies.get(_SHARE_VIEW_COOKIE))
+    if not get_settings().MANOR_FS_ENABLED:
+        raise CodedError(
+            404,
+            code="permissions.error.share.file_unavailable",
+            message="File is not available for preview",
+        )
+    if expected_kind == "docx" and not documents._is_docx_document(doc):
+        raise HTTPException(400, "Not a Word document")
+    if expected_kind == "pptx" and not documents._is_pptx_document(doc):
+        raise HTTPException(400, "Not a presentation file")
+    source_path = documents._document_full_path(doc, str(doc.entity_id))
+    if not source_path or not os.path.isfile(source_path):
+        raise CodedError(
+            404,
+            code="permissions.error.share.file_unavailable",
+            message="File is not available for preview",
+        )
+    return doc, source_path
+
+
+async def _render_shared_office_preview(
+    token: str,
+    request: Request,
+    access_token: str | None,
+    db: AsyncSession,
+    expected_kind: Literal["docx", "pptx"],
+) -> tuple[list[str], Document]:
+    """Render a share-scoped Office source with the internal cache contract."""
+    from apps.api.routers import documents
+    from packages.core.services.slide_renderer import (
+        OfficeRenderLimitError,
+        render_document_pages,
+        render_slides,
+    )
+
+    doc, source_path = await _load_shared_preview_source(
+        db, token, request, access_token, expected_kind,
+    )
+    entity_id = str(doc.entity_id)
+    cache_name = ".document-page-cache" if expected_kind == "docx" else ".slide-cache"
+    cache_dir = os.path.join(documents.settings.MANOR_FS_ROOT, entity_id, cache_name, doc.id)
+
+    # Do not occupy a database transaction while waiting for the entity lock.
+    await db.rollback()
+    async with documents._document_filesystem_mutation(entity_id):
+        doc, source_path = await _load_shared_preview_source(
+            db, token, request, access_token, expected_kind,
+        )
+        source_snapshot = await asyncio.to_thread(
+            documents._capture_document_source_snapshot,
+            source_path,
+        )
+        document_ext = documents._document_ext(doc)
+        source_ext = (
+            f".{document_ext}" if document_ext in {"doc", "docx", "wps"} else ".docx"
+        ) if expected_kind == "docx" else documents._presentation_source_format(doc)
+        await db.rollback()
+
+    try:
+        paths = await (
+            render_document_pages(source_path, cache_dir, source_ext=source_ext)
+            if expected_kind == "docx"
+            else render_slides(source_path, cache_dir, source_ext=source_ext)
+        )
+    except OfficeRenderLimitError as exc:
+        raise HTTPException(413, str(exc)) from exc
+    except Exception as exc:
+        logger.warning("Shared %s preview rendering failed: %s", expected_kind, exc)
+        raise HTTPException(502, "Office preview rendering failed") from exc
+
+    async with documents._document_filesystem_mutation(entity_id):
+        current_doc, current_source_path = await _load_shared_preview_source(
+            db, token, request, access_token, expected_kind,
+        )
+        source_matches = await asyncio.to_thread(
+            documents._document_source_matches,
+            source_snapshot,
+            current_source_path,
+        )
+        if not source_matches:
+            raise HTTPException(
+                409,
+                {
+                    "code": "document_source_changed",
+                    "message": "Document changed while its preview was being prepared",
+                },
+            )
+        await asyncio.to_thread(
+            documents._publish_rendered_preview_version,
+            cache_dir,
+            paths,
+            source_snapshot.path,
+        )
+        await db.rollback()
+    return paths, current_doc
+
+
+class ShareOtpRequest(BaseModel):
+    email: str = Field(min_length=3, max_length=320)
+
+
+class ShareOtpVerifyRequest(ShareOtpRequest):
+    code: str = Field(min_length=6, max_length=6)
+
+
+async def _limit_share_otp(request: Request, share_id: str, purpose: str) -> None:
+    max_requests = 5 if purpose == "request" else 10
+    window_seconds = 10 * 60
+    result = await _SHARE_OTP_LIMITER.check(
+        f"share-otp:{purpose}:{share_id}:{client_ip(request)}",
+        max_requests,
+        window_seconds,
+    )
+    if not result.allowed:
+        raise HTTPException(
+            429,
+            "Too many verification attempts. Please try again later",
+            headers={"Retry-After": str(result.retry_after or window_seconds)},
+        )
+
+
+@public_router.post("/{token}/request-otp")
+async def request_shared_doc_otp(
+    token: str,
+    req: ShareOtpRequest,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
+    share, _doc, _now = await _load_public_document_share(db, token)
+    share_id = str(share.id)
+    await db.rollback()
+    await _limit_share_otp(request, share_id, "request")
+    share, _doc, _now = await _load_public_document_share(
+        db,
+        token,
+        share_for_update=True,
+    )
+    if not share_requires_verification(share):
+        raise HTTPException(400, "This share does not require email verification")
+    try:
+        challenge = create_otp_challenge_record(share, req.email)
+    except ShareAccessError:
+        # Keep recipient membership private even from someone holding the
+        # opaque share URL. The response is intentionally indistinguishable.
+        await db.rollback()
+        return {"status": "sent"}
+    from packages.core.services.email_service import send_share_verification_email
+
+    # The challenge must be durable before external provider I/O, and no
+    # lifecycle/resource/share row lock may be held while email is sent.
+    await db.commit()
+    if not await send_share_verification_email(challenge.email, challenge.code):
+        failed_share = (await db.execute(
+            select(Share)
+            .where(
+                Share.id == share_id,
+                Share.entity_id == share.entity_id,
+            )
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )).scalar_one_or_none()
+        if failed_share is not None:
+            discard_otp_challenge(
+                failed_share,
+                challenge.email,
+                challenge.challenge_id,
+            )
+            await db.commit()
+        raise HTTPException(503, "Verification email could not be sent")
+    return {"status": "sent"}
+
+
+@public_router.post("/{token}/verify-otp")
+async def verify_shared_doc_otp(
+    token: str,
+    req: ShareOtpVerifyRequest,
+    request: Request,
+    response: Response,
+    db: AsyncSession = Depends(get_db),
+):
+    share, _doc, _now = await _load_public_document_share(db, token)
+    share_id = str(share.id)
+    await db.rollback()
+    await _limit_share_otp(request, share_id, "verify")
+    share, _doc, _now = await _load_public_document_share(
+        db,
+        token,
+        share_for_update=True,
+    )
+    try:
+        access_token = verify_otp_challenge(share, req.email, req.code)
+    except ShareAccessError as exc:
+        await db.commit()
+        raise HTTPException(400, str(exc)) from exc
+    response.set_cookie(
+        key=_SHARE_ACCESS_COOKIE,
+        value=access_token,
+        max_age=3600,
+        httponly=True,
+        secure=request.url.scheme == "https",
+        samesite="strict",
+        path=f"/api/v1/shared-doc/{token}",
+    )
+    await db.commit()
+    return {"access_token": access_token, "expires_in": 3600}
+
+
+@public_router.get("/{token}", response_model=SharedDocResponse)
+async def view_shared_doc(
+    token: str,
+    request: Request,
+    response: Response,
+    access_token: str | None = Query(None),
+    db: AsyncSession = Depends(get_db),
+):
+    """Unauthenticated. Look up a share by hashed token; enforce expiry &
+    use-count; bump counters; write access log."""
+    share, doc, now = await _load_public_document_share(
+        db,
+        token,
+        share_for_update=True,
+    )
+    verified_email = _require_public_share_access(
+        share,
+        access_token or request.cookies.get(_SHARE_ACCESS_COOKIE),
+    )
+    effective_classification, _visibility, _client_visible = (
+        await effective_document_folder_policy(db, doc)
+    )
 
     share.use_count = (share.use_count or 0) + 1
     share.last_used_at = now
 
     await _write_access_log(
-        db, doc=doc, actor_type="share_token", actor_id=share.id,
+        db, doc=doc, actor_type="share_token", actor_id=verified_email or share.id,
         action="share_use", share_id=share.id, request=request,
     )
 
+    if share.max_uses is not None:
+        response.set_cookie(
+            key=_SHARE_VIEW_COOKIE,
+            value=create_share_view_session(share=share, use_count=share.use_count),
+            max_age=_SHARE_VIEW_SESSION_SECONDS,
+            httponly=True,
+            secure=request.url.scheme == "https",
+            samesite="strict",
+            path=f"/api/v1/shared-doc/{token}",
+        )
     await db.commit()
     return SharedDocResponse(
         document_id=doc.id,
         name=doc.name,
-        classification=getattr(doc, "classification", None),
+        classification=effective_classification,
         capabilities=list(share.capabilities or []),
         watermark=bool(share.watermark),
         allow_download=bool(share.allow_download),
@@ -869,6 +1545,7 @@ async def view_shared_doc(
 async def view_shared_doc_content(
     token: str,
     request: Request,
+    access_token: str | None = Query(None),
     db: AsyncSession = Depends(get_db),
 ):
     """Serve the file bytes *inline* for a public document share.
@@ -883,88 +1560,191 @@ async def view_shared_doc_content(
     ``Content-Disposition: inline`` so PDFs/images render in the
     browser tab / iframe / <img> rather than downloading.
     """
-    from fastapi.responses import FileResponse
-
-    token_hash = _hash_token(token)
-    share = (
-        await db.execute(
-            select(Share).where(
-                Share.token_hash == token_hash,
-                Share.status == "active",
-            )
-        )
-    ).scalar_one_or_none()
-    if not share:
-        raise CodedError(
-            404,
-            code="permissions.error.share.not_found_or_revoked",
-            message="Share not found or revoked",
-        )
-    now = datetime.now(timezone.utc)
-    if share.expires_at and share.expires_at < now:
-        raise CodedError(
-            410,
-            code="permissions.error.share.expired",
-            message="Share link has expired",
-        )
-    if share.max_uses is not None and share.use_count >= share.max_uses:
-        raise CodedError(
-            410,
-            code="permissions.error.share.use_limit_reached",
-            message="Share link reached use limit",
-        )
-    if share.resource_type != ResourceType.DOCUMENT:
-        raise HTTPException(404, "Not a document share")
-
-    doc = (
-        await db.execute(select(Document).where(Document.id == share.resource_id))
-    ).scalar_one_or_none()
-    if not doc:
-        raise HTTPException(404, "Underlying document not found")
-
-    if not getattr(doc, "fs_path", None):
-        raise CodedError(
-            404,
-            code="permissions.error.share.file_unavailable",
-            message="File is not available for preview",
-        )
-    import os as _os
-    from packages.core.services.entity_fs import resolve_path
-
-    full_path = resolve_path(doc.entity_id, str(doc.fs_path))
-    if not full_path:
-        raise HTTPException(403, "Access denied")
-    if not _os.path.isfile(full_path):
-        raise CodedError(
-            404,
-            code="permissions.error.share.file_unavailable",
-            message="File is not available for preview",
-        )
-
-    share.use_count = (share.use_count or 0) + 1
-    share.last_used_at = now
-    await _write_access_log(
-        db, doc=doc, actor_type="share_token", actor_id=share.id,
-        action="share_view_content", share_id=share.id, request=request,
+    scoped_share, scoped_doc, _now = await _load_public_document_share(
+        db,
+        token,
+        allow_use_limit_reached=True,
     )
-    await db.commit()
+    _require_public_share_access(
+        scoped_share,
+        access_token or request.cookies.get(_SHARE_ACCESS_COOKIE),
+    )
+    _require_public_share_view_session(
+        scoped_share,
+        request.cookies.get(_SHARE_VIEW_COOKIE),
+    )
+    _require_public_document_file_path(
+        scoped_doc,
+        unavailable_message="File is not available for preview",
+    )
+    read_boundary, share, doc, _now = await _acquire_public_document_file_boundary(
+        db,
+        token,
+        expected_entity_id=str(scoped_doc.entity_id),
+    )
+    try:
+        _require_public_share_access(
+            share,
+            access_token or request.cookies.get(_SHARE_ACCESS_COOKIE),
+        )
+        _require_public_share_view_session(
+            share,
+            request.cookies.get(_SHARE_VIEW_COOKIE),
+        )
 
-    return FileResponse(
-        path=full_path,
-        media_type=doc.mime_type or "application/octet-stream",
+        full_path = _require_public_document_file_path(
+            doc,
+            unavailable_message="File is not available for preview",
+        )
+
+        media_type = doc.mime_type or "application/octet-stream"
+        await db.rollback()
+        return EntitySnapshotFileResponse(
+            path=full_path,
+            media_type=media_type,
+            headers={
+                "Content-Disposition": "inline",
+                # Public share content is sensitive-ish; don't let shared
+                # proxies cache it. Browser may still keep it for the tab.
+                "Cache-Control": "private, no-store",
+            },
+            read_boundary=read_boundary,
+        )
+    except BaseException:
+        await read_boundary.__aexit__(None, None, None)
+        raise
+
+
+def _shared_preview_response(rendered_file, *, filename: str) -> StreamingResponse:
+    from apps.api.routers import documents
+
+    return StreamingResponse(
+        documents._stream_open_file(rendered_file),
+        media_type="image/png",
         headers={
-            "Content-Disposition": "inline",
-            # Public share content is sensitive-ish; don't let shared
-            # proxies cache it. Browser may still keep it for the tab.
             "Cache-Control": "private, no-store",
+            "Content-Disposition": f"inline; filename*=UTF-8''{urllib.parse.quote(filename)}",
         },
     )
+
+
+@public_router.get("/{token}/preview/pages")
+async def get_shared_document_page_images(
+    token: str,
+    request: Request,
+    access_token: str | None = Query(None),
+    db: AsyncSession = Depends(get_db),
+):
+    paths, _doc = await _render_shared_office_preview(token, request, access_token, db, "docx")
+    from apps.api.routers import documents
+
+    version = Path(paths[0]).parent.name if paths else ""
+    pages = []
+    for index, path in enumerate(paths):
+        dimensions = documents._png_dimensions(path)
+        pages.append({
+            "index": index,
+            "url": f"/api/v1/shared-doc/{token}/preview/pages/{index}?version={version}",
+            "width": dimensions[0] if dimensions else None,
+            "height": dimensions[1] if dimensions else None,
+        })
+    return {"pages": pages, "total": len(paths), "version": version}
+
+
+@public_router.get("/{token}/preview/pages/{page_index}")
+async def get_shared_document_page_image(
+    token: str,
+    page_index: int,
+    request: Request,
+    version: str = Query(pattern=r"^[0-9a-f]{16}$"),
+    access_token: str | None = Query(None),
+    db: AsyncSession = Depends(get_db),
+):
+    from apps.api.routers import documents
+    from packages.core.services.slide_renderer import open_cached_document_page
+
+    doc, source_path = await _load_shared_preview_source(db, token, request, access_token, "docx")
+    entity_id = str(doc.entity_id)
+    cache_dir = os.path.join(documents.settings.MANOR_FS_ROOT, entity_id, ".document-page-cache", doc.id)
+    await db.rollback()
+    try:
+        async with documents._document_filesystem_mutation(entity_id):
+            doc, source_path = await _load_shared_preview_source(db, token, request, access_token, "docx")
+            rendered_file = await open_cached_document_page(cache_dir, version, page_index, source_path)
+            await db.rollback()
+    except FileNotFoundError as exc:
+        raise HTTPException(404, "Word preview version not found") from exc
+    except IndexError as exc:
+        raise HTTPException(404, "Page index out of range") from exc
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.warning("Shared Word preview image read failed: %s", exc)
+        raise HTTPException(502, "Word page image could not be read") from exc
+    return _shared_preview_response(rendered_file, filename=f"page-{page_index + 1}.png")
+
+
+@public_router.get("/{token}/preview/slides")
+async def get_shared_slide_images(
+    token: str,
+    request: Request,
+    access_token: str | None = Query(None),
+    db: AsyncSession = Depends(get_db),
+):
+    paths, _doc = await _render_shared_office_preview(token, request, access_token, db, "pptx")
+    from apps.api.routers import documents
+
+    version = Path(paths[0]).parent.name if paths else ""
+    slides = []
+    for index, path in enumerate(paths):
+        dimensions = documents._png_dimensions(path)
+        slides.append({
+            "index": index,
+            "url": f"/api/v1/shared-doc/{token}/preview/slides/{index}?version={version}",
+            "width": dimensions[0] if dimensions else None,
+            "height": dimensions[1] if dimensions else None,
+        })
+    return {"slides": slides, "total": len(paths), "version": version}
+
+
+@public_router.get("/{token}/preview/slides/{slide_index}")
+async def get_shared_slide_image(
+    token: str,
+    slide_index: int,
+    request: Request,
+    version: str = Query(pattern=r"^[0-9a-f]{16}$"),
+    access_token: str | None = Query(None),
+    db: AsyncSession = Depends(get_db),
+):
+    from apps.api.routers import documents
+    from packages.core.services.slide_renderer import open_cached_slide
+
+    doc, source_path = await _load_shared_preview_source(db, token, request, access_token, "pptx")
+    entity_id = str(doc.entity_id)
+    cache_dir = os.path.join(documents.settings.MANOR_FS_ROOT, entity_id, ".slide-cache", doc.id)
+    await db.rollback()
+    try:
+        async with documents._document_filesystem_mutation(entity_id):
+            doc, source_path = await _load_shared_preview_source(db, token, request, access_token, "pptx")
+            rendered_file = await open_cached_slide(cache_dir, version, slide_index, source_path)
+            await db.rollback()
+    except FileNotFoundError as exc:
+        raise HTTPException(404, "Slide preview version not found") from exc
+    except IndexError as exc:
+        raise HTTPException(404, "Slide index out of range") from exc
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.warning("Shared presentation preview image read failed: %s", exc)
+        raise HTTPException(502, "Slide image could not be read") from exc
+    return _shared_preview_response(rendered_file, filename=f"slide-{slide_index + 1}.png")
 
 
 @public_router.get("/{token}/download")
 async def download_shared_doc(
     token: str,
     request: Request,
+    access_token: str | None = Query(None),
     db: AsyncSession = Depends(get_db),
 ):
     """Stream the actual file bytes for a public document share.
@@ -976,94 +1756,67 @@ async def download_shared_doc(
     must be true (the latter is the per-share override the dialog sets
     when the anonymous role is "downloader").
 
-    Each successful download bumps ``use_count`` and writes an access
-    log entry just like ``share_use`` — so admins can see who pulled
-    bytes via which link.
+    Limited shares reuse the counted public-page view, so a preview and its
+    allowed download consume one use together. Unlimited shares retain the
+    existing per-download access log and counter behavior.
     """
-    from fastapi.responses import FileResponse
+    scoped_share, scoped_doc, _now = await _load_public_document_share(
+        db,
+        token,
+        allow_use_limit_reached=True,
+    )
+    _require_public_share_download_access(
+        scoped_share,
+        request=request,
+        access_token=access_token,
+    )
+    _require_public_document_file_path(
+        scoped_doc,
+        unavailable_message="File is not available for download",
+    )
+    read_boundary, share, doc, now = await _acquire_public_document_file_boundary(
+        db,
+        token,
+        expected_entity_id=str(scoped_doc.entity_id),
+        share_for_update=True,
+    )
+    try:
+        verified_email = _require_public_share_download_access(
+            share,
+            request=request,
+            access_token=access_token,
+        )
 
-    token_hash = _hash_token(token)
-    share = (
-        await db.execute(
-            select(Share).where(
-                Share.token_hash == token_hash,
-                Share.status == "active",
+        full_path = _require_public_document_file_path(
+            doc,
+            unavailable_message="File is not available for download",
+        )
+
+        if share.max_uses is None:
+            share.use_count = (share.use_count or 0) + 1
+            share.last_used_at = now
+            await _write_access_log(
+                db,
+                doc=doc,
+                actor_type="share_token",
+                actor_id=verified_email or share.id,
+                action="share_download",
+                share_id=share.id,
+                request=request,
             )
-        )
-    ).scalar_one_or_none()
-    if not share:
-        raise CodedError(
-            404,
-            code="permissions.error.share.not_found_or_revoked",
-            message="Share not found or revoked",
-        )
-    now = datetime.now(timezone.utc)
-    if share.expires_at and share.expires_at < now:
-        raise CodedError(
-            410,
-            code="permissions.error.share.expired",
-            message="Share link has expired",
-        )
-    if share.max_uses is not None and share.use_count >= share.max_uses:
-        raise CodedError(
-            410,
-            code="permissions.error.share.use_limit_reached",
-            message="Share link reached use limit",
-        )
-    if share.resource_type != ResourceType.DOCUMENT:
-        raise HTTPException(404, "Not a document share")
+        filename = doc.name
+        media_type = doc.mime_type or "application/octet-stream"
+        await db.commit()
 
-    # Capability gate — this is the only difference from view_shared_doc.
-    # We require both: (a) the share's capabilities list contains
-    # 'download', AND (b) the per-share allow_download flag is true. The
-    # frontend dialog already enforces this on the create side, but
-    # belt-and-braces.
-    caps = set(share.capabilities or [])
-    if "download" not in caps or not getattr(share, "allow_download", False):
-        raise CodedError(
-            403,
-            code="permissions.error.share.download_not_allowed",
-            message="This share link does not allow downloading the file",
+        return EntitySnapshotFileResponse(
+            path=full_path,
+            media_type=media_type,
+            filename=filename,
+            read_boundary=read_boundary,
         )
-
-    doc = (
-        await db.execute(select(Document).where(Document.id == share.resource_id))
-    ).scalar_one_or_none()
-    if not doc:
-        raise HTTPException(404, "Underlying document not found")
-
-    if not getattr(doc, "fs_path", None):
-        raise CodedError(
-            404,
-            code="permissions.error.share.file_unavailable",
-            message="File is not available for download",
-        )
-    import os as _os
-    from packages.core.services.entity_fs import resolve_path
-
-    full_path = resolve_path(doc.entity_id, str(doc.fs_path))
-    if not full_path:
-        raise HTTPException(403, "Access denied")
-    if not _os.path.isfile(full_path):
-        raise CodedError(
-            404,
-            code="permissions.error.share.file_unavailable",
-            message="File is not available for download",
-        )
-
-    share.use_count = (share.use_count or 0) + 1
-    share.last_used_at = now
-    await _write_access_log(
-        db, doc=doc, actor_type="share_token", actor_id=share.id,
-        action="share_download", share_id=share.id, request=request,
-    )
-    await db.commit()
-
-    return FileResponse(
-        path=full_path,
-        media_type=doc.mime_type or "application/octet-stream",
-        filename=doc.name,
-    )
+    except BaseException:
+        await read_boundary.__aexit__(None, None, None)
+        raise
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -1098,7 +1851,7 @@ async def list_doc_access_requests(
     db: AsyncSession = Depends(get_db),
 ):
     doc = await _load_doc(db, doc_id, user.entity_id)
-    if not _is_owner_or_admin(doc, user):
+    if not await _is_owner_or_admin(db, doc, user):
         raise CodedError(
             403,
             code="permissions.error.access_request.view_owner_only",
@@ -1148,8 +1901,8 @@ async def decide_access_request(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    doc = await _load_doc(db, doc_id, user.entity_id)
-    if not _is_owner_or_admin(doc, user):
+    doc = await _load_doc(db, doc_id, user.entity_id, for_update=True)
+    if not await _is_owner_or_admin(db, doc, user):
         raise CodedError(
             403,
             code="permissions.error.access_request.decide_owner_only",
@@ -1162,7 +1915,7 @@ async def decide_access_request(
                 ResourceGrantPending.resource_type == ResourceType.DOCUMENT,
                 ResourceGrantPending.resource_id == doc.id,
                 ResourceGrantPending.entity_id == user.entity_id,
-            )
+            ).with_for_update()
         )
     ).scalar_one_or_none()
     if not pending:
@@ -1181,25 +1934,49 @@ async def decide_access_request(
 
     now = datetime.now(timezone.utc)
     if req.decision == "approve":
-        # Materialize a real grant
-        caps = req.approved_capabilities or list(pending.requested_capabilities or [])
-        if not caps:
-            raise HTTPException(400, "No capabilities to grant")
-        grant = ResourceGrant(
-            id=generate_ulid(),
+        requested_capabilities = list(pending.requested_capabilities or [])
+        proposed_capabilities = (
+            requested_capabilities
+            if req.approved_capabilities is None
+            else req.approved_capabilities
+        )
+        try:
+            capabilities = ResourceGrantPolicyFactory.create(
+                ResourceType.DOCUMENT
+            ).validate(
+                proposed_capabilities,
+                requested_capabilities=requested_capabilities,
+            )
+        except ResourceGrantPolicyError as exc:
+            raise HTTPException(400, str(exc)) from exc
+
+        canonical_subject_id, _subject_user, subject_staff = (
+            await _resolve_user_grant_subject(
+                db,
+                entity_id=user.entity_id,
+                subject_id=pending.requester_user_id,
+            )
+        )
+        equivalent_subject_ids = [
+            pending.requester_user_id,
+            canonical_subject_id,
+        ]
+        if subject_staff:
+            equivalent_subject_ids.append(subject_staff.id)
+        grant = await upsert_manual_resource_grant(
+            db,
             entity_id=user.entity_id,
             resource_type=ResourceType.DOCUMENT,
             resource_id=doc.id,
             subject_type=SubjectType.USER,
-            subject_id=pending.requester_user_id,
-            capabilities=caps,
+            subject_id=canonical_subject_id,
+            equivalent_subject_ids=equivalent_subject_ids,
+            capabilities=capabilities,
             granted_by=user.id,
-            granted_at=now,
             expires_at=req.expires_at,
-            status=GrantStatus.ACTIVE,
+            merge_capabilities=True,
+            metadata={"last_access_request_id": pending.id},
         )
-        db.add(grant)
-        await db.flush()
         pending.granted_grant_id = grant.id
         pending.status = PendingStatus.APPROVED
     else:
@@ -1250,7 +2027,7 @@ async def list_access_log(
 ):
     doc = await _load_doc(db, doc_id, user.entity_id)
     # Owner self-service (RFC §13.8) — admin can also see.
-    if not _is_owner_or_admin(doc, user):
+    if not await _is_owner_or_admin(db, doc, user):
         raise HTTPException(403, "Only the document owner or an admin can view access history")
     rows = (
         await db.execute(
@@ -1295,7 +2072,7 @@ class CreateShareApprovalRequest(BaseModel):
     audience_type: Literal["anonymous", "email", "domain"] = "email"
     audience_value: str | None = None
     capabilities: list[str] = Field(default_factory=lambda: ["view"])
-    expires_in_days: int = Field(default=7, ge=1, le=90)
+    expires_in_days: int | None = Field(default=7, ge=1, le=90)
     watermark: bool = True
     require_otp: bool = True
     allow_download: bool = False
@@ -1382,13 +2159,15 @@ async def request_share_approval(
     The actual ``shares`` row is NOT created here — it's materialized by
     ``decide_share_approval`` when an admin approves.
     """
-    doc = await _load_doc(db, doc_id, user.entity_id)
-    if not _is_owner_or_admin(doc, user):
+    doc = await _load_doc(db, doc_id, user.entity_id, for_update=True)
+    if not await _is_owner_or_admin(db, doc, user):
         raise HTTPException(
             403, "Only the document owner or an admin can request a share approval",
         )
 
-    cls = getattr(doc, "classification", None)
+    cls, _visibility, _client_visible = await effective_document_folder_policy(
+        db, doc
+    )
     # Restricted is hard-banned for external share, period.
     if cls == Classification.RESTRICTED:
         raise HTTPException(400, "Restricted documents cannot be shared externally")
@@ -1413,6 +2192,11 @@ async def request_share_approval(
         require_otp=req.require_otp,
         allow_download=req.allow_download,
     )
+    if req.audience_type == "anonymous" or not req.require_otp:
+        raise HTTPException(
+            400,
+            "Confidential external shares require an OTP-protected email or domain audience",
+        )
     _ = _normalize_share_config(proxy)
 
     pending = ResourceGrantPending(
@@ -1450,7 +2234,7 @@ async def list_share_approvals(
     on the admin inbox surface (filter status=pending).
     """
     doc = await _load_doc(db, doc_id, user.entity_id)
-    if not _is_owner_or_admin(doc, user):
+    if not await _is_owner_or_admin(db, doc, user):
         raise CodedError(
             403,
             code="permissions.error.share_approval.view_owner_only",
@@ -1485,8 +2269,8 @@ async def decide_share_approval(
     materialize the actual ``shares`` row from the snapshotted config and
     return the raw token + URL exactly once for the admin to relay.
     """
-    doc = await _load_doc(db, doc_id, user.entity_id)
-    if not has_permission(user.role, Permission.ADMIN_SETTINGS):
+    doc = await _load_doc(db, doc_id, user.entity_id, for_update=True)
+    if not await effective_user_has_permission(db, user, Permission.ADMIN_SETTINGS):
         raise CodedError(
             403,
             code="permissions.error.share_approval.admin_required",
@@ -1500,7 +2284,7 @@ async def decide_share_approval(
                 ResourceGrantPending.resource_type == _RT_SHARE_APPROVAL,
                 ResourceGrantPending.resource_id == doc.id,
                 ResourceGrantPending.entity_id == user.entity_id,
-            )
+            ).with_for_update()
         )
     ).scalar_one_or_none()
     if not pending:
@@ -1520,7 +2304,9 @@ async def decide_share_approval(
     # If the doc was downgraded out of Confidential between submission and
     # decision, the approval flow no longer applies — caller should resubmit
     # via plain /shares.
-    cls = getattr(doc, "classification", None)
+    cls, _visibility, _client_visible = await effective_document_folder_policy(
+        db, doc
+    )
     if cls == Classification.RESTRICTED:
         raise CodedError(
             400,
@@ -1548,6 +2334,13 @@ async def decide_share_approval(
             raise HTTPException(500, f"Stored share config invalid: {e}")
 
         audience = _normalize_share_config(proxy)
+        if cls == Classification.CONFIDENTIAL and (
+            proxy.audience_type == "anonymous" or not proxy.require_otp
+        ):
+            raise HTTPException(
+                400,
+                "Confidential external shares require an OTP-protected email or domain audience",
+            )
         share, raw_token, share_url = await _materialize_share(
             db, doc=doc,
             # The share is owned/created by the original requester, not the
@@ -1555,6 +2348,7 @@ async def decide_share_approval(
             # with the user who'll consume the link.
             creator_user_id=pending.requester_user_id,
             req=proxy, audience=audience, request=request,
+            approved_external_share=True,
         )
         await db.flush()
         pending.granted_grant_id = share.id  # reuse field as approved_share_id

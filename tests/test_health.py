@@ -21,6 +21,16 @@ async def test_health(client):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("client", [{"MANOR_SERVICE_ROLE": "chat"}], indirect=True)
+async def test_health_reports_service_role(client):
+    """Basic health endpoint exposes the normalized service role for routing checks."""
+    resp = await client.get("/health")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["service_role"] == "chat"
+
+
+@pytest.mark.asyncio
 async def test_client_config_defaults_flows_to_coming_soon_in_prod(client, monkeypatch):
     monkeypatch.delenv("FLOWS_AVAILABLE", raising=False)
     monkeypatch.setenv("MANOR_ENV", "prod")
@@ -45,6 +55,20 @@ async def test_client_config_enables_flows_locally_or_by_override(client, monkey
 
 
 @pytest.mark.asyncio
+async def test_client_config_reports_local_ai_credits_as_unlimited(client, monkeypatch):
+    monkeypatch.setenv("DEPLOYMENT_MODE", "cloud")
+    monkeypatch.setenv("MANOR_ENV", "local-k8s")
+
+    local_response = await client.get("/config")
+
+    assert local_response.json()["ai_credits_unlimited"] is True
+
+    monkeypatch.setenv("MANOR_ENV", "production")
+    production_response = await client.get("/config")
+    assert production_response.json()["ai_credits_unlimited"] is False
+
+
+@pytest.mark.asyncio
 async def test_deep_health(client):
     """Deep health check returns postgres status (at minimum)."""
     resp = await client.get("/health/deep")
@@ -55,6 +79,18 @@ async def test_deep_health(client):
     assert "postgres" in data["checks"]
     assert data["checks"]["postgres"]["status"] == "ok"
     assert "credentials" in data["checks"]
+
+
+@pytest.mark.asyncio
+async def test_cloud_deep_health_hides_dependency_and_system_details(client, monkeypatch):
+    monkeypatch.setenv("DEPLOYMENT_MODE", "cloud")
+
+    resp = await client.get("/health/deep")
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["status"] == "ok"
+    assert set(data) == {"status", "timestamp"}
 
 
 @pytest.mark.asyncio
@@ -105,6 +141,16 @@ async def test_system_info(client):
     assert system["uptime_seconds"] >= 0
     assert "python" in system
     assert "platform" in system
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("client", [{"MANOR_SERVICE_ROLE": "worker-heavy"}], indirect=True)
+async def test_deep_health_system_info_reports_service_role(client):
+    """Deep health system info includes the normalized service role."""
+    resp = await client.get("/health/deep")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["system"]["service_role"] == "worker-heavy"
 
 
 def test_filesystem_marker_is_repaired_when_mount_exists(tmp_path, monkeypatch):

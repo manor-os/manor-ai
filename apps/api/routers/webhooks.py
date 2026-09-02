@@ -2,16 +2,15 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from pydantic import BaseModel, HttpUrl
+from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from packages.core.database import get_db
 from packages.core.models.user import User
 from packages.core.services import webhook_service
-from apps.api.deps import get_current_user, require_permission
+from apps.api.deps import require_permission
 from packages.core.permissions import Permission
 
 router = APIRouter(prefix="/api/v1/webhooks", tags=["webhooks"])
@@ -41,7 +40,6 @@ class WebhookEndpointResponse(BaseModel):
     id: str
     entity_id: str
     url: str
-    secret: str | None = None
     events: list[str] = []
     headers: dict = {}
     enabled: bool = True
@@ -51,6 +49,12 @@ class WebhookEndpointResponse(BaseModel):
     consecutive_failures: int = 0
     created_at: datetime
     updated_at: datetime | None = None
+
+
+class WebhookEndpointCreateResponse(WebhookEndpointResponse):
+    """Creation response includes the newly generated/provided secret once."""
+
+    secret: str
 
 
 class WebhookDeliveryResponse(BaseModel):
@@ -78,22 +82,24 @@ class TestResultResponse(BaseModel):
 # ── Helpers ──
 
 
-def _endpoint_to_response(ep) -> WebhookEndpointResponse:
-    return WebhookEndpointResponse(
-        id=ep.id,
-        entity_id=ep.entity_id,
-        url=ep.url,
-        secret=ep.secret,
-        events=ep.events or [],
-        headers=ep.headers or {},
-        enabled=ep.enabled,
-        description=ep.description,
-        last_triggered_at=ep.last_triggered_at,
-        last_status=ep.last_status,
-        consecutive_failures=ep.consecutive_failures,
-        created_at=ep.created_at,
-        updated_at=ep.updated_at,
-    )
+def _endpoint_to_response(ep, *, include_secret: bool = False) -> dict:
+    response = {
+        "id": ep.id,
+        "entity_id": ep.entity_id,
+        "url": ep.url,
+        "events": ep.events or [],
+        "headers": ep.headers or {},
+        "enabled": ep.enabled,
+        "description": ep.description,
+        "last_triggered_at": ep.last_triggered_at,
+        "last_status": ep.last_status,
+        "consecutive_failures": ep.consecutive_failures,
+        "created_at": ep.created_at,
+        "updated_at": ep.updated_at,
+    }
+    if include_secret:
+        response["secret"] = ep.secret
+    return response
 
 
 def _delivery_to_response(d) -> WebhookDeliveryResponse:
@@ -125,23 +131,26 @@ async def list_endpoints(
     return [_endpoint_to_response(ep) for ep in endpoints]
 
 
-@router.post("", response_model=WebhookEndpointResponse, status_code=201)
+@router.post("", response_model=WebhookEndpointCreateResponse, status_code=201)
 async def create_endpoint(
     req: WebhookEndpointCreate,
     user: User = Depends(require_permission(Permission.ADMIN_WEBHOOKS)),
     db: AsyncSession = Depends(get_db),
 ):
     """Register a new webhook endpoint."""
-    endpoint = await webhook_service.create_endpoint(
-        db,
-        entity_id=user.entity_id,
-        url=req.url,
-        events=req.events,
-        secret=req.secret,
-        headers=req.headers,
-        description=req.description,
-    )
-    return _endpoint_to_response(endpoint)
+    try:
+        endpoint = await webhook_service.create_endpoint(
+            db,
+            entity_id=user.entity_id,
+            url=req.url,
+            events=req.events,
+            secret=req.secret,
+            headers=req.headers,
+            description=req.description,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return _endpoint_to_response(endpoint, include_secret=True)
 
 
 @router.get("/{endpoint_id}", response_model=WebhookEndpointResponse)
@@ -150,7 +159,7 @@ async def get_endpoint(
     user: User = Depends(require_permission(Permission.ADMIN_WEBHOOKS)),
     db: AsyncSession = Depends(get_db),
 ):
-    """Get a single webhook endpoint (includes secret for owner)."""
+    """Get a single webhook endpoint without exposing its signing secret."""
     endpoint = await webhook_service.get_endpoint(db, endpoint_id, user.entity_id)
     if not endpoint:
         raise HTTPException(status_code=404, detail="Webhook endpoint not found")
@@ -166,9 +175,12 @@ async def update_endpoint(
 ):
     """Update a webhook endpoint."""
     updates = req.model_dump(exclude_unset=True)
-    endpoint = await webhook_service.update_endpoint(
-        db, endpoint_id, user.entity_id, **updates
-    )
+    try:
+        endpoint = await webhook_service.update_endpoint(
+            db, endpoint_id, user.entity_id, **updates
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     if not endpoint:
         raise HTTPException(status_code=404, detail="Webhook endpoint not found")
     return _endpoint_to_response(endpoint)

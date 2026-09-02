@@ -64,6 +64,24 @@ export function isUserUploadedAgentAvatarUrl(avatarUrl?: string | null): boolean
   }
 }
 
+export function agentAvatarSeed(agent: {
+  id?: unknown;
+  category?: unknown;
+  avatar_seed?: unknown;
+  config?: unknown;
+}): string {
+  const config = agent.config && typeof agent.config === "object"
+    ? agent.config as Record<string, unknown>
+    : undefined;
+  return String(
+    agent.avatar_seed
+      || config?.source_agent_id
+      || agent.id
+      || agent.category
+      || "",
+  );
+}
+
 function hashString(s: string): number {
   let h = 2166136261;
   for (let i = 0; i < s.length; i++) {

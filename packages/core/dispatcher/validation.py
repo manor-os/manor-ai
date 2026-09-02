@@ -21,8 +21,13 @@ from __future__ import annotations
 import logging
 from typing import Any, Optional
 
-from jsonschema import Draft202012Validator
-
+from packages.core.contracts.json_schema import (
+    SchemaContractError,
+    SchemaContractValidatorFactory,
+)
+from packages.core.contracts.task_output import (
+    output_contract_for_schema,
+)
 from packages.core.models.execution import ExecutionStep
 
 logger = logging.getLogger(__name__)
@@ -43,7 +48,7 @@ def validate_step_input(
     """Raise SchemaError if step.expected_input_schema is set and the
     resolved params don't match. No-op when no schema."""
     schema = step.expected_input_schema
-    if not schema:
+    if schema is None:
         return
     _check(schema, resolved_params, side="input", step=step)
 
@@ -55,7 +60,7 @@ def validate_step_output(
     """Raise SchemaError if step.expected_output_schema is set and the
     result doesn't match. No-op when no schema."""
     schema = step.expected_output_schema
-    if not schema:
+    if schema is None:
         return
     _check(schema, result, side="output", step=step)
 
@@ -80,28 +85,32 @@ def output_schema_is_advisory(
     task deliverables come from Task.expected_output; both are declared before
     execution and must fail/retry before the step can be marked done.
     """
-    from packages.core.contracts.task_output import is_hard_output_contract_schema
-
-    if is_hard_output_contract_schema(schema):
+    if output_contract_for_schema(schema).is_hard:
         return False
-    return str(step_kind or "") in _ADVISORY_OUTPUT_SCHEMA_KINDS
+    return str(step_kind or "").strip().lower() in _ADVISORY_OUTPUT_SCHEMA_KINDS
 
 
 def _check(
     schema: dict, value: Any, *, side: str, step: ExecutionStep,
 ) -> None:
     try:
-        validator = Draft202012Validator(schema)
+        validator = SchemaContractValidatorFactory.build(schema)
+        errors = sorted(validator.iter_errors(value), key=lambda e: list(e.path))
+    except SchemaContractError as exc:
+        # A malformed/dangling contract is a planner bug. Surface it as a
+        # controlled schema failure instead of allowing jsonschema's resolver
+        # exception to escape complete_lease and crash the worker tick.
+        raise SchemaError(
+            f"step {step.step_key}: invalid {side} contract ({exc})",
+            errors=[{"path": "$", "message": str(exc)}],
+        ) from exc
     except Exception as exc:  # noqa: BLE001
-        # A malformed schema is a Planner bug, not a step failure —
-        # log loudly and skip rather than blocking execution.
-        logger.warning(
-            "step %s/%s: malformed expected_%s_schema (%s) — skipping validation",
-            step.plan_id, step.step_key, side, exc,
-        )
-        return
-
-    errors = sorted(validator.iter_errors(value), key=lambda e: list(e.path))
+        # Resolver and validator implementations can raise on malformed
+        # composition during iter_errors; keep the lease boundary controlled.
+        raise SchemaError(
+            f"step {step.step_key}: {side} validation could not run ({exc})",
+            errors=[{"path": "$", "message": str(exc)}],
+        ) from exc
     if not errors:
         return
 
@@ -124,13 +133,15 @@ def maybe_collect_errors(
 ) -> list[dict]:
     """Soft variant: returns the same error list a SchemaError would
     carry, without raising. Useful for the Planner's self-check pass."""
-    if not schema:
+    if schema is None:
         return []
     try:
-        validator = Draft202012Validator(schema)
-    except Exception:
-        return []
-    errors = sorted(validator.iter_errors(value), key=lambda e: list(e.path))
+        validator = SchemaContractValidatorFactory.build(schema)
+        errors = sorted(validator.iter_errors(value), key=lambda e: list(e.path))
+    except SchemaContractError as exc:
+        return [{"path": "$", "message": str(exc)}]
+    except Exception as exc:  # noqa: BLE001 - soft mirror of the hard boundary
+        return [{"path": "$", "message": f"validation could not run ({exc})"}]
     return [
         {"path": "$" + "".join(f"[{p!r}]" for p in e.path), "message": e.message}
         for e in errors[:10]

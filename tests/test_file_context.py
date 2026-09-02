@@ -242,3 +242,40 @@ async def test_kb_text_document_uses_legacy_content_text_metadata():
     assert attachments.to_runtime_context()["counts"]["refs"] == 1
     assert "# Starter" in attachments.text_context
     assert "Legacy inline body." in attachments.text_context
+
+
+@pytest.mark.asyncio
+async def test_kb_text_document_with_fs_path_stores_reference_even_without_text(monkeypatch):
+    async def _empty_extract(*_args, **_kwargs):
+        return ""
+
+    monkeypatch.setattr(file_context, "extract_text", _empty_extract)
+    doc = Document(
+        id="doc_attached_template",
+        entity_id="entity_1",
+        name="completion-reviews/daily-review-template.md",
+        fs_path="completion-reviews/daily-review-template.md",
+        file_type="md",
+        mime_type="text/markdown",
+        source="upload",
+    )
+
+    attachments = await file_context.build_file_context(
+        [],
+        ["doc_attached_template"],
+        "entity_1",
+        db=_FakeDb([doc]),
+    )
+
+    assert attachments.attachment_refs == [
+        {
+            "kind": "knowledge_document",
+            "name": "completion-reviews/daily-review-template.md",
+            "mime": "text/markdown",
+            "path": "completion-reviews/daily-review-template.md",
+            "url": "/api/v1/fs/entity_1/completion-reviews/daily-review-template.md",
+            "document_id": "doc_attached_template",
+            "text": True,
+        }
+    ]
+    assert "KB: completion-reviews/daily-review-template.md" in attachments.text_context

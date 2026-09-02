@@ -17,7 +17,7 @@ import Card from "../components/ui/Card";
 import Chip from "../components/ui/Chip";
 import SmartToolbar from "../components/ui/SmartToolbar";
 import StatusBadge from "../components/ui/StatusBadge";
-import SharedAgentAvatar from "../components/ui/AgentAvatar";
+import SharedAgentAvatar, { agentAvatarSeed } from "../components/ui/AgentAvatar";
 import CompactCard from "../components/ui/CompactCard";
 import { openDetail, closeDetail } from "../stores/detail";
 import { useAgentEditModalStore, openAgentEditModal } from "../stores/agentEditModal";
@@ -482,6 +482,9 @@ export default function Agents() {
         toast.success(t("page.agents.agent_deleted"));
       }
     },
+    onError: () => {
+      deleteIsUnsubscribeRef.current = false;
+    },
   });
 
   const clearEditParam = () => {
@@ -684,8 +687,8 @@ export default function Agents() {
                     icon={
                       <AgentAvatar
                         name={agent.name}
-                        avatarUrl={isHired ? undefined : agent.avatar_url}
-                        seed={agent.id || agent.category}
+                        avatarUrl={agent.avatar_url}
+                        seed={agentAvatarSeed(agent)}
                         size={34}
                       />
                     }
@@ -713,8 +716,8 @@ export default function Agents() {
                         icon: (
                           <AgentAvatar
                             name={agent.name}
-                            avatarUrl={isHired ? undefined : agent.avatar_url}
-                            seed={agent.id || agent.category}
+                            avatarUrl={agent.avatar_url}
+                            seed={agentAvatarSeed(agent)}
                             size={48}
                           />
                         ),

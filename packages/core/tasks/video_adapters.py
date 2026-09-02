@@ -11,12 +11,75 @@ from dataclasses import dataclass
 import json
 import logging
 import time
-from typing import Any, Awaitable, Callable, Protocol
+from typing import Any, Awaitable, Callable, Literal, Protocol
 from urllib.parse import urlsplit
 
 import httpx
 
 logger = logging.getLogger(__name__)
+
+
+# The gateway persists the full JSON body, where base64 expands image bytes by
+# roughly one third. Leave room for the prompt and async operation envelope.
+VERCEL_VIDEO_INLINE_REFERENCE_MAX_BYTES = 160 * 1024
+# OpenRouter accepts data URLs for image_url payloads. Keep each local image
+# bounded so multiple reference images cannot produce an unreasonably large
+# video-start request.
+OPENROUTER_VIDEO_INLINE_IMAGE_MAX_BYTES = 2 * 1024 * 1024
+
+
+INLINE_BASE64_REFERENCE = "inline_base64"
+SIGNED_URL_REFERENCE = "signed_url"
+
+
+@dataclass(frozen=True)
+class MediaReferenceCapability:
+    """Allowed transport for one media kind on a video provider route."""
+
+    transports: tuple[str, ...]
+    max_inline_bytes: int | None = None
+
+    @property
+    def requires_public_url(self) -> bool:
+        return self.transports == (SIGNED_URL_REFERENCE,)
+
+
+@dataclass(frozen=True)
+class VideoModelFile:
+    """Provider-neutral file value modeled after AI SDK VideoModelV4File."""
+
+    type: Literal["file", "url"]
+    media_type: str
+    value: str
+
+    def as_vercel_file(self) -> dict[str, str]:
+        key = "data" if self.type == "file" else "url"
+        return {"type": self.type, key: self.value, "mediaType": self.media_type}
+
+    def as_data_url(self) -> str:
+        if self.type == "url":
+            return self.value
+        return f"data:{self.media_type};base64,{self.value}"
+
+    def as_url(self) -> str:
+        if self.type != "url":
+            raise RuntimeError("This provider requires a publicly readable media URL.")
+        return self.value
+
+
+class InlineMediaReferenceLimitError(RuntimeError):
+    """An image cannot fit within a provider's inline media payload limit."""
+
+
+PUBLIC_URL_MEDIA_REFERENCE = MediaReferenceCapability((SIGNED_URL_REFERENCE,))
+VERCEL_IMAGE_MEDIA_REFERENCE = MediaReferenceCapability(
+    (INLINE_BASE64_REFERENCE, SIGNED_URL_REFERENCE),
+    max_inline_bytes=VERCEL_VIDEO_INLINE_REFERENCE_MAX_BYTES,
+)
+OPENROUTER_IMAGE_MEDIA_REFERENCE = MediaReferenceCapability(
+    (INLINE_BASE64_REFERENCE, SIGNED_URL_REFERENCE),
+    max_inline_bytes=OPENROUTER_VIDEO_INLINE_IMAGE_MAX_BYTES,
+)
 
 
 VIDEO_NATIVE_MODEL_MAP = {
@@ -213,6 +276,7 @@ class VideoAdapterRuntime:
     openrouter_api_url: Callable[[str], str]
     normalize_duration: Callable[[Any], int]
     normalize_resolution: Callable[[str | None, Any], str]
+    ensure_inline_data_url: Callable[..., Awaitable[str]] | None = None
 
 
 @dataclass(frozen=True)
@@ -228,6 +292,38 @@ class VideoGenerationAdapter:
     provider = ""
     route = "native"
     poll_provider = ""
+
+    def supports_inline_local_references(self) -> bool:
+        return not self.media_reference_capability("", "image").requires_public_url
+
+    def media_reference_capability(
+        self,
+        model: str,
+        media_kind: Literal["image", "video", "audio"],
+    ) -> MediaReferenceCapability:
+        del model, media_kind
+        return PUBLIC_URL_MEDIA_REFERENCE
+
+    def references_requiring_public_urls(
+        self,
+        model: str,
+        *,
+        first_frame_url: str = "",
+        last_frame_url: str = "",
+        reference_urls: list[str] | None = None,
+        reference_video_urls: list[str] | None = None,
+        audio_reference_urls: list[str] | None = None,
+    ) -> list[str]:
+        refs: list[str] = []
+        groups = (
+            ("image", [first_frame_url, last_frame_url, *(reference_urls or [])]),
+            ("video", list(reference_video_urls or [])),
+            ("audio", list(audio_reference_urls or [])),
+        )
+        for media_kind, values in groups:
+            if self.media_reference_capability(model, media_kind).requires_public_url:
+                refs.extend(str(value or "") for value in values if str(value or "").strip())
+        return refs
 
     def metadata(self, model: str) -> VideoAdapterMetadata:
         return VideoAdapterMetadata(
@@ -260,6 +356,14 @@ class OpenRouterVideoAdapter(VideoGenerationAdapter):
             route=self.route,
             native_model=model,
         )
+
+    def media_reference_capability(
+        self,
+        model: str,
+        media_kind: Literal["image", "video", "audio"],
+    ) -> MediaReferenceCapability:
+        del model
+        return OPENROUTER_IMAGE_MEDIA_REFERENCE if media_kind == "image" else PUBLIC_URL_MEDIA_REFERENCE
 
     async def submit(
         self,
@@ -299,6 +403,7 @@ class OpenRouterVideoAdapter(VideoGenerationAdapter):
             job.entity_id,
             runtime=runtime,
             public_base_url=public_base_url,
+            capability=self.media_reference_capability(model, "image"),
         )
         if frame_images:
             payload["frame_images"] = frame_images
@@ -307,14 +412,18 @@ class OpenRouterVideoAdapter(VideoGenerationAdapter):
         if reference_urls:
             refs = []
             for ref_url in reference_urls[:9]:
+                reference = await materialize_video_reference(
+                    ref_url,
+                    job.entity_id,
+                    media_kind="image",
+                    capability=self.media_reference_capability(model, "image"),
+                    runtime=runtime,
+                    public_base_url=public_base_url,
+                )
                 refs.append({
                     "type": "image_url",
                     "image_url": {
-                        "url": await runtime.ensure_public_url(
-                            ref_url,
-                            job.entity_id,
-                            **runtime.public_url_kwargs(public_base_url),
-                        )
+                        "url": reference.as_data_url()
                     },
                 })
             payload["input_references"] = refs
@@ -380,6 +489,14 @@ class VercelGatewayVideoAdapter(VideoGenerationAdapter):
     route = "vercel"
     poll_provider = "vercel"
 
+    def media_reference_capability(
+        self,
+        model: str,
+        media_kind: Literal["image", "video", "audio"],
+    ) -> MediaReferenceCapability:
+        del model
+        return VERCEL_IMAGE_MEDIA_REFERENCE if media_kind == "image" else PUBLIC_URL_MEDIA_REFERENCE
+
     def metadata(self, model: str) -> VideoAdapterMetadata:
         return VideoAdapterMetadata(
             adapter=self.adapter_name,
@@ -418,6 +535,7 @@ class VercelGatewayVideoAdapter(VideoGenerationAdapter):
         if params.get("seed") is not None:
             payload["seed"] = params["seed"]
 
+        image_capability = self.media_reference_capability(model, "image")
         frame_images: list[dict[str, Any]] = []
         for frame_type, value in (
             ("first_frame", params.get("first_frame_url")),
@@ -428,30 +546,40 @@ class VercelGatewayVideoAdapter(VideoGenerationAdapter):
             frame_images.append(
                 {
                     "frameType": frame_type,
-                    "image": await _vercel_video_url_file(
-                        str(value),
-                        job.entity_id,
-                        runtime=runtime,
-                        public_base_url=public_base_url,
-                    ),
+                    "image": (
+                        await materialize_video_reference(
+                            str(value),
+                            job.entity_id,
+                            media_kind="image",
+                            capability=image_capability,
+                            runtime=runtime,
+                            public_base_url=public_base_url,
+                        )
+                    ).as_vercel_file(),
                 }
             )
         if frame_images:
             payload["frameImages"] = frame_images
 
         input_references: list[dict[str, Any]] = []
-        for value in [
-            *(params.get("reference_urls") or []),
-            *(params.get("reference_video_urls") or []),
-        ]:
-            input_references.append(
-                await _vercel_video_url_file(
-                    str(value),
-                    job.entity_id,
-                    runtime=runtime,
-                    public_base_url=public_base_url,
+        for media_kind, values in (
+            ("image", params.get("reference_urls") or []),
+            ("video", params.get("reference_video_urls") or []),
+        ):
+            capability = self.media_reference_capability(model, media_kind)
+            for value in values:
+                input_references.append(
+                    (
+                        await materialize_video_reference(
+                            str(value),
+                            job.entity_id,
+                            media_kind=media_kind,
+                            capability=capability,
+                            runtime=runtime,
+                            public_base_url=public_base_url,
+                        )
+                    ).as_vercel_file()
                 )
-            )
         if input_references:
             payload["inputReferences"] = input_references
 
@@ -539,33 +667,78 @@ def _vercel_video_resolution(resolution: str, aspect_ratio: str) -> str:
     return f"{width}x{height}"
 
 
-async def _vercel_video_url_file(
+def _video_media_type(value: str, media_kind: Literal["image", "video", "audio"]) -> str:
+    lowered = urlsplit(value).path.lower()
+    if lowered.endswith(".webm"):
+        return "video/webm"
+    if lowered.endswith(".mov"):
+        return "video/quicktime"
+    if lowered.endswith(".mp4"):
+        return "video/mp4"
+    if lowered.endswith(".webp"):
+        return "image/webp"
+    if lowered.endswith(".png"):
+        return "image/png"
+    if lowered.endswith((".jpg", ".jpeg")):
+        return "image/jpeg"
+    if lowered.endswith(".wav"):
+        return "audio/wav"
+    if lowered.endswith(".mp3"):
+        return "audio/mpeg"
+    return {"image": "image/jpeg", "video": "video/mp4", "audio": "audio/mpeg"}[media_kind]
+
+
+def _video_model_file_from_data_url(
+    value: str,
+    media_kind: Literal["image", "video", "audio"],
+) -> VideoModelFile:
+    header, separator, data = value.partition(",")
+    if not separator or not header.startswith("data:") or ";base64" not in header:
+        raise RuntimeError("Inline video reference must be a base64 data URL.")
+    media_type = header[5:].split(";", 1)[0] or _video_media_type(value, media_kind)
+    return VideoModelFile(type="file", media_type=media_type, value=data)
+
+
+async def materialize_video_reference(
     value: str,
     entity_id: str,
     *,
+    media_kind: Literal["image", "video", "audio"],
+    capability: MediaReferenceCapability,
     runtime: VideoAdapterRuntime,
     public_base_url: str,
-) -> dict[str, str]:
-    url = await runtime.ensure_public_url(
-        value,
-        entity_id,
-        **runtime.public_url_kwargs(public_base_url),
-    )
-    lowered = urlsplit(url).path.lower()
-    media_type = (
-        "video/webm"
-        if lowered.endswith(".webm")
-        else "video/quicktime"
-        if lowered.endswith(".mov")
-        else "video/mp4"
-        if lowered.endswith(".mp4")
-        else "image/webp"
-        if lowered.endswith(".webp")
-        else "image/png"
-        if lowered.endswith(".png")
-        else "image/jpeg"
-    )
-    return {"type": "url", "url": url, "mediaType": media_type}
+) -> VideoModelFile:
+    """Materialize an entity reference as the shared VideoModelV4-like union."""
+    if INLINE_BASE64_REFERENCE in capability.transports and runtime.ensure_inline_data_url is not None:
+        try:
+            inline = await runtime.ensure_inline_data_url(
+                value,
+                entity_id,
+                max_bytes=capability.max_inline_bytes or VERCEL_VIDEO_INLINE_REFERENCE_MAX_BYTES,
+            )
+        except InlineMediaReferenceLimitError:
+            if SIGNED_URL_REFERENCE not in capability.transports:
+                raise
+            logger.info(
+                "Video reference exceeded inline limit; using signed URL instead "
+                "(entity=%s, media_kind=%s)",
+                entity_id,
+                media_kind,
+            )
+        else:
+            if inline.startswith("data:"):
+                return _video_model_file_from_data_url(inline, media_kind)
+            return VideoModelFile(type="url", media_type=_video_media_type(inline, media_kind), value=inline)
+
+    if SIGNED_URL_REFERENCE in capability.transports:
+        public_url = await runtime.ensure_public_url(
+            value,
+            entity_id,
+            **runtime.public_url_kwargs(public_base_url),
+        )
+        return VideoModelFile(type="url", media_type=_video_media_type(public_url, media_kind), value=public_url)
+
+    raise RuntimeError(f"No supported transport for {media_kind} media reference.")
 
 
 def _vercel_video_result_url(payload: dict[str, Any]) -> str:
@@ -930,14 +1103,18 @@ async def seedance_media_content(
     public_base_url: str = "",
 ) -> dict[str, Any]:
     field = f"{media_type}_url"
+    reference = await materialize_video_reference(
+        url,
+        entity_id,
+        media_kind=media_type,
+        capability=PUBLIC_URL_MEDIA_REFERENCE,
+        runtime=runtime,
+        public_base_url=public_base_url,
+    )
     item: dict[str, Any] = {
         "type": field,
         field: {
-            "url": await runtime.ensure_public_url(
-                url,
-                entity_id,
-                **runtime.public_url_kwargs(public_base_url),
-            )
+            "url": reference.as_url()
         },
     }
     if role:
@@ -969,31 +1146,40 @@ async def build_openrouter_frame_images(
     *,
     runtime: VideoAdapterRuntime,
     public_base_url: str = "",
+    capability: MediaReferenceCapability = OPENROUTER_IMAGE_MEDIA_REFERENCE,
 ) -> list[dict[str, Any]]:
     frames: list[dict[str, Any]] = []
     first_frame = params.get("first_frame_url", "")
     last_frame = params.get("last_frame_url", "")
     if first_frame:
+        reference = await materialize_video_reference(
+            first_frame,
+            entity_id,
+            media_kind="image",
+            capability=capability,
+            runtime=runtime,
+            public_base_url=public_base_url,
+        )
         frames.append({
             "type": "image_url",
             "image_url": {
-                "url": await runtime.ensure_public_url(
-                    first_frame,
-                    entity_id,
-                    **runtime.public_url_kwargs(public_base_url),
-                )
+                "url": reference.as_data_url()
             },
             "frame_type": "first_frame",
         })
     if last_frame:
+        reference = await materialize_video_reference(
+            last_frame,
+            entity_id,
+            media_kind="image",
+            capability=capability,
+            runtime=runtime,
+            public_base_url=public_base_url,
+        )
         frames.append({
             "type": "image_url",
             "image_url": {
-                "url": await runtime.ensure_public_url(
-                    last_frame,
-                    entity_id,
-                    **runtime.public_url_kwargs(public_base_url),
-                )
+                "url": reference.as_data_url()
             },
             "frame_type": "last_frame",
         })

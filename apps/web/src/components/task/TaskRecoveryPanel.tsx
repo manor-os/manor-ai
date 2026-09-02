@@ -12,6 +12,8 @@ interface TaskRecoveryPanelProps {
   logs: TaskLog[];
   comment?: string;
   detailReason?: string;
+  inputStepId?: string;
+  inputPrompt?: string;
   isPending?: boolean;
   variant?: "detail" | "compact";
   onRetry: (note?: string) => void;
@@ -31,14 +33,21 @@ function isRecoverableStatus(status: string): status is RecoverableStatus {
   return status === "waiting_on_customer" || status === "blocked" || status === "failed";
 }
 
-function findLatestRecoveryEvent(logs: TaskLog[], status: RecoverableStatus) {
-  const targetType =
+function findLatestRecoveryEvent(
+  logs: TaskLog[],
+  status: RecoverableStatus,
+  inputStepId?: string,
+) {
+  const targetTypes =
     status === "waiting_on_customer"
-      ? "ai_hitl_requested"
+      ? new Set(["ai_hitl_requested", "step_needs_human"])
       : status === "failed"
-        ? "ai_execution_failed"
-        : "ai_needs_replan";
-  return [...logs].reverse().find((log) => log.log_type === targetType);
+        ? new Set(["ai_execution_failed"])
+        : new Set(["ai_needs_replan"]);
+  return [...logs].reverse().find((log) => (
+    targetTypes.has(log.log_type)
+    && (!inputStepId || String(log.meta?.step_id || "") === inputStepId)
+  ));
 }
 
 function hitlFieldsFromLog(log?: TaskLog): HITLField[] {
@@ -55,6 +64,8 @@ export default function TaskRecoveryPanel({
   logs,
   comment = "",
   detailReason = "",
+  inputStepId,
+  inputPrompt = "",
   isPending = false,
   variant = "detail",
   onRetry,
@@ -63,7 +74,9 @@ export default function TaskRecoveryPanel({
   const [expanded, setExpanded] = useState(false);
   const [fieldValues, setFieldValues] = useState<Record<string, string>>({});
   const isRecoverable = isRecoverableStatus(status);
-  const lastEvent = isRecoverable ? findLatestRecoveryEvent(logs, status) : undefined;
+  const lastEvent = isRecoverable
+    ? findLatestRecoveryEvent(logs, status, inputStepId)
+    : undefined;
 
   useEffect(() => {
     setExpanded(false);
@@ -71,19 +84,24 @@ export default function TaskRecoveryPanel({
 
   useEffect(() => {
     setFieldValues({});
-  }, [lastEvent?.id]);
+  }, [inputStepId, lastEvent?.id]);
 
   if (!isRecoverable) return null;
 
   const isWaiting = status === "waiting_on_customer";
   const isFailed = status === "failed";
-  const reason = formatUserFacingStructuredText(detailReason || lastEvent?.meta?.reason || lastEvent?.content || "");
-  const question = formatUserFacingStructuredText(lastEvent?.meta?.question || "");
+  const reason = formatUserFacingStructuredText(
+    (inputStepId ? "" : detailReason) || lastEvent?.meta?.reason || lastEvent?.content || "",
+  );
+  const question = formatUserFacingStructuredText(
+    inputPrompt || lastEvent?.meta?.question || "",
+  );
   const hitlFields = isWaiting ? hitlFieldsFromLog(lastEvent) : [];
   const hasStructuredHITL = hitlFields.length > 0;
   const hasDetails = Boolean(question || (reason && reason !== question) || hasStructuredHITL);
+  const acceptsInput = isWaiting && Boolean(onRespond);
   const StatusIcon = isFailed ? IconError : IconWarning;
-  const ActionIcon = isWaiting ? IconPlay : IconRefresh;
+  const ActionIcon = acceptsInput ? IconPlay : IconRefresh;
 
   const palette = isWaiting
     ? { bg: "#faf7ef", border: "#ecdca4", text: "#76502c", icon: "#b27c34", iconBg: "#f3ecd6" }
@@ -93,15 +111,15 @@ export default function TaskRecoveryPanel({
 
   const title = isWaiting ? t("component.task_recovery_panel.agent_waiting_for_input") : isFailed ? t("component.task_recovery_panel.agent_run_failed") : t("component.task_recovery_panel.agent_is_blocked");
   const compactTitle = isWaiting ? t("component.task_recovery_panel.waiting_for_input") : title;
-  const retryLabel = isWaiting ? t("component.task_recovery_panel.resume_agent") : t("component.task_recovery_panel.retry_task");
-  const compactRetryLabel = isWaiting ? t("component.task_recovery_panel.resume") : t("component.task_recovery_panel.retry");
+  const retryLabel = acceptsInput ? t("component.task_recovery_panel.resume_agent") : t("component.task_recovery_panel.retry_task");
+  const compactRetryLabel = acceptsInput ? t("component.task_recovery_panel.resume") : t("component.task_recovery_panel.retry");
   const structuredFields = Object.fromEntries(
     Object.entries(fieldValues).filter(([, value]) => value.trim()),
   );
   const responseValue = (fieldValues.response || comment).trim();
   const missingRequired = hitlFields.some((field) => field.required && !String(fieldValues[field.name] || "").trim());
   const hasResponsePayload = Boolean(responseValue || Object.keys(structuredFields).length);
-  const actionDisabled = isPending || (isWaiting && !!onRespond && (!hasResponsePayload || missingRequired));
+  const actionDisabled = isPending || (acceptsInput && (!hasResponsePayload || missingRequired));
   const helper = isWaiting
     ? hasStructuredHITL
       ? t("component.task_recovery_panel.fill_requested_fields")
@@ -111,7 +129,7 @@ export default function TaskRecoveryPanel({
       : variant === "compact" ? t("component.task_recovery_panel.review_details_retry") : t("component.task_recovery_panel.edit_description_retry");
 
   const submitAction = () => {
-    if (isWaiting && onRespond) {
+    if (acceptsInput && onRespond) {
       onRespond(responseValue, structuredFields);
     } else {
       onRetry(comment.trim() || undefined);

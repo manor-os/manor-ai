@@ -142,6 +142,16 @@ async def test_workspace_operation_goal_measurement_sources_update_materializes_
     follower_job = (
         await db_session.execute(select(ScheduledJob).where(ScheduledJob.job_id == f"gm:{follower.id}"))
     ).scalar_one_or_none()
+    assert follower_job is None
+
+    started = await client.post(
+        f"/api/v1/workspaces/{ws_id}/resume",
+        headers=headers,
+    )
+    assert started.status_code == 200
+    follower_job = (
+        await db_session.execute(select(ScheduledJob).where(ScheduledJob.job_id == f"gm:{follower.id}"))
+    ).scalar_one_or_none()
     assert follower_job is not None
     assert follower_job.execution_type == "goal_measurement"
 
@@ -152,3 +162,69 @@ async def test_workspace_operation_goal_measurement_sources_update_materializes_
 
     workspace = (await db_session.execute(select(Workspace).where(Workspace.id == ws_id))).scalar_one()
     assert workspace.operating_model["evaluation"]["scorecard"]["metrics"][0]["metric_key"] == "follower_count"
+
+
+@pytest.mark.asyncio
+async def test_workspace_operation_materializes_goals_by_goal_key_not_shared_metric(
+    client: AsyncClient,
+    db_session,
+) -> None:
+    from sqlalchemy import select
+
+    from packages.core.models.goal import Goal
+
+    headers = await _register(client, "ws_op_shared_goal_metric")
+    create = await client.post(
+        "/api/v1/workspaces",
+        headers=headers,
+        json={"name": "Shared Operation Metric"},
+    )
+    assert create.status_code == 201, create.text
+    workspace_id = create.json()["id"]
+
+    def goals(trial_target: int, paid_target: int) -> list[dict]:
+        return [
+            {
+                "goal_key": "trial_signups",
+                "title": "Trial signups",
+                "metric_key": "signup_count",
+                "target_value": trial_target,
+                "cadence": "weekly",
+            },
+            {
+                "goal_key": "paid_signups",
+                "title": "Paid signups",
+                "metric_key": "signup_count",
+                "target_value": paid_target,
+                "cadence": "weekly",
+            },
+        ]
+
+    initial = await client.put(
+        f"/api/v1/workspaces/{workspace_id}/goals",
+        headers=headers,
+        json={"goals": goals(100, 25)},
+    )
+    assert initial.status_code == 200, initial.text
+    visible = await client.get(
+        f"/api/v1/workspaces/{workspace_id}",
+        headers=headers,
+    )
+    assert visible.status_code == 200, visible.text
+    updated = await client.put(
+        f"/api/v1/workspaces/{workspace_id}/goals",
+        headers=headers,
+        json={"goals": goals(120, 30)},
+    )
+    assert updated.status_code == 200, updated.text
+
+    db_session.expire_all()
+    stored = list((await db_session.execute(
+        select(Goal).where(Goal.workspace_id == workspace_id)
+    )).scalars().all())
+    assert len(stored) == 2
+    by_key = {goal.goal_key: goal for goal in stored}
+    assert set(by_key) == {"trial_signups", "paid_signups"}
+    assert {goal.metric_key for goal in stored} == {"signup_count"}
+    assert float(by_key["trial_signups"].target_value) == 120
+    assert float(by_key["paid_signups"].target_value) == 30

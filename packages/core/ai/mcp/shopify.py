@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import logging
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -24,6 +25,7 @@ logger = logging.getLogger(__name__)
 _ADMIN_API_VERSION = "2026-04"
 _MAX_CHARS = 12_000
 _TIMEOUT = 30.0
+_MAX_PAGE_SIZE = 250
 
 
 # ── MCP Protocol ─────────────────────────────────────────────────────────────
@@ -40,9 +42,12 @@ async def call_tool(
     handler = _HANDLERS.get(name)
     if not handler:
         return _error(f"Unknown tool: {name}")
+    if not isinstance(arguments, dict):
+        return _error("arguments must be an object")
+    arguments = dict(arguments)
 
     spec = _TOOLS.get(name, {})
-    missing = [p for p in spec.get("required", []) if arguments.get(p) in (None, "")]
+    missing = [p for p in spec.get("required", []) if _is_blank(arguments.get(p))]
     if missing:
         return _error(f"Missing required params: {', '.join(missing)}")
 
@@ -50,12 +55,18 @@ async def call_tool(
         cfg = json.loads(bearer_token) if bearer_token else {}
     except Exception:
         return _error("Shopify credentials malformed (expected JSON).")
+    if not isinstance(cfg, dict):
+        return _error("Shopify credentials malformed (expected JSON object).")
     domain = cfg.get("shop_domain") or cfg.get("myshopify_domain") or cfg.get("domain")
     token = cfg.get("access_token") or cfg.get("admin_access_token")
-    if not (domain and token):
+    if domain is not None and not isinstance(domain, str):
+        return _error("Shopify shop_domain must be a string.")
+    if token is not None and not isinstance(token, str):
+        return _error("Shopify access_token must be a string.")
+    domain = _normalize_shop_domain(domain)
+    if not domain or _is_blank(token):
         return _error("Shopify needs shop_domain and access_token.")
-    if not str(domain).endswith(".myshopify.com") and "." not in str(domain):
-        domain = f"{domain}.myshopify.com"
+    token = str(token).strip()
 
     try:
         text = await handler(domain, token, arguments)
@@ -71,8 +82,39 @@ def _error(msg: str) -> Dict[str, Any]:
     return {"content": [{"type": "text", "text": msg}], "isError": True}
 
 
+def _is_blank(value: Any) -> bool:
+    return value is None or (isinstance(value, str) and not value.strip())
+
+
+def _normalize_shop_domain(value: Any) -> str | None:
+    """Accept a shop host, short shop name, or copied admin URL."""
+    text = value.strip() if isinstance(value, str) else ""
+    if not text:
+        return None
+    parsed = urlsplit(text if "://" in text else f"//{text}")
+    host = (parsed.hostname or "").strip().rstrip(".").lower()
+    if not host:
+        return None
+    return host if "." in host else f"{host}.myshopify.com"
+
+
 class _ShopifyError(RuntimeError):
     pass
+
+
+def _page_size(args: Dict[str, Any]) -> int:
+    raw = args.get("first", 20)
+    if isinstance(raw, bool):
+        raise _ShopifyError("first must be an integer between 1 and 250.")
+    try:
+        first = int(raw)
+    except (TypeError, ValueError):
+        raise _ShopifyError("first must be an integer between 1 and 250.") from None
+    if isinstance(raw, float) and raw != first:
+        raise _ShopifyError("first must be an integer between 1 and 250.")
+    if first < 1 or first > _MAX_PAGE_SIZE:
+        raise _ShopifyError("first must be an integer between 1 and 250.")
+    return first
 
 
 # ── GraphQL client ────────────────────────────────────────────────────────────
@@ -139,7 +181,7 @@ async def _list_products(domain, token, args) -> str:
             pageInfo {{ hasNextPage }}
           }}
         }}
-    """, {"first": int(args.get("first", 20)), "query": args.get("query")})
+    """, {"first": _page_size(args), "query": args.get("query")})
 
 
 async def _get_product(domain, token, args) -> str:
@@ -156,7 +198,7 @@ async def _list_orders(domain, token, args) -> str:
             pageInfo {{ hasNextPage }}
           }}
         }}
-    """, {"first": int(args.get("first", 20)), "query": args.get("query")})
+    """, {"first": _page_size(args), "query": args.get("query")})
 
 
 async def _get_order(domain, token, args) -> str:
@@ -173,16 +215,19 @@ async def _list_customers(domain, token, args) -> str:
             edges { node { id displayName email phone numberOfOrders } }
           }
         }
-    """, {"first": int(args.get("first", 20)), "query": args.get("query")})
+    """, {"first": _page_size(args), "query": args.get("query")})
 
 
 # ── Write ─────────────────────────────────────────────────────────────────────
 
 async def _create_product(domain, token, args) -> str:
-    pinput: Dict[str, Any] = {"title": args["title"]}
+    pinput: Dict[str, Any] = {
+        "title": args["title"],
+        "status": args.get("status") or "DRAFT",
+    }
     for k_arg, k_api in (
         ("description", "descriptionHtml"), ("vendor", "vendor"),
-        ("product_type", "productType"), ("status", "status"),
+        ("product_type", "productType"),
     ):
         if args.get(k_arg) is not None:
             pinput[k_api] = args[k_arg]
@@ -199,6 +244,17 @@ async def _create_product(domain, token, args) -> str:
           }
         }
     """, {"input": pinput})
+
+
+async def _delete_product(domain, token, args) -> str:
+    return await _gql(domain, token, """
+        mutation productDelete($input: ProductDeleteInput!) {
+          productDelete(input: $input) {
+            deletedProductId
+            userErrors { field message }
+          }
+        }
+    """, {"input": {"id": _gid("Product", args["product_id"])}})
 
 
 async def _update_product(domain, token, args) -> str:
@@ -327,16 +383,23 @@ _TOOLS: Dict[str, Dict[str, Any]] = {
     },
     # Write
     "create_product": {
-        "description": "Create a product",
+        "description": "Create a product (defaults to DRAFT)",
         "properties": {
             "title": _prop("Product title"),
             "description": _prop("Description (HTML)"),
             "vendor": _prop("Vendor"),
             "product_type": _prop("Product type"),
-            "status": _prop("ACTIVE, DRAFT, or ARCHIVED"),
+            "status": _prop("ACTIVE, DRAFT, or ARCHIVED (default: DRAFT)"),
             "tags": _prop("Tags (comma-separated or array)"),
         },
         "required": ["title"],
+    },
+    "delete_product": {
+        "description": "Permanently delete a product (use to clean up staging fixtures)",
+        "properties": {
+            "product_id": _prop("Product id (numeric or gid)"),
+        },
+        "required": ["product_id"],
     },
     "update_product": {
         "description": "Update a product's fields",
@@ -391,6 +454,7 @@ _HANDLERS = {
     "get_order": _get_order,
     "list_customers": _list_customers,
     "create_product": _create_product,
+    "delete_product": _delete_product,
     "update_product": _update_product,
     "add_order_tags": _add_order_tags,
     "create_customer": _create_customer,

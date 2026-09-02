@@ -31,6 +31,7 @@ os.environ.setdefault("CELERY_RESULT_BACKEND", "cache+memory://")
 TEST_EMBEDDING_DIMENSIONS = int(os.getenv("EMBEDDING_DIMENSIONS", "1024") or 1024)
 
 _tables_created = False
+_TEST_DATABASE_ADVISORY_LOCK_ID = 742918364
 _ROOT = Path(__file__).resolve().parents[1]
 _CLOUD_ONLY_TEST_PATTERNS: tuple[str, ...] = ()
 
@@ -85,8 +86,33 @@ async def _prepare_test_database(engine, *, truncate_existing: bool) -> None:
     await seed_mcp_catalog(engine)
 
 
+@pytest_asyncio.fixture(scope="session")
+async def _test_database_guard() -> AsyncGenerator[None, None]:
+    """Keep one process's shared test schema stable for its entire session."""
+    engine = create_async_engine(TEST_DATABASE_URL, echo=False, poolclass=NullPool)
+    try:
+        async with engine.connect() as guard:
+            await guard.execute(
+                text("SELECT pg_advisory_lock(:lock_id)"),
+                {"lock_id": _TEST_DATABASE_ADVISORY_LOCK_ID},
+            )
+            # Session advisory locks survive COMMIT. Close the implicit
+            # transaction so a long test run does not sit idle in transaction.
+            await guard.commit()
+            try:
+                yield
+            finally:
+                await guard.execute(
+                    text("SELECT pg_advisory_unlock(:lock_id)"),
+                    {"lock_id": _TEST_DATABASE_ADVISORY_LOCK_ID},
+                )
+                await guard.commit()
+    finally:
+        await engine.dispose()
+
+
 @pytest_asyncio.fixture
-async def client(request) -> AsyncGenerator[AsyncClient, None]:
+async def client(request, _test_database_guard) -> AsyncGenerator[AsyncClient, None]:
     """FastAPI test client — fresh engine per test, tables auto-created."""
     env_overrides = getattr(request, "param", None) or {}
     old_env: dict[str, str | None] = {}
@@ -129,7 +155,7 @@ async def client(request) -> AsyncGenerator[AsyncClient, None]:
 
 
 @pytest_asyncio.fixture
-async def db_session() -> AsyncGenerator[AsyncSession, None]:
+async def db_session(_test_database_guard) -> AsyncGenerator[AsyncSession, None]:
     """A standalone async DB session, sharing the same DB the ``client``
     fixture uses. Useful for tests that need to seed / inspect rows
     directly without going through the HTTP API.

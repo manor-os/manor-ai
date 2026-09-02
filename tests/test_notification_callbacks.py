@@ -13,9 +13,11 @@ The flow under test:
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 import pytest
+from celery.exceptions import SoftTimeLimitExceeded
 from httpx import AsyncClient
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -30,8 +32,62 @@ from packages.core.models.notification import (
 from packages.core.services import notify as notify_module
 from packages.core.services import notification_callbacks
 from packages.core.services.channel_gateway import dispatch_inbound
+from packages.core.services.channel_inbound_actions import (
+    maybe_handle_pending_channel_delivery,
+)
 from packages.core.services.channels import ADAPTERS
 from packages.core.services.channels.base import ChannelAdapter
+
+
+@pytest.mark.asyncio
+async def test_whatsapp_contact_cannot_trigger_notification_callback(monkeypatch):
+    """WhatsApp Business senders are customers, never Manor user identities."""
+
+    def unexpected_session():
+        raise AssertionError("WhatsApp notification callback reached the database")
+
+    monkeypatch.setattr(
+        "packages.core.services.channel_inbound_actions.async_session",
+        unexpected_session,
+    )
+
+    outcome = await maybe_handle_pending_channel_delivery(
+        entity_id="entity-1",
+        channel_type="whatsapp",
+        conversation_id="conversation-1",
+        channel_contact_id="contact-1",
+        sender_id="15550001111",
+        sender_name="Customer",
+        content="approve",
+        contact_user_id="historical-user-id",
+        contact_role="member",
+    )
+
+    assert outcome is None
+
+
+@pytest.mark.asyncio
+async def test_callback_soft_time_limit_is_not_converted_to_terminal_failure():
+    callback_kind = "test.soft-time-limit"
+    original = notification_callbacks.get_callback(callback_kind)
+
+    async def handler(_payload, _action_key, _context):
+        raise SoftTimeLimitExceeded()
+
+    notification_callbacks.register_callback(callback_kind, handler)
+    try:
+        with pytest.raises(SoftTimeLimitExceeded):
+            await notification_callbacks.dispatch_callback(
+                callback_kind,
+                payload={},
+                action_key="approve",
+                context={},
+            )
+    finally:
+        if original is None:
+            notification_callbacks._REGISTRY.pop(callback_kind, None)
+        else:
+            notification_callbacks._REGISTRY[callback_kind] = original
 
 
 # ── Test fixtures ───────────────────────────────────────────────────────────
@@ -230,7 +286,7 @@ async def test_notify_with_actions_writes_delivery(
     fake_telegram: _RecordingAdapter,
 ):
     ctx = await _register(client, "actions_user")
-    cc, contact = await _link_telegram(
+    _cc, contact = await _link_telegram(
         db_session,
         entity_id=ctx["entity_id"],
         user_id=ctx["user_id"],
@@ -374,6 +430,152 @@ async def test_channel_reply_resolves_delivery_via_callback(
     ack_text = fake_telegram.sent[0]["text"]
     assert "Recorded approve" in ack_text
     assert "TASK-42" in ack_text
+
+
+@pytest.mark.asyncio
+async def test_concurrent_channel_replies_consume_one_delivery_once(
+    client: AsyncClient,
+    db_session: AsyncSession,
+    fake_telegram: _RecordingAdapter,
+):
+    ctx = await _register(client, "concurrent_reply_user")
+    _cc, contact = await _link_telegram(
+        db_session,
+        entity_id=ctx["entity_id"],
+        user_id=ctx["user_id"],
+    )
+    await client.put(
+        "/api/v1/notifications/preferences",
+        headers=ctx["headers"],
+        json={"default_channels": ["telegram"]},
+    )
+
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    calls: list[str] = []
+
+    async def handler(_payload, action_key, _context):
+        calls.append(action_key)
+        entered.set()
+        await release.wait()
+        return {"ok": True}
+
+    callback_kind = "test.concurrent-hitl"
+    original = notification_callbacks.get_callback(callback_kind)
+    notification_callbacks.register_callback(callback_kind, handler)
+    try:
+        await notify_module.notify(
+            entity_id=ctx["entity_id"],
+            user_id=ctx["user_id"],
+            type="task_hitl_requested",
+            title="Approve once?",
+            actions=[{"key": "approve", "label": "Approve"}],
+            callback_kind=callback_kind,
+            callback_payload={},
+        )
+
+        kwargs = {
+            "entity_id": ctx["entity_id"],
+            "channel_type": "telegram",
+            "conversation_id": "conversation-1",
+            "channel_contact_id": contact.id,
+            "sender_id": contact.source_id,
+            "sender_name": "Tester",
+            "content": "approve",
+            "contact_user_id": ctx["user_id"],
+            "contact_role": "member",
+        }
+        first = asyncio.create_task(
+            maybe_handle_pending_channel_delivery(**kwargs)
+        )
+        await entered.wait()
+        second = asyncio.create_task(
+            maybe_handle_pending_channel_delivery(**kwargs)
+        )
+        await asyncio.sleep(0.05)
+        assert calls == ["approve"]
+        release.set()
+        outcomes = await asyncio.gather(first, second)
+    finally:
+        release.set()
+        if original is None:
+            notification_callbacks._REGISTRY.pop(callback_kind, None)
+        else:
+            notification_callbacks._REGISTRY[callback_kind] = original
+
+    assert all(outcome is not None for outcome in outcomes)
+    assert {
+        outcome.result["status"] for outcome in outcomes if outcome is not None
+    } == {"delivery_resolved", "delivery_callback_in_progress"}
+    assert calls == ["approve"]
+
+
+@pytest.mark.asyncio
+async def test_relinked_contact_cannot_consume_previous_users_delivery(
+    client: AsyncClient,
+    db_session: AsyncSession,
+    fake_telegram: _RecordingAdapter,
+):
+    ctx = await _register(client, "relinked_delivery_owner")
+    _cc, contact = await _link_telegram(
+        db_session,
+        entity_id=ctx["entity_id"],
+        user_id=ctx["user_id"],
+    )
+    await client.put(
+        "/api/v1/notifications/preferences",
+        headers=ctx["headers"],
+        json={"default_channels": ["telegram"]},
+    )
+
+    calls: list[str] = []
+
+    async def handler(_payload, action_key, _context):
+        calls.append(action_key)
+        return {"ok": True}
+
+    callback_kind = "test.relinked-delivery"
+    original = notification_callbacks.get_callback(callback_kind)
+    notification_callbacks.register_callback(callback_kind, handler)
+    try:
+        await notify_module.notify(
+            entity_id=ctx["entity_id"],
+            user_id=ctx["user_id"],
+            type="task_hitl_requested",
+            title="Approve for original owner?",
+            actions=[{"key": "approve", "label": "Approve"}],
+            callback_kind=callback_kind,
+            callback_payload={},
+        )
+        contact.user_id = "replacement-user-id"
+        await db_session.commit()
+
+        outcome = await maybe_handle_pending_channel_delivery(
+            entity_id=ctx["entity_id"],
+            channel_type="telegram",
+            conversation_id="conversation-1",
+            channel_contact_id=contact.id,
+            sender_id=contact.source_id,
+            sender_name="Replacement",
+            content="approve",
+            contact_user_id="replacement-user-id",
+            contact_role="admin",
+        )
+    finally:
+        if original is None:
+            notification_callbacks._REGISTRY.pop(callback_kind, None)
+        else:
+            notification_callbacks._REGISTRY[callback_kind] = original
+
+    assert outcome is None
+    assert calls == []
+    db_session.expire_all()
+    delivery_row = (await db_session.execute(
+        select(NotificationDelivery).where(
+            NotificationDelivery.user_id == ctx["user_id"],
+        )
+    )).scalar_one()
+    assert delivery_row.resolved_at is None
 
 
 @pytest.mark.asyncio
@@ -553,6 +755,103 @@ async def test_callback_failure_marks_delivery_failed(
 
     # Still sends a (default) ack so the user knows their reply was seen
     assert len(fake_telegram.sent) == 1
+
+
+@pytest.mark.asyncio
+async def test_retryable_callback_keeps_delivery_open_for_second_reply(
+    client: AsyncClient,
+    db_session: AsyncSession,
+    fake_telegram: _RecordingAdapter,
+):
+    ctx = await _register(client, "retryable_callback_user")
+    _cc, contact = await _link_telegram(
+        db_session,
+        entity_id=ctx["entity_id"],
+        user_id=ctx["user_id"],
+    )
+    await client.put(
+        "/api/v1/notifications/preferences",
+        headers=ctx["headers"],
+        json={"default_channels": ["telegram"]},
+    )
+
+    calls: list[str] = []
+
+    async def handler(_payload, action_key, _context):
+        calls.append(action_key)
+        if len(calls) == 1:
+            return {
+                "ok": False,
+                "disposition": "retryable",
+                "error": "external_reply_retryable",
+                "message": "Provider unavailable; retry.",
+            }
+        return {"ok": True, "message": "Reply sent."}
+
+    callback_kind = "test.retryable-hitl"
+    original = notification_callbacks.get_callback(callback_kind)
+    notification_callbacks.register_callback(callback_kind, handler)
+    try:
+        await notify_module.notify(
+            entity_id=ctx["entity_id"],
+            user_id=ctx["user_id"],
+            type="task_hitl_requested",
+            title="Approve retryable reply?",
+            actions=[{"key": "approve", "label": "Approve"}],
+            callback_kind=callback_kind,
+            callback_payload={},
+        )
+
+        kwargs = {
+            "entity_id": ctx["entity_id"],
+            "channel_type": "telegram",
+            "conversation_id": "conversation-1",
+            "channel_contact_id": contact.id,
+            "sender_id": contact.source_id,
+            "sender_name": "Tester",
+            "content": "approve",
+            "contact_user_id": ctx["user_id"],
+            "contact_role": "member",
+        }
+        first = await maybe_handle_pending_channel_delivery(**kwargs)
+        assert first is not None
+        assert first.result["status"] == "delivery_callback_retryable"
+
+        db_session.expire_all()
+        persisted = (
+            await db_session.execute(
+                select(NotificationDelivery).where(
+                    NotificationDelivery.user_id == ctx["user_id"],
+                )
+            )
+        ).scalar_one()
+        assert persisted.status == "sent"
+        assert persisted.resolved_action_key is None
+        assert persisted.resolved_at is None
+        assert persisted.error_message == "external_reply_retryable"
+
+        second = await maybe_handle_pending_channel_delivery(**kwargs)
+        assert second is not None
+        assert second.result["status"] == "delivery_resolved"
+    finally:
+        if original is None:
+            notification_callbacks._REGISTRY.pop(callback_kind, None)
+        else:
+            notification_callbacks._REGISTRY[callback_kind] = original
+
+    assert calls == ["approve", "approve"]
+    db_session.expire_all()
+    persisted = (
+        await db_session.execute(
+            select(NotificationDelivery).where(
+                NotificationDelivery.user_id == ctx["user_id"],
+            )
+        )
+    ).scalar_one()
+    assert persisted.status == "resolved"
+    assert persisted.resolved_action_key == "approve"
+    assert persisted.resolved_at is not None
+    assert persisted.error_message is None
 
 
 @pytest.mark.asyncio

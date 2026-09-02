@@ -178,6 +178,286 @@ async def test_wiki_index_includes_db_backed_markdown_documents(client: AsyncCli
 
 
 @pytest.mark.asyncio
+async def test_wiki_index_does_not_remerge_private_db_markdown(
+    client: AsyncClient,
+    db_session,
+    tmp_path,
+):
+    import apps.api.routers.documents as documents_router
+    from packages.core.config import get_settings
+    from packages.core.models.base import generate_ulid
+    from packages.core.models.document import Document
+    from tests.test_document_permissions import _invite_and_accept_member
+
+    settings = get_settings()
+    old_documents_settings = documents_router.settings
+    old_root, old_enabled = settings.MANOR_FS_ROOT, settings.MANOR_FS_ENABLED
+    settings.MANOR_FS_ROOT = str(tmp_path)
+    settings.MANOR_FS_ENABLED = True
+    documents_router.settings = settings
+    try:
+        register = await client.post(
+            "/api/v1/auth/register",
+            json={
+                "username": "wikimemberowner",
+                "email": "wikimemberowner@test.com",
+                "password": "pass123",
+                "entity_name": "Wiki ACL Corp",
+            },
+        )
+        body = register.json()
+        owner_headers = {"Authorization": f"Bearer {body['access_token']}"}
+        member_headers, _ = await _invite_and_accept_member(
+            client, owner_headers, "wikimember@test.com"
+        )
+        entity_root = tmp_path / body["entity_id"]
+        entity_root.mkdir(parents=True, exist_ok=True)
+        (entity_root / "Visible Notes.md").write_text(
+            "visible marker",
+            encoding="utf-8",
+        )
+        (entity_root / "Private Board.md").write_text(
+            "[[Visible Notes]]\n[[PRIVATE-WIKI-TARGET]]",
+            encoding="utf-8",
+        )
+        db_session.add_all([
+            Document(
+                id=generate_ulid(),
+                entity_id=body["entity_id"],
+                name="Visible Notes.md",
+                file_type="md",
+                mime_type="text/markdown",
+                fs_path="Visible Notes.md",
+                visibility="entity",
+                metadata_={"content_text": "visible marker"},
+            ),
+            Document(
+                id=generate_ulid(),
+                entity_id=body["entity_id"],
+                name="Private Board.md",
+                file_type="md",
+                mime_type="text/markdown",
+                fs_path="Private Board.md",
+                visibility="private",
+                metadata_={"content_text": "PRIVATE-WIKI-MARKER"},
+            ),
+        ])
+        await db_session.commit()
+
+        response = await client.get("/api/v1/fs/wiki-index", headers=member_headers)
+        assert response.status_code == 200, response.text
+        serialized = response.text
+        assert "Visible Notes" in serialized
+        assert "Private Board" not in serialized
+        assert "PRIVATE-WIKI-MARKER" not in serialized
+        assert "PRIVATE-WIKI-TARGET" not in serialized
+        index = response.json()
+        assert index["page_count"] == 1
+        assert index["link_count"] == 0
+        assert index["missing_links"] == []
+        assert index["pages"][0]["backlinks"] == []
+        assert index["orphaned_pages"] == ["Visible Notes.md"]
+    finally:
+        settings.MANOR_FS_ROOT = old_root
+        settings.MANOR_FS_ENABLED = old_enabled
+        documents_router.settings = old_documents_settings
+
+
+@pytest.mark.asyncio
+async def test_wiki_links_hide_unreadable_target_existence_and_metadata(
+    client: AsyncClient,
+    db_session,
+    tmp_path,
+):
+    import apps.api.routers.documents as documents_router
+    from packages.core.config import get_settings
+    from packages.core.models.base import generate_ulid
+    from packages.core.models.document import Document
+    from tests.test_document_permissions import _invite_and_accept_member
+
+    settings = get_settings()
+    old_documents_settings = documents_router.settings
+    old_root, old_enabled = settings.MANOR_FS_ROOT, settings.MANOR_FS_ENABLED
+    settings.MANOR_FS_ROOT = str(tmp_path)
+    settings.MANOR_FS_ENABLED = True
+    documents_router.settings = settings
+    try:
+        register = await client.post(
+            "/api/v1/auth/register",
+            json={
+                "username": "wikilinktargetowner",
+                "email": "wikilinktargetowner@test.com",
+                "password": "pass123",
+                "entity_name": "Wiki Target ACL Corp",
+            },
+        )
+        assert register.status_code == 200, register.text
+        body = register.json()
+        owner_headers = {"Authorization": f"Bearer {body['access_token']}"}
+        member_headers, _ = await _invite_and_accept_member(
+            client,
+            owner_headers,
+            "wikilinktargetmember@test.com",
+        )
+        entity_root = tmp_path / body["entity_id"]
+        entity_root.mkdir(parents=True, exist_ok=True)
+        (entity_root / "Visible Source.md").write_text(
+            "Review [[Private Target]].",
+            encoding="utf-8",
+        )
+        (entity_root / "Private Target.md").write_text(
+            "secret",
+            encoding="utf-8",
+        )
+        private_id = generate_ulid()
+        db_session.add_all([
+            Document(
+                id=generate_ulid(),
+                entity_id=body["entity_id"],
+                name="Visible Source.md",
+                fs_path="Visible Source.md",
+                file_type="md",
+                mime_type="text/markdown",
+                visibility="entity",
+            ),
+            Document(
+                id=private_id,
+                entity_id=body["entity_id"],
+                name="Private Target.md",
+                fs_path="Private Target.md",
+                file_type="md",
+                mime_type="text/markdown",
+                visibility="private",
+            ),
+        ])
+        await db_session.commit()
+
+        response = await client.get(
+            "/api/v1/fs/wiki-links",
+            headers=member_headers,
+            params={"path": "Visible Source.md"},
+        )
+        assert response.status_code == 200, response.text
+        link = response.json()["links"][0]
+        assert link["target"] == "Private Target"
+        assert link["exists"] is False
+        assert link["resolved_path"] is None
+        assert link["document_id"] is None
+        assert link["document_name"] is None
+        assert private_id not in response.text
+    finally:
+        settings.MANOR_FS_ROOT = old_root
+        settings.MANOR_FS_ENABLED = old_enabled
+        documents_router.settings = old_documents_settings
+
+
+@pytest.mark.asyncio
+async def test_wiki_links_fall_back_to_readable_same_name_target(
+    client: AsyncClient,
+    db_session,
+    tmp_path,
+):
+    import apps.api.routers.documents as documents_router
+    from packages.core.config import get_settings
+    from packages.core.models.base import generate_ulid
+    from packages.core.models.document import Document
+    from tests.test_document_permissions import _invite_and_accept_member
+
+    settings = get_settings()
+    old_documents_settings = documents_router.settings
+    old_root, old_enabled = settings.MANOR_FS_ROOT, settings.MANOR_FS_ENABLED
+    settings.MANOR_FS_ROOT = str(tmp_path)
+    settings.MANOR_FS_ENABLED = True
+    documents_router.settings = settings
+    try:
+        register = await client.post(
+            "/api/v1/auth/register",
+            json={
+                "username": "wikishadowowner",
+                "email": "wikishadowowner@test.com",
+                "password": "pass123",
+                "entity_name": "Wiki Shadow Corp",
+            },
+        )
+        assert register.status_code == 200, register.text
+        body = register.json()
+        owner_headers = {"Authorization": f"Bearer {body['access_token']}"}
+        member_headers, _ = await _invite_and_accept_member(
+            client,
+            owner_headers,
+            "wikishadowmember@test.com",
+        )
+
+        entity_root = tmp_path / body["entity_id"]
+        public_root = entity_root / "public"
+        public_root.mkdir(parents=True, exist_ok=True)
+        (entity_root / "Visible Source.md").write_text(
+            "Review [[Roadmap]].",
+            encoding="utf-8",
+        )
+        (entity_root / "Roadmap.md").write_text("private", encoding="utf-8")
+        (public_root / "Roadmap.md").write_text("public", encoding="utf-8")
+
+        private_id = generate_ulid()
+        public_id = generate_ulid()
+        db_session.add_all([
+            Document(
+                id=generate_ulid(),
+                entity_id=body["entity_id"],
+                name="Visible Source.md",
+                fs_path="Visible Source.md",
+                file_type="md",
+                mime_type="text/markdown",
+                visibility="entity",
+            ),
+            Document(
+                id=private_id,
+                entity_id=body["entity_id"],
+                name="Roadmap.md",
+                fs_path="Roadmap.md",
+                file_type="md",
+                mime_type="text/markdown",
+                visibility="private",
+            ),
+            Document(
+                id=public_id,
+                entity_id=body["entity_id"],
+                name="Roadmap.md",
+                fs_path="public/Roadmap.md",
+                file_type="md",
+                mime_type="text/markdown",
+                visibility="entity",
+            ),
+        ])
+        await db_session.commit()
+
+        member_response = await client.get(
+            "/api/v1/fs/wiki-links",
+            headers=member_headers,
+            params={"path": "Visible Source.md"},
+        )
+        assert member_response.status_code == 200, member_response.text
+        member_link = member_response.json()["links"][0]
+        assert member_link["resolved_path"] == "public/Roadmap.md"
+        assert member_link["document_id"] == public_id
+        assert private_id not in member_response.text
+
+        owner_response = await client.get(
+            "/api/v1/fs/wiki-links",
+            headers=owner_headers,
+            params={"path": "Visible Source.md"},
+        )
+        assert owner_response.status_code == 200, owner_response.text
+        owner_link = owner_response.json()["links"][0]
+        assert owner_link["resolved_path"] == "Roadmap.md"
+        assert owner_link["document_id"] == private_id
+    finally:
+        settings.MANOR_FS_ROOT = old_root
+        settings.MANOR_FS_ENABLED = old_enabled
+        documents_router.settings = old_documents_settings
+
+
+@pytest.mark.asyncio
 async def test_wiki_links_endpoint_uses_db_content_when_fs_file_missing(client: AsyncClient, db_session, tmp_path):
     import apps.api.routers.documents as documents_router
     from packages.core.config import get_settings

@@ -1,28 +1,14 @@
 /**
  * SharedDocument — public anonymous viewer for a single-document share link.
  *
- * URL: /shared-doc/:token  (matches backend's
- *      /api/v1/shared-doc/{token} URL returned by createShare)
- *
- * No auth required. The token itself is the entitlement; backend verifies
- * its sha256 hash, expiry, max_uses, and revocation state.
- *
- * Renders the actual content inline when the file type supports it:
- *   - markdown  → react-markdown (GFM)
- *   - text/code → monospace <pre>
- *   - pdf       → <iframe>
- *   - image     → <img>
- *   - other     → "preview not available" + download button (if allowed)
- *
- * Content bytes come from /api/v1/shared-doc/{token}/content (inline
- * disposition). The `view` capability — present on every share — is what
- * gates this; download is a separate capability for saving the original.
+ * The opaque token is the entitlement. Public previews are deliberately
+ * read-only and obtain all bytes through token-scoped routes.
  */
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useParams } from "react-router-dom";
-import Markdown from "react-markdown";
-import remarkGfm from "remark-gfm";
 import { ClassificationBadge } from "../components/permissions";
+import ShareOtpGate from "../components/permissions/ShareOtpGate";
+import ReadOnlyFilePreview from "../components/file-preview/ReadOnlyFilePreview";
 import { IconDocument, IconDownload } from "../components/icons";
 import { t } from "../lib/i18n";
 
@@ -39,112 +25,72 @@ interface SharedDocResponse {
   file_size?: number | null;
 }
 
-type RenderMode = "markdown" | "text" | "pdf" | "image" | "video" | "audio" | "unsupported";
-
-const MARKDOWN_EXT = new Set(["md", "markdown", "mdx"]);
-const TEXT_EXT = new Set([
-  "txt", "log", "csv", "tsv", "json", "yaml", "yml", "xml", "html", "htm",
-  "js", "ts", "tsx", "jsx", "py", "go", "rs", "java", "c", "cpp", "h", "sh",
-  "sql", "toml", "ini", "env", "css", "scss",
-]);
-const IMAGE_EXT = new Set(["png", "jpg", "jpeg", "gif", "webp", "svg", "bmp", "avif"]);
-const VIDEO_EXT = new Set(["mp4", "webm", "ogv", "mov", "m4v"]);
-const AUDIO_EXT = new Set(["mp3", "wav", "ogg", "m4a", "aac", "flac"]);
-
-function _ext(name: string, fileType?: string | null): string {
-  if (fileType) return fileType.toLowerCase().replace(/^\./, "");
-  const dot = name.lastIndexOf(".");
-  return dot >= 0 ? name.slice(dot + 1).toLowerCase() : "";
-}
-
-function _renderMode(data: SharedDocResponse): RenderMode {
-  const ext = _ext(data.name, data.file_type);
-  const mime = (data.mime_type || "").toLowerCase();
-  if (MARKDOWN_EXT.has(ext)) return "markdown";
-  if (ext === "pdf" || mime === "application/pdf") return "pdf";
-  if (IMAGE_EXT.has(ext) || mime.startsWith("image/")) return "image";
-  if (VIDEO_EXT.has(ext) || mime.startsWith("video/")) return "video";
-  if (AUDIO_EXT.has(ext) || mime.startsWith("audio/")) return "audio";
-  if (TEXT_EXT.has(ext) || mime.startsWith("text/")) return "text";
-  return "unsupported";
-}
-
 export default function SharedDocument() {
   const { token } = useParams<{ token: string }>();
   const [state, setState] = useState<
     | { kind: "loading" }
+    | { kind: "verification" }
     | { kind: "ok"; data: SharedDocResponse }
     | { kind: "error"; status: number; message: string }
   >({ kind: "loading" });
-  // Fetched text content for markdown/text render modes.
-  const [textContent, setTextContent] = useState<string | null>(null);
-  const [textError, setTextError] = useState<string | null>(null);
+  const [verificationVersion, setVerificationVersion] = useState(0);
 
   useEffect(() => {
     if (!token) return;
-    (async () => {
+    void (async () => {
       try {
-        const res = await fetch(
+        const response = await fetch(
           `/api/v1/shared-doc/${encodeURIComponent(token)}`,
           { headers: { Accept: "application/json" } },
         );
-        if (!res.ok) {
-          const body = await res.json().catch(() => ({}));
+        if (!response.ok) {
+          const body = await response.json().catch(() => ({}));
           const detail = body?.detail;
+          if (response.status === 401 && detail?.code === "permissions.error.share.verification_required") {
+            setState({ kind: "verification" });
+            return;
+          }
           let message: string;
-          if (typeof detail === "object" && detail !== null && typeof (detail as any).code === "string") {
-            const code = (detail as any).code as string;
-            const vars = (detail as any).vars as Record<string, string | number> | undefined;
-            const translated = t(code, vars);
-            message = translated !== code ? translated : ((detail as any).message || code);
+          if (typeof detail === "object" && detail !== null && typeof detail.code === "string") {
+            const translated = t(detail.code, detail.vars);
+            message = translated !== detail.code ? translated : (detail.message || detail.code);
           } else if (typeof detail === "string") {
             message = detail;
           } else {
-            message =
-              res.status === 404
-                ? t("page.shared_doc.error.not_found")
-                : res.status === 410
-                  ? t("page.shared_doc.error.expired")
-                  : `${t("permissions.error.generic")} (${res.status})`;
+            message = response.status === 404
+              ? t("page.shared_doc.error.not_found")
+              : response.status === 410
+                ? t("page.shared_doc.error.expired")
+                : `${t("permissions.error.generic")} (${response.status})`;
           }
-          setState({ kind: "error", status: res.status, message });
+          setState({ kind: "error", status: response.status, message });
           return;
         }
-        const data: SharedDocResponse = await res.json();
-        setState({ kind: "ok", data });
-      } catch (e: any) {
+        setState({ kind: "ok", data: await response.json() as SharedDocResponse });
+      } catch (error: any) {
         setState({
           kind: "error",
           status: 0,
-          message: e?.message || t("page.shared_doc.error.network"),
+          message: error?.message || t("page.shared_doc.error.network"),
         });
       }
     })();
-  }, [token]);
-
-  // Once metadata resolves, fetch text content for markdown/text modes.
-  useEffect(() => {
-    if (state.kind !== "ok" || !token) return;
-    const mode = _renderMode(state.data);
-    if (mode !== "markdown" && mode !== "text") return;
-    let cancelled = false;
-    (async () => {
-      try {
-        const res = await fetch(`/api/v1/shared-doc/${encodeURIComponent(token)}/content`);
-        if (!res.ok) {
-          if (!cancelled) setTextError(t("page.shared_doc.preview_unavailable"));
-          return;
-        }
-        const txt = await res.text();
-        if (!cancelled) setTextContent(txt);
-      } catch {
-        if (!cancelled) setTextError(t("page.shared_doc.preview_unavailable"));
-      }
-    })();
-    return () => { cancelled = true; };
-  }, [state, token]);
+  }, [token, verificationVersion]);
 
   const contentUrl = token ? `/api/v1/shared-doc/${encodeURIComponent(token)}/content` : "";
+  const source = useMemo(() => {
+    const baseUrl = token ? `/api/v1/shared-doc/${encodeURIComponent(token)}` : "";
+    const getOfficePreview = async (kind: "pages" | "slides") => {
+      const response = await fetch(`${baseUrl}/preview/${kind}`);
+      if (!response.ok) throw new Error("Office preview is unavailable");
+      return response.json();
+    };
+    return {
+      contentUrl,
+      getPages: () => getOfficePreview("pages"),
+      getSlides: () => getOfficePreview("slides"),
+    };
+  }, [contentUrl, token]);
 
   return (
     <div
@@ -174,10 +120,20 @@ export default function SharedDocument() {
           </p>
         )}
 
+        {state.kind === "verification" && token && (
+          <ShareOtpGate
+            endpoint={`/api/v1/shared-doc/${encodeURIComponent(token)}`}
+            onVerified={() => {
+              setState({ kind: "loading" });
+              setVerificationVersion((version) => version + 1);
+            }}
+          />
+        )}
+
         {state.kind === "error" && (
           <div style={{ padding: "32px 0", textAlign: "center" }}>
             <p style={{ fontSize: 18, fontWeight: 600, color: "#292524", margin: "0 0 4px" }}>
-              {state.status === 404 ? "🔒" : "⏰"} {state.message}
+              {state.status === 404 ? "Locked" : "Expired"} {state.message}
             </p>
             <p style={{ fontSize: 12, color: "#a8a29e", margin: "12px 0 0" }}>
               {t("page.shared_doc.contact_owner")}
@@ -187,8 +143,7 @@ export default function SharedDocument() {
 
         {state.kind === "ok" && (() => {
           const data = state.data;
-          const mode = _renderMode(data);
-          const canDownload = data.allow_download || data.capabilities.includes("download");
+          const canDownload = data.allow_download && data.capabilities.includes("download");
           return (
             <>
               <div style={{ display: "flex", alignItems: "center", gap: 12, margin: "12px 0 4px" }}>
@@ -231,98 +186,8 @@ export default function SharedDocument() {
                 )}
               </div>
 
-              {/* ── Content preview ── */}
-              <div
-                style={{
-                  borderTop: "1px solid rgba(28,25,23,0.06)",
-                  paddingTop: 18,
-                }}
-              >
-                {mode === "markdown" && (
-                  textError ? (
-                    <PreviewFallback message={textError} />
-                  ) : textContent == null ? (
-                    <PreviewLoading />
-                  ) : (
-                    <div className="markdown-body" style={{ fontSize: 14, lineHeight: 1.7, color: "#292524" }}>
-                      <Markdown remarkPlugins={[remarkGfm]}>{textContent}</Markdown>
-                    </div>
-                  )
-                )}
-
-                {mode === "text" && (
-                  textError ? (
-                    <PreviewFallback message={textError} />
-                  ) : textContent == null ? (
-                    <PreviewLoading />
-                  ) : (
-                    <pre
-                      style={{
-                        margin: 0,
-                        padding: 16,
-                        background: "#fafaf9",
-                        borderRadius: 8,
-                        fontSize: 13,
-                        lineHeight: 1.6,
-                        overflowX: "auto",
-                        whiteSpace: "pre-wrap",
-                        wordBreak: "break-word",
-                        fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
-                        color: "#292524",
-                      }}
-                    >
-                      {textContent}
-                    </pre>
-                  )
-                )}
-
-                {mode === "pdf" && (
-                  <iframe
-                    title={data.name}
-                    src={contentUrl}
-                    style={{ width: "100%", height: "75vh", border: "1px solid rgba(28,25,23,0.06)", borderRadius: 8 }}
-                  />
-                )}
-
-                {mode === "image" && (
-                  <img
-                    src={contentUrl}
-                    alt={data.name}
-                    style={{ maxWidth: "100%", borderRadius: 8, display: "block", margin: "0 auto" }}
-                  />
-                )}
-
-                {mode === "video" && (
-                  <video
-                    src={contentUrl}
-                    controls
-                    controlsList={canDownload ? undefined : "nodownload"}
-                    style={{ width: "100%", maxHeight: "75vh", borderRadius: 8, background: "#000", display: "block" }}
-                  >
-                    {t("page.shared_doc.preview_unsupported")}
-                  </video>
-                )}
-
-                {mode === "audio" && (
-                  <audio
-                    src={contentUrl}
-                    controls
-                    controlsList={canDownload ? undefined : "nodownload"}
-                    style={{ width: "100%", display: "block" }}
-                  >
-                    {t("page.shared_doc.preview_unsupported")}
-                  </audio>
-                )}
-
-                {mode === "unsupported" && (
-                  <PreviewFallback
-                    message={
-                      canDownload
-                        ? t("page.shared_doc.preview_unsupported_downloadable")
-                        : t("page.shared_doc.preview_unsupported")
-                    }
-                  />
-                )}
+              <div style={{ borderTop: "1px solid rgba(28,25,23,0.06)", paddingTop: 18 }}>
+                <ReadOnlyFilePreview file={data} source={source} canDownload={canDownload} />
               </div>
 
               <div
@@ -341,21 +206,5 @@ export default function SharedDocument() {
         })()}
       </div>
     </div>
-  );
-}
-
-function PreviewLoading() {
-  return (
-    <p style={{ fontSize: 13, color: "#a8a29e", textAlign: "center", padding: "24px 0" }}>
-      {t("page.shared_doc.loading")}
-    </p>
-  );
-}
-
-function PreviewFallback({ message }: { message: string }) {
-  return (
-    <p style={{ fontSize: 13, color: "#a8a29e", textAlign: "center", padding: "24px 0" }}>
-      {message}
-    </p>
   );
 }

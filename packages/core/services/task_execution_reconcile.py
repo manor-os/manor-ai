@@ -12,6 +12,10 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from packages.core.constants.supervisor import (
+    SUPERVISOR_VERDICT_LOG_TYPE,
+    SupervisorVerdict,
+)
 from packages.core.constants.task import (
     HITL_LOG_TYPES,
     HITL_REQUEST_LOG_TYPES,
@@ -36,15 +40,29 @@ _PLAN_COMPLETION_RECONCILABLE_TASK_STATUSES = {
 }
 
 
-def _actual_output_from_steps(plan: ExecutionPlan, steps: list[ExecutionStep]) -> dict[str, Any]:
+def _actual_output_from_steps(
+    plan: ExecutionPlan,
+    steps: list[ExecutionStep],
+    *,
+    task: Any | None = None,
+    supervisor_review: dict[str, str] | None = None,
+) -> dict[str, Any]:
     # Keep artifact extraction identical to the executor so task output,
     # dependency handoff, and UI display agree on file references.
     from packages.core.plans.executor import (
         _artifact_refs_from_result,
         _dedupe_task_artifact_refs,
         _step_result_summary,
+        _validated_terminal_task_output,
     )
 
+    review_verdict = (supervisor_review or {}).get("verdict")
+    review_accepts_output = review_verdict == SupervisorVerdict.COMPLETED.value
+    validated_task_output = (
+        _validated_terminal_task_output(task, steps)
+        if task is not None and review_accepts_output
+        else None
+    )
     step_summaries: list[dict[str, Any]] = []
     all_files: list[dict[str, Any]] = []
     for step in steps:
@@ -67,6 +85,8 @@ def _actual_output_from_steps(plan: ExecutionPlan, steps: list[ExecutionStep]) -
                     entry["document_id"] = step.result["document_id"]
                 if step.result.get("fs_path"):
                     entry["fs_path"] = step.result["fs_path"]
+        if validated_task_output and step.step_key == validated_task_output[0]:
+            entry["data"] = validated_task_output[1]
         if step.error:
             entry["error"] = {
                 "type": step.error.get("type", "unknown"),
@@ -74,7 +94,7 @@ def _actual_output_from_steps(plan: ExecutionPlan, steps: list[ExecutionStep]) -
             }
         step_summaries.append(entry)
 
-    return {
+    actual_output = {
         "plan_id": plan.id,
         "plan_status": plan.status,
         "steps": step_summaries,
@@ -84,6 +104,18 @@ def _actual_output_from_steps(plan: ExecutionPlan, steps: list[ExecutionStep]) -
         ) if all_files else None,
         "reconciled_from_plan": True,
     }
+    if validated_task_output is not None:
+        from packages.core.contracts.task_output import TASK_OUTPUT_CONTRACT_SOURCE
+
+        actual_output["result"] = validated_task_output[1]
+        actual_output["result_step_key"] = validated_task_output[0]
+        actual_output["result_contract_source"] = TASK_OUTPUT_CONTRACT_SOURCE
+    if supervisor_review:
+        if supervisor_review.get("verdict"):
+            actual_output["supervisor_verdict"] = supervisor_review["verdict"]
+        if supervisor_review.get("evidence"):
+            actual_output["supervisor_evidence"] = supervisor_review["evidence"]
+    return actual_output
 
 
 def _has_duplicate_file_refs(actual: dict[str, Any]) -> bool:
@@ -114,8 +146,10 @@ def _actual_artifact_refs(actual: dict[str, Any]) -> list[dict[str, Any]]:
 def _has_unprojected_local_artifacts(actual: dict[str, Any]) -> bool:
     """A local file is not a delivered Artifact until it has a Document id."""
 
+    from packages.core.services.generated_file_refs import canonical_document_id
+
     for item in _actual_artifact_refs(actual):
-        if not isinstance(item, dict) or item.get("document_id"):
+        if not isinstance(item, dict) or canonical_document_id(item.get("document_id")):
             continue
         if any(item.get(key) for key in ("fs_path", "path", "file_path", "local_path", "saved_to")):
             return True
@@ -182,6 +216,38 @@ async def _has_open_supervisor_input_request(db: AsyncSession, *, task_id: str, 
     return open_request
 
 
+async def _supervisor_review_for_plan(
+    db: AsyncSession,
+    *,
+    task_id: str,
+    plan_id: str,
+    actual_output: dict[str, Any],
+) -> dict[str, str]:
+    """Return the persisted Supervisor decision for this exact Plan, if any."""
+    rows = list((await db.execute(
+        select(TaskLog).where(
+            TaskLog.task_id == task_id,
+            TaskLog.log_type == SUPERVISOR_VERDICT_LOG_TYPE,
+        ).order_by(TaskLog.created_at.desc(), TaskLog.id.desc())
+    )).scalars().all())
+    for log in rows:
+        metadata = log.meta or {}
+        if str(metadata.get("plan_id") or "") != plan_id:
+            continue
+        verdict = str(metadata.get("verdict") or "")
+        if verdict:
+            return {
+                "verdict": verdict,
+                "evidence": str(metadata.get("evidence") or ""),
+            }
+    if actual_output.get("plan_id") == plan_id and actual_output.get("supervisor_verdict"):
+        return {
+            "verdict": str(actual_output["supervisor_verdict"]),
+            "evidence": str(actual_output.get("supervisor_evidence") or ""),
+        }
+    return {}
+
+
 async def reconcile_task_from_latest_completed_plan(db: AsyncSession, task: Any) -> bool:
     """Repair stale task output/status from the latest completed plan.
 
@@ -211,20 +277,56 @@ async def reconcile_task_from_latest_completed_plan(db: AsyncSession, task: Any)
         return False
 
     actual = getattr(task, "actual_output", None) if isinstance(getattr(task, "actual_output", None), dict) else {}
+    supervisor_review = await _supervisor_review_for_plan(
+        db,
+        task_id=task_id,
+        plan_id=plan.id,
+        actual_output=actual,
+    )
+    supervisor_verdict = supervisor_review.get("verdict")
+    if (
+        supervisor_verdict
+        and supervisor_verdict != SupervisorVerdict.COMPLETED.value
+    ):
+        # A completed Plan is only the mechanical execution state.  The
+        # Supervisor owns Task acceptance and a read-time repair must never
+        # reverse its explicit needs_replan/needs_human/failed decision.
+        return False
     if (
         task_status == "waiting_on_customer"
+        and not supervisor_verdict
         and (
-            actual.get("supervisor_verdict") == "needs_human"
-            or await _has_open_supervisor_input_request(db, task_id=task_id, plan_id=plan.id)
+            await _has_open_supervisor_input_request(
+                db,
+                task_id=task_id,
+                plan_id=plan.id,
+            )
         )
     ):
         return False
 
+    from packages.core.contracts.task_output import (
+        TASK_OUTPUT_CONTRACT_SOURCE,
+        task_expected_output_json_schema,
+    )
+
+    requires_structured_result = (
+        task_expected_output_json_schema(getattr(task, "expected_output", None))
+        is not None
+    )
+    if (
+        requires_structured_result
+        and supervisor_verdict != SupervisorVerdict.COMPLETED.value
+    ):
+        # A completed Plan proves mechanical execution only. Structured Task
+        # output becomes formal only after an explicit persisted acceptance.
+        return False
     if (
         actual.get("plan_id") == plan.id
         and actual.get("plan_status") == "completed"
         and task_status == "completed"
         and not _has_duplicate_file_refs(actual)
+        and not requires_structured_result
     ):
         if not _has_unprojected_local_artifacts(actual):
             return False
@@ -238,9 +340,41 @@ async def reconcile_task_from_latest_completed_plan(db: AsyncSession, task: Any)
         select(ExecutionStep).where(ExecutionStep.plan_id == plan.id)
         .order_by(ExecutionStep.created_at)
     )).scalars().all())
+    rebuilt_output = _actual_output_from_steps(
+        plan,
+        steps,
+        task=task,
+        supervisor_review=supervisor_review,
+    )
+    if requires_structured_result and "result" not in rebuilt_output:
+        # A mechanically completed Plan is insufficient when the Task owns a
+        # hard result schema. If the persisted terminal Step can no longer
+        # prove the exact accepted deliverable, leave the Task untouched
+        # instead of manufacturing a completed result during read repair.
+        return False
+
+    if (
+        requires_structured_result
+        and task_status == "completed"
+        and actual.get("plan_id") == plan.id
+        and actual.get("plan_status") == "completed"
+        and not _has_duplicate_file_refs(actual)
+        and "result" in actual
+        and actual["result"] == rebuilt_output["result"]
+        and actual.get("result_step_key") == rebuilt_output["result_step_key"]
+        and actual.get("result_contract_source") == TASK_OUTPUT_CONTRACT_SOURCE
+    ):
+        if not _has_unprojected_local_artifacts(actual):
+            return False
+        projected = await _project_actual_output_artifacts(task, actual)
+        if projected == actual:
+            return False
+        task.actual_output = projected
+        return True
+
     task.actual_output = await _project_actual_output_artifacts(
         task,
-        _actual_output_from_steps(plan, steps),
+        rebuilt_output,
     )
 
     if task_status != "completed":

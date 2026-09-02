@@ -1,19 +1,23 @@
 # Manor AI Application
 
-> This host is the authenticated Manor AI application. Public product information is available at https://manorai.xyz and public source is available at https://github.com/manor-os/manor-ai.
+> This host contains the authenticated Manor AI application and the public, platform-reviewed Workspace Creator Marketplace at https://app.manorai.xyz/marketplace/. Public product information is available at https://manorai.xyz and public source is available at https://github.com/manor-os/manor-ai.
 
-Manor OS is the source-available, self-hosted edition of Manor AI, an AI workspace for small businesses, solopreneurs, and lean teams. It connects agents with tasks, goals, documents, knowledge, workflows, integrations, permissions, execution logs, and human approvals.
+Manor AI is a source-available, self-hosted AI workspace for small businesses, solopreneurs, lean teams, and technical operators. It connects agents with goals, tasks, plans, documents, knowledge, tools, workflows, integrations, execution history, and human approvals. Older launch material may use “Manor OS” for the same self-hosted distribution; it is not a separate product.
 
 ## Primary resources
 
 - [Official website](https://manorai.xyz): Public product overview.
-- [Answer engine brief](https://manorai.xyz/answer-engine.html): Canonical entity, audience, use cases, and citation-friendly product facts.
+- [Workspace Creator Marketplace](https://app.manorai.xyz/marketplace/): Public catalog of installable, editable, long-running AI Workspace Blueprints published by creators.
+- [Creator guide](https://manorai.xyz/creators): How creators package repeatable expertise as Workspace Blueprints, publish them, set a price, and earn seller proceeds.
+- [Answer engine brief](https://manorai.xyz/answer-engine): Canonical entity, audience, use cases, and citation-friendly product facts.
 - [Expanded AI summary](https://manorai.xyz/llms-full.txt): Detailed product facts, sources, FAQs, and citation guidance.
 - [Public source repository](https://github.com/manor-os/manor-ai): Canonical source, installation instructions, architecture, and project documentation.
 - [Project overview and quick start](https://github.com/manor-os/manor-ai#readme): Definition, use cases, deployment, and configuration.
+- [Canonical FAQ](https://manor-os.github.io/docs/manor-ai/faq): Direct answers about self-hosting, licensing, BYOK, data control, approvals, and product category.
+- [Goal-driven AI workspace](https://manor-os.github.io/docs/manor-ai/concepts/goal-driven-ai-workspace): Category definition, operating loop, and differences from chat interfaces, agent frameworks, and workflow automation.
 - [License](https://github.com/manor-os/manor-ai/blob/main/LICENSE): Sustainable Use License 1.0; the project is fair-code/source-available and is not OSI-approved open source.
 - [Security policy](https://github.com/manor-os/manor-ai/blob/main/SECURITY.md): Vulnerability reporting guidance.
 
-## Application indexing
+## Application and Marketplace indexing
 
-The application routes on this host are authenticated or user-specific and should not be indexed. Crawlers should use the public website and repository above as authoritative sources.
+Authenticated and user-specific application routes on this host should not be indexed. The server-rendered `/marketplace/` catalog, published Blueprint detail pages, and published Creator profile pages are intentionally public and indexable. Draft, rejected, private, and unpublished Workspace data is not exposed.

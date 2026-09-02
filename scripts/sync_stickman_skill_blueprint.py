@@ -13,9 +13,8 @@ ROOT = Path(__file__).resolve().parents[1]
 SKILL_PATH = ROOT / "packages/core/ai/marketplace_skills/stickman-video-creator/SKILL.md"
 BLUEPRINT_PATH = ROOT / "packages/core/blueprints/configs/solo_company/solo-faceless-stickman-studio-v1.json"
 CHANGELOG_ENTRY = (
-    "v1.41 (2026-08-13): accept YouTube Details normalized titles and visible short or "
-    "watch links as authoritative upload evidence, preventing false failures when Studio "
-    "hides the original MP4 filename and video ID from the page URL."
+    "v1.43 (2026-08-17): verify final Stickman publication from durable MP4, subtitle, "
+    "and narration-timeline receipts before the YouTube continuation."
 )
 
 

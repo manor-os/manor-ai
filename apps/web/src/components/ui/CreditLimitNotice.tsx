@@ -2,6 +2,7 @@ import { useNavigate } from "react-router-dom";
 import type { PlanLimitDetail } from "../../lib/api";
 import { t } from "../../lib/i18n";
 import { planLimitOffersCredits, planLimitTitle } from "../../lib/planLimit";
+import { useConfigStore } from "../../stores/config";
 
 interface Props {
   detail?: PlanLimitDetail;
@@ -10,10 +11,32 @@ interface Props {
 
 export default function CreditLimitNotice({ detail, compact = false }: Props) {
   const navigate = useNavigate();
+  const creditsUnlimited = useConfigStore((s) => s.ai_credits_unlimited);
   const message =
     detail?.message ||
     t("component.upgrade_prompt.default_message");
   const offersCredits = planLimitOffersCredits(detail?.kind);
+
+  if (creditsUnlimited) {
+    return (
+      <div
+        role="status"
+        style={{
+          background: "var(--surface-muted)",
+          borderRadius: 8,
+          padding: compact ? "10px" : "12px",
+          color: "var(--text-muted)",
+        }}
+      >
+        <div style={{ fontSize: 13, fontWeight: 700, color: "var(--text-strong)" }}>
+          {t("page.settings.unlimited_ai_credits")}
+        </div>
+        <div style={{ fontSize: 12, lineHeight: 1.5, marginTop: 3 }}>
+          {t("page.settings.track_usage_without_credit_limit")}
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div

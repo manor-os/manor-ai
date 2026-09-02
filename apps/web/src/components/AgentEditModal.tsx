@@ -375,6 +375,9 @@ export default function AgentEditModal() {
       sum + tools.filter((tool: any) => selectedToolIdSet.has(tool.id)).length,
     0,
   );
+  const selectedMcpServerCount = Array.from(mcpToolsByServer.values()).filter(
+    (tools) => tools.some((tool: any) => selectedToolIdSet.has(tool.id)),
+  ).length;
   const mcpServers = (mcpServerStatus as any[]) || [];
   const filteredMcpServers = mcpServers.filter((server: any) => {
     if (!mcpSearch.trim()) return true;
@@ -765,6 +768,7 @@ export default function AgentEditModal() {
                         avatar_url: "",
                         category: draft.category || "",
                         tags: draft.tags || [],
+                        capability_ids: draft.capability_ids || [],
                         source: "llm-generated",
                         config: mergeAgentConfig({}, true, "hosted"),
                       });
@@ -1070,7 +1074,7 @@ export default function AgentEditModal() {
                 </p>
               </div>
               <span className="shrink-0 rounded-md bg-stone-100 px-2.5 py-1 text-[11px] font-semibold text-stone-600">
-                {selectedSkillCount + selectedRuntimeToolCount + selectedMcpActionCount} selected
+                {selectedSkillCount + selectedRuntimeToolCount + selectedMcpServerCount} selected
               </span>
             </div>
             <div className="mb-3 grid grid-cols-3 rounded-lg bg-stone-100 p-1">
@@ -1088,7 +1092,7 @@ export default function AgentEditModal() {
                 {
                   key: "mcp" as const,
                   label: "MCP",
-                  count: selectedMcpActionCount,
+                  count: selectedMcpServerCount,
                 },
               ].map((item) => (
                 <button
@@ -1302,6 +1306,7 @@ export default function AgentEditModal() {
                       const tools = mcpToolsByServer.get(server.server_key) || [];
                       const selectedCount = tools.filter((tool: any) => selectedToolIdSet.has(tool.id)).length;
                       const ready = Boolean(server.agent_can_use);
+                      const requiresExplicitAccount = Boolean(server.requires_explicit_account);
                       const comingSoon = Boolean(server.coming_soon);
                       const connectionCount =
                         (Array.isArray(server.connections) ? server.connections.length : 0) +
@@ -1316,10 +1321,10 @@ export default function AgentEditModal() {
                                   {mcpProviderLabel(server)}
                                 </div>
                                 <StatusBadge
-                                  type={ready ? "active" : comingSoon ? "gray" : "warning"}
+                                  type={ready && !requiresExplicitAccount ? "active" : comingSoon ? "gray" : "warning"}
                                   dot={!comingSoon}
                                 >
-                                  {ready ? "Ready" : comingSoon ? "Soon" : "Needs setup"}
+                                  {requiresExplicitAccount ? "Account required" : ready ? "Ready" : comingSoon ? "Soon" : "Needs setup"}
                                 </StatusBadge>
                                 <Chip variant="slate" size="sm">
                                   {selectedCount}/{tools.length} actions

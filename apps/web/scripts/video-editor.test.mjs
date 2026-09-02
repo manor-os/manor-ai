@@ -494,7 +494,9 @@ try {
   assert.match(editorSource, /revealedCaptionText/);
   assert.match(editorSource, /createMotionDesignComposition\(recipe\.motion_design/);
   assert.match(editorSource, /motion_design_presets: MOTION_DESIGN_PRESETS/);
-  assert.match(editorSource, /getContent: \(\) => editorLiveContentRef\.current/);
+  assert.match(editorSource, /adapter: createEditorLiveAdapter\(\{/);
+  assert.match(editorSource, /target: \{ kind: AiEditTargetKind\.Video, id: doc\.id \}/);
+  assert.match(editorSource, /read: \(\) => editorLiveContentRef\.current/);
   assert.match(editorSource, /ai\.example\.camera_move/);
   assert.match(editorSource, /version: 11/);
   assert.match(editorSource, /if \(routeIsRecipe \|\| recipeDoc\) return/);

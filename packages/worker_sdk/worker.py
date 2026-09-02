@@ -2,14 +2,16 @@
 
 User code:
 
+    from packages.worker_sdk import LeaseResult
+
     worker = ManorWorker(endpoint="https://manor.example.com",
-                          worker_id="wkr_x", secret="wks_y",
-                          max_concurrent_leases=4)
+                         worker_id="wkr_x", secret="wks_y",
+                         max_concurrent_leases=4)
 
     @worker.handle(kind="action", provider="shopify")
-    async def handle_shopify(lease, ctx) -> dict:
+    async def handle_shopify(lease, ctx) -> LeaseResult:
         ...
-        return {"result": {...}, "cost": {...}}
+        return LeaseResult(result={...}, cost={...})
 
     await worker.run_forever()
 
@@ -40,8 +42,9 @@ from packages.worker_sdk.types import (
     HeartbeatCompletedLease,
     HeartbeatRequest,
     Lease,
-    LeaseResult,
+    LeaseResultFactory,
     NeedHumanInput,
+    TaskOutputValueKind,
 )
 
 logger = logging.getLogger(__name__)
@@ -54,7 +57,8 @@ class NoHandlerError(Exception):
     chat message instead of a perpetual retry."""
 
 
-# Handler signature: ``async def fn(lease, ctx) -> LeaseResult|dict|None``
+# Plain handler values are task payloads. Return ``LeaseResult`` only when the
+# handler needs transport metadata such as cost or evidence references.
 LeaseHandler = Callable[["Lease", "LeaseContext"], Awaitable[Any]]
 
 
@@ -149,8 +153,17 @@ class ManorWorker:
             try:
                 next_heartbeat_in = await self._tick()
             except WorkerClientError as exc:
-                if exc.status_code in (401, 403):
-                    logger.error("manor SDK: auth failed (%s) — exiting", exc.status_code)
+                if exc.requires_operator_action:
+                    if exc.status_code == 426:
+                        logger.error(
+                            "manor SDK: worker protocol registration rejected (426); "
+                            "re-register this worker before restarting"
+                        )
+                    else:
+                        logger.error(
+                            "manor SDK: auth failed (%s) — exiting",
+                            exc.status_code,
+                        )
                     self._stop.set()
                     break
                 logger.warning("manor SDK: heartbeat failed (%s) — backing off", exc)
@@ -229,13 +242,23 @@ class ManorWorker:
                 )
 
             raw = await handler(lease, ctx)
-            result = self._coerce_result(raw)
+            result = LeaseResultFactory.from_handler_output(raw)
             await self._client.complete_lease(lease.lease_id, result)
-            self._completions.append(HeartbeatCompletedLease(
-                lease_id=lease.lease_id, status="done",
-                result=result.result, cost=result.cost,
-                evidence_refs=result.evidence_refs,
-            ))
+            completion: dict[str, Any] = {
+                "lease_id": lease.lease_id,
+                "status": "done",
+            }
+            # Preserve field presence: ``LeaseResult()`` means the handler
+            # omitted a result, while ``LeaseResult(result=None)`` is an
+            # explicit JSON null that a nullable bare contract may accept.
+            if "result" in result.model_fields_set:
+                completion["result"] = result.result
+            if "cost" in result.model_fields_set:
+                completion["cost"] = result.cost
+            if "evidence_refs" in result.model_fields_set:
+                completion["evidence_refs"] = result.evidence_refs
+            completion["task_output_value_kind"] = result.task_output_value_kind
+            self._completions.append(HeartbeatCompletedLease(**completion))
 
         except NeedHumanInput as nh:
             try:
@@ -251,6 +274,7 @@ class ManorWorker:
             await self._client.fail_lease(lease.lease_id, error=err, will_retry=False)
             self._completions.append(HeartbeatCompletedLease(
                 lease_id=lease.lease_id, status="failed", error=err,
+                task_output_value_kind=TaskOutputValueKind.TASK_PAYLOAD,
             ))
 
         except Exception as exc:
@@ -262,27 +286,11 @@ class ManorWorker:
                 logger.warning("fail_lease report failed: %s", report_exc)
             self._completions.append(HeartbeatCompletedLease(
                 lease_id=lease.lease_id, status="failed", error=err,
+                task_output_value_kind=TaskOutputValueKind.TASK_PAYLOAD,
             ))
 
         finally:
             self._active.pop(lease.lease_id, None)
-
-    @staticmethod
-    def _coerce_result(raw: Any) -> LeaseResult:
-        """Handlers may return: a LeaseResult, a dict, or None.
-        Normalise to LeaseResult."""
-        if raw is None:
-            return LeaseResult()
-        if isinstance(raw, LeaseResult):
-            return raw
-        if isinstance(raw, dict):
-            # If it looks like a LeaseResult shape (top-level result/cost/...)
-            # pass through; otherwise wrap as result.
-            keys = set(raw.keys())
-            if keys & {"result", "cost", "evidence_refs"}:
-                return LeaseResult(**{k: raw.get(k) for k in ("result", "cost", "evidence_refs")})
-            return LeaseResult(result=raw)
-        return LeaseResult(result={"value": raw})
 
     # ── Lifecycle ────────────────────────────────────────────────────
 

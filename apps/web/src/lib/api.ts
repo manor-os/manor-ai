@@ -21,6 +21,7 @@ import type {
   TaskRetryResponse,
   CalendarSettings,
   CalendarSettingsResponse,
+  CalendarOptionsResponse,
   BookingLink,
   BookingLinkWrite,
   DailyAgendaResponse,
@@ -67,16 +68,27 @@ import type {
   Comment,
   CommentAnchor,
 } from "./types";
+import type { AiEditTargetKind } from "./editorLiveChat";
 
 import { useToastStore } from "../stores/toast";
-import { t } from "./i18n";
+import { normalizeLocale, t } from "./i18n";
 import {
+  legacyManualSkillIds,
+  type ManualSkillReference,
+} from "./manualSkillRefs";
+import {
+  authPrincipalKey,
   getAuthToken,
   clearAuthBrowserState,
 } from "./authToken";
 import { captureClientError } from "./clientErrors";
 
 const API_BASE = "/api/v1";
+
+export enum ConversationSurfaceKind {
+  OrdinaryChat = "chat",
+  AiEdit = "ai_edit",
+}
 const BACKEND_UNAVAILABLE_TOAST_ID = "backend-unavailable";
 
 export type DashboardAppliedModuleChange = {
@@ -179,6 +191,7 @@ type DocumentBrowseResponse = DocumentListResponse & {
   total_documents: number;
   direct_total_files?: number;
   direct_total_size?: number;
+  max_upload_mb: number;
 };
 type DocumentIndexingStatus = Pick<Document, "id" | "vector_status" | "indexing_progress">;
 
@@ -291,8 +304,7 @@ function clearBackendUnavailableToast() {
 }
 
 function getStoredLocale(): string {
-  const locale = localStorage.getItem("manor_locale");
-  return locale === "zh" || locale === "es" || locale === "en" ? locale : "en";
+  return normalizeLocale(localStorage.getItem("manor_locale"));
 }
 
 export interface WiringStatus {
@@ -305,22 +317,48 @@ export interface WiringStatus {
   pending_update_count: number | null;
 }
 
+export interface HealthCheckStatus {
+  ok: boolean | null;
+  detail: string | null;
+  configured_url?: string | null;
+  expected_url?: string | null;
+}
+
 export interface HealthStatus {
   ok: boolean | null;
+  reason_code: string | null;
   detail: string | null;
   latency_ms: number | null;
   checked_at: string | null;
   wiring: WiringStatus | null;
+  integration_id: string | null;
+  channel_config_id: string | null;
+  phone_number_id: string | null;
+  waba_id: string | null;
+  checks: Record<string, HealthCheckStatus> | null;
 }
 
 export interface IntegrationMCPAccount {
   id: string;
   display_name: string | null;
   is_default: boolean;
+  kind: "oauth_account" | "integration";
+  ownership: "mine" | "shared";
+  owner_user_id: string | null;
+  owner_display_name: string | null;
+  can_manage: boolean;
+  can_share: boolean;
+  runtime_callable: boolean;
+  availability:
+    | "callable"
+    | "reconnect_required"
+    | "permission_denied"
+    | "load_failed";
 }
 
 export interface IntegrationMCPServer {
   server_key: string;
+  server_kind: "managed" | "custom";
   name: string;
   category: string | null;
   description: string | null;
@@ -333,17 +371,21 @@ export interface IntegrationMCPServer {
   supports_multi_account: boolean;
   capabilities?: string[];
   example_prompts?: string[];
-  connections: Array<IntegrationMCPAccount & {
+  connections: Array<Omit<IntegrationMCPAccount, "kind"> & {
+    kind: "oauth_account";
     provider_user_id: string;
     expires_at: string | null;
     connected_at: string | null;
     health: HealthStatus | null;
   }>;
-  entity_accounts: Array<IntegrationMCPAccount & {
+  entity_accounts: Array<Omit<IntegrationMCPAccount, "kind"> & {
+    kind: "integration";
     name: string | null;
     created_at: string | null;
     status: string;
     health: HealthStatus | null;
+    nango_backed: boolean;
+    whatsapp_readiness_code: string | null;
   }>;
   user_connected: boolean;
   user_expires_at: string | null;
@@ -351,9 +393,11 @@ export interface IntegrationMCPServer {
   required_permission: string | null;
   user_has_required_permission: boolean;
   agent_can_use: boolean;
+  requires_explicit_account: boolean;
   hint: string;
   nango_provider_config_key?: string | null;
   oauth_configured?: boolean;
+  oauth_client_secret_required?: boolean;
   coming_soon?: boolean;
   cli_spec?: {
     command_template: string;
@@ -371,8 +415,18 @@ export interface IntegrationMCPServer {
   } | null;
 }
 
+export interface NangoSyncResponse {
+  upserted: number;
+  providers: string[];
+  integration_id: string | null;
+  readiness_code: string | null;
+  provisioning_pending: boolean;
+  provisioning_detail: string | null;
+}
+
 export interface IntegrationOperation {
   name: string;
+  tool_name: string;
   label: string;
   resource: string;
   description: string;
@@ -383,11 +437,30 @@ export interface IntegrationOperation {
     required: string[];
     [key: string]: any;
   };
+  output_schema?: Record<string, any> | null;
+  account_input_schemas?: Record<string, {
+    type: "object";
+    properties: Record<string, Record<string, any>>;
+    required: string[];
+    [key: string]: any;
+  }>;
+  account_output_schemas?: Record<string, Record<string, any>>;
+  account_ids: string[];
+  account_options: Array<{
+    id: string;
+    display_name?: string;
+    provider?: string;
+    scope?: string;
+    is_default?: boolean;
+  }>;
+  requires_explicit_account: boolean;
+  supports_all_accounts?: boolean | null;
 }
 
 export interface IntegrationOperationCatalog {
   server_key: string;
-  source: "builtin" | "cache";
+  server_kind: "managed" | "custom";
+  source: "builtin" | "cache" | "account_discovery";
   operations: IntegrationOperation[];
 }
 
@@ -412,7 +485,7 @@ export interface WorkerRegisterRequest {
     max_risk_level?: "low" | "medium" | "high";
     uses_manor_credentials?: boolean;
     deployment?: "local" | "remote" | "cloud";
-    protocol_version?: number;
+    protocol_version: 2;
     [key: string]: unknown;
   };
   trust_level?: "high" | "standard" | "low";
@@ -427,6 +500,7 @@ export interface WorkerRegisterResponse {
   expires_at: string | null;
   heartbeat_endpoint: string;
   next_heartbeat_in_seconds: number;
+  protocol_version: 2;
 }
 
 export interface WorkerResponse {
@@ -489,6 +563,21 @@ export interface AgentDeploymentResponse {
   updated_at: string | null;
 }
 
+export interface WorkspaceAgentMapping {
+  id: string;
+  agent_id: string;
+  service_key: string | null;
+  custom_prompt: string | null;
+  config: Record<string, unknown>;
+  created_at: string | null;
+  agent: {
+    id: string;
+    name: string;
+    avatar_url: string | null;
+    avatar_seed: string;
+  } | null;
+}
+
 
 
 // ── Workspace budget (M8) ──────────────────────────────────────────
@@ -512,6 +601,20 @@ export interface WorkspaceBudgetUpdate {
   monthly_budget_usd?: number | null;
   auto_pause_on_budget?: boolean;
   reset_alert_state?: boolean;
+}
+
+export interface WorkspaceSetupStatus {
+  ready: boolean;
+  status: string;
+  summary: string;
+  incomplete_checks: Array<{
+    key?: string;
+    kind?: string;
+    todo_kind?: string;
+    reason?: string;
+    provider?: string;
+    [key: string]: unknown;
+  }>;
 }
 
 export interface WorkspaceEvaluationSnapshot {
@@ -584,9 +687,27 @@ export interface WorkspaceDraftTurn {
 export interface WorkspaceDraftFinalize {
   workspace_id: string;
   draft: WorkspaceDraft;
+  strategist_eta_seconds?: number | null;
+  dispatch_warning?: string | null;
 }
 
 // ── Workspace Blueprint / Marketplace types (M12) ─────────────────────
+
+export interface WorkspaceConnectionStatus {
+  workspace_id: string;
+  required_issue_count: number;
+  requirements: Array<{
+    key: string;
+    kind: "integration" | "channel" | "browser_session";
+    provider: string;
+    label: string;
+    required: boolean;
+    ready: boolean;
+    reason: string;
+    service_keys: string[];
+    setup_kind?: string | null;
+  }>;
+}
 
 export interface BlueprintSetupItem {
   label: string;
@@ -594,7 +715,7 @@ export interface BlueprintSetupItem {
   kind: string | null;
   required: boolean;
   purpose: string | null;
-  default: string | null;
+  default: unknown;
 }
 
 export interface BlueprintSetupPreview {
@@ -698,6 +819,7 @@ export interface UpdateBlueprintRequest {
 }
 
 export interface ExportBlueprintRequest {
+  marketplace_blueprint_id?: string;
   slug: string;
   title: string;
   summary?: string;
@@ -706,6 +828,14 @@ export interface ExportBlueprintRequest {
   cover_image_url?: string;
   author_handle?: string;
   author_display_name?: string;
+  install_variables?: Array<{
+    key: string;
+    label: string;
+    purpose?: string;
+    required: boolean;
+    default?: unknown;
+    materialize?: boolean;
+  }>;
   include_subscriptions?: boolean;
   include_goals?: boolean;
   include_stats?: boolean;
@@ -721,7 +851,17 @@ export interface ExportBlueprintRequest {
   knowledge_pack_mode?: "skeleton" | "inline_text";
   include_starter_memory?: boolean;
   include_memory_files?: boolean;
+  knowledge_document_ids?: string[];
   replace_existing?: boolean;
+}
+
+export interface BlueprintExportKnowledgeDocument {
+  id: string;
+  name: string;
+  path: string;
+  file_size: number;
+  groups: Array<{ id: string; name: string }>;
+  groups_truncated?: boolean;
 }
 
 export type InstallMode = "simulate" | "live";
@@ -957,15 +1097,43 @@ export interface InstallBlueprintRequest {
   mode?: InstallMode;
   workspace_name?: string;
   create_missing_agents?: boolean;
+  variable_values?: Record<string, unknown>;
+  channel_config_ids?: Record<string, string>;
   governance_preset?: GovernancePresetKey;
   share_token?: string;
 }
 
+export interface BlueprintInstallPreflightRequirement {
+  kind: "integration" | "channel" | "browser_session";
+  provider: string;
+  label: string;
+  required: boolean;
+  blocking: boolean;
+  ready: boolean;
+  reason: string;
+  purpose: string | null;
+  setup_kind: string | null;
+  scope: string | null;
+  config_fields_to_set: string[];
+  requirement_key: string | null;
+  resource_id: string | null;
+  resource_options: Array<{ id: string; label: string }>;
+}
+
+export interface BlueprintInstallPreflight {
+  ready: boolean;
+  blocking_count: number;
+  requirements: BlueprintInstallPreflightRequirement[];
+}
+
+
 // Mirrors backend PurchaseStatusResponse (apps/api/routers/marketplace.py).
 export interface PurchaseStatusResponse {
-  purchase_id: string;
-  blueprint_id: string;
+  purchase_id: string | null;
+  blueprint_id: string | null;
   status: string;
+  purchase_status: string | null;
+  attempt_status?: string | null;
   purchased_at?: string | null;
 }
 
@@ -981,9 +1149,14 @@ export interface MerchantSaleItem {
   purchase_id: string;
   blueprint_id: string;
   blueprint_title: string;
+  buyer_display_name: string | null;
   amount_cents: number;
-  platform_fee_cents: number;
-  seller_amount_cents: number;
+  refunded_amount_cents: number;
+  transfer_reversed_amount_cents: number | null;
+  platform_fee_refunded_amount_cents: number | null;
+  platform_fee_cents: number | null;
+  seller_amount_cents: number | null;
+  reconciliation_pending: boolean;
   currency: string;
   status: string;
   purchased_at?: string | null;
@@ -991,9 +1164,11 @@ export interface MerchantSaleItem {
 
 export interface MerchantSalesResponse {
   items: MerchantSaleItem[];
-  gross_cents: number;
-  fees_cents: number;
-  net_cents: number;
+  gross_cents: number | null;
+  fees_cents: number | null;
+  net_cents: number | null;
+  reconciliation_pending: boolean;
+  reconciliation_pending_count: number;
 }
 
 export interface BillingPayment {
@@ -1035,6 +1210,7 @@ export interface InstallBlueprintResponse {
   goal_ids: string[];
   subscription_ids: string[];
   scheduled_job_ids: string[];
+  workflow_binding_ids: string[];
   custom_field_ids: string[];
   governance_applied: boolean;
   todos: InstallTodo[];
@@ -1143,7 +1319,7 @@ let _sessionRedirecting = false;
  *  show their own inline error instead of redirecting. */
 function handleSessionExpired(path: string) {
   if (typeof window === "undefined" || _sessionRedirecting) return;
-  if (path.startsWith("/auth/")) return;
+  if (path.startsWith("/auth/") && path !== "/auth/renew") return;
   if (window.location.pathname.startsWith("/login")) return;
   _sessionRedirecting = true;
   try {
@@ -1175,6 +1351,44 @@ export class ApiError extends Error {
   ) {
     super(message);
     this.name = "ApiError";
+  }
+}
+
+export type DocumentUploadPhase = "uploading" | "processing";
+
+export interface DocumentUploadProgress {
+  phase: DocumentUploadPhase;
+  loaded: number;
+  total: number;
+  percent: number;
+}
+
+export interface DocumentUploadRequestOptions {
+  signal?: AbortSignal;
+  onProgress?: (progress: DocumentUploadProgress) => void;
+  /** Abort only while the browser has stopped sending bytes for this long. */
+  stallTimeoutMs?: number;
+  /** Bound the server-side validation/persistence phase after all bytes arrive. */
+  processingTimeoutMs?: number;
+  /** Stable across retries so an ambiguous completion cannot create a duplicate. */
+  idempotencyKey?: string;
+  /** Bound receipt reconciliation after the browser times out waiting for processing. */
+  receiptReconcileTimeoutMs?: number;
+}
+
+export class DocumentUploadStalledError extends Error {
+  constructor(public phase: DocumentUploadPhase = "uploading") {
+    super(phase === "processing"
+      ? "Upload processing did not finish in time"
+      : "Upload stopped making progress");
+    this.name = "DocumentUploadStalledError";
+  }
+}
+
+export class DocumentUploadAuthChangedError extends Error {
+  constructor() {
+    super("Upload stopped because the authenticated account changed");
+    this.name = "DocumentUploadAuthChangedError";
   }
 }
 
@@ -1258,6 +1472,8 @@ export interface PlanLimitDetail {
   kind?: PlanLimitKind;
   /** Exact billing-period boundary for the next included-credit refill. */
   resets_at?: string | null;
+  /** Safe in-app destination used to continue an interrupted paid action. */
+  return_to?: string | null;
 }
 
 type DocumentDownloadCacheEntry = {
@@ -1267,7 +1483,9 @@ type DocumentDownloadCacheEntry = {
   size: number;
 };
 
-type DocumentBlobOptions = { cache?: boolean; force?: boolean };
+export type ProtectedFileResponseOptions = { signal?: AbortSignal };
+type DocumentBlobOptions = ProtectedFileResponseOptions & { cache?: boolean; force?: boolean };
+type DocumentResponseOptions = ProtectedFileResponseOptions;
 type DocumentThumbnailOptions = DocumentBlobOptions & {
   persistent?: boolean;
   version?: string | null;
@@ -1517,7 +1735,7 @@ function pruneDocumentDownloadCache(protectedId?: string) {
 
 function invalidateDocumentDownloadCache(id?: string) {
   if (id) {
-    [id, `download:${id}`, `thumbnail:${id}`].forEach((key) => {
+    [id, `download:${id}`, `preview:${id}`, `thumbnail:${id}`].forEach((key) => {
       documentDownloadCache.delete(key);
       documentDownloadInflight.delete(key);
     });
@@ -1534,7 +1752,9 @@ async function fetchProtectedBlob(
   url: string,
   options: DocumentBlobOptions = {},
 ): Promise<Blob> {
-  const useCache = options.cache !== false;
+  // Abortable requests are caller-owned. Keeping them out of the shared
+  // in-flight cache prevents one viewer cancellation from aborting another.
+  const useCache = options.cache !== false && !options.signal;
   const now = Date.now();
   if (useCache && !options.force) {
     const cached = documentDownloadCache.get(cacheKey);
@@ -1552,13 +1772,15 @@ async function fetchProtectedBlob(
   }
 
   const token = getAuthToken();
-  const promise = fetch(url, {
+  let request: Promise<Blob>;
+  request = fetch(url, {
     cache: "no-store",
     headers: token ? { Authorization: `Bearer ${token}` } : {},
+    signal: options.signal,
   }).then(async (res) => {
     if (!res.ok) throw new ApiError(res.status, "Download failed");
     const blob = await res.blob();
-    if (useCache) {
+    if (useCache && documentDownloadInflight.get(cacheKey) === request) {
       documentDownloadCache.set(cacheKey, {
         blob,
         expiresAt: Date.now() + DOCUMENT_DOWNLOAD_CACHE_TTL_MS,
@@ -1568,12 +1790,16 @@ async function fetchProtectedBlob(
       pruneDocumentDownloadCache(cacheKey);
     }
     return blob;
-  }).finally(() => {
-    documentDownloadInflight.delete(cacheKey);
   });
 
-  if (useCache) documentDownloadInflight.set(cacheKey, promise);
-  return promise;
+  if (!useCache) return request;
+
+  documentDownloadInflight.set(cacheKey, request);
+  return request.finally(() => {
+    if (documentDownloadInflight.get(cacheKey) === request) {
+      documentDownloadInflight.delete(cacheKey);
+    }
+  });
 }
 
 function cacheBustUrl(url: string): string {
@@ -1589,7 +1815,22 @@ async function fetchProtectedDocumentBlob(
 }
 
 async function fetchDocumentBlob(id: string, options: DocumentBlobOptions = {}): Promise<Blob> {
-  return fetchProtectedDocumentBlob(`download:${id}`, `/documents/${id}/download`, options);
+  return fetchProtectedDocumentBlob(`download:${id}`, `/documents/${id}/download`, { ...options, cache: false });
+}
+
+async function fetchDocumentResponse(
+  id: string,
+  options: DocumentResponseOptions = {},
+  action = "download",
+): Promise<Response> {
+  const token = getAuthToken();
+  const response = await fetch(cacheBustUrl(`${API_BASE}/documents/${id}/${action}`), {
+    cache: "no-store",
+    headers: token ? { Authorization: `Bearer ${token}` } : {},
+    signal: options.signal,
+  });
+  if (!response.ok) throw new ApiError(response.status, "Download failed");
+  return response;
 }
 
 async function fetchDocumentThumbnailBlob(id: string, options: DocumentBlobOptions = {}): Promise<Blob> {
@@ -1714,7 +1955,7 @@ async function fetchDocumentVideoThumbnailUrl(id: string, options: DocumentThumb
     // browser capture fallback below.
   }
 
-  const blob = await fetchDocumentBlob(id, options);
+  const blob = await fetchProtectedDocumentBlob(`preview:${id}`, `/documents/${id}/preview/content`, options);
   const videoUrl = URL.createObjectURL(blob);
   try {
     const dataUrl = await captureDocumentVideoFrame(videoUrl);
@@ -1774,7 +2015,7 @@ async function fetchDocumentImageThumbnailUrl(id: string, options: DocumentThumb
     // client-side fallback.
   }
 
-  const blob = await fetchDocumentBlob(id, options);
+  const blob = await fetchProtectedDocumentBlob(`preview:${id}`, `/documents/${id}/preview/content`, options);
   if (usePersistentCache) {
     const captured = await captureDocumentImageThumbnail(blob).catch(() => null);
     const dataUrl = captured
@@ -1829,6 +2070,7 @@ export function normalizePlanLimitDetail(detail: unknown, fallback: string): Pla
       plan: String(d.plan || "current"),
       kind,
       resets_at: typeof d.resets_at === "string" ? d.resets_at : null,
+      return_to: typeof d.return_to === "string" ? d.return_to : null,
     };
   }
   return {
@@ -1837,6 +2079,7 @@ export function normalizePlanLimitDetail(detail: unknown, fallback: string): Pla
     current: null,
     plan: "current",
     resets_at: null,
+    return_to: null,
   };
 }
 
@@ -1853,8 +2096,9 @@ function isAbortError(error: unknown): boolean {
 async function request<T>(
   path: string,
   options: RequestInit = {},
+  authTokenOverride?: string | null,
 ): Promise<T> {
-  const token = getAuthToken();
+  const token = authTokenOverride === undefined ? getAuthToken() : authTokenOverride;
   const headers: Record<string, string> = {
     "Content-Type": "application/json",
     "X-Language": getStoredLocale(),
@@ -1876,7 +2120,7 @@ async function request<T>(
     });
   } catch (error) {
     if (isAbortError(error)) throw error;
-    showBackendUnavailableToast();
+    if (!suppressErrorToast) showBackendUnavailableToast();
     captureClientError(error, {
       handled: true,
       mechanism: "api.network",
@@ -1887,10 +2131,11 @@ async function request<T>(
     });
     throw error;
   }
+  const tokenIsCurrent = () => token === getAuthToken();
 
   if (!res.ok) {
     if (isBackendUnavailableStatus(res.status)) {
-      showBackendUnavailableToast();
+      if (!suppressErrorToast) showBackendUnavailableToast();
       const err = new ApiError(res.status, t("lib.api.backend_unavailable"));
       captureClientError(err, {
         handled: true,
@@ -1924,7 +2169,12 @@ async function request<T>(
       : message;
     // Expired session mid-use → clear + route to login (once), so an in-app
     // action never silently dead-ends on a stale token.
-    if (res.status === 401) handleSessionExpired(path);
+    if (
+      res.status === 401 &&
+      authTokenOverride === undefined &&
+      Boolean(token) &&
+      tokenIsCurrent()
+    ) handleSessionExpired(path);
     // Background reads own their loading/empty/error state. A missing resource
     // should not produce a global toast for every query that referenced it.
     if (shouldShowRequestErrorToast(res.status, options.method, suppressErrorToast)) {
@@ -1941,6 +2191,499 @@ async function request<T>(
 
   if (res.status === 204) return undefined as T;
   return res.json();
+}
+
+const DEFAULT_DOCUMENT_UPLOAD_STALL_TIMEOUT_MS = 120_000;
+const DEFAULT_DOCUMENT_UPLOAD_PROCESSING_TIMEOUT_MS = 600_000;
+const DEFAULT_DOCUMENT_UPLOAD_RECEIPT_RECONCILE_TIMEOUT_MS = 15_000;
+
+function createDocumentUploadIdempotencyKey(): string {
+  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+    return crypto.randomUUID();
+  }
+  return `document-upload-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+}
+
+function documentUploadResponseBody(xhr: XMLHttpRequest): Record<string, any> {
+  let body: Record<string, any> = {};
+  try {
+    body = xhr.responseText ? JSON.parse(xhr.responseText) : {};
+  } catch {
+    body = {};
+  }
+  return body;
+}
+
+function documentUploadHttpError(
+  xhr: XMLHttpRequest,
+  path: string,
+  requestToken: string | null,
+  body = documentUploadResponseBody(xhr),
+): ApiError {
+  const detail = body.detail;
+  const message =
+    (typeof detail === "string" ? detail : detail?.message)
+    || xhr.statusText
+    || "Upload failed";
+  const coded = _extractCodedDetail(detail);
+
+  if (xhr.status === 402) {
+    const limitDetail = normalizePlanLimitDetail(
+      detail,
+      body.error || t("component.upgrade_prompt.default_message"),
+    );
+    const error = new ApiError(xhr.status, limitDetail.message);
+    error.detail = limitDetail as unknown as Record<string, unknown>;
+    return error;
+  }
+
+  if (
+    xhr.status === 401
+    && Boolean(requestToken)
+    && requestToken === getAuthToken()
+  ) {
+    handleSessionExpired(path);
+  }
+  if (isBackendUnavailableStatus(xhr.status)) {
+    const error = new ApiError(xhr.status, t("lib.api.backend_unavailable"));
+    if (coded.code) error.code = coded.code;
+    if (coded.vars) error.vars = coded.vars;
+    if (typeof detail === "object" && detail !== null) {
+      error.detail = detail as Record<string, unknown>;
+    }
+    captureClientError(error, {
+      handled: true,
+      mechanism: "api.http",
+      tags: { method: "POST", path, status: xhr.status },
+    });
+    return error;
+  }
+
+  const error = new ApiError(xhr.status, message);
+  if (coded.code) error.code = coded.code;
+  if (coded.vars) error.vars = coded.vars;
+  if (typeof detail === "object" && detail !== null) {
+    error.detail = detail as Record<string, unknown>;
+  }
+  return error;
+}
+
+function documentUploadReceiptPause(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(new DOMException("Upload cancelled", "AbortError"));
+      return;
+    }
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", abort);
+      resolve();
+    }, ms);
+    const abort = () => {
+      clearTimeout(timer);
+      reject(new DOMException("Upload cancelled", "AbortError"));
+    };
+    signal?.addEventListener("abort", abort, { once: true });
+  });
+}
+
+async function reconcileDocumentUploadReceipt(
+  idempotencyKey: string,
+  timeoutMs: number,
+  signal?: AbortSignal,
+  expectedPrincipalKey = authPrincipalKey(getAuthToken()),
+): Promise<Document> {
+  const deadline = Date.now() + timeoutMs;
+  let pauseMs = 250;
+  while (true) {
+    if (signal?.aborted) throw new DOMException("Upload cancelled", "AbortError");
+    if (authPrincipalKey(getAuthToken()) !== expectedPrincipalKey) {
+      throw new DocumentUploadAuthChangedError();
+    }
+    const receipt = await lookupDocumentUploadReceipt(
+      idempotencyKey,
+      signal,
+      expectedPrincipalKey,
+    );
+    if (receipt) return receipt;
+    const remainingMs = deadline - Date.now();
+    if (remainingMs <= 0) throw new DocumentUploadStalledError("processing");
+    await documentUploadReceiptPause(Math.min(pauseMs, remainingMs), signal);
+    pauseMs = Math.min(pauseMs * 2, 4_000);
+  }
+}
+
+async function lookupDocumentUploadReceipt(
+  idempotencyKey: string,
+  signal?: AbortSignal,
+  expectedPrincipalKey = authPrincipalKey(getAuthToken()),
+): Promise<Document | null> {
+  const receiptToken = getAuthToken();
+  if (authPrincipalKey(receiptToken) !== expectedPrincipalKey) {
+    throw new DocumentUploadAuthChangedError();
+  }
+  try {
+    return await request<Document>(
+      `/documents/upload-receipts/${encodeURIComponent(idempotencyKey)}`,
+      {
+        signal,
+        headers: { "X-Silent-Error": "1" },
+      },
+      receiptToken,
+    );
+  } catch (error) {
+    if (error instanceof ApiError && error.status === 404) return null;
+    throw error;
+  }
+}
+
+function uploadDocumentRequest(
+  file: File,
+  folderId?: string | null,
+  options?: {
+    visibility?: string;
+    classification?: string;
+    client_visible?: boolean;
+  },
+  requestOptions: DocumentUploadRequestOptions = {},
+  requestAttempt = 0,
+  expectedPrincipalKey?: string,
+): Promise<Document> {
+  const form = new FormData();
+  form.append("file", file);
+  const params = new URLSearchParams();
+  if (folderId) params.set("folder_id", folderId);
+  if (options?.visibility) params.set("visibility", options.visibility);
+  if (options?.classification) params.set("classification", options.classification);
+  if (options?.client_visible != null) params.set("client_visible", String(options.client_visible));
+  const query = params.toString();
+  const path = `/documents/upload${query ? `?${query}` : ""}`;
+  const stallTimeoutMs = Math.max(
+    1_000,
+    requestOptions.stallTimeoutMs ?? DEFAULT_DOCUMENT_UPLOAD_STALL_TIMEOUT_MS,
+  );
+  const processingTimeoutMs = Math.max(
+    1_000,
+    requestOptions.processingTimeoutMs ?? DEFAULT_DOCUMENT_UPLOAD_PROCESSING_TIMEOUT_MS,
+  );
+  const receiptReconcileTimeoutMs = Math.max(
+    0,
+    requestOptions.receiptReconcileTimeoutMs
+      ?? DEFAULT_DOCUMENT_UPLOAD_RECEIPT_RECONCILE_TIMEOUT_MS,
+  );
+  const idempotencyKey = requestOptions.idempotencyKey || createDocumentUploadIdempotencyKey();
+  const token = getAuthToken();
+  const requestPrincipalKey = expectedPrincipalKey ?? authPrincipalKey(token);
+
+  return new Promise<Document>((resolve, reject) => {
+    if (authPrincipalKey(token) !== requestPrincipalKey) {
+      reject(new DocumentUploadAuthChangedError());
+      return;
+    }
+    if (requestOptions.signal?.aborted) {
+      reject(new DOMException("Upload cancelled", "AbortError"));
+      return;
+    }
+
+    const xhr = new XMLHttpRequest();
+    let settled = false;
+    let stalledPhase: DocumentUploadPhase | null = null;
+    let uploadBytesSent = false;
+    let lastLoaded = 0;
+    let stallTimer: ReturnType<typeof setTimeout> | null = null;
+    let processingTimer: ReturnType<typeof setTimeout> | null = null;
+
+    const clearStallTimer = () => {
+      if (stallTimer !== null) {
+        clearTimeout(stallTimer);
+        stallTimer = null;
+      }
+    };
+    const armStallTimer = () => {
+      clearStallTimer();
+      stallTimer = setTimeout(() => {
+        stalledPhase = "uploading";
+        xhr.abort();
+      }, stallTimeoutMs);
+    };
+    const clearProcessingTimer = () => {
+      if (processingTimer !== null) {
+        clearTimeout(processingTimer);
+        processingTimer = null;
+      }
+    };
+    const armProcessingTimer = () => {
+      clearProcessingTimer();
+      processingTimer = setTimeout(() => {
+        stalledPhase = "processing";
+        xhr.abort();
+      }, processingTimeoutMs);
+    };
+    const cleanup = () => {
+      clearStallTimer();
+      clearProcessingTimer();
+      requestOptions.signal?.removeEventListener("abort", abortRequest);
+    };
+    const finishResolve = (document: Document) => {
+      if (settled) return;
+      if (authPrincipalKey(getAuthToken()) !== requestPrincipalKey) {
+        finishReject(new DocumentUploadAuthChangedError());
+        return;
+      }
+      settled = true;
+      cleanup();
+      resolve(document);
+    };
+    const finishReject = (error: unknown) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      reject(error);
+    };
+    const finishRetry = () => {
+      if (settled) return;
+      if (authPrincipalKey(getAuthToken()) !== requestPrincipalKey) {
+        finishReject(new DocumentUploadAuthChangedError());
+        return;
+      }
+      settled = true;
+      cleanup();
+      uploadDocumentRequest(
+        file,
+        folderId,
+        options,
+        { ...requestOptions, idempotencyKey },
+        requestAttempt + 1,
+        requestPrincipalKey,
+      ).then(resolve, reject);
+    };
+    const finishProcessingReconciliation = () => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      reconcileDocumentUploadReceipt(
+        idempotencyKey,
+        receiptReconcileTimeoutMs,
+        requestOptions.signal,
+        requestPrincipalKey,
+      ).then(resolve, reject);
+    };
+    const finishHttpFailureReconciliation = (originalError: unknown) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      // A proxy can synthesize a 5xx, or corrupt a successful response, before
+      // a committed receipt is visible. Reconcile for a bounded window; one
+      // negative read is not proof that the server rolled the upload back.
+      reconcileDocumentUploadReceipt(
+        idempotencyKey,
+        receiptReconcileTimeoutMs,
+        requestOptions.signal,
+        requestPrincipalKey,
+      ).then(
+        resolve,
+        (reconciliationError) => {
+          if (
+            reconciliationError instanceof DocumentUploadAuthChangedError
+            || reconciliationError instanceof DOMException
+            || (originalError instanceof ApiError
+              && originalError.code === "document_upload_commit_uncertain")
+          ) {
+            reject(reconciliationError);
+          } else {
+            reject(originalError);
+          }
+        },
+      );
+    };
+    const abortRequest = () => xhr.abort();
+
+    xhr.open("POST", `${API_BASE}${path}`);
+    xhr.setRequestHeader("X-Language", getStoredLocale());
+    if (token) xhr.setRequestHeader("Authorization", `Bearer ${token}`);
+    xhr.setRequestHeader("Idempotency-Key", idempotencyKey);
+
+    xhr.upload.addEventListener("loadstart", () => {
+      requestOptions.onProgress?.({ phase: "uploading", loaded: 0, total: file.size, percent: 0 });
+      armStallTimer();
+    });
+    xhr.upload.addEventListener("progress", (event) => {
+      const total = event.lengthComputable && event.total > 0 ? event.total : file.size;
+      const loaded = Math.min(event.loaded, total || event.loaded);
+      if (loaded > lastLoaded) {
+        lastLoaded = loaded;
+        armStallTimer();
+      }
+      const percent = total > 0 ? Math.min(100, Math.round((loaded / total) * 100)) : 0;
+      requestOptions.onProgress?.({ phase: "uploading", loaded, total, percent });
+    });
+    xhr.upload.addEventListener("load", () => {
+      uploadBytesSent = true;
+      clearStallTimer();
+      armProcessingTimer();
+      requestOptions.onProgress?.({
+        phase: "processing",
+        loaded: file.size,
+        total: file.size,
+        percent: 100,
+      });
+    });
+
+    xhr.addEventListener("load", () => {
+      if (xhr.status < 200 || xhr.status >= 300) {
+        const body = documentUploadResponseBody(xhr);
+        if (xhr.status === 401 && requestAttempt === 0) {
+          const latestToken = getAuthToken();
+          if (latestToken && latestToken !== token) {
+            if (authPrincipalKey(latestToken) === requestPrincipalKey) {
+              finishRetry();
+            } else {
+              finishReject(new DocumentUploadAuthChangedError());
+            }
+            return;
+          }
+        }
+        const error = documentUploadHttpError(xhr, path, token, body);
+        if (uploadBytesSent && xhr.status >= 500) {
+          finishHttpFailureReconciliation(error);
+          return;
+        }
+        finishReject(error);
+        return;
+      }
+      try {
+        const document = JSON.parse(xhr.responseText) as Document;
+        clearBackendUnavailableToast();
+        finishResolve(document);
+      } catch (error) {
+        const invalidResponse = new ApiError(
+          500,
+          error instanceof Error ? `Invalid upload response: ${error.message}` : "Invalid upload response",
+        );
+        if (uploadBytesSent) {
+          finishHttpFailureReconciliation(invalidResponse);
+          return;
+        }
+        finishReject(invalidResponse);
+      }
+    });
+    xhr.addEventListener("error", () => {
+      // Once every byte left the browser, a transport error can mean the
+      // server committed but its response was lost. Resolve the durable
+      // receipt before presenting a retryable failure, so a retry cannot
+      // create an ambiguous duplicate.
+      if (uploadBytesSent) {
+        finishProcessingReconciliation();
+        return;
+      }
+      const error = new TypeError("Network request failed");
+      captureClientError(error, {
+        handled: true,
+        mechanism: "api.network",
+        tags: { method: "POST", path },
+      });
+      finishReject(error);
+    });
+    xhr.addEventListener("abort", () => {
+      if (stalledPhase === "processing") {
+        finishProcessingReconciliation();
+        return;
+      }
+      finishReject(
+        stalledPhase
+          ? new DocumentUploadStalledError(stalledPhase)
+          : new DOMException("Upload cancelled", "AbortError"),
+      );
+    });
+
+    requestOptions.signal?.addEventListener("abort", abortRequest, { once: true });
+    xhr.send(form);
+  });
+}
+
+async function requestStreamResponse(
+  path: string,
+  body: FormData,
+  signal?: AbortSignal,
+): Promise<Response> {
+  let token = getAuthToken();
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    let response: Response;
+    try {
+      response = await fetch(`${API_BASE}${path}`, {
+        method: "POST",
+        headers: token ? { Authorization: `Bearer ${token}` } : {},
+        body,
+        signal,
+      });
+    } catch (error) {
+      if (isAbortError(error)) throw error;
+      showBackendUnavailableToast();
+      captureClientError(error, {
+        handled: true,
+        mechanism: "api.network",
+        tags: { method: "POST", path },
+      });
+      throw error;
+    }
+
+    if (response.ok) {
+      clearBackendUnavailableToast();
+      return response;
+    }
+
+    const latestToken = getAuthToken();
+    if (
+      response.status === 401
+      && attempt === 0
+      && Boolean(latestToken)
+      && latestToken !== token
+    ) {
+      token = latestToken;
+      continue;
+    }
+
+    if (isBackendUnavailableStatus(response.status)) {
+      showBackendUnavailableToast();
+      const err = new ApiError(response.status, t("lib.api.backend_unavailable"));
+      captureClientError(err, {
+        handled: true,
+        mechanism: "api.http",
+        tags: { method: "POST", path, status: response.status },
+      });
+      throw err;
+    }
+
+    const responseBody = await response.json().catch(() => ({ detail: response.statusText }));
+    const detail = responseBody.detail;
+    if (response.status === 402) {
+      const limitDetail = normalizePlanLimitDetail(
+        detail,
+        responseBody.error || t("component.upgrade_prompt.default_message"),
+      );
+      const err = new ApiError(response.status, limitDetail.message);
+      err.detail = limitDetail as unknown as Record<string, unknown>;
+      throw err;
+    }
+
+    const message =
+      (typeof detail === "string" ? detail : (detail as any)?.message)
+      || response.statusText;
+    const coded = _extractCodedDetail(detail);
+    const displayMessage = coded.code ? t(coded.code, coded.vars) || message : message;
+    if (response.status === 401 && Boolean(token) && token === getAuthToken()) {
+      handleSessionExpired(path);
+    } else {
+      useToastStore.getState().error(t("lib.api.chat_failed"), displayMessage);
+    }
+    const err = new ApiError(response.status, message);
+    if (coded.code) err.code = coded.code;
+    if (coded.vars) err.vars = coded.vars;
+    if (typeof detail === "object" && detail !== null) {
+      err.detail = detail as Record<string, unknown>;
+    }
+    throw err;
+  }
+  throw new ApiError(401, "Unauthorized");
 }
 
 /**
@@ -2070,6 +2813,24 @@ export function isLocalFsUrl(url: string | null | undefined): boolean {
   }
 }
 
+/** Fetch a protected raw entity file without buffering it into a Blob first. */
+export async function fetchProtectedFsResponse(
+  url: string,
+  options: ProtectedFileResponseOptions = {},
+): Promise<Response> {
+  if (!isLocalFsUrl(url)) {
+    throw new Error("Protected filesystem response requires a local filesystem URL");
+  }
+  const token = getAuthToken();
+  const response = await fetch(cacheBustUrl(url), {
+    cache: "no-store",
+    headers: token ? { Authorization: `Bearer ${token}` } : {},
+    signal: options.signal,
+  });
+  if (!response.ok) throw new ApiError(response.status, "Download failed");
+  return response;
+}
+
 export async function resolveDisplayMediaUrl(url: string): Promise<{ url: string; revoke: () => void }> {
   if (!isLocalFsUrl(url)) return { url, revoke: () => {} };
   const blob = await fetchProtectedBlob(`media:${url}`, cacheBustUrl(url));
@@ -2126,7 +2887,7 @@ export interface WorkspaceFinalizeStreamHandlers {
   onStart?: (info: { draft_id?: string }) => void;
   /** Each progress checkpoint emitted by finalize_setup. */
   onProgress?: (e: FinalizeProgressEvent) => void;
-  onDone?: (final: WorkspaceDraftFinalize & { strategist_eta_seconds?: number }) => void;
+  onDone?: (final: WorkspaceDraftFinalize) => void;
   onError?: (message: string) => void;
 }
 
@@ -2172,7 +2933,7 @@ async function _streamFinalizeSSE(
   const decoder = new TextDecoder();
   let buffer = "";
   let finalPayload: WorkspaceDraftFinalize | null = null;
-  let streamError: string | null = null;
+  let streamError: Error | null = null;
   // Steps that flow through ``onProgress`` rather than start/done/error.
   const KNOWN_STEPS = new Set([
     "workspace_created",
@@ -2185,6 +2946,7 @@ async function _streamFinalizeSSE(
     "memory_seeded",
     "runtime_scheduled",
     "strategist_dispatched",
+    "dispatch_warning",
     "complete",
   ]);
 
@@ -2217,13 +2979,21 @@ async function _streamFinalizeSSE(
         finalPayload = payload as unknown as WorkspaceDraftFinalize;
         handlers.onDone?.(finalPayload);
       } else if (eventName === "error") {
-        streamError = (payload.message as string) || "Unknown finalize error";
-        handlers.onError?.(streamError);
+        const message = (payload.message as string) || "Unknown finalize error";
+        if (payload.kind === "workspaces") {
+          const limitDetail = normalizePlanLimitDetail(payload, message);
+          const error = new ApiError(402, limitDetail.message);
+          error.detail = limitDetail as unknown as Record<string, unknown>;
+          streamError = error;
+        } else {
+          streamError = new Error(message);
+        }
+        handlers.onError?.(message);
       }
     }
   }
 
-  if (streamError) throw new Error(streamError);
+  if (streamError) throw streamError;
   if (!finalPayload) throw new Error("Finalize ended without a final payload");
   return finalPayload;
 }
@@ -2416,6 +3186,83 @@ export interface WorkspaceStatsQuickView {
   configured: boolean;
 }
 
+export interface WorkspaceLedgerBreakdown {
+  key: string;
+  count: number;
+}
+
+export interface WorkspaceLedgerOverviewItem {
+  contract_id: string;
+  kind: "content" | "finance" | "recruiting" | "relationship" | string;
+  title: string;
+  directory: string;
+  schema_version: number;
+  projection_kind: "current" | "event_stream" | string;
+  record_count: number;
+  event_count: number;
+  updated_at: string | null;
+  status_counts: WorkspaceLedgerBreakdown[];
+  stage_counts: WorkspaceLedgerBreakdown[];
+  subject_counts?: WorkspaceLedgerBreakdown[];
+  totals: Array<{
+    currency: string;
+    inflow_minor: number;
+    outflow_minor: number;
+  }>;
+}
+
+export interface WorkspaceLedgerOverview {
+  workspace_id: string;
+  ledger_count: number;
+  record_count: number;
+  event_count: number;
+  ledgers: WorkspaceLedgerOverviewItem[];
+}
+
+export type WorkspaceLedgerVisualizationScalar = string | number | boolean | null;
+
+export interface WorkspaceLedgerPresentationSection {
+  type: "metrics" | "chart" | "records" | "profile" | "projection";
+  title?: string;
+  chart?: "bar" | "line" | "area" | "pie" | "donut";
+  metric?: string;
+  metrics?: string[];
+  columns?: string[];
+  forecast_periods?: number;
+}
+
+export interface WorkspaceLedgerPresentation {
+  version: 1;
+  title?: string;
+  subtitle?: string;
+  sections: WorkspaceLedgerPresentationSection[];
+}
+
+export interface WorkspaceLedgerQueryVisualization {
+  contract_id: string;
+  view: "current" | "events" | string;
+  layout: "metrics" | "bar" | "timeline" | "table" | "empty";
+  matched_count: number;
+  as_of: WorkspaceLedgerVisualizationScalar;
+  group_by: string[];
+  date_granularity?: "day" | "week" | "month" | null;
+  metrics: string[];
+  aggregates: Record<string, number>;
+  groups: Array<{
+    key: Record<string, WorkspaceLedgerVisualizationScalar>;
+    aggregates: Record<string, number>;
+  }>;
+  group_count?: number;
+  groups_truncated?: boolean;
+  columns: string[];
+  rows: Array<Record<string, WorkspaceLedgerVisualizationScalar>>;
+  has_more: boolean;
+  currency: string | null;
+  presentation?: WorkspaceLedgerPresentation | null;
+  query_fingerprint?: string;
+  coalesce_previous_visualization?: boolean;
+}
+
 export interface WorkspaceStatCreate {
   library_key?: string;
   key?: string;
@@ -2431,6 +3278,17 @@ export interface WorkspaceStatCreate {
   goal_eligible?: boolean;
 }
 
+interface EditorSaveIntent {
+  sessionId: string;
+  sequence: number;
+}
+
+interface FilesystemWriteOptions {
+  authToken?: string | null;
+  signal?: AbortSignal;
+  saveIntent?: EditorSaveIntent;
+}
+
 export const api = {
   platform: {
     flags: () => request<{ flags: Record<string, boolean> }>("/platform/flags"),
@@ -2443,7 +3301,7 @@ export const api = {
       invitation_code?: string;
       invite_token?: string;
     }) =>
-      request<{ access_token: string; user_id: string; entity_id: string; role: string }>("/auth/register", {
+      request<{ access_token: string; user_id: string; entity_id: string; role: string; is_new?: boolean }>("/auth/register", {
         method: "POST",
         body: JSON.stringify(data),
       }),
@@ -2456,6 +3314,10 @@ export const api = {
       request<{ access_token: string; user: User }>("/auth/login", {
         method: "POST",
         body: JSON.stringify(data),
+      }),
+    renew: () =>
+      request<{ access_token: string; user_id: string; entity_id: string; role: string }>("/auth/renew", {
+        method: "POST",
       }),
     logout: () => request<void>("/auth/logout", { method: "POST" }),
     verifyEmail: (email: string, code: string) =>
@@ -2546,8 +3408,16 @@ export const api = {
       }>("/auth/me/models", {
         method: "PUT", body: JSON.stringify(data),
       }),
-    oauthGoogle: (opts: { code?: string; redirectUri: string; invitationCode?: string; teamInviteToken?: string; oauthSession?: string; publicChatToken?: string; rememberMe?: boolean }) =>
-      request<{ access_token: string; user: User }>("/auth/oauth/google", {
+    oauthGoogle: (opts: {
+      code?: string;
+      redirectUri: string;
+      invitationCode?: string;
+      teamInviteToken?: string;
+      oauthSession?: string;
+      publicChatToken?: string;
+      rememberMe?: boolean;
+    }) =>
+      request<{ access_token: string; user: User; is_new?: boolean }>("/auth/oauth/google", {
         method: "POST",
         body: JSON.stringify({
           code: opts.code,
@@ -2591,15 +3461,33 @@ export const api = {
         method: "PUT",
         body: JSON.stringify(data),
       }),
-    list: (params?: { status?: string; limit?: number; offset?: number; parent_task_id?: string; workspace_id?: string; category_id?: string }) => {
+    list: (params?: { status?: string; attention?: boolean; limit?: number; offset?: number; parent_task_id?: string; workspace_id?: string; category_id?: string }) => {
       const q = new URLSearchParams();
       if (params?.status) q.set("status", params.status);
+      if (params?.attention) q.set("attention", "true");
       if (params?.limit) q.set("limit", String(params.limit));
       if (params?.offset) q.set("offset", String(params.offset));
       if (params?.parent_task_id) q.set("parent_task_id", params.parent_task_id);
       if (params?.workspace_id) q.set("workspace_id", params.workspace_id);
       if (params?.category_id) q.set("category_id", params.category_id);
       return request<PaginatedResponse<Task>>(`/tasks?${q}`);
+    },
+    listAttention: async (workspaceId: string) => {
+      const items: Task[] = [];
+      let total = 1;
+      while (items.length < total) {
+        const q = new URLSearchParams({
+          workspace_id: workspaceId,
+          attention: "true",
+          limit: "200",
+          offset: String(items.length),
+        });
+        const page = await request<PaginatedResponse<Task>>(`/tasks?${q}`);
+        total = page.total;
+        if (page.items.length === 0) break;
+        items.push(...page.items);
+      }
+      return items;
     },
     get: (id: string) => request<Task>(`/tasks/${id}`),
     create: (data: Partial<Task>) =>
@@ -2630,7 +3518,7 @@ export const api = {
         method: "POST",
         body: JSON.stringify({ note }),
       }),
-    respondHITL: (taskId: string, data: { response?: string; choice?: string; fields?: Record<string, any>; note?: string }) =>
+    respondHITL: (taskId: string, data: { step_id?: string; response?: string; choice?: string; fields?: Record<string, any>; note?: string }) =>
       request<TaskHITLResponse>(`/tasks/${taskId}/hitl-response`, {
         method: "POST",
         body: JSON.stringify(data),
@@ -2722,6 +3610,14 @@ export const api = {
 
   calendarSettings: {
     get: () => request<CalendarSettingsResponse>("/calendar-settings"),
+    calendars: (provider?: string, connectionId?: string) => {
+      const q = new URLSearchParams();
+      if (provider) q.set("provider", provider);
+      if (connectionId !== undefined) q.set("connection_id", connectionId);
+      return request<CalendarOptionsResponse>(
+        `/calendar-settings/calendars${q.toString() ? `?${q}` : ""}`,
+      );
+    },
     update: (data: Partial<Omit<CalendarSettings, "booking_links" | "bookings">>) =>
       request<CalendarSettingsResponse>("/calendar-settings", {
         method: "PUT",
@@ -2748,18 +3644,26 @@ export const api = {
       const q = new URLSearchParams({ start, end });
       return request<ExternalCalendarEventsResponse>(`/calendar-settings/events?${q}`);
     },
-    publicBookingLink: (slug: string, ownerId?: string) =>
-      request<PublicBookingLink>(
-        ownerId
+    publicBookingLink: (slug: string, ownerId?: string, month?: string, timezone?: string) => {
+      const q = new URLSearchParams();
+      if (month) q.set("month", month);
+      if (timezone) q.set("timezone", timezone);
+      const suffix = q.toString() ? `?${q}` : "";
+      return request<PublicBookingLink>(
+        `${ownerId
           ? `/calendar-settings/public/booking-links/u/${encodeURIComponent(ownerId)}/${encodeURIComponent(slug)}`
-          : `/calendar-settings/public/booking-links/${encodeURIComponent(slug)}`,
-      ),
+          : `/calendar-settings/public/booking-links/${encodeURIComponent(slug)}`}${suffix}`,
+        {},
+        null,
+      );
+    },
     bookPublicBookingLink: (slug: string, data: PublicBookingRequest, ownerId?: string) =>
       request<BookingConfirmation>(
         `${ownerId
           ? `/calendar-settings/public/booking-links/u/${encodeURIComponent(ownerId)}/${encodeURIComponent(slug)}`
           : `/calendar-settings/public/booking-links/${encodeURIComponent(slug)}`}/book`,
         { method: "POST", body: JSON.stringify(data) },
+        null,
       ),
   },
 
@@ -2772,7 +3676,6 @@ export const api = {
       conversationId?: string,
       opts?: { files?: File[]; documentIds?: string[]; agentId?: string; localWorkerId?: string },
     ): Promise<Response> => {
-      const token = getAuthToken();
       const form = new FormData();
       form.append("message", message);
       if (conversationId) form.append("conversation_id", conversationId);
@@ -2780,35 +3683,10 @@ export const api = {
       if (opts?.localWorkerId) form.append("local_worker_id", opts.localWorkerId);
       if (opts?.documentIds?.length) form.append("document_ids", opts.documentIds.join(","));
       if (opts?.files) opts.files.forEach((file) => form.append("files", file));
-      const response = await fetch(
-        `${API_BASE}/chat/flow-entrypoints/${encodeURIComponent(bindingId)}/stream`,
-        {
-          method: "POST",
-          headers: { Authorization: `Bearer ${token}` },
-          body: form,
-        },
+      return requestStreamResponse(
+        `/chat/flow-entrypoints/${encodeURIComponent(bindingId)}/stream`,
+        form,
       );
-      if (!response.ok) {
-        const body = await response.json().catch(() => ({ detail: response.statusText }));
-        const detail = body.detail;
-        if (response.status === 402) {
-          const limitDetail = normalizePlanLimitDetail(
-            detail,
-            body.error || t("component.upgrade_prompt.default_message"),
-          );
-          const err = new ApiError(response.status, limitDetail.message);
-          err.detail = limitDetail as unknown as Record<string, unknown>;
-          throw err;
-        }
-        const message =
-          (typeof detail === "string" ? detail : (detail as any)?.message)
-          || response.statusText;
-        if (response.status !== 401) {
-          useToastStore.getState().error(t("lib.api.chat_failed"), message);
-        }
-        throw new ApiError(response.status, message);
-      }
-      return response;
     },
     stream: async (
       message: string,
@@ -2817,6 +3695,7 @@ export const api = {
         files?: File[];
         documentIds?: string[];
         manualSkillIds?: string[];
+        manualSkillRefs?: ManualSkillReference[];
         agentId?: string;
         localWorkerId?: string;
         workspaceId?: string;
@@ -2824,23 +3703,28 @@ export const api = {
         threadRef?: { kind: "task" | "plan" | "goal"; id: string };
         chatMode?: string;
         chatModePayload?: Record<string, unknown>;
+        responseSurfaceSubmission?: object;
         disableTools?: boolean;
         blockedTools?: string[];
         editorContext?: {
+          target_kind?: AiEditTargetKind | null;
+          target_id?: string | null;
           path?: string | null;
           sourcePath?: string | null;
-          documentId?: string | null;
+          document_id?: string | null;
           documentName?: string | null;
           fileType?: string | null;
           mimeType?: string | null;
           editorType?: string | null;
           supportsImageGeneration?: boolean | null;
+          supportsNativeFilePatch?: boolean | null;
           currentDocumentContent?: string | null;
         };
+        conversationSurface?: ConversationSurfaceKind;
         ephemeral?: boolean;
+        signal?: AbortSignal;
       },
     ): Promise<Response> => {
-      const token = getAuthToken();
       const form = new FormData();
       form.append("message", message);
       if (conversationId) form.append("conversation_id", conversationId);
@@ -2852,40 +3736,27 @@ export const api = {
       if (opts?.threadRef?.id) form.append("thread_ref_id", opts.threadRef.id);
       if (opts?.chatMode) form.append("chat_mode", opts.chatMode);
       if (opts?.chatModePayload) form.append("chat_mode_payload", JSON.stringify(opts.chatModePayload));
+      if (opts?.responseSurfaceSubmission) {
+        form.append("response_surface_submission", JSON.stringify(opts.responseSurfaceSubmission));
+      }
       if (opts?.documentIds?.length) form.append("document_ids", opts.documentIds.join(","));
-      if (opts?.manualSkillIds?.length) form.append("manual_skill_ids", opts.manualSkillIds.join(","));
+      const compatibleManualSkillIds = Array.from(
+        new Set([
+          ...(opts?.manualSkillIds || []),
+          ...legacyManualSkillIds(opts?.manualSkillRefs),
+        ]),
+      );
+      if (compatibleManualSkillIds.length) {
+        form.append("manual_skill_ids", compatibleManualSkillIds.join(","));
+      }
+      if (opts?.manualSkillRefs?.length) form.append("manual_skill_refs", JSON.stringify(opts.manualSkillRefs));
       if (opts?.disableTools) form.append("disable_tools", "true");
       if (opts?.blockedTools?.length) form.append("blocked_tools", opts.blockedTools.join(","));
       if (opts?.editorContext) form.append("editor_context", JSON.stringify(opts.editorContext));
+      if (opts?.conversationSurface) form.append("conversation_surface", opts.conversationSurface);
       if (opts?.ephemeral) form.append("ephemeral", "true");
       if (opts?.files) opts.files.forEach((f) => form.append("files", f));
-      const response = await fetch(`${API_BASE}/chat/stream`, {
-        method: "POST",
-        headers: { Authorization: `Bearer ${token}` },
-        body: form,
-      });
-      if (!response.ok) {
-        const body = await response.json().catch(() => ({ detail: response.statusText }));
-        const detail = body.detail;
-        if (response.status === 402) {
-          const limitDetail = normalizePlanLimitDetail(detail, body.error || t("component.upgrade_prompt.default_message"));
-          const err = new ApiError(response.status, limitDetail.message);
-          err.detail = limitDetail as unknown as Record<string, unknown>;
-          throw err;
-        }
-        const message = (typeof detail === "string" ? detail : (detail as any)?.message) || response.statusText;
-        const coded = _extractCodedDetail(detail);
-        const displayMessage = coded.code ? t(coded.code, coded.vars) || message : message;
-        if (response.status !== 401) {
-          useToastStore.getState().error(t("lib.api.chat_failed"), displayMessage);
-        }
-        const err = new ApiError(response.status, message);
-        if (coded.code) err.code = coded.code;
-        if (coded.vars) err.vars = coded.vars;
-        if (typeof detail === "object" && detail !== null) err.detail = detail as Record<string, unknown>;
-        throw err;
-      }
-      return response;
+      return requestStreamResponse("/chat/stream", form, opts?.signal);
     },
     listConversations: (wsId?: string) =>
       request<Conversation[]>(`/chat/conversations${wsId ? `?workspace_id=${wsId}` : ""}`),
@@ -2919,12 +3790,38 @@ export const api = {
     feedback: (
       convId: string,
       messageId: string,
-      body: { rating: "up" | "down"; content_preview?: string; request_preview?: string },
+      body: {
+        rating: "up" | "down";
+        content_preview?: string;
+        request_preview?: string;
+      },
     ) =>
-      request<{ message_id: string; rating: "up" | "down"; updated_at: string | null }>(
+      request<{
+        message_id: string;
+        rating: "up" | "down";
+        mutation_sequence: number;
+        mutation_status: "accepted";
+        updated_at: string | null;
+        target_kind: string;
+        target_id: string;
+        task_id: string | null;
+        plan_id: string | null;
+      }>(
         `/chat/conversations/${convId}/messages/${messageId}/feedback`,
         { method: "POST", body: JSON.stringify(body) },
       ),
+    listFeedback: (convId: string) =>
+      request<Array<{
+        message_id: string;
+        rating: "up" | "down";
+        mutation_sequence: number;
+        target_kind: string;
+        target_id: string;
+        task_id: string | null;
+        plan_id: string | null;
+      }>>(`/chat/conversations/${convId}/feedback`, {
+        headers: { "X-Silent-Error": "1" },
+      }),
     cancelPendingFileApprovals: (convId: string, hitlIds?: string[]) =>
       request<{ cancelled: number }>(`/chat/conversations/${convId}/file-approvals/cancel`, {
         method: "POST",
@@ -2939,8 +3836,11 @@ export const api = {
         method: "PUT",
         body: JSON.stringify({ title }),
       }),
-    deleteConversation: (id: string) =>
-      request<void>(`/chat/conversations/${id}`, { method: "DELETE" }),
+    deleteConversation: (id: string, opts?: { silent?: boolean }) =>
+      request<void>(`/chat/conversations/${id}`, {
+        method: "DELETE",
+        headers: opts?.silent ? { "X-Silent-Error": "1" } : undefined,
+      }),
     tts: async (text: string, voice?: string): Promise<ArrayBuffer> => {
       const token = getAuthToken();
       const resp = await fetch(`${API_BASE}/chat/tts`, {
@@ -2950,35 +3850,6 @@ export const api = {
       });
       if (!resp.ok) throw new Error(`TTS failed: ${resp.status}`);
       return resp.arrayBuffer();
-    },
-    voiceSession: async (opts: {
-      agent_id?: string;
-      voice?: string;
-      conversation_id?: string;
-      workspace_id?: string;
-    }): Promise<{
-      ephemeral_key: string;
-      expires_at: number;
-      model: string;
-      conversation_id: string;
-      session_id: string;
-    }> => {
-      const token = getAuthToken();
-      const resp = await fetch(`${API_BASE}/chat/voice-session`, {
-        method: "POST",
-        headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
-        body: JSON.stringify(opts),
-      });
-      if (!resp.ok) throw new Error(`Voice session failed: ${resp.status}`);
-      return resp.json();
-    },
-    voiceSave: async (conversationId: string, turns: { role: string; content: string }[]) => {
-      const token = getAuthToken();
-      await fetch(`${API_BASE}/chat/voice-save`, {
-        method: "POST",
-        headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
-        body: JSON.stringify({ conversation_id: conversationId, turns }),
-      });
     },
   },
 
@@ -3045,22 +3916,21 @@ export const api = {
         classification?: string;
         client_visible?: boolean;
       },
-    ): Promise<Document> => {
-      const token = getAuthToken();
-      const form = new FormData();
-      form.append("file", file);
-      const params = new URLSearchParams();
-      if (folderId) params.set("folder_id", folderId);
-      if (options?.visibility) params.set("visibility", options.visibility);
-      if (options?.classification) params.set("classification", options.classification);
-      if (options?.client_visible != null) params.set("client_visible", String(options.client_visible));
-      const q = params.toString();
-      return fetch(`${API_BASE}/documents/upload${q ? `?${q}` : ""}`, {
-        method: "POST",
-        headers: { Authorization: `Bearer ${token}` || "" },
-        body: form,
-      }).then((r) => r.json() as Promise<Document>);
-    },
+      requestOptions?: DocumentUploadRequestOptions,
+    ): Promise<Document> => uploadDocumentRequest(file, folderId, options, requestOptions),
+    reconcileUploadReceipt: (
+      idempotencyKey: string,
+      options?: Pick<DocumentUploadRequestOptions, "signal" | "receiptReconcileTimeoutMs">,
+    ): Promise<Document> => reconcileDocumentUploadReceipt(
+      idempotencyKey,
+      Math.max(
+        0,
+        options?.receiptReconcileTimeoutMs
+          ?? DEFAULT_DOCUMENT_UPLOAD_RECEIPT_RECONCILE_TIMEOUT_MS,
+      ),
+      options?.signal,
+      authPrincipalKey(getAuthToken()),
+    ),
     delete: async (id: string) => {
       const result = await request<void>(`/documents/${id}`, { method: "DELETE" });
       invalidateDocumentDownloadCache(id);
@@ -3070,18 +3940,40 @@ export const api = {
       request<Document>(`/documents/${id}`, { method: "PUT", body: JSON.stringify({ name }) }),
     getContent: (id: string) =>
       request<{ content: string }>(`/documents/${id}/content`),
-    saveContent: async (id: string, content: string) => {
+    saveContent: async (
+      id: string,
+      content: string,
+      saveIntent?: EditorSaveIntent,
+      authTokenOverride?: string | null,
+    ) => {
       const result = await request<{ saved: boolean }>(`/documents/${id}/content`, {
         method: "PUT",
-        body: JSON.stringify({ content }),
-      });
+        body: JSON.stringify({
+          content,
+          save_session_id: saveIntent?.sessionId,
+          save_sequence: saveIntent?.sequence,
+        }),
+      }, authTokenOverride);
       invalidateDocumentDownloadCache(id);
       return result;
     },
-    replaceFile: async (id: string, file: File): Promise<Document> => {
-      const token = getAuthToken();
+    replaceFile: async (
+      id: string,
+      file: File,
+      saveIntent?: EditorSaveIntent,
+      authTokenOverride?: string | null,
+      expectedSourceSha256?: string | null,
+    ): Promise<Document> => {
+      const token = authTokenOverride === undefined ? getAuthToken() : authTokenOverride;
       const form = new FormData();
       form.append("file", file);
+      if (saveIntent) {
+        form.append("save_session_id", saveIntent.sessionId);
+        form.append("save_sequence", String(saveIntent.sequence));
+      }
+      if (expectedSourceSha256) {
+        form.append("expected_source_sha256", expectedSourceSha256);
+      }
       const headers: Record<string, string> = {};
       if (token) headers["Authorization"] = `Bearer ${token}`;
       const res = await fetch(`${API_BASE}/documents/${id}/file`, {
@@ -3108,6 +4000,18 @@ export const api = {
       const blob = await fetchDocumentBlob(id, options);
       return URL.createObjectURL(blob);
     },
+    downloadBlob: (id: string, options?: DocumentBlobOptions): Promise<Blob> =>
+      fetchDocumentBlob(id, options),
+    editableResponse: (id: string): Promise<Response> =>
+      fetchDocumentResponse(id, {}, "editable-file"),
+    downloadResponse: (id: string, options?: DocumentResponseOptions): Promise<Response> =>
+      fetchDocumentResponse(id, options),
+    preview: async (id: string, options?: DocumentBlobOptions): Promise<string> =>
+      URL.createObjectURL(await fetchProtectedDocumentBlob(`preview:${id}`, `/documents/${id}/preview/content`, options)),
+    previewBlob: (id: string, options?: DocumentBlobOptions): Promise<Blob> =>
+      fetchProtectedDocumentBlob(`preview:${id}`, `/documents/${id}/preview/content`, options),
+    previewResponse: (id: string, options?: DocumentResponseOptions): Promise<Response> =>
+      fetchDocumentResponse(id, options, "preview/content"),
     thumbnail: (id: string, options?: DocumentThumbnailOptions): Promise<string> => fetchDocumentThumbnailUrl(id, options),
     imageThumbnail: (id: string, options?: DocumentThumbnailOptions): Promise<string> => fetchDocumentImageThumbnailUrl(id, options),
     localImageThumbnail: (file: Blob): Promise<string> => captureDocumentImageThumbnail(file),
@@ -3127,6 +4031,26 @@ export const api = {
     },
     getSlides: (id: string) =>
       request<{ slides: { index: number; url: string }[]; total: number }>(`/documents/${id}/slides`),
+    presentationObjectBlob: (
+      id: string,
+      slideIndex: number,
+      objectId: string,
+      signal?: AbortSignal,
+    ): Promise<Blob> =>
+      fetchProtectedDocumentBlob(
+        `presentation-object:${id}:${slideIndex}:${objectId}`,
+        `/documents/${id}/slides/${slideIndex}/objects/${encodeURIComponent(objectId)}`,
+        { cache: false, signal },
+      ),
+    getPages: (id: string, signal?: AbortSignal) =>
+      request<{
+        pages: { index: number; url: string; width: number | null; height: number | null }[];
+        total: number;
+        version: string;
+      }>(
+        `/documents/${id}/pages`,
+        { signal },
+      ),
     listGroups: () => request<any[]>("/documents/groups"),
     createGroup: (data: { name: string; workspace_id?: string }) =>
       request<any>("/documents/groups", { method: "POST", body: JSON.stringify(data) }),
@@ -3216,7 +4140,7 @@ export const api = {
         audience_type: "anonymous" | "email" | "domain";
         audience_value?: string;
         capabilities: ("view" | "comment" | "download")[];
-        expires_in_days?: number;
+        expires_in_days?: number | null;
         watermark?: boolean;
         require_otp?: boolean;
         allow_download?: boolean;
@@ -3260,7 +4184,7 @@ export const api = {
         audience_type: "anonymous" | "email" | "domain";
         audience_value?: string;
         capabilities: ("view" | "comment" | "download")[];
-        expires_in_days?: number;
+        expires_in_days?: number | null;
         watermark?: boolean;
         require_otp?: boolean;
         allow_download?: boolean;
@@ -3366,7 +4290,7 @@ export const api = {
         audience_type: "anonymous" | "email" | "domain";
         audience_value?: string;
         capabilities: ("view" | "comment" | "download")[];
-        expires_in_days?: number;
+        expires_in_days?: number | null;
         watermark?: boolean;
         require_otp?: boolean;
         allow_download?: boolean;
@@ -3572,31 +4496,72 @@ export const api = {
   workspaces: {
     list: () => request<Workspace[]>("/workspaces"),
     get: (id: string) => request<Workspace>(`/workspaces/${id}`),
-    blueprintUpgradePlan: (id: string) =>
+    setupStatus: (id: string) =>
+      request<WorkspaceSetupStatus>(`/workspaces/${id}/setup-status`),
+    blueprintUpgradePlan: (
+      id: string,
+      variableValues?: Record<string, unknown>,
+      channelConfigIds?: Record<string, string>,
+    ) =>
       request<{
+        upgrade_protocol_version: number;
         workspace_id: string;
         workspace_name: string;
         blueprint_slug: string | null;
+        blueprint_fingerprint: string | null;
         can_revert: boolean;
+        setup_preflight: BlueprintInstallPreflight;
+        setup_preview: BlueprintSetupPreview;
+        variables_ready: boolean;
+        resolved_variable_keys: string[];
         items: Array<{
-          kind: "skill" | "agent" | "workflow" | "knowledge_document";
+          kind: "skill" | "agent" | "workflow" | "knowledge_document" | "blueprint_configuration";
           slug: string;
           name: string;
           id?: string;
-          action: "update" | "keep_yours" | "unchanged" | "missing";
+          revision?: number;
+          action: "update" | "keep_yours" | "unchanged" | "missing" | "baseline_unknown" | "reconfigure";
           changes: string[];
           /** The new version's actual content, per field, for reading before
            *  agreeing to overwrite what the agents currently run. */
           new_content: Record<string, string>;
         }>;
-      }>(`/workspaces/${id}/blueprint/upgrade`),
-    applyBlueprintUpgrade: (id: string) =>
+      }>(
+        variableValues === undefined && channelConfigIds === undefined
+          ? `/workspaces/${id}/blueprint/upgrade`
+          : `/workspaces/${id}/blueprint/upgrade/preview`,
+        variableValues === undefined && channelConfigIds === undefined
+          ? undefined
+          : {
+              method: "POST",
+              body: JSON.stringify({
+                variable_values: variableValues ?? {},
+                channel_config_ids: channelConfigIds ?? {},
+              }),
+            },
+      ),
+    applyBlueprintUpgrade: (id: string, data: {
+      expected_blueprint_fingerprint: string;
+      variable_values?: Record<string, unknown>;
+      channel_config_ids?: Record<string, string>;
+      conflict_resolutions: Array<{
+        kind: "skill" | "agent" | "workflow";
+        slug: string;
+        resolution: "keep_yours" | "use_blueprint";
+        expected_revision: number;
+      }>;
+    }) =>
       request<{
+        upgrade_protocol_version: number;
         workspace_id: string;
         updated: Array<{ kind: string; name: string; changes: string[] }>;
         kept_yours: Array<{ kind: string; name: string }>;
         can_revert: boolean;
-      }>(`/workspaces/${id}/blueprint/upgrade`, { method: "POST" }),
+        fully_synchronized: boolean;
+      }>(`/workspaces/${id}/blueprint/upgrade/v2`, {
+        method: "POST",
+        body: JSON.stringify(data),
+      }),
     revertBlueprintUpgrade: (id: string) =>
       request<{ workspace_id: string; reverted: Array<{ kind: string; name: string }> }>(
         `/workspaces/${id}/blueprint/revert`, { method: "POST" },
@@ -3617,6 +4582,13 @@ export const api = {
     trash: () => request<Workspace[]>("/workspaces/trash/list"),
     graceDays: () => request<{ grace_days: number }>("/workspaces/trash/grace-days"),
     dashboard: (id: string) => request<WorkspaceStats>(`/workspaces/${id}/dashboard`),
+    ledgerOverview: (id: string) =>
+      request<WorkspaceLedgerOverview>(`/workspaces/${id}/ledgers/overview`),
+    configureLedgers: (id: string, ledgerContracts: Array<string | Record<string, unknown>>) =>
+      request<{ workspace_id: string; ledger_contracts: Record<string, unknown>[]; source: string }>(
+        `/workspaces/${id}/ledgers/configuration`,
+        { method: "PUT", body: JSON.stringify({ ledger_contracts: ledgerContracts }) },
+      ),
     stats: {
       library: () => request<{ items: WorkspaceStatLibraryEntry[] }>("/workspaces/stats/library"),
       list: (wsId: string) => request<{ items: WorkspaceStatDefinition[] }>(`/workspaces/${wsId}/stats`),
@@ -3664,7 +4636,17 @@ export const api = {
         request<any>(`/workspaces/${wsId}/services/${serviceKey}`, { method: "DELETE" }),
     },
     agents: {
-      list: (wsId: string) => request<any[]>(`/workspaces/${wsId}/agents`),
+      list: (wsId: string) =>
+        request<WorkspaceAgentMapping[]>(`/workspaces/${wsId}/agents`),
+      assignable: (wsId: string) =>
+        request<{
+          agent_ids: string[];
+          subscriptions: Array<{
+            id: string;
+            agent_id: string;
+            role_label?: string | null;
+          }>;
+        }>(`/workspaces/${wsId}/agents/assignable`),
       map: (wsId: string, data: { service_key: string; agent_id: string; custom_prompt?: string }) =>
         request<any>(`/workspaces/${wsId}/agents`, { method: "POST", body: JSON.stringify(data) }),
       unmap: (wsId: string, serviceKey: string) =>
@@ -3756,6 +4738,14 @@ export const api = {
         request<void>(`/workspaces/${wsId}/staff/${staffId}`, { method: "DELETE" }),
     },
     channels: (wsId: string) => request<any[]>(`/workspaces/${wsId}/channels`),
+    webchatResources: (wsId: string, documentCursor = 0) => request<import("./webchatPage").WebchatWorkspaceResources>(`/workspaces/${wsId}/webchat/resources?document_cursor=${documentCursor}`),
+    reviewWebchatPage: (wsId: string, page: import("./webchatPage").WebchatPage) =>
+      request<import("./webchatPage").WebchatPage>(`/workspaces/${wsId}/webchat/review`, {
+        method: "POST",
+        body: JSON.stringify(page),
+      }),
+    reviewSavedWebchatPage: (wsId: string, channelBindingId: string) =>
+      request<import("./webchatPage").WebchatPage>(`/workspaces/${wsId}/channels/${channelBindingId}/webchat/review`),
     availableChannels: (wsId: string) => request<any[]>(`/workspaces/${wsId}/channels/available`),
     capabilities: (wsId: string) => request<any>(`/workspaces/${wsId}/capabilities`),
     attachChannel: (wsId: string, data: {
@@ -3786,6 +4776,7 @@ export const api = {
     }),
     removeChannel: (wsId: string, channelBindingId: string) =>
       request<void>(`/workspaces/${wsId}/channels/${channelBindingId}`, { method: "DELETE" }),
+    connectionStatus: (wsId: string) => request<WorkspaceConnectionStatus>(`/workspaces/${wsId}/connection-status`),
     resolveIntegrations: (wsId: string) => request<{ resolved: string[]; remaining: string[] }>(`/workspaces/${wsId}/resolve-integrations`, { method: "POST" }),
     documents: (wsId: string) => request<any[]>(`/workspaces/${wsId}/documents`),
     knowledge: {
@@ -3806,11 +4797,31 @@ export const api = {
           method: "POST",
           body: JSON.stringify({ document_ids: documentIds }),
         }),
+      addFolder: (wsId: string, folderId: string) =>
+        request<{ group_id: string; group_name: string; created: boolean; added: number; existing: number; total: number }>(
+          `/workspaces/${wsId}/documents/folders/${folderId}`,
+          { method: "POST" },
+        ),
       removeDocument: (wsId: string, groupId: string, documentId: string) =>
         request<void>(`/workspaces/${wsId}/documents/groups/${groupId}/members/${documentId}`, { method: "DELETE" }),
     },
-    pause: (wsId: string) => request<any>(`/workspaces/${wsId}/pause`, { method: "POST" }),
-    resume: (wsId: string) => request<any>(`/workspaces/${wsId}/resume`, { method: "POST" }),
+    pause: (wsId: string, transitionId?: string) => request<any>(
+      `/workspaces/${wsId}/pause${transitionId ? `?transition_id=${encodeURIComponent(transitionId)}` : ""}`,
+      { method: "POST" },
+    ),
+    resume: (
+      wsId: string,
+      transitionId?: string,
+      options?: {
+        goal?: { title: string; target_value: number };
+      },
+    ) => request<any>(
+      `/workspaces/${wsId}/resume${transitionId ? `?transition_id=${encodeURIComponent(transitionId)}` : ""}`,
+      {
+        method: "POST",
+        body: options ? JSON.stringify(options) : undefined,
+      },
+    ),
     heartbeat: {
       enable: (wsId: string) => request<any>(`/workspaces/${wsId}/heartbeat/enable`, { method: "POST" }),
       disable: (wsId: string) => request<any>(`/workspaces/${wsId}/heartbeat/disable`, { method: "POST" }),
@@ -3831,6 +4842,10 @@ export const api = {
         request<any>(`/workspaces/${wsId}/setup/finalize`, { method: "POST", body: JSON.stringify({ session_id: sessionId }) }),
     },
     // ── Workspace Blueprint / Marketplace (M12) ──────────────────────
+    blueprintExportKnowledgeDocuments: (wsId: string, limit = 50, offset = 0) =>
+      request<BlueprintExportKnowledgeDocument[]>(
+        `/workspaces/${wsId}/blueprint-export/knowledge-documents?limit=${limit}&offset=${offset}`,
+      ),
     exportBlueprint: (wsId: string, data: ExportBlueprintRequest) =>
       request<BlueprintDetail>(
         `/workspaces/${wsId}/export-blueprint`,
@@ -3854,13 +4869,20 @@ export const api = {
         bindingId: string,
         message: string,
         conversationId?: string,
-        opts?: { files?: File[]; documentIds?: string[]; localWorkerId?: string },
+        opts?: {
+          files?: File[];
+          documentIds?: string[];
+          localWorkerId?: string;
+          threadRef?: { kind: string; id: string };
+        },
       ): Promise<Response> => {
         const token = getAuthToken();
         const form = new FormData();
         form.append("message", message);
         if (conversationId) form.append("conversation_id", conversationId);
         if (opts?.localWorkerId) form.append("local_worker_id", opts.localWorkerId);
+        if (opts?.threadRef?.kind) form.append("thread_ref_kind", opts.threadRef.kind);
+        if (opts?.threadRef?.id) form.append("thread_ref_id", opts.threadRef.id);
         if (opts?.documentIds?.length) form.append("document_ids", opts.documentIds.join(","));
         if (opts?.files) opts.files.forEach((file) => form.append("files", file));
         const response = await fetch(
@@ -3922,6 +4944,8 @@ export const api = {
         if (opts?.before) q.set("before", opts.before);
         return request<PaginatedMessagesResponse<any>>(`/workspaces/${wsId}/chat/messages/page?${q}`);
       },
+      getMessage: (wsId: string, messageId: string, signal?: AbortSignal) =>
+        request<any>(`/workspaces/${wsId}/chat/messages/${messageId}`, { signal }),
       postMessage: (wsId: string, body: string, threadRef?: { kind: string; id: string }) =>
         request<any>(`/workspaces/${wsId}/chat/messages`, {
           method: "POST",
@@ -3943,7 +4967,17 @@ export const api = {
           method: "POST",
         }),
       feedback: (wsId: string, msgId: string, rating: "up" | "down") =>
-        request<any>(`/workspaces/${wsId}/chat/messages/${msgId}/feedback`, {
+        request<{
+          id: string;
+          rating: "up" | "down";
+          mutation_sequence: number;
+          mutation_status: "accepted";
+          feedback_updated_at: string;
+          feedback_target_kind: "task_completion" | "plan_completion";
+          feedback_target_id: string;
+          feedback_task_id: string | null;
+          feedback_plan_id: string | null;
+        }>(`/workspaces/${wsId}/chat/messages/${msgId}/feedback`, {
           method: "POST",
           body: JSON.stringify({ rating }),
         }),
@@ -3977,7 +5011,7 @@ export const api = {
      * `onToken`; the final hydrated draft + reply via `onDone`.
      */
     createStream: (
-      data: { initial_brief?: string } = {},
+      data: { initial_brief?: string; draft_id?: string } = {},
       handlers: WorkspaceDraftStreamHandlers = {},
     ) =>
       _streamDraftSSE(
@@ -4062,6 +5096,22 @@ export const api = {
       ),
     delete: (id: string) =>
       request<void>(`/blueprints/${id}`, { method: "DELETE" }),
+    installPreflight: (
+      id: string,
+      mode: InstallMode,
+      shareToken?: string,
+      variableValues: Record<string, unknown> = {},
+    ) => {
+      const params = new URLSearchParams();
+      params.set("mode", mode);
+      if (shareToken) params.set("share_token", shareToken);
+      params.set("variable_values", JSON.stringify(variableValues));
+      return (
+      request<BlueprintInstallPreflight>(
+        `/blueprints/${id}/install-preflight?${params.toString()}`,
+      )
+      );
+    },
     install: (id: string, data: InstallBlueprintRequest) =>
       request<InstallBlueprintResponse>(
         `/blueprints/${id}/install`,
@@ -4073,6 +5123,8 @@ export const api = {
       workspace_name?: string;
       create_missing_agents?: boolean;
       governance_preset?: GovernancePresetKey;
+      variable_values?: Record<string, unknown>;
+      channel_config_ids?: Record<string, string>;
     }) =>
       request<InstallBlueprintResponse>(
         "/blueprints/install-payload",
@@ -4098,6 +5150,7 @@ export const api = {
       request<BlueprintDetail>(`/blueprints/shared/${encodeURIComponent(token)}`),
   },
 
+
   marketplace: {
     checkout: (blueprintId: string) =>
       request<{ checkout_url: string }>(
@@ -4111,10 +5164,13 @@ export const api = {
   },
 
   merchant: {
-    onboard: () =>
-      request<{ onboarding_url: string }>("/merchant/onboard", {
+    onboard: (returnPath: "/merchant" | "/creator-center" = "/merchant") =>
+      request<{ onboarding_url: string }>(`/merchant/onboard?return_path=${encodeURIComponent(returnPath)}`, {
         method: "POST",
       }),
+    dashboard: () => request<{ dashboard_url: string }>("/merchant/dashboard", {
+      method: "POST",
+    }),
     status: () => request<MerchantStatusResponse>("/merchant/status"),
     sales: () => request<MerchantSalesResponse>("/merchant/sales"),
   },
@@ -4187,6 +5243,7 @@ export const api = {
           name: string;
           client_id: string | null;
           has_secret: boolean;
+          client_secret_required: boolean;
           source: "env" | "ui" | "db" | "none";
           scopes: string | null;
           configured: boolean;
@@ -4882,12 +5939,14 @@ export const api = {
       request<any>("/goals", { method: "POST", body: JSON.stringify(data) }),
     update: (id: string, data: any) =>
       request<any>(`/goals/${id}`, { method: "PUT", body: JSON.stringify(data) }),
+    delete: (id: string) =>
+      request<void>(`/goals/${id}`, { method: "DELETE" }),
     cancel: (id: string) =>
       request<any>(`/goals/${id}/cancel`, { method: "POST" }),
     getSteps: (id: string) => request<any[]>(`/goals/${id}/steps`),
     getMeasurements: (id: string, limit = 30) =>
       request<any[]>(`/goals/${id}/measurements?limit=${limit}`),
-    addMeasurement: (id: string, value: number, source = "manual", note?: string) =>
+    addMeasurement: (id: string, value: number | string, source = "manual", note?: string) =>
       request<any>(`/goals/${id}/measurements`, {
         method: "POST",
         body: JSON.stringify({ value, source, note }),
@@ -4929,21 +5988,55 @@ export const api = {
       request<any>(`/integrations/${id}`, { method: "PUT", body: JSON.stringify(data) }),
     delete: (id: string) =>
       request<void>(`/integrations/${id}`, { method: "DELETE" }),
+    listConnectionGrants: (kind: "integration" | "oauth_account", connectionId: string) =>
+      request<Array<{ id: string; user_id: string; capabilities: string[] }>>(
+        `/integrations/connections/${kind}/${connectionId}/grants`,
+      ),
+    createConnectionGrant: (
+      kind: "integration" | "oauth_account",
+      connectionId: string,
+      data: { user_id: string },
+    ) => request<{ id: string; user_id: string; capabilities: string[] }>(
+      `/integrations/connections/${kind}/${connectionId}/grants`,
+      { method: "POST", body: JSON.stringify(data) },
+    ),
+    deleteConnectionGrant: (
+      kind: "integration" | "oauth_account",
+      connectionId: string,
+      grantId: string,
+    ) => request<void>(
+      `/integrations/connections/${kind}/${connectionId}/grants/${grantId}`,
+      { method: "DELETE" },
+    ),
     nango: {
       /** Mint a Nango Connect session token + popup URL. */
-      startConnect: (provider_config_keys?: string[]) =>
-        request<{ session_token: string; nango_connect_url: string }>(
+      startConnect: (
+        provider_config_keys?: string[],
+        replace_integration_id?: string,
+      ) =>
+        request<{
+          session_token: string;
+          nango_connect_url: string;
+          connection_id: string;
+          provider_config_key: string;
+        }>(
           "/integrations/nango/connect-session",
           {
             method: "POST",
-            body: JSON.stringify({ provider_config_keys }),
+            body: JSON.stringify({ provider_config_keys, replace_integration_id }),
           },
         ),
       /** After the popup closes, mirror Nango connections into our integrations table. */
-      sync: () =>
-        request<{ upserted: number; providers: string[] }>(
+      sync: (data: {
+        expected_connection_id: string;
+        expected_provider_config_key: string;
+        replace_integration_id?: string;
+        whatsapp_waba_id?: string;
+        whatsapp_phone_number_id?: string;
+      }) =>
+        request<NangoSyncResponse>(
           "/integrations/nango/connections/sync",
-          { method: "POST" },
+          { method: "POST", body: JSON.stringify(data) },
         ),
     },
     mcpServers: () =>
@@ -4967,6 +6060,19 @@ export const api = {
       request<void>(
         `/integrations/mcp-servers/${serverKey}/entity-accounts/${accountId}/set-default`,
         { method: "POST" },
+      ),
+    retryWhatsAppProvisioning: (accountId: string, registration_pin: string) =>
+      request<{
+        ok: boolean;
+        integration_id: string;
+        readiness_code: string;
+        detail: string;
+      }>(
+        `/integrations/entity-accounts/${accountId}/whatsapp/provisioning/retry`,
+        {
+          method: "POST",
+          body: JSON.stringify({ registration_pin }),
+        },
       ),
     deleteEntityAccount: (serverKey: string, accountId: string) =>
       request<void>(
@@ -4996,10 +6102,12 @@ export const api = {
         last_error?: string | null;
         callback_configured?: boolean;
       }>(`/integrations/wechat-personal/${accountId}/status`),
-    /** Absolute URL for the live QR png. Used as an <img> src; the
-     *  browser will include cookies via the same-origin /api path. */
-    wechatPersonalQrUrl: (accountId: string) =>
-      `/api/v1/integrations/wechat-personal/${accountId}/qr.png`,
+    wechatPersonalQrBlob: (accountId: string) =>
+      fetchProtectedBlob(
+        `wechat-personal-qr:${accountId}`,
+        `${API_BASE}/integrations/wechat-personal/${accountId}/qr.png`,
+        { cache: false, force: true },
+      ),
 
     // ── Multi-session WeChat scan flow ──────────────────────────
     // The Integration row is created on /finish, AFTER the runner says
@@ -5018,8 +6126,12 @@ export const api = {
         last_error?: string | null;
         callback_configured?: boolean;
       }>(`/integrations/wechat-personal/sessions/${sessionId}/status`),
-    wechatPersonalSessionQrUrl: (sessionId: string) =>
-      `/api/v1/integrations/wechat-personal/sessions/${sessionId}/qr.png`,
+    wechatPersonalSessionQrBlob: (sessionId: string) =>
+      fetchProtectedBlob(
+        `wechat-personal-session-qr:${sessionId}`,
+        `${API_BASE}/integrations/wechat-personal/sessions/${sessionId}/qr.png`,
+        { cache: false, force: true },
+      ),
     wechatPersonalFinishSession: (sessionId: string, name?: string) =>
       request<{ id: string; provider: string; status: string }>(
         `/integrations/wechat-personal/sessions/${sessionId}/finish`,
@@ -5043,12 +6155,19 @@ export const api = {
         status: string;
         bound_channel_id: string | null;
         bound_agent_id: string | null;
+        bound_agent_subscription_id: string | null;
+        bound_workspace_id: string | null;
         agent_name: string | null;
+        workspace_name: string | null;
         binding_status: string | null;
         last_inbound_at: string | null;
         last_outbound_at: string | null;
       }>>("/integrations/channel-bindings"),
-    upsertChannelBinding: (data: { channel_config_id: string; agent_id: string | null }) =>
+    upsertChannelBinding: (data: {
+      channel_config_id: string;
+      agent_id?: string | null;
+      agent_subscription_id?: string | null;
+    }) =>
       request<{
         channel_config_id: string;
         channel_type: string;
@@ -5058,7 +6177,10 @@ export const api = {
         status: string;
         bound_channel_id: string | null;
         bound_agent_id: string | null;
+        bound_agent_subscription_id: string | null;
+        bound_workspace_id: string | null;
         agent_name: string | null;
+        workspace_name: string | null;
         binding_status: string | null;
         last_inbound_at: string | null;
         last_outbound_at: string | null;
@@ -5417,12 +6539,29 @@ export const api = {
       request<{ items: any[]; path: string; count: number }>(`/fs/list?path=${encodeURIComponent(path)}&show_system=${showSystem}`),
     tree: (maxDepth = 3) =>
       request<{ tree: any[]; entity_id: string }>(`/fs/tree?max_depth=${maxDepth}`),
-    read: (path: string) =>
-      request<{ content: string; encoding: string; path: string; size: number; mime_type: string }>(`/fs/read?path=${encodeURIComponent(path)}`),
+    read: (path: string, authToken?: string | null) =>
+      request<{ content: string; encoding: string; path: string; size: number; mime_type: string }>(
+        `/fs/read?path=${encodeURIComponent(path)}`,
+        {},
+        authToken,
+      ),
     info: (path: string) =>
       request<any>(`/fs/info?path=${encodeURIComponent(path)}`),
-    write: (path: string, content: string) =>
-      request<{ status: string; path: string }>("/fs/write", { method: "POST", body: JSON.stringify({ path, content }) }),
+    write: (path: string, content: string, options: FilesystemWriteOptions = {}) =>
+      request<{ status: string; path: string }>(
+        "/fs/write",
+        {
+          method: "POST",
+          body: JSON.stringify({
+            path,
+            content,
+            save_session_id: options.saveIntent?.sessionId,
+            save_sequence: options.saveIntent?.sequence,
+          }),
+          signal: options.signal,
+        },
+        options.authToken,
+      ),
     mkdir: (path: string) =>
       request<{ status: string; path: string }>("/fs/mkdir", { method: "POST", body: JSON.stringify({ path }) }),
     move: (src: string, dest: string) =>
@@ -5483,8 +6622,14 @@ export const api = {
         site: SiteInfo | null;
         hosting_configured: boolean;
         auto_connection_plan: SiteAutoConnectionPlan | null;
+        publish_snapshot_hash: string | null;
       }>(`/sites/for-path?path=${encodeURIComponent(path)}`),
-    publish: (data: { path: string; name: string; auto_connect?: boolean }) =>
+    publish: (data: {
+      path: string;
+      name: string;
+      auto_connect?: boolean;
+      expected_snapshot_hash?: string;
+    }) =>
       request<SitePublishResult>("/sites/publish", {
         method: "POST",
         body: JSON.stringify(data),
@@ -5526,6 +6671,7 @@ export interface SiteConnections {
 
 export interface SiteAutoConnectionPlan {
   eligible: boolean;
+  can_auto_connect: boolean;
   workspace_id: string | null;
   workspace_name: string | null;
   features: {
@@ -5541,7 +6687,7 @@ export interface SiteAutoConnectionPlan {
     subscription_flow: "create" | "reuse" | "not_detected";
     analytics: "enable";
   };
-  reason: "no_workspace_origin" | null;
+  reason: "no_workspace_origin" | "workspace_manage_required" | null;
 }
 
 export interface SiteAnalytics {

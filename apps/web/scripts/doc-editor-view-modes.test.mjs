@@ -29,3 +29,28 @@ test("document header toggles share the same accessible neutral selected state",
   );
   assert.doesNotMatch(editorSource, /btn-manor-neutral-light/);
 });
+
+test("plain text edits connect native input and accepted AI previews to bounded history", () => {
+  assert.match(editorSource, /const plainTextHistoryRef = useRef\(createPlainTextHistory\(\)\);/);
+  assert.match(
+    editorSource,
+    /recordPlainTextHistory\([\s\S]*?input: options\.input,[\s\S]*?beforeGeneration,[\s\S]*?afterGeneration,/,
+  );
+  assert.match(editorSource, /onBeforeInput=\{\(event\) => \{/);
+  assert.match(editorSource, /preview\.mode === "text"[\s\S]*?recordPlainTextHistory\([\s\S]*?preview\.baseline,[\s\S]*?finalContent/);
+  assert.match(editorSource, /runPlainTextHistoryCommand\(e\.shiftKey \? "redo" : "undo"\)/);
+  assert.doesNotMatch(editorSource, /document\.execCommand\(command\)/);
+});
+
+test("late text-byte decoding preserves edits in every text-like editor", () => {
+  assert.match(
+    editorSource,
+    /const keepLocalTextChange = textSaveEditRevisionRef\.current !== textSavePersistedRevisionRef\.current[\s\S]*?contentRef\.current !== decoded\.text[\s\S]*?if \(!keepLocalTextChange\)/,
+  );
+  assert.doesNotMatch(editorSource, /const keepLocalTextChange = mode === "text"/);
+  assert.match(editorSource, /needsTextByteHydration[\s\S]*?textBytesReadyDocumentId !== docId/);
+  assert.match(
+    editorSource,
+    /if \(isCsv\)[\s\S]*?if \(!keepLocalTextChange\) \{[\s\S]*?setSheetData\(/,
+  );
+});

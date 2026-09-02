@@ -8,7 +8,7 @@ export interface PresentationEditabilityShape {
   imgUrl?: string;
   texts?: Array<{ text?: string }>;
   tableRows?: unknown[][];
-  source?: { editable: boolean };
+  source?: { editable: boolean; part?: string };
 }
 
 export interface PresentationSlideEditability {
@@ -18,6 +18,13 @@ export interface PresentationSlideEditability {
   editableTableCount: number;
   editableImageCount: number;
   flattenedImageShapeId: string | null;
+}
+
+export function presentationShapesForDuplicateSlide<T extends { source?: { part?: string } }>(
+  shapes: T[],
+  sourcePart?: string,
+): T[] {
+  return shapes.filter((shape) => !shape.source || shape.source.part === sourcePart);
 }
 
 /**

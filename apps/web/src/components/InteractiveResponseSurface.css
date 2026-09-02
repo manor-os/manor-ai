@@ -1,0 +1,161 @@
+.response-surface {
+  width: 100%;
+  min-width: 0;
+  margin: 8px 0 10px;
+  overflow: hidden;
+  border-radius: var(--radius-card);
+  background: var(--glass-card);
+  box-shadow: var(--shadow-sm);
+  backdrop-filter: var(--glass-blur-sm);
+}
+
+.response-surface-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 11px 12px;
+}
+
+.response-surface-heading {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 10px;
+}
+
+.response-surface-heading > div {
+  min-width: 0;
+}
+
+.response-surface-heading h3,
+.response-surface-heading p {
+  overflow: hidden;
+  margin: 0;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.response-surface-heading h3 {
+  color: var(--text-strong);
+  font-size: 13px;
+  font-weight: 750;
+}
+
+.response-surface-heading p {
+  margin-top: 2px;
+  color: var(--text-muted);
+  font-size: 11px;
+}
+
+.response-surface-icon {
+  display: inline-flex;
+  width: 30px;
+  height: 30px;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: center;
+  border-radius: var(--radius-control);
+  background: var(--surface-muted);
+  color: var(--text-default);
+}
+
+.response-surface-runtime {
+  position: relative;
+  min-width: 0;
+  background: var(--surface-muted);
+}
+
+.response-surface-runtime.is-focused {
+  height: 100%;
+  min-height: 0;
+}
+
+.response-surface-disabled {
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 18px;
+  background: color-mix(in srgb, var(--surface-muted) 78%, transparent);
+  color: var(--text-default);
+  font-size: 12px;
+  font-weight: 700;
+  text-align: center;
+  backdrop-filter: blur(2px);
+}
+
+.response-surface-frame {
+  display: block;
+  width: 100%;
+  min-height: 180px;
+  border: 0;
+  background: var(--surface-muted);
+}
+
+.response-surface-runtime.is-focused .response-surface-frame {
+  min-height: 100%;
+}
+
+.response-surface-fallback {
+  padding: 18px;
+  color: var(--text-default);
+}
+
+.response-surface-submit-error {
+  position: absolute;
+  right: 12px;
+  bottom: 12px;
+  left: 12px;
+  z-index: 3;
+  padding: 10px 12px;
+  border-radius: var(--radius-control);
+  background: var(--surface-panel);
+  color: var(--status-danger-text, var(--text-default));
+  font-size: 11px;
+  font-weight: 650;
+  box-shadow: var(--shadow-md);
+}
+
+.response-surface-modal {
+  border: 0 !important;
+  border-radius: var(--radius-panel) !important;
+}
+
+.response-surface-modal-body {
+  min-height: 0;
+  flex: 1;
+  padding: 0 !important;
+  overflow: hidden !important;
+}
+
+.response-surface-modal-body > .response-surface-runtime {
+  height: 100%;
+}
+
+@media (max-width: 640px) {
+  .response-surface-modal-overlay {
+    padding: 0 !important;
+    height: 100dvh !important;
+    min-height: 100dvh !important;
+    overflow: hidden !important;
+  }
+
+  .response-surface-header {
+    align-items: flex-start;
+    flex-wrap: wrap;
+  }
+
+  .response-surface-header > button {
+    width: 100%;
+  }
+
+  .response-surface-modal {
+    width: 100vw !important;
+    height: 100dvh !important;
+    max-height: 100dvh !important;
+    border-radius: 0 !important;
+  }
+}

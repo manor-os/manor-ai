@@ -43,7 +43,11 @@ class WebchatAdapter(ChannelAdapter):
         # The gateway already persists the reply into MessageLog + Message.
         # The public chat endpoint polls for new messages, so no extra
         # push is needed. When WebSocket support is added later, push here.
-        return {"delivered_via": "webchat", "session_id": to}
+        return {
+            "delivered_via": "webchat",
+            "session_id": to,
+            "status": "sent",
+        }
 
     async def verify_inbound(self, cc: ChannelConfig, *, headers, query, body) -> bool:
         # Public endpoint — no signature verification.

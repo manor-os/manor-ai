@@ -23,16 +23,44 @@ from packages.core.governance.approvals import (
     count_open_requests,
     grant_approval,
     grant_open_request_for_step,
-    resolve_approval,
     resolve_origin_requests,
 )
 from packages.core.models.base import generate_ulid
-from packages.core.models.workspace import Workspace
+from packages.core.models.user import User, UserMembership
+from packages.core.models.workspace import Workspace, WorkspaceStaff
+from packages.core.services.runtime_authorization import (
+    AuthorizationRule,
+    PermissionDecision,
+)
+
+
+async def resolve_approval(*args, **kwargs):
+    """Governance tests run inside an explicitly authorized system worker."""
+    kwargs.setdefault(
+        "permission_decision",
+        PermissionDecision.allow(AuthorizationRule.SYSTEM_WORKER),
+    )
+    from packages.core.governance.approvals import resolve_approval as _resolve
+
+    return await _resolve(*args, **kwargs)
 
 
 async def _ws(db):
     entity_id = generate_ulid()
     workspace_id = generate_ulid()
+    db.add(User(
+        id="op",
+        entity_id=entity_id,
+        email=f"op-{entity_id}@example.com",
+        password_hash="x",
+        role="owner",
+    ))
+    db.add(UserMembership(
+        user_id="op",
+        entity_id=entity_id,
+        role="owner",
+        status="active",
+    ))
     db.add(Workspace(id=workspace_id, entity_id=entity_id, name="Gov WS", operating_model={}))
     await db.flush()
     return entity_id, workspace_id
@@ -277,11 +305,35 @@ async def test_the_user_is_the_authority_on_what_becomes_standing(db_session):
 
 
 @pytest.mark.asyncio
-async def test_operator_resume_grants_the_steps_open_request__317(db_session):
-    """Task-detail Resume / plan Retry on an approval-paused step IS the
-    approval: granting by step id lets the reparked step through the gate."""
+async def test_explicit_operator_resume_grants_the_steps_open_request__317(db_session):
+    """An explicit HITL Resume on an approval-paused step records the
+    approval and lets the reparked step through the gate."""
+    from packages.core.models.execution import ExecutionPlan, ExecutionStep
+
     e, w = await _ws(db_session)
     step = generate_ulid()
+    plan = generate_ulid()
+    db_session.add(ExecutionPlan(
+        id=plan,
+        entity_id=e,
+        workspace_id=w,
+        status="paused",
+        execution_mode="live",
+        approval_required=False,
+        plan_dag={"steps": []},
+    ))
+    db_session.add(ExecutionStep(
+        id=step,
+        plan_id=plan,
+        entity_id=e,
+        workspace_id=w,
+        step_key="publish",
+        kind="subagent",
+        params={},
+        depends_on=[],
+        step_status="waiting_human",
+    ))
+    await db_session.flush()
     subject = _subject(e, w, risk_level="high")
 
     d1 = await resolve_approval(db_session, subject=subject, origin=_step_origin(step_id=step))
@@ -301,6 +353,68 @@ async def test_operator_resume_grants_the_steps_open_request__317(db_session):
     assert await grant_open_request_for_step(
         db_session, entity_id=e, step_id=generate_ulid(), by_user_id="op",
     ) is None
+
+
+@pytest.mark.asyncio
+async def test_requestless_inline_review_requires_explicit_decision(db_session):
+    from packages.core.governance.approvals import ApprovalDecisionRequiredError
+    from packages.core.models.execution import ExecutionPlan, ExecutionStep
+
+    e, w = await _ws(db_session)
+    viewer_id = generate_ulid()
+    db_session.add_all([
+        User(
+            id=viewer_id,
+            entity_id=e,
+            email=f"viewer-{viewer_id}@example.com",
+            password_hash="x",
+            role="member",
+        ),
+        UserMembership(
+            user_id=viewer_id,
+            entity_id=e,
+            role="member",
+            status="active",
+        ),
+        WorkspaceStaff(
+            workspace_id=w,
+            staff_id=None,
+            user_id=viewer_id,
+            role="viewer",
+            status="active",
+        ),
+    ])
+    plan_id, step_id = generate_ulid(), generate_ulid()
+    db_session.add(ExecutionPlan(
+        id=plan_id,
+        entity_id=e,
+        workspace_id=w,
+        status="paused",
+        execution_mode="live",
+        approval_required=False,
+        plan_dag={"steps": []},
+    ))
+    db_session.add(ExecutionStep(
+        id=step_id,
+        plan_id=plan_id,
+        entity_id=e,
+        workspace_id=w,
+        step_key="review",
+        kind="human",
+        params={"review": {"summary": "Review this output."}},
+        depends_on=[],
+        step_status="waiting_human",
+    ))
+    await db_session.flush()
+
+    with pytest.raises(ApprovalDecisionRequiredError):
+        await grant_open_request_for_step(
+            db_session,
+            entity_id=e,
+            step_id=step_id,
+            by_user_id=viewer_id,
+            via="task_resume",
+        )
 
 
 @pytest.mark.asyncio

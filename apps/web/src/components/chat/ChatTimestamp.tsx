@@ -5,6 +5,7 @@ const LOCALES = {
   de: "de-DE",
   en: "en-US",
   es: "es-ES",
+  fr: "fr-FR",
   zh: "zh-CN",
 } as const;
 

@@ -7,22 +7,22 @@ recipient Gmail refuses at RCPT. The fix fans out one clean single-recipient
 message per address, RFC-2047 encodes non-ASCII subjects, and reports partial
 success.
 
-Follows the module-level ``aiosmtplib`` swap pattern from ``test_email.py``.
+Mocks the shared SMTP transport so these tests remain independent of network
+egress mode.
 """
 
 from __future__ import annotations
 
-from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
 
 
-def _swap_aiosmtplib(mock_send):
+def _swap_transport(mock_send):
     import packages.core.services.email_service as email_mod
 
-    original = email_mod.aiosmtplib
-    email_mod.aiosmtplib = SimpleNamespace(send=mock_send)  # type: ignore[assignment]
+    original = email_mod.smtp_transport.send_message_async
+    email_mod.smtp_transport.send_message_async = mock_send
     return email_mod, original
 
 
@@ -34,7 +34,7 @@ async def test_bulk_email_sends_one_message_per_recipient():
     """A list of N recipients produces N individual sends, each with exactly
     one clean To header — never a stringified list."""
     mock_send = AsyncMock()
-    email_mod, original = _swap_aiosmtplib(mock_send)
+    email_mod, original = _swap_transport(mock_send)
     try:
         with pytest.MonkeyPatch.context() as mp:
             mp.setenv("EMAIL_ENABLED", "true")
@@ -57,7 +57,7 @@ async def test_bulk_email_sends_one_message_per_recipient():
         assert result["sent"] == 3
         assert result["failed"] == []
     finally:
-        email_mod.aiosmtplib = original
+        email_mod.smtp_transport.send_message_async = original
 
 
 @pytest.mark.asyncio
@@ -65,13 +65,13 @@ async def test_bulk_email_reports_partial_failure():
     """One failing recipient must not nuke the batch — the others still
     deliver and the failure is reported per-address."""
 
-    async def flaky_send(msg, **kwargs):
-        if msg["To"] == "bad@corp.com":
+    async def flaky_send(*, message, **kwargs):
+        if message["To"] == "bad@corp.com":
             raise RuntimeError("SMTPRecipientRefused 555 5.5.2 Syntax error")
         return None
 
     mock_send = AsyncMock(side_effect=flaky_send)
-    email_mod, original = _swap_aiosmtplib(mock_send)
+    email_mod, original = _swap_transport(mock_send)
     try:
         with pytest.MonkeyPatch.context() as mp:
             mp.setenv("EMAIL_ENABLED", "true")
@@ -86,14 +86,14 @@ async def test_bulk_email_reports_partial_failure():
         assert result["failed"][0]["to"] == "bad@corp.com"
         assert "555" in result["failed"][0]["error"]
     finally:
-        email_mod.aiosmtplib = original
+        email_mod.smtp_transport.send_message_async = original
 
 
 @pytest.mark.asyncio
 async def test_bulk_email_accepts_single_address_string():
     """A plain string address still works and is treated as one recipient."""
     mock_send = AsyncMock()
-    email_mod, original = _swap_aiosmtplib(mock_send)
+    email_mod, original = _swap_transport(mock_send)
     try:
         with pytest.MonkeyPatch.context() as mp:
             mp.setenv("EMAIL_ENABLED", "true")
@@ -103,7 +103,7 @@ async def test_bulk_email_accepts_single_address_string():
         assert mock_send.call_count == 1
         assert result["sent"] == 1
     finally:
-        email_mod.aiosmtplib = original
+        email_mod.smtp_transport.send_message_async = original
 
 
 @pytest.mark.asyncio
@@ -111,7 +111,7 @@ async def test_bulk_email_disabled_pretends_success():
     """EMAIL_ENABLED=false keeps the pretend-success contract for all
     recipients and never touches SMTP."""
     mock_send = AsyncMock()
-    email_mod, original = _swap_aiosmtplib(mock_send)
+    email_mod, original = _swap_transport(mock_send)
     try:
         with pytest.MonkeyPatch.context() as mp:
             mp.setenv("EMAIL_ENABLED", "false")
@@ -122,7 +122,7 @@ async def test_bulk_email_disabled_pretends_success():
         assert result["sent"] == 2
         assert result["failed"] == []
     finally:
-        email_mod.aiosmtplib = original
+        email_mod.smtp_transport.send_message_async = original
 
 
 # ── RFC-2047 subject encoding ───────────────────────────────────────────────
@@ -134,13 +134,13 @@ async def test_chinese_subject_is_rfc2047_encoded():
     ``=?utf-8?...?=`` encoded-word, not raw UTF-8 in the header."""
     captured = {}
 
-    async def capture_send(msg, **kwargs):
-        captured["raw"] = msg.as_string()
-        captured["subject_header"] = msg["Subject"]
+    async def capture_send(*, message, **kwargs):
+        captured["raw"] = message.as_string()
+        captured["subject_header"] = message["Subject"]
         return None
 
     mock_send = AsyncMock(side_effect=capture_send)
-    email_mod, original = _swap_aiosmtplib(mock_send)
+    email_mod, original = _swap_transport(mock_send)
     try:
         with pytest.MonkeyPatch.context() as mp:
             mp.setenv("EMAIL_ENABLED", "true")
@@ -153,7 +153,7 @@ async def test_chinese_subject_is_rfc2047_encoded():
         # And the raw bytes of the header are ASCII-safe.
         assert "每周业务简报" not in captured["raw"]
     finally:
-        email_mod.aiosmtplib = original
+        email_mod.smtp_transport.send_message_async = original
 
 
 @pytest.mark.asyncio
@@ -162,16 +162,16 @@ async def test_ascii_subject_is_left_plain():
     template senders' headers human-readable)."""
     captured = {}
 
-    async def capture_send(msg, **kwargs):
-        captured["subject_header"] = msg["Subject"]
+    async def capture_send(*, message, **kwargs):
+        captured["subject_header"] = message["Subject"]
         return None
 
     mock_send = AsyncMock(side_effect=capture_send)
-    email_mod, original = _swap_aiosmtplib(mock_send)
+    email_mod, original = _swap_transport(mock_send)
     try:
         with pytest.MonkeyPatch.context() as mp:
             mp.setenv("EMAIL_ENABLED", "true")
             await email_mod.send_email("user@corp.com", "Plain subject", "<p>x</p>")
         assert captured["subject_header"] == "Plain subject"
     finally:
-        email_mod.aiosmtplib = original
+        email_mod.smtp_transport.send_message_async = original

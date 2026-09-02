@@ -45,6 +45,7 @@ from packages.core.dispatcher.service import (
     Dispatcher,
     DispatchError,
     LeaseNotActive,
+    MISSING_RESULT,
     NoMatchingSteps,
 )
 from packages.core.dispatcher.validation import (
@@ -57,6 +58,7 @@ __all__ = [
     "Dispatcher",
     "DispatchError",
     "LeaseNotActive",
+    "MISSING_RESULT",
     "NoMatchingSteps",
     "SchemaError",
     "validate_step_input",

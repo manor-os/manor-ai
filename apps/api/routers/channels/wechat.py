@@ -1,7 +1,7 @@
 """WeChat Official Account webhook endpoints.
 
-GET  /api/v1/channels/wechat/callback  — WeChat server verification
-POST /api/v1/channels/wechat/callback  — Receive messages from WeChat
+GET  /api/v1/channels/wechat/callback?config_id=<id>  — WeChat server verification
+POST /api/v1/channels/wechat/callback?config_id=<id>  — Receive messages from WeChat
 
 WeChat requires a fixed callback URL during Official Account configuration.
 The channel_config_id is passed as a query parameter so multiple OA accounts
@@ -14,10 +14,11 @@ import logging
 from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import PlainTextResponse
 from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.exc import IntegrityError
 
 from packages.core.database import async_session
-from packages.core.models.channel import ChannelConfig
+from packages.core.models.channel import ChannelConfig, MessageLog
+from packages.core.services.channel_credentials import lease_channel_credentials
 from packages.core.services.channels.wechat_adapter import WeChatAdapter
 from packages.core.services.channel_service import handle_inbound_message
 from packages.core.tasks.channel_tasks import dispatch_inbound_task
@@ -34,17 +35,21 @@ router = APIRouter(prefix="/api/v1/channels/wechat", tags=["channels"])
 async def _get_adapter_and_config(
     config_id: str,
 ) -> tuple[WeChatAdapter, ChannelConfig]:
-    """Load ChannelConfig and build a WeChatAdapter from its credentials."""
+    """Load an active source-linked config and lease its WeChat credentials."""
     async with async_session() as db:
         result = await db.execute(
             select(ChannelConfig).where(ChannelConfig.id == config_id)
         )
         cc = result.scalar_one_or_none()
+        if not cc:
+            raise HTTPException(404, "Channel config not found")
+        try:
+            creds = await lease_channel_credentials(
+                db, cc, reason="channel.wechat.webhook",
+            )
+        except ValueError as exc:
+            raise HTTPException(410, "WeChat channel credential source is unavailable") from exc
 
-    if not cc:
-        raise HTTPException(404, "Channel config not found")
-
-    creds = cc.credentials or {}
     app_id = creds.get("app_id", "")
     app_secret = creds.get("app_secret", "")
     token = creds.get("token", "")
@@ -141,10 +146,12 @@ async def wechat_receive(
         logger.exception("Failed to parse WeChat message")
         return PlainTextResponse("success")
 
-    # Log the inbound message
-    try:
-        async with async_session() as db:
-            await handle_inbound_message(
+    # Persist the receipt and publish its id before committing. This mirrors
+    # the Slack/WhatsApp callbacks: a provider retry either hits the unique
+    # receipt index or a queue failure rolls the insert back for a later retry.
+    async with async_session() as db:
+        try:
+            inbound_log = await handle_inbound_message(
                 db,
                 entity_id=cc.entity_id,
                 channel_config_id=cc.id,
@@ -160,20 +167,41 @@ async def wechat_receive(
                     },
                 },
             )
+            # Enqueue agent dispatch on Celery — WeChat's 5-second ack is
+            # hard, and the broker keeps the task alive across worker restarts.
+            dispatch_inbound_task.delay(
+                entity_id=cc.entity_id,
+                channel_config_id=cc.id,
+                channel_type="wechat",
+                sender_id=parsed["sender_id"],
+                sender_name=parsed.get("sender_name"),
+                chat_id=parsed["sender_id"],  # WeChat replies use the OpenID
+                content=parsed.get("content", "") or "",
+                inbound_message_log_id=inbound_log.id,
+            )
             await db.commit()
-    except Exception:
-        logger.exception("Failed to log inbound WeChat message")
-
-    # Enqueue agent dispatch on Celery — WeChat's 5-second ack is hard,
-    # and the broker keeps the task alive across worker restarts.
-    dispatch_inbound_task.delay(
-        entity_id=cc.entity_id,
-        channel_config_id=cc.id,
-        channel_type="wechat",
-        sender_id=parsed["sender_id"],
-        sender_name=parsed.get("sender_name"),
-        chat_id=parsed["sender_id"],  # WeChat replies go to the OpenID
-        content=parsed.get("content", "") or "",
-    )
+        except IntegrityError:
+            await db.rollback()
+            duplicate = await db.scalar(
+                select(MessageLog.id).where(
+                    MessageLog.channel_config_id == cc.id,
+                    MessageLog.direction == "inbound",
+                    MessageLog.channel_type == "wechat",
+                    MessageLog.external_id == parsed.get("msg_id"),
+                ).limit(1)
+            )
+            if duplicate is not None:
+                logger.info(
+                    "Ignoring duplicate WeChat message config=%s external_id=%s",
+                    cc.id,
+                    parsed.get("msg_id"),
+                )
+                return PlainTextResponse("success")
+            logger.exception("Failed to persist inbound WeChat message")
+            raise HTTPException(503, "Unable to persist inbound WeChat message")
+        except Exception as exc:
+            await db.rollback()
+            logger.exception("Failed to enqueue inbound WeChat message")
+            raise HTTPException(503, "Inbound message queue unavailable") from exc
 
     return PlainTextResponse("success")

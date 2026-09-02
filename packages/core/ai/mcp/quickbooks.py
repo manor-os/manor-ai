@@ -35,20 +35,34 @@ async def call_tool(
     arguments: Dict[str, Any],
     bearer_token: str,
 ) -> Dict[str, Any]:
+    if not isinstance(arguments, dict):
+        return _error("arguments must be an object")
+    arguments = dict(arguments)
     handler = _HANDLERS.get(name)
     if not handler:
         return _error(f"Unknown tool: {name}")
 
     spec = _TOOLS.get(name, {})
-    missing = [p for p in spec.get("required", []) if arguments.get(p) in (None, "")]
+    try:
+        token, configured_realm_id = _credentials(bearer_token)
+    except ValueError as exc:
+        return _error(str(exc))
+    if not token:
+        return _error("QuickBooks access token is missing. Connect QuickBooks first.")
+    if configured_realm_id and _is_blank(arguments.get("realm_id")):
+        arguments["realm_id"] = configured_realm_id
+
+    missing = [p for p in spec.get("required", []) if _is_blank(arguments.get(p))]
     if missing:
         return _error(f"Missing required params: {', '.join(missing)}")
 
-    # bearer_token here is the access_token. We need realm_id too.
-    # The auth resolver gives us just the token. realm_id must come from arguments
-    # or we fetch it from the integration config via a helper.
+    for parameter in spec.get("required", []):
+        value = arguments.get(parameter)
+        if isinstance(value, str):
+            arguments[parameter] = value.strip()
+
     try:
-        text = await handler(bearer_token, arguments)
+        text = await handler(token, arguments)
         return {"content": [{"type": "text", "text": text}], "isError": False}
     except Exception as e:
         logger.exception("QuickBooks MCP tool %s failed", name)
@@ -61,10 +75,24 @@ def _error(msg: str) -> Dict[str, Any]:
 
 # ── QBO API client ───────────────────────────────────────────────────────────
 
-def _base_url() -> str:
-    """Use sandbox in dev, production otherwise."""
-    env = os.getenv("QBO_ENVIRONMENT", "production").lower()
-    return _API_SANDBOX if env == "sandbox" else _API_PROD
+def quickbooks_base_url() -> str:
+    """Resolve QBO's endpoint without allowing non-production to hit live data."""
+    configured = (
+        os.getenv("QUICKBOOKS_ENVIRONMENT", "").strip()
+        or os.getenv("QBO_ENVIRONMENT", "").strip()
+    ).lower()
+    if configured:
+        if configured in {"sandbox", "test"}:
+            return _API_SANDBOX
+        if configured in {"production", "prod", "live"}:
+            return _API_PROD
+        raise ValueError(
+            "QUICKBOOKS_ENVIRONMENT (or legacy QBO_ENVIRONMENT) must be "
+            "'sandbox' or 'production'."
+        )
+
+    manor_env = os.getenv("MANOR_ENV", "").strip().lower()
+    return _API_PROD if manor_env in {"production", "prod", "live"} else _API_SANDBOX
 
 
 async def _api(
@@ -75,8 +103,11 @@ async def _api(
     body: Optional[Dict] = None,
     params: Optional[Dict] = None,
 ) -> str:
-    base = _base_url()
-    url = f"{base}/{realm_id}/{path.lstrip('/')}"
+    token = str(token or "").strip()
+    if _is_blank(token):
+        raise ValueError("QuickBooks access token is missing.")
+    base = quickbooks_base_url()
+    url = f"{base}/{_path_segment(realm_id)}/{path.lstrip('/')}"
     headers = {
         "Authorization": f"Bearer {token}",
         "Accept": "application/json",
@@ -126,18 +157,22 @@ async def _query(token: str, realm_id: str, sql: str) -> str:
 
 async def _get_company_info(token: str, args: Dict) -> str:
     realm_id = args["realm_id"]
-    return await _api(token, "GET", realm_id, f"companyinfo/{realm_id}")
+    return await _api(token, "GET", realm_id, f"companyinfo/{_path_segment(realm_id)}")
 
 
 async def _query_customers(token: str, args: Dict) -> str:
     realm_id = args["realm_id"]
-    limit = _clamp(args.get("limit", 20), 1, 1000)
+    limit = _limit(args.get("limit"), default=20)
     where = f" WHERE DisplayName LIKE '%{_esc(args['name'])}%'" if args.get("name") else ""
-    return await _query(token, realm_id, f"SELECT * FROM Customer{where} MAXRESULTS {limit}")
+    # QBO query fragments are fixed; values pass through _esc and limit is bounded.
+    return await _query(token, realm_id, f"SELECT * FROM Customer{where} MAXRESULTS {limit}")  # nosec B608
 
 
 async def _get_customer(token: str, args: Dict) -> str:
-    return await _api(token, "GET", args["realm_id"], f"customer/{args['customer_id']}")
+    return await _api(
+        token, "GET", args["realm_id"],
+        f"customer/{_path_segment(args['customer_id'])}",
+    )
 
 
 async def _create_customer(token: str, args: Dict) -> str:
@@ -153,7 +188,7 @@ async def _create_customer(token: str, args: Dict) -> str:
 
 async def _query_invoices(token: str, args: Dict) -> str:
     realm_id = args["realm_id"]
-    limit = _clamp(args.get("limit", 20), 1, 1000)
+    limit = _limit(args.get("limit"), default=20)
     conditions = []
     if args.get("customer_id"):
         conditions.append(f"CustomerRef = '{_esc(args['customer_id'])}'")
@@ -161,11 +196,16 @@ async def _query_invoices(token: str, args: Dict) -> str:
         # QBO uses Balance for paid/unpaid: Balance = '0' means paid
         pass  # complex filter, skip for simplicity
     where = f" WHERE {' AND '.join(conditions)}" if conditions else ""
-    return await _query(token, realm_id, f"SELECT * FROM Invoice{where} ORDERBY MetaData.CreateTime DESC MAXRESULTS {limit}")
+    # QBO query fragments are fixed; values are escaped and LIMIT is bounded.
+    query = f"SELECT * FROM Invoice{where} ORDERBY MetaData.CreateTime DESC MAXRESULTS {limit}"  # nosec B608
+    return await _query(token, realm_id, query)
 
 
 async def _get_invoice(token: str, args: Dict) -> str:
-    return await _api(token, "GET", args["realm_id"], f"invoice/{args['invoice_id']}")
+    return await _api(
+        token, "GET", args["realm_id"],
+        f"invoice/{_path_segment(args['invoice_id'])}",
+    )
 
 
 async def _create_invoice(token: str, args: Dict) -> str:
@@ -192,51 +232,70 @@ async def _send_invoice(token: str, args: Dict) -> str:
     invoice_id = args["invoice_id"]
     email = args.get("email", "")
     params = {"sendTo": email} if email else None
-    return await _api(token, "POST", realm_id, f"invoice/{invoice_id}/send", params=params)
+    return await _api(
+        token, "POST", realm_id,
+        f"invoice/{_path_segment(invoice_id)}/send", params=params,
+    )
+
+
+async def _void_invoice(token: str, args: Dict) -> str:
+    invoice_id = args["invoice_id"]
+    body = {"Id": invoice_id, "SyncToken": args["sync_token"]}
+    return await _api(
+        token, "POST", args["realm_id"],
+        f"invoice/{_path_segment(invoice_id)}/void", body=body,
+    )
 
 
 async def _query_payments(token: str, args: Dict) -> str:
     realm_id = args["realm_id"]
-    limit = _clamp(args.get("limit", 20), 1, 1000)
+    limit = _limit(args.get("limit"), default=20)
     conditions = []
     if args.get("customer_id"):
         conditions.append(f"CustomerRef = '{_esc(args['customer_id'])}'")
     where = f" WHERE {' AND '.join(conditions)}" if conditions else ""
-    return await _query(token, realm_id, f"SELECT * FROM Payment{where} ORDERBY MetaData.CreateTime DESC MAXRESULTS {limit}")
+    # QBO query fragments are fixed; values are escaped and LIMIT is bounded.
+    query = f"SELECT * FROM Payment{where} ORDERBY MetaData.CreateTime DESC MAXRESULTS {limit}"  # nosec B608
+    return await _query(token, realm_id, query)
 
 
 async def _get_payment(token: str, args: Dict) -> str:
-    return await _api(token, "GET", args["realm_id"], f"payment/{args['payment_id']}")
+    return await _api(
+        token, "GET", args["realm_id"],
+        f"payment/{_path_segment(args['payment_id'])}",
+    )
 
 
 async def _query_items(token: str, args: Dict) -> str:
     realm_id = args["realm_id"]
-    limit = _clamp(args.get("limit", 20), 1, 1000)
+    limit = _limit(args.get("limit"), default=20)
     where = f" WHERE Name LIKE '%{_esc(args['name'])}%'" if args.get("name") else ""
-    return await _query(token, realm_id, f"SELECT * FROM Item{where} MAXRESULTS {limit}")
+    return await _query(token, realm_id, f"SELECT * FROM Item{where} MAXRESULTS {limit}")  # nosec B608
 
 
 async def _query_accounts(token: str, args: Dict) -> str:
     realm_id = args["realm_id"]
-    limit = _clamp(args.get("limit", 50), 1, 1000)
-    return await _query(token, realm_id, f"SELECT * FROM Account MAXRESULTS {limit}")
+    limit = _limit(args.get("limit"), default=50)
+    return await _query(token, realm_id, f"SELECT * FROM Account MAXRESULTS {limit}")  # nosec B608
 
 
 async def _query_vendors(token: str, args: Dict) -> str:
     realm_id = args["realm_id"]
-    limit = _clamp(args.get("limit", 20), 1, 1000)
+    limit = _limit(args.get("limit"), default=20)
     where = f" WHERE DisplayName LIKE '%{_esc(args['name'])}%'" if args.get("name") else ""
-    return await _query(token, realm_id, f"SELECT * FROM Vendor{where} MAXRESULTS {limit}")
+    return await _query(token, realm_id, f"SELECT * FROM Vendor{where} MAXRESULTS {limit}")  # nosec B608
 
 
 async def _query_bills(token: str, args: Dict) -> str:
     realm_id = args["realm_id"]
-    limit = _clamp(args.get("limit", 20), 1, 1000)
+    limit = _limit(args.get("limit"), default=20)
     conditions = []
     if args.get("vendor_id"):
         conditions.append(f"VendorRef = '{_esc(args['vendor_id'])}'")
     where = f" WHERE {' AND '.join(conditions)}" if conditions else ""
-    return await _query(token, realm_id, f"SELECT * FROM Bill{where} ORDERBY MetaData.CreateTime DESC MAXRESULTS {limit}")
+    # QBO query fragments are fixed; values are escaped and LIMIT is bounded.
+    query = f"SELECT * FROM Bill{where} ORDERBY MetaData.CreateTime DESC MAXRESULTS {limit}"  # nosec B608
+    return await _query(token, realm_id, query)
 
 
 async def _run_report(token: str, args: Dict) -> str:
@@ -247,7 +306,10 @@ async def _run_report(token: str, args: Dict) -> str:
         params["start_date"] = args["start_date"]
     if args.get("end_date"):
         params["end_date"] = args["end_date"]
-    return await _api(token, "GET", realm_id, f"reports/{report_name}", params=params)
+    return await _api(
+        token, "GET", realm_id,
+        f"reports/{_path_segment(report_name)}", params=params,
+    )
 
 
 async def _custom_query(token: str, args: Dict) -> str:
@@ -266,11 +328,45 @@ def _esc(value: str) -> str:
     return str(value).replace("'", "''").replace("%", "\\%").replace("_", "\\_")
 
 
-def _clamp(value, lo, hi):
+def _is_blank(value: Any) -> bool:
+    return value is None or (isinstance(value, str) and not value.strip())
+
+
+def _credentials(value: str) -> tuple[str, str]:
+    raw = value.strip() if isinstance(value, str) else ""
+    if not raw.startswith("{"):
+        return raw, ""
     try:
-        return max(lo, min(hi, int(value)))
-    except (TypeError, ValueError):
-        return lo
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError("QuickBooks credentials are malformed; reconnect QuickBooks.") from exc
+    if not isinstance(parsed, dict):
+        raise ValueError("QuickBooks credentials must be a JSON object.")
+    token = parsed.get("access_token")
+    realm_id = parsed.get("realm_id")
+    if token is not None and not isinstance(token, str):
+        raise ValueError("QuickBooks access_token must be a string.")
+    if realm_id is not None and not isinstance(realm_id, str):
+        raise ValueError("QuickBooks realm_id must be a string.")
+    return str(token or "").strip(), str(realm_id or "").strip()
+
+
+def _path_segment(value: Any) -> str:
+    return quote(str(value), safe="")
+
+
+def _limit(value: Any, *, default: int) -> int:
+    if value is None or value == "":
+        return default
+    if isinstance(value, bool) or isinstance(value, float):
+        raise ValueError("limit must be an integer between 1 and 1000")
+    try:
+        limit = int(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("limit must be an integer between 1 and 1000") from exc
+    if limit < 1 or limit > 1000:
+        raise ValueError("limit must be an integer between 1 and 1000")
+    return limit
 
 
 # ── Tool definitions ──────────────────────────────────────────────────────────
@@ -327,6 +423,15 @@ _TOOLS: Dict[str, Dict[str, Any]] = {
         "description": "Get a QuickBooks invoice by ID",
         "properties": {"realm_id": _REALM, "invoice_id": _prop("Invoice ID")},
         "required": ["realm_id", "invoice_id"],
+    },
+    "void_invoice": {
+        "description": "Void a QuickBooks invoice using its current SyncToken",
+        "properties": {
+            "realm_id": _REALM,
+            "invoice_id": _prop("Invoice ID"),
+            "sync_token": _prop("Current invoice SyncToken"),
+        },
+        "required": ["realm_id", "invoice_id", "sync_token"],
     },
     "create_invoice": {
         "description": "Create a QuickBooks invoice",
@@ -431,6 +536,7 @@ _HANDLERS = {
     "create_customer": _create_customer,
     "query_invoices": _query_invoices,
     "get_invoice": _get_invoice,
+    "void_invoice": _void_invoice,
     "create_invoice": _create_invoice,
     "send_invoice": _send_invoice,
     "query_payments": _query_payments,

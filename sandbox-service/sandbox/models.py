@@ -24,6 +24,29 @@ class SandboxStatus(str, Enum):
     DESTROYED = "destroyed"
 
 
+class ExecutionStatus(str, Enum):
+    QUEUED = "queued"
+    RUNNING = "running"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
+    @classmethod
+    def terminal(cls) -> set["ExecutionStatus"]:
+        return {cls.COMPLETED, cls.FAILED, cls.CANCELLED}
+
+
+class ExecutionEventType(str, Enum):
+    PROGRESS = "progress"
+    WARNING = "warning"
+    ERROR = "error"
+    NEED_INPUT = "need_input"
+    NEED_FILE = "need_file"
+    NEED_TOOL = "need_tool"
+    NEED_CREDENTIAL = "need_credential"
+    RESULT = "result"
+
+
 class WorkspaceAccess(str, Enum):
     NONE = "none"
     RO = "ro"
@@ -85,6 +108,7 @@ class SandboxInfo(BaseModel):
     last_used_at: float
     config: ContainerConfig
     active_command: Optional[str] = None
+    active_execution_id: Optional[str] = None
     expires_at: Optional[float] = None
 
 
@@ -94,6 +118,7 @@ class SandboxInfo(BaseModel):
 class CreateSandboxRequest(BaseModel):
     """Create a sandbox for a skill directory."""
     skill_dir: str = Field(..., description="Path to the skill directory on the host")
+    idempotency_key: Optional[str] = Field(None, max_length=128)
     env: dict[str, str] = Field(default_factory=dict, description="Environment variables to inject")
     allowed_sensitive_keys: list[str] = Field(
         default_factory=list,
@@ -118,12 +143,61 @@ class ExecRequest(BaseModel):
     command: str = Field(..., description="Shell command to execute inside sandbox")
     timeout: int = Field(60, description="Timeout in seconds", ge=1, le=1800)
     workdir: Optional[str] = Field(None, description="Working directory override")
+    execution_id: Optional[str] = Field(None, max_length=128)
 
 
 class ExecResponse(BaseModel):
     stdout: str
     stderr: str
     exit_code: int
+    execution_id: Optional[str] = None
+
+
+class ExecutionStatusResponse(BaseModel):
+    sandbox_id: str
+    execution_id: str
+    status: ExecutionStatus
+    created_at: float
+    started_at: Optional[float] = None
+    finished_at: Optional[float] = None
+    stdout: Optional[str] = None
+    stderr: Optional[str] = None
+    exit_code: Optional[int] = None
+    error: Optional[str] = None
+    events: list["ExecutionEvent"] = Field(default_factory=list)
+    next_sequence: int = 0
+    waiting_for_response: bool = False
+
+
+class ExecutionEvent(BaseModel):
+    sequence: int = Field(..., ge=1)
+    event_id: str = Field(..., min_length=1, max_length=128)
+    type: ExecutionEventType
+    message: str = Field("", max_length=2000)
+    payload: dict = Field(default_factory=dict)
+    requires_response: bool = False
+    responded: bool = False
+    created_at: float
+
+
+class ExecutionResponseRequest(BaseModel):
+    event_id: str = Field(..., min_length=1, max_length=128)
+    payload: dict = Field(default_factory=dict)
+    message: str = Field("", max_length=2000)
+
+
+class ExecutionResponseAck(BaseModel):
+    sandbox_id: str
+    execution_id: str
+    event_id: str
+    accepted: bool
+    duplicate: bool = False
+
+
+class CancelExecutionResponse(BaseModel):
+    sandbox_id: str
+    execution_id: str
+    cancelled: bool
 
 
 class FileReadRequest(BaseModel):
@@ -173,6 +247,7 @@ class SkillScanRequest(BaseModel):
 class CreateFromFilesRequest(BaseModel):
     """Create a sandbox by providing file contents directly (for MinIO / remote workspace skills)."""
     skill_name: str = Field(..., description="Skill identifier / name")
+    idempotency_key: Optional[str] = Field(None, max_length=128)
     files: dict[str, str] = Field(
         ...,
         description="File contents keyed by relative path, e.g. {'run.py': '...', 'requirements.txt': '...'}",
@@ -187,6 +262,7 @@ class CreateFromFilesRequest(BaseModel):
 class CreateFromBuiltinRequest(BaseModel):
     """Create a sandbox for a builtin (codebase) skill."""
     skill_name: str = Field(..., description="Builtin skill ID (must match builtin_skills/{id}/ directory)")
+    idempotency_key: Optional[str] = Field(None, max_length=128)
     files: dict[str, str] = Field(
         ...,
         description="File contents read from the codebase builtin_skills directory",

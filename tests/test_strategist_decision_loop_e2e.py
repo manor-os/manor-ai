@@ -68,6 +68,7 @@ from packages.core.models.workspace import (
     WorkspaceWorkBatch,
 )
 from packages.core.models.workspace_event import WorkspaceEvent
+from packages.core.models.user import User, UserMembership
 from packages.core.services import feature_flags as feature_flags_service
 from packages.core.services.task_state_machine import apply_task_status_transition
 from packages.core.services.workspace_operation_service import (
@@ -89,6 +90,7 @@ async def _seed_workspace(db, *, name: str, entity_id: str | None = None) -> Wor
     ``entity_id`` may be pinned to a registered user's entity so the
     HTTP endpoints (Test D) can see the same workspace."""
     entity_id = entity_id or generate_ulid()
+    actor_id = entity_id
     workspace = Workspace(
         id=generate_ulid(),
         entity_id=entity_id,
@@ -127,7 +129,26 @@ async def _seed_workspace(db, *, name: str, entity_id: str | None = None) -> Wor
         service_key="ops",
         status="active",
     )
-    db.add_all([workspace, goal, agent, subscription])
+    db.add_all([
+        User(
+            id=actor_id,
+            entity_id=entity_id,
+            email=f"{actor_id}@example.com",
+            password_hash="test-only",
+            role="owner",
+            status="active",
+        ),
+        UserMembership(
+            user_id=actor_id,
+            entity_id=entity_id,
+            role="owner",
+            status="active",
+        ),
+        workspace,
+        goal,
+        agent,
+        subscription,
+    ])
     await db.commit()
     return workspace
 
@@ -535,7 +556,7 @@ async def test_needs_human_rejection_feeds_next_briefing(db_session, monkeypatch
     assert items[0].approval_request_id == req.id
 
     # Operator pushes back with a coded reason.
-    operator_id = generate_ulid()
+    operator_id = workspace.entity_id
     rejection_comment = "Wrong direction — focus on retention, not hacks."
     cancelled = await strategist_service.reject_proposal(
         db,
@@ -704,7 +725,7 @@ async def test_human_request_and_meta_suppression_loop(client, db_session, monke
     auto-approval + human_request commitment → operator fulfils via the
     respond endpoint → next review sees the decision and a clean
     human_participation report."""
-    from auth_helpers import register_user_and_get_token
+    from tests.auth_helpers import register_user_and_get_token
 
     from packages.core.consolidators.human_participation import (
         HumanParticipationConsolidator,
@@ -937,7 +958,7 @@ async def test_experiment_lifecycle_loop(client, db_session, monkeypatch):
     correlation → the guardrail tick completes on max_runs and
     auto-evaluates (overlay off) → review 2 consumes the lifecycle facts
     and its learning_evidence report + the timeline API close the loop."""
-    from auth_helpers import register_user_and_get_token
+    from tests.auth_helpers import register_user_and_get_token
 
     from packages.core.consolidators.learning_evidence import (
         LearningEvidenceConsolidator,

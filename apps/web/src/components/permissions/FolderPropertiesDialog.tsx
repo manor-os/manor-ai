@@ -10,8 +10,8 @@
  *   - cascade=true (default): existing docs + subfolders get auto-adjusted
  *     to satisfy classification-floor + visibility-ceiling. Reported back
  *     in the response so we can show "12 docs updated, 3 subfolders updated".
- *   - cascade=false: only this folder row changes; children pick up the
- *     new constraints lazily on next upload/move.
+ *   - cascade=false: folder visibility narrows lazily at read time; unsafe
+ *     classification/client-visibility drift is rejected atomically.
  */
 import { useEffect, useState } from "react";
 import type { Classification, Visibility } from "../../lib/types";

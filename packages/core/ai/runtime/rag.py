@@ -268,6 +268,7 @@ async def _runtime_rag_filter_to_visible_documents(
             user_id=user_id,
             workspace_id=workspace_id,
             actor_type="agent",
+            allow_redacted=False,
         ):
             visible.append(result)
     return visible

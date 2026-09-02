@@ -112,6 +112,52 @@ def _render_coverage_gaps(briefing: ReviewBriefingModel) -> list[str]:
     return lines
 
 
+def _workflow_value(value: Any) -> str:
+    try:
+        return json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def _render_workflow_runs(briefing: ReviewBriefingModel) -> list[str]:
+    lines = ["## Workflow runs"]
+    if not briefing.workflow_runs:
+        lines.append("_(no active or recent Workflow runs)_")
+        return lines
+
+    for run in briefing.workflow_runs:
+        identity = run.workflow_slug or run.workflow_name
+        line = (
+            f"- [{run.status}] flow={identity} run={run.run_id} "
+            f"attempt={run.attempt_number} trigger={run.trigger_source or 'unknown'}"
+        )
+        if run.binding_id:
+            line += f" binding={run.binding_id}"
+        if run.scheduled_job_id:
+            line += f" scheduled_job={run.scheduled_job_id}"
+        if run.period_key:
+            line += f" period={run.period_key}"
+        lines.append(line)
+        details: list[str] = []
+        if run.current_step_id:
+            details.append(f"current_step={run.current_step_id} ({run.current_step_name or run.current_step_id})")
+        if run.business_outcome:
+            details.append(f"business_outcome={run.business_outcome}")
+        if run.started_at:
+            details.append(f"started_at={run.started_at}")
+        if run.completed_at:
+            details.append(f"completed_at={run.completed_at}")
+        if details:
+            lines.append("  - " + " · ".join(details))
+        if run.result_summary is not None:
+            lines.append(f"  - result: {_workflow_value(run.result_summary)}")
+        if run.blocker is not None:
+            lines.append(f"  - blocker: {_workflow_value(run.blocker)}")
+        if run.error:
+            lines.append(f"  - error: {run.error}")
+    return lines
+
+
 def _render_open_approvals(briefing: ReviewBriefingModel) -> list[str]:
     """The approvals block the strategist reads.
 
@@ -164,6 +210,7 @@ def render_briefing_markdown(b: ReviewBriefingModel) -> str:
     blocks: list[list[str]] = [_render_review_window(b)]
     for domain in sorted(b.reports):
         blocks.append(_render_report(b.reports[domain]))
+    blocks.append(_render_workflow_runs(b))
     blocks.append(_render_coverage_gaps(b))
     blocks.append(_render_open_approvals(b))
     blocks.append(_render_previous_decisions(b))

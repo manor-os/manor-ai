@@ -19,6 +19,7 @@ export function htmlPreviewAssetKind(
   ref: string,
   result: HtmlPreviewFsReadResult,
 ): HtmlPreviewAssetReplacement["kind"] | null;
+export function htmlPreviewAssetDataUrl(result: HtmlPreviewFsReadResult): string;
 export function rewriteCssPreviewAssetUrls(css: string, replacements: Record<string, string>): string;
 export function rewriteHtmlPreviewAssetUrls(
   html: string,

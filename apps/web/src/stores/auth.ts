@@ -32,6 +32,7 @@ interface AuthState {
   verifyEmail: (email: string, code: string) => Promise<void>;
   resendVerification: (email: string) => Promise<void>;
   switchEntity: (entityId: string) => Promise<User>;
+  renewSession: () => Promise<void>;
   logout: () => Promise<void>;
   checkAuth: () => Promise<void>;
 }
@@ -150,6 +151,12 @@ export const useAuthStore = create<AuthState>((set, get) => ({
     rememberUser(user);
     set({ user });
     return user;
+  },
+
+  renewSession: async () => {
+    const res = await api.auth.renew();
+    localStorage.setItem("manor_token", res.access_token);
+    set({ token: res.access_token });
   },
 
   logout: async () => {

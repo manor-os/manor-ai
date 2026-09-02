@@ -299,6 +299,37 @@ async def test_workspace_update_invalidates_chat_context_summary(client: AsyncCl
 
 
 @pytest.mark.asyncio
+async def test_workspace_update_does_not_mutate_another_workspace(client: AsyncClient):
+    headers = await _register(client, "ws_update_scope")
+    first = await client.post(
+        "/api/v1/workspaces",
+        headers=headers,
+        json={"name": "Workspace A", "primary_work": "A original work"},
+    )
+    second = await client.post(
+        "/api/v1/workspaces",
+        headers=headers,
+        json={"name": "Workspace B", "primary_work": "B original work"},
+    )
+    assert first.status_code == 201
+    assert second.status_code == 201
+
+    updated = await client.put(
+        f"/api/v1/workspaces/{first.json()['id']}",
+        headers=headers,
+        json={"name": "Workspace A updated", "primary_work": "A updated work"},
+    )
+    assert updated.status_code == 200
+
+    first_after = await client.get(f"/api/v1/workspaces/{first.json()['id']}", headers=headers)
+    second_after = await client.get(f"/api/v1/workspaces/{second.json()['id']}", headers=headers)
+    assert first_after.json()["name"] == "Workspace A updated"
+    assert first_after.json()["primary_work"] == "A updated work"
+    assert second_after.json()["name"] == "Workspace B"
+    assert second_after.json()["primary_work"] == "B original work"
+
+
+@pytest.mark.asyncio
 async def test_workspace_context_summary_lists_service_keys_for_delegation(client: AsyncClient, db_session):
     from packages.core.models.base import generate_ulid
     from packages.core.models.workspace import Agent, AgentSubscription
@@ -384,6 +415,42 @@ async def test_workspace_knowledge_group_changes_refresh_context_and_policy(clie
     )
     assert "Fresh client policy" in search
     assert "Stale purpose from operation model" not in search
+
+
+@pytest.mark.asyncio
+async def test_workspace_search_accepts_plain_string_operating_rules(db_session):
+    from packages.core.models.base import generate_ulid
+    from packages.core.models.workspace import Workspace
+    from packages.core.workspace_chat import context as chat_context
+
+    entity_id = generate_ulid()
+    workspace_id = generate_ulid()
+    db_session.add(
+        Workspace(
+            id=workspace_id,
+            entity_id=entity_id,
+            name="String Rules Context",
+            status="active",
+            operating_model={
+                "rules": [
+                    "One primary audience per video.",
+                    "Publish only a verified final video.",
+                ]
+            },
+        )
+    )
+    await db_session.commit()
+
+    search = await chat_context.workspace_search(
+        db_session,
+        workspace_id,
+        entity_id,
+        query="publish",
+        category="rules",
+    )
+
+    assert "Publish only a verified final video." in search
+    assert "One primary audience per video." not in search
 
 
 @pytest.mark.asyncio
@@ -875,7 +942,11 @@ async def test_workspace_operation_goal_apply_materializes_runtime_goal_rows(cli
     from packages.core.models.scheduler import ScheduledJob
 
     headers = await _register(client, "ws_op_goal_runtime")
-    create = await client.post("/api/v1/workspaces", headers=headers, json={"name": "Goal Runtime"})
+    create = await client.post(
+        "/api/v1/workspaces",
+        headers=headers,
+        json={"name": "Goal Runtime"},
+    )
     ws_id = create.json()["id"]
 
     first = await client.put(
@@ -910,9 +981,21 @@ async def test_workspace_operation_goal_apply_materializes_runtime_goal_rows(cli
     }
     assert goal.measurement_cadence == "weekly"
     assert goal.status == "active"
-    # Workspace goals default to Manor runtime evidence instead of a manual
-    # number entry so Strategist can reason over fresh execution state.
-    job = (await db_session.execute(select(ScheduledJob).where(ScheduledJob.job_id == f"gm:{goal.id}"))).scalar_one()
+    # Goal schedules follow the Workspace runtime switch. Saving a goal while
+    # autonomy is stopped materializes the Goal row but must not start polling.
+    stopped_job = (
+        await db_session.execute(select(ScheduledJob).where(ScheduledJob.job_id == f"gm:{goal.id}"))
+    ).scalar_one_or_none()
+    assert stopped_job is None
+
+    resumed = await client.post(
+        f"/api/v1/workspaces/{ws_id}/resume",
+        headers=headers,
+    )
+    assert resumed.status_code == 200
+    job = (
+        await db_session.execute(select(ScheduledJob).where(ScheduledJob.job_id == f"gm:{goal.id}"))
+    ).scalar_one()
     assert job.execution_type == "goal_measurement"
     assert job.enabled is True
     assert job.schedule_kind == "every"
@@ -979,7 +1062,11 @@ async def test_workspace_internal_goal_measurement_uses_linked_task_impact(clien
     from packages.core.models.task import Task
 
     headers = await _register(client, "ws_internal_goal_measurement")
-    create = await client.post("/api/v1/workspaces", headers=headers, json={"name": "Internal Goal Measurement"})
+    create = await client.post(
+        "/api/v1/workspaces",
+        headers=headers,
+        json={"name": "Internal Goal Measurement", "heartbeat_enabled": True},
+    )
     ws_body = create.json()
 
     goal = Goal(
@@ -1052,6 +1139,360 @@ async def test_workspace_internal_goal_measurement_uses_linked_task_impact(clien
         await db_session.execute(select(ScheduledJob).where(ScheduledJob.job_id == f"gm:{goal.id}"))
     ).scalar_one_or_none()
     assert removed_job is None
+
+
+@pytest.mark.asyncio
+async def test_automatic_goal_measurement_stops_when_workspace_runtime_is_disabled(
+    db_session,
+):
+    from decimal import Decimal
+
+    from sqlalchemy import select
+
+    from packages.core.goals.measurement import measure_goal
+    from packages.core.models.base import generate_ulid
+    from packages.core.models.goal import Goal, GoalMeasurement
+    from packages.core.models.workspace import Workspace
+
+    entity_id = generate_ulid()
+    workspace = Workspace(
+        id=generate_ulid(),
+        entity_id=entity_id,
+        name="Disabled autonomous Goal measurement",
+        status="active",
+        heartbeat_enabled=False,
+        settings={},
+        operating_model={},
+    )
+    goal = Goal(
+        id=generate_ulid(),
+        entity_id=entity_id,
+        workspace_id=workspace.id,
+        title="Do not write after stop",
+        metric_key="stopped_measurement_count",
+        target_value=Decimal("3"),
+        measurement_source={"provider": "workspace_internal", "params": {}},
+        measurement_cadence="daily",
+        status="active",
+        pace_status="unknown",
+    )
+    db_session.add_all([workspace, goal])
+    await db_session.flush()
+
+    result = await measure_goal(goal.id, db=db_session)
+
+    assert result == {
+        "goal_id": goal.id,
+        "skipped": True,
+        "reason": "workspace_runtime_disabled",
+    }
+    assert (await db_session.execute(
+        select(GoalMeasurement).where(GoalMeasurement.goal_id == goal.id)
+    )).scalar_one_or_none() is None
+    await db_session.refresh(goal)
+    assert goal.current_value is None
+
+
+@pytest.mark.asyncio
+async def test_in_flight_goal_measurement_rechecks_runtime_before_write(
+    db_session,
+    monkeypatch,
+):
+    from decimal import Decimal
+
+    from sqlalchemy import select
+    from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+    from packages.core.goals import measurement as measurement_service
+    from packages.core.models.base import generate_ulid
+    from packages.core.models.goal import Goal, GoalMeasurement
+    from packages.core.models.workspace import Workspace
+
+    entity_id = generate_ulid()
+    workspace = Workspace(
+        id=generate_ulid(),
+        entity_id=entity_id,
+        name="Stop in-flight Goal measurement",
+        status="active",
+        heartbeat_enabled=True,
+        settings={},
+        operating_model={},
+    )
+    goal = Goal(
+        id=generate_ulid(),
+        entity_id=entity_id,
+        workspace_id=workspace.id,
+        title="Recheck before write",
+        metric_key="in_flight_measurement_count",
+        target_value=Decimal("5"),
+        measurement_source={"provider": "workspace_internal", "params": {}},
+        measurement_cadence="daily",
+        status="active",
+        pace_status="unknown",
+    )
+    db_session.add_all([workspace, goal])
+    await db_session.commit()
+
+    provider_started = asyncio.Event()
+    provider_can_finish = asyncio.Event()
+
+    async def slow_simulation(_db, _goal):
+        provider_started.set()
+        await provider_can_finish.wait()
+        return Decimal("2")
+
+    monkeypatch.setattr(measurement_service, "_maybe_simulate", slow_simulation)
+    session_factory = async_sessionmaker(
+        db_session.bind,
+        class_=AsyncSession,
+        expire_on_commit=False,
+    )
+    async with session_factory() as measurement_db, session_factory() as lifecycle_db:
+        measurement_task = asyncio.create_task(
+            measurement_service.measure_goal(goal.id, db=measurement_db)
+        )
+        await asyncio.wait_for(provider_started.wait(), timeout=2)
+
+        locked_workspace = (await lifecycle_db.execute(
+            select(Workspace).where(Workspace.id == workspace.id).with_for_update()
+        )).scalar_one()
+        locked_workspace.heartbeat_enabled = False
+        await lifecycle_db.commit()
+        provider_can_finish.set()
+
+        result = await asyncio.wait_for(measurement_task, timeout=2)
+        assert result == {
+            "goal_id": goal.id,
+            "skipped": True,
+            "reason": "workspace_runtime_disabled",
+        }
+        await measurement_db.rollback()
+
+    async with session_factory() as verifier:
+        assert (await verifier.execute(
+            select(GoalMeasurement).where(GoalMeasurement.goal_id == goal.id)
+        )).scalar_one_or_none() is None
+        stored_goal = await verifier.get(Goal, goal.id)
+        assert stored_goal is not None
+        assert stored_goal.current_value is None
+
+
+@pytest.mark.parametrize(
+    ("goal_change", "expected_reason"),
+    [
+        ("pause", "status=paused"),
+        ("source", "goal_measurement_config_changed"),
+        ("target", "goal_measurement_config_changed"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_in_flight_goal_measurement_rechecks_goal_before_write(
+    db_session,
+    monkeypatch,
+    goal_change,
+    expected_reason,
+):
+    from decimal import Decimal
+
+    from sqlalchemy import select
+    from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+    from packages.core.goals import measurement as measurement_service
+    from packages.core.goals.service import update_goal
+    from packages.core.models.base import generate_ulid
+    from packages.core.models.goal import Goal, GoalMeasurement
+    from packages.core.models.workspace import Workspace
+
+    entity_id = generate_ulid()
+    workspace = Workspace(
+        id=generate_ulid(),
+        entity_id=entity_id,
+        name=f"In-flight Goal {goal_change} guard",
+        status="active",
+        heartbeat_enabled=True,
+        settings={},
+        operating_model={},
+    )
+    goal = Goal(
+        id=generate_ulid(),
+        entity_id=entity_id,
+        workspace_id=workspace.id,
+        title="Discard stale provider output",
+        metric_key="stale_provider_output_count",
+        target_value=Decimal("5"),
+        measurement_source={"provider": "workspace_internal", "params": {}},
+        measurement_cadence="daily",
+        status="active",
+        pace_status="unknown",
+    )
+    db_session.add_all([workspace, goal])
+    await db_session.commit()
+
+    provider_started = asyncio.Event()
+    provider_can_finish = asyncio.Event()
+
+    async def slow_simulation(_db, _goal):
+        provider_started.set()
+        await provider_can_finish.wait()
+        return Decimal("2")
+
+    monkeypatch.setattr(measurement_service, "_maybe_simulate", slow_simulation)
+    session_factory = async_sessionmaker(
+        db_session.bind,
+        class_=AsyncSession,
+        expire_on_commit=False,
+    )
+    async with session_factory() as measurement_db, session_factory() as mutation_db:
+        measurement_task = asyncio.create_task(
+            measurement_service.measure_goal(goal.id, db=measurement_db)
+        )
+        await asyncio.wait_for(provider_started.wait(), timeout=2)
+
+        if goal_change == "pause":
+            fields = {"status": "paused"}
+        elif goal_change == "source":
+            fields = {
+                "measurement_source": {
+                    "provider": "workspace_internal",
+                    "params": {"mode": "completed_tasks"},
+                },
+            }
+        else:
+            fields = {"target_value": 10}
+        updated = await update_goal(
+            mutation_db,
+            goal.id,
+            entity_id,
+            sync_contract=False,
+            **fields,
+        )
+        assert updated is not None
+        await mutation_db.commit()
+        provider_can_finish.set()
+
+        result = await asyncio.wait_for(measurement_task, timeout=2)
+        assert result == {
+            "goal_id": goal.id,
+            "skipped": True,
+            "reason": expected_reason,
+        }
+        await measurement_db.rollback()
+
+    async with session_factory() as verifier:
+        assert (await verifier.execute(
+            select(GoalMeasurement).where(GoalMeasurement.goal_id == goal.id)
+        )).scalar_one_or_none() is None
+        stored_goal = await verifier.get(Goal, goal.id)
+        assert stored_goal is not None
+        assert stored_goal.current_value is None
+
+
+@pytest.mark.asyncio
+async def test_sandbox_goal_measurement_initializes_source_before_simulation(
+    db_session,
+    monkeypatch,
+):
+    from decimal import Decimal
+
+    from sqlalchemy import select
+
+    from packages.core.goals import measurement as measurement_service
+    from packages.core.models.base import generate_ulid
+    from packages.core.models.goal import Goal, GoalMeasurement
+    from packages.core.models.workspace import Workspace
+
+    entity_id = generate_ulid()
+    workspace = Workspace(
+        id=generate_ulid(),
+        entity_id=entity_id,
+        name="Sandbox measurement source",
+        status="active",
+        heartbeat_enabled=True,
+        settings={},
+        operating_model={},
+    )
+    goal = Goal(
+        id=generate_ulid(),
+        entity_id=entity_id,
+        workspace_id=workspace.id,
+        title="Simulate safely",
+        metric_key="simulated_count",
+        target_value=Decimal("5"),
+        measurement_source={"provider": "workspace_internal", "params": {}},
+        measurement_cadence="daily",
+        status="active",
+        pace_status="unknown",
+    )
+    db_session.add_all([workspace, goal])
+    await db_session.flush()
+
+    async def simulate(_db, _goal):
+        return Decimal("2")
+
+    monkeypatch.setattr(measurement_service, "_maybe_simulate", simulate)
+
+    result = await measurement_service.measure_goal(goal.id, db=db_session)
+
+    assert result["value"] == 2.0
+    await db_session.refresh(goal)
+    assert goal.baseline_value == Decimal("0")
+    assert goal.current_value == Decimal("2")
+    measurement = (await db_session.execute(
+        select(GoalMeasurement).where(GoalMeasurement.goal_id == goal.id)
+    )).scalar_one()
+    assert measurement.source == "simulated"
+
+
+@pytest.mark.asyncio
+async def test_automatic_goal_measurement_result_preserves_exact_decimal(
+    db_session,
+    monkeypatch,
+):
+    from decimal import Decimal
+
+    from packages.core.goals import measurement as measurement_service
+    from packages.core.models.base import generate_ulid
+    from packages.core.models.goal import Goal
+    from packages.core.models.workspace import Workspace
+
+    entity_id = generate_ulid()
+    workspace = Workspace(
+        id=generate_ulid(),
+        entity_id=entity_id,
+        name="Exact automatic Goal measurement",
+        status="active",
+        heartbeat_enabled=True,
+        settings={},
+        operating_model={},
+    )
+    goal = Goal(
+        id=generate_ulid(),
+        entity_id=entity_id,
+        workspace_id=workspace.id,
+        title="Preserve automatic revenue value",
+        metric_key="revenue_units",
+        target_value=Decimal("9999999999999999.9999"),
+        baseline_value=Decimal("0"),
+        measurement_source={"provider": "workspace_internal", "params": {}},
+        measurement_cadence="daily",
+        status="active",
+        pace_status="unknown",
+    )
+    db_session.add_all([workspace, goal])
+    await db_session.flush()
+
+    exact_value = Decimal("9007199254740992.0001")
+
+    async def simulate(_db, _goal):
+        return exact_value
+
+    monkeypatch.setattr(measurement_service, "_maybe_simulate", simulate)
+
+    result = await measurement_service.measure_goal(goal.id, db=db_session)
+
+    assert result["value"] == "9007199254740992.0001"
+    await db_session.refresh(goal)
+    assert goal.current_value == exact_value
 
 
 @pytest.mark.asyncio
@@ -1137,7 +1578,18 @@ async def test_get_skill_by_slug_prefers_entity_skill_over_global_duplicate(db_s
 
 
 @pytest.mark.asyncio
-async def test_get_skill_by_slug_accepts_hyphen_underscore_aliases(db_session):
+@pytest.mark.parametrize(
+    ("stored_slug", "requested_slug"),
+    [
+        ("stickman_video_creator", "stickman-video-creator"),
+        ("stickman-video-creator", "stickman_video_creator"),
+    ],
+)
+async def test_get_skill_by_slug_accepts_hyphen_underscore_aliases(
+    db_session,
+    stored_slug,
+    requested_slug,
+):
     from packages.core.models.base import generate_ulid
     from packages.core.models.skill import Skill
     from packages.core.services.skill_service import get_skill_by_slug
@@ -1147,7 +1599,7 @@ async def test_get_skill_by_slug_accepts_hyphen_underscore_aliases(db_session):
         id=generate_ulid(),
         entity_id=entity_id,
         name="stickman-video-creator",
-        slug="stickman_video_creator",
+        slug=stored_slug,
         system_prompt="Create a complete stickman video.",
         tools=[],
         input_schema={},
@@ -1159,7 +1611,7 @@ async def test_get_skill_by_slug_accepts_hyphen_underscore_aliases(db_session):
 
     selected = await get_skill_by_slug(
         db_session,
-        "stickman-video-creator",
+        requested_slug,
         entity_id,
     )
 
@@ -1184,7 +1636,7 @@ async def test_external_goal_measurement_requires_provider_evidence(
     create = await client.post(
         "/api/v1/workspaces",
         headers=headers,
-        json={"name": "External Goal Evidence"},
+        json={"name": "External Goal Evidence", "heartbeat_enabled": True},
     )
     ws_body = create.json()
 
@@ -1574,7 +2026,8 @@ async def test_strategist_context_scopes_integrations_to_workspace_declared_prov
             user_id=body["user_id"],
             provider="twitter_x",
             provider_user_id="x-user",
-            access_token="tok",
+            credential_ref="encrypted-oauth-ref",
+            credential_scheme="dev",
             profile={},
         )
     )
@@ -1870,6 +2323,11 @@ async def test_workspace_heartbeat_endpoint_advances_operation_revision(client: 
     )
     assert stale_apply.status_code == 409
 
+    await db_session.refresh(workspace)
+    assert workspace.operation_revision == 1
+    assert workspace.heartbeat_enabled is True
+    assert workspace.heartbeat_cadence == "weekly"
+
 
 @pytest.mark.asyncio
 async def test_workspace_pause_resume_cannot_bypass_needs_setup(client: AsyncClient, db_session):
@@ -1920,6 +2378,371 @@ async def test_workspace_pause_resume_cannot_bypass_needs_setup(client: AsyncCli
         f"/api/v1/workspaces/{workspace_id}/heartbeat/enable",
         headers=headers,
     )).status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_workspace_autonomy_start_derives_goal_mode_from_active_goals(
+    client: AsyncClient,
+    db_session,
+):
+    from sqlalchemy import select
+
+    from packages.core.models.scheduler import ScheduledJob
+    from packages.core.models.workspace import Workspace
+    from packages.core.strategist.context import gather_context
+
+    headers = await _register(client, "ws_autonomy_goal_mode")
+    created = await client.post(
+        "/api/v1/workspaces",
+        headers=headers,
+        json={"name": "Autonomy Goal Mode", "heartbeat_enabled": False},
+    )
+    workspace_id = created.json()["id"]
+    started_without_goals = await client.post(
+        f"/api/v1/workspaces/{workspace_id}/resume",
+        headers=headers,
+        json={"use_goals": True},
+    )
+    assert started_without_goals.status_code == 200
+    assert started_without_goals.json()["heartbeat_enabled"] is True
+    assert started_without_goals.json()["use_goals"] is False
+
+    db_session.expire_all()
+    workspace = (await db_session.execute(
+        select(Workspace).where(Workspace.id == workspace_id)
+    )).scalar_one()
+    assert workspace.status == "active"
+    assert workspace.heartbeat_enabled is True
+    assert workspace.operating_model["strategist"]["use_goals"] is False
+    assert (await gather_context(db_session, workspace)).goals == []
+    strategist_job = (await db_session.execute(
+        select(ScheduledJob).where(ScheduledJob.job_id == f"sr:{workspace_id}")
+    )).scalar_one()
+    assert strategist_job.enabled is True
+
+    paused = await client.post(
+        f"/api/v1/workspaces/{workspace_id}/pause",
+        headers=headers,
+    )
+    assert paused.status_code == 200
+    goal = await client.post(
+        "/api/v1/goals",
+        headers=headers,
+        json={
+            "workspace_id": workspace_id,
+            "title": "Reach qualified users",
+            "target_value": 25,
+        },
+    )
+    assert goal.status_code == 201
+    restarted_with_goals = await client.post(
+        f"/api/v1/workspaces/{workspace_id}/resume",
+        headers=headers,
+        json={"use_goals": False},
+    )
+    assert restarted_with_goals.status_code == 200
+    assert restarted_with_goals.json()["use_goals"] is True
+
+    db_session.expire_all()
+    workspace = (await db_session.execute(
+        select(Workspace).where(Workspace.id == workspace_id)
+    )).scalar_one()
+    context = await gather_context(db_session, workspace)
+    assert [item.title for item in context.goals] == ["Reach qualified users"]
+
+
+@pytest.mark.asyncio
+async def test_workspace_resume_rechecks_goals_after_concurrent_delete(
+    client: AsyncClient,
+    db_session,
+):
+    from sqlalchemy import select
+    from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+    from apps.api.routers.workspaces import resume_workspace
+    from packages.core.goals.service import delete_goal
+    from packages.core.models.goal import Goal
+    from packages.core.models.user import User
+
+    username = "ws_resume_goal_delete_race"
+    headers = await _register(client, username)
+    created = await client.post(
+        "/api/v1/workspaces",
+        headers=headers,
+        json={"name": "Resume Goal delete race", "heartbeat_enabled": False},
+    )
+    workspace_id = created.json()["id"]
+    goal_response = await client.post(
+        "/api/v1/goals",
+        headers=headers,
+        json={
+            "workspace_id": workspace_id,
+            "title": "Delete before resume decides Goal mode",
+            "target_value": 1,
+        },
+    )
+    goal_id = goal_response.json()["id"]
+    user = (await db_session.execute(
+        select(User).where(User.email == f"{username}@test.com")
+    )).scalar_one()
+    user_id = user.id
+    entity_id = user.entity_id
+    await db_session.commit()
+
+    session_factory = async_sessionmaker(
+        db_session.bind,
+        class_=AsyncSession,
+        expire_on_commit=False,
+    )
+    async with session_factory() as deleter, session_factory() as resumer:
+        resumer_user = await resumer.get(User, user_id)
+        assert resumer_user is not None
+        assert await delete_goal(deleter, goal_id, entity_id) is True
+
+        resume_task = asyncio.create_task(resume_workspace(
+            workspace_id=workspace_id,
+            transition_id="resume-after-goal-delete",
+            req=None,
+            user=resumer_user,
+            db=resumer,
+        ))
+        await asyncio.sleep(0.05)
+        assert not resume_task.done()
+
+        await deleter.commit()
+        result = await asyncio.wait_for(resume_task, timeout=3)
+        assert result["use_goals"] is False
+        assert result["goal_id"] is None
+
+    async with session_factory() as verifier:
+        archived_goal = (await verifier.execute(
+            select(Goal).where(Goal.id == goal_id)
+        )).scalar_one()
+        assert archived_goal.status == "abandoned"
+
+
+@pytest.mark.asyncio
+async def test_workspace_resume_creates_or_updates_goal_in_start_transaction(
+    client: AsyncClient,
+    db_session,
+):
+    from sqlalchemy import select
+
+    from packages.core.models.goal import Goal
+    from packages.core.models.workspace import Workspace
+
+    headers = await _register(client, "ws_autonomy_atomic_goal")
+    created = await client.post(
+        "/api/v1/workspaces",
+        headers=headers,
+        json={"name": "Atomic Goal Start", "heartbeat_enabled": False},
+    )
+    workspace_id = created.json()["id"]
+
+    rejected = await client.post(
+        f"/api/v1/workspaces/{workspace_id}/resume",
+        headers=headers,
+        json={
+            "goal": {
+                "title": "Reject an overflowing target",
+                "target_value": "10000000000000000",
+            },
+        },
+    )
+    assert rejected.status_code == 422, rejected.text
+
+    started = await client.post(
+        f"/api/v1/workspaces/{workspace_id}/resume",
+        headers=headers,
+        json={
+            "goal": {"title": "Reach qualified users", "target_value": 25},
+        },
+    )
+
+    assert started.status_code == 200
+    assert started.json()["heartbeat_enabled"] is True
+    assert started.json()["created_goal_id"]
+    assert started.json()["goal_id"] == started.json()["created_goal_id"]
+    assert started.json()["goal_created"] is True
+
+    retried = await client.post(
+        f"/api/v1/workspaces/{workspace_id}/resume?transition_id=retry-after-lost-response",
+        headers=headers,
+        json={
+            "goal": {"title": "Reach qualified users", "target_value": 25},
+        },
+    )
+    assert retried.status_code == 200
+    assert retried.json()["goal_id"] == started.json()["goal_id"]
+    assert retried.json()["created_goal_id"] is None
+    assert retried.json()["goal_created"] is False
+    assert retried.json()["goal_updated"] is False
+
+    edited = await client.post(
+        f"/api/v1/workspaces/{workspace_id}/resume?transition_id=edit-active-goal",
+        headers=headers,
+        json={
+            "goal": {"title": "Reach activated users", "target_value": 1},
+        },
+    )
+    assert edited.status_code == 200
+    assert edited.json()["goal_id"] == started.json()["goal_id"]
+    assert edited.json()["goal_created"] is False
+    assert edited.json()["goal_updated"] is True
+
+    db_session.expire_all()
+    workspace = (await db_session.execute(
+        select(Workspace).where(Workspace.id == workspace_id)
+    )).scalar_one()
+    goals = (await db_session.execute(
+        select(Goal).where(Goal.workspace_id == workspace_id)
+    )).scalars().all()
+    assert len(goals) == 1
+    goal = goals[0]
+    assert workspace.heartbeat_enabled is True
+    assert goal.id == started.json()["created_goal_id"]
+    assert goal.title == "Reach activated users"
+    assert float(goal.target_value) == 25
+
+
+@pytest.mark.asyncio
+async def test_workspace_resume_preserves_exact_goal_target(
+    client: AsyncClient,
+    db_session,
+):
+    from decimal import Decimal
+
+    from sqlalchemy import select
+
+    from packages.core.models.goal import Goal
+
+    headers = await _register(client, "ws_autonomy_exact_goal")
+    created = await client.post(
+        "/api/v1/workspaces",
+        headers=headers,
+        json={"name": "Exact Goal Start", "heartbeat_enabled": False},
+    )
+    workspace_id = created.json()["id"]
+
+    started = await client.post(
+        f"/api/v1/workspaces/{workspace_id}/resume",
+        headers=headers,
+        json={
+            "goal": {
+                "title": "Preserve exact target",
+                "target_value": "9999999999999999.9999",
+            },
+        },
+    )
+
+    assert started.status_code == 200, started.text
+    goal = (await db_session.execute(select(Goal).where(
+        Goal.id == started.json()["goal_id"],
+    ))).scalar_one()
+    assert goal.target_value == Decimal("9999999999999999.9999")
+
+
+@pytest.mark.asyncio
+async def test_workspace_resume_rolls_back_goal_when_start_fails(
+    client: AsyncClient,
+    db_session,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from sqlalchemy import select
+
+    from packages.core.goals import service as goal_service
+    from packages.core.models.goal import Goal
+    from packages.core.models.workspace import Workspace
+
+    headers = await _register(client, "ws_autonomy_atomic_rollback")
+    created = await client.post(
+        "/api/v1/workspaces",
+        headers=headers,
+        json={"name": "Atomic Goal Rollback", "heartbeat_enabled": False},
+    )
+    workspace_id = created.json()["id"]
+    original_create_goal = goal_service.create_goal
+
+    async def fail_after_goal_flush(*args, **kwargs):
+        await original_create_goal(*args, **kwargs)
+        raise RuntimeError("start transaction failed")
+
+    monkeypatch.setattr(goal_service, "create_goal", fail_after_goal_flush)
+    with pytest.raises(RuntimeError, match="start transaction failed"):
+        await client.post(
+            f"/api/v1/workspaces/{workspace_id}/resume",
+            headers=headers,
+            json={
+                "goal": {"title": "Must roll back", "target_value": 1},
+            },
+        )
+
+    db_session.expire_all()
+    workspace = (await db_session.execute(
+        select(Workspace).where(Workspace.id == workspace_id)
+    )).scalar_one()
+    goals = (await db_session.execute(
+        select(Goal).where(Goal.workspace_id == workspace_id)
+    )).scalars().all()
+    assert workspace.heartbeat_enabled is False
+    assert goals == []
+
+
+@pytest.mark.asyncio
+async def test_workspace_resume_rolls_back_goal_edit_when_start_fails(
+    client: AsyncClient,
+    db_session,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from sqlalchemy import select
+
+    from packages.core.goals import service as goal_service
+    from packages.core.models.goal import Goal
+    from packages.core.models.workspace import Workspace
+
+    headers = await _register(client, "ws_autonomy_atomic_edit_rollback")
+    created = await client.post(
+        "/api/v1/workspaces",
+        headers=headers,
+        json={"name": "Atomic Goal Edit Rollback", "heartbeat_enabled": False},
+    )
+    workspace_id = created.json()["id"]
+    goal_response = await client.post(
+        "/api/v1/goals",
+        headers=headers,
+        json={
+            "workspace_id": workspace_id,
+            "title": "Original Goal",
+            "target_value": 1,
+        },
+    )
+    assert goal_response.status_code == 201
+    goal_id = goal_response.json()["id"]
+    original_update_goal = goal_service.update_goal
+
+    async def fail_after_goal_edit(*args, **kwargs):
+        await original_update_goal(*args, **kwargs)
+        raise RuntimeError("start transaction failed after Goal edit")
+
+    monkeypatch.setattr(goal_service, "update_goal", fail_after_goal_edit)
+    with pytest.raises(RuntimeError, match="start transaction failed after Goal edit"):
+        await client.post(
+            f"/api/v1/workspaces/{workspace_id}/resume",
+            headers=headers,
+            json={
+                "goal": {"title": "Edited Goal", "target_value": 1},
+            },
+        )
+
+    db_session.expire_all()
+    workspace = (await db_session.execute(
+        select(Workspace).where(Workspace.id == workspace_id)
+    )).scalar_one()
+    goal = (await db_session.execute(
+        select(Goal).where(Goal.id == goal_id)
+    )).scalar_one()
+    assert workspace.heartbeat_enabled is False
+    assert goal.title == "Original Goal"
 
 
 @pytest.mark.asyncio
@@ -2023,6 +2846,215 @@ async def test_workspace_operation_capability_binding_overlays_runtime_tool_scop
 
 
 @pytest.mark.asyncio
+async def test_workspace_ledger_tools_are_inherited_by_active_internal_service_agents(
+    client: AsyncClient,
+    db_session,
+):
+    from sqlalchemy import select
+
+    from packages.core.ai.runtime.surfaces import ChatSurface
+    from packages.core.models.base import generate_ulid
+    from packages.core.models.workspace import AgentSubscription, Workspace
+    from packages.core.services.workspace_runtime import resolve_workspace_runtime
+
+    headers = await _register(client, "ws_ledger_runtime_scope")
+    owner_user_id = (await client.get("/api/v1/auth/me", headers=headers)).json()["id"]
+    created = await client.post(
+        "/api/v1/workspaces",
+        headers=headers,
+        json={"name": "Finance Ledger Runtime Scope"},
+    )
+    workspace_id = created.json()["id"]
+    entity_id = created.json()["entity_id"]
+    service_agent = await client.post(
+        "/api/v1/agents",
+        headers=headers,
+        json={"name": "Finance Service Agent"},
+    )
+    unrelated_agent = await client.post(
+        "/api/v1/agents",
+        headers=headers,
+        json={"name": "Unrelated Agent"},
+    )
+
+    workspace = (
+        await db_session.execute(
+            select(Workspace).where(Workspace.id == workspace_id)
+        )
+    ).scalar_one()
+    workspace.settings = {
+        **dict(workspace.settings or {}),
+        "ledger_contracts": [
+            {
+                "contract_id": "manor.finance_ledger/v1",
+                "schema_version": 1,
+                "directory": "finance-ledger",
+            }
+        ],
+    }
+    db_session.add(
+        AgentSubscription(
+            id=generate_ulid(),
+            entity_id=entity_id,
+            workspace_id=workspace_id,
+            agent_id=service_agent.json()["id"],
+            service_key="services.finance",
+            status="active",
+        )
+    )
+    await db_session.commit()
+    db_session.expire_all()
+
+    service_runtime = await resolve_workspace_runtime(
+        db_session,
+        entity_id=entity_id,
+        workspace_id=workspace_id,
+        agent_id=service_agent.json()["id"],
+        is_master=False,
+        runtime_surface=ChatSurface.WORKSPACE_CHAT,
+    )
+    master_runtime = await resolve_workspace_runtime(
+        db_session,
+        entity_id=entity_id,
+        user_id=owner_user_id,
+        workspace_id=workspace_id,
+        agent_id=None,
+        is_master=True,
+        runtime_surface=ChatSurface.WORKSPACE_CHAT,
+    )
+    read_only_runtime = await resolve_workspace_runtime(
+        db_session,
+        entity_id=entity_id,
+        user_id=generate_ulid(),
+        workspace_id=workspace_id,
+        agent_id=None,
+        is_master=True,
+        runtime_surface=ChatSurface.WORKSPACE_CHAT,
+    )
+    background_runtime = await resolve_workspace_runtime(
+        db_session,
+        entity_id=entity_id,
+        user_id=generate_ulid(),
+        workspace_id=workspace_id,
+        agent_id=None,
+        is_master=True,
+        runtime_surface=ChatSurface.SCHEDULED_AGENT_RUN,
+    )
+    unrelated_runtime = await resolve_workspace_runtime(
+        db_session,
+        entity_id=entity_id,
+        workspace_id=workspace_id,
+        agent_id=unrelated_agent.json()["id"],
+        is_master=False,
+        runtime_surface=ChatSurface.WORKSPACE_CHAT,
+    )
+    public_runtime = await resolve_workspace_runtime(
+        db_session,
+        entity_id=entity_id,
+        workspace_id=workspace_id,
+        agent_id=service_agent.json()["id"],
+        is_master=False,
+        runtime_surface=ChatSurface.PUBLIC_CUSTOMER_CHAT,
+    )
+
+    service_tools = set(service_runtime.bound_tool_names or set())
+    assert {
+        "read_finance_ledger",
+        "query_ledger",
+        "visualize_workspace_ledgers",
+    } <= service_tools
+    assert "record_finance_ledger" not in service_tools
+    assert "record_finance_ledger" in set(master_runtime.bound_tool_names or set())
+    assert "read_finance_ledger" in set(read_only_runtime.bound_tool_names or set())
+    assert "record_finance_ledger" not in set(read_only_runtime.bound_tool_names or set())
+    assert "record_finance_ledger" in set(background_runtime.bound_tool_names or set())
+    assert "read_finance_ledger" not in set(
+        unrelated_runtime.bound_tool_names or set()
+    )
+    assert "read_finance_ledger" not in set(public_runtime.bound_tool_names or set())
+
+
+@pytest.mark.asyncio
+async def test_empty_workspace_ledger_configuration_is_reachable_from_chat(
+    client: AsyncClient,
+    db_session,
+):
+    from sqlalchemy import select
+
+    from packages.core.ai.runtime.surfaces import ChatSurface
+    from packages.core.models.workspace import Workspace
+    from packages.core.services.workspace_runtime import resolve_workspace_runtime
+
+    headers = await _register(client, "empty_ledger_runtime_scope")
+    owner_user_id = (await client.get("/api/v1/auth/me", headers=headers)).json()["id"]
+    created = await client.post(
+        "/api/v1/workspaces",
+        headers=headers,
+        json={"name": "Unmatched Workspace"},
+    )
+    workspace_id = created.json()["id"]
+    entity_id = created.json()["entity_id"]
+    workspace = (
+        await db_session.execute(
+            select(Workspace).where(Workspace.id == workspace_id)
+        )
+    ).scalar_one()
+    workspace.settings = {
+        **dict(workspace.settings or {}),
+        "ledger_contracts": [],
+    }
+    await db_session.commit()
+
+    runtime = await resolve_workspace_runtime(
+        db_session,
+        entity_id=entity_id,
+        user_id=owner_user_id,
+        workspace_id=workspace_id,
+        agent_id=None,
+        is_master=True,
+        runtime_surface=ChatSurface.WORKSPACE_CHAT,
+    )
+    public_runtime = await resolve_workspace_runtime(
+        db_session,
+        entity_id=entity_id,
+        user_id=owner_user_id,
+        workspace_id=workspace_id,
+        agent_id=None,
+        is_master=True,
+        runtime_surface=ChatSurface.PUBLIC_CUSTOMER_CHAT,
+    )
+    background_runtime = await resolve_workspace_runtime(
+        db_session,
+        entity_id=entity_id,
+        user_id=owner_user_id,
+        workspace_id=workspace_id,
+        agent_id=None,
+        is_master=True,
+        runtime_surface=ChatSurface.SCHEDULED_AGENT_RUN,
+    )
+
+    tools = set(runtime.bound_tool_names or set())
+    assert "visualize_workspace_ledgers" in tools
+    assert "query_ledger" not in tools
+    assert not tools.intersection({
+        "read_content_ledger",
+        "read_finance_ledger",
+        "read_recruiting_ledger",
+        "read_relationship_ledger",
+        "record_content_ledger",
+        "record_finance_ledger",
+        "record_recruiting_ledger",
+        "record_relationship_ledger",
+    })
+    assert "visualize_workspace_ledgers" not in set(
+        public_runtime.bound_tool_names or set()
+    )
+    assert "visualize_workspace_ledgers" not in set(
+        background_runtime.bound_tool_names or set()
+    )
+
+
+@pytest.mark.asyncio
 async def test_workspace_operation_skill_binding_overlays_agent_skills(client: AsyncClient, db_session):
     from sqlalchemy import select
     from packages.core.models.base import generate_ulid
@@ -2075,7 +3107,7 @@ async def test_workspace_operation_skill_binding_overlays_agent_skills(client: A
                         "binding": {
                             "owner_scope": "service",
                             "owner_service_key": "leasing_consultant",
-                            "skill_key": "lease_reply",
+                            "skill_id": skill_id,
                         },
                     },
                 },
@@ -2856,6 +3888,7 @@ async def test_task_details_update_preserves_workspace_batch_runtime(
     monkeypatch,
 ):
     from sqlalchemy import select
+    from packages.core.models.task import Task
     from packages.core.models.workspace import WorkspaceWorkBatch
     from packages.core.tasks import ai_tasks
 
@@ -2879,12 +3912,22 @@ async def test_task_details_update_preserves_workspace_batch_runtime(
             "details": {
                 "workspace_work_batch_id": "batch_details_merge",
                 "workspace_operation_draft_id": "draft_details_merge",
-                "runtime_context": {"instructions": "Preserve runtime metadata."},
             },
         },
     )
     assert task_resp.status_code == 201
     task_id = task_resp.json()["id"]
+    assert task_resp.json()["details"] == {}
+
+    task = (
+        await db_session.execute(select(Task).where(Task.id == task_id))
+    ).scalar_one()
+    task.details = {
+        "workspace_work_batch_id": "batch_details_merge",
+        "workspace_operation_draft_id": "draft_details_merge",
+        "runtime_context": {"instructions": "Preserve runtime metadata."},
+    }
+    await db_session.commit()
 
     calls: list[dict] = []
 
@@ -2895,6 +3938,12 @@ async def test_task_details_update_preserves_workspace_batch_runtime(
             return None
 
     monkeypatch.setattr(ai_tasks, "run_strategist_review", _FakeStrategistTask)
+    task = await db_session.get(Task, task_id)
+    assert task is not None
+    task.details = {
+        **dict(task.details or {}),
+        "runtime_context": {"instructions": "Preserve runtime metadata."},
+    }
     db_session.add(
         WorkspaceWorkBatch(
             id="batch_details_merge",
@@ -2998,6 +4047,74 @@ async def test_workspace_staff_assignment_rejects_cross_entity_staff(client: Asy
 
     assert listed.status_code == 200
     assert all(row.get("staff_id") != staff_b_id for row in listed.json())
+
+
+@pytest.mark.asyncio
+async def test_workspace_staff_list_includes_user_only_membership(
+    client: AsyncClient,
+    db_session,
+):
+    from packages.core.models.workspace import WorkspaceStaff
+    from tests.test_document_permissions import _create_entity_user
+
+    owner_headers = await _register(client, "ws_user_only_staff_owner")
+    foreign_headers = await _register(client, "ws_user_only_staff_foreign")
+    owner = (await client.get("/api/v1/auth/me", headers=owner_headers)).json()
+    workspace = await client.post(
+        "/api/v1/workspaces",
+        headers=owner_headers,
+        json={"name": "User-only membership workspace"},
+    )
+    assert workspace.status_code == 201, workspace.text
+
+    foreign_staff = await client.post(
+        "/api/v1/staff",
+        headers=foreign_headers,
+        json={"name": "Foreign Staff"},
+    )
+    assert foreign_staff.status_code == 201, foreign_staff.text
+
+    member = await _create_entity_user(
+        owner["entity_id"],
+        "ws_user_only_staff_member",
+        role="member",
+        display_name="User-only Member",
+    )
+    dirty_member = await _create_entity_user(
+        owner["entity_id"],
+        "ws_user_only_staff_dirty_member",
+        role="member",
+    )
+    membership = WorkspaceStaff(
+        workspace_id=workspace.json()["id"],
+        staff_id=None,
+        user_id=member["id"],
+        role="viewer",
+        status="active",
+    )
+    db_session.add(membership)
+    db_session.add(
+        WorkspaceStaff(
+            workspace_id=workspace.json()["id"],
+            staff_id=foreign_staff.json()["id"],
+            user_id=dirty_member["id"],
+            role="viewer",
+            status="active",
+        )
+    )
+    await db_session.commit()
+
+    listed = await client.get(
+        f"/api/v1/workspaces/{workspace.json()['id']}/staff",
+        headers=owner_headers,
+    )
+
+    assert listed.status_code == 200, listed.text
+    row = next(item for item in listed.json() if item["user_id"] == member["id"])
+    assert row["staff_id"] is None
+    assert row["display_name"] == "User-only Member"
+    assert row["email"] == "ws_user_only_staff_member@test.com"
+    assert all(item["staff_id"] != foreign_staff.json()["id"] for item in listed.json())
 
 
 @pytest.mark.asyncio
@@ -3109,12 +4226,77 @@ async def test_workspace_staff_invite_links_user_for_task_assignment(client: Asy
     assert accept.status_code == 200
     assert membership is not None
     assert membership.user_id == user_id
+    assert membership.role == "viewer"
     assert listed.status_code == 200
     listed_membership = next(row for row in listed.json() if row["staff_id"] == staff_id)
     assert listed_membership["user_id"] == user_id
     assert task.status_code == 201
     assert task.json()["assignee_id"] == user_id
     assert task.json()["assignee_name"] == "Task Staff"
+
+
+@pytest.mark.asyncio
+async def test_workspace_staff_reinvite_clears_expired_membership(client: AsyncClient, db_session):
+    from datetime import datetime, timedelta, timezone
+
+    from sqlalchemy import select
+
+    from packages.core.models.base import generate_ulid
+    from packages.core.models.workspace import WorkspaceStaff
+
+    owner_headers = await _register(client, "ws_staff_reinvite_owner")
+    invitee = await client.post(
+        "/api/v1/auth/register",
+        json={
+            "username": "ws_staff_reinvite_member",
+            "email": "ws.staff.reinvite@test.com",
+            "password": "pass123",
+            "entity_name": "Reinvite Member Corp",
+        },
+    )
+    assert invitee.status_code == 200
+    invitee_body = invitee.json()
+    workspace = await client.post(
+        "/api/v1/workspaces",
+        headers=owner_headers,
+        json={"name": "Reinvite Workspace"},
+    )
+    workspace_id = workspace.json()["id"]
+    db_session.add(WorkspaceStaff(
+        id=generate_ulid(),
+        workspace_id=workspace_id,
+        user_id=invitee_body["user_id"],
+        role="viewer",
+        status="active",
+        expires_at=datetime.now(timezone.utc) - timedelta(days=1),
+    ))
+    await db_session.commit()
+
+    invite = await client.post(
+        "/api/v1/staff/invite",
+        headers=owner_headers,
+        json={
+            "email": "ws.staff.reinvite@test.com",
+            "workspace_ids": [workspace_id],
+        },
+    )
+    assert invite.status_code == 201, invite.text
+    accepted = await client.post(
+        f"/api/v1/people/invites/{invite.json()['staff_id']}/accept",
+        headers={"Authorization": f"Bearer {invitee_body['access_token']}"},
+    )
+    assert accepted.status_code == 200, accepted.text
+
+    membership = (
+        await db_session.execute(
+            select(WorkspaceStaff).where(
+                WorkspaceStaff.workspace_id == workspace_id,
+                WorkspaceStaff.user_id == invitee_body["user_id"],
+            )
+        )
+    ).scalar_one()
+    assert membership.status == "active"
+    assert membership.expires_at is None
 
 
 @pytest.mark.asyncio
@@ -3249,10 +4431,12 @@ async def test_workspace_channel_update_edits_routing_and_config(client: AsyncCl
 
 @pytest.mark.asyncio
 async def test_public_webchat_info_resolves_subscription_agent_name(client: AsyncClient, db_session):
+    from datetime import datetime, timezone
+
     from packages.core.models.base import generate_ulid
     from packages.core.models.channel import ChannelConfig
     from packages.core.models.document import Channel
-    from packages.core.models.workspace import AgentSubscription
+    from packages.core.models.workspace import AgentSubscription, Workspace
 
     headers = await _register(client, "ws_public_chat_info")
     ws = await client.post("/api/v1/workspaces", headers=headers, json={"name": "Public Chat Workspace"})
@@ -3315,6 +4499,18 @@ async def test_public_webchat_info_resolves_subscription_agent_name(client: Asyn
     assert body["welcome_message"] == "Tell us what you need."
     assert body["purpose"] == "Website lead intake."
 
+    workspace = await db_session.get(Workspace, ws_body["id"])
+    workspace.status = "paused"
+    await db_session.commit()
+    paused = await client.get(f"/api/v1/public/chat/{token}")
+    assert paused.status_code == 404
+
+    workspace.status = "active"
+    workspace.deleted_at = datetime.now(timezone.utc)
+    await db_session.commit()
+    deleted = await client.get(f"/api/v1/public/chat/{token}")
+    assert deleted.status_code == 404
+
 
 @pytest.mark.asyncio
 async def test_public_webchat_poll_reads_gateway_conversation(client: AsyncClient, db_session, monkeypatch):
@@ -3372,7 +4568,10 @@ async def test_public_webchat_poll_reads_gateway_conversation(client: AsyncClien
 
     from packages.core.services.channel_agent_runtime import ChannelAgentRunResult
 
+    agent_turn: dict[str, object] = {}
+
     async def fake_run_agent(**kwargs):
+        agent_turn.update(kwargs)
         return ChannelAgentRunResult(content="Thanks, I can help with that.")
 
     monkeypatch.setattr(
@@ -3395,6 +4594,8 @@ async def test_public_webchat_poll_reads_gateway_conversation(client: AsyncClien
     assert send_body["status"] == "ok"
     assert send_body["reply"] == "Thanks, I can help with that."
     assert send_body["sent"]
+    assert "runtime_metadata" in agent_turn
+    assert agent_turn["runtime_metadata"] is None
 
     poll = await client.get(f"/api/v1/public/chat/{token}/messages?session_id={session_id}")
 
@@ -4269,6 +5470,8 @@ async def test_workspace_task_rule_scope_e2e_through_runtime_tool_gate(
     from packages.core.workspace_chat.service import ensure_main_conversation
 
     headers = await _register(client, "ws_task_rule_scope_e2e")
+    me = await client.get("/api/v1/auth/me", headers=headers)
+    assert me.status_code == 200
     ws = await client.post("/api/v1/workspaces", headers=headers, json={"name": "Task Rule Scope E2E"})
     ws_body = ws.json()
     main = await ensure_main_conversation(
@@ -4282,7 +5485,7 @@ async def test_workspace_task_rule_scope_e2e_through_runtime_tool_gate(
     pool.register("workspace_agent", WORKSPACE_AGENT_SCHEMA, _workspace_agent_handler)
     common = {
         "entity_id": ws_body["entity_id"],
-        "user_id": "USER_TASK_RULE_SCOPE_E2E",
+        "user_id": me.json()["id"],
         "workspace_id": ws_body["id"],
     }
 
@@ -4390,7 +5593,14 @@ async def test_workspace_chat_uses_workspace_agent_tool_profile(client: AsyncCli
 
     assert ctx.runtime_profile == RuntimeProfile.WORKSPACE_OPERATOR.value
     assert ctx.tool_profile == WORKSPACE_AGENT_TOOL_PROFILE
-    assert {"search_tools", "workspace_agent", "workspace_resolve_hitl", "answer_task_blocker", "workspace_search", "rag"} <= eager_names
+    assert {"search_tools", "manor", "rag"} <= eager_names
+    assert not {
+        "workspace_agent",
+        "workspace_resolve_hitl",
+        "answer_task_blocker",
+        "workspace_search",
+        "workspace_create_task",
+    }.intersection(eager_names)
     assert "bash" in eager_names
     assert "bash" in ctx.allowed_tool_names
     assert "browse_web" in ctx.allowed_tool_names
@@ -4533,6 +5743,8 @@ async def test_workspace_runtime_includes_task_service_agent_tool_scope(client: 
     from packages.core.services.workspace_runtime import resolve_workspace_runtime
 
     headers = await _register(client, "ws_runtime_service_tools")
+    me = await client.get("/api/v1/auth/me", headers=headers)
+    assert me.status_code == 200
     ws = await client.post("/api/v1/workspaces", headers=headers, json={"name": "Runtime Service Tools"})
     ws_body = ws.json()
     agent_id = generate_ulid()
@@ -4620,6 +5832,9 @@ async def test_workspace_runtime_includes_task_service_agent_tool_scope(client: 
             await tool_pool.execute(
                 "search_tools",
                 {"query": "leasing unit", "max_results": 5},
+                entity_id=ws_body["entity_id"],
+                user_id=me.json()["id"],
+                workspace_id=ws_body["id"],
                 tool_profile=runtime.tool_profile,
                 allowed_tool_names=allowed,
             )
@@ -4767,7 +5982,9 @@ async def test_attachment_only_task_comment_does_not_schedule_workspace_agent(
 
 
 @pytest.mark.asyncio
-async def test_channel_gateway_workspace_subscription_uses_tool_profile(monkeypatch):
+async def test_channel_gateway_workspace_subscription_uses_tool_profile_and_runtime_metadata(
+    monkeypatch,
+):
     from types import SimpleNamespace
 
     from packages.core.ai.runtime.profiles import (
@@ -4836,10 +6053,12 @@ async def test_channel_gateway_workspace_subscription_uses_tool_profile(monkeypa
             workspace_id="workspace-runtime-channel",
             custom_prompt=None,
         ),
+        runtime_metadata={"voice_session_mode": "chat_gateway"},
     )
 
     assert result and result.content == "ok"
     assert captured["appendix_kwargs"]["tool_profile"] == WORKSPACE_AGENT_TOOL_PROFILE
+    assert captured["appendix_kwargs"]["request"].metadata["voice_session_mode"] == "chat_gateway"
     assert captured["loop_kwargs"]["tool_profile"] == WORKSPACE_AGENT_TOOL_PROFILE
     assert captured["loop_kwargs"]["allowed_tool_names"] == set()
 
@@ -4917,13 +6136,14 @@ async def test_workspace_agent_creates_workspace_task_with_runtime_context(clien
     from packages.core.models.task import Task
 
     headers = await _register(client, "ws_agent_task")
+    me = (await client.get("/api/v1/auth/me", headers=headers)).json()
     ws = await client.post("/api/v1/workspaces", headers=headers, json={"name": "Agent Task Runtime"})
     ws_body = ws.json()
 
     result = json.loads(
         await _workspace_agent_handler(
             entity_id=ws_body["entity_id"],
-            user_id="USERWORKSPACEAGENTTASK000",
+            user_id=me["id"],
             workspace_id=ws_body["id"],
             conversation_id="CONVWORKSPACEAGENTTASK000",
             action="create_task",
@@ -4948,6 +6168,7 @@ async def test_workspace_agent_creates_workspace_task_with_runtime_context(clien
     task = (await db_session.execute(select(Task).where(Task.id == result["task"]["id"]))).scalar_one()
     runtime = task.details["runtime_context"]
     assert task.workspace_id == ws_body["id"]
+    assert task.creator_id == me["id"]
     assert runtime["instructions"] == "Use the leasing FAQ before suggesting units."
     assert runtime["required_refs"] == ["doc:leasing-faq"]
     assert runtime["knowledge_query"] == "leasing FAQ and available unit matching guidance"
@@ -4955,7 +6176,7 @@ async def test_workspace_agent_creates_workspace_task_with_runtime_context(clien
 
 
 @pytest.mark.asyncio
-async def test_public_webchat_broad_agent_binding_can_create_customer_ticket(client: AsyncClient, db_session):
+async def test_public_webchat_explicit_ticket_binding_can_create_customer_ticket(client: AsyncClient, db_session):
     import json
 
     from sqlalchemy import select
@@ -4968,9 +6189,12 @@ async def test_public_webchat_broad_agent_binding_can_create_customer_ticket(cli
         runtime_prepare_agent_tool_surface_for_turn,
     )
     from packages.core.ai.tools.workspace_agent_tools import _workspace_create_task_handler
-    from packages.core.models.task import Task
+    from packages.core.constants.task import TaskLogType
+    from packages.core.constants.task_actors import TASK_ACTOR_META_KEY, TaskActor
+    from packages.core.models.task import Task, TaskLog
 
     headers = await _register(client, "ws_public_ticket")
+    me = (await client.get("/api/v1/auth/me", headers=headers)).json()
     ws = await client.post("/api/v1/workspaces", headers=headers, json={"name": "Public Ticket Runtime"})
     agent = await client.post("/api/v1/agents", headers=headers, json={"name": "Ticket Concierge"})
     ws_body = ws.json()
@@ -4979,6 +6203,7 @@ async def test_public_webchat_broad_agent_binding_can_create_customer_ticket(cli
     request = AIRuntimeRequest(
         surface=ChatSurface.PUBLIC_CUSTOMER_CHAT,
         entity_id=ws_body["entity_id"],
+        user_id=me["id"],
         agent_id=agent_body["id"],
         workspace_id=ws_body["id"],
         conversation_id="CONVPUBLICTICKET00000001",
@@ -4995,7 +6220,13 @@ async def test_public_webchat_broad_agent_binding_can_create_customer_ticket(cli
     surface = runtime_prepare_agent_tool_surface_for_turn(
         request,
         agent_id=agent_body["id"],
-        bound_tool_names={"rag", "workspace_agent", "workspace_operation", "manor"},
+        bound_tool_names={
+            "rag",
+            "workspace_agent",
+            "workspace_operation",
+            "workspace_create_task",
+            "manor",
+        },
     )
 
     assert surface.allowed_tool_names == {"rag", "workspace_create_task"}
@@ -5010,7 +6241,7 @@ async def test_public_webchat_broad_agent_binding_can_create_customer_ticket(cli
         },
         handler_resolver=lambda name: _workspace_create_task_handler if name == "workspace_create_task" else None,
         entity_id=ws_body["entity_id"],
-        user_id=None,
+        user_id=me["id"],
         agent_id=agent_body["id"],
         workspace_id=ws_body["id"],
         conversation_id="CONVPUBLICTICKET00000001",
@@ -5023,7 +6254,18 @@ async def test_public_webchat_broad_agent_binding_can_create_customer_ticket(cli
     task = (await db_session.execute(select(Task).where(Task.id == result["task"]["id"]))).scalar_one()
     assert task.workspace_id == ws_body["id"]
     assert task.conversation_id == "CONVPUBLICTICKET00000001"
-    assert task.creator_id == agent_body["id"]
+    assert task.creator_id is None
+    assert "user_id" not in task.details.get("runtime_context", {}).get("captured_from", {})
+    creation_log = (
+        await db_session.execute(
+            select(TaskLog).where(
+                TaskLog.task_id == task.id,
+                TaskLog.log_type == TaskLogType.CREATE.value,
+            )
+        )
+    ).scalar_one()
+    assert creation_log.meta["agent_id"] == agent_body["id"]
+    assert creation_log.meta[TASK_ACTOR_META_KEY] == TaskActor.AGENT.value
     customer_context = task.details["customer_context"]
     assert customer_context == {
         "source": "public_customer_chat",
@@ -5053,25 +6295,36 @@ async def test_workspace_agent_updates_existing_task_runtime_context(client: Asy
         json={
             "title": "Prepare customer housing options",
             "workspace_id": ws_body["id"],
-            "details": {
-                "runtime_context": {
-                    "instructions": "Use the existing leasing preferences.",
-                    "required_refs": ["doc:lease-intake"],
-                    "rules": [
-                        {
-                            "rule_key": "approval_before_send",
-                            "description": "Ask before sending listings to the customer.",
-                            "rule_type": "approval_required",
-                            "action_patterns": ["external_message.send"],
-                        }
-                    ],
-                    "knowledge_query": "leasing preferences",
-                },
-            },
         },
     )
     assert create.status_code == 201
     task_id = create.json()["id"]
+    assert create.json()["details"] == {}
+
+    seeded = json.loads(
+        await _workspace_agent_handler(
+            entity_id=ws_body["entity_id"],
+            user_id="USER_RUNTIME_UPDATE",
+            workspace_id=ws_body["id"],
+            conversation_id="CONV_RUNTIME_UPDATE",
+            action="update_task_runtime",
+            params={
+                "task_id": task_id,
+                "runtime_instructions": "Use the existing leasing preferences.",
+                "required_refs": ["doc:lease-intake"],
+                "knowledge_query": "leasing preferences",
+                "rules": [
+                    {
+                        "rule_key": "approval_before_send",
+                        "description": "Ask before sending listings to the customer.",
+                        "rule_type": "approval_required",
+                        "action_patterns": ["external_message.send"],
+                    }
+                ],
+            },
+        )
+    )
+    assert seeded["updated"] is True
 
     result = json.loads(
         await _workspace_agent_handler(
@@ -5265,6 +6518,7 @@ async def test_workspace_agent_delegates_to_service_bound_agent(
         )
         return SimpleNamespace(
             content="Tweet drafted and queued.",
+            messages=[],
             rounds=2,
             tool_calls_made=["mcp__twitter_x__post_tweet"],
             usage={"total_tokens": 42},
@@ -6543,6 +7797,159 @@ async def test_non_streaming_workspace_chat_persists_operation_review_card(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("tool_name", "tool_args", "visualization_kind"),
+    [
+        (
+            "manor",
+            {"action": "workspace", "params": {"action": "visualize_ledgers"}},
+            "workspace_ledger_overview",
+        ),
+        ("query_ledger", {}, "ledger_query_result"),
+    ],
+)
+async def test_non_streaming_workspace_chat_persists_ledger_visualization(
+    client: AsyncClient,
+    monkeypatch,
+    tool_name: str,
+    tool_args: dict,
+    visualization_kind: str,
+):
+    import importlib
+    from types import SimpleNamespace
+
+    agentic_loop_module = importlib.import_module("packages.core.ai.agentic_loop")
+    captured_tool_names: set[str] = set()
+
+    overview = {
+        "workspace_id": "replaced-after-create",
+        "ledger_count": 1,
+        "record_count": 2,
+        "event_count": 3,
+        "ledgers": [
+            {
+                "contract_id": "manor.recruiting_ledger/v1",
+                "kind": "recruiting",
+                "title": "Recruiting & HR",
+                "directory": "recruiting-ledger",
+                "schema_version": 1,
+                "projection_kind": "current",
+                "record_count": 2,
+                "event_count": 3,
+                "updated_at": "2026-08-23T17:00:00Z",
+                "status_counts": [{"key": "active", "count": 2}],
+                "stage_counts": [{"key": "screening", "count": 2}],
+                "subject_counts": [{"key": "candidate", "count": 2}],
+                "totals": [],
+            }
+        ],
+    }
+    query_visualization = {
+        "contract_id": "manor.recruiting_ledger/v1",
+        "view": "current",
+        "layout": "bar",
+        "matched_count": 2,
+        "as_of": "2026-08-23T17:00:00Z",
+        "group_by": ["stage"],
+        "metrics": ["count"],
+        "aggregates": {"count": 2},
+        "groups": [
+            {"key": {"stage": "screening"}, "aggregates": {"count": 2}},
+        ],
+        "columns": [],
+        "rows": [],
+        "has_more": False,
+        "currency": None,
+    }
+    visualization_data = (
+        overview
+        if visualization_kind == "workspace_ledger_overview"
+        else query_visualization
+    )
+
+    async def fake_agentic_loop(*_args, **kwargs):
+        captured_tool_names.update(
+            tool.get("function", {}).get("name", "")
+            for tool in kwargs["tools"]
+            if isinstance(tool, dict)
+        )
+        assert tool_name in captured_tool_names
+        tool_result = json.dumps({
+            "ok": True,
+            "visualization": {
+                "kind": visualization_kind,
+                "data": visualization_data,
+            },
+        })
+        kwargs["on_tool_start"](tool_name, tool_args)
+        kwargs["on_tool_end"](
+            tool_name,
+            tool_result,
+            duration_ms=1,
+            args=tool_args,
+        )
+        return SimpleNamespace(
+            content="Here is the current recruiting Ledger overview.",
+            usage={},
+            tool_calls_made=[tool_name],
+            rounds=1,
+            stop_reason="completed",
+            error=None,
+            error_detail=None,
+            messages=[],
+        )
+
+    monkeypatch.setattr(agentic_loop_module, "agentic_loop", fake_agentic_loop)
+
+    headers = await _register(client, "ws_nonstream_ledger")
+    ws = await client.post(
+        "/api/v1/workspaces",
+        headers=headers,
+        json={
+            "name": "Recruiting Operations",
+            "operating_context": "Recruit candidates and manage employee onboarding.",
+            "primary_work": "Operate the hiring pipeline.",
+        },
+    )
+    assert ws.status_code == 201
+    workspace_id = ws.json()["id"]
+    overview["workspace_id"] = workspace_id
+
+    response = await client.post(
+        "/api/v1/chat/message",
+        headers=headers,
+        json={
+            "message": "Show me the current recruiting Ledger overview.",
+            "workspace_id": workspace_id,
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["tool_calls_made"] == [tool_name]
+
+    messages = await client.get(
+        f"/api/v1/workspaces/{workspace_id}/chat/messages/page?limit=20",
+        headers=headers,
+    )
+    assert messages.status_code == 200
+    rows = messages.json()["items"]
+    assert any(
+        row["author_kind"] == "user"
+        and row["body"] == "Show me the current recruiting Ledger overview."
+        for row in rows
+    )
+    assistant = next(row for row in rows if row["author_kind"] == "agent")
+    visualization = next(
+        block
+        for block in assistant["assistant_blocks"]
+        if block["type"] == "visualization"
+    )
+    assert visualization["kind"] == visualization_kind
+    assert visualization["data"] == visualization_data
+    assert assistant["meta"]["assistant_blocks"] == assistant["assistant_blocks"]
+
+
+@pytest.mark.asyncio
 async def test_workspace_chat_operation_review_card_applies_draft(client: AsyncClient, db_session):
     from sqlalchemy import select
     from packages.core.models.base import generate_ulid
@@ -7182,6 +8589,7 @@ async def test_plan_completed_notifications_include_task_ref(monkeypatch):
         posted.append(kwargs)
 
     monkeypatch.setattr(notifiers, "_safe_post", fake_safe_post)
+    monkeypatch.setattr(notifiers, "_safe_post_completion", fake_safe_post)
 
     await notifiers.notify_plan_completed(
         entity_id="entity_1",
@@ -7203,6 +8611,94 @@ async def test_plan_completed_notifications_include_task_ref(monkeypatch):
         {"type": "plan", "id": "plan_1"},
         {"type": "task", "id": "task_1"},
     ]
+    assert posted[0]["meta"]["feedback_target_kind"] == "none"
+    assert posted[1]["meta"]["feedback_target_kind"] == "task_completion"
+
+    posted.clear()
+    await notifiers.notify_plan_completed(
+        entity_id="entity_1",
+        workspace_id="workspace_1",
+        plan_id="plan_without_task",
+        duration_seconds=3.0,
+        cost_usd=None,
+        steps=[],
+    )
+    assert posted[0]["meta"]["feedback_target_kind"] == "none"
+    assert posted[1]["meta"]["feedback_target_kind"] == "plan_completion"
+
+
+@pytest.mark.asyncio
+async def test_plan_completion_notifier_posts_only_for_completed_lineage(
+    client: AsyncClient,
+    db_session,
+    monkeypatch,
+):
+    from sqlalchemy import select
+
+    import packages.core.database as database
+    from packages.core.models.base import generate_ulid
+    from packages.core.models.execution import ExecutionPlan
+    from packages.core.models.task import Conversation, Message, Task
+    from packages.core.workspace_chat import notifiers
+
+    headers = await _register(client, "completion_notifier_lineage")
+    workspace = await client.post(
+        "/api/v1/workspaces",
+        headers=headers,
+        json={"name": "Completion Notifier Lineage"},
+    )
+    workspace_body = workspace.json()
+    task_id = generate_ulid()
+    plan_id = generate_ulid()
+    db_session.add_all(
+        [
+            Task(
+                id=task_id,
+                entity_id=workspace_body["entity_id"],
+                workspace_id=workspace_body["id"],
+                title="Completed notification task",
+                status="completed",
+            ),
+            ExecutionPlan(
+                id=plan_id,
+                entity_id=workspace_body["entity_id"],
+                workspace_id=workspace_body["id"],
+                task_id=task_id,
+                status="completed",
+            ),
+        ]
+    )
+    await db_session.commit()
+
+    monkeypatch.setattr(notifiers, "async_session", database.async_session)
+    await notifiers.notify_plan_completed(
+        entity_id=workspace_body["entity_id"],
+        workspace_id=workspace_body["id"],
+        plan_id=plan_id,
+        task_id=task_id,
+        task_title="Completed notification task",
+        duration_seconds=2.0,
+        cost_usd=None,
+        steps=[],
+    )
+
+    rows = (
+        await db_session.execute(
+            select(Message)
+            .join(Conversation, Conversation.id == Message.conversation_id)
+            .where(Conversation.workspace_id == workspace_body["id"])
+        )
+    ).scalars().all()
+    completion_rows = [
+        message
+        for message in rows
+        if {"type": "plan", "id": plan_id} in (message.refs or [])
+    ]
+    assert len(completion_rows) == 2
+    assert {
+        (message.meta or {}).get("feedback_target_kind")
+        for message in completion_rows
+    } == {"none", "task_completion"}
 
 
 @pytest.mark.asyncio
@@ -7346,12 +8842,14 @@ async def test_workspace_chat_task_thread_messages_include_task_ref(client: Asyn
 
 
 @pytest.mark.asyncio
-async def test_workspace_chat_task_completion_feedback_records_message_meta_and_evidence(
+async def test_workspace_chat_task_completion_feedback_records_canonical_evidence(
     client: AsyncClient,
     db_session,
+    monkeypatch,
 ):
-    from sqlalchemy import select
+    from sqlalchemy import select, text
     from packages.core.models.base import generate_ulid
+    from packages.core.models.chat_feedback import ChatMessageFeedback
     from packages.core.models.execution import ExecutionPlan
     from packages.core.models.runtime_learning import RuntimeEvidence
     from packages.core.models.task import Conversation, Message, Task
@@ -7361,7 +8859,12 @@ async def test_workspace_chat_task_completion_feedback_records_message_meta_and_
     ws_body = ws.json()
 
     conv_id = generate_ulid()
+    thread_conv_id = generate_ulid()
+    unrelated_user_message_id = generate_ulid()
     message_id = generate_ulid()
+    ordinary_message_id = generate_ulid()
+    typed_message_id = generate_ulid()
+    invalid_lineage_message_id = generate_ulid()
     plan_id = generate_ulid()
     task_id = generate_ulid()
     db_session.add(
@@ -7372,6 +8875,18 @@ async def test_workspace_chat_task_completion_feedback_records_message_meta_and_
             title="Plan updates",
             channel="workspace",
             scope="workspace_main",
+        )
+    )
+    db_session.add(
+        Conversation(
+            id=thread_conv_id,
+            entity_id=ws_body["entity_id"],
+            workspace_id=ws_body["id"],
+            title="Plan detail",
+            channel="workspace",
+            scope="workspace_thread",
+            thread_ref_kind="plan",
+            thread_ref_id=plan_id,
         )
     )
     db_session.add(
@@ -7394,6 +8909,16 @@ async def test_workspace_chat_task_completion_feedback_records_message_meta_and_
     )
     db_session.add(
         Message(
+            id=unrelated_user_message_id,
+            conversation_id=conv_id,
+            role="user",
+            content="This belongs to a different request and user turn.",
+            author_kind="user",
+            message_kind="text",
+        )
+    )
+    db_session.add(
+        Message(
             id=message_id,
             conversation_id=conv_id,
             role="assistant",
@@ -7401,15 +8926,50 @@ async def test_workspace_chat_task_completion_feedback_records_message_meta_and_
             author_kind="agent",
             message_kind="agent_update",
             refs=[{"type": "plan", "id": plan_id}],
+            meta={"feedback_target_kind": "task_completion"},
+        )
+    )
+    db_session.add(
+        Message(
+            id=ordinary_message_id,
+            conversation_id=conv_id,
+            role="assistant",
+            content="Ordinary agent response",
+            author_kind="agent",
+            message_kind="text",
+        )
+    )
+    db_session.add(
+        Message(
+            id=typed_message_id,
+            conversation_id=thread_conv_id,
+            role="assistant",
+            content="任务已完成，可以查看交付结果。",
+            author_kind="agent",
+            message_kind="agent_update",
+            refs=[{"type": "plan", "id": plan_id}],
+            meta={"feedback_target_kind": "task_completion"},
+        )
+    )
+    db_session.add(
+        Message(
+            id=invalid_lineage_message_id,
+            conversation_id=conv_id,
+            role="assistant",
+            content="任务已完成，但引用无效。",
+            author_kind="agent",
+            message_kind="agent_update",
+            refs=[{"type": "task", "id": generate_ulid()}],
+            meta={"feedback_target_kind": "task_completion"},
         )
     )
     await db_session.commit()
-
     listed = await client.get(
         f"/api/v1/workspaces/{ws_body['id']}/chat/messages",
         headers=headers,
     )
     listed_message = next(row for row in listed.json() if row["id"] == message_id)
+    assert listed_message["meta"]["feedback_target_kind"] == "task_completion"
     task_ref = next(ref for ref in listed_message["refs"] if ref["type"] == "task" and ref["id"] == task_id)
     assert task_ref["title"] == "Follow up with lead"
     assert task_ref["status"] == "completed"
@@ -7421,13 +8981,28 @@ async def test_workspace_chat_task_completion_feedback_records_message_meta_and_
     )
 
     assert resp.status_code == 200
+    assert resp.json()["rating"] == "up"
+    assert resp.json()["mutation_sequence"] == 1
+    assert resp.json()["feedback_target_kind"] == "task_completion"
+    assert resp.json()["feedback_target_id"] == plan_id
     meta = resp.json()["meta"]
-    assert meta["latest_task_completion_feedback"]["rating"] == "up"
-    assert list(meta["task_completion_feedback"].values()) == ["up"]
+    assert meta["feedback_target_kind"] == "task_completion"
+    assert "task_completion_feedback" not in meta
 
     db_session.expire_all()
     msg = (await db_session.execute(select(Message).where(Message.id == message_id))).scalar_one()
-    assert list(msg.meta["task_completion_feedback"].values()) == ["up"]
+    assert "task_completion_feedback" not in (msg.meta or {})
+    stored_feedback = (
+        await db_session.execute(
+            select(ChatMessageFeedback).where(
+                ChatMessageFeedback.target_kind == "task_completion",
+                ChatMessageFeedback.target_id == plan_id,
+            )
+        )
+    ).scalar_one()
+    assert stored_feedback.task_id == task_id
+    assert stored_feedback.plan_id == plan_id
+    assert stored_feedback.request_preview is None
     evidence = (
         await db_session.execute(
             select(RuntimeEvidence).where(
@@ -7442,6 +9017,707 @@ async def test_workspace_chat_task_completion_feedback_records_message_meta_and_
     assert evidence.details["rating"] == "up"
     assert evidence.details["plan_id"] == plan_id
     assert evidence.metrics["helpful"] == 1
+
+    changed = await client.post(
+        f"/api/v1/workspaces/{ws_body['id']}/chat/messages/{message_id}/feedback",
+        headers=headers,
+        json={"rating": "down"},
+    )
+    assert changed.status_code == 200, changed.text
+    assert changed.json()["rating"] == "down"
+    assert changed.json()["mutation_sequence"] == 2
+
+    db_session.expire_all()
+    feedback = (
+        await db_session.execute(
+            select(ChatMessageFeedback).where(
+                ChatMessageFeedback.message_id == message_id,
+            )
+        )
+    ).scalar_one()
+    assert feedback.rating == "down"
+    assert feedback.mutation_sequence == 2
+    assert feedback.meta["target_kind"] == "task_completion"
+    evidence = (
+        await db_session.execute(
+            select(RuntimeEvidence).where(
+                RuntimeEvidence.message_id == message_id,
+                RuntimeEvidence.evidence_type == "task_completion_feedback",
+            )
+        )
+    ).scalar_one()
+    assert evidence.details["rating"] == "down"
+    assert evidence.metrics["helpful"] == 0
+
+    restored = await client.get(
+        f"/api/v1/chat/conversations/{conv_id}/feedback",
+        headers=headers,
+    )
+    assert restored.status_code == 200, restored.text
+    restored_feedback = next(
+        item for item in restored.json() if item["message_id"] == message_id
+    )
+    assert restored_feedback == {
+        "message_id": message_id,
+        "rating": "down",
+        "mutation_sequence": 2,
+        "target_kind": "task_completion",
+        "target_id": plan_id,
+        "task_id": task_id,
+        "plan_id": plan_id,
+    }
+
+    concurrent = await asyncio.gather(
+        client.post(
+            f"/api/v1/workspaces/{ws_body['id']}/chat/messages/{message_id}/feedback",
+            headers=headers,
+            json={"rating": "up"},
+        ),
+        client.post(
+            f"/api/v1/workspaces/{ws_body['id']}/chat/messages/{message_id}/feedback",
+            headers=headers,
+            json={"rating": "down"},
+        ),
+    )
+    assert all(response.status_code == 200 for response in concurrent)
+    revisions = sorted(
+        (response.json() for response in concurrent),
+        key=lambda item: item["mutation_sequence"],
+    )
+    assert [item["mutation_sequence"] for item in revisions] == [3, 4]
+    authoritative_rating = revisions[-1]["rating"]
+
+    db_session.expire_all()
+    feedback = (
+        await db_session.execute(
+            select(ChatMessageFeedback).where(
+                ChatMessageFeedback.message_id == message_id,
+            )
+        )
+    ).scalar_one()
+    evidence = (
+        await db_session.execute(
+            select(RuntimeEvidence).where(
+                RuntimeEvidence.message_id == message_id,
+                RuntimeEvidence.evidence_type == "task_completion_feedback",
+            )
+        )
+    ).scalar_one()
+    assert feedback.rating == authoritative_rating
+    assert feedback.mutation_sequence == 4
+    assert evidence.details["rating"] == authoritative_rating
+
+    typed = await client.post(
+        f"/api/v1/workspaces/{ws_body['id']}/chat/messages/{typed_message_id}/feedback",
+        headers=headers,
+        json={"rating": "up"},
+    )
+    assert typed.status_code == 200, typed.text
+    assert typed.json()["mutation_sequence"] == 5
+    assert typed.json()["feedback_target_kind"] == "task_completion"
+
+    db_session.expire_all()
+    canonical_rows = (
+        await db_session.execute(
+            select(ChatMessageFeedback).where(
+                ChatMessageFeedback.target_kind == "task_completion",
+                ChatMessageFeedback.target_id == plan_id,
+            )
+        )
+    ).scalars().all()
+    assert len(canonical_rows) == 1
+    assert canonical_rows[0].message_id == typed_message_id
+    response_projection = (
+        await db_session.execute(
+            select(ChatMessageFeedback).where(
+                ChatMessageFeedback.message_id == typed_message_id,
+                ChatMessageFeedback.target_kind == "response",
+            )
+        )
+    ).scalar_one_or_none()
+    assert response_projection is None
+    canonical_evidence = (
+        await db_session.execute(
+            select(RuntimeEvidence).where(
+                RuntimeEvidence.workspace_id == ws_body["id"],
+                RuntimeEvidence.evidence_type == "task_completion_feedback",
+            )
+        )
+    ).scalars().all()
+    assert len(canonical_evidence) == 1
+    assert canonical_evidence[0].message_id == typed_message_id
+    assert canonical_evidence[0].details["target_kind"] == "task_completion"
+
+    invalid_lineage = await client.post(
+        f"/api/v1/workspaces/{ws_body['id']}/chat/messages/{invalid_lineage_message_id}/feedback",
+        headers=headers,
+        json={"rating": "up"},
+    )
+    assert invalid_lineage.status_code == 422, invalid_lineage.text
+
+    import packages.core.services.runtime_learning as runtime_learning
+
+    async def fail_evidence_write(db, **_kwargs):
+        await db.execute(text("SELECT 1 / 0"))
+
+    monkeypatch.setattr(
+        runtime_learning,
+        "record_user_signal_evidence",
+        fail_evidence_write,
+    )
+    evidence_failure = await client.post(
+        f"/api/v1/workspaces/{ws_body['id']}/chat/messages/{message_id}/feedback",
+        headers=headers,
+        json={"rating": "up"},
+    )
+    assert evidence_failure.status_code == 200, evidence_failure.text
+    assert evidence_failure.json()["rating"] == "up"
+    assert evidence_failure.json()["mutation_sequence"] == 6
+
+    db_session.expire_all()
+    feedback = (
+        await db_session.execute(
+            select(ChatMessageFeedback).where(
+                ChatMessageFeedback.message_id == message_id,
+            )
+        )
+    ).scalar_one()
+    assert feedback.rating == "up"
+    stale_evidence = (
+        await db_session.execute(
+            select(RuntimeEvidence).where(
+                RuntimeEvidence.message_id == message_id,
+                RuntimeEvidence.evidence_type == "task_completion_feedback",
+            )
+        )
+    ).scalars().all()
+    assert stale_evidence == []
+
+    rejected = await client.post(
+        f"/api/v1/workspaces/{ws_body['id']}/chat/messages/{ordinary_message_id}/feedback",
+        headers=headers,
+        json={"rating": "up"},
+    )
+    assert rejected.status_code == 422, rejected.text
+
+    task = (
+        await db_session.execute(select(Task).where(Task.id == task_id))
+    ).scalar_one()
+    task.status = "in_progress"
+    await db_session.commit()
+    non_completed_task = await client.post(
+        f"/api/v1/workspaces/{ws_body['id']}/chat/messages/{typed_message_id}/feedback",
+        headers=headers,
+        json={"rating": "down"},
+    )
+    assert non_completed_task.status_code == 422, non_completed_task.text
+
+
+@pytest.mark.asyncio
+async def test_completion_feedback_keeps_separate_plan_evidence_for_one_task(
+    client: AsyncClient,
+    db_session,
+):
+    from sqlalchemy import select
+
+    from packages.core.models.base import generate_ulid
+    from packages.core.models.chat_feedback import ChatMessageFeedback
+    from packages.core.models.execution import ExecutionPlan
+    from packages.core.models.runtime_learning import RuntimeEvidence
+    from packages.core.models.task import Conversation, Message, Task
+
+    headers = await _register(client, "ws_chat_feedback_two_plans")
+    workspace = await client.post(
+        "/api/v1/workspaces",
+        headers=headers,
+        json={"name": "Completion Feedback Two Plans"},
+    )
+    workspace_body = workspace.json()
+    conversation_id = generate_ulid()
+    task_id = generate_ulid()
+    plan_a_id = generate_ulid()
+    plan_b_id = generate_ulid()
+    message_a_id = generate_ulid()
+    message_b_id = generate_ulid()
+    db_session.add_all(
+        [
+            Conversation(
+                id=conversation_id,
+                entity_id=workspace_body["entity_id"],
+                workspace_id=workspace_body["id"],
+                title="Two completed plans",
+                channel="workspace",
+                scope="workspace_main",
+            ),
+            Task(
+                id=task_id,
+                entity_id=workspace_body["entity_id"],
+                workspace_id=workspace_body["id"],
+                title="Task with a replan",
+                status="completed",
+            ),
+            ExecutionPlan(
+                id=plan_a_id,
+                entity_id=workspace_body["entity_id"],
+                workspace_id=workspace_body["id"],
+                task_id=task_id,
+                status="completed",
+            ),
+            ExecutionPlan(
+                id=plan_b_id,
+                entity_id=workspace_body["entity_id"],
+                workspace_id=workspace_body["id"],
+                task_id=task_id,
+                status="completed",
+            ),
+            Message(
+                id=message_a_id,
+                conversation_id=conversation_id,
+                role="assistant",
+                content="Plan A completed.",
+                author_kind="agent",
+                message_kind="agent_update",
+                refs=[
+                    {"type": "plan", "id": plan_a_id},
+                    {"type": "task", "id": task_id},
+                ],
+                meta={"feedback_target_kind": "task_completion"},
+            ),
+            Message(
+                id=message_b_id,
+                conversation_id=conversation_id,
+                role="assistant",
+                content="Plan B completed after a replan.",
+                author_kind="agent",
+                message_kind="agent_update",
+                refs=[
+                    {"type": "plan", "id": plan_b_id},
+                    {"type": "task", "id": task_id},
+                ],
+                meta={"feedback_target_kind": "task_completion"},
+            ),
+        ]
+    )
+    await db_session.commit()
+
+    rated_a = await client.post(
+        f"/api/v1/workspaces/{workspace_body['id']}/chat/messages/"
+        f"{message_a_id}/feedback",
+        headers=headers,
+        json={"rating": "up"},
+    )
+    rated_b = await client.post(
+        f"/api/v1/workspaces/{workspace_body['id']}/chat/messages/"
+        f"{message_b_id}/feedback",
+        headers=headers,
+        json={"rating": "down"},
+    )
+    assert rated_a.status_code == 200, rated_a.text
+    assert rated_b.status_code == 200, rated_b.text
+
+    db_session.expire_all()
+    feedback_by_target = {
+        row.target_id: row
+        for row in (
+            await db_session.execute(
+                select(ChatMessageFeedback).where(
+                    ChatMessageFeedback.target_kind == "task_completion",
+                    ChatMessageFeedback.target_id.in_((plan_a_id, plan_b_id)),
+                )
+            )
+        ).scalars()
+    }
+    evidence_by_target = {
+        row.details["target_id"]: row
+        for row in (
+            await db_session.execute(
+                select(RuntimeEvidence).where(
+                    RuntimeEvidence.workspace_id == workspace_body["id"],
+                    RuntimeEvidence.evidence_type
+                    == "task_completion_feedback",
+                )
+            )
+        ).scalars()
+    }
+    assert set(feedback_by_target) == {plan_a_id, plan_b_id}
+    assert set(evidence_by_target) == {plan_a_id, plan_b_id}
+    assert evidence_by_target[plan_a_id].details["rating"] == "up"
+    assert evidence_by_target[plan_b_id].details["rating"] == "down"
+
+    rerated_b = await client.post(
+        f"/api/v1/workspaces/{workspace_body['id']}/chat/messages/"
+        f"{message_b_id}/feedback",
+        headers=headers,
+        json={"rating": "up"},
+    )
+    assert rerated_b.status_code == 200, rerated_b.text
+    assert rerated_b.json()["mutation_sequence"] == 2
+
+    db_session.expire_all()
+    evidence_by_target = {
+        row.details["target_id"]: row
+        for row in (
+            await db_session.execute(
+                select(RuntimeEvidence).where(
+                    RuntimeEvidence.workspace_id == workspace_body["id"],
+                    RuntimeEvidence.evidence_type
+                    == "task_completion_feedback",
+                )
+            )
+        ).scalars()
+    }
+    assert set(evidence_by_target) == {plan_a_id, plan_b_id}
+    assert evidence_by_target[plan_a_id].details["rating"] == "up"
+    assert evidence_by_target[plan_b_id].details["rating"] == "up"
+
+
+@pytest.mark.asyncio
+async def test_workspace_chat_plan_completion_feedback_supports_taskless_plan_and_deletion(
+    client: AsyncClient,
+    db_session,
+):
+    from sqlalchemy import select
+    from packages.core.models.base import generate_ulid
+    from packages.core.models.chat_feedback import ChatMessageFeedback
+    from packages.core.models.execution import ExecutionPlan
+    from packages.core.models.runtime_learning import RuntimeEvidence
+    from packages.core.models.task import Conversation, Message
+
+    headers = await _register(client, "ws_chat_plan_completion_feedback")
+    ws = await client.post(
+        "/api/v1/workspaces",
+        headers=headers,
+        json={"name": "Plan Completion Feedback"},
+    )
+    ws_body = ws.json()
+    conversation_id = generate_ulid()
+    plan_id = generate_ulid()
+    message_id = generate_ulid()
+    db_session.add(
+        Conversation(
+            id=conversation_id,
+            entity_id=ws_body["entity_id"],
+            workspace_id=ws_body["id"],
+            title="Plan completion",
+            channel="workspace",
+            scope="workspace_main",
+        )
+    )
+    db_session.add(
+        ExecutionPlan(
+            id=plan_id,
+            entity_id=ws_body["entity_id"],
+            workspace_id=ws_body["id"],
+            task_id=None,
+            status="completed",
+        )
+    )
+    db_session.add(
+        Message(
+            id=message_id,
+            conversation_id=conversation_id,
+            role="assistant",
+            content="Plan completed with the requested deliverable.",
+            author_kind="agent",
+            message_kind="agent_update",
+            refs=[{"type": "plan", "id": plan_id}],
+            meta={"feedback_target_kind": "plan_completion"},
+        )
+    )
+    await db_session.commit()
+
+    rated = await client.post(
+        f"/api/v1/workspaces/{ws_body['id']}/chat/messages/{message_id}/feedback",
+        headers=headers,
+        json={"rating": "up"},
+    )
+    assert rated.status_code == 200, rated.text
+    assert rated.json()["feedback_target_kind"] == "plan_completion"
+    assert rated.json()["feedback_target_id"] == plan_id
+    assert rated.json()["feedback_task_id"] is None
+
+    feedback = (
+        await db_session.execute(
+            select(ChatMessageFeedback).where(
+                ChatMessageFeedback.target_kind == "plan_completion",
+                ChatMessageFeedback.target_id == plan_id,
+            )
+        )
+    ).scalar_one()
+    assert feedback.plan_id == plan_id
+    assert feedback.task_id is None
+    evidence = (
+        await db_session.execute(
+            select(RuntimeEvidence).where(
+                RuntimeEvidence.evidence_type == "plan_completion_feedback",
+                RuntimeEvidence.details["target_id"].as_string() == plan_id,
+            )
+        )
+    ).scalar_one()
+    assert evidence.task_id is None
+    assert evidence.details["target_kind"] == "plan_completion"
+    feedback_id = feedback.id
+    evidence_id = evidence.id
+
+    deleted = await client.delete(
+        f"/api/v1/chat/conversations/{conversation_id}",
+        headers=headers,
+    )
+    assert deleted.status_code == 204, deleted.text
+    await db_session.rollback()
+    assert (
+        await db_session.execute(
+            select(ChatMessageFeedback).where(ChatMessageFeedback.id == feedback_id)
+        )
+    ).scalar_one_or_none() is None
+    assert (
+        await db_session.execute(
+            select(RuntimeEvidence).where(RuntimeEvidence.id == evidence_id)
+        )
+    ).scalar_one_or_none() is None
+
+
+@pytest.mark.asyncio
+async def test_task_delete_retires_completion_feedback_evidence_and_message_marker(
+    client: AsyncClient,
+    db_session,
+    monkeypatch,
+):
+    from sqlalchemy import select
+
+    from packages.core.models.base import generate_ulid
+    from packages.core.models.chat_feedback import ChatMessageFeedback
+    from packages.core.models.execution import ExecutionPlan
+    from packages.core.models.runtime_learning import RuntimeEvidence
+    from packages.core.models.task import Conversation, Message, Task
+
+    headers = await _register(client, "ws_chat_completion_task_delete")
+    me = (await client.get("/api/v1/auth/me", headers=headers)).json()
+    workspace = await client.post(
+        "/api/v1/workspaces",
+        headers=headers,
+        json={"name": "Completion Feedback Task Delete"},
+    )
+    workspace_body = workspace.json()
+    conversation_id = generate_ulid()
+    task_id = generate_ulid()
+    plan_id = generate_ulid()
+    message_id = generate_ulid()
+
+    db_session.add_all(
+        [
+            Conversation(
+                id=conversation_id,
+                entity_id=workspace_body["entity_id"],
+                workspace_id=workspace_body["id"],
+                title="Completion projection",
+                channel="workspace",
+                scope="workspace_main",
+            ),
+            Task(
+                id=task_id,
+                entity_id=workspace_body["entity_id"],
+                workspace_id=workspace_body["id"],
+                title="Delete completed task",
+                status="completed",
+            ),
+            ExecutionPlan(
+                id=plan_id,
+                entity_id=workspace_body["entity_id"],
+                workspace_id=workspace_body["id"],
+                task_id=task_id,
+                status="completed",
+            ),
+            Message(
+                id=message_id,
+                conversation_id=conversation_id,
+                role="assistant",
+                content="Task complete — delivery is ready.",
+                author_kind="agent",
+                message_kind="agent_update",
+                refs=[
+                    {"type": "plan", "id": plan_id},
+                    {"type": "task", "id": task_id},
+                ],
+                meta={
+                    "feedback_target_kind": "task_completion",
+                },
+            ),
+        ]
+    )
+    await db_session.commit()
+    db_session.add_all(
+        [
+            ChatMessageFeedback(
+                entity_id=workspace_body["entity_id"],
+                user_id=me["id"],
+                conversation_id=conversation_id,
+                message_id=message_id,
+                target_kind="task_completion",
+                target_id=plan_id,
+                task_id=task_id,
+                plan_id=plan_id,
+                rating="up",
+                mutation_sequence=1,
+            ),
+            RuntimeEvidence(
+                entity_id=workspace_body["entity_id"],
+                workspace_id=workspace_body["id"],
+                user_id=me["id"],
+                conversation_id=conversation_id,
+                message_id=message_id,
+                task_id=task_id,
+                evidence_type="task_completion_feedback",
+                source="workspace_chat",
+                status="succeeded",
+                summary="Current completion feedback",
+                details={
+                    "target_kind": "task_completion",
+                    "target_id": plan_id,
+                    "task_id": task_id,
+                    "plan_id": plan_id,
+                    "rating": "up",
+                },
+                metrics={"helpful": 1},
+            ),
+            RuntimeEvidence(
+                entity_id=workspace_body["entity_id"],
+                workspace_id=workspace_body["id"],
+                user_id=me["id"],
+                conversation_id=conversation_id,
+                message_id=message_id,
+                task_id=None,
+                evidence_type="plan_completion_feedback",
+                source="workspace_chat",
+                status="succeeded",
+                summary="Legacy completion feedback",
+                details={"plan_id": plan_id, "rating": "down"},
+                metrics={"helpful": 0},
+            ),
+        ]
+    )
+    await db_session.commit()
+
+    deleted = await client.delete(
+        f"/api/v1/tasks/{task_id}",
+        headers=headers,
+    )
+    assert deleted.status_code == 204, deleted.text
+
+    await db_session.rollback()
+    assert (
+        await db_session.execute(select(Task).where(Task.id == task_id))
+    ).scalar_one_or_none() is None
+    assert (
+        await db_session.execute(
+            select(ChatMessageFeedback).where(
+                ChatMessageFeedback.task_id == task_id
+            )
+        )
+    ).scalars().all() == []
+    assert (
+        await db_session.execute(
+            select(RuntimeEvidence).where(
+                RuntimeEvidence.workspace_id == workspace_body["id"],
+                RuntimeEvidence.evidence_type.in_(
+                    (
+                        "task_completion_feedback",
+                        "plan_completion_feedback",
+                    )
+                ),
+            )
+        )
+    ).scalars().all() == []
+    message = (
+        await db_session.execute(select(Message).where(Message.id == message_id))
+    ).scalar_one()
+    assert message.meta["feedback_target_kind"] == "none"
+
+    rerated = await client.post(
+        f"/api/v1/workspaces/{workspace_body['id']}/chat/messages/{message_id}/feedback",
+        headers=headers,
+        json={"rating": "down"},
+    )
+    assert rerated.status_code == 422, rerated.text
+
+    # A worker can finish after the API transaction deleted its Task. The
+    # completion producer must share the feedback-subject lock and revalidate
+    # lineage instead of recreating a rateable main-chat projection.
+    import packages.core.database as database
+    from packages.core.workspace_chat import notifiers
+
+    monkeypatch.setattr(notifiers, "async_session", database.async_session)
+    await notifiers.notify_plan_completed(
+        entity_id=workspace_body["entity_id"],
+        workspace_id=workspace_body["id"],
+        plan_id=plan_id,
+        task_id=task_id,
+        task_title="Delete completed task",
+        duration_seconds=1.0,
+        cost_usd=None,
+        steps=[],
+    )
+
+    await db_session.rollback()
+    completion_messages = (
+        await db_session.execute(
+            select(Message)
+            .join(Conversation, Conversation.id == Message.conversation_id)
+            .where(Conversation.workspace_id == workspace_body["id"])
+        )
+    ).scalars().all()
+    assert all(
+        (message.meta or {}).get("feedback_target_kind")
+        not in {"task_completion", "plan_completion"}
+        for message in completion_messages
+    )
+
+
+def test_task_completion_feedback_policy_requires_a_typed_target():
+    from packages.core.models.task import Message
+    from packages.core.services.chat_feedback import (
+        ChatFeedbackTargetKind,
+        ChatFeedbackTargetPolicyFactory,
+    )
+
+    task_policy = ChatFeedbackTargetPolicyFactory.create(
+        ChatFeedbackTargetKind.TASK_COMPLETION
+    )
+    common = {
+        "conversation_id": "conversation",
+        "role": "assistant",
+        "author_kind": "agent",
+        "message_kind": "agent_update",
+        "refs": [{"type": "task", "id": "task"}],
+    }
+    typed = Message(
+        **common,
+        content="任务已完成",
+        meta={"feedback_target_kind": "task_completion"},
+    )
+    untyped = Message(**common, content="✅ **Task complete — Delivered**")
+    incidental = Message(**common, content="Status: task complete is the next milestone")
+
+    assert task_policy.evaluate(typed, workspace_scoped=True).eligible is True
+    assert task_policy.evaluate(untyped, workspace_scoped=True).eligible is False
+    assert task_policy.evaluate(incidental, workspace_scoped=True).eligible is False
+
+    plan_completion = Message(
+        **{**common, "refs": [{"type": "plan", "id": "plan"}]},
+        content="计划已完成",
+        meta={"feedback_target_kind": "plan_completion"},
+    )
+    disabled_projection = Message(
+        **common,
+        content="✅ **Task complete — Delivered**",
+        meta={"feedback_target_kind": "none"},
+    )
+    assert ChatFeedbackTargetPolicyFactory.create(
+        ChatFeedbackTargetKind.PLAN_COMPLETION
+    ).evaluate(plan_completion, workspace_scoped=True).eligible is True
+    assert ChatFeedbackTargetPolicyFactory.create(
+        ChatFeedbackTargetKind.NONE
+    ).evaluate(disabled_projection, workspace_scoped=True).eligible is False
 
 
 @pytest.mark.asyncio
@@ -7622,7 +9898,7 @@ async def test_workspace_agent_can_manage_workspace_knowledge(client: AsyncClien
         )
     )
     assert added["updated"] is True
-    assert added["added"][0]["id"] == doc_id
+    assert added["added"][0]["document_id"] == doc_id
 
     group = (await db_session.execute(select(DocumentGroup).where(DocumentGroup.id == group_id))).scalar_one()
     workspace = (await db_session.execute(select(Workspace).where(Workspace.id == ws_body["id"]))).scalar_one()
@@ -7654,7 +9930,7 @@ async def test_workspace_agent_can_manage_workspace_knowledge(client: AsyncClien
         )
     )
     listed_group = next(item for item in listed["groups"] if item["id"] == group_id)
-    assert listed_group["documents"][0]["id"] == doc_id
+    assert listed_group["documents"][0]["document_id"] == doc_id
 
     removed = json.loads(
         await _workspace_agent_handler(
@@ -7942,7 +10218,11 @@ async def test_workspace_staff_assignment_upserts_existing_row(client: AsyncClie
     first = await client.post(
         f"/api/v1/workspaces/{ws_id}/staff",
         headers=headers,
-        json={"staff_id": staff_id, "role": "reviewer"},
+        json={
+            "staff_id": staff_id,
+            "role": "reviewer",
+            "expires_at": "2099-01-01T00:00:00Z",
+        },
     )
     second = await client.post(
         f"/api/v1/workspaces/{ws_id}/staff",
@@ -7957,6 +10237,8 @@ async def test_workspace_staff_assignment_upserts_existing_row(client: AsyncClie
     target_rows = [row for row in listed.json() if row["staff_id"] == staff_id]
     assert len(target_rows) == 1
     assert target_rows[0]["role"] == "lead"
+    assert target_rows[0]["expires_at"] is None
+    assert target_rows[0]["display_name"] == "Workspace Reviewer"
 
 
 @pytest.mark.asyncio
@@ -8063,6 +10345,170 @@ async def test_scheduler_skips_workspace_job_when_workspace_paused(client: Async
     assert run.status == "skipped"
     assert run.result == {"skipped": True, "reason": "workspace_paused"}
     assert job.last_status == "skipped"
+
+
+@pytest.mark.asyncio
+async def test_paused_workspace_rejects_pending_action_without_resuming_plan(
+    client: AsyncClient,
+    db_session,
+    monkeypatch,
+):
+    from sqlalchemy import select
+
+    import packages.core.tasks.ai_tasks as ai_tasks
+    from packages.core.models.base import generate_ulid
+    from packages.core.models.execution import ExecutionPlan, ExecutionStep
+    from packages.core.models.task import Conversation, Message, Task
+
+    headers = await _register(client, "ws_paused_pending_action")
+    me = (await client.get("/api/v1/auth/me", headers=headers)).json()
+    workspace = (await client.post(
+        "/api/v1/workspaces",
+        headers=headers,
+        json={"name": "Paused pending action"},
+    )).json()
+    task = Task(
+        id=generate_ulid(),
+        entity_id=me["entity_id"],
+        workspace_id=workspace["id"],
+        title="Waiting for human input",
+        status="waiting_on_customer",
+        details={},
+    )
+    plan = ExecutionPlan(
+        id=generate_ulid(),
+        entity_id=me["entity_id"],
+        workspace_id=workspace["id"],
+        task_id=task.id,
+        status="paused",
+    )
+    step = ExecutionStep(
+        id=generate_ulid(),
+        plan_id=plan.id,
+        entity_id=me["entity_id"],
+        workspace_id=workspace["id"],
+        step_key="request_input",
+        kind="human",
+        step_status="waiting_human",
+    )
+    conversation = Conversation(
+        id=generate_ulid(),
+        entity_id=me["entity_id"],
+        workspace_id=workspace["id"],
+        title="Workspace chat",
+        channel="workspace",
+        scope="workspace_main",
+    )
+    message = Message(
+        id=generate_ulid(),
+        conversation_id=conversation.id,
+        role="assistant",
+        content="Please provide the missing input.",
+        author_kind="agent",
+        message_kind="hitl_request",
+        pending_action={
+            "kind": "needs_input",
+            "task_id": task.id,
+            "plan_id": plan.id,
+            "step_id": step.id,
+        },
+    )
+    db_session.add_all([task, plan, step, conversation, message])
+    await db_session.commit()
+
+    queued: list[str] = []
+    monkeypatch.setattr(ai_tasks.run_plan, "delay", queued.append)
+    pause = await client.post(
+        f"/api/v1/workspaces/{workspace['id']}/pause",
+        headers=headers,
+    )
+    assert pause.status_code == 200, pause.text
+
+    response = await client.post(
+        f"/api/v1/workspaces/{workspace['id']}/chat/messages/{message.id}/resolve",
+        headers=headers,
+        json={"choice": "provide_answers", "payload": {"answer": "ready"}},
+    )
+
+    assert response.status_code == 409, response.text
+    step_id = step.id
+    plan_id = plan.id
+    message_id = message.id
+    db_session.expire_all()
+    stored_step = (await db_session.execute(
+        select(ExecutionStep).where(ExecutionStep.id == step_id)
+    )).scalar_one()
+    stored_plan = (await db_session.execute(
+        select(ExecutionPlan).where(ExecutionPlan.id == plan_id)
+    )).scalar_one()
+    stored_message = (await db_session.execute(
+        select(Message).where(Message.id == message_id)
+    )).scalar_one()
+    assert stored_step.step_status == "waiting_human"
+    assert stored_plan.status == "paused"
+    assert stored_message.resolved_at is None
+    assert queued == []
+
+
+@pytest.mark.asyncio
+async def test_scheduler_disables_goal_measurement_when_workspace_runtime_is_off(
+    client: AsyncClient,
+    db_session,
+):
+    from datetime import datetime, timezone
+    from decimal import Decimal
+    from sqlalchemy import select
+
+    from packages.core.models.base import generate_ulid
+    from packages.core.models.goal import Goal
+    from packages.core.models.scheduler import ScheduledJob, ScheduledJobRun
+    from packages.core.tasks.scheduler_tasks import _dispatch_job
+
+    headers = await _register(client, "ws_goal_scheduler_runtime_guard")
+    ws = await client.post(
+        "/api/v1/workspaces",
+        headers=headers,
+        json={"name": "Goal scheduler runtime guard", "heartbeat_enabled": False},
+    )
+    ws_body = ws.json()
+    goal = Goal(
+        id=generate_ulid(),
+        entity_id=ws_body["entity_id"],
+        workspace_id=ws_body["id"],
+        title="Do not measure while autonomy is off",
+        metric_key="guarded_measurement_count",
+        target_value=Decimal("3"),
+        measurement_source={"provider": "workspace_internal", "params": {}},
+        measurement_cadence="weekly",
+        status="active",
+    )
+    db_session.add(goal)
+    job = ScheduledJob(
+        id=generate_ulid(),
+        job_id=f"gm:{goal.id}",
+        entity_id=ws_body["entity_id"],
+        workspace_id=ws_body["id"],
+        name="Stale automatic Goal measurement",
+        job_type="interval",
+        schedule_kind="every",
+        every_seconds=60,
+        execution_type="goal_measurement",
+        execution_target={"goal_id": goal.id},
+        goal_id=goal.id,
+        enabled=True,
+    )
+    db_session.add(job)
+    await db_session.flush()
+
+    await _dispatch_job(db_session, job, datetime.now(timezone.utc))
+
+    run = (await db_session.execute(
+        select(ScheduledJobRun).where(ScheduledJobRun.job_id == job.job_id)
+    )).scalar_one()
+    assert run.status == "skipped"
+    assert run.result == {"skipped": True, "reason": "workspace_runtime_disabled"}
+    assert job.last_status == "skipped"
+    assert job.enabled is False
 
 
 @pytest.mark.asyncio
@@ -8197,7 +10643,8 @@ async def test_custom_agent_provisioning_rejects_unknown_tools_and_cross_entity_
     other_entity_id = generate_ulid()
     known_tool_id = generate_ulid()
     entity_skill_id = generate_ulid()
-    public_skill_id = generate_ulid()
+    platform_skill_id = generate_ulid()
+    cross_entity_public_skill_id = generate_ulid()
     other_skill_id = generate_ulid()
 
     db_session.add(
@@ -8221,11 +10668,22 @@ async def test_custom_agent_provisioning_rejects_unknown_tools_and_cross_entity_
     )
     db_session.add(
         Skill(
-            id=public_skill_id,
+            id=platform_skill_id,
+            entity_id=None,
+            name="Platform Skill",
+            slug="platform_skill",
+            system_prompt="Use the platform-approved workflow.",
+            is_public=True,
+            status="active",
+        )
+    )
+    db_session.add(
+        Skill(
+            id=cross_entity_public_skill_id,
             entity_id=other_entity_id,
-            name="Public Skill",
-            slug="public_skill",
-            system_prompt="Use the public workflow.",
+            name="Cross-entity Public Skill",
+            slug="cross_entity_public_skill",
+            system_prompt="This public workflow belongs to another entity.",
             is_public=True,
             status="active",
         )
@@ -8250,13 +10708,19 @@ async def test_custom_agent_provisioning_rejects_unknown_tools_and_cross_entity_
             agent_name="Scoped Agent",
             system_prompt="You are Scoped Agent. Work only with explicitly bound tools and skills.",
             tool_bindings=["known_entity_tool", "ghost_tool"],
-            skill_bindings=["entity_skill", "public_skill", other_skill_id],
+            skill_bindings=[
+                "entity_skill",
+                "platform_skill",
+                "cross_entity_public_skill",
+                other_skill_id,
+            ],
         ),
     )
 
     assert result.bound_tools == ["known_entity_tool"]
     assert "tool not found: ghost_tool" in result.warnings
-    assert sorted(result.bound_skills) == ["entity_skill", "public_skill"]
+    assert sorted(result.bound_skills) == ["entity_skill", "platform_skill"]
+    assert "skill not found: cross_entity_public_skill" in result.warnings
     assert f"skill not found: {other_skill_id}" in result.warnings
 
     bound_tool_ids = set(
@@ -8278,7 +10742,18 @@ async def test_custom_agent_provisioning_rejects_unknown_tools_and_cross_entity_
         .scalars()
         .all()
     )
-    assert bound_skill_ids == {entity_skill_id, public_skill_id}
+    assert entity_skill_id in bound_skill_ids
+    assert platform_skill_id not in bound_skill_ids
+    assert cross_entity_public_skill_id not in bound_skill_ids
+    assert other_skill_id not in bound_skill_ids
+    assert len(bound_skill_ids) == 2
+    installed_platform_skill_id = next(
+        skill_id for skill_id in bound_skill_ids if skill_id != entity_skill_id
+    )
+    installed_platform_skill = await db_session.get(Skill, installed_platform_skill_id)
+    assert installed_platform_skill is not None
+    assert installed_platform_skill.entity_id == entity_id
+    assert installed_platform_skill.config["source_skill_id"] == platform_skill_id
 
 
 @pytest.mark.asyncio
@@ -8292,6 +10767,7 @@ async def test_workspace_architect_custom_agent_redesign_clears_stale_integratio
     from packages.core.services.workspace_setup_service import DEFAULT_FIELDS
 
     entity_id = generate_ulid()
+    user_id = generate_ulid()
     fields = copy.deepcopy(DEFAULT_FIELDS)
     fields["agent_mappings"] = [
         {
@@ -8341,7 +10817,7 @@ async def test_workspace_architect_custom_agent_redesign_clears_stale_integratio
     ]
     draft = WorkspaceDraft(
         entity_id=entity_id,
-        user_id=None,
+        user_id=user_id,
         fields=fields,
         messages=[],
         missing=[],
@@ -8355,6 +10831,7 @@ async def test_workspace_architect_custom_agent_redesign_clears_stale_integratio
         await _request_custom_agent(
             db_session,
             entity_id=entity_id,
+            user_id=user_id,
             draft_id=draft.id,
             service_key="wechat_growth",
             agent_name="WeChat Growth Agent",
@@ -8386,6 +10863,7 @@ async def test_workspace_architect_can_remove_explicit_integration_warning(db_se
     from packages.core.services.workspace_setup_service import DEFAULT_FIELDS
 
     entity_id = generate_ulid()
+    user_id = generate_ulid()
     fields = copy.deepcopy(DEFAULT_FIELDS)
     fields["flagged_integrations"] = [
         {
@@ -8403,7 +10881,7 @@ async def test_workspace_architect_can_remove_explicit_integration_warning(db_se
     ]
     draft = WorkspaceDraft(
         entity_id=entity_id,
-        user_id=None,
+        user_id=user_id,
         fields=fields,
         messages=[],
         missing=[],
@@ -8417,6 +10895,7 @@ async def test_workspace_architect_can_remove_explicit_integration_warning(db_se
         await _remove(
             db_session,
             entity_id=entity_id,
+            user_id=user_id,
             draft_id=draft.id,
             kind="integration",
             key="OpenAI",
@@ -8434,7 +10913,7 @@ async def test_workspace_architect_can_remove_explicit_integration_warning(db_se
 
 
 @pytest.mark.asyncio
-async def test_workspace_architect_lint_requires_goal_and_materializable_agent_bindings(db_session):
+async def test_workspace_architect_lint_allows_no_goal_but_requires_materializable_agent_bindings(db_session):
     import copy
     import json
 
@@ -8444,6 +10923,7 @@ async def test_workspace_architect_lint_requires_goal_and_materializable_agent_b
     from packages.core.services.workspace_setup_service import DEFAULT_FIELDS
 
     entity_id = generate_ulid()
+    creator_id = generate_ulid()
     fields = copy.deepcopy(DEFAULT_FIELDS)
     fields.update({
         "name": "Executable Draft",
@@ -8472,6 +10952,7 @@ async def test_workspace_architect_lint_requires_goal_and_materializable_agent_b
     })
     draft = WorkspaceDraft(
         entity_id=entity_id,
+        user_id=creator_id,
         fields=fields,
         messages=[],
         missing=[],
@@ -8484,6 +10965,7 @@ async def test_workspace_architect_lint_requires_goal_and_materializable_agent_b
     result = json.loads(await _lint_draft(
         db_session,
         entity_id=entity_id,
+        user_id=creator_id,
         draft_id=draft.id,
     ))
     p0_locations = {
@@ -8492,7 +10974,7 @@ async def test_workspace_architect_lint_requires_goal_and_materializable_agent_b
         if issue["severity"] == "P0"
     }
 
-    assert "goals" in p0_locations
+    assert "goals" not in p0_locations
     assert "agent_mappings.content_ops.tool_bindings" in p0_locations
     assert "agent_mappings.content_ops.skill_bindings" in p0_locations
     assert "agent_mappings.content_ops.mcp_bindings" in p0_locations
@@ -8509,9 +10991,11 @@ async def test_workspace_architect_agent_inventory_exposes_bindings_and_respects
     from packages.core.models.workspace import Agent, AgentToolBinding, ToolDefinition
 
     entity_id = generate_ulid()
+    user_id = generate_ulid()
     agent = Agent(
         id=generate_ulid(),
         entity_id=entity_id,
+        owner_user_id=user_id,
         name="Inventory Agent",
         system_prompt="Operate the inventory test capability.",
         status="active",
@@ -8531,6 +11015,7 @@ async def test_workspace_architect_agent_inventory_exposes_bindings_and_respects
     skill = Skill(
         id=generate_ulid(),
         entity_id=entity_id,
+        owner_user_id=user_id,
         name="Inventory Skill",
         slug=f"inventory-skill-{generate_ulid().lower()}",
         system_prompt="Run the inventory skill.",
@@ -8568,6 +11053,7 @@ async def test_workspace_architect_agent_inventory_exposes_bindings_and_respects
     result = json.loads(await _search_entity_agents(
         db_session,
         entity_id=entity_id,
+        user_id=user_id,
     ))
     by_id = {candidate["id"]: candidate for candidate in result["agents"]}
 
@@ -8592,6 +11078,7 @@ async def test_workspace_architect_channel_remove_cleans_runtime_references(db_s
     from packages.core.services.workspace_setup_service import DEFAULT_FIELDS
 
     entity_id = generate_ulid()
+    user_id = generate_ulid()
     fields = copy.deepcopy(DEFAULT_FIELDS)
     fields.update(
         {
@@ -8667,7 +11154,7 @@ async def test_workspace_architect_channel_remove_cleans_runtime_references(db_s
     )
     draft = WorkspaceDraft(
         entity_id=entity_id,
-        user_id=None,
+        user_id=user_id,
         fields=fields,
         messages=[],
         missing=[],
@@ -8681,6 +11168,7 @@ async def test_workspace_architect_channel_remove_cleans_runtime_references(db_s
         await _remove(
             db_session,
             entity_id=entity_id,
+            user_id=user_id,
             draft_id=draft.id,
             kind="channel",
             key="email",
@@ -8754,6 +11242,7 @@ async def test_workspace_architect_replaces_same_signature_automation(db_session
     from packages.core.services.workspace_setup_service import DEFAULT_FIELDS
 
     entity_id = generate_ulid()
+    user_id = generate_ulid()
     fields = copy.deepcopy(DEFAULT_FIELDS)
     fields["automations"] = [
         {
@@ -8771,7 +11260,7 @@ async def test_workspace_architect_replaces_same_signature_automation(db_session
     ]
     draft = WorkspaceDraft(
         entity_id=entity_id,
-        user_id=None,
+        user_id=user_id,
         fields=fields,
         messages=[],
         missing=[],
@@ -8785,6 +11274,7 @@ async def test_workspace_architect_replaces_same_signature_automation(db_session
         await _propose_automation(
             db_session,
             entity_id=entity_id,
+            user_id=user_id,
             draft_id=draft.id,
             automation_key="new_inquiry_draft",
             description="Updated webchat inquiry automation.",
@@ -8873,10 +11363,11 @@ async def test_workspace_draft_field_patch_reconciles_stale_integration_flags(cl
 
 
 @pytest.mark.asyncio
-async def test_finalize_setup_materializes_architect_goal_target(db_session):
+async def test_finalize_setup_materializes_goal_without_enabling_unready_runtime(db_session):
     from sqlalchemy import select
     from packages.core.models.goal import Goal
     from packages.core.models.scheduler import ScheduledJob
+    from packages.core.models.workspace import Workspace
     from packages.core.services.workspace_setup_service import WorkspaceSetupSession, finalize_setup
 
     session = WorkspaceSetupSession(
@@ -8906,6 +11397,7 @@ async def test_finalize_setup_materializes_architect_goal_target(db_session):
 
     workspace_id = await finalize_setup(session, db_session)
     await db_session.commit()
+    workspace = await db_session.get(Workspace, workspace_id)
     goal = (await db_session.execute(select(Goal).where(Goal.workspace_id == workspace_id))).scalar_one()
     measurement_jobs = (
         (
@@ -8927,10 +11419,55 @@ async def test_finalize_setup_materializes_architect_goal_target(db_session):
         "params": {"mode": "linked_task_impact"},
     }
     assert goal.measurement_cadence == "weekly"
-    assert len(measurement_jobs) == 1
-    assert measurement_jobs[0].job_id == f"gm:{goal.id}"
-    assert measurement_jobs[0].enabled is True
-    assert measurement_jobs[0].every_seconds == 604800.0
+    assert workspace is not None
+    assert workspace.status == "needs_setup"
+    assert workspace.heartbeat_enabled is False
+    assert measurement_jobs == []
+
+
+@pytest.mark.asyncio
+async def test_finalize_setup_accepts_chat_channel_shorthand(db_session):
+    from sqlalchemy import select
+    from packages.core.models.channel import ChannelConfig
+    from packages.core.models.workspace import Workspace
+    from packages.core.services.workspace_setup_service import WorkspaceSetupSession, finalize_setup
+
+    session = WorkspaceSetupSession(
+        entity_id="ENTCHATSHORTHAND000000000",
+        fields={
+            "name": "Chat Shorthand Workspace",
+            "kind": "team",
+            "operating_context": "Plan weekly product delivery in Chat.",
+            "primary_work": "Turn product requirements into weekly delivery.",
+            "services": [],
+            "agent_mappings": [],
+            "goals": [],
+            "flagged_integrations": ["legacy-chat-marker"],
+            "channel_config": {
+                "channels": ["chat", {"channel_type": "chat"}],
+                "internal_channel": {"channel_type": "chat"},
+            },
+        },
+        messages=[],
+        ready=True,
+        missing=[],
+    )
+
+    workspace_id = await finalize_setup(session, db_session)
+    await db_session.commit()
+    workspace = await db_session.get(Workspace, workspace_id)
+    channel_configs = (
+        await db_session.execute(
+            select(ChannelConfig).where(ChannelConfig.workspace_id == workspace_id)
+        )
+    ).scalars().all()
+
+    assert workspace is not None
+    assert workspace.operating_model["channel_config"]["channels"] == [
+        "chat",
+        {"channel_type": "chat"},
+    ]
+    assert channel_configs == []
 
 
 @pytest.mark.asyncio
@@ -8943,16 +11480,38 @@ async def test_finalize_draft_serializes_concurrent_requests(db_session, monkeyp
     from packages.core.services import workspace_draft_service
 
     entity_id = generate_ulid()
+    creator_id = generate_ulid()
     workspace_id = generate_ulid()
     draft = WorkspaceDraft(
         entity_id=entity_id,
+        user_id=creator_id,
         fields={
             "name": "Concurrent Finalize",
             "kind": "operations",
             "operating_context": "Verify finalize serialization.",
             "primary_work": "Create one workspace exactly once.",
-            "services": [],
-            "agent_mappings": [],
+            "services": [
+                {
+                    "service_key": "workspace_operations",
+                    "name": "Workspace Operations",
+                    "description": "Handle the configured workspace work.",
+                    "autonomy_level": "supervised",
+                    "owner_role": "operator",
+                }
+            ],
+            "agent_mappings": [
+                {
+                    "service_key": "workspace_operations",
+                    "strategy": "create_custom",
+                    "create_agent_draft": {
+                        "agent_name": "Workspace Operations Agent",
+                        "system_prompt": (
+                            "Handle workspace operations and stay within this capability."
+                        ),
+                        "business_capabilities": ["runtime.discovery"],
+                    },
+                }
+            ],
             "channel_config": {},
         },
         messages=[],
@@ -8971,7 +11530,15 @@ async def test_finalize_draft_serializes_concurrent_requests(db_session, monkeyp
         await asyncio.sleep(0.1)
         return workspace_id
 
+    async def _fake_refresh_missing_from_lint(db, draft):
+        return True
+
     monkeypatch.setattr(workspace_draft_service, "finalize_setup", _fake_finalize_setup)
+    monkeypatch.setattr(
+        workspace_draft_service,
+        "_refresh_missing_from_lint",
+        _fake_refresh_missing_from_lint,
+    )
 
     async def _finalize_once() -> str:
         async with async_session() as session:
@@ -8979,6 +11546,7 @@ async def test_finalize_draft_serializes_concurrent_requests(db_session, monkeyp
                 session,
                 draft_id=draft.id,
                 entity_id=entity_id,
+                user_id=creator_id,
             )
             await session.commit()
             return result
@@ -9044,8 +11612,10 @@ async def test_workspace_architect_sets_credit_budget(db_session):
     from packages.core.models.workspace_draft import WorkspaceDraft
 
     entity_id = generate_ulid()
+    user_id = generate_ulid()
     draft = WorkspaceDraft(
         entity_id=entity_id,
+        user_id=user_id,
         fields={},
         messages=[],
         missing=[],
@@ -9058,6 +11628,7 @@ async def test_workspace_architect_sets_credit_budget(db_session):
     raw = await _set_budget(
         db_session,
         entity_id=entity_id,
+        user_id=user_id,
         draft_id=draft.id,
         monthly_budget_credits=12000,
         auto_pause_on_budget=False,

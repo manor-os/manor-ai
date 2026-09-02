@@ -266,12 +266,23 @@ async def resolve_official_provider_credential(
                             source=f"{provider}.official_db_key",
                         )
                     else:
-                        logger.warning(
-                            "Official model provider key for %s still uses legacy scheme=%s; re-save it from Admin → Models.",
-                            provider,
-                            row.credential_scheme,
+                        from packages.core.credentials import (
+                            Requester,
+                            get_credential_service,
                         )
-                        key = ""
+
+                        payload = get_credential_service().lease_model_provider_key(
+                            row,
+                            requester=Requester(
+                                kind="system",
+                                id=f"model_provider:{provider}",
+                            ),
+                            reason=reason,
+                        )
+                        key = sanitize_provider_api_key(
+                            str(payload.get("api_key") or ""),
+                            source=f"{provider}.official_db_key",
+                        )
                     if key:
                         cfg = dict(row.config or {})
                         return OfficialProviderCredential(

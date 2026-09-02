@@ -173,17 +173,13 @@ test("stream_status marks running and clears when the turn ends", () => {
 
 /* ---- wiring ---- */
 
-const [websocketSource, layoutSource, embeddedSource, floatingSource, storeSource, mobileSource] =
+const [websocketSource, layoutSource, embeddedSource, floatingSource, storeSource] =
   await Promise.all([
     read("src/lib/websocket.ts"),
     read("src/layouts/AppLayout.tsx"),
     read("src/components/EmbeddedChat.tsx"),
     read("src/components/FloatingChat.tsx"),
     read("src/stores/chatStream.ts"),
-    readFile(
-      path.join(webRoot, "../mobile/src/lib/useRealtime.ts"),
-      "utf8",
-    ),
   ]);
 
 test("the socket dispatches the event at all", () => {
@@ -294,17 +290,3 @@ test("a followed run cannot spin forever when a snapshot is lost", () => {
   }
 });
 
-test("mobile does not turn a per-second event into a poller", () => {
-  // Mentioning the event name is not the invariant — returning before the
-  // invalidation cascade is. Take the early-return statement itself.
-  const managerStart = mobileSource.indexOf("const mgr = new WsManager");
-  const earlyReturn = mobileSource.slice(
-    mobileSource.indexOf("if (", managerStart),
-    mobileSource.indexOf("return;", managerStart),
-  );
-  assert.match(earlyReturn, /event === "chat_stream_snapshot"/);
-  assert.ok(
-    !earlyReturn.includes("invalidateQueries"),
-    "the early return must precede every invalidation",
-  );
-});

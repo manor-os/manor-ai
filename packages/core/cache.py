@@ -14,9 +14,9 @@ Usage:
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
-import asyncio
 from functools import wraps
 from typing import Any, Optional
 
@@ -26,38 +26,113 @@ logger = logging.getLogger(__name__)
 
 _redis = None
 _redis_loop = None
+_redis_by_loop = {}
+
+_INCREMENT_WITH_TTL_SCRIPT = """
+local count = redis.call('INCR', KEYS[1])
+local ttl = redis.call('TTL', KEYS[1])
+if ttl < 0 then
+    redis.call('EXPIRE', KEYS[1], ARGV[1])
+    ttl = tonumber(ARGV[1])
+end
+return {count, ttl}
+"""
+
+_COUNTER_VALUE_WITH_TTL_SCRIPT = """
+local value = redis.call('GET', KEYS[1])
+if not value then
+    return {0, -2}
+end
+local count = tonumber(value)
+local ttl = redis.call('TTL', KEYS[1])
+if ttl < 0 then
+    redis.call('EXPIRE', KEYS[1], ARGV[1])
+    ttl = tonumber(ARGV[1])
+end
+return {count, ttl}
+"""
+
+
+async def redis_increment_with_ttl(
+    redis_client: Any,
+    key: str,
+    ttl_seconds: int,
+) -> tuple[int, int]:
+    """Atomically increment a Redis counter and ensure that it expires."""
+    if ttl_seconds <= 0:
+        raise ValueError("ttl_seconds must be positive")
+    result = await redis_client.eval(
+        _INCREMENT_WITH_TTL_SCRIPT,
+        1,
+        key,
+        ttl_seconds,
+    )
+    if not isinstance(result, (list, tuple)) or len(result) != 2:
+        raise RuntimeError("Unexpected Redis counter result")
+    return int(result[0]), int(result[1])
+
+
+async def redis_counter_value_with_ttl(
+    redis_client: Any,
+    key: str,
+    ttl_seconds: int,
+) -> tuple[int, int]:
+    """Atomically read a Redis counter and repair a missing expiry."""
+    if ttl_seconds <= 0:
+        raise ValueError("ttl_seconds must be positive")
+    result = await redis_client.eval(
+        _COUNTER_VALUE_WITH_TTL_SCRIPT,
+        1,
+        key,
+        ttl_seconds,
+    )
+    if not isinstance(result, (list, tuple)) or len(result) != 2:
+        raise RuntimeError("Unexpected Redis counter result")
+    return int(result[0]), int(result[1])
 
 
 async def _get_redis():
     global _redis, _redis_loop
     loop = asyncio.get_running_loop()
-    if _redis is not None and _redis_loop is not None and _redis_loop is not loop:
-        # Celery workers create and close event loops frequently. Reusing an
-        # asyncio Redis client from a previous loop causes noisy cross-loop
-        # failures during best-effort pub/sub and cache writes.
+    redis = _redis_by_loop.get(loop)
+    if redis is not None:
+        _redis = redis
+        _redis_loop = loop
+        return redis
+    if _redis is not None and _redis_loop is loop:
+        _redis_by_loop[loop] = _redis
+        return _redis
+    if _redis is not None and _redis_loop is not None:
+        _redis_by_loop.setdefault(_redis_loop, _redis)
+
+    # Celery workers create and close event loops frequently. Retire clients
+    # only after their owning loops close: another active loop may still be
+    # using its client while this one connects.
+    for owner_loop, client in list(_redis_by_loop.items()):
+        if owner_loop is loop or not owner_loop.is_closed():
+            continue
+        _redis_by_loop.pop(owner_loop, None)
         try:
-            await _redis.aclose()
+            await client.aclose()
         except Exception:
             pass
-        _redis = None
-        _redis_loop = None
-    if _redis is None:
-        try:
-            import redis.asyncio as aioredis
+    try:
+        import redis.asyncio as aioredis
 
-            url = get_settings().REDIS_URL
-            _redis = aioredis.from_url(url, decode_responses=True)
-            await _redis.ping()
-            _redis_loop = loop
-            logger.info(
-                "Redis cache connected: %s",
-                url.split("@")[-1] if "@" in url else url,
-            )
-        except Exception as e:
-            logger.warning("Redis not available for caching: %s", e)
-            _redis = None
-            _redis_loop = None
-    return _redis
+        url = get_settings().REDIS_URL
+        redis = aioredis.from_url(url, decode_responses=True)
+        await redis.ping()
+        _redis_by_loop[loop] = redis
+        _redis = redis
+        _redis_loop = loop
+        logger.info(
+            "Redis cache connected: %s",
+            url.split("@")[-1] if "@" in url else url,
+        )
+    except Exception as e:
+        logger.warning("Redis not available for caching: %s", e)
+        redis = None
+    return redis
 
 
 class Cache:
@@ -90,6 +165,74 @@ class Cache:
         except Exception as e:
             logger.debug("Cache set error for %s: %s", key, e)
             return False
+
+    async def acquire_lease(
+        self,
+        key: str,
+        token: str,
+        ttl: int = 60,
+    ) -> bool | None:
+        """Acquire a short Redis lease.
+
+        Returns True when acquired, False when another owner holds it, and
+        None when Redis is unavailable so callers can fall back without
+        waiting for a lock that does not exist.
+        """
+        r = await _get_redis()
+        if r is None:
+            return None
+        try:
+            acquired = await r.set(
+                f"{self.PREFIX}{key}",
+                token,
+                ex=max(int(ttl), 1),
+                nx=True,
+            )
+            return bool(acquired)
+        except Exception as e:
+            logger.debug("Cache lease acquire error for %s: %s", key, e)
+            return None
+
+    async def release_lease(self, key: str, token: str) -> bool:
+        """Release a Redis lease only when *token* still owns it."""
+        r = await _get_redis()
+        if r is None:
+            return False
+        script = (
+            "if redis.call('get', KEYS[1]) == ARGV[1] then "
+            "return redis.call('del', KEYS[1]) else return 0 end"
+        )
+        try:
+            return bool(await r.eval(script, 1, f"{self.PREFIX}{key}", token))
+        except Exception as e:
+            logger.debug("Cache lease release error for %s: %s", key, e)
+            return False
+
+    async def extend_lease(
+        self,
+        key: str,
+        token: str,
+        ttl: int = 60,
+    ) -> bool | None:
+        """Extend a Redis lease only when *token* still owns it."""
+        r = await _get_redis()
+        if r is None:
+            return None
+        script = (
+            "if redis.call('get', KEYS[1]) == ARGV[1] then "
+            "return redis.call('expire', KEYS[1], ARGV[2]) else return 0 end"
+        )
+        try:
+            return bool(await r.eval(
+                script,
+                1,
+                f"{self.PREFIX}{key}",
+                token,
+                max(int(ttl), 1),
+            ))
+        except Exception as e:
+            logger.debug("Cache lease extend error for %s: %s", key, e)
+            return None
 
     async def get_many(self, keys: list[str]) -> list[Any | None]:
         """Fetch several JSON values in one Redis round trip."""
@@ -226,12 +369,17 @@ class Cache:
         return decorator
 
     async def close(self):
-        """Close the Redis connection."""
+        """Close the Redis connection owned by the current event loop."""
         global _redis, _redis_loop
-        if _redis:
-            await _redis.aclose()
+        loop = asyncio.get_running_loop()
+        redis = _redis_by_loop.pop(loop, None)
+        if redis is None and _redis_loop is loop:
+            redis = _redis
+        if _redis_loop is loop:
             _redis = None
             _redis_loop = None
+        if redis:
+            await redis.aclose()
 
 
 # Global singleton

@@ -117,9 +117,12 @@ async def mark_hitl_request_resolved(
         return 0
     rows = list((await db.execute(
         select(Message)
-        .where(Message.conversation_id == conversation_id)
-        .order_by(Message.created_at.desc())
-        .limit(100)
+        .where(
+            Message.conversation_id == conversation_id,
+            Message.meta.contains({"hitl_requests": [{"id": str(hitl_id)}]}),
+        )
+        .order_by(Message.id)
+        .with_for_update()
     )).scalars().all())
     updated = 0
     for msg in rows:

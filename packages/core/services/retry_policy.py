@@ -14,6 +14,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+import math
 from typing import Any
 
 from sqlalchemy import select
@@ -312,7 +313,20 @@ def apply_transient_backoff(
     error: dict[str, Any], *, streak: TransientRetry, now: datetime,
 ) -> tuple[dict[str, Any], datetime]:
     """Stamp the streak + its exponential ``next_retry_at`` onto an error."""
-    next_retry_at = now + timedelta(seconds=transient_backoff_seconds(streak.count))
+    delay_seconds: float = transient_backoff_seconds(streak.count)
+    raw_retry_after = _as_dict(error).get("retry_after_seconds")
+    try:
+        requested_delay = float(raw_retry_after)
+    except (TypeError, ValueError):
+        requested_delay = 0.0
+    if math.isfinite(requested_delay) and requested_delay > 0:
+        # Provider headers are external input. Honor them up to the existing
+        # bounded transient ceiling, never as an unbounded queue timestamp.
+        delay_seconds = max(
+            delay_seconds,
+            min(requested_delay, TRANSIENT_MAX_DELAY_SECONDS),
+        )
+    next_retry_at = now + timedelta(seconds=delay_seconds)
     enriched = dict(error or {})
     enriched["transient_retry"] = streak.as_marker()
     enriched["next_retry_at"] = next_retry_at.isoformat()

@@ -17,6 +17,7 @@ def _task(status: str):
         started_at=None,
         completed_at=None,
         updated_at=None,
+        status_changed_at=None,
     )
 
 
@@ -42,6 +43,7 @@ async def test_apply_task_status_transition_updates_lifecycle_timestamps():
     assert task.status == "in_progress"
     assert task.started_at == now
     assert task.updated_at == now
+    assert task.status_changed_at == now
     assert task.completed_at is None
 
     done_at = datetime(2026, 5, 1, 13, 0, tzinfo=timezone.utc)
@@ -54,6 +56,7 @@ async def test_apply_task_status_transition_updates_lifecycle_timestamps():
     assert task.status == "pending"
     assert task.completed_at is None
     assert task.updated_at == reopened_at
+    assert task.status_changed_at == reopened_at
 
 
 def test_status_transition_map_includes_noop_and_retry_targets():

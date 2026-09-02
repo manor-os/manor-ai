@@ -12,12 +12,16 @@ import time
 from fastapi import APIRouter, HTTPException
 
 from sandbox.models import (
+    CancelExecutionResponse,
     CreateFromBuiltinRequest,
     CreateFromFilesRequest,
     CreateSandboxRequest,
     CreateSandboxResponse,
     ExecRequest,
     ExecResponse,
+    ExecutionResponseAck,
+    ExecutionResponseRequest,
+    ExecutionStatusResponse,
     FileReadBase64Request,
     FileReadBase64Response,
     FileReadRequest,
@@ -34,6 +38,7 @@ from sandbox.models import (
     SkillRunResponse,
     SkillScanRequest,
 )
+from sandbox.concurrency import SandboxConcurrencyExceeded
 from sandbox.security import SecurityError
 from sandbox.skill_runner import SkillRunner
 
@@ -102,6 +107,7 @@ async def create_sandbox(req: CreateSandboxRequest):
             allowed_sensitive_keys=set(req.allowed_sensitive_keys),
             config_overrides=req.config_overrides,
             auto_install=req.auto_install,
+            idempotency_key=req.idempotency_key,
         )
         logger.info(
             "sandbox/create: ok sandbox_id=%s container=%s status=%s skill=%s elapsed=%.2fs",
@@ -115,6 +121,9 @@ async def create_sandbox(req: CreateSandboxRequest):
     except SecurityError as exc:
         logger.warning("sandbox/create: security error skill_dir=%s error=%s", req.skill_dir, exc)
         raise HTTPException(status_code=403, detail=str(exc))
+    except SandboxConcurrencyExceeded as exc:
+        logger.warning("sandbox/create: capacity exceeded skill_dir=%s error=%s", req.skill_dir, exc)
+        raise HTTPException(status_code=429, detail=str(exc))
     except RuntimeError as exc:
         logger.error(
             "sandbox/create: failed skill_dir=%s elapsed=%.2fs error=%s",
@@ -145,6 +154,7 @@ async def create_sandbox_from_files(req: CreateFromFilesRequest):
             allowed_sensitive_keys=set(req.allowed_sensitive_keys),
             config_overrides=req.config_overrides,
             auto_install=req.auto_install,
+            idempotency_key=req.idempotency_key,
         )
         logger.info(
             "sandbox/create-from-files: ok sandbox_id=%s container=%s status=%s skill=%s elapsed=%.2fs",
@@ -158,6 +168,9 @@ async def create_sandbox_from_files(req: CreateFromFilesRequest):
     except SecurityError as exc:
         logger.warning("sandbox/create-from-files: security error skill=%s error=%s", req.skill_name, exc)
         raise HTTPException(status_code=403, detail=str(exc))
+    except SandboxConcurrencyExceeded as exc:
+        logger.warning("sandbox/create-from-files: capacity exceeded skill=%s error=%s", req.skill_name, exc)
+        raise HTTPException(status_code=429, detail=str(exc))
     except RuntimeError as exc:
         logger.error(
             "sandbox/create-from-files: failed skill=%s elapsed=%.2fs error=%s",
@@ -187,6 +200,7 @@ async def create_sandbox_from_builtin(req: CreateFromBuiltinRequest):
             allowed_sensitive_keys=set(req.allowed_sensitive_keys),
             config_overrides=req.config_overrides,
             auto_install=req.auto_install,
+            idempotency_key=req.idempotency_key,
         )
         logger.info(
             "sandbox/create-from-builtin: ok sandbox_id=%s container=%s status=%s skill=%s elapsed=%.2fs",
@@ -200,6 +214,9 @@ async def create_sandbox_from_builtin(req: CreateFromBuiltinRequest):
     except SecurityError as exc:
         logger.warning("sandbox/create-from-builtin: security error skill=%s error=%s", req.skill_name, exc)
         raise HTTPException(status_code=403, detail=str(exc))
+    except SandboxConcurrencyExceeded as exc:
+        logger.warning("sandbox/create-from-builtin: capacity exceeded skill=%s error=%s", req.skill_name, exc)
+        raise HTTPException(status_code=429, detail=str(exc))
     except RuntimeError as exc:
         logger.error(
             "sandbox/create-from-builtin: failed skill=%s elapsed=%.2fs error=%s",
@@ -329,6 +346,7 @@ async def exec_command(sandbox_id: str, req: ExecRequest):
             command=req.command,
             timeout=req.timeout,
             workdir=req.workdir,
+            execution_id=req.execution_id,
         )
         elapsed = time.time() - t0
         if result.exit_code == 0:
@@ -345,12 +363,114 @@ async def exec_command(sandbox_id: str, req: ExecRequest):
     except KeyError:
         logger.warning("sandbox/exec: not found sandbox_id=%s", sandbox_id)
         raise HTTPException(status_code=404, detail=f"Sandbox not found: {sandbox_id}")
+    except SandboxConcurrencyExceeded as exc:
+        logger.warning(
+            "sandbox/exec: capacity exceeded sandbox_id=%s elapsed=%.2fs error=%s",
+            sandbox_id, time.time() - t0, exc,
+        )
+        raise HTTPException(status_code=429, detail=str(exc))
     except RuntimeError as exc:
         logger.error(
             "sandbox/exec: failed sandbox_id=%s elapsed=%.2fs error=%s",
             sandbox_id, time.time() - t0, exc,
         )
         raise HTTPException(status_code=500, detail=str(exc))
+
+
+@router.post(
+    "/sandbox/{sandbox_id}/exec/start",
+    response_model=ExecutionStatusResponse,
+    tags=["exec"],
+)
+async def start_execution(sandbox_id: str, req: ExecRequest):
+    """Start a shell command without blocking until it exits."""
+    try:
+        return await _get_runner().start_execution(
+            sandbox_id=sandbox_id,
+            command=req.command,
+            timeout=req.timeout,
+            workdir=req.workdir,
+            execution_id=req.execution_id,
+        )
+    except KeyError:
+        raise HTTPException(status_code=404, detail=f"Sandbox not found: {sandbox_id}")
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    except SandboxConcurrencyExceeded as exc:
+        raise HTTPException(status_code=429, detail=str(exc))
+    except RuntimeError as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@router.get(
+    "/sandbox/{sandbox_id}/executions/{execution_id}",
+    response_model=ExecutionStatusResponse,
+    tags=["exec"],
+)
+async def get_execution_status(
+    sandbox_id: str,
+    execution_id: str,
+    after_sequence: int = 0,
+):
+    """Read a background command's current or terminal state."""
+    try:
+        return await _get_runner().get_execution_status(
+            sandbox_id,
+            execution_id,
+            after_sequence=max(0, after_sequence),
+        )
+    except KeyError:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Execution not found: {execution_id}",
+        )
+
+
+@router.post(
+    "/sandbox/{sandbox_id}/executions/{execution_id}/cancel",
+    response_model=CancelExecutionResponse,
+    tags=["exec"],
+)
+async def cancel_execution(sandbox_id: str, execution_id: str):
+    """Cancel an active execution without cancelling the Sandbox itself."""
+    try:
+        cancelled = await _get_runner().cancel_execution(sandbox_id, execution_id)
+        return CancelExecutionResponse(
+            sandbox_id=sandbox_id,
+            execution_id=execution_id,
+            cancelled=cancelled,
+        )
+    except KeyError:
+        raise HTTPException(status_code=404, detail=f"Sandbox not found: {sandbox_id}")
+    except RuntimeError as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@router.post(
+    "/sandbox/{sandbox_id}/executions/{execution_id}/responses",
+    response_model=ExecutionResponseAck,
+    tags=["exec"],
+)
+async def send_execution_response(
+    sandbox_id: str,
+    execution_id: str,
+    req: ExecutionResponseRequest,
+):
+    """Deliver one idempotent Agent response to a structured Sandbox event."""
+    try:
+        return await _get_runner().send_execution_response(
+            sandbox_id,
+            execution_id,
+            req.event_id,
+            payload=req.payload,
+            message=req.message,
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
 
 
 # ── File operations ──
@@ -561,6 +681,12 @@ async def run_skill(req: SkillRunRequest):
     except SecurityError as exc:
         logger.warning("skill/run: security error skill_dir=%s error=%s", req.skill_dir, exc)
         raise HTTPException(status_code=403, detail=str(exc))
+    except SandboxConcurrencyExceeded as exc:
+        logger.warning(
+            "skill/run: capacity exceeded skill_dir=%s elapsed=%.2fs error=%s",
+            req.skill_dir, time.time() - t0, exc,
+        )
+        raise HTTPException(status_code=429, detail=str(exc))
     except RuntimeError as exc:
         logger.error(
             "skill/run: failed skill_dir=%s elapsed=%.2fs error=%s",

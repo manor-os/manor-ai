@@ -1,0 +1,33 @@
+{
+  "id": "relationship-ledger",
+  "name": "relationship-ledger",
+  "display_name": "Relationship Ledger",
+  "type": "runtime_guidance",
+  "execution_mode": "instructions_only",
+  "description": "Use the active Workspace Relationship Ledger as the durable source for identities, contact routes, relationship state, interactions, follow-ups, consent, and evidence.",
+  "category": "workspace-ledger",
+  "output_format": "guidance",
+  "tags": [
+    "relationship-ledger",
+    "crm",
+    "contacts",
+    "workspace-ledger",
+    "runtime-guidance",
+    "builtin"
+  ],
+  "tools": [
+    "read_relationship_ledger",
+    "record_relationship_ledger",
+    "query_ledger",
+    "visualize_workspace_ledgers"
+  ],
+  "ledger_contracts": [
+    "manor.relationship_ledger/v1"
+  ],
+  "capability_companion": {
+    "tool_names": [
+      "read_relationship_ledger",
+      "record_relationship_ledger"
+    ]
+  }
+}

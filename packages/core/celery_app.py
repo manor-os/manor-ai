@@ -6,17 +6,30 @@ import os
 
 from celery import Celery
 from celery.schedules import crontab
-from celery.signals import worker_process_init, worker_process_shutdown
+from celery.signals import (
+    after_setup_logger,
+    after_setup_task_logger,
+    worker_process_init,
+    worker_process_shutdown,
+)
 from kombu import Queue
 
 from packages.core.queues import CeleryQueue, route_task
 from packages.core.services.step_deadline import (
     CELERY_BROKER_VISIBILITY_TIMEOUT_SECONDS,
 )
+from packages.core.observability.log_redaction import install_sensitive_log_filter
+
+
+@after_setup_logger.connect
+@after_setup_task_logger.connect
+def _install_worker_log_redaction(logger=None, **_kwargs) -> None:
+    install_sensitive_log_filter(logger)
 
 # Broker and result backend from environment
 CELERY_BROKER_URL = os.getenv("CELERY_BROKER_URL", "redis://localhost:6379/2")
 CELERY_RESULT_BACKEND = os.getenv("CELERY_RESULT_BACKEND", "redis://localhost:6379/3")
+CELERY_RESULT_EXPIRES_SECONDS = int(os.getenv("CELERY_RESULT_EXPIRES_SECONDS", "3600"))
 
 celery_app = Celery(
     "manor",
@@ -36,6 +49,10 @@ celery_app.conf.update(
     # Reliability
     task_acks_late=True,
     task_reject_on_worker_lost=True,
+    # Beat includes second-level maintenance tasks. Their AsyncResult values are
+    # diagnostic only, so keeping Celery's default one-day retention can fill a
+    # small Redis result backend before the next cleanup sweep.
+    result_expires=CELERY_RESULT_EXPIRES_SECONDS,
     # ``task_acks_late`` only means "ack when the task finishes" — it is the
     # BROKER that decides how long it waits for that ack before handing the
     # message to somebody else. Redis has no server-side ack, so kombu emulates
@@ -56,16 +73,18 @@ celery_app.conf.update(
     # Worker
     worker_prefetch_multiplier=1,
     worker_max_tasks_per_child=100,
-    # Queues — work is separated from the control plane so concurrent long
+    # Queues — heavy work is separated from the control plane so concurrent long
     # steps can no longer starve internal_worker_tick / cleanup_expired_leases /
-    # scheduler.tick. Every task's queue comes from the explicit registry in
+    # scheduler.tick. Versioned recovery is separate so a rolling-deploy worker
+    # cannot consume a settlement wire contract it does not understand. Every
+    # task's queue comes from the explicit registry in
     # packages/core/queues.py (a dotted-name lookup, never a prefix match); the
     # default queue keeps its historical name so a worker started without -Q
     # still consumes the whole control plane.
     # ``routing_key`` is pinned to the queue name on purpose: the Redis
     # transport resolves a direct-exchange message to the list named by the
     # routing key, and celery's default routing key is "celery" — leaving it
-    # implicit would silently deliver every work task back into the control
+    # implicit would silently deliver every heavy task back into the control
     # plane's list.
     task_queues=tuple(
         Queue(queue.value, routing_key=queue.value) for queue in CeleryQueue
@@ -89,15 +108,41 @@ celery_app.conf.include = [
     "packages.core.tasks.metrics_tasks",
     "packages.core.tasks.ops_tasks",
     "packages.core.tasks.deletion_tasks",
+    "packages.core.tasks.event_tasks",
     "packages.core.tasks.maintenance_tasks",
     "packages.core.tasks.media_tasks",
+    "packages.core.tasks.runtime_tasks",
 ]
 
 # Beat schedule — periodic jobs
 celery_app.conf.beat_schedule = {
+    "runtime-sandbox-scheduler": {
+        "task": "runtime.sandbox_scheduler",
+        "schedule": 2.0,
+    },
+    "runtime-outbox-dispatch": {
+        "task": "runtime.outbox_dispatch",
+        "schedule": 1.0,
+    },
     "scheduler-tick": {
         "task": "scheduler.tick",
         "schedule": 60.0,  # every 60 seconds
+    },
+    "scheduler-skill-generation-sweep": {
+        "task": "scheduler.skill_generation_sweep",
+        "schedule": 30.0,
+    },
+    "agent-claim-loss-recovery-sweep-v2": {
+        "task": "agent.recover_claim_loss_sweep_v2",
+        "schedule": 60.0,
+    },
+    "workflow-resume-sweep": {
+        "task": "workflow.resume_sweep",
+        "schedule": 15.0,
+    },
+    "workflow-terminal-effect-sweep": {
+        "task": "workflow.terminal_effect_sweep",
+        "schedule": 15.0,
     },
     "daily-health-briefing": {
         "task": "monitor.daily_health_briefing",
@@ -109,6 +154,12 @@ celery_app.conf.beat_schedule = {
         "task": "media.cleanup_media_references",
         "schedule": crontab(hour=4, minute=30),
     },
+    "ai-edit-session-cleanup": {
+        # AI Edit sessions keep multi-turn context while their editor is open.
+        # Explicit close deletes immediately; this sweep recovers crashed tabs.
+        "task": "maintenance.cleanup_ai_edit_sessions",
+        "schedule": 3600.0,
+    },
     "entity-chat-extraction-sweep": {
         # Entity-level (workspace-less) chats have no per-workspace
         # extraction job; this sweep gives the main assistant chat the
@@ -116,6 +167,14 @@ celery_app.conf.beat_schedule = {
         # one indexed query per pass.
         "task": "memory.entity_chat_extraction_sweep",
         "schedule": 6 * 3600.0,  # every 6h, matching workspace extraction
+    },
+    "teams-subscription-renewal": {
+        "task": "channel.ms_teams_subscription_tick",
+        "schedule": 6 * 3600.0,
+    },
+    "outlook-subscription-renewal": {
+        "task": "channel.outlook_subscription_tick",
+        "schedule": 6 * 3600.0,
     },
     "heartbeat-check": {
         "task": "monitor.heartbeat_check",
@@ -142,6 +201,12 @@ celery_app.conf.beat_schedule = {
         # Per-minute sweep for ``notify(deliver_at=…)`` scheduled rows.
         # Cheap when the queue is empty (indexed scan, exits in a few ms).
         "task": "notification.dispatch_due",
+        "schedule": 60.0,
+    },
+    "external-event-delivery-due": {
+        # EventLog owns the retry state, so business workers never have to wait
+        # indefinitely for webhook/email/channel network calls.
+        "task": "events.dispatch_external_due",
         "schedule": 60.0,
     },
     "integration-health-tick": {
@@ -262,6 +327,12 @@ celery_app.conf.beat_schedule = {
         "task": "maintenance.cleanup_chat_uploads",
         "schedule": crontab(hour=3, minute=5),
     },
+    "maintenance-cleanup-document-upload-recovery": {
+        # Daily 03:15 UTC - removes expired browser-upload recovery markers
+        # and only the source bytes that still have no Document projection.
+        "task": "maintenance.cleanup_document_upload_recovery",
+        "schedule": crontab(hour=3, minute=15),
+    },
     "maintenance-repair-missing-document-files": {
         # Periodic DB <-> filesystem consistency scan. Missing generated media
         # is restored from provider source URLs when available. Missing files
@@ -287,14 +358,19 @@ celery_app.conf.beat_schedule = {
 def _init_otel(**_kwargs: object) -> None:
     try:
         from packages.core.observability import init_tracing
-        init_tracing(service_name="manor-celery-worker")
+        from packages.core.service_role import otel_service_name_for_role
+
+        init_tracing(service_name=otel_service_name_for_role())
     except Exception:
         # Never block worker boot on tracing — log via celery's own
         # logger handle on the next step instead.
         pass
 
     try:
-        from packages.core.services.openrouter_pricing_sync import sync_openrouter_pricing_cache
+        from packages.core.services.openrouter_pricing_sync import (
+            sync_openrouter_pricing_cache,
+        )
+
         asyncio.run(sync_openrouter_pricing_cache(timeout_s=10.0))
     except Exception:
         pass

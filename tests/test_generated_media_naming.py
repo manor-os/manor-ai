@@ -2,9 +2,28 @@ from packages.core.services.generated_media_naming import (
     build_workspace_artifact_base_dir,
     build_generated_media_filename,
     build_generated_media_target,
+    collision_safe_artifact_path,
     scope_workspace_artifact_path,
     workspace_artifact_default_dir,
 )
+
+
+def test_collision_safe_artifact_path_is_stable_until_committed(tmp_path):
+    target = tmp_path / "artifacts" / "report.pdf"
+    target.parent.mkdir(parents=True)
+    target.write_bytes(b"existing")
+
+    first = collision_safe_artifact_path(str(tmp_path), "artifacts/report.pdf")
+    retry = collision_safe_artifact_path(str(tmp_path), "artifacts/report.pdf")
+
+    assert first == "artifacts/report_1.pdf"
+    assert retry == first
+
+    (tmp_path / first).write_bytes(b"committed")
+    assert collision_safe_artifact_path(
+        str(tmp_path),
+        "artifacts/report.pdf",
+    ) == "artifacts/report_2.pdf"
 
 
 def test_explicit_media_name_wins_without_opaque_prefix(tmp_path):

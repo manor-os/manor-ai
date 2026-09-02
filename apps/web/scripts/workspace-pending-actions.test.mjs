@@ -26,6 +26,14 @@ test("pending-action summaries describe the request instead of exposing its enum
   );
 });
 
+test("pending-action banner only appears while autonomous mode is running", () => {
+  assert.match(
+    workspaceChat,
+    /const showPendingActionsBanner =\s*autonomousRunning && openActionCount > 0 && pendingActions\.length > 0;/,
+  );
+  assert.match(workspaceChat, /\{showPendingActionsBanner && \(/);
+});
+
 test("every shipped locale has friendly generic and named-retry fallbacks", () => {
   for (const source of localeSources) {
     assert.match(source, /component\.workspace_chat\.pending_action_governance_approval/);

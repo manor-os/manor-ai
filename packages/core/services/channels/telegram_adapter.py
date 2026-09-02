@@ -8,14 +8,25 @@ Handles:
 - Bot info verification
 
 Configuration:
-  Credentials are stored in ChannelConfig.credentials:
+  Credentials are leased from the ChannelConfig's Integration source:
     bot_token  — Telegram Bot API token (from @BotFather)
 """
 from __future__ import annotations
 
+import hashlib as _hashlib
+import json as _json
 import logging
 from contextlib import asynccontextmanager as _asynccontextmanager
 from typing import Any, Optional
+
+from packages.core.config import get_settings as _get_settings
+from packages.core.models.channel import ChannelConfig
+from packages.core.services.channels.base import (
+    ChannelAdapter,
+    ChannelTextSendError,
+    NormalizedInbound,
+    register_adapter,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -391,7 +402,9 @@ class TelegramAdapter:
         Raises RuntimeError on HTTP or API errors.
         """
         if httpx is None:
-            raise RuntimeError("httpx is not installed. Run: pip install httpx")
+            raise ChannelTextSendError.determinate(
+                "httpx is not installed. Run: pip install httpx"
+            )
 
         url = f"{self.base_url}/{method}"
 
@@ -402,11 +415,21 @@ class TelegramAdapter:
                 resp = await client.get(url)
             data = resp.json()
 
-        if resp.status_code >= 400 or not data.get("ok", False):
+        if resp.status_code >= 400:
             error_desc = data.get("description", resp.text)
             error_code = data.get("error_code", resp.status_code)
             logger.error("Telegram API error: method=%s code=%s desc=%s", method, error_code, error_desc)
-            raise RuntimeError(f"Telegram API error {error_code}: {error_desc}")
+            raise ChannelTextSendError.from_http_status(
+                f"Telegram API error {error_code}: {error_desc}",
+                status_code=resp.status_code,
+            )
+        if not data.get("ok", False):
+            error_desc = data.get("description", resp.text)
+            error_code = data.get("error_code", resp.status_code)
+            logger.error("Telegram API error: method=%s code=%s desc=%s", method, error_code, error_desc)
+            raise ChannelTextSendError.determinate(
+                f"Telegram API error {error_code}: {error_desc}"
+            )
 
         return data
 
@@ -418,41 +441,37 @@ class TelegramAdapter:
         return f"{first} {last}".strip() or user.get("username", "")
 
 
-# ── Polymorphic ChannelAdapter wrapper ──────────────────────────────────────
-
-import hashlib as _hashlib
-import json as _json
-
-from packages.core.config import get_settings as _get_settings
-from packages.core.services.channels.base import (
-    ChannelAdapter,
-    NormalizedInbound,
-    register_adapter,
-)
-
-
 class TelegramChannelAdapter(ChannelAdapter):
     """Bridges ``TelegramAdapter`` into the polymorphic ``ChannelAdapter``
-    contract used by channel_gateway. Credentials come from the
-    ChannelConfig at call time so one adapter instance serves every
+    contract used by channel_gateway. Credentials are leased from each
+    ChannelConfig's source at call time, so one adapter instance serves every
     bot configured on the deployment.
     """
 
     channel_type = "telegram"
 
-    def _build(self, cc: ChannelConfig) -> TelegramAdapter:
-        creds = cc.credentials or {}
+    @staticmethod
+    def _build(creds: dict) -> TelegramAdapter:
         token = creds.get("bot_token")
         if not token:
-            raise RuntimeError("Telegram ChannelConfig missing bot_token")
+            raise ChannelTextSendError.determinate(
+                "Telegram credential source is missing bot_token"
+            )
         return TelegramAdapter(bot_token=token)
+
+    async def _credentials(self, cc: ChannelConfig, *, reason: str) -> dict:
+        credentials = await self.credentials(cc, reason=reason)
+        if not credentials.get("bot_token"):
+            raise ChannelTextSendError.determinate(
+                "Telegram credential source is missing bot_token"
+            )
+        return credentials
 
     def _hash(self, bot_token: str) -> str:
         return _hashlib.sha256(bot_token.encode("utf-8")).hexdigest()
 
-    def webhook_path(self, cc: ChannelConfig) -> str:
-        token = (cc.credentials or {}).get("bot_token", "")
-        return f"/api/v1/channels/telegram/webhook/{self._hash(token)}?config_id={cc.id}"
+    def _webhook_path(self, cc: ChannelConfig, bot_token: str) -> str:
+        return f"/api/v1/channels/telegram/webhook/{self._hash(bot_token)}?config_id={cc.id}"
 
     async def register_webhook(self, cc: ChannelConfig) -> dict[str, Any]:
         base = _get_settings().PUBLIC_BASE_URL.rstrip("/")
@@ -473,9 +492,12 @@ class TelegramChannelAdapter(ChannelAdapter):
                            "Run through an HTTPS tunnel or set the webhook manually.",
             }
 
-        url = f"{base}{self.webhook_path(cc)}"
-        secret = (cc.credentials or {}).get("secret_token") or None
-        adapter = self._build(cc)
+        credentials = await self._credentials(cc, reason="channel.telegram.register_webhook")
+        secret = credentials.get("secret_token")
+        if not secret:
+            raise RuntimeError("Telegram credential source is missing webhook secret")
+        url = f"{base}{self._webhook_path(cc, credentials['bot_token'])}"
+        adapter = self._build(credentials)
         try:
             ok = await adapter.set_webhook(url, secret_token=secret)
         except RuntimeError as e:
@@ -484,19 +506,28 @@ class TelegramChannelAdapter(ChannelAdapter):
             return {"registered": False, "reason": "telegram_api_error", "detail": str(e)}
         return {"registered": bool(ok), "url": url}
 
-    async def unregister_webhook(self, cc: ChannelConfig) -> dict[str, Any]:
-        adapter = self._build(cc)
+    async def unregister_webhook(
+        self,
+        cc: ChannelConfig,
+        *,
+        credentials: dict | None = None,
+    ) -> dict[str, Any]:
+        credentials = credentials or await self._credentials(
+            cc, reason="channel.telegram.unregister_webhook",
+        )
+        adapter = self._build(credentials)
         ok = await adapter.delete_webhook()
         return {"unregistered": bool(ok)}
 
     async def verify_inbound(
         self, cc: ChannelConfig, *, headers, query, body,
     ) -> bool:
-        # The URL hash is checked at the router level; additional header
-        # secret is optional.
-        secret = (cc.credentials or {}).get("secret_token") or ""
+        # The URL hash routes the request; Telegram's secret header proves
+        # delivery came from the registered webhook.
+        credentials = await self._credentials(cc, reason="channel.telegram.verify_inbound")
+        secret = credentials.get("secret_token") or ""
         if not secret:
-            return True
+            return False
         return headers.get("X-Telegram-Bot-Api-Secret-Token", "") == secret
 
     async def parse_inbound(
@@ -506,7 +537,10 @@ class TelegramChannelAdapter(ChannelAdapter):
             update = _json.loads(body.decode("utf-8")) if body else {}
         except Exception:
             return None
-        parsed = await self._build(cc).handle_update(update)
+        adapter = self._build(await self._credentials(
+            cc, reason="channel.telegram.parse_inbound",
+        ))
+        parsed = await adapter.handle_update(update)
         if not parsed:
             return None
         return NormalizedInbound(
@@ -525,7 +559,9 @@ class TelegramChannelAdapter(ChannelAdapter):
     async def send_text(
         self, cc: ChannelConfig, to: str, text: str, **kwargs: Any,
     ) -> dict[str, Any]:
-        adapter = self._build(cc)
+        adapter = self._build(await self._credentials(
+            cc, reason="channel.telegram.send_text",
+        ))
         # Chunk at 4096 chars to stay under Telegram's limit
         for chunk in _chunk_text(text, 4096):
             last = await adapter.send_message(to, chunk)
@@ -559,7 +595,9 @@ class TelegramChannelAdapter(ChannelAdapter):
             # ship the body.
             return await self.send_text(cc, to, text)
 
-        adapter = self._build(cc)
+        adapter = self._build(await self._credentials(
+            cc, reason="channel.telegram.send_actionable_message",
+        ))
         # Telegram message + keyboard ships in one call; we use the
         # already-implemented helper rather than rebuilding the request.
         return await adapter.send_inline_keyboard(to, text, rows)
@@ -572,7 +610,8 @@ class TelegramChannelAdapter(ChannelAdapter):
 
     async def _send_typing(self, cc: ChannelConfig, chat_id: str) -> None:
         import httpx as _httpx
-        token = (cc.credentials or {}).get("bot_token", "")
+        credentials = await self._credentials(cc, reason="channel.telegram.send_typing")
+        token = credentials.get("bot_token", "")
         if not token:
             return
         url = f"{TELEGRAM_API_BASE}/bot{token}/sendChatAction"
@@ -619,7 +658,9 @@ class TelegramChannelAdapter(ChannelAdapter):
             raise NotImplementedError(
                 "TelegramChannelAdapter only supports URL-based attachments for now"
             )
-        adapter = self._build(cc)
+        adapter = self._build(await self._credentials(
+            cc, reason="channel.telegram.send_attachment",
+        ))
         if kind == "image":
             return await adapter.send_photo(to, url, caption=caption or "")
         return await adapter.send_document(to, url, caption=caption or "")
@@ -635,9 +676,11 @@ def _chunk_text(text: str, limit: int) -> list[str]:
             buf = candidate
             continue
         if buf:
-            out.append(buf); buf = ""
+            out.append(buf)
+            buf = ""
         while len(paragraph) > limit:
-            out.append(paragraph[:limit]); paragraph = paragraph[limit:]
+            out.append(paragraph[:limit])
+            paragraph = paragraph[limit:]
         buf = paragraph
     if buf:
         out.append(buf)

@@ -88,8 +88,10 @@ Collecting information:
 - Ask only the next most important question, one at a time.
 - Once you have name, kind, context, and primary work, auto-generate the full
   workspace draft without waiting for more input.
-- Never ask the user to describe rules, automations, goals, or evaluation --
+- Never ask the user to describe rules, automations, or evaluation --
   infer sensible defaults from what they told you.
+- Goals are optional. Propose measurement definitions when useful, but ask
+  the user to confirm the target, formula/rubric, evidence source and cadence.
 - Never output raw JSON or code blocks in the visible reply.
 
 Auto-generating the draft:
@@ -121,6 +123,14 @@ Auto-generating the draft:
                       ``monthly`` for "月" / "monthly", etc. Never leave
                       empty.
   Also include ``title`` (a 2-4 word headline) when natural.
+  Every Goal also needs a user-confirmed ``measurement`` object. For a
+  custom, manually recorded metric include key, name, description (formula
+  and pass criteria), source (recorder and evidence), unit, value_type
+  (number/percent/currency/duration), and window (latest/lifetime/rolling_7d/
+  rolling_30d/calendar_week/calendar_month). Explain that manual recording is
+  required; a formula or Knowledge document is not an automatic collector.
+  Do not infer a score or replace outcome measurement with task completion.
+  Propose these details together and ask for confirmation, not field by field.
 - Rules: only if the user described policies or escalation paths.
 - Automations: only if the user described schedules or triggers.
 - Evaluation: if goals exist, auto-generate a matching scorecard.
@@ -174,11 +184,12 @@ Example shape (replace with real data):
 Status block rules:
 - always valid JSON
 - missing must only contain keys from: {required_keys_text}
-- goals, rules, automations, and evaluation are optional -- never in missing
+- goals, rules, automations, and evaluation are optional. An empty goals list
+  is valid; an existing Goal with incomplete measurement keeps ready=false.
 - for services: each item needs service_key, name, description,
   autonomy_level, owner_role to be counted complete
-- for goals: each item needs goal_key, description, target, cadence
-  (do not emit a goal entry that's missing target or cadence)
+- for goals: each item needs goal_key, description, target, cadence, measurement
+  (do not mark ready when a configured goal lacks target, cadence or measurement)
 - for agent_mappings: each service must have a corresponding entry
 - for channel_config: channels list should only include channel_type
   values from available_channels where ready=true. Empty list is OK
@@ -258,7 +269,7 @@ Workspace:
 
 Generate:
 1. services: 2-5 services with service_key, description, autonomy_level (full/assisted/supervised), owner_role
-2. goals: relevant goals with goal_key, title, description, metric_key, target_value, baseline_value, cadence (daily/weekly/hourly), priority (1-5)
+2. goals: preserve only user-confirmed goals and their measurement definitions from the input below; use [] if none. Never invent targets, baselines, readiness scores or automatic collectors.
 3. rules: operational rules with rule_type, description, service_key, priority
 4. automations: automation triggers with automation_type, service_key, trigger, schedule
 5. evaluation: scorecard with cadence, scorecard metrics, target_score, warning_score
@@ -268,6 +279,8 @@ Generate:
    - "0 */4 * * *" (every 4 hours) for active workspaces with daily goals
    - "0 9 * * *" (daily at 9am) for standard workspaces
    - "0 9 * * 1" (weekly Monday 9am) for slower-paced operations like quarterly reporting
+
+Confirmed goals: {json.dumps(fields.get('goals') or [], ensure_ascii=False)}
 
 Return ONLY valid JSON with keys: services, goals, rules, automations, evaluation, budget_policy, heartbeat_cadence.
 Do not wrap in markdown fences."""

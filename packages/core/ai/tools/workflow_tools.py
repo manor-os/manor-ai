@@ -20,6 +20,7 @@ from time import perf_counter
 from typing import Any
 
 from packages.core.database import async_session
+from packages.core.services.workflow_run_trace import visible_workflow_tags
 
 
 _WORKFLOW_TOOL_DEPTH: ContextVar[int] = ContextVar("workflow_tool_depth", default=0)
@@ -278,7 +279,7 @@ def _workflow_dict(wf, *, include_steps: bool = True) -> dict:
         "trigger_config": dict(wf.trigger_config or {}),
         "variables": dict(wf.variables or {}),
         "category": wf.category,
-        "tags": list(wf.tags or []),
+        "tags": visible_workflow_tags(wf.tags),
         "is_active": bool(wf.is_active),
         "status": wf.status,
         "version": int(wf.version or 1),
@@ -717,7 +718,7 @@ async def _get_workflow(entity_id: str = "", **kwargs: Any) -> str:
         if wf is None:
             return _error("Workflow not found")
         payload = _workflow_dict(wf)
-        payload["validation"] = svc.validate_workflow_steps(wf.steps)
+        payload["validation"] = svc.validate_workflow_definition(wf)
         payload["deployments"] = [
             _binding_dict(binding)
             for binding in await svc.list_bindings(db, entity_id, workflow_id=wf.id)
@@ -826,7 +827,11 @@ async def _update_workflow(entity_id: str = "", **kwargs: Any) -> str:
         }
         if not changes:
             return _error("No workflow changes were provided")
-        validation = svc.validate_workflow_steps(changes.get("steps", wf.steps))
+        validation = (
+            svc.validate_workflow_steps(changes["steps"])
+            if "steps" in changes
+            else svc.validate_workflow_definition(wf)
+        )
         if "steps" in changes and not validation["valid"] and not bool(kwargs.get("allow_invalid")):
             return _error("Workflow graph is invalid", validation=validation)
         wf = await svc.update_workflow(db, wf.id, entity_id, **changes)
@@ -848,7 +853,11 @@ async def _validate_workflow(entity_id: str = "", **kwargs: Any) -> str:
     return _dump({
         "ok": True,
         "workflow_id": workflow.id if workflow is not None else None,
-        "validation": svc.validate_workflow_steps(steps),
+        "validation": (
+            svc.validate_workflow_definition(workflow)
+            if workflow is not None
+            else svc.validate_workflow_steps(steps)
+        ),
     })
 
 
@@ -861,7 +870,7 @@ async def _deploy_workflow(entity_id: str = "", user_id: str = "", **kwargs: Any
         wf = await _resolve_workflow(db, entity_id, kwargs.get("workflow"))
         if wf is None:
             return _error("Workflow not found")
-        validation = svc.validate_workflow_steps(wf.steps)
+        validation = svc.validate_workflow_definition(wf)
         if not validation["valid"]:
             return _error("Workflow must be valid before deployment", validation=validation)
         if not wf.is_active or wf.status != "active":
@@ -919,7 +928,14 @@ async def _delete_workflow(entity_id: str = "", **kwargs: Any) -> str:
             )
         for binding in bindings:
             await svc.delete_binding(db, binding.id, entity_id)
-        deleted = await svc.delete_workflow(db, wf.id, entity_id)
+        try:
+            deleted = await svc.delete_workflow(db, wf.id, entity_id)
+        except svc.WorkflowInUseError as exc:
+            return _error(
+                str(exc),
+                binding_ids=exc.binding_ids,
+                scheduled_job_ids=exc.scheduled_job_ids,
+            )
         await db.commit()
         return _dump({"ok": deleted, "deleted": deleted, "workflow_id": wf.id, "deleted_bindings": len(bindings)})
 
@@ -1079,7 +1095,7 @@ async def _test_workflow(entity_id: str = "", user_id: str = "", **kwargs: Any) 
         wf = await _resolve_workflow(db, entity_id, kwargs.get("workflow"))
         if wf is None:
             return _error("Workflow not found")
-        validation = svc.validate_workflow_steps(wf.steps)
+        validation = svc.validate_workflow_definition(wf)
         if not validation["valid"]:
             return _error("Workflow is invalid", validation=validation)
         try:
@@ -1207,8 +1223,24 @@ async def _cancel_workflow_run(entity_id: str = "", user_id: str = "", **kwargs:
             return _error(f"Run is already {run.status}", run=_run_dict(run, detailed=False))
         run.status = "cancelled"
         run.completed_at = datetime.now(timezone.utc)
+        from packages.core.ai.workflow_runner import (
+            finalize_workflow_terminal_effects_best_effort,
+            mark_workflow_terminal_effects_pending,
+        )
+        from packages.core.services.workflow_chat_projection import (
+            project_workflow_run_status,
+        )
+
+        mark_workflow_terminal_effects_pending(run)
+        await project_workflow_run_status(db, run=run)
         await db.commit()
-        return _dump({"ok": True, "run": _run_dict(run)})
+        response = _dump({"ok": True, "run": _run_dict(run)})
+        await finalize_workflow_terminal_effects_best_effort(
+            run,
+            db,
+            context="workflow tool cancellation",
+        )
+        return response
 
 
 async def _resume_workflow_run(entity_id: str = "", user_id: str = "", **kwargs: Any) -> str:
@@ -1234,7 +1266,13 @@ async def _resume_workflow_run(entity_id: str = "", user_id: str = "", **kwargs:
         resumed_by=user_id or None,
         execute=bool(kwargs.get("execute", True)),
     )
-    if outcome in {"not_found", "not_paused", "invalid_approval"}:
+    if outcome in {
+        "not_found",
+        "not_paused",
+        "invalid_approval",
+        "definition_changed",
+        "continuation_required",
+    }:
         return _error(f"Could not resume workflow run: {outcome}")
     async with async_session() as db:
         run = await svc.get_run(db, run_id, entity_id)

@@ -14,6 +14,8 @@ from packages.core.workspace_chat.service import (
     ensure_main_conversation,
     spawn_thread,
     post_message,
+    post_workspace_lifecycle_activity,
+    publish_workspace_chat_message_event,
     list_messages,
     resolve_pending_action,
 )
@@ -33,6 +35,8 @@ __all__ = [
     "ensure_main_conversation",
     "spawn_thread",
     "post_message",
+    "post_workspace_lifecycle_activity",
+    "publish_workspace_chat_message_event",
     "list_messages",
     "resolve_pending_action",
     "notify_plan_started",

@@ -27,9 +27,16 @@ test("embedded chat header owns a stacking layer above scrollable messages", () 
 
 test("chat composer and app shells use shared borderless elevation", () => {
   const composer = ruleBody(".chat-composer");
+  const embeddedComposer = ruleBody(
+    ".embedded-chat-footer > .chat-composer:not(.chat-composer--focused)",
+  );
 
   assert.match(composer, /border:\s*0;/);
   assert.match(composer, /box-shadow:\s*var\(--glass-highlight\), var\(--shadow-md\);/);
+  assert.match(
+    embeddedComposer,
+    /box-shadow:\s*var\(--glass-highlight\), var\(--shadow-ambient\);/,
+  );
   assert.match(
     cssSource,
     /html:not\(\[data-theme="dark"\]\) \.app-shell-sidebar,\s*\.app-chat-shell,\s*\.app-content-panel:not\(\.app-content-panel--flush\)\s*\{[\s\S]*?border:\s*0 !important;[\s\S]*?var\(--shadow-md\)/,

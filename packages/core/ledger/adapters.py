@@ -23,10 +23,13 @@ import functools
 import hashlib
 import logging
 from datetime import datetime
+from decimal import Decimal
 from typing import Any, Awaitable, Callable, Optional
 
+from packages.core.constants.analytics import ProductGrowthMilestone
 from packages.core.ledger import event_types as et
 from packages.core.ledger.service import record_event
+from packages.core.goals.numbers import goal_number_to_json
 
 logger = logging.getLogger(__name__)
 
@@ -324,6 +327,34 @@ async def record_automation_run_finished(
     if event_type is None or not run_id:
         return
     entity_id, workspace_id = _automation_scope(job)
+    if (
+        event_type == et.AUTOMATION_RUN_COMPLETED
+        and entity_id
+        and getattr(job, "user_id", None)
+    ):
+        from packages.core.services.product_growth import (
+            record_product_growth_milestone,
+        )
+
+        try:
+            # Product analytics is optional.  Its own SAVEPOINT is required:
+            # swallowing an INSERT error outside one would still leave the
+            # caller's transaction aborted and break scheduler settlement.
+            async with db.begin_nested():
+                await record_product_growth_milestone(
+                    db,
+                    entity_id=entity_id,
+                    workspace_id=workspace_id,
+                    user_id=str(job.user_id),
+                    milestone=ProductGrowthMilestone.AUTOMATION_SUCCEEDED,
+                    source_kind="scheduled_job_run",
+                    source_id=run_id,
+                )
+        except Exception:  # noqa: BLE001 - analytics must remain non-fatal
+            logger.warning(
+                "product growth milestone write failed (ignored)",
+                exc_info=True,
+            )
     if not entity_id or not workspace_id:
         return
     await record_event(
@@ -347,6 +378,27 @@ _WORKFLOW_STATUS_EVENTS: dict[str, str] = {
     "failed": et.WORKFLOW_RUN_FAILED,
     "paused": et.WORKFLOW_RUN_PAUSED,
 }
+
+_DIRECT_WORKFLOW_TRIGGER_SOURCES = frozenset({"manual", "workspace_chat"})
+
+
+def _workflow_causation_id(run: Any, trigger_data: dict[str, Any]) -> Optional[str]:
+    for key in ("scheduled_job_id", "parent_run_id", "proposal_item_id", "strategist_review_id"):
+        value = trigger_data.get(key)
+        if value:
+            return _clip(value, 64)
+    proposal_context = trigger_data.get("_proposal_context")
+    if isinstance(proposal_context, dict):
+        for key in ("proposal_item_id", "review_id", "strategist_review_id", "proposal_id"):
+            value = proposal_context.get(key)
+            if value:
+                return _clip(value, 64)
+        return _clip(f"workflow-proposal:{run.id}", 64)
+
+    trigger_source = str(getattr(run, "trigger_source", None) or "").strip().lower()
+    if trigger_source in _DIRECT_WORKFLOW_TRIGGER_SOURCES and getattr(run, "started_by", None):
+        return None
+    return _clip(f"workflow-trigger:{trigger_source or 'unknown'}:{run.id}", 64)
 
 
 @_never_fatal
@@ -372,7 +424,7 @@ async def record_workflow_run_status(db: Any, run: Any) -> None:
         source_id=_clip(run.binding_id or run.workflow_id, 64),
         run_id=_clip(run.id, 64),
         root_execution_id=_clip(run.id, 64),
-        causation_id=_clip(trigger_data.get("scheduled_job_id"), 64),
+        causation_id=_workflow_causation_id(run, trigger_data),
         status=run.status,
         payload=payload,
         idempotency_key=f"wfrun:{run.id}:{event_type}",
@@ -444,10 +496,13 @@ async def record_goal_measurement_events(
         goal_refs=[goal.id],
         occurred_at=measured_at,
     )
+    event_value = goal_number_to_json(
+        value if isinstance(value, Decimal) else Decimal(str(value))
+    )
     await record_event(
         db,
         event_type=et.GOAL_MEASURED,
-        payload={"value": float(value), "source": source},
+        payload={"value": event_value, "source": source},
         status=None,
         idempotency_key=f"goal:{goal.id}:measured:{measured_at.isoformat()}",
         **base,
@@ -465,7 +520,7 @@ async def record_goal_measurement_events(
         await record_event(
             db,
             event_type=et.GOAL_ACHIEVED,
-            payload={"value": float(value)},
+            payload={"value": event_value},
             idempotency_key=f"goal:{goal.id}:achieved",
             **base,
         )

@@ -1,0 +1,14 @@
+{
+  "id": "file_engine",
+  "name": "File Engine",
+  "description": "Create and patch Knowledge files through one generate/read/patch contract.",
+  "version": "1.2.0",
+  "tools": [
+    "inspect_file_engine",
+    "search_documents",
+    "list_documents",
+    "read_file",
+    "generate_file",
+    "patch_file"
+  ]
+}

@@ -62,7 +62,7 @@ test("Flows mode stays visible but disabled while the feature is coming soon", (
   assert.match(embeddedChatSource, /disabled=\{unavailable\}/);
   assert.match(previewAccessSource, /if \(feature === "flows"\) return state\.flows_released/);
   assert.match(previewAccessSource, /released,/);
-  assert.match(appLayoutSource, /flowsConfigurationItem\(flowsAvailable, !flowsReleased\)/);
+  assert.match(appLayoutSource, /flowsConfigurationItem\(flowsAvailable\)/);
 });
 
 test("chat mode icons match the work they represent", () => {

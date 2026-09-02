@@ -36,6 +36,12 @@ def _config(*, config: dict | None = None, credentials: dict | None = None):
 def fake_smtp(monkeypatch):
     mock_send = AsyncMock()
     monkeypatch.setattr(cs, "aiosmtplib", SimpleNamespace(send=mock_send))
+
+    async def lease_credentials(config, *, reason: str):
+        assert reason == "channel_service.email.send"
+        return config.credentials
+
+    monkeypatch.setattr(cs, "lease_channel_config_credentials", lease_credentials)
     return mock_send
 
 

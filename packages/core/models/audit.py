@@ -23,7 +23,9 @@ class AuditLog(Base):
     user_id: Mapped[Optional[str]] = mapped_column(String(26))
     action: Mapped[str] = mapped_column(String(100), nullable=False)
     resource_type: Mapped[Optional[str]] = mapped_column(String(50))
-    resource_id: Mapped[Optional[str]] = mapped_column(String(26))
+    # Audit resources include opaque provider identities (for example Stripe
+    # object IDs), whose format and length are not constrained to Manor ULIDs.
+    resource_id: Mapped[Optional[str]] = mapped_column(String(255))
     details: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default="{}")
     ip_address: Mapped[Optional[str]] = mapped_column(String(128))
     user_agent: Mapped[Optional[str]] = mapped_column(String(500))

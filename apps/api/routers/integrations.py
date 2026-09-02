@@ -3,27 +3,70 @@ from __future__ import annotations
 
 import logging
 import os
+import secrets
+from datetime import datetime, timezone
 from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlparse, urlsplit, urlunsplit
 
-from fastapi import APIRouter, Depends, HTTPException, Query
-from pydantic import BaseModel
+from fastapi import APIRouter, Depends, Header, HTTPException, Query
+from pydantic import BaseModel, Field
 from sqlalchemy import or_, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from apps.api.deps import get_current_user
-from packages.core.credentials import CredentialError
+from packages.core.credentials import CredentialError, get_credential_service
 from packages.core.constants.plans import is_dev
 from packages.core.database import get_db
+from packages.core.models.integration_session import WechatPersonalSession
 from packages.core.models.user import User
 from packages.core.services.integration_health import is_credential_rejection
+from packages.core.services.discord_app_config import (
+    resolve_discord_app_config,
+    validate_discord_app_config,
+)
+from packages.core.services.channels.discord_adapter import (
+    leave_discord_guild,
+    register_discord_guild_command,
+)
+from packages.core.services.integration_operation_catalog import (
+    MCPServerKind,
+    MCPServerKindFactory,
+    nango_provider_capability,
+)
+from packages.core.services.integration_account_service import (
+    IntegrationAccountAvailability,
+    IntegrationAccountCatalogAccount,
+    IntegrationAccountKind,
+    load_integration_catalog_accounts,
+    lock_runtime_integration_account_scope,
+    normalize_runtime_integration_account_defaults,
+    set_default_runtime_integration_account,
+)
+from packages.core.services.oauth_account_credentials import (
+    lease_oauth_account_tokens,
+    oauth_account_is_runtime_usable,
+)
 from packages.core.services.integration_service import (
+    IntegrationCredentialConflictError,
+    IntegrationProviderImmutableError,
     list_integrations, get_integration, create_integration, update_integration,
-    list_channels, get_channel, create_channel, update_channel, delete_channel,
+    delete_integration, list_channels, get_channel, create_channel,
+    update_channel, delete_channel,
+    list_integration_channels as list_owned_integration_channels,
 )
 from packages.core.services.provider_keys import (
     canonical_provider_key,
     provider_key_aliases,
+)
+from packages.core.ai.mcp.nango import get_nango_secret
+from packages.core.services.whatsapp_business_config import (
+    load_whatsapp_business_config,
+)
+from packages.core.services.whatsapp_business_provisioning import (
+    delete_nango_connection,
+    disconnect_whatsapp_business_account,
+    provision_whatsapp_business_number,
 )
 from packages.core.constants.execution import WorkerStatus
 
@@ -38,7 +81,9 @@ _HIDDEN_CATALOG_SERVER_KEYS = {
 
 def _is_hidden_catalog_server_key(server_key: str | None) -> bool:
     key = str(server_key or "").strip().lower()
-    return key.startswith("manor_mcp_") or key in _HIDDEN_CATALOG_SERVER_KEYS
+    if key.startswith("manor_mcp_") or key in _HIDDEN_CATALOG_SERVER_KEYS:
+        return True
+    return False
 
 
 def _hide_coming_soon_in_dev() -> bool:
@@ -67,6 +112,7 @@ class WiringStatus(BaseModel):
     actually configured to deliver to our server?"""
     ok: bool | None = None
     detail: str | None = None
+    mode: str | None = None
     configured_url: str | None = None
     expected_url: str | None = None
     last_error: str | None = None
@@ -75,10 +121,16 @@ class WiringStatus(BaseModel):
 
 class HealthStatus(BaseModel):
     ok: bool | None = None           # None when never tested
+    reason_code: str | None = None
     detail: str | None = None
     latency_ms: float | None = None
     checked_at: str | None = None
     wiring: WiringStatus | None = None
+    integration_id: str | None = None
+    channel_config_id: str | None = None
+    phone_number_id: str | None = None
+    waba_id: str | None = None
+    checks: dict[str, dict[str, Any]] | None = None
 
 
 class UserOAuthConnection(BaseModel):
@@ -90,24 +142,44 @@ class UserOAuthConnection(BaseModel):
     is_default: bool = False
     connected_at: str | None = None  # ISO; useful for "most recent"
     health: HealthStatus | None = None
+    kind: str = "oauth_account"
+    ownership: str = "mine"
+    owner_user_id: str | None = None
+    owner_display_name: str | None = None
+    can_manage: bool = True
+    can_share: bool = False
+    runtime_callable: bool = True
+    availability: str = IntegrationAccountAvailability.CALLABLE.value
 
 
 class EntityAccountConnection(BaseModel):
-    """A single entity-level account for this provider — used by
-    credential/api-key based integrations that can have multiple rows
-    per (entity, provider): multiple email inboxes, WhatsApp senders,
-    WeChat bots, webhook endpoints, etc."""
+    """A user-owned non-OAuth account for this provider.
+
+    The legacy response-model name is retained for API compatibility; fields
+    record the actual owner and whether the requester only has shared use.
+    """
     id: str                          # integrations.id
     name: str | None = None          # admin-set label ("Support inbox")
-    display_name: str | None = None  # summary pulled from credentials
+    display_name: str | None = None  # credential-free account label
     is_default: bool = False
     created_at: str | None = None
     status: str = "active"
     health: HealthStatus | None = None
+    nango_backed: bool = False
+    whatsapp_readiness_code: str | None = None
+    kind: str = "integration"
+    ownership: str = "mine"
+    owner_user_id: str | None = None
+    owner_display_name: str | None = None
+    can_manage: bool = True
+    can_share: bool = False
+    runtime_callable: bool = True
+    availability: str = IntegrationAccountAvailability.CALLABLE.value
 
 
 class MCPServerStatus(BaseModel):
     server_key: str
+    server_kind: MCPServerKind
     name: str
     category: str | None = None
     description: str | None = None
@@ -144,6 +216,7 @@ class MCPServerStatus(BaseModel):
 
     # What an agent acting as the current user can actually do right now
     agent_can_use: bool
+    requires_explicit_account: bool = False
     hint: str
 
     # ── Nango bridge metadata ──
@@ -153,6 +226,11 @@ class MCPServerStatus(BaseModel):
     # sees "Nango" in the UI -- this flag just controls which connect
     # endpoint the card's button hits.
     nango_provider_config_key: str | None = None
+    # Nango is only a transport for the declared provider contract. These
+    # fields keep the UI from inferring native webhook/chat support from the
+    # presence of a Nango connection.
+    nango_mode: str | None = None
+    nango_operations: dict[str, bool] = {}
 
     # ── OAuth readiness ──
     # True when this deployment has client_id/secret configured for the
@@ -160,6 +238,7 @@ class MCPServerStatus(BaseModel):
     # the "Connect" CTA — if false, end users see "OAuth not configured
     # yet" instead of a dead button.
     oauth_configured: bool = False
+    oauth_client_secret_required: bool = True
 
     # ── Type-specific spec for non-OAuth/non-credentials AI tools ──
     # Populated for browser-session tools so the frontend can render the
@@ -179,97 +258,169 @@ class MCPServerStatus(BaseModel):
 
 class MCPToolOperation(BaseModel):
     name: str
+    tool_name: str
     label: str
     resource: str
     description: str = ""
     effect: str
-    input_schema: dict = {}
+    input_schema: dict = Field(default_factory=dict)
+    output_schema: dict | None = None
+    account_ids: list[str] = Field(default_factory=list)
+    account_options: list[dict] = Field(default_factory=list)
+    account_input_schemas: dict[str, dict] = Field(default_factory=dict)
+    account_output_schemas: dict[str, dict] = Field(default_factory=dict)
+    requires_explicit_account: bool = False
+    supports_all_accounts: bool | None = None
 
 
 class MCPToolCatalogResponse(BaseModel):
     server_key: str
+    server_kind: MCPServerKind
     source: str
-    operations: list[MCPToolOperation] = []
+    operations: list[MCPToolOperation] = Field(default_factory=list)
 
 
-def _first_display_value(*values: object) -> str | None:
-    for value in values:
-        if value is None:
-            continue
-        text = str(value).strip()
-        if text:
-            return text
-    return None
+class ConnectionGrantRequest(BaseModel):
+    user_id: str
 
 
-def _safe_entity_account_display_name(row, *, requester_id: str) -> str | None:
-    """Return a user-facing account label without exposing secrets.
+class ConnectionGrantResponse(BaseModel):
+    id: str
+    user_id: str
+    capabilities: list[str]
 
-    New integrations store credentials in the credential vault, so
-    ``row.credentials`` is often empty. Prefer non-secret config fields
-    written by setup forms, and only lease credentials to read safe
-    identifiers such as email/username when old rows lack config labels.
+
+def _connection_resource_type(kind: str) -> str | None:
+    from packages.core.models.permission import ResourceType
+
+    return {
+        "integration": ResourceType.INTEGRATION,
+        "oauth_account": ResourceType.OAUTH_ACCOUNT,
+    }.get(kind)
+
+
+async def _require_owned_connection(
+    db: AsyncSession,
+    *,
+    kind: str,
+    connection_id: str,
+    user: User,
+) -> None:
+    if _connection_resource_type(kind) is None:
+        raise HTTPException(404, "Connection not found")
+
+    from packages.core.services.integration_access import resolve_integration_access
+
+    decision = await resolve_integration_access(
+        db,
+        kind=kind,
+        connection_id=connection_id,
+        entity_id=user.entity_id,
+        user_id=user.id,
+        action="share",
+    )
+    if not decision.allowed:
+        raise HTTPException(404, "Connection not found")
+
+
+def _whatsapp_integration_is_ready(row: Any) -> bool:
+    if canonical_provider_key(row.provider) != "whatsapp":
+        return True
+    cfg = row.config if isinstance(row.config, dict) else {}
+    whatsapp = cfg.get("whatsapp") if isinstance(cfg.get("whatsapp"), dict) else {}
+    return (
+        whatsapp.get("provisioning_status") == "ready"
+        and whatsapp.get("readiness_code") == "ready"
+    )
+
+
+class _CatalogConnectionFactory:
+    """Build API-safe account projections from an authorized catalog account.
+
+    The catalog loader intentionally carries no credential-bearing ORM rows.
+    Callers authorize there first, then provide the matching persistence row
+    solely for management and display fields.
     """
-    cfg = row.config or {}
-    profile = cfg.get("profile") if isinstance(cfg.get("profile"), dict) else {}
-    legacy_creds = row.credentials or {}
 
-    display = _first_display_value(
-        profile.get("display_name"),
-        profile.get("email"),
-        profile.get("name"),
-        cfg.get("display_name"),
-        cfg.get("email"),
-        cfg.get("from_address"),
-        cfg.get("from_email"),
-        cfg.get("username"),
-        cfg.get("phone_number"),
-        cfg.get("account_sid"),
-        cfg.get("app_id"),
-        cfg.get("url"),
-        cfg.get("webhook_url"),
-        legacy_creds.get("from_address"),
-        legacy_creds.get("from_email"),
-        legacy_creds.get("email"),
-        legacy_creds.get("username"),
-        legacy_creds.get("phone_number"),
-        legacy_creds.get("account_sid"),
-        legacy_creds.get("app_id"),
-        legacy_creds.get("url"),
-        legacy_creds.get("webhook_url"),
-        cfg.get("name"),
-    )
-    if display:
-        return display
-
-    try:
-        from packages.core.credentials import Requester, get_credential_service
-
-        creds = get_credential_service().lease_integration(
-            row,
-            requester=Requester(kind="user", id=requester_id),
-            reason="integrations.mcp_servers.entity_account_display",
+    @staticmethod
+    def from_oauth(
+        account: IntegrationAccountCatalogAccount,
+        row: Any,
+        *,
+        owner_display_names: dict[str, str],
+        can_share_owned_connections: bool,
+    ) -> UserOAuthConnection:
+        profile = row.profile if isinstance(row.profile, dict) else {}
+        health_raw = profile.get("last_health_check")
+        return UserOAuthConnection(
+            id=row.id,
+            display_name=account.display_name,
+            provider_user_id=row.provider_user_id,
+            expires_at=(
+                row.token_expires_at.isoformat() if row.token_expires_at else None
+            ),
+            is_default=account.is_default,
+            connected_at=row.created_at.isoformat() if row.created_at else None,
+            health=(
+                HealthStatus(**health_raw)
+                if isinstance(health_raw, dict)
+                else None
+            ),
+            ownership=account.ownership,
+            owner_user_id=account.owner_user_id,
+            owner_display_name=owner_display_names.get(account.owner_user_id or ""),
+            can_manage=account.ownership == "mine",
+            can_share=(
+                account.ownership == "mine" and can_share_owned_connections
+            ),
+            runtime_callable=account.runtime_callable,
+            availability=account.availability.value,
         )
-    except Exception:
-        # Display-label lookup must never fail the listing. Any credential
-        # error — a domain CredentialError, or the key backend being
-        # unreachable (e.g. Vault down / not running in local dev) — falls
-        # back to the plain config name.
-        logger.debug("Could not lease credentials for integration display label", exc_info=True)
-        return _first_display_value(cfg.get("name"))
 
-    return _first_display_value(
-        creds.get("from_address"),
-        creds.get("from_email"),
-        creds.get("email"),
-        creds.get("username"),
-        creds.get("phone_number"),
-        creds.get("account_sid"),
-        creds.get("app_id"),
-        creds.get("url"),
-        creds.get("webhook_url"),
-        cfg.get("name"),
-    )
+    @staticmethod
+    def from_integration(
+        account: IntegrationAccountCatalogAccount,
+        row: Any,
+        *,
+        owner_display_names: dict[str, str],
+        can_share_owned_connections: bool,
+        include_health: bool = True,
+    ) -> EntityAccountConnection:
+        cfg = row.config if isinstance(row.config, dict) else {}
+        whatsapp = (
+            cfg.get("whatsapp")
+            if isinstance(cfg.get("whatsapp"), dict)
+            else {}
+        )
+        health_raw = cfg.get("last_health_check") if include_health else None
+        return EntityAccountConnection(
+            id=row.id,
+            name=cfg.get("name") or None,
+            display_name=account.display_name,
+            is_default=account.is_default,
+            created_at=row.created_at.isoformat() if row.created_at else None,
+            status=row.status,
+            health=(
+                HealthStatus(**health_raw)
+                if isinstance(health_raw, dict)
+                else None
+            ),
+            nango_backed=isinstance(cfg.get("nango"), dict),
+            whatsapp_readiness_code=(
+                str(whatsapp.get("readiness_code") or "").strip() or None
+            ),
+            ownership=account.ownership,
+            owner_user_id=account.owner_user_id,
+            owner_display_name=owner_display_names.get(account.owner_user_id or ""),
+            can_manage=account.ownership == "mine",
+            can_share=(
+                account.ownership == "mine" and can_share_owned_connections
+            ),
+            runtime_callable=(
+                account.runtime_callable and _whatsapp_integration_is_ready(row)
+            ),
+            availability=account.availability.value,
+        )
 
 
 
@@ -368,14 +519,14 @@ _PROVIDER_DISPLAY: dict[str, dict] = {
                         "docs_url": "https://itchat.readthedocs.io/",
                         "setup_hint": "Point the bot runner URL; scan the QR code to log the bot in.",
                         "color_hex": "#07C160", "supports_multi_account": True},
-    "wechat_official": {"category": "Messaging",
+    "wechat_official": {"category": "Social",
                         "tagline": "WeChat Official Account (公众号) — customer service and template messages.",
                         "docs_url": "https://developers.weixin.qq.com/doc/offiaccount/Getting_Started/Overview.html",
                         "setup_hint": "Create a Subscription or Service Account at mp.weixin.qq.com; copy AppID + AppSecret.",
                         "color_hex": "#07C160", "supports_multi_account": False},
     "whatsapp": {"category": "Messaging", "tagline": "Send messages and manage templates with the WhatsApp Business Cloud API.",
                  "docs_url": "https://developers.facebook.com/docs/whatsapp/cloud-api/",
-                 "setup_hint": "Add WhatsApp to a Meta app, then copy its access token, phone number ID, and business account ID.",
+                 "setup_hint": "Add WhatsApp to a Meta app, then copy its access token, phone number ID, business account ID, verify token, and App Secret.",
                  "color_hex": "#25D366", "supports_multi_account": True,
                  "capabilities": [
                      "Send text, template, image, document, audio, and video messages",
@@ -399,7 +550,7 @@ _PROVIDER_DISPLAY: dict[str, dict] = {
                  "capabilities": [
                      "Publish posts (text, link, image carousel) to your profile",
                      "Comment + react on posts as you",
-                     "Fetch profile insights and connection list",
+                     "Fetch your profile and engagement insights for your posts",
                  ],
                  "example_prompts": [
                      "Draft a 3-tweet thread about today's launch and post the LinkedIn version.",
@@ -629,6 +780,17 @@ _PROVIDER_DISPLAY: dict[str, dict] = {
                        "setup_hint": "Create OAuth app at developer.paypal.com (sandbox + live each get a separate app) → set PAYPAL_CLIENT_ID/SECRET in .env.",
                        "color_hex": "#003087",
                        "supports_multi_account": True},
+    "robinhood": {"category": "Finance",
+                  "tagline": "Connect your own Robinhood accounts through official OAuth and Trading MCP.",
+                  "capabilities": [
+                      "Read portfolios, positions, watchlists and market data",
+                      "Discover tools and parameter schemas from your connected account",
+                      "Official consent can include Agentic trading; writes follow Manor approval policy",
+                  ],
+                  "example_prompts": ["Summarize my portfolio and the stocks on my watchlists."],
+                  "docs_url": "https://robinhood.com/us/en/support/articles/agentic-trading-overview/",
+                  "setup_hint": "Register this deployment's exact OAuth callback with Robinhood, then set ROBINHOOD_CLIENT_ID. No client secret is used. Each user must complete Robinhood consent; the internal scope is not read-only. This is not a shared market-data redistribution license.",
+                  "supports_multi_account": True},
     # ── Microsoft 365 (one Azure AD app powers all 5) ──────────────────
     "outlook":    {"category": "Email", "tagline": "Outlook — read / send / draft mail, manage folders, flag and categorize.",
                        "capabilities": [
@@ -739,9 +901,7 @@ async def list_mcp_server_status(
     """
     from datetime import datetime, timedelta, timezone
     from sqlalchemy import select
-    from packages.core.models.document import Integration
     from packages.core.models.mcp import MCPServer
-    from packages.core.models.user import OAuthAccount
     from packages.core.permissions import user_has_permission
 
     servers = (await db.execute(
@@ -763,7 +923,7 @@ async def list_mcp_server_status(
     # Resolve OAuth readiness for each provider in one pass — drives the
     # "OAuth not configured" hint vs an active Connect CTA.
     from packages.core.services.oauth_provider_config import (
-        is_oauth_provider, oauth_client_configured,
+        is_oauth_provider, oauth_client_configured, oauth_client_secret_required,
     )
     oauth_configured_keys: set[str] = set()
     for s in servers:
@@ -784,9 +944,9 @@ async def list_mcp_server_status(
 
     now = datetime.now(timezone.utc)
 
-    # Bulk-load the user's OAuth accounts for the relevant providers.
-    # A user may have MULTIPLE accounts per provider (e.g. personal +
-    # work Gmail), so we group by provider → list.
+    # Resolve accounts through the connection-access service. Direct Entity
+    # queries here would allow Entity owners/admins to enumerate another
+    # member's private account from the catalog.
     server_keys = [s.server_key for s in servers]
     # Include Nango-only provider keys so virtual cards for HubSpot /
     # Linear / etc. can show their connected state from mirrored
@@ -796,85 +956,169 @@ async def list_mcp_server_status(
         *nango_provider_keys.keys(),
         *(alias for key in server_keys for alias in provider_key_aliases(key)),
     })
-    all_user_oauth = (await db.execute(
-        select(OAuthAccount).where(
-            OAuthAccount.user_id == user.id,
-            OAuthAccount.provider.in_(lookup_keys),
-        ).order_by(OAuthAccount.created_at.asc())
-    )).scalars().all()
-    user_oauth_by_provider: dict[str, list] = {}
-    for row in all_user_oauth:
-        user_oauth_by_provider.setdefault(row.provider, []).append(row)
-        canonical = canonical_provider_key(row.provider)
-        if canonical != row.provider:
-            user_oauth_by_provider.setdefault(canonical, []).append(row)
-    # Group every active Integration row by provider so we can expose a
-    # full entity_accounts list — credential-based providers support
-    # multiple accounts per entity.
-    all_entity_rows = (await db.execute(
-        select(Integration).where(
-            Integration.entity_id == user.entity_id,
-            Integration.provider.in_(lookup_keys),
-            Integration.status == "active",
-        ).order_by(Integration.created_at.desc())
-    )).scalars().all()
-    entity_accounts_by_provider: dict[str, list[Integration]] = {}
-    for row in all_entity_rows:
-        entity_accounts_by_provider.setdefault(row.provider, []).append(row)
-        canonical = canonical_provider_key(row.provider)
-        if canonical != row.provider:
-            entity_accounts_by_provider.setdefault(canonical, []).append(row)
+    catalog_snapshot = await load_integration_catalog_accounts(
+        db,
+        user_id=user.id,
+        entity_id=user.entity_id,
+        provider_keys=lookup_keys,
+    )
+    runtime_accounts_by_provider = {
+        provider: list(catalog_snapshot.accounts_for(provider))
+        for provider in lookup_keys
+    }
+
+    # The runtime registry is the authorization boundary and deliberately
+    # contains no ORM/credential references. Bulk-load source rows only for
+    # account IDs the registry has already approved for this actor.
+    authorized_accounts = [
+        account
+        for accounts in runtime_accounts_by_provider.values()
+        for account in accounts
+    ]
+    oauth_account_ids = {
+        account.id
+        for account in authorized_accounts
+        if account.kind is IntegrationAccountKind.OAUTH_ACCOUNT
+    }
+    integration_account_ids = {
+        account.id
+        for account in authorized_accounts
+        if account.kind is IntegrationAccountKind.INTEGRATION
+    }
+    from packages.core.models.document import Integration
+    from packages.core.models.user import OAuthAccount
+
+    oauth_rows_by_id = {}
+    if oauth_account_ids:
+        oauth_source_rows = (await db.execute(
+            select(OAuthAccount).where(OAuthAccount.id.in_(oauth_account_ids))
+        )).scalars().all()
+        oauth_rows_by_id = {row.id: row for row in oauth_source_rows}
+
+    integration_rows_by_id = {}
+    if integration_account_ids:
+        integration_source_rows = (await db.execute(
+            select(Integration).where(Integration.id.in_(integration_account_ids))
+        )).scalars().all()
+        integration_rows_by_id = {row.id: row for row in integration_source_rows}
+
+    owner_ids = {
+        account.owner_user_id
+        for accounts in runtime_accounts_by_provider.values()
+        for account in accounts
+        if account.owner_user_id
+    }
+    owner_display_names: dict[str, str] = {}
+    if owner_ids:
+        owner_rows = (await db.execute(
+            select(User).where(User.id.in_(owner_ids))
+        )).scalars().all()
+        owner_display_names = {
+            row.id: row.display_name or row.email
+            for row in owner_rows
+        }
+
+    from packages.core.permissions import Permission
+
+    can_share_owned_connections = await user_has_permission(
+        db,
+        user.id,
+        user.entity_id,
+        Permission.INTEGRATIONS_SHARE,
+    )
 
     out: list[MCPServerStatus] = []
     for s in servers:
-        oauth_rows = user_oauth_by_provider.get(s.server_key, [])
+        provider_accounts = runtime_accounts_by_provider.get(s.server_key, [])
+        catalog_binding = catalog_snapshot.integration(s.server_key)
+        requires_explicit_account = bool(
+            catalog_binding and catalog_binding.requires_explicit_account
+        )
+        oauth_accounts = [
+            (account, oauth_rows_by_id[account.id])
+            for account in provider_accounts
+            if (
+                account.kind is IntegrationAccountKind.OAUTH_ACCOUNT
+                and account.id in oauth_rows_by_id
+            )
+        ]
+        integration_accounts = [
+            (account, integration_rows_by_id[account.id])
+            for account in provider_accounts
+            if (
+                account.kind is IntegrationAccountKind.INTEGRATION
+                and account.id in integration_rows_by_id
+            )
+        ]
+        usable_oauth_rows = [
+            row
+            for account, row in oauth_accounts
+            if account.runtime_callable and oauth_account_is_runtime_usable(row)
+        ]
 
         # Build typed connections list
-        connections: list[UserOAuthConnection] = []
-        for r in oauth_rows:
-            profile = r.profile or {}
-            display_name = (
-                profile.get("email")
-                or profile.get("display_name")
-                or profile.get("name")
-                or r.provider_user_id
+        connections = [
+            _CatalogConnectionFactory.from_oauth(
+                account,
+                row,
+                owner_display_names=owner_display_names,
+                can_share_owned_connections=can_share_owned_connections,
             )
-            health_raw = profile.get("last_health_check") if profile else None
-            connections.append(UserOAuthConnection(
-                id=r.id,
-                display_name=display_name,
-                provider_user_id=r.provider_user_id,
-                expires_at=r.token_expires_at.isoformat() if r.token_expires_at else None,
-                is_default=bool(profile.get("is_default", False)),
-                connected_at=r.created_at.isoformat() if r.created_at else None,
-                health=HealthStatus(**health_raw) if health_raw else None,
-            ))
+            for account, row in oauth_accounts
+        ]
 
-        user_connected = len(connections) > 0
+        user_connected = bool(usable_oauth_rows)
 
-        # Build entity_accounts list from every Integration row for this
-        # (entity, provider). Ordered: default first, then newest.
-        entity_rows = entity_accounts_by_provider.get(s.server_key, [])
-        entity_accounts: list[EntityAccountConnection] = []
-        for r in entity_rows:
-            cfg = r.config or {}
-            display_name = _safe_entity_account_display_name(r, requester_id=user.id)
-            health_raw = cfg.get("last_health_check")
-            entity_accounts.append(EntityAccountConnection(
-                id=r.id,
-                name=cfg.get("name") or None,
-                display_name=display_name,
-                is_default=bool(cfg.get("is_default", False)),
-                created_at=r.created_at.isoformat() if r.created_at else None,
-                status=r.status,
-                health=HealthStatus(**health_raw) if health_raw else None,
-            ))
+        # Keep unavailable Nango rows visible to their owner as reconnectable,
+        # but never turn an inaccessible connection into a catalog hint.
+        live_integration_accounts = [
+            (account, row)
+            for account, row in integration_accounts
+            if account.runtime_callable and _whatsapp_integration_is_ready(row)
+        ]
+        has_missing_nango_connection = any(
+            account.availability
+            is IntegrationAccountAvailability.RECONNECT_REQUIRED
+            and isinstance(row.config, dict)
+            and isinstance(row.config.get("nango"), dict)
+            for account, row in integration_accounts
+        )
+        entity_accounts = [
+            _CatalogConnectionFactory.from_integration(
+                account,
+                row,
+                owner_display_names=owner_display_names,
+                can_share_owned_connections=can_share_owned_connections,
+            )
+            for account, row in integration_accounts
+        ]
         entity_accounts.sort(key=lambda a: (0 if a.is_default else 1, a.created_at or ""), reverse=False)
 
         # Prefer the default entity row (if marked); else most recent
-        primary_entity_row = next(
-            (r for r in entity_rows if (r.config or {}).get("is_default")),
-            entity_rows[0] if entity_rows else None,
+        primary_entity_account = next(
+            (
+                account_and_row
+                for account_and_row in live_integration_accounts
+                if account_and_row[0].is_default
+            ),
+            live_integration_accounts[0] if live_integration_accounts else None,
+        )
+        primary_entity_row = (
+            primary_entity_account[1] if primary_entity_account else None
+        )
+        permission_blocked_entity_account = next(
+            (
+                account_and_row
+                for account_and_row in integration_accounts
+                if account_and_row[0].availability
+                is IntegrationAccountAvailability.PERMISSION_DENIED
+            ),
+            None,
+        )
+        permission_blocked_entity_row = (
+            permission_blocked_entity_account[1]
+            if permission_blocked_entity_account
+            else None
         )
         entity_connected = bool(
             primary_entity_row
@@ -885,21 +1129,28 @@ async def list_mcp_server_status(
             )
         )
         required_permission = (
-            primary_entity_row.required_permission if primary_entity_row else None
+            primary_entity_row.required_permission
+            if primary_entity_row
+            else (
+                permission_blocked_entity_row.required_permission
+                if permission_blocked_entity_row
+                else None
+            )
         )
 
-        has_perm = True
-        if required_permission:
-            has_perm = await user_has_permission(
-                db, user.id, user.entity_id, required_permission,
-            )
+        # The registry already checked every callable account's permission.
+        # A blocked sibling must not disable a separate callable account.
+        has_perm = (
+            primary_entity_row is not None
+            or permission_blocked_entity_row is None
+        )
 
         # Agent's effective access right now
         handled_agent_access = False
         if not handled_agent_access:
             if user_connected:
                 agent_can_use = True
-                count = len(connections)
+                count = len(usable_oauth_rows)
                 hint = (
                     "Personal connection active — agents can call this on your behalf."
                     if count == 1
@@ -907,31 +1158,97 @@ async def list_mcp_server_status(
                 )
             elif entity_connected and has_perm:
                 agent_can_use = True
-                hint = (
-                    f"Using company-level {s.name} credentials."
-                    if not required_permission
-                    else f"Company credentials active (your role grants '{required_permission}')."
-                )
-            elif entity_connected and not has_perm:
+                hint = f"{s.name} connection active — agents can call this on your behalf."
+            elif not has_perm:
                 agent_can_use = False
                 hint = (
-                    f"{s.name} is connected at the company level, but your role "
-                    f"lacks '{required_permission}'. Ask an admin to invite you with "
-                    f"a higher role, or connect your own account below."
+                    f"Your role lacks '{required_permission}' for this {s.name} connection."
+                )
+            elif has_missing_nango_connection:
+                agent_can_use = False
+                hint = (
+                    f"Nango connection is no longer available. Reconnect {s.name} "
+                    "to let agents act on your behalf."
                 )
             else:
                 agent_can_use = False
                 hint = f"Connect {s.name} to let agents act on your behalf."
+
+        if requires_explicit_account and agent_can_use:
+            usable_oauth_ids = {row.id for row in usable_oauth_rows}
+            live_integration_ids = {
+                account.id
+                for account, _row in live_integration_accounts
+            }
+            explicit_callable = False
+            for account in provider_accounts:
+                if not account.runtime_callable:
+                    continue
+                if account.kind is IntegrationAccountKind.OAUTH_ACCOUNT:
+                    row = oauth_rows_by_id.get(account.id)
+                    explicit_callable = bool(
+                        account.id in usable_oauth_ids
+                        and row is not None
+                        and (
+                            row.token_expires_at is None
+                            or row.token_expires_at >= now
+                        )
+                    )
+                elif account.id in live_integration_ids:
+                    health = next(
+                        (
+                            item.health
+                            for item in entity_accounts
+                            if item.id == account.id
+                        ),
+                        None,
+                    )
+                    explicit_callable = not (
+                        health
+                        and health.ok is False
+                        and is_credential_rejection(health.detail)
+                    )
+                if explicit_callable:
+                    break
+            agent_can_use = explicit_callable
+
+        if requires_explicit_account:
+            hint = (
+                f"{s.name} account metadata is incomplete — select an account "
+                "explicitly."
+                if agent_can_use
+                else (
+                    f"{s.name} account metadata is incomplete — repair or "
+                    "reconnect an account to continue."
+                )
+            )
+
+        effective_default = next(
+            (
+                account
+                for account in provider_accounts
+                if account.runtime_callable and account.is_default
+            ),
+            None,
+        )
 
         # A credential the provider has actually refused is not usable, no
         # matter that a row exists. Only refusals count: a health check can
         # also fail because the network was down, and taking a working
         # integration away from agents over a DNS blip is worse than
         # letting one call fail.
-        if agent_can_use:
+        if (
+            agent_can_use
+            and effective_default is not None
+            and effective_default.kind is IntegrationAccountKind.INTEGRATION
+        ):
             primary_health = next(
-                (a.health for a in entity_accounts if a.is_default),
-                entity_accounts[0].health if entity_accounts else None,
+                (
+                    account.health
+                    for account in entity_accounts
+                    if account.id == effective_default.id
+                ),
+                None,
             )
             if (
                 primary_health
@@ -944,15 +1261,37 @@ async def list_mcp_server_status(
                     "re-enter them to let agents use this again."
                 )
 
-        # Warn on expired tokens (the first/default one)
-        if oauth_rows:
-            primary = next((r for r in oauth_rows if (r.profile or {}).get("is_default")), oauth_rows[0])
-            if primary.token_expires_at and primary.token_expires_at < now:
+        # Only the cross-kind effective default controls runtime readiness.
+        primary_oauth_row = (
+            oauth_rows_by_id.get(effective_default.id)
+            if (
+                effective_default is not None
+                and effective_default.kind is IntegrationAccountKind.OAUTH_ACCOUNT
+            )
+            else None
+        )
+        if primary_oauth_row is not None:
+            if (
+                primary_oauth_row.token_expires_at
+                and primary_oauth_row.token_expires_at < now
+            ):
                 hint = f"Your {s.name} connection expired — reconnect to continue."
                 agent_can_use = False
 
         display = _PROVIDER_DISPLAY.get(s.server_key, {})
-        legacy_expires = connections[0].expires_at if connections else None
+        legacy_oauth_row = primary_oauth_row or next(
+            (
+                row
+                for row in usable_oauth_rows
+                if (row.profile or {}).get("is_default")
+            ),
+            usable_oauth_rows[0] if usable_oauth_rows else None,
+        )
+        legacy_expires = (
+            legacy_oauth_row.token_expires_at.isoformat()
+            if legacy_oauth_row and legacy_oauth_row.token_expires_at
+            else None
+        )
         # Use the function form so MANOR_PREVIEW_INTEGRATIONS overrides
         # take effect on every request without a process restart-quirk
         # (the module-level constant is computed at import time).
@@ -971,6 +1310,10 @@ async def list_mcp_server_status(
 
         out.append(MCPServerStatus(
             server_key=s.server_key,
+            server_kind=MCPServerKindFactory.from_server(
+                s.server_key,
+                s.transport,
+            ),
             name=s.name,
             category=display.get("category"),
             description=display.get("description", s.description),
@@ -991,12 +1334,24 @@ async def list_mcp_server_status(
             required_permission=required_permission,
             user_has_required_permission=has_perm,
             agent_can_use=agent_can_use if not _is_coming_soon else False,
+            requires_explicit_account=requires_explicit_account,
             hint=hint if not _is_coming_soon else "Coming soon",
             coming_soon=_is_coming_soon,
             # Built-in card lights up Nango Connect button when the
             # platform is also configured in our self-hosted Nango.
             nango_provider_config_key=nango_config_key_by_server.get(s.server_key),
+            nango_mode=(
+                nango_provider_capability(
+                    nango_config_key_by_server.get(s.server_key) or ""
+                ) or {}
+            ).get("mode"),
+            nango_operations=(
+                nango_provider_capability(
+                    nango_config_key_by_server.get(s.server_key) or ""
+                ) or {}
+            ).get("operations") or {},
             oauth_configured=s.server_key in oauth_configured_keys,
+            oauth_client_secret_required=oauth_client_secret_required(s.server_key),
             browser_spec=_browser_spec_payload(browser_specs_by_id.get(s.id)),
         ))
 
@@ -1008,11 +1363,31 @@ async def list_mcp_server_status(
             continue  # already covered by built-in card above
         # The connection / account counts come from any mirrored
         # Integration row that the sync flow wrote.
-        entity_rows = entity_accounts_by_provider.get(nango_key, [])
-        primary = entity_rows[0] if entity_rows else None
+        provider_accounts = runtime_accounts_by_provider.get(nango_key, [])
+        catalog_binding = catalog_snapshot.integration(nango_key)
+        requires_explicit_account = bool(
+            catalog_binding and catalog_binding.requires_explicit_account
+        )
+        integration_accounts = [
+            (account, integration_rows_by_id[account.id])
+            for account in provider_accounts
+            if (
+                account.kind is IntegrationAccountKind.INTEGRATION
+                and account.id in integration_rows_by_id
+            )
+        ]
+        primary = next(
+            (
+                account_and_row
+                for account_and_row in integration_accounts
+                if account_and_row[0].runtime_callable
+            ),
+            None,
+        )
         connected = bool(primary)
         out.append(MCPServerStatus(
             server_key=nango_key,
+            server_kind=MCPServerKind.MANAGED,
             name=_humanize_provider(nango_provider or nango_key),
             category=None,
             description=f"Connect via {_humanize_provider(nango_provider or nango_key)} OAuth.",
@@ -1022,36 +1397,160 @@ async def list_mcp_server_status(
             docs_url=None,
             setup_hint=None,
             color_hex=None,
-            supports_multi_account=False,
+            supports_multi_account=True,
             connections=[],
             entity_accounts=[
-                EntityAccountConnection(
-                    id=r.id,
-                    name=(r.config or {}).get("name"),
-                    display_name=_safe_entity_account_display_name(r, requester_id=user.id),
-                    is_default=bool((r.config or {}).get("is_default", False)),
-                    created_at=r.created_at.isoformat() if r.created_at else None,
-                    status=r.status,
-                    health=None,
+                _CatalogConnectionFactory.from_integration(
+                    account,
+                    row,
+                    owner_display_names=owner_display_names,
+                    can_share_owned_connections=can_share_owned_connections,
+                    include_health=False,
                 )
-                for r in entity_rows
+                for account, row in integration_accounts
             ],
             entity_connected=connected,
             required_permission=None,
             user_has_required_permission=True,
             agent_can_use=connected,
+            requires_explicit_account=requires_explicit_account,
             hint=(
-                f"Connected — agents can act on your {_humanize_provider(nango_provider or nango_key)} account."
-                if connected
-                else f"Click Connect to authorize {_humanize_provider(nango_provider or nango_key)}."
+                "Account metadata is incomplete — select an account explicitly "
+                "or retry after the connection is repaired."
+                if requires_explicit_account
+                else (
+                    f"Connected — agents can act on your {_humanize_provider(nango_provider or nango_key)} account."
+                    if connected
+                    else f"Click Connect to authorize {_humanize_provider(nango_provider or nango_key)}."
+                )
             ),
             nango_provider_config_key=nango_key,
+            nango_mode=(nango_provider_capability(nango_key) or {}).get("mode"),
+            nango_operations=(
+                nango_provider_capability(nango_key) or {}
+            ).get("operations") or {},
         ))
 
     # Stable sort: by category order, then name
     cat_rank = {name: i for i, name in enumerate(_CATEGORY_ORDER)}
     out.sort(key=lambda m: (cat_rank.get(m.category or "", 999), m.name))
     return out
+
+
+@router.get(
+    "/connections/{kind}/{connection_id}/grants",
+    response_model=list[ConnectionGrantResponse],
+)
+async def list_connection_grants(
+    kind: str,
+    connection_id: str,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """List recipients for a connection the current user owns."""
+    from packages.core.models.permission import GrantStatus, ResourceGrant, SubjectType
+    from packages.core.permissions import Permission, check_effective_user_permission
+
+    await _require_owned_connection(
+        db,
+        kind=kind,
+        connection_id=connection_id,
+        user=user,
+    )
+    await check_effective_user_permission(db, user, Permission.INTEGRATIONS_SHARE)
+    resource_type = _connection_resource_type(kind)
+    assert resource_type is not None
+    rows = (await db.execute(
+        select(ResourceGrant).where(
+            ResourceGrant.entity_id == user.entity_id,
+            ResourceGrant.resource_type == resource_type,
+            ResourceGrant.resource_id == connection_id,
+            ResourceGrant.subject_type == SubjectType.USER,
+            ResourceGrant.status == GrantStatus.ACTIVE,
+        ).order_by(ResourceGrant.granted_at.asc())
+    )).scalars().all()
+    return [
+        ConnectionGrantResponse(
+            id=row.id,
+            user_id=row.subject_id,
+            capabilities=list(row.capabilities or []),
+        )
+        for row in rows
+    ]
+
+
+@router.post(
+    "/connections/{kind}/{connection_id}/grants",
+    response_model=ConnectionGrantResponse,
+    status_code=201,
+)
+async def create_connection_grant(
+    kind: str,
+    connection_id: str,
+    req: ConnectionGrantRequest,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Grant one named Entity member permission to use an owned connection."""
+    from packages.core.permissions import Permission, check_effective_user_permission
+    from packages.core.services.integration_access import grant_connection_use
+
+    await _require_owned_connection(
+        db,
+        kind=kind,
+        connection_id=connection_id,
+        user=user,
+    )
+    await check_effective_user_permission(db, user, Permission.INTEGRATIONS_SHARE)
+    try:
+        grant = await grant_connection_use(
+            db,
+            kind=kind,
+            connection_id=connection_id,
+            entity_id=user.entity_id,
+            owner_user_id=user.id,
+            grantee_user_id=req.user_id,
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    await db.commit()
+    return ConnectionGrantResponse(
+        id=grant.id,
+        user_id=grant.subject_id,
+        capabilities=list(grant.capabilities or []),
+    )
+
+
+@router.delete("/connections/{kind}/{connection_id}/grants/{grant_id}", status_code=204)
+async def revoke_connection_grant(
+    kind: str,
+    connection_id: str,
+    grant_id: str,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Revoke one recipient's use grant from an owned connection."""
+    from packages.core.permissions import Permission, check_effective_user_permission
+    from packages.core.services.integration_access import revoke_connection_use
+
+    await _require_owned_connection(
+        db,
+        kind=kind,
+        connection_id=connection_id,
+        user=user,
+    )
+    await check_effective_user_permission(db, user, Permission.INTEGRATIONS_SHARE)
+    revoked = await revoke_connection_use(
+        db,
+        kind=kind,
+        connection_id=connection_id,
+        grant_id=grant_id,
+        entity_id=user.entity_id,
+        owner_user_id=user.id,
+    )
+    if not revoked:
+        raise HTTPException(404, "Grant not found")
+    await db.commit()
 
 
 @router.get(
@@ -1071,7 +1570,7 @@ async def list_mcp_server_tools(
     """
     from packages.core.models.mcp import MCPServer
     from packages.core.services.integration_operation_catalog import (
-        integration_operation_catalog,
+        actor_integration_operation_catalog,
     )
 
     server = (await db.execute(
@@ -1083,13 +1582,21 @@ async def list_mcp_server_tools(
     if server is None or _is_hidden_catalog_server_key(server.server_key):
         raise HTTPException(404, "Integration operation catalog not found")
 
-    operations, source = integration_operation_catalog(
+    operations, source = await actor_integration_operation_catalog(
+        db,
+        user_id=user.id,
+        entity_id=user.entity_id,
         server_key=server.server_key,
         transport=server.transport,
+        endpoint=server.endpoint,
         tools_cached=server.tools_cached,
     )
     return MCPToolCatalogResponse(
         server_key=server.server_key,
+        server_kind=MCPServerKindFactory.from_server(
+            server.server_key,
+            server.transport,
+        ),
         source=source,
         operations=operations,
     )
@@ -1155,27 +1662,16 @@ async def set_default_connection(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Mark one of the user's OAuth accounts for this provider as default.
-    Agents resolving a bearer token pick the default account first."""
-    from sqlalchemy import select
-    from packages.core.models.user import OAuthAccount
-
-    rows = (await db.execute(
-        select(OAuthAccount).where(
-            OAuthAccount.user_id == user.id,
-            OAuthAccount.provider == server_key,
-        )
-    )).scalars().all()
-
-    found = False
-    for r in rows:
-        profile = dict(r.profile or {})
-        is_target = r.id == connection_id
-        profile["is_default"] = is_target
-        r.profile = profile
-        found = found or is_target
-
-    if not found:
+    """Prefer one callable OAuth account for the current user."""
+    updated = await set_default_runtime_integration_account(
+        db,
+        kind=IntegrationAccountKind.OAUTH_ACCOUNT,
+        user_id=user.id,
+        entity_id=user.entity_id,
+        provider=server_key,
+        account_id=connection_id,
+    )
+    if not updated:
         raise HTTPException(404, "Connection not found")
     await db.commit()
 
@@ -1191,29 +1687,49 @@ async def disconnect_account(
     from sqlalchemy import select
     from packages.core.models.user import OAuthAccount
 
+    await lock_runtime_integration_account_scope(
+        db,
+        kind=IntegrationAccountKind.OAUTH_ACCOUNT,
+        user_id=user.id,
+        entity_id=user.entity_id,
+        provider=server_key,
+    )
     row = (await db.execute(
         select(OAuthAccount).where(
             OAuthAccount.id == connection_id,
             OAuthAccount.user_id == user.id,
-            OAuthAccount.provider == server_key,
+            OAuthAccount.provider.in_(provider_key_aliases(server_key)),
         )
     )).scalar_one_or_none()
     if not row:
         raise HTTPException(404, "Connection not found")
-    was_default = bool((row.profile or {}).get("is_default"))
+    if canonical_provider_key(server_key) == "discord":
+        guild_id = str((row.profile or {}).get("guild_id") or "").strip()
+        app = await resolve_discord_app_config(db)
+        if app is not None and guild_id:
+            try:
+                await leave_discord_guild(app, guild_id)
+            except Exception:
+                logger.warning(
+                    "Discord Guild leave failed for guild=%s; "
+                    "continuing authoritative local disconnect",
+                    guild_id,
+                )
+    await _delete_oauth_channel_bridges(
+        db,
+        entity_id=user.entity_id,
+        owner_user_id=user.id,
+        oauth_account_id=connection_id,
+    )
     await db.delete(row)
     await db.flush()
-    if was_default:
-        replacement = (await db.execute(
-            select(OAuthAccount).where(
-                OAuthAccount.user_id == user.id,
-                OAuthAccount.provider == server_key,
-            ).order_by(OAuthAccount.created_at.desc()).limit(1)
-        )).scalar_one_or_none()
-        if replacement:
-            profile = dict(replacement.profile or {})
-            profile["is_default"] = True
-            replacement.profile = profile
+    await normalize_runtime_integration_account_defaults(
+        db,
+        kind=IntegrationAccountKind.OAUTH_ACCOUNT,
+        user_id=user.id,
+        entity_id=user.entity_id,
+        provider=server_key,
+    )
     await db.commit()
 
 
@@ -1228,13 +1744,15 @@ async def test_entity_account(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Run the provider's test_connection for one entity-level account
+    """Run the provider's test_connection for one user-owned account
     synchronously. Returns the probe result; the stored
     ``config.last_health_check`` is also refreshed."""
     from packages.core.services.integration_health import run_and_persist_integration
     from packages.core.services.integration_service import get_integration
 
-    existing = await get_integration(db, account_id, user.entity_id)
+    existing = await get_integration(
+        db, account_id, user.entity_id, user.id, action="manage",
+    )
     if not existing:
         raise HTTPException(404, "Account not found")
 
@@ -1246,23 +1764,176 @@ async def test_entity_account(
 _WECHAT_RUNNER_URL = os.getenv(
     "WECHAT_RUNNER_URL", "http://wechat-runner:8800",
 ).rstrip("/")
-_WECHAT_RUNNER_BEARER = os.getenv("WECHAT_RUNNER_BEARER_TOKEN", "")
+_WECHAT_RUNNER_BEARER = os.getenv("WECHAT_RUNNER_BEARER_TOKEN", "").strip()
 
 
-def _wechat_runner_headers() -> dict[str, str]:
+def _wechat_runner_headers(bearer_token: str | None = None) -> dict[str, str]:
     h: dict[str, str] = {"Accept": "application/json"}
-    if _WECHAT_RUNNER_BEARER:
-        h["Authorization"] = f"Bearer {_WECHAT_RUNNER_BEARER}"
+    token = bearer_token or _WECHAT_RUNNER_BEARER
+    if token:
+        h["Authorization"] = f"Bearer {token}"
     return h
 
 
-def _wechat_session_id_from_creds(integ) -> str | None:
-    return ((integ.credentials or {}).get("session_id") or "").strip() or None
+async def _require_wechat_runner_bearer(
+    authorization: str | None = Header(None),
+) -> None:
+    """Authorize runner-only endpoints with the deployment shared secret."""
+    if not _WECHAT_RUNNER_BEARER:
+        raise HTTPException(503, "WeChat runner restore is not configured")
+    supplied = (authorization or "").strip()
+    expected = f"Bearer {_WECHAT_RUNNER_BEARER}"
+    if not secrets.compare_digest(supplied, expected):
+        raise HTTPException(401, "Bad WeChat runner bearer token")
 
 
-def _wechat_runner_url_from_creds(integ) -> str:
-    creds = integ.credentials or {}
-    return (creds.get("runner_url") or _WECHAT_RUNNER_URL).rstrip("/")
+def _wechat_session_id_from_creds(credentials: dict[str, Any]) -> str | None:
+    return (str(credentials.get("session_id") or "").strip() or None)
+
+
+def _wechat_runner_url_from_creds(credentials: dict[str, Any]) -> str:
+    return str(credentials.get("runner_url") or _WECHAT_RUNNER_URL).rstrip("/")
+
+
+async def _wechat_personal_session_for_owner(
+    db: AsyncSession,
+    *,
+    session_id: str,
+    entity_id: str,
+    user_id: str,
+    for_update: bool = False,
+) -> WechatPersonalSession:
+    query = select(WechatPersonalSession).where(
+        WechatPersonalSession.session_id == session_id,
+        WechatPersonalSession.entity_id == entity_id,
+        WechatPersonalSession.owner_user_id == user_id,
+    )
+    if for_update:
+        query = query.with_for_update()
+    session = (await db.execute(query)).scalar_one_or_none()
+    if not session:
+        raise HTTPException(404, "Session not found — start a fresh one.")
+    return session
+
+
+def _wechat_personal_credentials(integration, user_id: str) -> dict[str, Any]:
+    from packages.core.credentials import Requester, get_credential_service
+
+    return get_credential_service().lease_integration(
+        integration,
+        requester=Requester(kind="user", id=user_id),
+        reason="wechat_personal_runner_request",
+    )
+
+
+async def _wechat_restore_callback_url(
+    db: AsyncSession,
+    *,
+    entity_id: str,
+    integration_id: str,
+) -> str | None:
+    """Build the callback URL for a persisted WeChat integration."""
+    from packages.core.config import get_settings
+    from packages.core.models.channel import ChannelConfig
+
+    channel_config = (await db.execute(
+        select(ChannelConfig).where(
+            ChannelConfig.entity_id == entity_id,
+            ChannelConfig.credential_source_kind == "integration",
+            ChannelConfig.credential_source_id == integration_id,
+            ChannelConfig.channel_type == "wechat_personal",
+        )
+    )).scalar_one_or_none()
+    if not channel_config:
+        return None
+    base = (get_settings().PUBLIC_BASE_URL or "").rstrip("/")
+    if not base:
+        return None
+    return f"{base}/api/v1/channels/wechat_personal/callback?config_id={channel_config.id}"
+
+
+@router.get(
+    "/wechat-personal/internal/sessions",
+    dependencies=[Depends(_require_wechat_runner_bearer)],
+)
+async def wechat_personal_restore_sessions(
+    db: AsyncSession = Depends(get_db),
+) -> list[dict[str, Any]]:
+    """Return active token-backed sessions to a freshly started runner.
+
+    This is an internal bearer-protected endpoint. It returns only the
+    credentials required to recreate the in-memory iLink client; cursor,
+    peer context, and QR state are intentionally not persisted.
+    """
+    from packages.core.models.document import Integration
+    from packages.core.credentials import Requester, get_credential_service
+
+    rows = (await db.execute(
+        select(WechatPersonalSession).where(
+            WechatPersonalSession.status == "active",
+            WechatPersonalSession.integration_id.is_not(None),
+        )
+    )).scalars().all()
+    response: list[dict[str, Any]] = []
+    credentials_changed = False
+    for session in rows:
+        integration = (await db.execute(
+            select(Integration).where(
+                Integration.id == session.integration_id,
+                Integration.entity_id == session.entity_id,
+                Integration.provider == "wechat_personal",
+            )
+        )).scalar_one_or_none()
+        if not integration:
+            continue
+        try:
+            credentials = get_credential_service().lease_integration(
+                integration,
+                requester=Requester(kind="system", id="wechat-runner"),
+                reason="wechat_personal_runner_restore",
+            )
+        except CredentialError:
+            logger.warning(
+                "Cannot lease credentials for WeChat session %s during restore",
+                session.session_id,
+            )
+            continue
+        bot_token = str(credentials.get("bot_token") or "").strip()
+        if not bot_token:
+            # Integrations created before token persistence need a new QR scan.
+            continue
+
+        runner_url = _wechat_runner_url_from_creds(credentials)
+        if runner_url != _WECHAT_RUNNER_URL:
+            # This endpoint serves the built-in singleton only. A custom
+            # runner owns its own restore mechanism and must not receive its
+            # token or have its bearer rewritten here.
+            continue
+
+        # A runner bearer rotation should not strand existing integrations.
+        # Keep custom runner credentials untouched; the built-in runner uses
+        # the current deployment secret for all restored accounts.
+        if _WECHAT_RUNNER_BEARER and credentials.get("bearer_token") != _WECHAT_RUNNER_BEARER:
+            credentials = {**credentials, "bearer_token": _WECHAT_RUNNER_BEARER}
+            get_credential_service().store_integration(integration, credentials)
+            credentials_changed = True
+
+        response.append({
+            "session_id": session.session_id,
+            "bot_token": bot_token,
+            "base_url": credentials.get("base_url"),
+            "account": (integration.config or {}).get("ilink_account")
+            if isinstance(integration.config, dict) else None,
+            "callback_url": await _wechat_restore_callback_url(
+                db,
+                entity_id=session.entity_id,
+                integration_id=integration.id,
+            ),
+            "callback_bearer": credentials.get("bearer_token"),
+        })
+    if credentials_changed:
+        await db.commit()
+    return response
 
 
 # ── Pre-integration scan flow ────────────────────────────────────────
@@ -1276,10 +1947,9 @@ def _wechat_runner_url_from_creds(integ) -> str:
 @router.post("/wechat-personal/sessions")
 async def wechat_personal_start_session(
     user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
 ):
-    """Spawn a new iLink session on the runner. No DB writes — the
-    Integration row only gets created on /finish. Returns the
-    runner-side session_id the frontend uses for polling."""
+    """Spawn a runner session and persist its owner before returning it."""
     import httpx as _httpx
     try:
         async with _httpx.AsyncClient(timeout=10) as client:
@@ -1293,17 +1963,35 @@ async def wechat_personal_start_session(
         )
     if not r.is_success:
         raise HTTPException(502, f"Runner /sessions: {r.status_code} {r.text[:200]}")
-    return r.json()
+    payload = r.json()
+    session_id = str(payload.get("session_id") or "").strip()
+    if not session_id:
+        raise HTTPException(502, "Runner /sessions response did not include session_id")
+    db.add(WechatPersonalSession(
+        session_id=session_id,
+        entity_id=user.entity_id,
+        owner_user_id=user.id,
+        status="pending",
+    ))
+    await db.flush()
+    return payload
 
 
 @router.get("/wechat-personal/sessions/{session_id}/status")
 async def wechat_personal_session_status(
     session_id: str,
     user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
 ):
     """Pre-integration polling — same shape as the per-account status
     endpoint but addressed by runner session_id."""
     import httpx as _httpx
+    await _wechat_personal_session_for_owner(
+        db,
+        session_id=session_id,
+        entity_id=user.entity_id,
+        user_id=user.id,
+    )
     try:
         async with _httpx.AsyncClient(timeout=8) as client:
             r = await client.get(
@@ -1324,18 +2012,23 @@ async def wechat_personal_session_status(
 @router.get("/wechat-personal/sessions/{session_id}/qr.png")
 async def wechat_personal_session_qr(
     session_id: str,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
 ):
-    """Proxy the runner's per-session QR image. Unauthenticated so it
-    works as an ``<img src>`` (browsers can't add a JWT header). The
-    session_id is opaque (96-bit random) and short-lived; intercepting
-    it doesn't help an attacker — they'd need to also intercept the
-    user's WeChat scan."""
+    """Proxy a QR image only to the owner of its pairing session."""
     import httpx as _httpx
     from fastapi.responses import Response as _Response
+    await _wechat_personal_session_for_owner(
+        db,
+        session_id=session_id,
+        entity_id=user.entity_id,
+        user_id=user.id,
+    )
     try:
         async with _httpx.AsyncClient(timeout=8) as client:
             r = await client.get(
                 f"{_WECHAT_RUNNER_URL}/sessions/{session_id}/qr.png",
+                headers=_wechat_runner_headers(),
             )
     except _httpx.HTTPError as exc:
         raise HTTPException(502, f"Runner unreachable: {exc}")
@@ -1373,6 +2066,27 @@ async def wechat_personal_finish_session(
     import httpx as _httpx
     if req.session_id != session_id:
         raise HTTPException(400, "session_id mismatch")
+    pairing_session = await _wechat_personal_session_for_owner(
+        db,
+        session_id=session_id,
+        entity_id=user.entity_id,
+        user_id=user.id,
+        for_update=True,
+    )
+    if pairing_session.integration_id:
+        integration = await get_integration(
+            db,
+            pairing_session.integration_id,
+            user.entity_id,
+            user.id,
+            action="manage",
+        )
+        if not integration:
+            raise HTTPException(404, "WeChat integration not found")
+        return _integration_resp(
+            integration,
+            creator_names=await _creator_names(db, [integration]),
+        )
     try:
         async with _httpx.AsyncClient(timeout=8) as client:
             r = await client.get(
@@ -1391,6 +2105,29 @@ async def wechat_personal_finish_session(
             f"(state: {status_data}).",
         )
 
+    # The status surface is deliberately credential-free. Fetch the token
+    # through the runner's bearer-protected internal endpoint only after the
+    # QR flow reports an online session, then immediately vault it with the
+    # Integration row.
+    try:
+        async with _httpx.AsyncClient(timeout=8) as client:
+            credentials_response = await client.get(
+                f"{_WECHAT_RUNNER_URL}/sessions/{session_id}/credentials",
+                headers=_wechat_runner_headers(),
+            )
+    except _httpx.RequestError as exc:
+        raise HTTPException(502, f"Runner unreachable: {exc}")
+    if not credentials_response.is_success:
+        raise HTTPException(
+            502,
+            "Runner did not return the paired bot token; deploy the current "
+            f"runner image and retry (HTTP {credentials_response.status_code}).",
+        )
+    runner_credentials = credentials_response.json()
+    bot_token = str(runner_credentials.get("bot_token") or "").strip()
+    if not bot_token:
+        raise HTTPException(502, "Runner credentials response did not include bot_token")
+
     account = status_data.get("account") or {}
     config = {
         "name": req.name or account.get("nick_name") or account.get("user_name") or "WeChat (personal)",
@@ -1400,23 +2137,31 @@ async def wechat_personal_finish_session(
         "runner_url": _WECHAT_RUNNER_URL,
         "bearer_token": _WECHAT_RUNNER_BEARER,
         "session_id": session_id,
+        "bot_token": bot_token,
+        "base_url": runner_credentials.get("base_url"),
     }
     try:
         integration = await create_integration(
             db, user.entity_id, "wechat_personal",
             config=config, credentials=creds,
             created_by_user_id=user.id,
+            owner_user_id=user.id,
         )
         await _sync_channel_config_if_needed(
             db,
             entity_id=user.entity_id,
+            owner_user_id=user.id,
             provider="wechat_personal",
             integration_id=integration.id,
-            credentials=creds,
         )
+        pairing_session.integration_id = integration.id
+        pairing_session.status = "active"
         await db.commit()
     except CredentialError as exc:
         await _raise_credential_backend_unavailable(db, exc, action="wechat_personal_finish")
+    await _register_integration_channel_webhooks(
+        db, entity_id=user.entity_id, integration_id=integration.id,
+    )
     return _integration_resp(
         integration,
         creator_names=await _creator_names(db, [integration]),
@@ -1427,11 +2172,21 @@ async def wechat_personal_finish_session(
 async def wechat_personal_cancel_session(
     session_id: str,
     user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
 ):
     """Tear down a runner session — used when the user closes the
     modal before scanning. Best-effort; the runner GCs orphaned
     sessions anyway."""
     import httpx as _httpx
+    pairing_session = await _wechat_personal_session_for_owner(
+        db,
+        session_id=session_id,
+        entity_id=user.entity_id,
+        user_id=user.id,
+        for_update=True,
+    )
+    if pairing_session.integration_id:
+        raise HTTPException(409, "Session is already connected")
     try:
         async with _httpx.AsyncClient(timeout=6) as client:
             await client.delete(
@@ -1440,6 +2195,7 @@ async def wechat_personal_cancel_session(
             )
     except _httpx.RequestError:
         pass
+    await db.delete(pairing_session)
     return None
 
 
@@ -1456,19 +2212,27 @@ async def wechat_personal_status(
     by Integration id — used by the cards UI to show per-account
     online state."""
     import httpx as _httpx
-    existing = await get_integration(db, account_id, user.entity_id)
+    existing = await get_integration(
+        db, account_id, user.entity_id, user.id, action="manage",
+    )
     if not existing or existing.provider != "wechat_personal":
         raise HTTPException(404, "Not a wechat_personal account")
-    sid = _wechat_session_id_from_creds(existing)
+    try:
+        credentials = _wechat_personal_credentials(existing, user.id)
+    except CredentialError as exc:
+        await _raise_credential_backend_unavailable(
+            db, exc, action="wechat_personal_status",
+        )
+    sid = _wechat_session_id_from_creds(credentials)
     if not sid:
         return {"online": False, "qr_pending": False,
                 "last_error": "Integration has no session_id — re-scan needed."}
-    runner_url = _wechat_runner_url_from_creds(existing)
+    runner_url = _wechat_runner_url_from_creds(credentials)
     try:
         async with _httpx.AsyncClient(timeout=6) as client:
             r = await client.get(
                 f"{runner_url}/sessions/{sid}/status",
-                headers=_wechat_runner_headers(),
+                headers=_wechat_runner_headers(credentials.get("bearer_token")),
             )
         if r.status_code == 404:
             return {"online": False, "qr_pending": False,
@@ -1498,16 +2262,27 @@ async def wechat_personal_qr(
     import httpx as _httpx
     from fastapi.responses import Response as _Response
 
-    existing = await get_integration(db, account_id, user.entity_id)
+    existing = await get_integration(
+        db, account_id, user.entity_id, user.id, action="manage",
+    )
     if not existing or existing.provider != "wechat_personal":
         raise HTTPException(404, "Not a wechat_personal account")
-    sid = _wechat_session_id_from_creds(existing)
+    try:
+        credentials = _wechat_personal_credentials(existing, user.id)
+    except CredentialError as exc:
+        await _raise_credential_backend_unavailable(
+            db, exc, action="wechat_personal_qr",
+        )
+    sid = _wechat_session_id_from_creds(credentials)
     if not sid:
         raise HTTPException(404, "Integration has no session_id.")
-    runner_url = _wechat_runner_url_from_creds(existing)
+    runner_url = _wechat_runner_url_from_creds(credentials)
     try:
         async with _httpx.AsyncClient(timeout=8) as client:
-            r = await client.get(f"{runner_url}/sessions/{sid}/qr.png")
+            r = await client.get(
+                f"{runner_url}/sessions/{sid}/qr.png",
+                headers=_wechat_runner_headers(credentials.get("bearer_token")),
+            )
     except _httpx.HTTPError as e:
         raise HTTPException(502, f"Runner unreachable: {e}")
     if r.status_code == 404:
@@ -1535,15 +2310,30 @@ async def register_wiring_for_account(
     from sqlalchemy import select as _select
     from packages.core.models.channel import ChannelConfig
 
-    existing = await get_integration(db, account_id, user.entity_id)
+    existing = await get_integration(
+        db, account_id, user.entity_id, user.id, action="manage",
+    )
     if not existing:
         raise HTTPException(404, "Account not found")
+
+    if existing.provider == "telegram":
+        try:
+            await _repair_telegram_source_security(
+                db, integration=existing, requester_user_id=user.id,
+            )
+            # The adapter leases source credentials from an independent
+            # short-lived session, so make the repaired source visible first.
+            await db.commit()
+        except TelegramBotAlreadyConnected as exc:
+            raise HTTPException(409, str(exc)) from exc
 
     # Find the ChannelConfig that bridges this Integration
     cc = (await db.execute(
         _select(ChannelConfig).where(
             ChannelConfig.entity_id == user.entity_id,
-            ChannelConfig.config["integration_id"].astext == account_id,
+            ChannelConfig.owner_user_id == user.id,
+            ChannelConfig.credential_source_kind == "integration",
+            ChannelConfig.credential_source_id == account_id,
         )
     )).scalar_one_or_none()
     if not cc:
@@ -1613,7 +2403,10 @@ class ChannelBindingItem(BaseModel):
     status: str
     bound_channel_id: str | None = None
     bound_agent_id: str | None = None
+    bound_agent_subscription_id: str | None = None
+    bound_workspace_id: str | None = None
     agent_name: str | None = None
+    workspace_name: str | None = None
     binding_status: str | None = None
     last_inbound_at: str | None = None
     last_outbound_at: str | None = None
@@ -1622,6 +2415,60 @@ class ChannelBindingItem(BaseModel):
 class UpsertChannelBindingRequest(BaseModel):
     channel_config_id: str
     agent_id: str | None = None   # null = unassigned
+    agent_subscription_id: str | None = None
+
+
+class WhatsAppProvisioningRetryRequest(BaseModel):
+    registration_pin: str = Field(
+        min_length=6,
+        max_length=6,
+        pattern=r"^[0-9]{6}$",
+    )
+
+
+class WhatsAppProvisioningRetryResponse(BaseModel):
+    ok: bool
+    integration_id: str
+    readiness_code: str
+    detail: str
+
+
+@router.post(
+    "/entity-accounts/{account_id}/whatsapp/provisioning/retry",
+    response_model=WhatsAppProvisioningRetryResponse,
+)
+async def retry_whatsapp_business_provisioning(
+    account_id: str,
+    req: WhatsAppProvisioningRetryRequest,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    integration = await get_integration(
+        db,
+        account_id,
+        user.entity_id,
+        user.id,
+        action="manage",
+    )
+    if (
+        integration is None
+        or integration.owner_user_id != user.id
+        or canonical_provider_key(integration.provider) != "whatsapp"
+        or not isinstance((integration.config or {}).get("nango"), dict)
+    ):
+        raise HTTPException(404, "WhatsApp Business integration not found")
+    try:
+        outcome = await _provision_whatsapp_integration_account(
+            db,
+            entity_id=user.entity_id,
+            integration_id=integration.id,
+            registration_pin=req.registration_pin,
+        )
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(503, "WhatsApp Business setup is unavailable") from exc
+    return WhatsAppProvisioningRetryResponse(**outcome)
 
 
 @router.get("/channel-bindings", response_model=list[ChannelBindingItem])
@@ -1632,7 +2479,7 @@ async def list_channel_bindings_endpoint(
     """Every ChannelConfig for the entity + which agent it's routing to
     (if any). Drives the Agent Channels tab."""
     from packages.core.services.integration_service import list_channel_bindings
-    rows = await list_channel_bindings(db, user.entity_id)
+    rows = await list_channel_bindings(db, user.entity_id, user.id)
     return [ChannelBindingItem(**r) for r in rows]
 
 
@@ -1653,15 +2500,18 @@ async def upsert_channel_binding_endpoint(
     try:
         await upsert_channel_binding(
             db, entity_id=user.entity_id,
+            user_id=user.id,
             channel_config_id=req.channel_config_id,
             agent_id=req.agent_id,
+            agent_subscription_id=req.agent_subscription_id,
+            user_role=user.role,
         )
     except ValueError as e:
         raise HTTPException(404, str(e))
     await db.commit()
 
     # Return the refreshed row so the UI can reconcile
-    rows = await list_channel_bindings(db, user.entity_id)
+    rows = await list_channel_bindings(db, user.entity_id, user.id)
     match = next(
         (r for r in rows if r["channel_config_id"] == req.channel_config_id),
         None,
@@ -1681,7 +2531,7 @@ async def delete_channel_binding_endpoint(
     ChannelConfig in place so inbound still parses + logs (just no
     agent dispatch)."""
     from packages.core.services.integration_service import delete_channel_binding
-    removed = await delete_channel_binding(db, user.entity_id, channel_id)
+    removed = await delete_channel_binding(db, user.entity_id, user.id, channel_id)
     if not removed:
         raise HTTPException(404, "Channel binding not found")
     await db.commit()
@@ -1718,7 +2568,7 @@ async def list_channel_logs(
     from packages.core.services.channel_service import list_messages
 
     rows = await list_messages(
-        db, user.entity_id,
+        db, user.entity_id, user.id,
         channel_type=channel_type, direction=direction,
         limit=limit, offset=offset,
     )
@@ -1741,7 +2591,7 @@ async def list_channel_logs(
     ]
 
 
-# ── Entity-level accounts (credential / api-key providers) ──────────────────
+# ── User-owned accounts (credential / api-key providers) ───────────────────
 
 @router.post(
     "/mcp-servers/{server_key}/entity-accounts/{account_id}/set-default",
@@ -1753,16 +2603,17 @@ async def set_default_entity_account(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Mark one entity-level Integration row as the default for its
-    provider. Agents pick this row first when no account_id is supplied.
-    """
-    from packages.core.services.integration_service import (
-        get_integration, set_default_integration,
+    """Prefer one callable entity account for the current user."""
+    updated = await set_default_runtime_integration_account(
+        db,
+        kind=IntegrationAccountKind.INTEGRATION,
+        user_id=user.id,
+        entity_id=user.entity_id,
+        provider=server_key,
+        account_id=account_id,
     )
-    target = await get_integration(db, account_id, user.entity_id)
-    if not target or target.provider != server_key:
+    if not updated:
         raise HTTPException(404, "Account not found")
-    await set_default_integration(db, user.entity_id, account_id)
     await db.commit()
 
 
@@ -1776,34 +2627,45 @@ async def delete_entity_account(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Remove one entity-level Integration row. Paired ChannelConfig row
+    """Remove one owned Integration row. Paired ChannelConfig row
     (if any) is also removed so inbound routing stops."""
-    from packages.core.models.document import Integration
-
-    target = await get_integration(db, account_id, user.entity_id)
-    if not target or target.provider != server_key:
+    target = await get_integration(
+        db, account_id, user.entity_id, user.id, action="manage",
+    )
+    if (
+        not target
+        or canonical_provider_key(target.provider)
+        != canonical_provider_key(server_key)
+    ):
         raise HTTPException(404, "Account not found")
+
+    if canonical_provider_key(target.provider) == "whatsapp":
+        try:
+            await _disconnect_whatsapp_integration_once(
+                db,
+                entity_id=user.entity_id,
+                integration_id=account_id,
+            )
+        except WhatsAppDisconnectPending:
+            _enqueue_whatsapp_disconnect_retry(
+                entity_id=user.entity_id,
+                integration_id=account_id,
+            )
+        return
 
     await _delete_integration_channel_bridges(
         db,
         entity_id=user.entity_id,
         integration_id=account_id,
     )
-    was_default = bool((target.config or {}).get("is_default"))
-    await db.delete(target)
-    await db.flush()
-    if was_default:
-        replacement = (await db.execute(
-            select(Integration).where(
-                Integration.entity_id == user.entity_id,
-                Integration.provider == server_key,
-                Integration.status == "active",
-            ).order_by(Integration.created_at.desc()).limit(1)
-        )).scalar_one_or_none()
-        if replacement:
-            config = dict(replacement.config or {})
-            config["is_default"] = True
-            replacement.config = config
+    removed = await delete_integration(
+        db,
+        account_id,
+        user.entity_id,
+        user.id,
+    )
+    if not removed:
+        raise HTTPException(404, "Account not found")
     await db.commit()
 
 
@@ -1855,7 +2717,7 @@ async def oauth_start(
     from packages.core.services.oauth_provider_config import (
         is_oauth_provider, resolve_oauth_config,
     )
-    from packages.core.services.oauth_flow import begin_authorization
+    from packages.core.services.oauth_flow import OAuthFlowError, begin_authorization
 
     if not is_oauth_provider(server_key):
         raise HTTPException(400, f"{server_key} is not an OAuth provider")
@@ -1882,16 +2744,28 @@ async def oauth_start(
             f"Set the provider's client_id and client_secret (env or admin UI).",
         )
 
+    if server_key == "discord":
+        discord_app = await resolve_discord_app_config(db)
+        if discord_app is None or not await validate_discord_app_config(discord_app):
+            raise HTTPException(
+                503,
+                "Discord App runtime configuration is invalid",
+            )
+
     app_url = os.getenv("APP_URL", "http://localhost:3010").rstrip("/")
     redirect_uri = f"{app_url}{config.redirect_path}"
     safe_return_to = _safe_oauth_return_path(return_to)
-    start = begin_authorization(
-        config=config,
-        user_id=user.id,
-        redirect_uri=redirect_uri,
-        return_to=safe_return_to,
-        connection_id=connection_id,
-    )
+    try:
+        start = await begin_authorization(
+            config=config,
+            user_id=user.id,
+            redirect_uri=redirect_uri,
+            entity_id=user.entity_id,
+            return_to=safe_return_to,
+            connection_id=connection_id,
+        )
+    except OAuthFlowError as exc:
+        raise HTTPException(exc.status, exc.message)
     return OAuthStartResponse(
         authorize_url=start.authorize_url,
         state=start.state,
@@ -1907,6 +2781,7 @@ async def oauth_callback(
     state: str | None = None,
     error: str | None = None,
     error_description: str | None = None,
+    realm_id: str | None = Query(default=None, alias="realmId"),
     db: AsyncSession = Depends(get_db),
 ):
     """Exchange the authorization code for tokens and persist to
@@ -1918,12 +2793,12 @@ async def oauth_callback(
     """
     import os
     from packages.core.models.base import generate_ulid
-    from packages.core.models.user import OAuthAccount
+    from packages.core.models.user import OAuthAccount, UserMembership
     from packages.core.services.oauth_provider_config import resolve_oauth_config
     from packages.core.services.oauth_flow import (
         complete_authorization, render_oauth_error_page, OAuthFlowError,
-        get_pending_connection_id, get_pending_return_to, resolve_oauth_identity,
-        validate_pending_state,
+        get_pending_state,
+        resolve_oauth_identity,
     )
 
     # Provider rejected (scope, cancel, app not approved) → human page.
@@ -1931,11 +2806,12 @@ async def oauth_callback(
         return render_oauth_error_page(server_key, error, error_description)
 
     try:
-        validate_pending_state(state, server_key=server_key)
-        return_to = get_pending_return_to(state, server_key=server_key)
-        reconnect_connection_id = get_pending_connection_id(
-            state, server_key=server_key,
-        )
+        pending = await get_pending_state(state, server_key=server_key)
+        return_to = pending.get("return_to")
+        reconnect_connection_id = pending.get("connection_id")
+        oauth_entity_id = pending.get("entity_id")
+        if not oauth_entity_id:
+            raise OAuthFlowError(400, "OAuth state is missing its Entity context")
     except OAuthFlowError as exc:
         raise HTTPException(exc.status, exc.message)
 
@@ -1962,16 +2838,47 @@ async def oauth_callback(
     access_token = tokens.access_token
     refresh_token = tokens.refresh_token
     token_expires_at = tokens.expires_at
-    provider_user_id, identity_profile = await resolve_oauth_identity(
-        server_key,
-        tokens,
-    )
+    try:
+        provider_user_id, identity_profile = await resolve_oauth_identity(
+            server_key,
+            tokens,
+            application_id=config.client_id,
+        )
+    except OAuthFlowError as exc:
+        raise HTTPException(exc.status, exc.message) from exc
+    if server_key == "quickbooks" and str(realm_id or "").strip():
+        identity_profile["realm_id"] = str(realm_id).strip()
+    oauth_owner = (await db.execute(
+        select(User).where(
+            User.id == user_id,
+            User.status == "active",
+            User.deleted_at.is_(None),
+        )
+    )).scalar_one_or_none()
+    if oauth_owner is None:
+        raise HTTPException(404, "OAuth connection owner not found")
+    active_membership = (await db.execute(
+        select(UserMembership.id).where(
+            UserMembership.user_id == user_id,
+            UserMembership.entity_id == oauth_entity_id,
+            UserMembership.status == "active",
+            UserMembership.deleted_at.is_(None),
+        )
+    )).scalar_one_or_none()
+    if active_membership is None:
+        raise HTTPException(403, "OAuth connection Entity membership is no longer active")
 
     # Upsert one external account without overwriting sibling connections.
-    from sqlalchemy import select
     from packages.core.services.provider_keys import provider_key_aliases
 
     aliases = provider_key_aliases(server_key)
+    await lock_runtime_integration_account_scope(
+        db,
+        kind=IntegrationAccountKind.OAUTH_ACCOUNT,
+        user_id=user_id,
+        entity_id=oauth_entity_id,
+        provider=server_key,
+    )
     reconnect_row = None
     if reconnect_connection_id:
         reconnect_row = (await db.execute(
@@ -1994,18 +2901,51 @@ async def oauth_callback(
     existing = identity_row or reconnect_row
 
     if existing:
+        preserved_refresh_token = refresh_token
+        if (
+            server_key != "facebook"
+            and not preserved_refresh_token
+            and oauth_account_is_runtime_usable(existing)
+        ):
+            preserved_refresh_token = lease_oauth_account_tokens(
+                existing,
+                requester_id=user_id,
+                requester_kind="user",
+                reason="oauth.token.rotate_preserve_refresh_before_provider_update",
+            ).get("refresh_token")
         existing.provider = server_key
         existing.provider_user_id = provider_user_id
         from packages.core.services.oauth_account_credentials import store_oauth_account_tokens
         store_oauth_account_tokens(
             existing,
             access_token=access_token,
-            refresh_token=refresh_token,
+            refresh_token=preserved_refresh_token,
+            # Any old refresh token was leased before provider canonicalization
+            # so the encrypted credential's original AAD remains readable.
+            preserve_existing_refresh=False,
             requester_id=user_id,
         )
         existing.token_expires_at = token_expires_at
         profile = dict(existing.profile or {})
-        profile.update(identity_profile)
+        if server_key == "slack":
+            for key in (
+                "app_id",
+                "team_id",
+                "team_name",
+                "enterprise_id",
+                "enterprise_name",
+                "bot_user_id",
+                "authed_user_id",
+            ):
+                profile.pop(key, None)
+        if server_key == "discord":
+            for key in ("application_id", "guild_id", "guild_name"):
+                profile.pop(key, None)
+        profile.update({
+            key: value
+            for key, value in identity_profile.items()
+            if key != "is_default"
+        })
         # A user just completed OAuth again, so any previous "auth failed /
         # reconnect required" health result is stale. The async health probe
         # below will write a fresh result after it validates the new token.
@@ -2014,14 +2954,12 @@ async def oauth_callback(
         existing.profile = profile
         oauth_row_id = existing.id
     else:
-        sibling_count = len((await db.execute(
-            select(OAuthAccount.id).where(
-                OAuthAccount.user_id == user_id,
-                OAuthAccount.provider.in_(aliases),
-            )
-        )).scalars().all())
-        profile = dict(identity_profile)
-        profile["is_default"] = sibling_count == 0
+        profile = {
+            key: value
+            for key, value in identity_profile.items()
+            if key != "is_default"
+        }
+        profile["is_default"] = False
         new_row = OAuthAccount(
             id=generate_ulid(),
             user_id=user_id,
@@ -2041,6 +2979,57 @@ async def oauth_callback(
         db.add(new_row)
         oauth_row_id = new_row.id
     await db.flush()
+    await normalize_runtime_integration_account_defaults(
+        db,
+        kind=IntegrationAccountKind.OAUTH_ACCOUNT,
+        user_id=user_id,
+        entity_id=oauth_entity_id,
+        provider=server_key,
+    )
+    try:
+        await _sync_oauth_channel_config_if_needed(
+            db,
+            entity_id=oauth_entity_id,
+            owner_user_id=user_id,
+            provider=server_key,
+            oauth_account_id=oauth_row_id,
+            connection_profile=dict(
+                existing.profile if existing else new_row.profile
+            ),
+        )
+    except IntegrityError as exc:
+        await db.rollback()
+        if server_key == "discord":
+            raise HTTPException(
+                409,
+                "This Discord Server is already connected. "
+                "Ask its owner to share the connection instead.",
+            ) from exc
+        raise
+    if server_key == "discord":
+        guild_id = str(
+            (existing.profile if existing else new_row.profile).get("guild_id")
+            or ""
+        ).strip()
+        app = await resolve_discord_app_config(db)
+        if (
+            app is None
+            or app.application_id != config.client_id
+            or not guild_id
+        ):
+            await db.rollback()
+            raise HTTPException(
+                503,
+                "Discord App runtime configuration is invalid",
+            )
+        try:
+            await register_discord_guild_command(app, guild_id)
+        except Exception as exc:
+            await db.rollback()
+            raise HTTPException(
+                502,
+                "Could not register the Discord /manor command",
+            ) from exc
     await db.commit()
 
     # Fire-and-forget health probe so the card lights up green as soon
@@ -2063,7 +3052,7 @@ async def oauth_callback(
 
 class OAuthConfigRequest(BaseModel):
     client_id: str
-    client_secret: str
+    client_secret: str = ""
     scopes: str | None = None
 
 
@@ -2081,15 +3070,20 @@ async def set_oauth_config(
 
     Requires ``users.manage`` permission (admin / owner only).
     """
-    from packages.core.permissions import Permission, check_permission
+    from packages.core.permissions import Permission, check_effective_user_permission
     from packages.core.services.oauth_provider_config import (
-        is_oauth_provider, save_oauth_config,
+        is_oauth_provider, save_oauth_config, oauth_client_secret_required,
     )
 
-    check_permission(user.role, Permission.USERS_MANAGE)
+    await check_effective_user_permission(db, user, Permission.USERS_MANAGE)
 
     if not is_oauth_provider(server_key):
         raise HTTPException(400, f"{server_key} is not an OAuth provider")
+
+    if not req.client_id.strip() or (
+        oauth_client_secret_required(server_key) and not req.client_secret.strip()
+    ):
+        raise HTTPException(400, "Required OAuth client credentials are missing")
 
     ok = await save_oauth_config(
         db, server_key,
@@ -2114,11 +3108,14 @@ class IntegrationResponse(BaseModel):
     # secret-like fields are replaced by the sentinel below. The raw
     # ``credentials`` object is intentionally never serialized.
     credential_preview: dict = {}
-    # Who connected this. Provenance only — integrations remain entity-wide,
-    # so this never affects who may use or edit one. Null for rows created
-    # before it was recorded, or when that user no longer exists.
+    # Audit provenance remains distinct from the current connection owner.
     created_by_user_id: str | None = None
     created_by_name: str | None = None
+    owner_user_id: str | None = None
+    owner_display_name: str | None = None
+    ownership: str = "mine"
+    can_manage: bool = True
+    can_share: bool = False
     created_at: str | None = None
     updated_at: str | None = None
 
@@ -2189,14 +3186,35 @@ def _credential_preview(creds: dict) -> dict:
     return out
 
 
-def _integration_resp(i, *, creator_names: dict[str, str] | None = None) -> IntegrationResponse:
+def _integration_config_preview(config: object) -> dict:
+    """Return user-editable config without server-owned credential pointers."""
+    out = dict(config) if isinstance(config, dict) else {}
+    out.pop("nango", None)
+    return out
+
+
+def _integration_resp(
+    i,
+    *,
+    creator_names: dict[str, str] | None = None,
+    owner_names: dict[str, str] | None = None,
+    requester_user_id: str | None = None,
+    can_share: bool = False,
+) -> IntegrationResponse:
     creator_id = getattr(i, "created_by_user_id", None)
+    owner_id = getattr(i, "owner_user_id", None)
+    is_owner = owner_id == requester_user_id if requester_user_id else True
     return IntegrationResponse(
         id=i.id, entity_id=i.entity_id, provider=i.provider,
-        status=i.status, config=i.config,
+        status=i.status, config=_integration_config_preview(i.config),
         credential_preview=_credential_preview(i.credentials or {}),
         created_by_user_id=creator_id,
         created_by_name=(creator_names or {}).get(creator_id) if creator_id else None,
+        owner_user_id=owner_id,
+        owner_display_name=(owner_names or {}).get(owner_id) if owner_id else None,
+        ownership="mine" if is_owner else "shared",
+        can_manage=is_owner,
+        can_share=is_owner and can_share,
         created_at=i.created_at.isoformat() if i.created_at else None,
         updated_at=i.updated_at.isoformat() if i.updated_at else None,
     )
@@ -2212,6 +3230,25 @@ async def _creator_names(db: AsyncSession, integrations: list) -> dict[str, str]
         getattr(i, "created_by_user_id", None)
         for i in integrations
         if getattr(i, "created_by_user_id", None)
+    }
+    if not ids:
+        return {}
+    rows = (
+        await db.execute(
+            select(User.id, User.display_name, User.email).where(User.id.in_(ids))
+        )
+    ).all()
+    return {
+        str(uid): (display_name or email or "")
+        for uid, display_name, email in rows
+    }
+
+
+async def _owner_names(db: AsyncSession, integrations: list) -> dict[str, str]:
+    ids = {
+        getattr(i, "owner_user_id", None)
+        for i in integrations
+        if getattr(i, "owner_user_id", None)
     }
     if not ids:
         return {}
@@ -2261,9 +3298,24 @@ async def list_my_integrations(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    items = await list_integrations(db, user.entity_id)
+    from packages.core.permissions import Permission, effective_user_has_permission
+
+    items = await list_integrations(db, user.entity_id, user.id)
     names = await _creator_names(db, items)
-    return [_integration_resp(i, creator_names=names) for i in items]
+    owner_names = await _owner_names(db, items)
+    can_share = await effective_user_has_permission(
+        db, user, Permission.INTEGRATIONS_SHARE,
+    )
+    return [
+        _integration_resp(
+            i,
+            creator_names=names,
+            owner_names=owner_names,
+            requester_user_id=user.id,
+            can_share=can_share,
+        )
+        for i in items
+    ]
 
 
 @router.post("", response_model=IntegrationResponse, status_code=201)
@@ -2272,11 +3324,28 @@ async def create_new_integration(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
+    if canonical_provider_key(req.provider) in {"whatsapp", "whatsapp_cloud"}:
+        raise HTTPException(
+            400,
+            "Connect WhatsApp Business with OAuth from the Integrations catalog.",
+        )
+    credentials = _prepare_channel_credentials(req.provider, req.credentials)
+    telegram_bot_id = (
+        await _telegram_bot_id(credentials)
+        if canonical_provider_key(req.provider) == "telegram"
+        else None
+    )
+    whatsapp_phone_number_id = (
+        str((credentials or {}).get("phone_number_id") or "").strip() or None
+        if canonical_provider_key(req.provider) == "whatsapp"
+        else None
+    )
     try:
         integration = await create_integration(
             db, user.entity_id, req.provider,
-            config=req.config, credentials=req.credentials,
+            config=req.config, credentials=credentials,
             created_by_user_id=user.id,
+            owner_user_id=user.id,
         )
 
         # Channel-flavoured providers also get a ChannelConfig row + auto
@@ -2285,13 +3354,23 @@ async def create_new_integration(
         await _sync_channel_config_if_needed(
             db,
             entity_id=user.entity_id,
-            provider=req.provider,
+            owner_user_id=user.id,
+            provider=integration.provider,
             integration_id=integration.id,
-            credentials=req.credentials or {},
+            telegram_bot_id=telegram_bot_id,
+            whatsapp_phone_number_id=whatsapp_phone_number_id,
         )
         await db.commit()
     except CredentialError as exc:
         await _raise_credential_backend_unavailable(db, exc, action="create_integration")
+    except TelegramBotAlreadyConnected as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except WhatsAppPhoneAlreadyConnected as exc:
+        raise HTTPException(409, str(exc)) from exc
+
+    await _register_integration_channel_webhooks(
+        db, entity_id=user.entity_id, integration_id=integration.id,
+    )
 
     # Fire-and-forget health check so the user sees green/red on the
     # card within a couple of seconds of saving.
@@ -2307,6 +3386,8 @@ async def create_new_integration(
     return _integration_resp(
         integration,
         creator_names=await _creator_names(db, [integration]),
+        owner_names=await _owner_names(db, [integration]),
+        requester_user_id=user.id,
     )
 
 
@@ -2322,6 +3403,8 @@ _INTEGRATION_TO_CHANNELS: dict[str, list[tuple[str, str]]] = {
     "email":           [("email",            "smtp_imap")],
     "slack":           [("slack",            "slack_app")],
     "discord":         [("discord",          "discord_app")],
+    "ms_teams":        [("ms_teams",          "microsoft_graph")],
+    "outlook":         [("outlook",           "microsoft_graph")],
     # Twilio needs two channel types so one account can serve both SMS
     # and voice webhooks/dispatch without manual DB surgery.
     "twilio":          [("twilio_sms",       "twilio"), ("twilio_voice", "twilio")],
@@ -2329,17 +3412,938 @@ _INTEGRATION_TO_CHANNELS: dict[str, list[tuple[str, str]]] = {
 }
 
 
+class TelegramBotAlreadyConnected(ValueError):
+    """Raised when a Telegram bot already has a webhook owner in Manor."""
+
+
+class WhatsAppPhoneAlreadyConnected(ValueError):
+    """Raised when a WhatsApp phone number is already routed in Manor."""
+
+
+class WhatsAppDisconnectPending(RuntimeError):
+    """Raised after fail-closed state is durable but provider cleanup is pending."""
+
+
+def _prepare_channel_credentials(provider: str, credentials: dict | None) -> dict | None:
+    """Validate provider webhook credentials before vaulting."""
+    if credentials is None:
+        return None
+    prepared = dict(credentials)
+    if canonical_provider_key(provider) == "telegram":
+        if not str(prepared.get("bot_token") or "").strip():
+            raise HTTPException(422, "Telegram bot_token is required")
+        # Telegram allows URL-safe characters and requires this value on every
+        # delivery. It is generated by Manor, never accepted from browser UI.
+        prepared["secret_token"] = secrets.token_urlsafe(32)
+    elif canonical_provider_key(provider) == "whatsapp":
+        from packages.core.services.whatsapp_business_config import (
+            load_whatsapp_business_config,
+        )
+
+        if not str(prepared.get("phone_number_id") or "").strip():
+            raise HTTPException(422, "WhatsApp phone_number_id is required")
+        if not str(prepared.get("access_token") or "").strip():
+            raise HTTPException(422, "WhatsApp access_token is required")
+        try:
+            load_whatsapp_business_config()
+        except RuntimeError as exc:
+            raise HTTPException(422, str(exc)) from exc
+        prepared.pop("app_secret", None)
+        prepared.pop("verify_token", None)
+    elif canonical_provider_key(provider) == "wechat_official":
+        if not str(prepared.get("app_id") or "").strip():
+            raise HTTPException(422, "WeChat app_id is required")
+        if not str(prepared.get("app_secret") or "").strip():
+            raise HTTPException(422, "WeChat app_secret is required")
+        if not str(prepared.get("token") or "").strip():
+            raise HTTPException(422, "WeChat callback token is required")
+        if str(prepared.get("encoding_aes_key") or "").strip():
+            raise HTTPException(
+                422,
+                "WeChat encrypted callbacks are not supported; use plain-text mode and omit encoding_aes_key.",
+            )
+    return prepared
+
+
+async def _assert_whatsapp_phone_available(
+    db: AsyncSession,
+    *,
+    phone_number_id: str,
+    integration_id: str,
+) -> None:
+    from packages.core.models.channel import ChannelConfig
+
+    other = (await db.execute(
+        select(ChannelConfig).where(
+            ChannelConfig.whatsapp_phone_number_id == phone_number_id,
+            or_(
+                ChannelConfig.credential_source_id.is_(None),
+                ChannelConfig.credential_source_id != integration_id,
+            ),
+        )
+    )).scalar_one_or_none()
+    if other:
+        raise WhatsAppPhoneAlreadyConnected(
+            "This WhatsApp phone number is already connected by another user."
+        )
+
+
+async def _telegram_bot_id(credentials: dict | None) -> str | None:
+    if not credentials:
+        return None
+    token = str(credentials.get("bot_token") or "").strip()
+    if not token:
+        raise HTTPException(422, "Telegram bot_token is required")
+    from packages.core.services.channels.telegram_adapter import TelegramAdapter
+
+    try:
+        bot = await TelegramAdapter(token).get_me()
+    except Exception as exc:
+        raise HTTPException(400, f"Telegram rejected the bot token: {exc}") from exc
+    bot_id = str((bot or {}).get("id") or "").strip()
+    if not bot_id or not bool((bot or {}).get("is_bot")):
+        raise HTTPException(400, "Telegram token did not resolve to a bot")
+    return bot_id
+
+
+async def _assert_telegram_bot_available(
+    db: AsyncSession,
+    *,
+    bot_id: str,
+    integration_id: str,
+) -> None:
+    from packages.core.models.channel import ChannelConfig
+
+    other_owner = (await db.execute(
+        select(ChannelConfig).where(
+            ChannelConfig.telegram_bot_id == bot_id,
+            ChannelConfig.credential_source_id != integration_id,
+        )
+    )).scalar_one_or_none()
+    if other_owner:
+        raise TelegramBotAlreadyConnected(
+            "This Telegram bot is already connected by another user. "
+            "Ask its owner to share the connection instead."
+        )
+
+
+async def _repair_telegram_source_security(
+    db: AsyncSession,
+    *,
+    integration,
+    requester_user_id: str,
+) -> None:
+    """Backfill the server-owned webhook secret on a legacy Telegram bot."""
+    from packages.core.credentials import Requester, get_credential_service
+
+    credential_service = get_credential_service()
+    credentials = credential_service.lease_integration(
+        integration,
+        requester=Requester(kind="user", id=requester_user_id),
+        reason="telegram_manual_webhook_registration",
+    )
+    if not credentials.get("secret_token"):
+        credentials = dict(credentials)
+        credentials["secret_token"] = secrets.token_urlsafe(32)
+        credential_service.store_integration(integration, credentials)
+
+    telegram_bot_id = await _telegram_bot_id(credentials)
+    await _assert_telegram_bot_available(
+        db, bot_id=telegram_bot_id, integration_id=integration.id,
+    )
+    for channel_config in await _channel_configs_for_integration(
+        db, entity_id=integration.entity_id, integration_id=integration.id,
+    ):
+        if channel_config.channel_type == "telegram":
+            channel_config.telegram_bot_id = telegram_bot_id
+            channel_config.credentials = {}
+            channel_config.credential_ref = None
+    await db.flush()
+
+
+async def _channel_configs_for_integration(
+    db: AsyncSession,
+    *,
+    entity_id: str,
+    integration_id: str,
+):
+    from packages.core.models.channel import ChannelConfig
+
+    return (await db.execute(
+        select(ChannelConfig).where(
+            ChannelConfig.entity_id == entity_id,
+            ChannelConfig.credential_source_kind == "integration",
+            ChannelConfig.credential_source_id == integration_id,
+        )
+    )).scalars().all()
+
+
+def _classify_whatsapp_provisioning_result(result) -> tuple[str, str, str, bool]:
+    from packages.core.services.whatsapp_business_provisioning import (
+        WhatsAppPhoneState,
+    )
+
+    if result.ok:
+        return (
+            "ready",
+            "ready",
+            "WhatsApp Business account is ready.",
+            False,
+        )
+    if result.phone_state is WhatsAppPhoneState.REGISTRATION_REQUIRED:
+        return (
+            "registration_required",
+            "phone_not_registered",
+            "Enter the WhatsApp Business number's six-digit registration PIN.",
+            False,
+        )
+    if not result.exact_app_subscribed:
+        return (
+            "failed",
+            "app_not_subscribed",
+            "The Manor Meta App subscription is not confirmed yet.",
+            True,
+        )
+    return (
+        "failed",
+        "provider_unavailable",
+        "WhatsApp Business provider setup is temporarily unavailable.",
+        True,
+    )
+
+
+async def _set_whatsapp_provisioning_state(
+    db: AsyncSession,
+    *,
+    integration_id: str,
+    provisioning_status: str,
+    readiness_code: str,
+    detail: str,
+) -> None:
+    from packages.core.models.document import Integration
+
+    integration = await db.get(Integration, integration_id)
+    if integration is None or canonical_provider_key(integration.provider) != "whatsapp":
+        return
+    config = dict(integration.config or {})
+    whatsapp = dict(config.get("whatsapp") or {})
+    ready = provisioning_status == "ready" and readiness_code == "ready"
+    whatsapp["provisioning_status"] = provisioning_status
+    whatsapp["readiness_code"] = readiness_code
+    whatsapp["provisioning_attempt_count"] = (
+        int(whatsapp.get("provisioning_attempt_count") or 0) + 1
+    )
+    whatsapp["provisioning_last_attempt_at"] = datetime.now(timezone.utc).isoformat()
+    # Keep the legacy projection until every inventory/readiness consumer has
+    # moved to provisioning_status.
+    whatsapp["subscription_status"] = "ready" if ready else "failed"
+    if ready or provisioning_status == "registration_required":
+        whatsapp.pop("provisioning_error", None)
+        whatsapp.pop("subscription_error", None)
+    else:
+        whatsapp["provisioning_error"] = detail
+        whatsapp["subscription_error"] = detail
+    config["whatsapp"] = whatsapp
+    config["last_health_check"] = {
+        "ok": ready,
+        "reason_code": "healthy" if ready else readiness_code,
+        "detail": detail,
+        "latency_ms": 0,
+        "checked_at": datetime.now(timezone.utc).isoformat(),
+    }
+    integration.config = config
+
+    for channel_config in await _channel_configs_for_integration(
+        db,
+        entity_id=integration.entity_id,
+        integration_id=integration.id,
+    ):
+        if channel_config.channel_type != "whatsapp":
+            continue
+        channel_config.status = "active" if ready else "error"
+        channel_config.config = {
+            **(channel_config.config or {}),
+            "whatsapp_provisioning_status": provisioning_status,
+            "whatsapp_readiness_code": readiness_code,
+            "whatsapp_registration_pending": not ready,
+            "whatsapp_last_registration_error": (
+                None if ready or provisioning_status == "registration_required" else detail
+            ),
+        }
+
+
+async def _set_whatsapp_subscription_state(
+    db: AsyncSession,
+    *,
+    integration_id: str,
+    ready: bool,
+    detail: str,
+) -> None:
+    """Compatibility wrapper for legacy callers during the provisioning rollout."""
+    await _set_whatsapp_provisioning_state(
+        db,
+        integration_id=integration_id,
+        provisioning_status="ready" if ready else "failed",
+        readiness_code="ready" if ready else "app_not_subscribed",
+        detail=detail,
+    )
+
+
+async def _stage_whatsapp_reconnect(
+    db: AsyncSession,
+    *,
+    entity_id: str,
+    owner_user_id: str,
+    integration_id: str,
+    provider_config_key: str,
+    connection_id: str,
+    waba_id: str,
+    phone_number_id: str,
+    display_name: str | None,
+    synced_at: str | None,
+) -> tuple[str, str]:
+    """Persist a non-secret replacement snapshot without changing the live route."""
+    from packages.core.models.document import Integration
+
+    integration = (await db.execute(
+        select(Integration).where(
+            Integration.id == integration_id,
+            Integration.entity_id == entity_id,
+            Integration.owner_user_id == owner_user_id,
+            Integration.status == "active",
+        ).with_for_update().execution_options(populate_existing=True)
+    )).scalar_one_or_none()
+    if integration is None:
+        raise ValueError("Integration selected for reconnect was not found")
+    config = dict(integration.config or {})
+    live_nango = config.get("nango")
+    if not isinstance(live_nango, dict) or not live_nango.get("connection_id"):
+        raise ValueError("Only an active Nango-backed Integration can be reconnected")
+    live_provider_config_key = str(
+        live_nango.get("provider_config_key") or integration.provider
+    ).strip()
+    if canonical_provider_key(provider_config_key) not in {
+        canonical_provider_key(integration.provider),
+        canonical_provider_key(live_provider_config_key),
+    }:
+        raise ValueError("Reconnect provider does not match the selected Integration")
+
+    previous_pending = config.get("whatsapp_reconnect")
+    previous_attempts = (
+        int(previous_pending.get("attempt_count") or 0)
+        if isinstance(previous_pending, dict)
+        and previous_pending.get("connection_id") == connection_id
+        else 0
+    )
+    config["whatsapp_reconnect"] = {
+        "status": "provisioning",
+        "readiness_code": "provider_unavailable",
+        "provider_config_key": provider_config_key,
+        "connection_id": connection_id,
+        "waba_id": waba_id,
+        "phone_number_id": phone_number_id,
+        "display_name": display_name,
+        "synced_at": synced_at,
+        "connected_by_user_id": owner_user_id,
+        "attempt_count": previous_attempts + 1,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    integration.config = config
+    await db.flush()
+    return str(live_nango["connection_id"]), live_provider_config_key
+
+
+async def _apply_whatsapp_reconnect_result(
+    db: AsyncSession,
+    *,
+    entity_id: str,
+    owner_user_id: str,
+    integration_id: str,
+    connection_id: str,
+    provisioning_status: str,
+    readiness_code: str,
+    detail: str,
+    retryable: bool,
+    credential_service=None,
+) -> tuple[bool, tuple[str, str] | None]:
+    """Update pending evidence or atomically replace the live account pointer."""
+    from packages.core.models.document import Integration
+
+    integration = (await db.execute(
+        select(Integration).where(
+            Integration.id == integration_id,
+            Integration.entity_id == entity_id,
+            Integration.owner_user_id == owner_user_id,
+            Integration.status == "active",
+        ).with_for_update().execution_options(populate_existing=True)
+    )).scalar_one_or_none()
+    if integration is None:
+        raise ValueError("Integration selected for reconnect was not found")
+    config = dict(integration.config or {})
+    pending = config.get("whatsapp_reconnect")
+    if not isinstance(pending, dict) or pending.get("connection_id") != connection_id:
+        raise ValueError("WhatsApp reconnect state changed before provisioning completed")
+
+    pending = {
+        **pending,
+        "status": provisioning_status,
+        "readiness_code": readiness_code,
+        "retryable": retryable,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    if readiness_code == "ready" or provisioning_status == "registration_required":
+        pending.pop("detail", None)
+    else:
+        pending["detail"] = detail
+    config["whatsapp_reconnect"] = pending
+    integration.config = config
+    if readiness_code != "ready":
+        await db.flush()
+        return False, None
+
+    phone_number_id = str(pending.get("phone_number_id") or "").strip()
+    waba_id = str(pending.get("waba_id") or "").strip()
+    provider_config_key = str(
+        pending.get("provider_config_key") or "whatsapp"
+    ).strip()
+    if not phone_number_id or not waba_id or not provider_config_key:
+        raise ValueError("WhatsApp reconnect assets are incomplete")
+    await _assert_whatsapp_phone_available(
+        db,
+        phone_number_id=phone_number_id,
+        integration_id=integration_id,
+    )
+    live_nango = config.get("nango")
+    if not isinstance(live_nango, dict) or not live_nango.get("connection_id"):
+        raise ValueError("The live WhatsApp Nango connection is unavailable")
+    old_connection_id = str(live_nango["connection_id"])
+    old_provider_config_key = str(
+        live_nango.get("provider_config_key") or integration.provider
+    ).strip()
+    superseded_ids = [
+        item
+        for item in live_nango.get("superseded_connection_ids", [])
+        if isinstance(item, str) and item != connection_id
+    ]
+    if old_connection_id != connection_id and old_connection_id not in superseded_ids:
+        superseded_ids.append(old_connection_id)
+    new_nango = {
+        "connection_id": connection_id,
+        "provider_config_key": provider_config_key,
+        "synced_at": pending.get("synced_at"),
+        "connected_by_user_id": owner_user_id,
+    }
+    if superseded_ids:
+        new_nango["superseded_connection_ids"] = superseded_ids
+    config["nango"] = new_nango
+    config["whatsapp"] = {
+        "waba_id": waba_id,
+        "phone_number_id": phone_number_id,
+        "display_name": pending.get("display_name"),
+        "provisioning_status": "ready",
+        "readiness_code": "ready",
+        "subscription_status": "ready",
+    }
+    config.pop("whatsapp_reconnect", None)
+    if old_connection_id != connection_id:
+        config["whatsapp_retirement"] = {
+            "status": "pending",
+            "provider_config_key": old_provider_config_key,
+            "connection_id": old_connection_id,
+            "attempt_count": 0,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+    integration.config = config
+    (credential_service or get_credential_service()).store_integration(
+        integration,
+        {
+            "via": "nango",
+            "connection_id": connection_id,
+            "provider_config_key": provider_config_key,
+        },
+    )
+    await _sync_channel_config_if_needed(
+        db,
+        entity_id=entity_id,
+        owner_user_id=owner_user_id,
+        provider="whatsapp",
+        integration_id=integration_id,
+        whatsapp_phone_number_id=phone_number_id,
+        whatsapp_provisioning_pending=False,
+    )
+    await _set_whatsapp_provisioning_state(
+        db,
+        integration_id=integration_id,
+        provisioning_status="ready",
+        readiness_code="ready",
+        detail=detail,
+    )
+    await db.flush()
+    retirement = (
+        (old_provider_config_key, old_connection_id)
+        if old_connection_id != connection_id
+        else None
+    )
+    return True, retirement
+
+
+async def _clear_whatsapp_retirement_state(
+    db: AsyncSession,
+    *,
+    entity_id: str,
+    integration_id: str,
+    connection_id: str,
+) -> None:
+    from packages.core.models.document import Integration
+
+    integration = (await db.execute(
+        select(Integration).where(
+            Integration.id == integration_id,
+            Integration.entity_id == entity_id,
+        ).with_for_update().execution_options(populate_existing=True)
+    )).scalar_one_or_none()
+    if integration is None:
+        return
+    config = dict(integration.config or {})
+    retirement = config.get("whatsapp_retirement")
+    if isinstance(retirement, dict) and retirement.get("connection_id") == connection_id:
+        config.pop("whatsapp_retirement", None)
+        integration.config = config
+        await db.flush()
+
+
+async def _provision_whatsapp_integration_account(
+    db: AsyncSession,
+    *,
+    entity_id: str,
+    integration_id: str,
+    registration_pin: str | None = None,
+) -> dict[str, Any]:
+    import httpx
+
+    from packages.core.models.document import Integration
+
+    integration = await db.get(Integration, integration_id)
+    if (
+        integration is None
+        or integration.entity_id != entity_id
+        or canonical_provider_key(integration.provider) != "whatsapp"
+    ):
+        raise ValueError("WhatsApp Business integration not found")
+    config = integration.config if isinstance(integration.config, dict) else {}
+    nango = config.get("nango") if isinstance(config.get("nango"), dict) else {}
+    whatsapp = (
+        config.get("whatsapp")
+        if isinstance(config.get("whatsapp"), dict)
+        else {}
+    )
+    reconnect = (
+        config.get("whatsapp_reconnect")
+        if isinstance(config.get("whatsapp_reconnect"), dict)
+        else None
+    )
+    source_nango = reconnect or nango
+    source_whatsapp = reconnect or whatsapp
+    connection_id = str(source_nango.get("connection_id") or "").strip()
+    provider_config_key = str(
+        source_nango.get("provider_config_key") or "whatsapp"
+    ).strip()
+    phone_number_id = str(source_whatsapp.get("phone_number_id") or "").strip()
+    waba_id = str(source_whatsapp.get("waba_id") or "").strip()
+    if not connection_id or not provider_config_key or not phone_number_id or not waba_id:
+        raise ValueError("WhatsApp Business account assets are incomplete")
+    nango_secret = await get_nango_secret(db, entity_id)
+    if not nango_secret:
+        raise RuntimeError("Nango is not configured")
+    deployment = load_whatsapp_business_config()
+
+    # Release all database locks before provider I/O. The exact connection and
+    # asset snapshot is revalidated when Task 9 adds replacement staging.
+    await db.commit()
+    try:
+        result = await provision_whatsapp_business_number(
+            nango_secret=nango_secret,
+            provider_config_key=provider_config_key,
+            connection_id=connection_id,
+            phone_number_id=phone_number_id,
+            waba_id=waba_id,
+            expected_app_id=deployment.app_id,
+            registration_pin=registration_pin,
+        )
+    except (httpx.HTTPError, RuntimeError):
+        provisioning_status = "failed"
+        readiness_code = "provider_unavailable"
+        detail = "WhatsApp Business provider setup is temporarily unavailable."
+        retryable = True
+    else:
+        (
+            provisioning_status,
+            readiness_code,
+            detail,
+            retryable,
+        ) = _classify_whatsapp_provisioning_result(result)
+    retirement: tuple[str, str] | None = None
+    if reconnect is not None:
+        _activated, retirement = await _apply_whatsapp_reconnect_result(
+            db,
+            entity_id=entity_id,
+            owner_user_id=str(integration.owner_user_id or ""),
+            integration_id=integration_id,
+            connection_id=connection_id,
+            provisioning_status=provisioning_status,
+            readiness_code=readiness_code,
+            detail=detail,
+            retryable=retryable,
+        )
+    else:
+        await _set_whatsapp_provisioning_state(
+            db,
+            integration_id=integration_id,
+            provisioning_status=provisioning_status,
+            readiness_code=readiness_code,
+            detail=detail,
+        )
+    await db.commit()
+    if retirement is not None:
+        old_provider_config_key, old_connection_id = retirement
+        try:
+            await delete_nango_connection(
+                nango_secret=nango_secret,
+                provider_config_key=old_provider_config_key,
+                connection_id=old_connection_id,
+            )
+        except Exception:
+            try:
+                from packages.core.tasks.channel_tasks import (
+                    retire_nango_connection_task,
+                )
+
+                retire_nango_connection_task.delay(
+                    entity_id=entity_id,
+                    integration_id=integration_id,
+                )
+            except Exception:
+                logger.warning(
+                    "Could not enqueue Nango retirement for integration=%s",
+                    integration_id,
+                )
+        else:
+            await _clear_whatsapp_retirement_state(
+                db,
+                entity_id=entity_id,
+                integration_id=integration_id,
+                connection_id=old_connection_id,
+            )
+            await db.commit()
+    return {
+        "ok": readiness_code == "ready",
+        "retryable": retryable,
+        "integration_id": integration_id,
+        "readiness_code": readiness_code,
+        "detail": detail,
+    }
+
+
+async def _register_integration_channel_webhooks(
+    db: AsyncSession,
+    *,
+    entity_id: str,
+    integration_id: str,
+) -> list[str]:
+    """Register provider webhooks after their source credentials are committed."""
+    from packages.core.services.channels import get_adapter
+
+    changed = False
+    failures: list[str] = []
+    for channel_config in await _channel_configs_for_integration(
+        db, entity_id=entity_id, integration_id=integration_id,
+    ):
+        if channel_config.channel_type == "whatsapp":
+            try:
+                outcome = await _provision_whatsapp_integration_account(
+                    db,
+                    entity_id=entity_id,
+                    integration_id=integration_id,
+                )
+            except Exception:
+                failures.append(channel_config.id)
+                logger.exception(
+                    "WhatsApp Business provisioning retry failed for config=%s",
+                    channel_config.id,
+                )
+            else:
+                changed = True
+                if not outcome["ok"]:
+                    failures.append(channel_config.id)
+            continue
+        adapter = get_adapter(channel_config.channel_type)
+        if not adapter:
+            continue
+        try:
+            result = await adapter.register_webhook(channel_config)
+            if result.get("registered"):
+                changed = True
+                if channel_config.channel_type == "whatsapp":
+                    await _set_whatsapp_subscription_state(
+                        db,
+                        integration_id=integration_id,
+                        ready=True,
+                        detail=(
+                            result.get("detail")
+                            or "WhatsApp Business webhook subscription confirmed."
+                        ),
+                    )
+                if channel_config.channel_type in {"ms_teams", "outlook"}:
+                    pending_key = f"{channel_config.channel_type.replace('ms_teams', 'teams')}_registration_pending"
+                    channel_config.config = {
+                        **(channel_config.config or {}),
+                        pending_key: False,
+                    }
+                logger.info(
+                    "Channel webhook registered for %s config=%s",
+                    channel_config.channel_type,
+                    channel_config.id,
+                )
+            elif channel_config.channel_type in {"whatsapp", "ms_teams", "outlook"}:
+                if channel_config.channel_type == "whatsapp":
+                    await _set_whatsapp_subscription_state(
+                        db,
+                        integration_id=integration_id,
+                        ready=False,
+                        detail=(
+                            result.get("detail")
+                            or "WhatsApp Business webhook subscription is pending."
+                        ),
+                    )
+                pending_key = f"{channel_config.channel_type.replace('ms_teams', 'teams')}_registration_pending"
+                if channel_config.channel_type != "whatsapp":
+                    channel_config.config = {
+                        **(channel_config.config or {}),
+                        pending_key: True,
+                    }
+                changed = True
+                failures.append(channel_config.id)
+                logger.warning(
+                    "Teams webhook registration was not confirmed for config=%s: %s",
+                    channel_config.id,
+                    result,
+                )
+        except Exception:
+            if channel_config.channel_type in {"whatsapp", "ms_teams", "outlook"}:
+                if channel_config.channel_type == "whatsapp":
+                    await _set_whatsapp_subscription_state(
+                        db,
+                        integration_id=integration_id,
+                        ready=False,
+                        detail="WhatsApp Business webhook subscription is pending.",
+                    )
+                pending_key = f"{channel_config.channel_type.replace('ms_teams', 'teams')}_registration_pending"
+                if channel_config.channel_type != "whatsapp":
+                    channel_config.config = {
+                        **(channel_config.config or {}),
+                        pending_key: True,
+                    }
+                changed = True
+                failures.append(channel_config.id)
+            logger.exception(
+                "Auto webhook registration failed for %s config=%s",
+                channel_config.channel_type,
+                channel_config.id,
+            )
+    if changed:
+        # Teams stores its Graph subscription id/clientState on ChannelConfig.
+        # Persist that routing state after the provider confirms creation.
+        await db.commit()
+    return failures
+
+
+async def _unregister_telegram_webhooks(
+    db: AsyncSession,
+    *,
+    entity_id: str,
+    integration_id: str,
+    credentials: dict | None = None,
+) -> None:
+    """Remove Telegram's external webhook using current or supplied credentials."""
+    from packages.core.services.channels import get_adapter
+
+    for channel_config in await _channel_configs_for_integration(
+        db, entity_id=entity_id, integration_id=integration_id,
+    ):
+        if channel_config.channel_type != "telegram":
+            continue
+        adapter = get_adapter(channel_config.channel_type)
+        if not adapter:
+            continue
+        try:
+            if credentials is None:
+                result = await adapter.unregister_webhook(channel_config)
+            else:
+                result = await adapter.unregister_webhook(
+                    channel_config, credentials=credentials,
+                )
+        except Exception as exc:
+            raise HTTPException(
+                502,
+                "Could not remove the Telegram webhook; retry before changing this connection.",
+            ) from exc
+        if not result.get("unregistered"):
+            raise HTTPException(
+                502,
+                "Telegram did not confirm webhook removal; retry before changing this connection.",
+            )
+
+
+async def _unregister_teams_webhooks(
+    db: AsyncSession,
+    *,
+    entity_id: str,
+    integration_id: str,
+) -> None:
+    """Best-effort removal of Graph subscriptions before deleting a bridge."""
+    from packages.core.services.channels import get_adapter
+
+    for channel_config in await _channel_configs_for_integration(
+        db, entity_id=entity_id, integration_id=integration_id,
+    ):
+        if channel_config.channel_type != "ms_teams":
+            continue
+        adapter = get_adapter(channel_config.channel_type)
+        if not adapter:
+            continue
+        try:
+            await adapter.unregister_webhook(channel_config)
+        except Exception:
+            # Deletion must still remove the Manor bridge. A stale Graph
+            # subscription is harmless after routing state is gone and can be
+            # cleaned up from the provider console if Graph is unavailable.
+            logger.warning(
+                "Could not remove Teams subscription for config=%s during deletion",
+                channel_config.id,
+                exc_info=True,
+            )
+
+
+async def _sync_oauth_channel_config_if_needed(
+    db: AsyncSession,
+    *,
+    entity_id: str,
+    owner_user_id: str,
+    provider: str,
+    oauth_account_id: str,
+    connection_profile: dict | None = None,
+) -> None:
+    mappings = _INTEGRATION_TO_CHANNELS.get(provider)
+    if not mappings:
+        return
+
+    from packages.core.models.channel import ChannelConfig
+
+    routing_config: dict[str, str] = {}
+    if provider == "slack":
+        profile = connection_profile or {}
+        routing_config = {
+            target: str(profile[source])
+            for target, source in {
+                "slack_app_id": "app_id",
+                "slack_team_id": "team_id",
+                "slack_enterprise_id": "enterprise_id",
+                "slack_bot_user_id": "bot_user_id",
+            }.items()
+            if profile.get(source)
+        }
+    elif provider == "discord":
+        profile = connection_profile or {}
+        if not profile.get("application_id") or not profile.get("guild_id"):
+            raise ValueError("Discord connection profile is missing Guild identity")
+        routing_config = {
+            "discord_application_id": str(profile["application_id"]),
+            "discord_guild_id": str(profile["guild_id"]),
+        }
+
+    for channel_type, channel_provider in mappings:
+        existing = (await db.execute(
+            select(ChannelConfig).where(
+                ChannelConfig.entity_id == entity_id,
+                ChannelConfig.owner_user_id == owner_user_id,
+                ChannelConfig.channel_type == channel_type,
+                ChannelConfig.credential_source_kind == "oauth_account",
+                ChannelConfig.credential_source_id == oauth_account_id,
+            )
+        )).scalar_one_or_none()
+        if existing:
+            existing.status = "active"
+            existing_config = dict(existing.config or {})
+            if provider == "slack":
+                for key in (
+                    "slack_app_id",
+                    "slack_team_id",
+                    "slack_enterprise_id",
+                    "slack_bot_user_id",
+                ):
+                    existing_config.pop(key, None)
+            existing.config = {
+                **existing_config,
+                "connection_kind": "oauth_account",
+                "connection_id": oauth_account_id,
+                **routing_config,
+            }
+            if provider == "slack" and (connection_profile or {}).get("team_name"):
+                existing.name = str(connection_profile["team_name"])
+            if provider == "discord":
+                existing.discord_application_id = routing_config[
+                    "discord_application_id"
+                ]
+                existing.discord_guild_id = routing_config["discord_guild_id"]
+                existing.name = str(
+                    (connection_profile or {}).get("guild_name") or "Discord"
+                )
+            continue
+        db.add(ChannelConfig(
+            entity_id=entity_id,
+            owner_user_id=owner_user_id,
+            channel_type=channel_type,
+            provider=channel_provider,
+            name=(connection_profile or {}).get("team_name")
+            or (connection_profile or {}).get("guild_name")
+            or provider,
+            credential_source_kind="oauth_account",
+            credential_source_id=oauth_account_id,
+            config={
+                "connection_kind": "oauth_account",
+                "connection_id": oauth_account_id,
+                **routing_config,
+            },
+            credentials={},
+            discord_application_id=(
+                routing_config.get("discord_application_id")
+                if provider == "discord"
+                else None
+            ),
+            discord_guild_id=(
+                routing_config.get("discord_guild_id")
+                if provider == "discord"
+                else None
+            ),
+            status="active",
+        ))
+    await db.flush()
+
+
 async def _sync_channel_config_if_needed(
     db: AsyncSession,
     *,
     entity_id: str,
+    owner_user_id: str,
     provider: str,
     integration_id: str,
-    credentials: dict,
+    telegram_bot_id: str | None = None,
+    whatsapp_phone_number_id: str | None = None,
+    whatsapp_provisioning_pending: bool = False,
 ) -> None:
     """Mirror a channel-flavoured Integration into a ChannelConfig so
-    inbound webhooks have credentials to verify + agents have a
-    channel to bind to. Idempotent per (entity, channel_type).
+    inbound routing can bind to it. Credentials remain exclusively on the
+    linked Integration. Idempotent per typed source account.
     """
     mappings = _INTEGRATION_TO_CHANNELS.get(provider)
     if not mappings:
@@ -2352,46 +4356,102 @@ async def _sync_channel_config_if_needed(
         existing = (await db.execute(
             select(ChannelConfig).where(
                 ChannelConfig.entity_id == entity_id,
+                ChannelConfig.owner_user_id == owner_user_id,
                 ChannelConfig.channel_type == channel_type,
-                ChannelConfig.config["integration_id"].astext == integration_id,
+                ChannelConfig.credential_source_kind == "integration",
+                ChannelConfig.credential_source_id == integration_id,
             )
         )).scalar_one_or_none()
 
+        if provider == "telegram" and telegram_bot_id:
+            await _assert_telegram_bot_available(
+                db, bot_id=telegram_bot_id, integration_id=integration_id,
+            )
+        if provider == "whatsapp" and whatsapp_phone_number_id:
+            await _assert_whatsapp_phone_available(
+                db,
+                phone_number_id=whatsapp_phone_number_id,
+                integration_id=integration_id,
+            )
         if existing:
-            existing.credentials = credentials
+            # Source-linked ChannelConfigs must never maintain a second token
+            # copy. Clear legacy values left by the entity-scoped bridge.
+            existing.credentials = {}
+            existing.credential_ref = None
             existing.status = "active"
-            cc = existing
+            existing_config = dict(existing.config or {})
+            existing.config = {
+                **existing_config,
+                "connection_kind": "integration",
+                "connection_id": integration_id,
+                "integration_id": integration_id,
+            }
+            if provider == "telegram":
+                existing.telegram_bot_id = telegram_bot_id
+            if provider == "whatsapp":
+                effective_phone_number_id = (
+                    whatsapp_phone_number_id or existing.whatsapp_phone_number_id
+                )
+                existing.whatsapp_phone_number_id = effective_phone_number_id
+                if not effective_phone_number_id:
+                    existing.status = "error"
+                    existing_config["whatsapp_not_ready_reason"] = (
+                        "phone_number_id is unavailable from the connection"
+                    )
+                else:
+                    existing_config.pop("whatsapp_not_ready_reason", None)
+                if whatsapp_provisioning_pending:
+                    existing.status = "error"
+                    existing_config.update({
+                        "whatsapp_provisioning_status": "pending",
+                        "whatsapp_readiness_code": "provider_unavailable",
+                        "whatsapp_registration_pending": True,
+                        "whatsapp_last_registration_error": None,
+                    })
+            if provider == "ms_teams":
+                existing_config.setdefault("teams_registration_pending", True)
+            existing.config = existing_config
         else:
-            cc = ChannelConfig(
+            channel_config_values = {
+                "connection_kind": "integration",
+                "connection_id": integration_id,
+                "integration_id": integration_id,
+            }
+            if provider == "ms_teams":
+                channel_config_values["teams_registration_pending"] = True
+            if provider == "whatsapp" and not whatsapp_phone_number_id:
+                channel_config_values["whatsapp_not_ready_reason"] = (
+                    "phone_number_id is unavailable from the connection"
+                )
+            if provider == "whatsapp" and whatsapp_provisioning_pending:
+                channel_config_values.update({
+                    "whatsapp_provisioning_status": "pending",
+                    "whatsapp_readiness_code": "provider_unavailable",
+                    "whatsapp_registration_pending": True,
+                    "whatsapp_last_registration_error": None,
+                })
+            db.add(ChannelConfig(
                 entity_id=entity_id,
+                owner_user_id=owner_user_id,
                 channel_type=channel_type,
                 provider=channel_provider,
                 name=provider,
-                config={"integration_id": integration_id},
-                credentials=credentials,
-                status="active",
-            )
-            db.add(cc)
+                credential_source_kind="integration",
+                credential_source_id=integration_id,
+                config=channel_config_values,
+                credentials={},
+                telegram_bot_id=telegram_bot_id if provider == "telegram" else None,
+                whatsapp_phone_number_id=(
+                    whatsapp_phone_number_id if provider == "whatsapp" else None
+                ),
+                status=(
+                    "active"
+                    if provider != "whatsapp"
+                    or (whatsapp_phone_number_id and not whatsapp_provisioning_pending)
+                    else "error"
+                ),
+            ))
             await db.flush()
-
-        # Fire-and-forget webhook registration. Adapters that don't auto-
-        # register (email, WeChat) leave this as a no-op.
-        try:
-            from packages.core.services.channels import get_adapter
-            adapter = get_adapter(channel_type)
-            if adapter is None:
-                continue
-            result = await adapter.register_webhook(cc)
-            if result.get("registered"):
-                logger.info(
-                    "Channel webhook registered for %s config=%s url=%s",
-                    channel_type, cc.id, result.get("url"),
-                )
-        except Exception:
-            logger.exception(
-                "Auto webhook registration failed for %s (ChannelConfig continues without it)",
-                channel_type,
-            )
 
 
 async def _delete_integration_channel_bridges(
@@ -2405,16 +4465,28 @@ async def _delete_integration_channel_bridges(
     Channel-flavoured integrations create shared ChannelConfig rows. Deleting
     the Integration must not leave those configs visible as attachable channels.
     """
-    from packages.core.models.channel import ChannelConfig
     from packages.core.models.document import Channel
 
-    cc_rows = (await db.execute(
-        select(ChannelConfig).where(
-            ChannelConfig.entity_id == entity_id,
-            ChannelConfig.config["integration_id"].astext == integration_id,
-        )
-    )).scalars().all()
+    await _unregister_telegram_webhooks(
+        db, entity_id=entity_id, integration_id=integration_id,
+    )
+    await _unregister_teams_webhooks(
+        db, entity_id=entity_id, integration_id=integration_id,
+    )
+    cc_rows = await _channel_configs_for_integration(
+        db, entity_id=entity_id, integration_id=integration_id,
+    )
     cc_ids = [cc.id for cc in cc_rows]
+    if cc_ids:
+        from packages.core.services.voice.call_sessions import (
+            cancel_pending_call_sessions,
+        )
+
+        await cancel_pending_call_sessions(
+            db,
+            channel_config_ids=cc_ids,
+            reason="Twilio integration disconnected",
+        )
 
     channel_filters = [
         Channel.entity_id == entity_id,
@@ -2432,6 +4504,241 @@ async def _delete_integration_channel_bridges(
         await db.delete(row)
 
 
+def _whatsapp_disconnect_coordinates(integration) -> tuple[str, str, str] | None:
+    if canonical_provider_key(integration.provider) != "whatsapp":
+        return None
+    config = integration.config if isinstance(integration.config, dict) else {}
+    nango = config.get("nango") if isinstance(config.get("nango"), dict) else {}
+    whatsapp = (
+        config.get("whatsapp")
+        if isinstance(config.get("whatsapp"), dict)
+        else {}
+    )
+    connection_id = str(nango.get("connection_id") or "").strip()
+    provider_config_key = str(
+        nango.get("provider_config_key") or "whatsapp"
+    ).strip()
+    waba_id = str(whatsapp.get("waba_id") or "").strip()
+    if not connection_id or not provider_config_key or not waba_id:
+        return None
+    return provider_config_key, connection_id, waba_id
+
+
+async def _disconnect_whatsapp_integration_once(
+    db: AsyncSession,
+    *,
+    entity_id: str,
+    integration_id: str,
+) -> bool:
+    """Fail closed, retire delegated access, then remove Manor routing rows."""
+    from packages.core.models.channel import ChannelConfig
+    from packages.core.models.document import Integration
+
+    integration = (await db.execute(
+        select(Integration).where(
+            Integration.id == integration_id,
+            Integration.entity_id == entity_id,
+            Integration.status.in_(("active", "disconnecting")),
+        ).with_for_update().execution_options(populate_existing=True)
+    )).scalar_one_or_none()
+    if integration is None:
+        return True
+    coordinates = _whatsapp_disconnect_coordinates(integration)
+    owner_user_id = str(integration.owner_user_id or "").strip()
+
+    config = dict(integration.config or {})
+    previous_state = config.get("whatsapp_disconnect")
+    attempt_count = (
+        int(previous_state.get("attempt_count") or 0)
+        if isinstance(previous_state, dict)
+        else 0
+    ) + 1
+    config["whatsapp_disconnect"] = {
+        "status": "disconnecting",
+        "attempt_count": attempt_count,
+        "app_unsubscribed": False,
+        "nango_connection_deleted": False,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    integration.config = config
+    integration.status = "disconnecting"
+    channel_configs = (await db.execute(
+        select(ChannelConfig).where(
+            ChannelConfig.entity_id == entity_id,
+            ChannelConfig.credential_source_kind == "integration",
+            ChannelConfig.credential_source_id == integration_id,
+            ChannelConfig.channel_type == "whatsapp",
+        ).with_for_update().execution_options(populate_existing=True)
+    )).scalars().all()
+    for channel_config in channel_configs:
+        channel_config.status = "disconnecting"
+    await db.commit()
+
+    if coordinates is None or not owner_user_id:
+        retained = (await db.execute(
+            select(Integration).where(
+                Integration.id == integration_id,
+                Integration.entity_id == entity_id,
+            ).with_for_update().execution_options(populate_existing=True)
+        )).scalar_one_or_none()
+        if retained is not None:
+            retained_config = dict(retained.config or {})
+            disconnect_state = dict(
+                retained_config.get("whatsapp_disconnect") or {}
+            )
+            disconnect_state.update({
+                "status": "retry_pending",
+                "last_error_code": "provider_metadata_incomplete",
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            })
+            retained_config["whatsapp_disconnect"] = disconnect_state
+            retained.config = retained_config
+            await db.commit()
+        raise WhatsAppDisconnectPending(
+            "WhatsApp disconnect metadata is incomplete"
+        )
+    provider_config_key, connection_id, waba_id = coordinates
+
+    try:
+        nango_secret = await get_nango_secret(db, entity_id)
+        if not nango_secret:
+            raise RuntimeError("Nango is not configured")
+        await db.commit()
+        await disconnect_whatsapp_business_account(
+            nango_secret=nango_secret,
+            provider_config_key=provider_config_key,
+            connection_id=connection_id,
+            waba_id=waba_id,
+        )
+    except Exception:
+        await db.rollback()
+        retained = (await db.execute(
+            select(Integration).where(
+                Integration.id == integration_id,
+                Integration.entity_id == entity_id,
+            ).with_for_update().execution_options(populate_existing=True)
+        )).scalar_one_or_none()
+        if retained is not None:
+            retained_config = dict(retained.config or {})
+            disconnect_state = dict(
+                retained_config.get("whatsapp_disconnect") or {}
+            )
+            disconnect_state.update({
+                "status": "retry_pending",
+                "last_error_code": "provider_cleanup_failed",
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            })
+            retained_config["whatsapp_disconnect"] = disconnect_state
+            retained.config = retained_config
+            retained.status = "disconnecting"
+            for channel_config in await _channel_configs_for_integration(
+                db,
+                entity_id=entity_id,
+                integration_id=integration_id,
+            ):
+                if channel_config.channel_type == "whatsapp":
+                    channel_config.status = "disconnecting"
+            await db.commit()
+        raise WhatsAppDisconnectPending(
+            "WhatsApp provider cleanup is pending"
+        ) from None
+
+    await lock_runtime_integration_account_scope(
+        db,
+        kind=IntegrationAccountKind.INTEGRATION,
+        user_id=owner_user_id,
+        entity_id=entity_id,
+        provider="whatsapp",
+    )
+    retained = (await db.execute(
+        select(Integration).where(
+            Integration.id == integration_id,
+            Integration.entity_id == entity_id,
+            Integration.owner_user_id == owner_user_id,
+        ).with_for_update().execution_options(populate_existing=True)
+    )).scalar_one_or_none()
+    if retained is None:
+        await db.commit()
+        return True
+    await _delete_integration_channel_bridges(
+        db,
+        entity_id=entity_id,
+        integration_id=integration_id,
+    )
+    await db.delete(retained)
+    await db.flush()
+    await normalize_runtime_integration_account_defaults(
+        db,
+        kind=IntegrationAccountKind.INTEGRATION,
+        user_id=owner_user_id,
+        entity_id=entity_id,
+        provider="whatsapp",
+    )
+    await db.commit()
+    return True
+
+
+def _enqueue_whatsapp_disconnect_retry(*, entity_id: str, integration_id: str) -> None:
+    try:
+        from packages.core.tasks.channel_tasks import (
+            disconnect_whatsapp_business_task,
+        )
+
+        disconnect_whatsapp_business_task.delay(
+            entity_id=entity_id,
+            integration_id=integration_id,
+        )
+    except Exception:
+        logger.warning(
+            "Could not enqueue WhatsApp disconnect retry for integration=%s",
+            integration_id,
+        )
+
+
+async def _delete_oauth_channel_bridges(
+    db: AsyncSession,
+    *,
+    entity_id: str,
+    owner_user_id: str,
+    oauth_account_id: str,
+) -> None:
+    """Remove a deleted OAuth account's routing and prior orphan bridges."""
+    from packages.core.models.channel import ChannelConfig
+    from packages.core.models.document import Channel
+    from packages.core.models.user import OAuthAccount
+
+    valid_oauth_account_ids = set((await db.execute(
+        select(OAuthAccount.id).where(OAuthAccount.user_id == owner_user_id)
+    )).scalars().all())
+
+    cc_rows = (await db.execute(
+        select(ChannelConfig).where(
+            ChannelConfig.entity_id == entity_id,
+            ChannelConfig.owner_user_id == owner_user_id,
+            ChannelConfig.credential_source_kind == "oauth_account",
+        )
+    )).scalars().all()
+    cc_rows = [
+        row for row in cc_rows
+        if row.credential_source_id == oauth_account_id
+        or row.credential_source_id not in valid_oauth_account_ids
+    ]
+    cc_ids = [row.id for row in cc_rows]
+    if not cc_ids:
+        return
+
+    channel_rows = (await db.execute(
+        select(Channel).where(
+            Channel.entity_id == entity_id,
+            Channel.config["channel_config_id"].astext.in_(cc_ids),
+        )
+    )).scalars().all()
+    for row in channel_rows:
+        await db.delete(row)
+    for row in cc_rows:
+        await db.delete(row)
+
+
 # ── Channel fixed paths (before parameterized integration paths) ──
 
 @router.get("/channels", response_model=list[ChannelResponse])
@@ -2440,7 +4747,7 @@ async def list_all_channels(
     db: AsyncSession = Depends(get_db),
 ):
     """List all channel bindings for the current user's entity."""
-    channels = await list_channels(db, user.entity_id)
+    channels = await list_channels(db, user.entity_id, user.id)
     return [_channel_resp(c) for c in channels]
 
 
@@ -2450,12 +4757,15 @@ async def create_new_channel(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    channel = await create_channel(
-        db, user.entity_id, req.type,
-        name=req.name, user_id=user.id,
-        workspace_id=req.workspace_id,
-        agent_id=req.agent_id, config=req.config,
-    )
+    try:
+        channel = await create_channel(
+            db, user.entity_id, req.type,
+            name=req.name, user_id=user.id,
+            workspace_id=req.workspace_id,
+            agent_id=req.agent_id, config=req.config,
+        )
+    except ValueError as exc:
+        raise HTTPException(404, str(exc)) from exc
     return _channel_resp(channel)
 
 
@@ -2465,7 +4775,7 @@ async def get_one_channel(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    channel = await get_channel(db, channel_id, user.entity_id)
+    channel = await get_channel(db, channel_id, user.entity_id, user.id)
     if not channel:
         raise HTTPException(404, "Channel not found")
     return _channel_resp(channel)
@@ -2478,11 +4788,14 @@ async def update_one_channel(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    channel = await update_channel(
-        db, channel_id, user.entity_id,
-        name=req.name, type=req.type, workspace_id=req.workspace_id,
-        agent_id=req.agent_id, config=req.config, status=req.status,
-    )
+    try:
+        channel = await update_channel(
+            db, channel_id, user.entity_id, user.id,
+            name=req.name, type=req.type, workspace_id=req.workspace_id,
+            agent_id=req.agent_id, config=req.config, status=req.status,
+        )
+    except ValueError as exc:
+        raise HTTPException(404, str(exc)) from exc
     if not channel:
         raise HTTPException(404, "Channel not found")
     return _channel_resp(channel)
@@ -2494,7 +4807,7 @@ async def delete_one_channel(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    ok = await delete_channel(db, channel_id, user.entity_id)
+    ok = await delete_channel(db, channel_id, user.entity_id, user.id)
     if not ok:
         raise HTTPException(404, "Channel not found")
 
@@ -2507,12 +4820,16 @@ async def get_one_integration(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    integration = await get_integration(db, integration_id, user.entity_id)
+    integration = await get_integration(
+        db, integration_id, user.entity_id, user.id,
+    )
     if not integration:
         raise HTTPException(404, "Integration not found")
     return _integration_resp(
         integration,
         creator_names=await _creator_names(db, [integration]),
+        owner_names=await _owner_names(db, [integration]),
+        requester_user_id=user.id,
     )
 
 
@@ -2528,6 +4845,22 @@ async def update_one_integration(
     # preserve the existing stored value instead of overwriting it with
     # the mask string.
     credentials = req.credentials
+    current = None
+    telegram_bot_id = None
+    whatsapp_phone_number_id = None
+    previous_telegram_credentials: dict | None = None
+    expected_credentials: dict | None = None
+    if req.provider is not None:
+        current = await get_integration(
+            db, integration_id, user.entity_id, user.id, action="manage",
+        )
+        if not current:
+            raise HTTPException(404, "Integration not found")
+        if canonical_provider_key(req.provider) != current.provider:
+            raise HTTPException(
+                422,
+                "Integration provider cannot be changed; create a new connection instead.",
+            )
     if credentials is not None:
         from packages.core.services.integration_service import get_integration as _get_int
         from packages.core.credentials import (
@@ -2535,9 +4868,19 @@ async def update_one_integration(
             Requester,
             get_credential_service,
         )
-        current = await _get_int(db, integration_id, user.entity_id)
+        current = await _get_int(
+            db, integration_id, user.entity_id, user.id, action="manage",
+        )
         if not current:
             raise HTTPException(404, "Integration not found")
+        if (
+            canonical_provider_key(current.provider) == "whatsapp"
+            and isinstance((current.config or {}).get("nango"), dict)
+        ):
+            raise HTTPException(
+                400,
+                "WhatsApp Business credentials are managed through OAuth; reconnect the account instead.",
+            )
         try:
             existing_creds = get_credential_service().lease_integration(
                 current,
@@ -2555,41 +4898,102 @@ async def update_one_integration(
                 "Could not load existing credentials; re-enter credentials to update this integration.",
             ) from exc
         merged = dict(existing_creds)
+        expected_credentials = existing_creds
         for k, v in credentials.items():
             if v == _SECRET_MASK:
                 continue  # keep existing
             merged[k] = v
-        credentials = merged
+        target_provider = canonical_provider_key(req.provider or current.provider)
+        # The Official Account adapter currently accepts plain XML only. A
+        # legacy encrypted-mode value must be explicitly removed when an
+        # operator edits the connection; the UI no longer offers that field.
+        if target_provider == "wechat_official" and (
+            "encoding_aes_key" not in credentials
+            or credentials.get("encoding_aes_key") == _SECRET_MASK
+        ):
+            merged.pop("encoding_aes_key", None)
+        credentials = _prepare_channel_credentials(target_provider, merged)
+        if target_provider == "telegram":
+            telegram_bot_id = await _telegram_bot_id(credentials)
+            try:
+                await _assert_telegram_bot_available(
+                    db, bot_id=telegram_bot_id, integration_id=integration_id,
+                )
+            except TelegramBotAlreadyConnected as exc:
+                raise HTTPException(409, str(exc)) from exc
+        if target_provider == "whatsapp":
+            whatsapp_phone_number_id = (
+                str((credentials or {}).get("phone_number_id") or "").strip() or None
+            )
+
+        if current.provider == "telegram":
+            # Keep the old token only for the post-commit external cleanup.
+            # It is never written to ChannelConfig or logged.
+            previous_telegram_credentials = existing_creds
 
     try:
         integration = await update_integration(
-            db, integration_id, user.entity_id,
+            db, integration_id, user.entity_id, user.id,
             provider=req.provider, status=req.status,
             config=req.config, credentials=credentials,
+            expected_credentials=expected_credentials,
         )
+    except IntegrationCredentialConflictError as exc:
+        await db.rollback()
+        raise HTTPException(
+            409,
+            "Integration credentials changed; reload and retry the update.",
+        ) from exc
+    except IntegrationProviderImmutableError as exc:
+        raise HTTPException(422, str(exc)) from exc
     except CredentialError as exc:
         await _raise_credential_backend_unavailable(db, exc, action="update_integration")
     if not integration:
         raise HTTPException(404, "Integration not found")
 
     # Keep ChannelConfig bridge rows in sync when credentials rotate.
-    # Only run when this request actually carried credentials so we don't
-    # overwrite ChannelConfig secrets with empty legacy JSONB payloads.
     if credentials is not None:
         try:
             await _sync_channel_config_if_needed(
                 db,
                 entity_id=user.entity_id,
+                owner_user_id=user.id,
                 provider=integration.provider,
                 integration_id=integration.id,
-                credentials=credentials,
+                telegram_bot_id=telegram_bot_id,
+                whatsapp_phone_number_id=whatsapp_phone_number_id,
             )
-        except Exception:
-            logger.exception(
-                "ChannelConfig sync failed after integration update (provider=%s id=%s)",
-                integration.provider,
-                integration.id,
-            )
+            # The adapter resolves credentials through a separate short-lived
+            # session, so commit the new source before registration.
+            await db.commit()
+        except TelegramBotAlreadyConnected as exc:
+            raise HTTPException(409, str(exc)) from exc
+        except WhatsAppPhoneAlreadyConnected as exc:
+            raise HTTPException(409, str(exc)) from exc
+
+        # setWebhook replaces a webhook for the same bot, so cleanup is only
+        # needed when the bot token itself changed. Do it after persistence so
+        # a Vault/DB failure cannot strand the old bot without a source token.
+        if (
+            previous_telegram_credentials
+            and previous_telegram_credentials.get("bot_token") != credentials.get("bot_token")
+        ):
+            try:
+                await _unregister_telegram_webhooks(
+                    db,
+                    entity_id=user.entity_id,
+                    integration_id=integration.id,
+                    credentials=previous_telegram_credentials,
+                )
+            except HTTPException:
+                logger.exception(
+                    "Could not remove old Telegram webhook after updating integration %s",
+                    integration.id,
+                )
+
+        await _register_integration_channel_webhooks(
+            db, entity_id=user.entity_id, integration_id=integration.id,
+        )
 
     # Refresh the health signal now that creds changed.
     try:
@@ -2601,6 +5005,8 @@ async def update_one_integration(
     return _integration_resp(
         integration,
         creator_names=await _creator_names(db, [integration]),
+        owner_names=await _owner_names(db, [integration]),
+        requester_user_id=user.id,
     )
 
 
@@ -2610,15 +5016,37 @@ async def delete_one_integration(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    integration = await get_integration(db, integration_id, user.entity_id)
+    integration = await get_integration(
+        db, integration_id, user.entity_id, user.id, action="manage",
+    )
     if not integration:
         raise HTTPException(404, "Integration not found")
+    if canonical_provider_key(integration.provider) == "whatsapp":
+        try:
+            await _disconnect_whatsapp_integration_once(
+                db,
+                entity_id=user.entity_id,
+                integration_id=integration_id,
+            )
+        except WhatsAppDisconnectPending:
+            _enqueue_whatsapp_disconnect_retry(
+                entity_id=user.entity_id,
+                integration_id=integration_id,
+            )
+        return
     await _delete_integration_channel_bridges(
         db,
         entity_id=user.entity_id,
         integration_id=integration_id,
     )
-    await db.delete(integration)
+    removed = await delete_integration(
+        db,
+        integration_id,
+        user.entity_id,
+        user.id,
+    )
+    if not removed:
+        raise HTTPException(404, "Integration not found")
     await db.commit()
 
 
@@ -2630,8 +5058,16 @@ async def list_integration_channels(
     db: AsyncSession = Depends(get_db),
 ):
     # Verify the integration belongs to this entity
-    integration = await get_integration(db, integration_id, user.entity_id)
+    integration = await get_integration(
+        db, integration_id, user.entity_id, user.id, action="manage",
+    )
     if not integration:
         raise HTTPException(404, "Integration not found")
-    channels = await list_channels(db, user.entity_id, workspace_id=workspace_id)
+    channels = await list_owned_integration_channels(
+        db,
+        user.entity_id,
+        user.id,
+        integration_id,
+        workspace_id=workspace_id,
+    )
     return [_channel_resp(c) for c in channels]

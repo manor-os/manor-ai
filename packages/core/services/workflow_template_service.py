@@ -17,11 +17,16 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from packages.core.blueprints.installer import _blueprint_workflow_definition_values
 from packages.core.blueprints.seed import platform_blueprint_id
 from packages.core.blueprints.solo_company import get_solo_company_blueprints
+from packages.core.blueprints.workflow_dependencies import WorkflowDependencyFactory
 from packages.core.models.base import generate_ulid
 from packages.core.models.workflow import (
     WorkflowDefinition,
     WorkflowTemplateInstallation,
 )
+from packages.core.services.reusable_resource_locks import (
+    lock_reusable_resource_payload_references,
+)
+from packages.core.services.workflow_run_trace import visible_workflow_tags
 
 
 FLOW_TEMPLATE_ID_PREFIX = "builtin-flow:"
@@ -216,20 +221,6 @@ async def _installed_workflow(
     return None, None
 
 
-def _replace_dependency_ids(steps: list[dict], workflow_ids_by_key: dict[str, str]) -> None:
-    for step in steps:
-        if not isinstance(step, dict) or step.get("type") not in {
-            "subworkflow", "foreach_subworkflow",
-        }:
-            continue
-        config = step.get("config") if isinstance(step.get("config"), dict) else {}
-        key = str(config.get("workflow_id") or "").strip()
-        if key in workflow_ids_by_key:
-            config["workflow_id"] = workflow_ids_by_key[key]
-            config["source_workflow_key"] = key
-            step["config"] = config
-
-
 async def install_flow_template(
     db: AsyncSession,
     *,
@@ -283,7 +274,15 @@ async def install_flow_template(
             values = deepcopy(spec.values)
             steps = list(values.pop("steps", []))
             values.pop("name", None)
-            _replace_dependency_ids(steps, dependency_workflow_ids)
+            steps = WorkflowDependencyFactory.to_runtime(
+                steps,
+                workflow_id_by_key=dependency_workflow_ids,
+            )
+            await lock_reusable_resource_payload_references(
+                db,
+                entity_id=entity_id,
+                payload=steps,
+            )
             workflow = WorkflowDefinition(
                 id=generate_ulid(),
                 entity_id=entity_id,
@@ -352,7 +351,7 @@ async def install_flow_template(
                 "steps": workflow.steps or [],
                 "variables": workflow.variables or {},
                 "category": workflow.category,
-                "tags": workflow.tags or [],
+                "tags": visible_workflow_tags(workflow.tags),
                 "status": workflow.status,
                 "is_active": workflow.is_active,
                 "version": workflow.version,

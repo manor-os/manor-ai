@@ -131,8 +131,23 @@ async def test_yt_get_channel_mine(yt_http):
 
 async def test_yt_get_channel_requires_a_selector(yt_http):
     out = await yt.call_tool("get_channel", {}, _TOKEN)
+    assert out["isError"] is True
     assert "Provide channel_id" in out["content"][0]["text"]
     assert not yt_http.calls
+
+
+async def test_yt_blank_token_is_rejected_without_http(yt_http):
+    out = await yt.call_tool("search", {"query": "lofi"}, "   ")
+    assert out["isError"] is True
+    assert "token" in out["content"][0]["text"].lower()
+    assert not yt_http.calls
+
+
+async def test_yt_non_2xx_surfaces_as_error(yt_http):
+    yt_http.response = _FakeResp(500, text="upstream down")
+    out = await yt.call_tool("search", {"query": "lofi"}, _TOKEN)
+    assert out["isError"] is True
+    assert "500" in out["content"][0]["text"]
 
 
 async def test_yt_list_captions(yt_http):
@@ -201,6 +216,57 @@ async def test_yt_upload_video_resumable(yt_http, monkeypatch, tmp_path):
     assert not source.exists()
 
 
+@pytest.mark.parametrize(
+    ("scenario", "expected"),
+    [
+        ("init_rejected", "forbidden"),
+        ("missing_location", "session url"),
+        ("chunk_rejected", "upload error (500)"),
+        ("source_truncated", "source ended"),
+        ("no_final_response", "without a final response"),
+    ],
+)
+async def test_yt_upload_failures_are_error_envelopes(
+    yt_http,
+    monkeypatch,
+    tmp_path,
+    scenario,
+    expected,
+):
+    source = tmp_path / f"{scenario}.mp4"
+    source.write_bytes(b"video-bytes")
+    declared_size = source.stat().st_size + (1 if scenario == "source_truncated" else 0)
+
+    async def _stage(_url):
+        return source, declared_size, "video/mp4"
+
+    monkeypatch.setattr(yt, "_stage_video_source", _stage)
+
+    def _route(method, _url):
+        if method == "POST":
+            if scenario == "init_rejected":
+                return _FakeResp(403, text="quota exhausted")
+            headers = {} if scenario == "missing_location" else {
+                "location": "https://upload.youtube.test/session/error"
+            }
+            return _FakeResp(200, headers=headers)
+        if scenario == "chunk_rejected":
+            return _FakeResp(500, text="upload unavailable")
+        return _FakeResp(308)
+
+    yt_http.route = _route
+
+    out = await yt.call_tool(
+        "upload_video",
+        {"video_url": "https://cdn.example.com/fail.mp4", "title": "Failure"},
+        _TOKEN,
+    )
+
+    assert out["isError"] is True
+    assert expected in out["content"][0]["text"].lower()
+    assert not source.exists()
+
+
 async def test_yt_upload_video_rejects_unsafe_release_settings(yt_http):
     out = await yt.call_tool(
         "upload_video",
@@ -208,6 +274,7 @@ async def test_yt_upload_video_rejects_unsafe_release_settings(yt_http):
         _TOKEN,
     )
     assert "privacy must be" in out["content"][0]["text"]
+    assert out["isError"] is True
     assert not yt_http.calls
 
     out = await yt.call_tool(
@@ -221,6 +288,7 @@ async def test_yt_upload_video_rejects_unsafe_release_settings(yt_http):
         _TOKEN,
     )
     assert "publish_at requires privacy=private" in out["content"][0]["text"]
+    assert out["isError"] is True
     assert not yt_http.calls
 
 
@@ -249,6 +317,7 @@ async def test_yt_rate_video(yt_http):
 async def test_yt_rate_video_rejects_bad_rating(yt_http):
     out = await yt.call_tool("rate_video", {"video_id": "v1", "rating": "love"}, _TOKEN)
     assert "rating must be" in out["content"][0]["text"]
+    assert out["isError"] is True
     assert not yt_http.calls
 
 
@@ -291,7 +360,21 @@ async def test_yt_update_video_preserves_title_and_category(yt_http):
 async def test_yt_update_video_missing_video(yt_http):
     yt_http.route = lambda m, u: _FakeResp(200, {"items": []})
     out = await yt.call_tool("update_video", {"video_id": "gone", "title": "x"}, _TOKEN)
+    assert out["isError"] is True
     assert "not found" in out["content"][0]["text"].lower()
+
+
+async def test_yt_update_video_rejects_invalid_provider_response(yt_http):
+    yt_http.route = lambda _method, _url: _FakeResp(200, text="not-json")
+
+    out = await yt.call_tool(
+        "update_video",
+        {"video_id": "v1", "title": "x"},
+        _TOKEN,
+    )
+
+    assert out["isError"] is True
+    assert "invalid response" in out["content"][0]["text"].lower()
 
 
 async def test_yt_add_to_playlist_resource(yt_http):
@@ -340,6 +423,32 @@ async def test_tk_list_videos_clamps_max_count(tk_http):
     tk_http.calls = []
     await tk.call_tool("list_videos", {"max_count": 0}, _TOKEN)
     assert _last(tk_http)["json"]["max_count"] == 1
+
+
+async def test_tk_blank_token_is_rejected_without_http(tk_http):
+    out = await tk.call_tool("get_user_info", {}, "   ")
+    assert out["isError"] is True
+    assert "token" in out["content"][0]["text"].lower()
+    assert not tk_http.calls
+
+
+async def test_tk_non_2xx_surfaces_as_error(tk_http):
+    tk_http.response = _FakeResp(500, text="upstream down")
+    out = await tk.call_tool("get_user_info", {}, _TOKEN)
+    assert out["isError"] is True
+    assert "500" in out["content"][0]["text"]
+
+
+async def test_tk_http_200_business_error_surfaces_as_error(tk_http):
+    tk_http.response = _FakeResp(
+        200,
+        {"data": {}, "error": {"code": "scope_not_authorized", "message": "scope missing"}},
+    )
+
+    out = await tk.call_tool("get_user_info", {}, _TOKEN)
+
+    assert out["isError"] is True
+    assert "scope_not_authorized" in out["content"][0]["text"]
 
 
 async def test_tk_query_videos_csv_ids(tk_http):

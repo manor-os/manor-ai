@@ -13,14 +13,18 @@ read the file via the existing filesystem MCP.
 """
 from __future__ import annotations
 
+import contextvars
 import json
 import logging
+import math
 import time
 import uuid
 from pathlib import Path
 from typing import Any, Dict, List
 
 import httpx
+
+from packages.core.services.runtime_paths import private_runtime_dir
 
 logger = logging.getLogger(__name__)
 
@@ -37,7 +41,7 @@ _DEFAULT_MUSIC_MODEL = "music_v1"
 
 # Where to drop generated MP3s when there is no entity context. Entity-scoped
 # saves go through the shared entity filesystem helpers instead.
-_FALLBACK_AUDIO_DIR = Path("/tmp/manor-audio/elevenlabs")
+_FALLBACK_AUDIO_DIR = private_runtime_dir("audio", "elevenlabs")
 
 
 def _get_audio_dir() -> Path:
@@ -45,18 +49,20 @@ def _get_audio_dir() -> Path:
     _FALLBACK_AUDIO_DIR.mkdir(parents=True, exist_ok=True)
     return _FALLBACK_AUDIO_DIR
 
-# Call context — set by the MCP dispatcher before call_tool()
-_call_context: Dict[str, str] = {}
+# Call context — set by the MCP dispatcher before call_tool(). Context-local
+# storage prevents concurrent tool calls from crossing tenant boundaries.
+_call_context_var: contextvars.ContextVar[Dict[str, str]] = contextvars.ContextVar(
+    "elevenlabs_mcp_call_context",
+    default={},
+)
 
 
 def set_call_context(ctx: Dict[str, str]) -> None:
-    global _call_context
-    _call_context = ctx
+    _call_context_var.set(dict(ctx or {}))
 
 
 def clear_call_context() -> None:
-    global _call_context
-    _call_context = {}
+    _call_context_var.set({})
 
 
 # ── MCP protocol ────────────────────────────────────────────────────────────
@@ -223,7 +229,8 @@ async def call_tool(
     arguments: Dict[str, Any],
     bearer_token: str,
 ) -> Dict[str, Any]:
-    if not bearer_token:
+    api_key = bearer_token.strip() if isinstance(bearer_token, str) else ""
+    if not api_key:
         return _error(
             "ElevenLabs API key is missing. Get one at "
             "https://elevenlabs.io/app/settings/api-keys and add it "
@@ -233,9 +240,13 @@ async def call_tool(
     handler = _HANDLERS.get(name)
     if handler is None:
         return _error(f"Unknown elevenlabs tool: {name}")
+    if not isinstance(arguments, dict):
+        return _error("arguments must be an object")
+    arguments = dict(arguments)
 
     try:
-        return _content(await handler(arguments, bearer_token))
+        _validate_arguments(name, arguments)
+        return _content(await handler(arguments, api_key))
     except httpx.HTTPStatusError as exc:
         body = exc.response.text[:500] if exc.response is not None else ""
         return _error(f"ElevenLabs HTTP {exc.response.status_code}: {body}")
@@ -245,6 +256,67 @@ async def call_tool(
 
 
 # ── Handlers ────────────────────────────────────────────────────────────────
+
+def _validate_arguments(name: str, arguments: dict[str, Any]) -> None:
+    """Validate the JSON shape before a provider request or file write."""
+    tool = next((item for item in list_tools() if item["name"] == name), None)
+    if tool is None:  # pragma: no cover - guarded by ``_HANDLERS``
+        return
+
+    for field, spec in tool["parameters"].get("properties", {}).items():
+        value = arguments.get(field)
+        if value is None:
+            continue
+        kind = spec.get("type")
+        if kind == "string" and not isinstance(value, str):
+            raise ValueError(f"{field} must be a string")
+        if kind == "boolean" and not isinstance(value, bool):
+            raise ValueError(f"{field} must be a boolean")
+        if kind == "object" and not isinstance(value, dict):
+            raise ValueError(f"{field} must be an object")
+        if kind != "array":
+            continue
+        if not isinstance(value, list):
+            raise ValueError(f"{field} must be an array")
+        item_spec = spec.get("items") or {}
+        item_kind = item_spec.get("type")
+        for index, item in enumerate(value, start=1):
+            if item_kind == "string" and not isinstance(item, str):
+                raise ValueError(f"{field}[{index}] must be a string")
+            if item_kind != "object":
+                continue
+            if not isinstance(item, dict):
+                raise ValueError(f"{field}[{index}] must be an object")
+            for nested_field, nested_spec in (item_spec.get("properties") or {}).items():
+                nested_value = item.get(nested_field)
+                if nested_value is not None and nested_spec.get("type") == "string" and not isinstance(nested_value, str):
+                    raise ValueError(f"{field}[{index}].{nested_field} must be a string")
+
+def _bounded_number(
+    value: Any,
+    *,
+    field: str,
+    minimum: float,
+    maximum: float,
+    integer: bool = False,
+) -> float | int:
+    if isinstance(value, bool):
+        raise ValueError(f"{field} must be a number")
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"{field} must be a number") from exc
+    if not math.isfinite(parsed) or parsed < minimum or parsed > maximum:
+        bounds = (
+            f"{int(minimum)}-{int(maximum)}"
+            if integer
+            else f"{minimum:g}-{maximum:g}"
+        )
+        raise ValueError(f"{field} must be between {bounds}")
+    if integer and not parsed.is_integer():
+        raise ValueError(f"{field} must be an integer between {int(minimum)}-{int(maximum)}")
+    return int(parsed) if integer else parsed
+
 
 async def _text_to_speech(args: Dict[str, Any], api_key: str) -> str:
     text = (args.get("text") or "").strip()
@@ -256,9 +328,13 @@ async def _text_to_speech(args: Dict[str, Any], api_key: str) -> str:
 
     voice_settings: Dict[str, Any] = {}
     if args.get("stability") is not None:
-        voice_settings["stability"] = float(args["stability"])
+        voice_settings["stability"] = _bounded_number(
+            args["stability"], field="stability", minimum=0, maximum=1,
+        )
     if args.get("similarity_boost") is not None:
-        voice_settings["similarity_boost"] = float(args["similarity_boost"])
+        voice_settings["similarity_boost"] = _bounded_number(
+            args["similarity_boost"], field="similarity_boost", minimum=0, maximum=1,
+        )
 
     body: Dict[str, Any] = {"text": text, "model_id": model_id}
     if voice_settings:
@@ -299,8 +375,8 @@ async def _text_to_dialogue(args: Dict[str, Any], api_key: str) -> str:
     for index, item in enumerate(inputs, start=1):
         if not isinstance(item, dict):
             raise ValueError(f"inputs[{index}] must be an object")
-        text = str(item.get("text") or "").strip()
-        voice_id = str(item.get("voice_id") or "").strip()
+        text = (item.get("text") or "").strip()
+        voice_id = (item.get("voice_id") or "").strip()
         if not text or not voice_id:
             raise ValueError(f"inputs[{index}] requires text and voice_id")
         normalized_inputs.append({"text": text, "voice_id": voice_id})
@@ -355,11 +431,21 @@ async def _generate_sound_effect(args: Dict[str, Any], api_key: str) -> str:
         "model_id": (args.get("model_id") or _DEFAULT_SOUND_EFFECT_MODEL).strip(),
     }
     if args.get("duration_seconds") is not None:
-        body["duration_seconds"] = float(args["duration_seconds"])
+        body["duration_seconds"] = _bounded_number(
+            args["duration_seconds"],
+            field="duration_seconds",
+            minimum=0.5,
+            maximum=30,
+        )
     if args.get("loop") is not None:
         body["loop"] = bool(args["loop"])
     if args.get("prompt_influence") is not None:
-        body["prompt_influence"] = float(args["prompt_influence"])
+        body["prompt_influence"] = _bounded_number(
+            args["prompt_influence"],
+            field="prompt_influence",
+            minimum=0,
+            maximum=1,
+        )
 
     async with httpx.AsyncClient(timeout=_TIMEOUT) as cx:
         r = await cx.post(
@@ -398,7 +484,13 @@ async def _compose_music(args: Dict[str, Any], api_key: str) -> str:
     if prompt:
         body["prompt"] = prompt
         if args.get("music_length_ms") is not None:
-            body["music_length_ms"] = int(args["music_length_ms"])
+            body["music_length_ms"] = _bounded_number(
+                args["music_length_ms"],
+                field="music_length_ms",
+                minimum=3000,
+                maximum=600000,
+                integer=True,
+            )
         if args.get("force_instrumental") is not None:
             body["force_instrumental"] = bool(args["force_instrumental"])
     else:
@@ -433,7 +525,7 @@ async def _save_audio_bytes(audio_bytes: bytes, filename_hint: str) -> tuple[Pat
         for c in (filename_hint or "audio")
     )[:32]
     fname = f"{int(time.time())}_{safe_hint}_{uuid.uuid4().hex[:8]}.mp3"
-    entity_id = _call_context.get("entity_id")
+    entity_id = _call_context_var.get().get("entity_id")
     if entity_id:
         from packages.core.services.entity_fs import write_entity_file_atomic
 
@@ -458,7 +550,7 @@ async def _save_audio_bytes(audio_bytes: bytes, filename_hint: str) -> tuple[Pat
 
 async def _register_document(name: str, fs_path: str, file_size: int) -> None:
     """Register a generated audio file in the documents table."""
-    entity_id = _call_context.get("entity_id")
+    entity_id = _call_context_var.get().get("entity_id")
     if not entity_id:
         logger.warning("No entity_id in call context — skipping document registration for %s", name)
         return
@@ -480,11 +572,12 @@ async def _register_document(name: str, fs_path: str, file_size: int) -> None:
         rel_dir = str(Path(rel_path).parent).replace("\\", "/")
         rel_dir = "" if rel_dir == "." else rel_dir
         folder_id = await ensure_folder_path(entity_id, rel_dir)
-        workspace_id = _call_context.get("workspace_id")
-        task_id = _call_context.get("task_id")
-        agent_id = _call_context.get("agent_id")
-        conversation_id = _call_context.get("conversation_id")
-        user_id = _call_context.get("user_id")
+        call_context = _call_context_var.get()
+        workspace_id = call_context.get("workspace_id")
+        task_id = call_context.get("task_id")
+        agent_id = call_context.get("agent_id")
+        conversation_id = call_context.get("conversation_id")
+        user_id = call_context.get("user_id")
         document_id = None
         async with async_session() as db:
             doc = await upsert_document_by_fs_path(

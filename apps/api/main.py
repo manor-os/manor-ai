@@ -12,9 +12,9 @@ Cloud features loaded as plugins via DEPLOYMENT_MODE env var.
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import os
 import logging
-import re
 import sys
 from contextlib import asynccontextmanager
 from urllib.parse import urlsplit
@@ -23,58 +23,14 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from apps.api.middleware import setup_middleware
+from packages.core.observability.log_redaction import (
+    SensitiveQueryStringFilter as SensitiveQueryStringFilter,
+    install_sensitive_log_filter,
+    redact_sensitive_log_text as redact_sensitive_log_text,
+)
 
 # ── Logging setup ────────────────────────────────────────────────────────
 # Configure root logger so all manor.* loggers emit to stderr (Docker logs).
-_SENSITIVE_QUERY_RE = re.compile(
-    r"([?&](?:token|access_token|refresh_token|id_token|api_key|client_secret|password|code)=)"
-    r"[^&\s\"']+",
-    re.IGNORECASE,
-)
-_SENSITIVE_LOG_VALUE_RE = re.compile(
-    r"(?i)\b(verification[_ -]?code|password[_ -]?reset[_ -]?token|"
-    r"access[_ -]?token|refresh[_ -]?token|client[_ -]?secret|api[_ -]?key)"
-    r"(\s*(?:for\s+[^\s:]+)?\s*[:=]\s*)([^\s,;&\"']+)"
-)
-
-
-def redact_sensitive_log_text(value: str) -> str:
-    """Remove credentials and verification material before log emission."""
-    redacted = _SENSITIVE_QUERY_RE.sub(r"\1<redacted>", value)
-    return _SENSITIVE_LOG_VALUE_RE.sub(r"\1\2<redacted>", redacted)
-
-
-class SensitiveQueryStringFilter(logging.Filter):
-    """Redact credentials in uvicorn/FastAPI access-log messages."""
-
-    def filter(self, record: logging.LogRecord) -> bool:
-        if isinstance(record.msg, str):
-            record.msg = redact_sensitive_log_text(record.msg)
-
-        if isinstance(record.args, tuple):
-            record.args = tuple(
-                redact_sensitive_log_text(arg) if isinstance(arg, str) else arg
-                for arg in record.args
-            )
-        elif isinstance(record.args, dict):
-            record.args = {
-                key: redact_sensitive_log_text(arg) if isinstance(arg, str) else arg
-                for key, arg in record.args.items()
-            }
-        return True
-
-
-def install_sensitive_log_filter() -> None:
-    sensitive_filter = SensitiveQueryStringFilter()
-    for logger_name in ("uvicorn.access", "uvicorn.error", "apps.api.middleware_core"):
-        target = logging.getLogger(logger_name)
-        if not any(isinstance(existing, SensitiveQueryStringFilter) for existing in target.filters):
-            target.addFilter(sensitive_filter)
-    for handler in logging.getLogger().handlers:
-        if not any(isinstance(existing, SensitiveQueryStringFilter) for existing in handler.filters):
-            handler.addFilter(sensitive_filter)
-
-
 _log_level = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(
     level=getattr(logging, _log_level, logging.INFO),
@@ -94,6 +50,7 @@ logger = logging.getLogger(__name__)
 def _cors_allowed_origins() -> list[str]:
     configured = os.getenv("CORS_ALLOWED_ORIGINS", "")
     cloud_mode = os.getenv("DEPLOYMENT_MODE", "oss").strip().lower() == "cloud"
+    local_k8s_mode = os.getenv("MANOR_ENV", "").strip().lower() == "local-k8s"
     origins = (
         [origin.strip().rstrip("/") for origin in configured.split(",") if origin.strip()]
         if configured.strip()
@@ -123,7 +80,28 @@ def _cors_allowed_origins() -> list[str]:
             or parsed.fragment
         ):
             raise RuntimeError(f"Invalid CORS origin: {origin!r}")
-        if cloud_mode and parsed.scheme != "https":
+        is_hostless_public_ipv4 = False
+        is_loopback_http = False
+        if parsed.scheme == "http" and parsed.port is None and parsed.hostname:
+            try:
+                address = ipaddress.ip_address(parsed.hostname)
+                is_hostless_public_ipv4 = address.version == 4 and address.is_global
+            except ValueError:
+                pass
+        if parsed.scheme == "http" and parsed.hostname:
+            if parsed.hostname.lower() == "localhost":
+                is_loopback_http = True
+            else:
+                try:
+                    is_loopback_http = ipaddress.ip_address(parsed.hostname).is_loopback
+                except ValueError:
+                    pass
+        if (
+            cloud_mode
+            and parsed.scheme != "https"
+            and not is_hostless_public_ipv4
+            and not (local_k8s_mode and is_loopback_http)
+        ):
             raise RuntimeError("Cloud CORS origins must use HTTPS")
     return normalized
 
@@ -137,7 +115,37 @@ async def lifespan(app: FastAPI):
     # source, so anyone could forge tokens for any user. Hard-fail in cloud;
     # warn loudly in self-hosted/OSS mode (local dev may not set it yet).
     from packages.core.config import get_settings, is_insecure_jwt_secret
+    from packages.core.service_role import (
+        SERVICE_ROLE_API,
+        api_startup_side_effects_enabled,
+        normalize_service_role,
+        otel_service_name_for_role,
+        telegram_polling_startup_enabled,
+        validate_service_role_for_deployment,
+    )
     _settings = get_settings()
+    _service_role_error = validate_service_role_for_deployment(
+        _settings.MANOR_SERVICE_ROLE,
+        deployment_mode=_settings.DEPLOYMENT_MODE,
+    )
+    if _service_role_error:
+        raise RuntimeError(_service_role_error)
+
+    _service_role = normalize_service_role(_settings.MANOR_SERVICE_ROLE)
+    _run_api_side_effects = api_startup_side_effects_enabled(
+        _service_role,
+        deployment_mode=_settings.DEPLOYMENT_MODE,
+    )
+    _run_telegram_polling = telegram_polling_startup_enabled(
+        _service_role,
+        deployment_mode=_settings.DEPLOYMENT_MODE,
+    )
+    logger.info(
+        "Manor AI service role=%s startup_side_effects=%s telegram_polling=%s",
+        _service_role,
+        _run_api_side_effects,
+        _run_telegram_polling,
+    )
     if is_insecure_jwt_secret(_settings.JWT_SECRET_KEY):
         if _settings.DEPLOYMENT_MODE.strip().lower() == "cloud":
             raise RuntimeError(
@@ -155,7 +163,7 @@ async def lifespan(app: FastAPI):
     # OTEL tracing (no-op when OTEL_ENABLED is not set).
     try:
         from packages.core.observability import init_tracing
-        init_tracing(service_name="manor-api")
+        init_tracing(service_name=otel_service_name_for_role(_service_role))
     except Exception as e:
         logger.warning("OTEL init skipped: %s", e)
 
@@ -169,15 +177,16 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.error("Runtime tool registry initialization failed: %s", e, exc_info=True)
 
-    # Self-heal the MCP catalog. Test fixtures wipe the table, and OSS
-    # deployments may skip init_db — both end up with an empty
-    # Integrations page. Seed on every boot (idempotent via ON CONFLICT).
-    try:
-        from packages.core.database import engine as _engine
-        from packages.core.services.mcp_seed import seed_mcp_catalog
-        await seed_mcp_catalog(_engine)
-    except Exception as e:
-        logger.warning("MCP catalog auto-seed skipped: %s", e)
+    if _run_api_side_effects:
+        # Self-heal the MCP catalog. Test fixtures wipe the table, and OSS
+        # deployments may skip init_db — both end up with an empty
+        # Integrations page. Seed on every boot (idempotent via ON CONFLICT).
+        try:
+            from packages.core.database import engine as _engine
+            from packages.core.services.mcp_seed import seed_mcp_catalog
+            await seed_mcp_catalog(_engine)
+        except Exception as e:
+            logger.warning("MCP catalog auto-seed skipped: %s", e)
 
     # Register built-in runtime Skills before the first Agent turn. This also
     # selects the edition-specific public product guide: cloud-intro in the
@@ -230,7 +239,7 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning("Plan cache load skipped: %s", e)
 
-    if os.getenv("DEPLOYMENT_MODE", "oss").strip().lower() == "oss":
+    if _run_api_side_effects and os.getenv("DEPLOYMENT_MODE", "oss").strip().lower() == "oss":
         try:
             from packages.core.database import async_session
             from packages.core.services.demo_account import ensure_demo_account
@@ -242,12 +251,15 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             logger.warning("OSS demo account seed skipped: %s", e)
 
-    # Warm optional model price metadata for runtime accounting displays.
-    try:
-        from packages.core.services.openrouter_pricing_sync import sync_openrouter_pricing_cache
-        await sync_openrouter_pricing_cache(timeout_s=10.0)
-    except Exception as e:
-        logger.warning("OpenRouter pricing cache warmup skipped: %s", e)
+    if _run_api_side_effects:
+        # Warm optional model price metadata for runtime accounting displays.
+        # Cloud split deployments refresh this through the scheduled billing
+        # task, so avoid fanning out an external request from every API/Chat pod.
+        try:
+            from packages.core.services.openrouter_pricing_sync import sync_openrouter_pricing_cache
+            await sync_openrouter_pricing_cache(timeout_s=10.0)
+        except Exception as e:
+            logger.warning("OpenRouter pricing cache warmup skipped: %s", e)
 
     async def _oauth_env_bootstrap_task() -> None:
         # Bootstrap OAuth client credentials from env into the MCPServer
@@ -276,35 +288,36 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             logger.warning("OAuth env bootstrap skipped: %s", e)
 
-    # Bootstrap OAuth PROVIDER clients (Manor-as-IdP for downstream apps).
-    # Distinct from the block above (that was for Manor-as-OAuth-consumer
-    # of Gmail/Slack/etc). Reads MANOR_OAUTH_CLIENT_<NAME>_SECRET env vars
-    # (set via the deploy workflow from GitHub Secrets) and upserts the
-    # matching rows in oauth_client_apps. Idempotent: same secret → no
-    # bcrypt re-hash, same redirect_uris → no DB write. Replaces the
-    # manual scripts/seed_oauth_client_pms.py SSH workflow.
-    try:
-        from packages.core.database import async_session
-        from packages.core.services.oauth_provider_service import (
-            seed_clients_from_env as seed_oauth_provider_clients,
-        )
-        async with async_session() as _db:
-            actions = await seed_oauth_provider_clients(_db)
-        changed = [k for k, v in actions.items() if v in ("seeded", "rotated")]
-        skipped = [k for k, v in actions.items() if str(v).startswith("skipped")]
-        errored = [(k, v) for k, v in actions.items() if str(v).startswith("error")]
-        if changed:
-            logger.info("OAuth provider clients applied: %s", ", ".join(
-                f"{k}={actions[k]}" for k in changed
-            ))
-        if skipped:
-            logger.info("OAuth provider clients skipped (no env secret): %s",
-                        ", ".join(skipped))
-        if errored:
-            logger.warning("OAuth provider client seed errors: %s",
-                           "; ".join(f"{k} → {v}" for k, v in errored))
-    except Exception as e:
-        logger.warning("OAuth provider bootstrap skipped: %s", e)
+    if _run_api_side_effects:
+        # Bootstrap OAuth PROVIDER clients (Manor-as-IdP for downstream apps).
+        # Distinct from the block above (that was for Manor-as-OAuth-consumer
+        # of Gmail/Slack/etc). Reads MANOR_OAUTH_CLIENT_<NAME>_SECRET env vars
+        # (set via the deploy workflow from GitHub Secrets) and upserts the
+        # matching rows in oauth_client_apps. Idempotent: same secret → no
+        # bcrypt re-hash, same redirect_uris → no DB write. Replaces the
+        # manual scripts/seed_oauth_client_pms.py SSH workflow.
+        try:
+            from packages.core.database import async_session
+            from packages.core.services.oauth_provider_service import (
+                seed_clients_from_env as seed_oauth_provider_clients,
+            )
+            async with async_session() as _db:
+                actions = await seed_oauth_provider_clients(_db)
+            changed = [k for k, v in actions.items() if v in ("seeded", "rotated")]
+            skipped = [k for k, v in actions.items() if str(v).startswith("skipped")]
+            errored = [(k, v) for k, v in actions.items() if str(v).startswith("error")]
+            if changed:
+                logger.info("OAuth provider clients applied: %s", ", ".join(
+                    f"{k}={actions[k]}" for k in changed
+                ))
+            if skipped:
+                logger.info("OAuth provider clients skipped (no env secret): %s",
+                            ", ".join(skipped))
+            if errored:
+                logger.warning("OAuth provider client seed errors: %s",
+                               "; ".join(f"{k} → {v}" for k, v in errored))
+        except Exception as e:
+            logger.warning("OAuth provider bootstrap skipped: %s", e)
 
     async def _nango_bootstrap_task() -> None:
         # Bootstrap Nango provider config and webhook settings. Nango is
@@ -336,81 +349,89 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             logger.warning("Nango env bootstrap skipped: %s", e)
 
-    # Self-heal ChannelContact table. Added as a new model after the
-    # initial schema shipped; CREATE IF NOT EXISTS keeps existing
-    # deployments from hitting "relation channel_contacts does not
-    # exist" on first inbound message. Also adds the user_id/role
-    # identity columns if they're missing from an older deployment.
-    try:
-        from sqlalchemy import text as _sql_text
-        from packages.core.database import engine as _engine
-        from packages.core.models.base import Base
-        from packages.core.models.channel import ChannelContact  # noqa: F401
-        async with _engine.begin() as conn:
-            await conn.run_sync(
-                lambda c: Base.metadata.tables["channel_contacts"].create(c, checkfirst=True)
-            )
-            await conn.execute(_sql_text(
-                "ALTER TABLE channel_contacts "
-                "ADD COLUMN IF NOT EXISTS user_id VARCHAR(26)"
-            ))
-            await conn.execute(_sql_text(
-                "ALTER TABLE channel_contacts "
-                "ADD COLUMN IF NOT EXISTS role VARCHAR(32) NOT NULL DEFAULT 'external'"
-            ))
-    except Exception as e:
-        logger.warning("ChannelContact table auto-heal skipped: %s", e)
+    if _run_api_side_effects:
+        # Self-heal ChannelContact table. Added as a new model after the
+        # initial schema shipped; CREATE IF NOT EXISTS keeps existing
+        # deployments from hitting "relation channel_contacts does not
+        # exist" on first inbound message. Also adds the user_id/role
+        # identity columns if they're missing from an older deployment.
+        try:
+            from sqlalchemy import text as _sql_text
+            from packages.core.database import engine as _engine
+            from packages.core.models.base import Base
+            from packages.core.models.channel import ChannelContact  # noqa: F401
+            async with _engine.begin() as conn:
+                await conn.run_sync(
+                    lambda c: Base.metadata.tables["channel_contacts"].create(c, checkfirst=True)
+                )
+                await conn.execute(_sql_text(
+                    "ALTER TABLE channel_contacts "
+                    "ADD COLUMN IF NOT EXISTS user_id VARCHAR(26)"
+                ))
+                await conn.execute(_sql_text(
+                    "ALTER TABLE channel_contacts "
+                    "ADD COLUMN IF NOT EXISTS role VARCHAR(32) NOT NULL DEFAULT 'external'"
+                ))
+        except Exception as e:
+            logger.warning("ChannelContact table auto-heal skipped: %s", e)
 
-    # Self-heal subscription-centric channel routing columns. All
-    # nullable — legacy rows keep working (the gateway synthesises a
-    # stub subscription from ``Channel.agent_id`` when these are empty).
-    try:
-        from sqlalchemy import text as _sql_text
-        from packages.core.database import engine as _engine
-        async with _engine.begin() as conn:
-            await conn.execute(_sql_text(
-                "ALTER TABLE channels "
-                "ADD COLUMN IF NOT EXISTS agent_subscription_id VARCHAR(26)"
-            ))
-            await conn.execute(_sql_text(
-                "ALTER TABLE channel_contacts "
-                "ADD COLUMN IF NOT EXISTS agent_subscription_id VARCHAR(26)"
-            ))
-            await conn.execute(_sql_text(
-                "ALTER TABLE conversations "
-                "ADD COLUMN IF NOT EXISTS agent_subscription_id VARCHAR(26)"
-            ))
-            await conn.execute(_sql_text(
-                "ALTER TABLE agent_subscriptions "
-                "ADD COLUMN IF NOT EXISTS name VARCHAR(255)"
-            ))
-    except Exception as e:
-        logger.warning("Subscription routing auto-heal skipped: %s", e)
+        # Self-heal subscription-centric channel routing columns. All
+        # nullable — legacy rows keep working (the gateway synthesises a
+        # stub subscription from ``Channel.agent_id`` when these are empty).
+        try:
+            from sqlalchemy import text as _sql_text
+            from packages.core.database import engine as _engine
+            async with _engine.begin() as conn:
+                await conn.execute(_sql_text(
+                    "ALTER TABLE channels "
+                    "ADD COLUMN IF NOT EXISTS agent_subscription_id VARCHAR(26)"
+                ))
+                await conn.execute(_sql_text(
+                    "ALTER TABLE channel_contacts "
+                    "ADD COLUMN IF NOT EXISTS agent_subscription_id VARCHAR(26)"
+                ))
+                await conn.execute(_sql_text(
+                    "ALTER TABLE conversations "
+                    "ADD COLUMN IF NOT EXISTS agent_subscription_id VARCHAR(26)"
+                ))
+                await conn.execute(_sql_text(
+                    "ALTER TABLE agent_subscriptions "
+                    "ADD COLUMN IF NOT EXISTS name VARCHAR(255)"
+                ))
+        except Exception as e:
+            logger.warning("Subscription routing auto-heal skipped: %s", e)
 
-    # Kick off the Telegram long-polling runner when TELEGRAM_MODE is
-    # "polling" (or "auto" + non-HTTPS PUBLIC_BASE_URL). No-op otherwise.
-    try:
-        from packages.core.services.channels.telegram_poller import poller as _tg_poller
-        await _tg_poller.start()
-    except Exception as e:
-        logger.warning("Telegram poller startup skipped: %s", e)
+    if _run_telegram_polling:
+        # Kick off the Telegram long-polling runner when TELEGRAM_MODE is
+        # "polling" (or "auto" + non-HTTPS PUBLIC_BASE_URL). In cloud/K8s,
+        # this must be owned by one explicit runner/worker, not every API pod.
+        try:
+            from packages.core.services.channels.telegram_poller import poller as _tg_poller
+            await _tg_poller.start()
+        except Exception as e:
+            logger.warning("Telegram poller startup skipped: %s", e)
 
-    # Start Redis pub/sub relay for WS broadcasts from worker
-    try:
-        from apps.api.routers.ws import start_redis_relay
-        start_redis_relay()
-        logger.info("Redis WS relay task started")
-    except Exception as e:
-        logger.warning("Redis WS relay startup skipped: %s", e)
+    _run_ws_redis_relay = _service_role == SERVICE_ROLE_API
 
-    startup_tasks.append(asyncio.create_task(
-        _oauth_env_bootstrap_task(),
-        name="oauth-env-bootstrap",
-    ))
-    startup_tasks.append(asyncio.create_task(
-        _nango_bootstrap_task(),
-        name="nango-bootstrap",
-    ))
+    if _run_ws_redis_relay:
+        # Start Redis pub/sub relay for WS broadcasts from worker. This is
+        # per-pod realtime infrastructure, not a singleton startup side effect.
+        try:
+            from apps.api.routers.ws import start_redis_relay
+            start_redis_relay()
+            logger.info("Redis WS relay task started")
+        except Exception as e:
+            logger.warning("Redis WS relay startup skipped: %s", e)
+
+    if _run_api_side_effects:
+        startup_tasks.append(asyncio.create_task(
+            _oauth_env_bootstrap_task(),
+            name="oauth-env-bootstrap",
+        ))
+        startup_tasks.append(asyncio.create_task(
+            _nango_bootstrap_task(),
+            name="nango-bootstrap",
+        ))
 
     async def _knowledge_backfill_task() -> None:
         try:
@@ -419,11 +440,12 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             logger.warning("Knowledge startup backfill skipped: %s", e, exc_info=True)
 
-    knowledge_backfill_task = asyncio.create_task(
-        _knowledge_backfill_task(),
-        name="knowledge-startup-backfill",
-    )
-    startup_tasks.append(knowledge_backfill_task)
+    if _run_api_side_effects:
+        knowledge_backfill_task = asyncio.create_task(
+            _knowledge_backfill_task(),
+            name="knowledge-startup-backfill",
+        )
+        startup_tasks.append(knowledge_backfill_task)
 
     async def _workspace_operation_repair_task() -> None:
         try:
@@ -434,11 +456,12 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             logger.warning("Workspace operation startup repair skipped: %s", e, exc_info=True)
 
-    workspace_operation_repair_task = asyncio.create_task(
-        _workspace_operation_repair_task(),
-        name="workspace-operation-startup-repair",
-    )
-    startup_tasks.append(workspace_operation_repair_task)
+    if _run_api_side_effects:
+        workspace_operation_repair_task = asyncio.create_task(
+            _workspace_operation_repair_task(),
+            name="workspace-operation-startup-repair",
+        )
+        startup_tasks.append(workspace_operation_repair_task)
 
     async def _stale_stream_repair_task() -> None:
         try:
@@ -456,27 +479,30 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             logger.warning("Assistant stream startup repair skipped: %s", e, exc_info=True)
 
-    stale_stream_repair_task = asyncio.create_task(
-        _stale_stream_repair_task(),
-        name="assistant-stream-startup-repair",
-    )
-    startup_tasks.append(stale_stream_repair_task)
+    if _run_api_side_effects:
+        stale_stream_repair_task = asyncio.create_task(
+            _stale_stream_repair_task(),
+            name="assistant-stream-startup-repair",
+        )
+        startup_tasks.append(stale_stream_repair_task)
 
     yield
     # Shutdown
     for startup_task in startup_tasks:
         if not startup_task.done():
             startup_task.cancel()
-    try:
-        from apps.api.routers.ws import stop_redis_relay
-        stop_redis_relay()
-    except Exception:
-        pass
-    try:
-        from packages.core.services.channels.telegram_poller import poller as _tg_poller
-        await _tg_poller.stop()
-    except Exception:
-        logger.debug("Telegram poller stop failed", exc_info=True)
+    if _run_ws_redis_relay:
+        try:
+            from apps.api.routers.ws import stop_redis_relay
+            stop_redis_relay()
+        except Exception:
+            pass
+    if _run_telegram_polling:
+        try:
+            from packages.core.services.channels.telegram_poller import poller as _tg_poller
+            await _tg_poller.stop()
+        except Exception:
+            logger.debug("Telegram poller stop failed", exc_info=True)
     from packages.core.cache import cache
     await cache.close()
     try:
@@ -561,7 +587,12 @@ def create_app() -> FastAPI:
             "X-Request-ID",
             "X-Silent-Error",
         ],
-        expose_headers=["Content-Disposition", "Content-Length", "X-Request-ID"],
+        expose_headers=[
+            "Content-Disposition",
+            "Content-Length",
+            "X-Request-ID",
+            "X-Response-Surface-Event-ID",
+        ],
     )
 
     # Production middleware (request ID, logging, rate limiting, error handling)
@@ -600,15 +631,40 @@ def create_app() -> FastAPI:
             }
         })
 
+    from packages.core.services.plan_gate import WorkspacePlanLimitError
+
+    @app.exception_handler(WorkspacePlanLimitError)
+    async def _workspace_plan_limit_handler(
+        request, exc: WorkspacePlanLimitError,
+    ):
+        return JSONResponse(status_code=402, content={"detail": exc.detail})
+
+    from packages.core.services.reusable_resource_locks import (
+        ReusableResourceUnavailableError,
+    )
+
+    @app.exception_handler(ReusableResourceUnavailableError)
+    async def _reusable_resource_unavailable_handler(
+        request,
+        exc: ReusableResourceUnavailableError,
+    ):
+        return JSONResponse(status_code=409, content={"detail": str(exc)})
+
     # ── Core routers (always loaded) ──
     from apps.api.routers import auth, health, entities, workspaces, workspace_stats, workspace_drafts, tasks, chat, messages, agents, documents, integrations, notifications, admin, admin_oauth, oauth_provider, people, usage, goals, plans, workspace_chat, workers, scheduler, ws, search, dashboard, bulk, activity, webhooks, api_keys, templates, backup, skills, custom_fields, memories, comments, quotas, favorites, tags, presence, workflows, reports, portal, orders, docgen, browser, staff_management, calendar_settings, filesystem, nango_oauth, nango_webhooks, platform_public, business, audio, media, permissions as permissions_router, permissions_v1, document_permissions, folder_permissions, client_errors, support, sites
+    from apps.api.routers import internal_capacity
     from apps.api.routers.channels import wechat as wechat_channel
     from apps.api.routers.channels import twilio as twilio_channel
     from apps.api.routers.channels import whatsapp as whatsapp_channel
     from apps.api.routers.channels import telegram as telegram_channel
     from apps.api.routers.channels import facebook as facebook_channel
+    from apps.api.routers.channels import slack as slack_channel
+    from apps.api.routers.channels import discord_interactions as discord_channel
+    from apps.api.routers.channels import ms_teams as ms_teams_channel
+    from apps.api.routers.channels import outlook as outlook_channel
     from apps.api.routers.channels import generic as generic_channel
     from apps.api.routers.channels import voice_stream as voice_stream_channel
+    app.include_router(internal_capacity.router)
     app.include_router(auth.router)
     app.include_router(health.router)
     app.include_router(entities.router)
@@ -642,6 +698,8 @@ def create_app() -> FastAPI:
     app.include_router(business.router)
     app.include_router(support.router)
     app.include_router(audio.router)
+    from apps.api.chat_voice import router as chat_voice_router
+    app.include_router(chat_voice_router)
     app.include_router(media.router)
     # permissions_router must load BEFORE people.router because its
     # /staff/roles, /staff/invite paths would otherwise be shadowed by
@@ -684,12 +742,16 @@ def create_app() -> FastAPI:
     app.include_router(public_task.router)
     app.include_router(public_chat.router)
     app.include_router(wechat_channel.router)
+    app.include_router(slack_channel.router)
+    app.include_router(discord_channel.router)
     app.include_router(generic_channel.router)
     app.include_router(voice_stream_channel.router)
     app.include_router(twilio_channel.router)
     app.include_router(whatsapp_channel.router)
     app.include_router(telegram_channel.router)
     app.include_router(facebook_channel.router)
+    app.include_router(ms_teams_channel.router)
+    app.include_router(outlook_channel.router)
 
     # ── M7 + M10 routers (goal templates / governance / pairing / sessions) ──
     from apps.api.routers import (
@@ -711,6 +773,9 @@ def create_app() -> FastAPI:
     # ── M12.1 Workspace Blueprints / Marketplace ──
     app.include_router(blueprints_router.blueprint_router)
     app.include_router(blueprints_router.workspace_router)
+    from apps.api.routers import public_marketplace as public_marketplace_router
+    app.include_router(public_marketplace_router.api_router)
+    app.include_router(public_marketplace_router.page_router)
 
 
     return app
@@ -729,7 +794,9 @@ def run_cli() -> None:
     """
     import uvicorn
 
-    host = os.getenv("MANOR_HOST", "0.0.0.0")
+    # The packaged server must be reachable from its container/network; auth,
+    # ingress and firewall policy remain the external access boundary.
+    host = os.getenv("MANOR_HOST", "0.0.0.0")  # nosec B104
     port = int(os.getenv("MANOR_PORT", "8000"))
     reload = os.getenv("MANOR_RELOAD", "false").lower() in ("1", "true", "yes")
     workers = int(os.getenv("API_WORKERS") or os.getenv("MANOR_WORKERS", "1"))

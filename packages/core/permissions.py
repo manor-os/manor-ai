@@ -73,7 +73,8 @@ class Permission(str, Enum):
     # Integrations (OAuth connections, API keys)
     INTEGRATIONS_READ = "integrations.read"
     INTEGRATIONS_CONNECT = "integrations.connect"  # add a personal integration
-    INTEGRATIONS_MANAGE = "integrations.manage"    # manage entity-scope integrations
+    INTEGRATIONS_MANAGE = "integrations.manage"    # manage owned integrations
+    INTEGRATIONS_SHARE = "integrations.share"      # share owned integrations
 
     # MCP — agent-initiated access to integrations
     MCP_USE_PERSONAL = "mcp.use_personal"          # call any of the user's own MCPs via agents
@@ -118,6 +119,7 @@ ROLE_PERMISSIONS: dict[str, set[Permission]] = {
         Permission.ADMIN_AUDIT,
         Permission.CHAT_VIEW_ALL,
         Permission.INTEGRATIONS_MANAGE,
+        Permission.INTEGRATIONS_SHARE,
         Permission.MCP_QUICKBOOKS_USE,
         Permission.MCP_STRIPE_USE,
     },
@@ -188,6 +190,7 @@ async def user_has_permission(
                 Staff.user_id == user_id,
                 Staff.entity_id == entity_id,
                 Staff.status == "active",
+                Staff.deleted_at.is_(None),
             )
         )
     ).scalar_one_or_none()
@@ -195,8 +198,16 @@ async def user_has_permission(
     if not staff_row or not staff_row.role_id:
         return False
 
-    role = await db.get(StaffRole, staff_row.role_id)
-    if not role or role.status != "active":
+    role = (
+        await db.execute(
+            select(StaffRole).where(
+                StaffRole.id == staff_row.role_id,
+                StaffRole.entity_id == entity_id,
+                StaffRole.status == "active",
+            )
+        )
+    ).scalar_one_or_none()
+    if not role:
         return False
 
     return perm_value in (role.permissions or [])
@@ -207,35 +218,24 @@ async def effective_user_has_permission(
     user,
     permission: Permission | str,
 ) -> bool:
-    """Check permission using StaffRole when present, otherwise legacy role.
+    """Check permission using Staff authority, otherwise legacy role.
 
-    Invite-created team users should honor the editable StaffRole permission
-    set. Older owner/admin accounts may not have a linked Staff row yet, so
-    they keep the legacy ``User.role`` fallback.
+    Invite-created team users honor the editable StaffRole permission set.
+    Pre-StaffRole rows may use their Staff-owned metadata role. Only accounts
+    with no linked Staff row keep the legacy ``User.role`` fallback.
     """
-    from packages.core.models.staff import Staff, StaffRole
-
     entity_id = getattr(user, "entity_id", None)
     user_id = getattr(user, "id", None)
     perm_value = permission.value if isinstance(permission, Permission) else str(permission)
 
     if entity_id and user_id:
-        staff_row = (
-            await db.execute(
-                select(Staff).where(
-                    Staff.user_id == user_id,
-                    Staff.entity_id == entity_id,
-                    Staff.status == "active",
-                    Staff.deleted_at.is_(None),
-                )
-            )
-        ).scalar_one_or_none()
-
-        role_id = getattr(staff_row, "role_id", None)
-        if staff_row and role_id:
-            role = await db.get(StaffRole, role_id)
-            if role and role.entity_id == entity_id and role.status == "active":
-                return perm_value in (role.permissions or [])
+        has_staff_record, _, _, permissions = await user_staff_role_assignment(
+            db,
+            user_id,
+            entity_id,
+        )
+        if has_staff_record:
+            return perm_value in permissions
 
     return has_permission(getattr(user, "role", ""), permission)
 
@@ -251,37 +251,143 @@ async def check_effective_user_permission(
         raise HTTPException(403, f"Permission denied: {perm_value}")
 
 
+async def user_staff_role_assignment(
+    db: "AsyncSession",
+    user_id: str,
+    entity_id: str,
+) -> tuple[bool, str | None, str | None, list[str]]:
+    """Return the authoritative Staff assignment for one entity.
+
+    The first value reports whether any linked Staff row exists. Active Staff
+    supplies permissions; inactive or deleted Staff fails closed. Only users
+    with no linked Staff history may fall back to legacy ``User.role`` during
+    migration.
+    """
+    from packages.core.models.staff import Staff, StaffRole
+
+    staff_rows = list(
+        (
+            await db.execute(
+                select(Staff).where(
+                    Staff.user_id == user_id,
+                    Staff.entity_id == entity_id,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+    if not staff_rows:
+        return False, None, None, []
+    active_staff_rows = [
+        row
+        for row in staff_rows
+        if row.status == "active" and row.deleted_at is None
+    ]
+    if len(active_staff_rows) != 1:
+        return True, None, None, []
+    staff_row = active_staff_rows[0]
+    if not staff_row.role_id:
+        # Legacy Staff rows created before StaffRole seeding store their
+        # system role in metadata.  This is still Staff-owned authority, not
+        # a fallback to the independently mutable/stale User.role column.
+        legacy_role = str((staff_row.meta or {}).get("role") or "").strip().lower()
+        legacy_permissions = _get_role_permissions(legacy_role)
+        if legacy_role:
+            return (
+                True,
+                None,
+                legacy_role,
+                sorted(permission.value for permission in legacy_permissions),
+            )
+        return True, None, None, []
+
+    role = (
+        await db.execute(
+            select(StaffRole).where(
+                StaffRole.id == staff_row.role_id,
+                StaffRole.entity_id == entity_id,
+                StaffRole.status == "active",
+            )
+        )
+    ).scalar_one_or_none()
+    if not role:
+        return True, staff_row.role_id, None, []
+
+    return True, role.id, role.name, list(role.permissions or [])
+
+
 async def user_staff_role_summary(
     db: "AsyncSession",
     user_id: str,
     entity_id: str,
 ) -> tuple[str | None, str | None, list[str]]:
-    """Return the active StaffRole attached to a user in an entity.
+    """Return the configured StaffRole while preserving the legacy API shape."""
+    _, role_id, role_name, permissions = await user_staff_role_assignment(
+        db,
+        user_id,
+        entity_id,
+    )
+    return role_id, role_name, permissions
 
-    The tuple is ``(role_id, role_name, permissions)``. Empty values mean the
-    user has no active Staff/StaffRole link for that entity.
+
+async def resolve_effective_user_role_name(
+    db: "AsyncSession",
+    *,
+    user_id: str | None,
+    entity_id: str | None,
+    legacy_role: str | None = None,
+) -> str:
+    """Resolve one user's authoritative role inside a target entity.
+
+    Staff is authoritative whenever any linked Staff history exists. Without
+    Staff, an active entity membership wins over compatibility role values;
+    legacy User.role is used only for accounts not yet represented there.
     """
-    from packages.core.models.staff import Staff, StaffRole
+    if not user_id or not entity_id:
+        return (legacy_role or "").strip().lower()
 
-    staff_row = (
+    has_staff_record, _, assigned_role, _ = await user_staff_role_assignment(
+        db,
+        user_id,
+        entity_id,
+    )
+    if has_staff_record:
+        return (assigned_role or "").strip().lower()
+
+    from packages.core.models.user import User, UserMembership
+
+    membership = (
         await db.execute(
-            select(Staff).where(
-                Staff.user_id == user_id,
-                Staff.entity_id == entity_id,
-                Staff.status == "active",
-                Staff.deleted_at.is_(None),
+            select(
+                UserMembership.role,
+                UserMembership.status,
+                UserMembership.deleted_at,
+            ).where(
+                UserMembership.user_id == user_id,
+                UserMembership.entity_id == entity_id,
+            )
+        )
+    ).one_or_none()
+    if membership is not None:
+        membership_role, membership_status, membership_deleted_at = membership
+        if membership_status == "active" and membership_deleted_at is None:
+            return str(membership_role or "").strip().lower()
+        return ""
+    if legacy_role:
+        return legacy_role.strip().lower()
+
+    user_role = (
+        await db.execute(
+            select(User.role).where(
+                User.id == user_id,
+                User.entity_id == entity_id,
+                User.deleted_at.is_(None),
             )
         )
     ).scalar_one_or_none()
-
-    if not staff_row or not staff_row.role_id:
-        return None, None, []
-
-    role = await db.get(StaffRole, staff_row.role_id)
-    if not role or role.status != "active":
-        return staff_row.role_id, None, []
-
-    return role.id, role.name, list(role.permissions or [])
+    return str(user_role or "").strip().lower()
 
 
 async def user_effective_permission_keys(
@@ -290,11 +396,15 @@ async def user_effective_permission_keys(
     entity_id: str,
     legacy_role: str | None = None,
 ) -> set[str]:
-    """Union legacy ``User.role`` permissions with configured StaffRole keys."""
-    perms = {p.value for p in _get_role_permissions(legacy_role or "")}
-    _, _, staff_role_perms = await user_staff_role_summary(db, user_id, entity_id)
-    perms.update(str(p) for p in staff_role_perms)
-    return perms
+    """Return StaffRole keys, falling back only when no linked Staff exists."""
+    has_staff_record, _, _, staff_role_perms = await user_staff_role_assignment(
+        db,
+        user_id,
+        entity_id,
+    )
+    if has_staff_record:
+        return {str(permission) for permission in staff_role_perms}
+    return {permission.value for permission in _get_role_permissions(legacy_role or "")}
 
 
 async def user_has_effective_permission(
@@ -320,7 +430,7 @@ async def check_effective_permission(
     legacy_role: str | None,
     permission: Permission | str,
 ) -> None:
-    """Raise 403 unless legacy role or StaffRole grants the permission."""
+    """Raise 403 unless the authoritative effective role grants permission."""
     if not await user_has_effective_permission(
         db,
         user_id,
@@ -370,31 +480,43 @@ async def legacy_role_for_staff_role(
     return legacy_role_from_role_name(role.name, default=default)
 
 
-async def effective_user_role_name(db: "AsyncSession", user) -> str:
-    """Return the actor's effective role name, preferring StaffRole."""
-    from packages.core.models.staff import Staff, StaffRole
-
-    entity_id = getattr(user, "entity_id", None)
-    user_id = getattr(user, "id", None)
-
+async def assigned_staff_role_name(
+    db: "AsyncSession",
+    *,
+    user_id: str | None,
+    entity_id: str | None,
+) -> str | None:
+    """Return the active Staff-authoritative role name in one entity."""
     if entity_id and user_id:
-        staff_row = (
-            await db.execute(
-                select(Staff).where(
-                    Staff.user_id == user_id,
-                    Staff.entity_id == entity_id,
-                    Staff.status == "active",
-                    Staff.deleted_at.is_(None),
-                )
-            )
-        ).scalar_one_or_none()
-        role_id = getattr(staff_row, "role_id", None)
-        if staff_row and role_id:
-            role = await db.get(StaffRole, role_id)
-            if role and role.entity_id == entity_id and role.status == "active":
-                return (role.name or "").strip().lower()
+        _, _, role_name, _ = await user_staff_role_assignment(
+            db,
+            user_id,
+            entity_id,
+        )
+        if role_name:
+            return str(role_name).strip().lower()
 
-    return (getattr(user, "role", "") or "").strip().lower()
+    return None
+
+
+async def effective_user_role_name(db: "AsyncSession", user) -> str:
+    """Return StaffRole name, falling back only without a linked Staff row."""
+    return await resolve_effective_user_role_name(
+        db,
+        user_id=getattr(user, "id", None),
+        entity_id=getattr(user, "entity_id", None),
+        legacy_role=getattr(user, "role", None),
+    )
+
+
+async def user_is_effective_entity_admin(db: "AsyncSession", user) -> bool:
+    """Return whether the actor's effective role is an entity administrator.
+
+    A linked ``Staff`` assignment is authoritative when present. Inactive and
+    deleted Staff fail closed so stale ``User.role`` values cannot retain
+    administrator privileges after authority is revoked.
+    """
+    return await effective_user_role_name(db, user) in {"owner", "admin"}
 
 
 async def user_is_effective_owner(db: "AsyncSession", user) -> bool:

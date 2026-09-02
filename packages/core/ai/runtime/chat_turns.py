@@ -64,6 +64,8 @@ async def runtime_stream_chat_turn(
     channel_context: ChannelRuntimeContext | dict | None = None,
     runtime_metadata: dict | None = None,
     persist_messages: bool = True,
+    runtime_run_id: str | None = None,
+    runtime_checkpoint: dict | None = None,
 ) -> AsyncGenerator[str, None]:
     """Stream a chat turn through an explicit Runtime surface."""
 
@@ -89,5 +91,7 @@ async def runtime_stream_chat_turn(
         runtime_metadata=runtime_metadata,
         persist_messages=persist_messages,
         runtime_surface=resolved_surface,
+        runtime_run_id=runtime_run_id,
+        runtime_checkpoint=runtime_checkpoint,
     ):
         yield event

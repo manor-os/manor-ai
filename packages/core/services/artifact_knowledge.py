@@ -13,10 +13,14 @@ from urllib.parse import unquote, urlsplit
 
 from packages.core.services.entity_fs import get_entity_root
 from packages.core.services.generated_file_refs import (
+    ArtifactReferenceFactory,
+    ArtifactReferenceIdentity,
     canonical_file_markdown_link,
-    canonical_generated_file_ref,
 )
-from packages.core.services.knowledge_sync import sync_file_to_knowledge
+from packages.core.services.knowledge_sync import (
+    bind_document_to_workspace,
+    sync_file_to_knowledge,
+)
 
 
 @dataclass(frozen=True)
@@ -107,6 +111,98 @@ def _artifact_name(ref: dict[str, Any], rel_path: str | None, document_id: str) 
     return document_id
 
 
+@dataclass(frozen=True)
+class ArtifactDocumentResolution:
+    document_id: str = ""
+    failure_reason: str | None = None
+
+
+class ArtifactDocumentResolver:
+    """Resolve one artifact identity to a Document, with per-run caching."""
+
+    def __init__(
+        self,
+        *,
+        entity_id: str,
+        entity_root: str,
+        workspace_id: str | None,
+        task_id: str | None,
+        agent_id: str | None,
+        user_id: str | None,
+        tool_name: str,
+    ) -> None:
+        self.entity_id = entity_id
+        self.entity_root = entity_root
+        self.workspace_id = workspace_id
+        self.task_id = task_id
+        self.agent_id = agent_id
+        self.user_id = user_id
+        self.tool_name = tool_name
+        self._bind_cache: dict[str, str | None] = {}
+        self._sync_cache: dict[str, ArtifactDocumentResolution] = {}
+
+    async def resolve(
+        self,
+        identity: ArtifactReferenceIdentity,
+        rel_path: str | None,
+    ) -> ArtifactDocumentResolution:
+        if identity.document_id and self.workspace_id:
+            bound_document_id = await self._bind(identity.document_id)
+            if bound_document_id:
+                return ArtifactDocumentResolution(document_id=bound_document_id)
+
+        if identity.document_id and (not self.workspace_id or not rel_path):
+            return ArtifactDocumentResolution(document_id=identity.document_id)
+
+        if rel_path:
+            return await self._sync(rel_path)
+        return ArtifactDocumentResolution()
+
+    async def _bind(self, document_id: str) -> str | None:
+        if document_id not in self._bind_cache:
+            self._bind_cache[document_id] = await bind_document_to_workspace(
+                entity_id=self.entity_id,
+                document_id=document_id,
+                workspace_id=self.workspace_id,
+                task_id=self.task_id,
+                agent_id=self.agent_id,
+                user_id=self.user_id,
+                tool_name=self.tool_name,
+            )
+        return self._bind_cache[document_id]
+
+    async def _sync(self, rel_path: str) -> ArtifactDocumentResolution:
+        if rel_path in self._sync_cache:
+            return self._sync_cache[rel_path]
+
+        abs_path = os.path.realpath(os.path.join(self.entity_root, rel_path))
+        if not os.path.isfile(abs_path):
+            resolution = ArtifactDocumentResolution(failure_reason="not_file")
+        else:
+            sync = await sync_file_to_knowledge(
+                entity_id=self.entity_id,
+                abs_path=abs_path,
+                entity_root=self.entity_root,
+                source="agent",
+                created_by=self.user_id or self.agent_id or "ai-agent",
+                force=True,
+                workspace_id=self.workspace_id,
+                task_id=self.task_id,
+                agent_id=self.agent_id,
+                user_id=self.user_id,
+                tool_name=self.tool_name,
+            )
+            document_id = str(sync.document_id or "").strip()
+            resolution = ArtifactDocumentResolution(
+                document_id=document_id,
+                failure_reason=None if sync.synced and document_id else (
+                    sync.reason or "missing_document_id"
+                ),
+            )
+        self._sync_cache[rel_path] = resolution
+        return resolution
+
+
 async def project_artifact_refs_to_knowledge(
     *,
     entity_id: str,
@@ -120,60 +216,47 @@ async def project_artifact_refs_to_knowledge(
     """Return canonical refs and fail any claimed local file without a Document."""
 
     entity_root = get_entity_root(entity_id)
+    reference_factory = ArtifactReferenceFactory(entity_id=entity_id)
+    document_resolver = ArtifactDocumentResolver(
+        entity_id=entity_id,
+        entity_root=entity_root,
+        workspace_id=workspace_id,
+        task_id=task_id,
+        agent_id=agent_id,
+        user_id=user_id,
+        tool_name=tool_name,
+    )
     projected: list[dict[str, Any]] = []
     knowledge_artifacts: list[dict[str, Any]] = []
     failures: list[dict[str, str]] = []
-    sync_cache: dict[str, tuple[str | None, str | None]] = {}
     seen_documents: set[str] = set()
 
     for raw_ref in refs:
         if not isinstance(raw_ref, dict):
             continue
         ref = dict(raw_ref)
-        document_id = str(ref.get("document_id") or "").strip()
+        identity = reference_factory.inspect(ref)
         rel_path = _ref_local_path(
             ref,
             entity_id=entity_id,
             entity_root=entity_root,
         )
-
-        if not document_id and rel_path:
-            if rel_path not in sync_cache:
-                abs_path = os.path.realpath(os.path.join(entity_root, rel_path))
-                if not os.path.isfile(abs_path):
-                    sync_cache[rel_path] = (None, "not_file")
-                else:
-                    sync = await sync_file_to_knowledge(
-                        entity_id=entity_id,
-                        abs_path=abs_path,
-                        entity_root=entity_root,
-                        source="agent",
-                        created_by=user_id or agent_id or "ai-agent",
-                        force=True,
-                        workspace_id=workspace_id,
-                        task_id=task_id,
-                        agent_id=agent_id,
-                        user_id=user_id,
-                        tool_name=tool_name,
-                    )
-                    sync_cache[rel_path] = (
-                        str(sync.document_id or "").strip() or None,
-                        None if sync.synced and sync.document_id else (sync.reason or "missing_document_id"),
-                    )
-            document_id, reason = sync_cache[rel_path]
-            if not document_id:
-                failures.append({"fs_path": rel_path, "reason": reason or "sync_failed"})
+        resolution = await document_resolver.resolve(identity, rel_path)
+        document_id = resolution.document_id
+        if resolution.failure_reason and rel_path:
+            failures.append({"fs_path": rel_path, "reason": resolution.failure_reason})
 
         if document_id:
             ref["document_id"] = document_id
-            ref["viewer_url"] = f"/viewer/{document_id}"
             if rel_path:
                 ref["fs_path"] = rel_path
             name = _artifact_name(ref, rel_path, document_id)
             ref.setdefault("name", name)
+        canonical_ref = reference_factory.create(ref)
+        if document_id:
             if document_id not in seen_documents:
                 seen_documents.add(document_id)
-                viewer_url = f"/viewer/{document_id}"
+                viewer_url = canonical_ref["viewer_url"]
                 knowledge_artifacts.append({
                     "type": str(ref.get("type") or "file"),
                     "name": name,
@@ -182,7 +265,7 @@ async def project_artifact_refs_to_knowledge(
                     "markdown_link": canonical_file_markdown_link(name, viewer_url),
                     **({"fs_path": rel_path} if rel_path else {}),
                 })
-        projected.append(canonical_generated_file_ref(ref, entity_id=entity_id))
+        projected.append(canonical_ref)
 
     return ArtifactKnowledgeProjection(
         refs=projected,

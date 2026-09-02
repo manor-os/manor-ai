@@ -112,7 +112,8 @@ async def answer_task_blocker(
     for an answer (the user's answer IS the consumption; nothing
     downstream consumes a lease grant, and granted-unconsumed rows still
     count as live for dedup), deny for a refusal; (2) the waiting step is
-    mutated per its pending kind; (3) the plan is revived and re-enqueued.
+    mutated per its pending kind; (3) the plan is revived and returned to the
+    caller for post-commit dispatch.
 
     Caller commits.
     """
@@ -127,7 +128,7 @@ async def answer_task_blocker(
         select(HitlRequest).where(
             HitlRequest.id == request_id,
             HitlRequest.entity_id == entity_id,
-        )
+        ).with_for_update()
     )).scalar_one_or_none()
     if request is None:
         return {"resolved": False, "reason": "request_not_found"}
@@ -161,13 +162,19 @@ async def answer_task_blocker(
     display = user_display or user_id
 
     if refuse:
-        await deny_approval(db, request, by_user_id=user_id, via="chat_bridge")
-        await cancel_step(
+        plan_to_run = await cancel_step(
             db,
+            entity_id=entity_id,
             step_id=step_id,
             plan_id=plan_id,
+            workspace_id=request.workspace_id,
+            task_id=request.origin_task_id,
             reason=f"user declined via chat: {(answer or 'declined')[:200]}",
+            enqueue=False,
         )
+        if plan_to_run is None:
+            return {"resolved": False, "reason": "origin_no_longer_waiting"}
+        await deny_approval(db, request, by_user_id=user_id, via="chat_bridge")
         await _mark_blocker_card_resolved(
             db, request=request, user_id=user_id, choice="skip", note=answer,
         )
@@ -176,6 +183,7 @@ async def answer_task_blocker(
             "decision": "refused",
             "request_id": request.id,
             "task_id": request.origin_task_id,
+            "_plan_to_run": plan_to_run,
         }
 
     if pending_kind == KIND_NEEDS_LOGIN:
@@ -224,19 +232,23 @@ async def answer_task_blocker(
         # ignored by tools that don't recognize them.
         resume_kwargs["params_update"] = {"confirm": True, "confirm_destructive": True}
 
-    await grant_approval(db, request, by_user_id=user_id, via="chat_bridge")
-    # Spend it immediately: the user's answer IS the consumption (see the
-    # chat card resolve endpoint for the full rationale).
-    await consume_approval(db, request)
-
-    await resume_step_for_retry(
+    plan_to_run = await resume_step_for_retry(
         db,
         entity_id=entity_id,
         user_id=user_id,
         step_id=step_id,
         plan_id=plan_id,
+        workspace_id=request.workspace_id,
+        task_id=request.origin_task_id,
+        enqueue=False,
         **resume_kwargs,
     )
+    if plan_to_run is None:
+        return {"resolved": False, "reason": "origin_no_longer_waiting"}
+    await grant_approval(db, request, by_user_id=user_id, via="chat_bridge")
+    # Spend it immediately: the user's answer IS the consumption (see the
+    # chat card resolve endpoint for the full rationale).
+    await consume_approval(db, request)
     await _mark_blocker_card_resolved(
         db, request=request, user_id=user_id, choice="respond", note=answer,
     )
@@ -250,6 +262,7 @@ async def answer_task_blocker(
         "task_id": request.origin_task_id,
         "pending_kind": pending_kind,
         "resumed_step_id": step_id,
+        "_plan_to_run": plan_to_run,
     }
 
 

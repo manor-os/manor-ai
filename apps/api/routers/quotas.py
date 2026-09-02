@@ -19,6 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from packages.core.database import get_db
 from packages.core.models.user import User
+from packages.core.permissions import user_is_effective_entity_admin
 from packages.core.services.quota_service import (
     check_quota,
     get_usage_report,
@@ -113,7 +114,7 @@ async def update_entity_quota(
     db: AsyncSession = Depends(get_db),
 ):
     """Update quota limits (owner only)."""
-    if user.role not in ("owner", "admin"):
+    if not await user_is_effective_entity_admin(db, user):
         raise HTTPException(status_code=403, detail="Only owners and admins can update quotas")
 
     quota = await update_quota(db, user.entity_id, **req.model_dump(exclude_none=True))

@@ -23,8 +23,14 @@ during dev / CI.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
+import re
+from collections.abc import Awaitable, Callable
+from copy import deepcopy
+from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import Any, Optional
 
 from pydantic import ValidationError
@@ -32,12 +38,18 @@ from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from packages.core.ai.runtime import (
+    RuntimeResolvedBillingScope,
+    approval_args_hash,
+    approval_stable_target_hash,
+    approval_stable_target_payload,
     runtime_apply_action_binding_schemas_to_steps,
     runtime_capability_id_for_action_key,
     runtime_execute_planner_chat_turn,
     runtime_execute_planner_tool_call,
+    runtime_current_billing_context,
     runtime_planner_assistant_message,
     runtime_planner_action_specs_from_tools_cached,
+    runtime_planner_action_binding_for,
     runtime_planner_llm_billing_context,
     runtime_planner_system_prompt,
     runtime_planner_task_prompt,
@@ -45,14 +57,30 @@ from packages.core.ai.runtime import (
     runtime_planner_tool_message,
     runtime_planner_user_message,
 )
+from packages.core.ai.llm_client import (
+    CreditCheckUnavailableError,
+    CreditExhaustedError,
+)
+from packages.core.constants.task import TaskStatus, TaskType
 from packages.core.models.execution import ExecutionPlan
 from packages.core.models.task import Task
 from packages.core.models.workspace import Agent, AgentSubscription, Workspace
 from packages.core.plans.schema import Plan, PlanStep
+from packages.core.plans.refs import extract_step_refs
 from packages.core.plans.service import (
     PlanContractError,
+    bind_task_output_contract,
     create_plan_from_dag,
     plan_contract_gaps,
+    raise_for_active_task_plan,
+)
+from packages.core.services.integration_account_service import (
+    IntegrationAccountSelectionMode,
+)
+from packages.core.services.official_remote_mcp import MCPActionEffect
+from packages.core.services.workflow_run_execution_claim import (
+    commit_fenced_execution_boundary,
+    task_plan_execution_claim,
 )
 
 logger = logging.getLogger(__name__)
@@ -65,10 +93,197 @@ class PlannerError(Exception):
     """Planner couldn't produce a valid plan after retries."""
 
 
+class TaskPlanAdmissionError(PlannerError):
+    """The Task lifecycle does not allow background planning."""
+
+    def __init__(self, task_id: str, status: str | None, reason: str) -> None:
+        self.task_id = task_id
+        self.status = status
+        self.reason = reason
+        super().__init__(reason)
+
+
 class CapabilityError(Exception):
     """Planner produced a plan referencing capabilities not in the
     workspace's allowlists. Should never happen if the prompt was
     followed; we re-validate as a safety net."""
+
+
+class TaskPlanClaimHeldError(RuntimeError):
+    """Another live caller already owns billable planning for this Task."""
+
+    def __init__(self, task_id: str) -> None:
+        self.task_id = task_id
+        super().__init__(f"task {task_id} is already being planned")
+
+
+def task_plan_admission_error(task: Task) -> str | None:
+    """Return why this Task cannot enter the background Plan runtime."""
+    if getattr(task, "task_type", None) == TaskType.INTERACTIVE.value:
+        return "interactive tasks run through Task Session, not Plans"
+    status = getattr(task, "status", None)
+    if status != TaskStatus.IN_PROGRESS.value:
+        return (
+            f"task status {status!r} cannot start a new Plan; "
+            f"expected {TaskStatus.IN_PROGRESS.value!r}"
+        )
+    return None
+
+
+@dataclass(frozen=True)
+class _TaskPlanningScope:
+    entity_id: str
+    workspace_id: str | None
+
+
+async def _lock_task_planning_origin(
+    db: AsyncSession,
+    task_id: str,
+) -> tuple[Task, _TaskPlanningScope]:
+    """Lock Workspace -> Task and validate one planning admission snapshot."""
+    task_scope = (await db.execute(
+        select(Task.id, Task.entity_id, Task.workspace_id).where(Task.id == task_id)
+    )).one_or_none()
+    if task_scope is None:
+        raise PlannerError(f"task {task_id} not found")
+
+    scope = _TaskPlanningScope(
+        entity_id=str(task_scope.entity_id),
+        workspace_id=(
+            str(task_scope.workspace_id) if task_scope.workspace_id else None
+        ),
+    )
+    if scope.workspace_id:
+        from packages.core.services.workspace_access import (
+            lock_workspace_access_boundary,
+        )
+
+        workspace = await lock_workspace_access_boundary(
+            db,
+            workspace_id=scope.workspace_id,
+            entity_id=scope.entity_id,
+        )
+        if (
+            workspace is None
+            or workspace.deleted_at is not None
+            or workspace.status != "active"
+        ):
+            raise PlannerError("Workspace is not active for planning")
+
+    task = (await db.execute(
+        select(Task)
+        .where(Task.id == task_id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )).scalar_one_or_none()
+    if task is None or (
+        str(task.entity_id) != scope.entity_id
+        or (str(task.workspace_id) if task.workspace_id else None)
+        != scope.workspace_id
+    ):
+        raise PlannerError("Task scope changed during planning admission")
+    if admission_error := task_plan_admission_error(task):
+        raise TaskPlanAdmissionError(
+            task_id,
+            str(task.status) if task.status is not None else None,
+            admission_error,
+        )
+    await raise_for_active_task_plan(
+        db,
+        task_id=str(task.id),
+        entity_id=str(task.entity_id),
+    )
+    return task, scope
+
+
+async def _admit_task_without_holding_locks(
+    db: AsyncSession,
+    task_id: str,
+) -> _TaskPlanningScope:
+    """Validate admission under row locks, then release them before LLM I/O.
+
+    PostgreSQL releases row locks acquired after a savepoint when that
+    savepoint is rolled back. Lightweight test doubles do not implement nested
+    transactions, so they keep the old single-session behavior.
+    """
+    begin_nested = getattr(db, "begin_nested", None)
+    if not callable(begin_nested):
+        _task, scope = await _lock_task_planning_origin(db, task_id)
+        return scope
+
+    savepoint = await begin_nested()
+    try:
+        _task, scope = await _lock_task_planning_origin(db, task_id)
+        return scope
+    finally:
+        if savepoint.is_active:
+            await savepoint.rollback()
+
+
+def _planning_task_values(task: Task) -> dict[str, Any]:
+    """Copy the canonical persisted Task input set used by planning guards."""
+    return {
+        column.key: deepcopy(getattr(task, column.key, None))
+        for column in Task.__table__.columns
+    }
+
+
+def _planning_task_snapshot(task: Task, *, details: dict | None = None) -> Any:
+    """Detach the provider prompt from the live ORM row.
+
+    Contract-gap guidance must be visible to a second Planner attempt, but it
+    must not dirty or autoflush the Task while generation runs without locks.
+    """
+    values = _planning_task_values(task)
+    if details is not None:
+        values["details"] = deepcopy(details)
+    return SimpleNamespace(**values)
+
+
+def _planning_task_fingerprint(task: Task) -> str:
+    """Fingerprint every persisted Task input that can shape a Plan.
+
+    Planning intentionally releases lifecycle locks during provider I/O.  A
+    full Task-column fingerprint lets the final locked section reject a result
+    generated from stale title, contracts, ownership, or governance details
+    instead of trying to guess which fields matter to every current and future
+    prompt/context builder.
+    """
+    payload = json.dumps(
+        _planning_task_values(task),
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+async def _assert_workspace_setup_allows_planning(
+    db: AsyncSession,
+    context,
+) -> None:
+    context_workspace = getattr(context, "workspace", None)
+    if context_workspace is None:
+        return
+
+    from packages.core.services.workspace_readiness import (
+        evaluate_current_workspace_blocking_setup,
+    )
+
+    setup_status = await evaluate_current_workspace_blocking_setup(
+        db,
+        workspace_id=str(context_workspace.id),
+        entity_id=(
+            str(context_workspace.entity_id)
+            if getattr(context_workspace, "entity_id", None)
+            else None
+        ),
+    )
+    if setup_status is not None and setup_status.blocks_work:
+        raise PlannerError(
+            "Workspace setup is incomplete; automated setup must run through "
+            "the Blueprint's authorized setup job before Tasks may be planned"
+        )
 
 
 # ── Public entry point ────────────────────────────────────────────────
@@ -78,6 +293,9 @@ async def plan_task(
     task_id: str,
     *,
     execution_mode: Optional[str] = None,
+    before_provider: (
+        Callable[[], Awaitable[RuntimeResolvedBillingScope | None]] | None
+    ) = None,
 ) -> ExecutionPlan:
     """Generate + persist a Plan for ``task_id``. Raises if the task
     doesn't exist or the Planner can't produce a valid plan.
@@ -86,13 +304,33 @@ async def plan_task(
     for — sandbox workspaces get ``sandbox`` automatically, regular
     workspaces get ``live``. Callers can still force a specific mode
     (eg. UI "Run as dry-run preview" button)."""
-    task = (await db.execute(
-        select(Task).where(Task.id == task_id)
-    )).scalar_one_or_none()
-    if not task:
-        raise PlannerError(f"task {task_id} not found")
+    requested_execution_mode = execution_mode
+    task_scope = await _admit_task_without_holding_locks(db, task_id)
 
+    # Reload after rolling back the admission savepoint: ORM state loaded in a
+    # rolled-back savepoint may be expired, and no live row should be handed to
+    # provider code while another transaction is free to update it.
+    task = (await db.execute(
+        select(Task)
+        .where(Task.id == task_id, Task.entity_id == task_scope.entity_id)
+        .execution_options(populate_existing=True)
+    )).scalar_one_or_none()
+    if task is None or (
+        (str(task.workspace_id) if task.workspace_id else None)
+        != task_scope.workspace_id
+    ):
+        raise PlannerError("Task scope changed before planning")
+    if admission_error := task_plan_admission_error(task):
+        raise TaskPlanAdmissionError(
+            task_id,
+            str(task.status) if task.status is not None else None,
+            admission_error,
+        )
+
+    planning_task_fingerprint = _planning_task_fingerprint(task)
     context = await _gather_context(db, task)
+    await _assert_workspace_setup_allows_planning(db, context)
+    planning_task = _planning_task_snapshot(task)
 
     if execution_mode is None:
         from packages.core.workspaces import default_execution_mode
@@ -101,19 +339,47 @@ async def plan_task(
             if context.workspace else "live"
         )
 
+    billing_scope = await before_provider() if before_provider is not None else None
+    if billing_scope is None:
+        current_billing = runtime_current_billing_context()
+        if current_billing is not None and str(
+            getattr(current_billing, "entity_id", "")
+        ) == str(planning_task.entity_id):
+            billing_scope = RuntimeResolvedBillingScope(
+                entity_id=str(planning_task.entity_id),
+                workspace_id=(
+                    str(planning_task.workspace_id)
+                    if planning_task.workspace_id
+                    else None
+                ),
+                user_id=getattr(current_billing, "user_id", None),
+                byok=bool(getattr(current_billing, "byok", False)),
+            )
+    # Commit read state plus any billing preflight before provider I/O. Manor
+    # sessions use expire_on_commit=False, so the immutable prompt snapshot and
+    # loaded context remain usable without reopening this transaction.
+    await db.commit()
+
     async with runtime_planner_llm_billing_context(
-        entity_id=task.entity_id,
-        workspace_id=task.workspace_id,
+        entity_id=planning_task.entity_id,
+        workspace_id=planning_task.workspace_id,
+        billing_scope=billing_scope,
     ):
-        plan = await _generate_plan(task, context)
+        plan = await _generate_plan(planning_task, context)
+    plan = _apply_replan_approval_constraints(planning_task, plan)
+    plan = bind_task_output_contract(
+        plan,
+        getattr(planning_task, "expected_output", None),
+    )
     _enforce_allowlists(plan, context)
 
     gaps = plan_contract_gaps(
         plan.topo_order(),
-        task_expected_output=getattr(task, "expected_output", None),
+        task_expected_output=getattr(planning_task, "expected_output", None),
         require_explicit_agent_outputs=True,
     )
-    required_step_errors = _required_plan_step_errors(task, plan)
+    required_step_errors = _required_plan_step_errors(planning_task, plan)
+    generated_replan_updates: dict[str, Any] | None = None
     if gaps or required_step_errors:
         # Re-plan once, feeding the gaps back to the Planner via task.details
         # (the prompt dumps Details JSON, so _replan_context reaches the LLM).
@@ -121,28 +387,47 @@ async def plan_task(
         # (executor._maybe_replan) may have populated prior_plan_id /
         # succeeded_steps / failed_steps that lineage (_replan_parent_plan_id)
         # and the minimal-replan guidance depend on; don't clobber them.
-        existing_ctx = (task.details or {}).get("_replan_context")
+        existing_ctx = (planning_task.details or {}).get("_replan_context")
         replan_ctx = dict(existing_ctx) if isinstance(existing_ctx, dict) else {}
-        replan_ctx.setdefault("reason", "contract_gaps" if gaps else "required_plan_steps")
+        generated_replan_updates = {}
+        if "reason" not in replan_ctx:
+            generated_replan_updates["reason"] = (
+                "contract_gaps" if gaps else "required_plan_steps"
+            )
         if gaps:
-            replan_ctx["contract_gaps"] = "; ".join(
+            generated_replan_updates["contract_gaps"] = "; ".join(
                 f"{g.step_key}: {g.detail}" for g in gaps
             )
         if required_step_errors:
-            replan_ctx["required_plan_step_errors"] = required_step_errors
-        task.details = {**(task.details or {}), "_replan_context": replan_ctx}
+            generated_replan_updates["required_plan_step_errors"] = (
+                required_step_errors
+            )
+        replan_ctx.update(generated_replan_updates)
+        planning_task = _planning_task_snapshot(
+            task,
+            details={
+                **(planning_task.details or {}),
+                "_replan_context": replan_ctx,
+            },
+        )
         async with runtime_planner_llm_billing_context(
-            entity_id=task.entity_id,
-            workspace_id=task.workspace_id,
+            entity_id=planning_task.entity_id,
+            workspace_id=planning_task.workspace_id,
+            billing_scope=billing_scope,
         ):
-            plan = await _generate_plan(task, context)
+            plan = await _generate_plan(planning_task, context)
+        plan = _apply_replan_approval_constraints(planning_task, plan)
+        plan = bind_task_output_contract(
+            plan,
+            getattr(planning_task, "expected_output", None),
+        )
         _enforce_allowlists(plan, context)
         gaps = plan_contract_gaps(
             plan.topo_order(),
-            task_expected_output=getattr(task, "expected_output", None),
+            task_expected_output=getattr(planning_task, "expected_output", None),
             require_explicit_agent_outputs=True,
         )
-        required_step_errors = _required_plan_step_errors(task, plan)
+        required_step_errors = _required_plan_step_errors(planning_task, plan)
         if gaps or required_step_errors:
             if required_step_errors and not gaps:
                 raise PlannerError(
@@ -150,6 +435,54 @@ async def plan_task(
                     + "; ".join(required_step_errors)
                 )
             raise PlanContractError(gaps)
+
+    # Provider work runs without lifecycle locks. Reacquire Workspace -> Task,
+    # then rebuild every mutable authorization/contract input immediately
+    # before persistence. No provider I/O occurs in this final critical section.
+    task, final_scope = await _lock_task_planning_origin(db, task_id)
+    if final_scope != task_scope:
+        raise PlannerError("Task scope changed while planning")
+    if _planning_task_fingerprint(task) != planning_task_fingerprint:
+        raise PlannerError("Task planning inputs changed while planning; retry planning")
+    if generated_replan_updates is not None:
+        latest_details = task.details if isinstance(task.details, dict) else {}
+        latest_context = latest_details.get("_replan_context")
+        merged_context = (
+            dict(latest_context) if isinstance(latest_context, dict) else {}
+        )
+        # Only merge the contract diagnostics generated by this Planner turn.
+        # Never copy the stale prompt snapshot's approval or Plan-lineage
+        # fields back over the freshly locked Task.
+        merged_context.update(generated_replan_updates)
+        task.details = {
+            **latest_details,
+            "_replan_context": merged_context,
+        }
+
+    final_context = await _gather_context(db, task)
+    await _assert_workspace_setup_allows_planning(db, final_context)
+    plan = _apply_replan_approval_constraints(task, plan)
+    plan = bind_task_output_contract(plan, getattr(task, "expected_output", None))
+    _enforce_allowlists(plan, final_context)
+    final_gaps = plan_contract_gaps(
+        plan.topo_order(),
+        task_expected_output=getattr(task, "expected_output", None),
+        require_explicit_agent_outputs=True,
+    )
+    final_required_step_errors = _required_plan_step_errors(task, plan)
+    if final_gaps or final_required_step_errors:
+        if final_required_step_errors and not final_gaps:
+            raise PlannerError(
+                "required plan steps changed while planning: "
+                + "; ".join(final_required_step_errors)
+            )
+        raise PlanContractError(final_gaps)
+    if requested_execution_mode is None:
+        from packages.core.workspaces import default_execution_mode
+        execution_mode = (
+            default_execution_mode(final_context.workspace)
+            if final_context.workspace else "live"
+        )
 
     return await create_plan_from_dag(
         db,
@@ -161,7 +494,46 @@ async def plan_task(
         planner_version=PLANNER_VERSION,
         parent_plan_id=_replan_parent_plan_id(task),
         execution_mode=execution_mode,
+        enforce_contract=True,
     )
+
+
+async def plan_task_and_commit(
+    db: AsyncSession,
+    task_id: str,
+    *,
+    execution_mode: Optional[str] = None,
+    before_provider: (
+        Callable[[], Awaitable[RuntimeResolvedBillingScope | None]] | None
+    ) = None,
+    before_commit: Callable[[ExecutionPlan], Awaitable[None]] | None = None,
+) -> ExecutionPlan:
+    """Single-flight one billable planning turn through its durable commit.
+
+    The renewable claim prevents API and worker entrypoints from running the
+    provider concurrently. The final claim-token fence and Plan commit share
+    the caller's transaction, so an expired owner cannot persist after a
+    successor acquires the Task planning lease.
+    """
+
+    async with task_plan_execution_claim(task_id) as claim:
+        if not claim:
+            raise TaskPlanClaimHeldError(task_id)
+        plan = await plan_task(
+            db,
+            task_id,
+            execution_mode=execution_mode,
+            before_provider=before_provider,
+        )
+        if before_commit is not None:
+            await before_commit(plan)
+        await commit_fenced_execution_boundary(
+            db.commit,
+            execution_claim=claim,
+            session=db,
+            after_commit=claim.mark_terminal_committed,
+        )
+        return plan
 
 
 def _replan_parent_plan_id(task: Task) -> str | None:
@@ -174,6 +546,97 @@ def _replan_parent_plan_id(task: Task) -> str | None:
     if isinstance(prior_plan_id, str) and prior_plan_id.strip():
         return prior_plan_id.strip()
     return None
+
+
+def _apply_replan_approval_constraints(task: Task, plan: Plan) -> Plan:
+    """Keep a human decision attached to the same replacement operation.
+
+    Planner-authored ``requires_approval`` is intentionally normalized away:
+    policy, not an LLM, owns approval rules.  A constraint written after a
+    human denied an operation or requested changes is different — it is the
+    user's decision boundary. If the replacement plan keeps the same step key,
+    or keeps the same concrete subject, integration, and stable target, it must
+    return for approval/review rather than running because revised copy changed
+    the full parameter payload and the planner omitted the flag.
+
+    A genuinely different alternative (different key and subject) is not
+    force-gated here; normal Workspace policy still applies to it.
+    """
+
+    details = task.details if isinstance(task.details, dict) else {}
+    context = details.get("_replan_context")
+    if not isinstance(context, dict):
+        return plan
+    raw_constraints = context.get("approval_constraints")
+    if not isinstance(raw_constraints, list) or not raw_constraints:
+        return plan
+
+    constraints = [row for row in raw_constraints if isinstance(row, dict)]
+    if not constraints:
+        return plan
+
+    changed = False
+    steps: list[PlanStep] = []
+    for step in plan.steps:
+        matched = False
+        for constraint in constraints:
+            same_key = bool(
+                constraint.get("step_key")
+                and str(constraint["step_key"]) == step.key
+            )
+            constraint_action = constraint.get("action_key")
+            constraint_capability = constraint.get("capability_id")
+            if constraint_action:
+                same_subject = constraint_action == step.action_key
+            elif constraint_capability:
+                same_subject = constraint_capability == step.capability_id
+            else:
+                same_subject = constraint.get("kind") == step.kind
+            same_provider = not constraint.get("provider") or (
+                constraint.get("provider") == step.provider
+            )
+            same_integration = not constraint.get("integration_id") or (
+                constraint.get("integration_id") == step.integration_id
+            )
+            target_fingerprint = constraint.get("target_fingerprint")
+            if target_fingerprint:
+                same_target = (
+                    target_fingerprint
+                    == approval_stable_target_hash(step.params or {})
+                )
+                if not same_target:
+                    # Replacement Plans are inspected before their refs are
+                    # resolved. If a routing/target field is dynamic, the
+                    # planner cannot prove that it differs from the operation
+                    # the user denied or sent back for revision. Keep it gated
+                    # until execution has concrete arguments. Refs confined to
+                    # mutable review content (prompt/body/caption/etc.) were
+                    # removed by approval_stable_target_payload and do not
+                    # trigger this fail-closed path.
+                    same_target = bool(extract_step_refs(
+                        approval_stable_target_payload(step.params or {})
+                    ))
+            else:
+                # Compatibility for replan contexts written before the stable
+                # target fingerprint was introduced.
+                same_target = bool(
+                    constraint.get("params_fingerprint")
+                    and constraint.get("params_fingerprint")
+                    == approval_args_hash(step.params or {})
+                )
+            if same_key or (
+                same_subject and same_provider and same_integration and same_target
+            ):
+                matched = True
+                break
+        if matched and not step.requires_approval:
+            step = step.model_copy(update={"requires_approval": True})
+            changed = True
+        steps.append(step)
+
+    if not changed:
+        return plan
+    return Plan(steps=steps, metadata=plan.metadata)
 
 
 # ── Context gathering ─────────────────────────────────────────────────
@@ -260,10 +723,26 @@ async def _gather_context(db: AsyncSession, task: Task) -> _Context:
     # Provider/action map — derived from agent_mcp_bindings + mcp_servers.
     # Keep both a per-service scope for routing correctness and a union for
     # backward-compatible planner prompt summaries.
+    from packages.core.services.task_requester_identity import (
+        TaskRequesterIdentityError,
+        resolve_task_execution_user_id,
+    )
+
+    try:
+        actor_user_id = await resolve_task_execution_user_id(db, task)
+    except TaskRequesterIdentityError:
+        logger.info(
+            "Planner task %s has no executable user; account MCP catalogs are unavailable",
+            task.id,
+        )
+        actor_user_id = None
+
     service_provider_actions, service_provider_action_specs = await _compute_service_provider_actions(
         db,
         subscriptions=subs,
         agents_by_id=agents_by_id,
+        actor_user_id=actor_user_id,
+        entity_id=task.entity_id,
     )
     provider_actions = _union_provider_actions(service_provider_actions)
     provider_action_specs = _union_provider_action_specs(service_provider_action_specs)
@@ -285,8 +764,8 @@ async def _gather_context(db: AsyncSession, task: Task) -> _Context:
         staff_list = [{"staff_id": s.staff_id, "role": s.role} for s in staff_rows]
 
     # Per-agent platform tool bindings + skill bindings — so the Planner
-    # knows each agent's capabilities beyond MCP actions (e.g. write_file,
-    # generate_document_file, invoke_skill, web_search).
+    # knows each agent's capabilities beyond MCP actions (e.g. generate_file,
+    # patch_file, invoke_skill, web_search).
     agent_tool_names: dict[str, list[str]] = {}
     agent_skill_names: dict[str, list[dict]] = {}
     if agent_ids:
@@ -343,6 +822,8 @@ async def _compute_service_provider_actions(
     *,
     subscriptions: list[AgentSubscription],
     agents_by_id: dict[str, Agent],
+    actor_user_id: str | None,
+    entity_id: str,
 ) -> tuple[
     dict[str, dict[str, list[str]]],
     dict[str, dict[str, dict[str, dict[str, Any]]]],
@@ -384,6 +865,30 @@ async def _compute_service_provider_actions(
             )
         )).scalars().all()
     }
+    from packages.core.services.mcp_account_tool_catalog import (
+        actor_provider_mcp_tool_caches,
+    )
+    from packages.core.services.official_remote_mcp import OfficialRemoteMCPProvider
+
+    official_providers = {item.value for item in OfficialRemoteMCPProvider}
+    provider_endpoints = {
+        server.server_key: server.endpoint
+        for server in servers.values()
+        if server.server_key in official_providers and server.endpoint
+    }
+    try:
+        discovered_tool_caches = await actor_provider_mcp_tool_caches(
+            db,
+            provider_endpoints=provider_endpoints,
+            user_id=str(actor_user_id or ""),
+            entity_id=entity_id,
+        )
+    except Exception:
+        logger.warning(
+            "Planner could not load actor-scoped MCP account catalogs; using server fallback",
+            exc_info=True,
+        )
+        discovered_tool_caches = {}
 
     out: dict[str, dict[str, list[str]]] = {}
     spec_out: dict[str, dict[str, dict[str, dict[str, Any]]]] = {}
@@ -391,7 +896,9 @@ async def _compute_service_provider_actions(
         srv = servers.get(b.mcp_server_id)
         if not srv:
             continue
-        tool_specs = runtime_planner_action_specs_from_tools_cached(srv.tools_cached or [])
+        tool_specs = runtime_planner_action_specs_from_tools_cached(
+            discovered_tool_caches.get(srv.server_key) or srv.tools_cached or []
+        )
         all_tool_names = list(tool_specs)
         configured_allowed = b.allowed_tools if b.allowed_tools is not None else srv.default_allowed_tools
         if configured_allowed is not None:
@@ -424,13 +931,39 @@ async def _compute_service_provider_actions(
                 )
             )).scalars().all()
         }
+        missing_discovery_providers = set(direct_servers) - set(discovered_tool_caches)
+        if missing_discovery_providers:
+            missing_endpoints = {
+                provider: direct_servers[provider].endpoint
+                for provider in missing_discovery_providers
+                if (
+                    provider in official_providers
+                    and direct_servers[provider].endpoint
+                )
+            }
+            try:
+                discovered_tool_caches.update(
+                    await actor_provider_mcp_tool_caches(
+                        db,
+                        provider_endpoints=missing_endpoints,
+                        user_id=str(actor_user_id or ""),
+                        entity_id=entity_id,
+                    )
+                )
+            except Exception:
+                logger.warning(
+                    "Planner could not load direct actor MCP catalogs; using server fallback",
+                    exc_info=True,
+                )
         for agent_id, service_keys in service_keys_by_agent.items():
             direct_actions = await resolve_agent_direct_mcp_actions(db, agent_id)
             for provider, actions in direct_actions.items():
                 srv = direct_servers.get(provider)
                 if not srv:
                     continue
-                tool_specs = runtime_planner_action_specs_from_tools_cached(srv.tools_cached or [])
+                tool_specs = runtime_planner_action_specs_from_tools_cached(
+                    discovered_tool_caches.get(srv.server_key) or srv.tools_cached or []
+                )
                 allowed = [action for action in sorted(actions) if action in tool_specs]
                 if not allowed:
                     continue
@@ -509,6 +1042,8 @@ async def _generate_plan(task: Task, ctx: _Context) -> Plan:
                 entity_id=getattr(task, "entity_id", None),
                 workspace_id=getattr(task, "workspace_id", None),
             )
+        except (CreditExhaustedError, CreditCheckUnavailableError):
+            raise
         except Exception as exc:
             logger.warning("Planner LLM call failed on turn %d: %s", turn, exc)
             if turn == 0:
@@ -591,44 +1126,215 @@ _EXPLICIT_SAVED_ARTIFACT_TERMS = (
 
 def _normalize_plan_for_task(task: Task, plan: Plan) -> Plan:
     """Normalize planner overreach before materializing executable steps."""
+    plan = _normalize_required_skill_steps(task, plan)
     plan = _normalize_internal_agent_high_risk_steps(plan)
     plan = _normalize_planner_hard_approval_steps(plan)
-    if not _task_requests_text_report_only(task):
+    if _task_requests_text_report_only(task):
+        depended_on = {dep for step in plan.steps for dep in step.depends_on}
+        removable_keys = {
+            step.key
+            for step in plan.steps
+            if step.key not in depended_on
+            and _is_unrequested_text_report_file_write_step(step)
+        }
+        if removable_keys and len(removable_keys) < len(plan.steps):
+            metadata = plan.metadata.model_dump()
+            contract = metadata.get("acceptance_contract")
+            if isinstance(contract, dict):
+                for criterion in contract.get("criteria") or []:
+                    if isinstance(criterion, dict):
+                        criterion["evidence_step_keys"] = [
+                            key for key in criterion.get("evidence_step_keys") or []
+                            if key not in removable_keys
+                        ]
+                if any(
+                    not criterion.get("evidence_step_keys")
+                    for criterion in contract.get("criteria") or []
+                    if isinstance(criterion, dict)
+                ):
+                    metadata["acceptance_contract"] = None
+            plan = Plan.model_validate({
+                "steps": [
+                    step.model_dump()
+                    for step in plan.steps
+                    if step.key not in removable_keys
+                ],
+                "metadata": metadata,
+            })
+            try:
+                plan.metadata.normalized_removed_steps = sorted(removable_keys)
+                plan.metadata.normalization_reason = "unrequested_text_report_file_write"
+            except Exception:
+                pass
+
+    plan = _normalize_planner_acceptance_contract(plan, task)
+    _enforce_planner_acceptance_contract(plan, task)
+    return plan
+
+
+def _normalize_required_skill_steps(task: Task, plan: Plan) -> Plan:
+    """Bind required owner-service Skills to executable subagent steps."""
+    required_skills = [
+        str(value).strip()
+        for value in (getattr(task, "required_skills", None) or [])
+        if str(value or "").strip()
+    ]
+    owner_service_key = str(
+        getattr(task, "owner_service_key", "") or ""
+    ).strip()
+    if not required_skills or not owner_service_key:
         return plan
 
-    depended_on = {dep for step in plan.steps for dep in step.depends_on}
-    removable_keys = {
-        step.key
-        for step in plan.steps
-        if step.key not in depended_on
-        and _is_unrequested_text_report_file_write_step(step)
-    }
-    if not removable_keys or len(removable_keys) >= len(plan.steps):
+    changed: list[str] = []
+    steps: list[PlanStep] = []
+    for step in plan.steps:
+        if (
+            step.service_key == owner_service_key
+            and step.kind in {"llm", "subagent"}
+        ):
+            params = deepcopy(step.params)
+            params["skill_refs"] = list(dict.fromkeys([
+                *list(params.get("skill_refs") or []),
+                *required_skills,
+            ]))
+            steps.append(step.model_copy(update={
+                "kind": "subagent",
+                "params": params,
+            }))
+            changed.append(step.key)
+        else:
+            steps.append(step)
+    if not changed:
         return plan
-
-    normalized = Plan(
-        steps=[step for step in plan.steps if step.key not in removable_keys],
-        metadata=plan.metadata,
-    )
-    try:
-        normalized.metadata.normalized_removed_steps = sorted(removable_keys)
-        normalized.metadata.normalization_reason = "unrequested_text_report_file_write"
-    except Exception:
-        pass
+    normalized = Plan(steps=steps, metadata=plan.metadata)
+    normalized.metadata.normalized_required_skill_steps = changed
     return normalized
+
+
+def _task_acceptance_deliverables(task: Task) -> list[dict[str, Any]]:
+    expected_output = getattr(task, "expected_output", None)
+    if not isinstance(expected_output, dict):
+        return []
+    return [
+        item for item in (expected_output.get("deliverables") or [])
+        if isinstance(item, dict) and str(item.get("name") or "").strip()
+    ]
+
+
+def _acceptance_evidence_step_key(
+    deliverable_name: str,
+    steps: list[PlanStep],
+) -> str:
+    """Choose the narrowest step whose authored intent names a deliverable."""
+    needle = deliverable_name.strip().lower().replace("-", "_").replace(" ", "_")
+    for step in reversed(steps):
+        searchable = " ".join((
+            step.key,
+            str(step.description or ""),
+            str(step.params.get("prompt") or ""),
+        )).lower().replace("-", "_").replace(" ", "_")
+        if needle and needle in searchable:
+            return step.key
+    return steps[-1].key
+
+
+def _fallback_acceptance_contract(task: Task, plan: Plan) -> dict[str, Any] | None:
+    deliverables = _task_acceptance_deliverables(task)
+    if not deliverables:
+        return None
+    criteria = []
+    used_keys: set[str] = set()
+    for index, deliverable in enumerate(deliverables, 1):
+        name = str(deliverable["name"]).strip()
+        base_key = re.sub(r"[^a-z0-9]+", "_", name.lower()).strip("_") or f"deliverable_{index}"
+        key = f"{base_key}_accepted"
+        if key in used_keys:
+            key = f"{key}_{index}"
+        used_keys.add(key)
+        criteria.append({
+            "key": key,
+            "deliverable_name": name,
+            "description": str(
+                deliverable.get("acceptance")
+                or f"The {name} deliverable is produced."
+            ).strip(),
+            "evidence_step_keys": [
+                _acceptance_evidence_step_key(name, plan.steps)
+            ],
+        })
+    return {
+        "expected_result": str(
+            getattr(task, "description", None)
+            or getattr(task, "title", None)
+            or "The task deliverables are produced."
+        ).strip(),
+        "criteria": criteria,
+    }
+
+
+def _normalize_planner_acceptance_contract(task_plan: Plan, task: Task) -> Plan:
+    contract = task_plan.metadata.acceptance_contract
+    contract_payload = (
+        contract.model_dump() if contract is not None
+        else _fallback_acceptance_contract(task, task_plan)
+    )
+    if contract_payload is None:
+        return task_plan
+    expected_output = getattr(task, "expected_output", None)
+    contract_payload["task_expected_output"] = (
+        deepcopy(expected_output) if isinstance(expected_output, dict) else None
+    )
+    payload = task_plan.model_dump()
+    payload.setdefault("metadata", {})["acceptance_contract"] = contract_payload
+    return Plan.model_validate(payload)
+
+
+def _enforce_planner_acceptance_contract(plan: Plan, task: Task) -> None:
+    """Require each named Task deliverable to have one acceptance criterion."""
+    deliverable_names = [
+        str(item["name"]).strip() for item in _task_acceptance_deliverables(task)
+    ]
+    if not deliverable_names:
+        return
+    contract = plan.metadata.acceptance_contract
+    if contract is None:
+        raise PlannerError("plan is missing the required acceptance contract")
+    criterion_names = [criterion.deliverable_name for criterion in contract.criteria]
+    missing = [name for name in deliverable_names if criterion_names.count(name) == 0]
+    duplicates = [name for name in deliverable_names if criterion_names.count(name) > 1]
+    if missing:
+        raise PlannerError(
+            "acceptance contract is missing required criteria for: "
+            + ", ".join(missing)
+        )
+    if duplicates:
+        raise PlannerError(
+            "acceptance contract has duplicate criteria for: "
+            + ", ".join(duplicates)
+        )
 
 
 def _required_plan_step_errors(task: Task, plan: Plan) -> list[str]:
     """Return violations of an explicit task-level ExecutionPlan contract."""
     from packages.core.plans.refs import extract_step_refs
+    from packages.core.plans.task_constraints import (
+        binding_constraints_forbid_artifact_writes,
+        plan_step_requires_artifact_write,
+    )
 
     details = task.details if isinstance(task.details, dict) else {}
+    errors: list[str] = []
+    if binding_constraints_forbid_artifact_writes(details):
+        errors.extend(
+            f"step {step.key!r} requires a saved artifact but USER CONSTRAINTS prohibit file/artifact writes"
+            for step in plan.steps
+            if plan_step_requires_artifact_write(step)
+        )
     required_steps = details.get("required_plan_steps")
     if not isinstance(required_steps, list):
-        return []
+        return errors
 
     by_key = {step.key: step for step in plan.steps}
-    errors: list[str] = []
     for raw in required_steps:
         if not isinstance(raw, dict):
             continue
@@ -843,8 +1549,9 @@ def _enforce_allowlists(plan: Plan, ctx: _Context) -> None:
         if s.kind == "action":
             provider_actions = _ctx_provider_actions_for_step(ctx, s.service_key)
             provider_action_specs = _ctx_provider_action_specs_for_step(ctx, s.service_key)
-            runtime_apply_action_binding_schemas_to_steps(
-                [s],
+            binding = runtime_planner_action_binding_for(
+                provider=str(s.provider or ""),
+                action_key=str(s.action_key or ""),
                 provider_actions=provider_actions,
                 provider_action_specs=provider_action_specs,
             )
@@ -860,6 +1567,64 @@ def _enforce_allowlists(plan: Plan, ctx: _Context) -> None:
                     f"allowed actions for service_key={s.service_key!r} "
                     f"provider {s.provider}: {available}"
                 )
+            try:
+                account_selection_mode = IntegrationAccountSelectionMode.resolve(
+                    selector=s.integration_id,
+                    requested=(s.params or {}).get(
+                        "integration_account_selection"
+                    ),
+                )
+            except ValueError as exc:
+                raise CapabilityError(f"step {s.key}: {exc}") from exc
+            all_accounts = (
+                account_selection_mode is IntegrationAccountSelectionMode.ALL
+            )
+            if all_accounts and (
+                binding is None
+                or binding.effect is not MCPActionEffect.READ
+            ):
+                raise CapabilityError(
+                    f"step {s.key}: all-account execution is restricted to "
+                    "actions declared read-only"
+                )
+            if all_accounts and binding is not None and not binding.supports_all_accounts:
+                raise CapabilityError(
+                    f"step {s.key}: all-account execution requires compatible account contracts"
+                )
+            if all_accounts and binding is not None and binding.requires_explicit_account:
+                raise CapabilityError(
+                    f"step {s.key}: {s.provider}.{s.action_key} requires an exact "
+                    "integration_id because its account registry is incomplete"
+                )
+            if binding is not None and binding.account_ids and not all_accounts:
+                if s.integration_id and s.integration_id not in binding.account_ids:
+                    raise CapabilityError(
+                        f"step {s.key}: integration_id={s.integration_id!r} does not "
+                        f"expose {s.provider}.{s.action_key}; choose one of "
+                        f"{list(binding.account_ids)}"
+                    )
+                if binding.requires_explicit_account and not s.integration_id:
+                    raise CapabilityError(
+                        f"step {s.key}: {s.provider}.{s.action_key} requires an exact "
+                        "integration_id from its account_ids binding"
+                    )
+                if not s.integration_id:
+                    # Pin the first actor-ordered supported account into the
+                    # persisted step; the worker must not re-resolve a
+                    # provider-wide default that may not expose this action.
+                    s.integration_id = binding.account_ids[0]
+            runtime_apply_action_binding_schemas_to_steps(
+                [s],
+                provider_actions=provider_actions,
+                provider_action_specs=provider_action_specs,
+            )
+            if binding is not None and binding.effect is not None:
+                if binding.effect in {
+                    MCPActionEffect.WRITE,
+                    MCPActionEffect.DESTRUCTIVE,
+                }:
+                    s.risk_level = "high"
+                    s.requires_approval = True
             inferred_capability_id = runtime_capability_id_for_action_key(
                 s.action_key,
                 provider=s.provider,

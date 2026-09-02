@@ -40,6 +40,7 @@ class TokenModelPrice:
     # Audio-capable chat models bill audio tokens at their own (higher) rate.
     audio_input_per_m: float | None = None
     audio_output_per_m: float | None = None
+    cached_audio_input_per_m: float | None = None
     # Long-context tier: when prompt tokens exceed the threshold, providers
     # bill the whole request at the long-context rates.
     long_context_threshold: int | None = None
@@ -117,6 +118,47 @@ OFFICIAL_TOKEN_PRICES: dict[str, TokenModelPrice] = {
     "openai/gpt-4o-audio-preview": TokenModelPrice(
         "openai", 2.50, 10.00, "official",
         audio_input_per_m=40.00, audio_output_per_m=80.00,
+    ),
+    "openai/gpt-realtime-mini": TokenModelPrice(
+        "openai",
+        0.60,
+        2.40,
+        "official",
+        cache_read_multiplier=0.10,
+        audio_input_per_m=10.00,
+        audio_output_per_m=20.00,
+        cached_audio_input_per_m=0.30,
+        note="OpenAI Realtime Mini text, cached-input, and audio token rates.",
+    ),
+    "openai/gpt-realtime": TokenModelPrice(
+        "openai",
+        4.00,
+        16.00,
+        "official",
+        cache_read_multiplier=0.10,
+        audio_input_per_m=32.00,
+        audio_output_per_m=64.00,
+        note="OpenAI Realtime GA text, cached-input, and audio token rates.",
+    ),
+    "openai/gpt-realtime-2025-08-28": TokenModelPrice(
+        "openai",
+        4.00,
+        16.00,
+        "official",
+        cache_read_multiplier=0.10,
+        audio_input_per_m=32.00,
+        audio_output_per_m=64.00,
+        note="Pinned OpenAI Realtime GA snapshot.",
+    ),
+    "openai/gpt-realtime-2": TokenModelPrice(
+        "openai",
+        4.00,
+        24.00,
+        "official",
+        cache_read_multiplier=0.10,
+        audio_input_per_m=32.00,
+        audio_output_per_m=64.00,
+        note="OpenAI GPT-Realtime-2 text and audio rates, verified 2026-08-31.",
     ),
     "openai/gpt-image-1-mini": TokenModelPrice(
         "openai",
@@ -322,11 +364,19 @@ BASELINE_INPUT_COST_PER_M = 0.32
 
 
 def openrouter_pricing_cache_path() -> str:
-    return (os.getenv("OPENROUTER_PRICING_CACHE_PATH") or "/tmp/manor_openrouter_pricing_cache.json").strip()
+    configured = (os.getenv("OPENROUTER_PRICING_CACHE_PATH") or "").strip()
+    if configured:
+        return configured
+    from packages.core.services.runtime_paths import private_runtime_dir
+    return str(private_runtime_dir("cache") / "openrouter-pricing.json")
 
 
 def vercel_pricing_cache_path() -> str:
-    return (os.getenv("VERCEL_PRICING_CACHE_PATH") or "/tmp/manor_vercel_pricing_cache.json").strip()
+    configured = (os.getenv("VERCEL_PRICING_CACHE_PATH") or "").strip()
+    if configured:
+        return configured
+    from packages.core.services.runtime_paths import private_runtime_dir
+    return str(private_runtime_dir("cache") / "vercel-pricing.json")
 
 
 def _load_vercel_cache_if_needed() -> None:
@@ -549,6 +599,7 @@ def estimate_token_cost_usd(
     cache_write_multiplier: float = 1.25,
     audio_input_tokens: int = 0,
     audio_output_tokens: int = 0,
+    cached_audio_input_tokens: int = 0,
 ) -> float:
     input_per_m, output_per_m = token_unit_prices(
         model,
@@ -582,33 +633,46 @@ def estimate_token_cost_usd(
     # registry rate they simply stay priced as text.
     audio_in = int(audio_input_tokens or 0)
     audio_out = int(audio_output_tokens or 0)
+    cached_audio_in = min(
+        max(0, int(cached_audio_input_tokens or 0)),
+        max(0, audio_in),
+        max(0, int(cache_read_tokens or 0)),
+    )
+    uncached_audio_in = max(0, audio_in - cached_audio_in)
+    cached_text_in = max(0, int(cache_read_tokens or 0) - cached_audio_in)
     audio_cost = 0.0
+    cached_audio_cost = cached_audio_in * input_per_m * cache_read_multiplier
     if official and (audio_in or audio_out):
         if official.audio_input_per_m is not None:
-            audio_cost += audio_in * official.audio_input_per_m
+            audio_cost += uncached_audio_in * official.audio_input_per_m
         else:
-            audio_in = 0
+            uncached_audio_in = 0
         if official.audio_output_per_m is not None:
             audio_cost += audio_out * official.audio_output_per_m
         else:
             audio_out = 0
+        if cached_audio_in and official.cached_audio_input_per_m is not None:
+            cached_audio_cost = cached_audio_in * (
+                official.cached_audio_input_per_m
+            )
     else:
-        audio_in = audio_out = 0
+        uncached_audio_in = audio_out = 0
 
     base_input = max(
         0,
         int(input_tokens or 0)
         - int(cache_read_tokens or 0)
         - int(cache_creation_tokens or 0)
-        - audio_in,
+        - uncached_audio_in,
     )
     base_output = max(0, int(output_tokens or 0) - audio_out)
     return (
         base_input * input_per_m
-        + int(cache_read_tokens or 0) * input_per_m * cache_read_multiplier
+        + cached_text_in * input_per_m * cache_read_multiplier
         + int(cache_creation_tokens or 0) * input_per_m * cache_write_multiplier
         + base_output * output_per_m
         + audio_cost
+        + cached_audio_cost
     ) / 1_000_000
 
 

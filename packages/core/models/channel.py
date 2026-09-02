@@ -13,7 +13,7 @@ from datetime import datetime
 from decimal import Decimal
 from typing import Optional
 
-from sqlalchemy import DateTime, Index, Numeric, String, Text, func
+from sqlalchemy import DateTime, Index, Numeric, String, Text, func, text as sql_text
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -39,11 +39,45 @@ class ChannelConfig(Base, TimestampMixin):
     __table_args__ = (
         Index("ix_channel_configs_entity", "entity_id"),
         Index("ix_channel_configs_type", "entity_id", "channel_type"),
+        # Telegram permits exactly one active webhook per bot. A bot therefore
+        # cannot be attached to two user-owned ChannelConfigs on this Manor
+        # deployment.
+        Index("ux_channel_configs_telegram_bot_id", "telegram_bot_id", unique=True),
+        Index(
+            "ux_channel_configs_discord_installation",
+            "discord_application_id",
+            "discord_guild_id",
+            unique=True,
+        ),
+        # Meta sends the phone number id in every fixed webhook delivery.
+        # Keep it as a non-secret routing key so callbacks never need to scan
+        # and lease every WhatsApp credential source.
+        Index(
+            "ux_channel_configs_whatsapp_phone_number_id",
+            "whatsapp_phone_number_id",
+            unique=True,
+        ),
     )
 
     id: Mapped[str] = mapped_column(String(26), primary_key=True, default=generate_ulid)
     entity_id: Mapped[str] = mapped_column(String(26), nullable=False)
     workspace_id: Mapped[Optional[str]] = mapped_column(String(26))
+    # A communication endpoint follows the credential source owner's private
+    # access boundary. Legacy rows without an owner remain unavailable until
+    # explicitly repaired rather than becoming Entity-wide by default.
+    owner_user_id: Mapped[Optional[str]] = mapped_column(String(26))
+    credential_source_kind: Mapped[Optional[str]] = mapped_column(String(32))
+    credential_source_id: Mapped[Optional[str]] = mapped_column(String(26))
+    # Telegram's stable getMe().id. It is not a secret, and prevents one bot
+    # token from silently replacing another user's global Telegram webhook.
+    telegram_bot_id: Mapped[Optional[str]] = mapped_column(String(32))
+    # Discord App identity and installed Guild are stable, non-secret routing
+    # keys for the deployment-owned App and user-owned installation.
+    discord_application_id: Mapped[Optional[str]] = mapped_column(String(32))
+    discord_guild_id: Mapped[Optional[str]] = mapped_column(String(32))
+    # WhatsApp Business phone number id from Meta webhook metadata. It is not
+    # a secret and is used to route the fixed app-level callback.
+    whatsapp_phone_number_id: Mapped[Optional[str]] = mapped_column(String(32))
 
     # Channel classification
     channel_type: Mapped[str] = mapped_column(String(30), nullable=False)
@@ -69,6 +103,58 @@ class ChannelConfig(Base, TimestampMixin):
 
     status: Mapped[str] = mapped_column(String(20), nullable=False, default="active")
     # active | inactive | error
+
+
+# ---------------------------------------------------------------------------
+# Twilio Voice call sessions
+# ---------------------------------------------------------------------------
+
+class TwilioVoiceCallSession(Base, TimestampMixin):
+    """Durable routing and lifecycle state for one Twilio Voice call.
+
+    The raw session token is only sent to Twilio in a short-lived URL. Manor
+    stores its SHA-256 digest so a database read cannot be replayed as a live
+    Media Stream credential.
+    """
+    __tablename__ = "twilio_voice_call_sessions"
+    __table_args__ = (
+        Index("ix_twilio_voice_sessions_config_status", "channel_config_id", "status"),
+        Index("ix_twilio_voice_sessions_expires", "expires_at"),
+        Index(
+            "uq_twilio_voice_sessions_call_sid",
+            "call_sid",
+            unique=True,
+            postgresql_where=sql_text("call_sid IS NOT NULL"),
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(26), primary_key=True, default=generate_ulid)
+    entity_id: Mapped[str] = mapped_column(String(26), nullable=False, index=True)
+    owner_user_id: Mapped[Optional[str]] = mapped_column(String(26), index=True)
+    workspace_id: Mapped[Optional[str]] = mapped_column(String(26), index=True)
+    channel_config_id: Mapped[str] = mapped_column(String(26), nullable=False, index=True)
+    agent_id: Mapped[Optional[str]] = mapped_column(String(26))
+    conversation_id: Mapped[Optional[str]] = mapped_column(String(26))
+
+    direction: Mapped[str] = mapped_column(String(10), nullable=False)
+    # inbound | outbound
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="pending")
+    # pending | connecting | in_progress | completed | failed | busy |
+    # no_answer | canceled | expired
+
+    call_sid: Mapped[Optional[str]] = mapped_column(String(64))
+    stream_sid: Mapped[Optional[str]] = mapped_column(String(64))
+    session_token_hash: Mapped[str] = mapped_column(String(64), nullable=False, unique=True)
+    token_used_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+    from_number: Mapped[Optional[str]] = mapped_column(String(40))
+    to_number: Mapped[Optional[str]] = mapped_column(String(40))
+    connected_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    ended_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    duration_seconds: Mapped[Optional[int]] = mapped_column()
+    error_message: Mapped[Optional[str]] = mapped_column(String(500))
+    metadata_json: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default="{}")
 
 
 # ---------------------------------------------------------------------------
@@ -230,6 +316,86 @@ class MessageLog(Base, TimestampMixin):
         Index("ix_message_logs_conversation", "conversation_id"),
         Index("ix_message_logs_channel_config", "channel_config_id"),
         Index("ix_message_logs_external", "external_id"),
+        Index(
+            "uq_message_logs_slack_inbound_event",
+            "channel_config_id",
+            "external_id",
+            unique=True,
+            postgresql_where=sql_text(
+                "channel_type = 'slack' AND direction = 'inbound' "
+                "AND external_id IS NOT NULL"
+            ),
+        ),
+        Index(
+            "uq_message_logs_discord_inbound_interaction",
+            "channel_config_id",
+            "external_id",
+            unique=True,
+            postgresql_where=sql_text(
+                "channel_type = 'discord' AND direction = 'inbound' "
+                "AND external_id IS NOT NULL"
+            ),
+        ),
+        Index(
+            "uq_message_logs_whatsapp_inbound_event",
+            "channel_config_id",
+            "external_id",
+            unique=True,
+            postgresql_where=sql_text(
+                "channel_type = 'whatsapp' AND direction = 'inbound' "
+                "AND external_id IS NOT NULL"
+            ),
+        ),
+        Index(
+            "uq_message_logs_twilio_inbound_sid",
+            "channel_config_id",
+            "external_id",
+            unique=True,
+            postgresql_where=sql_text(
+                "channel_type = 'twilio_sms' AND direction = 'inbound' "
+                "AND external_id IS NOT NULL"
+            ),
+        ),
+        Index(
+            "uq_message_logs_outlook_inbound_message",
+            "channel_config_id",
+            "external_id",
+            unique=True,
+            postgresql_where=sql_text(
+                "channel_type = 'outlook' AND direction = 'inbound' "
+                "AND external_id IS NOT NULL"
+            ),
+        ),
+        Index(
+            "uq_message_logs_ms_teams_inbound_event",
+            "channel_config_id",
+            "external_id",
+            unique=True,
+            postgresql_where=sql_text(
+                "channel_type = 'ms_teams' AND direction = 'inbound' "
+                "AND external_id IS NOT NULL"
+            ),
+        ),
+        Index(
+            "uq_message_logs_wechat_personal_inbound_message",
+            "channel_config_id",
+            "external_id",
+            unique=True,
+            postgresql_where=sql_text(
+                "channel_type = 'wechat_personal' AND direction = 'inbound' "
+                "AND external_id IS NOT NULL"
+            ),
+        ),
+        Index(
+            "uq_message_logs_wechat_inbound_message",
+            "channel_config_id",
+            "external_id",
+            unique=True,
+            postgresql_where=sql_text(
+                "channel_type = 'wechat' AND direction = 'inbound' "
+                "AND external_id IS NOT NULL"
+            ),
+        ),
     )
 
     id: Mapped[str] = mapped_column(String(26), primary_key=True, default=generate_ulid)
@@ -255,7 +421,8 @@ class MessageLog(Base, TimestampMixin):
     # Provider's message ID (Gmail message ID, Twilio SID, WhatsApp wamid, ...)
 
     status: Mapped[str] = mapped_column(String(20), nullable=False, default="sent")
-    # sent | delivered | failed | received | queued
+    # sent | delivered | failed | received | processed | queued | processing
+    # | unknown (durable manual-reconciliation quarantine)
     error_message: Mapped[Optional[str]] = mapped_column(String)
 
     # Cost tracking (Twilio charges, etc.)

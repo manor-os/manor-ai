@@ -1,6 +1,6 @@
 ---
 name: mcp_quickbooks
-description: Operate the user's QuickBooks Online company through the QuickBooks MCP. Use when the user asks to look up or create customers and invoices, send an invoice, review payments/bills/accounts/vendors, or run a financial report.
+description: Operate the user's QuickBooks Online company through the QuickBooks MCP. Use when the user asks to look up or create customers and invoices, send or void an invoice, review payments/bills/accounts/vendors, or run a financial report.
 version: 1.0.0
 ---
 
@@ -29,6 +29,7 @@ Write (high-impact — see Guardrails):
 - `create_customer` (req `realm_id`,`display_name`).
 - `create_invoice` (req `realm_id`,`customer_id`).
 - `send_invoice` (req `realm_id`,`invoice_id`) — **emails the invoice to the customer**.
+- `void_invoice` (req `realm_id`,`invoice_id`,`sync_token`) — voids an invoice that has not been paid.
 
 ## Common Recipes
 
@@ -40,7 +41,7 @@ Write (high-impact — see Guardrails):
 
 ## Guardrails
 
-- **This is the company's financial system of record. Treat every write as high-impact.** Confirm exact details before `create_customer` / `create_invoice`.
+- **This is the company's financial system of record. Treat every write as high-impact.** Confirm exact details before `create_customer` / `create_invoice` / `void_invoice`.
 - **`send_invoice` emails a real customer and creates a payable obligation — never send without explicit approval** of recipient + amounts. Creating an invoice and sending it are two deliberate steps.
 - `custom_query` runs raw SQL — keep it read-only (SELECT); do not use it to mutate data.
 - Amounts/currency: confirm against `get_company_info` currency; double-check totals before creating an invoice.

@@ -18,6 +18,7 @@ from packages.core.ai.runtime.skill_forcing import runtime_apply_manual_skill_to
 from packages.core.ai.runtime.profiles import runtime_profile_name_for_surface
 from packages.core.ai.runtime.requests import AIRuntimeRequest
 from packages.core.ai.runtime.resolver import RuntimeResolver
+from packages.core.ai.runtime.tool_bindings import RuntimeMCPProviderToolScope
 from packages.core.ai.runtime.tool_registry import runtime_tool_schema
 from packages.core.ai.runtime.context_blocks import (
     RuntimeContextBlock,
@@ -107,12 +108,15 @@ async def runtime_assemble_prompt_for_turn(
     bound_tool_names: set[str] | None = None,
     is_master: bool = False,
     mcp_allowed_names: set[str] | None = None,
+    mcp_provider_scopes: Iterable[RuntimeMCPProviderToolScope] = (),
+    mcp_scope_unrestricted: bool = False,
     mode: RuntimePromptMode = "full",
     active_user_message: str | None = None,
     manual_skill_selected: bool = False,
     legacy_extra_context: str | None = None,
     initial_extra_context: str | None = None,
     configured_tool_names: Iterable[str] | str | None = None,
+    visible_tool_names: Iterable[str] | None = None,
     tool_schemas: Iterable[dict] | None = None,
     allowed_tool_names: Iterable[str] | None = None,
     extra_tool_schemas: Iterable[dict] | None = None,
@@ -136,12 +140,15 @@ async def runtime_assemble_prompt_for_turn(
         bound_tool_names=bound_tool_names,
         is_master=is_master,
         mcp_allowed_names=mcp_allowed_names,
+        mcp_provider_scopes=mcp_provider_scopes,
+        mcp_scope_unrestricted=mcp_scope_unrestricted,
         mode=mode,
         active_user_message=active_user_message,
         manual_skill_selected=manual_skill_selected,
         legacy_extra_context=legacy_extra_context,
         initial_extra_context=initial_extra_context,
         configured_tool_names=configured_tool_names,
+        visible_tool_names=visible_tool_names,
         tool_schemas=tool_schemas,
         allowed_tool_names=allowed_tool_names,
         extra_tool_schemas=extra_tool_schemas,
@@ -258,12 +265,15 @@ async def runtime_prepare_prompt_appendix_for_turn(
     bound_tool_names: set[str] | None = None,
     is_master: bool = False,
     mcp_allowed_names: set[str] | None = None,
+    mcp_provider_scopes: Iterable[RuntimeMCPProviderToolScope] = (),
+    mcp_scope_unrestricted: bool = False,
     mode: RuntimePromptMode = "full",
     active_user_message: str | None = None,
     manual_skill_selected: bool = False,
     legacy_extra_context: str | None = None,
     initial_extra_context: str | None = None,
     configured_tool_names: Iterable[str] | str | None = None,
+    visible_tool_names: Iterable[str] | None = None,
     tool_schemas: Iterable[dict] | None = None,
     allowed_tool_names: Iterable[str] | None = None,
     extra_tool_schemas: Iterable[dict] | None = None,
@@ -283,12 +293,15 @@ async def runtime_prepare_prompt_appendix_for_turn(
         bound_tool_names=bound_tool_names,
         is_master=is_master,
         mcp_allowed_names=mcp_allowed_names,
+        mcp_provider_scopes=mcp_provider_scopes,
+        mcp_scope_unrestricted=mcp_scope_unrestricted,
         mode=mode,
         active_user_message=active_user_message,
         manual_skill_selected=manual_skill_selected,
         legacy_extra_context=legacy_extra_context,
         initial_extra_context=initial_extra_context,
         configured_tool_names=configured_tool_names,
+        visible_tool_names=visible_tool_names,
         tool_schemas=tool_schemas,
         allowed_tool_names=allowed_tool_names,
         extra_tool_schemas=extra_tool_schemas,
@@ -325,12 +338,15 @@ async def runtime_prepare_prompt_context_for_turn(
     bound_tool_names: set[str] | None = None,
     is_master: bool = False,
     mcp_allowed_names: set[str] | None = None,
+    mcp_provider_scopes: Iterable[RuntimeMCPProviderToolScope] = (),
+    mcp_scope_unrestricted: bool = False,
     mode: RuntimePromptMode = "full",
     active_user_message: str | None = None,
     manual_skill_selected: bool = False,
     legacy_extra_context: str | None = None,
     initial_extra_context: str | None = None,
     configured_tool_names: Iterable[str] | str | None = None,
+    visible_tool_names: Iterable[str] | None = None,
     tool_schemas: Iterable[dict] | None = None,
     allowed_tool_names: Iterable[str] | None = None,
     extra_tool_schemas: Iterable[dict] | None = None,
@@ -404,11 +420,21 @@ async def runtime_prepare_prompt_context_for_turn(
             tool_profile=tool_profile,
         )
 
+    eager_extra_tool_schemas = list(extra_tool_schemas or ())
+    eager_extra_allowed_tool_names = (
+        None
+        if extra_allowed_tool_names is None
+        else {
+            str(name).strip()
+            for name in extra_allowed_tool_names
+            if str(name or "").strip()
+        }
+    )
     resolved_tools, resolved_allowed_tool_names = _apply_extra_tool_surface(
         tools=resolved_tools,
         allowed_tool_names=resolved_allowed_tool_names,
-        extra_tool_schemas=extra_tool_schemas,
-        extra_allowed_tool_names=extra_allowed_tool_names,
+        extra_tool_schemas=eager_extra_tool_schemas,
+        extra_allowed_tool_names=eager_extra_allowed_tool_names,
     )
     runtime_set_tools_for_prompt_context(
         ctx,
@@ -432,12 +458,47 @@ async def runtime_prepare_prompt_context_for_turn(
             allowed_tool_names=set(resolved_allowed_tool_names or set()),
         )
 
+    if visible_tool_names is not None and not disable_tools:
+        visible = {
+            str(name).strip()
+            for name in visible_tool_names
+            if str(name or "").strip()
+        }
+        # Caller-owned turn-scoped tools are eager by definition. Keep their
+        # schemas visible even when the general turn plan narrows the base
+        # catalog; RuntimeResolver still applies capability and policy gates.
+        visible.update(eager_extra_allowed_tool_names or set())
+        visible.update(
+            name
+            for name in (
+                runtime_prompt_tool_name(tool)
+                for tool in eager_extra_tool_schemas
+            )
+            if name
+        )
+        resolved_tools = [
+            tool
+            for tool in resolved_tools
+            if runtime_prompt_tool_name(tool) in visible
+        ]
+        # Keep the complete Runtime authorization set. Only schemas sent to the
+        # parent model are narrowed; an invoked Skill still receives every tool
+        # it is authorized to use, and search_tools may progressively disclose
+        # another allowed schema when the request genuinely needs it.
+        runtime_set_tools_for_prompt_context(
+            ctx,
+            tools=resolved_tools,
+            allowed_tool_names=set(resolved_allowed_tool_names or set()),
+        )
+
     runtime_surface_result = RuntimeResolver().resolve_tool_surface(
         request,
         tool_profile=tool_profile,
         tool_schemas=resolved_tools,
         allowed_tool_names=resolved_allowed_tool_names,
         blocked_tool_names=blocked_tool_names,
+        mcp_provider_scopes=mcp_provider_scopes,
+        mcp_scope_unrestricted=mcp_scope_unrestricted,
         skill_refs=skill_refs,
     )
     ctx.tools = runtime_surface_result.tool_schemas

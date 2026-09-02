@@ -7,7 +7,7 @@ resolves through the existing ``GET /api/v1/fs/public/{token}`` endpoint.
 
 Tenant safety
 ─────────────
-The token (HMAC-SHA256 over ``{entity_id, path, exp}``, see
+The token (HMAC-SHA256 over ``{entity_id, path, exp, user_id?}``, see
 ``packages.core.services.file_access_tokens``) bakes in:
 
   * the entity that requested the read,
@@ -21,13 +21,13 @@ endpoint resolves under ``get_entity_root(entity_id)`` which is a
 per-tenant directory, and the token's ``entity_id`` claim drives that
 lookup directly. Tampering with the claim invalidates the HMAC.
 
-Visibility
+Visibility and revocation
 ──────────
-We additionally call ``is_user_visible_path`` *before* signing. The
-endpoint trusts the signed claim; the wrapper layer is the gate that
-decides whether the user is allowed to ship that file to a browser
-tool at all. System paths (``_meta/``, ``.git/``, etc.) are blocked
-from being shipped to third-party platforms even when the agent asks.
+We call ``is_user_visible_path`` and the canonical document/workspace ACL
+before signing. Local-export tokens carry ``user_id``; the public fetch
+endpoint re-evaluates that actor against current state, so Trash,
+reclassification, membership removal, or revocation takes effect immediately.
+System paths (``_meta/``, ``.git/``, etc.) are blocked before signing.
 
 Usage
 ─────
@@ -35,7 +35,7 @@ Usage
         ["/Photos/cat.jpg", "https://example.com/dog.png"],
         entity_id=entity_id,
     )
-    # → ["http://api:8000/api/v1/fs/public/<token>",
+    # → ["http://manor-api:8000/api/v1/fs/public/<token>",
     #    "https://example.com/dog.png"]
 
 URLs already starting with ``http://`` / ``https://`` pass through
@@ -63,7 +63,7 @@ logger = logging.getLogger(__name__)
 # Defaults to the docker-compose service hostname; callers can pass paired
 # public/local origins as candidates in mixed staging/local deployments.
 _INTERNAL_API_URL = os.environ.get(
-    "MANOR_INTERNAL_API_URL", "http://api:8000",
+    "MANOR_INTERNAL_API_URL", "http://manor-api:8000",
 ).rstrip("/")
 
 
@@ -83,6 +83,7 @@ def paths_to_signed_urls(
     entity_id: str,
     ttl_seconds: int = _DEFAULT_TTL_SECONDS,
     base_url: str | None = None,
+    user_id: str | None = None,
 ) -> List[str]:
     """Convert a mixed list of paths/URLs into URLs a worker can GET.
 
@@ -97,12 +98,25 @@ def paths_to_signed_urls(
         raise KnowledgePathError("entity_id is required to sign knowledge URLs")
     out: List[str] = []
     for raw in paths or []:
-        url = _one(raw, entity_id=entity_id, ttl_seconds=ttl_seconds, base_url=base_url)
+        url = _one(
+            raw,
+            entity_id=entity_id,
+            ttl_seconds=ttl_seconds,
+            base_url=base_url,
+            user_id=user_id,
+        )
         out.append(url)
     return out
 
 
-def _one(raw: str, *, entity_id: str, ttl_seconds: int, base_url: str | None = None) -> str:
+def _one(
+    raw: str,
+    *,
+    entity_id: str,
+    ttl_seconds: int,
+    base_url: str | None = None,
+    user_id: str | None = None,
+) -> str:
     s = (raw or "").strip()
     if not s:
         raise KnowledgePathError("empty path in image_paths")
@@ -127,6 +141,7 @@ def _one(raw: str, *, entity_id: str, ttl_seconds: int, base_url: str | None = N
         entity_id=entity_id,
         rel_path=rel,
         expires_in_seconds=ttl_seconds,
+        user_id=user_id,
     )
     return f"{_api_origin(base_url)}/api/v1/fs/public/{token}"
 
@@ -173,6 +188,7 @@ def safe_paths_to_signed_urls(
     entity_id: Optional[str],
     ttl_seconds: int = _DEFAULT_TTL_SECONDS,
     base_url: str | None = None,
+    user_id: str | None = None,
 ) -> tuple[Optional[List[str]], Optional[str]]:
     """Same as ``paths_to_signed_urls`` but returns ``(urls, error_msg)``
     for use in MCP wrappers where we want to surface a structured
@@ -188,6 +204,7 @@ def safe_paths_to_signed_urls(
             entity_id=entity_id,
             ttl_seconds=ttl_seconds,
             base_url=base_url,
+            user_id=user_id,
         ), None
     except KnowledgePathError as exc:
         return None, str(exc)
@@ -199,6 +216,7 @@ def safe_paths_to_signed_url_candidates(
     entity_id: Optional[str],
     ttl_seconds: int = _DEFAULT_TTL_SECONDS,
     base_urls: List[str | None] | None = None,
+    user_id: str | None = None,
 ) -> tuple[Optional[List[List[str]]], Optional[str]]:
     """Return ordered, de-duplicated signed URL candidates per input path.
 
@@ -222,6 +240,7 @@ def safe_paths_to_signed_url_candidates(
             entity_id=entity_id,
             ttl_seconds=ttl_seconds,
             base_url=base_url,
+            user_id=user_id,
         )
         if err:
             errors.append(err)

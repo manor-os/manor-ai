@@ -2351,6 +2351,164 @@ async def _anthropic_messages_completion(
             payload["tool_choice"] = choice
 
     headers = _anthropic_request_headers(api_key)
+    if stream_handler is not None:
+        streamed_any_text = False
+        try:
+            client = await get_llm_client()
+            content_parts: List[str] = []
+            tool_call_parts: Dict[int, Dict[str, Any]] = {}
+            raw_usage: Dict[str, Any] = {}
+            finish_reason = ""
+            response_model = wire_model
+            async with client.stream(
+                "POST",
+                f"{base_url}/messages",
+                headers=dict(headers),
+                json={**payload, "stream": True},
+            ) as response:
+                response.raise_for_status()
+                async for line in _iter_stream_lines_with_idle_timeout(response):
+                    line = (line or "").strip()
+                    if not line or not line.startswith("data:"):
+                        continue
+                    data_line = line[5:].strip()
+                    if not data_line or data_line == "[DONE]":
+                        continue
+                    chunk = json.loads(data_line)
+                    event_type = chunk.get("type")
+                    if event_type == "error":
+                        error = chunk.get("error") or {}
+                        message = error.get("message") if isinstance(error, dict) else error
+                        raise RuntimeError(f"Anthropic stream error: {message or 'unknown error'}")
+                    if event_type == "message_start":
+                        message = chunk.get("message") or {}
+                        if isinstance(message, dict):
+                            response_model = str(message.get("model") or response_model)
+                            if isinstance(message.get("usage"), dict):
+                                raw_usage.update(message["usage"])
+                        continue
+                    if event_type == "content_block_start":
+                        index = int(chunk.get("index", 0) or 0)
+                        block = chunk.get("content_block") or {}
+                        if not isinstance(block, dict):
+                            continue
+                        if block.get("type") == "text":
+                            text = str(block.get("text") or "")
+                            if text:
+                                content_parts.append(text)
+                                streamed_any_text = True
+                                await _emit_stream_event(
+                                    stream_handler,
+                                    "text_delta",
+                                    {"content": text},
+                                )
+                        elif block.get("type") == "tool_use":
+                            tool_call_parts[index] = {
+                                "id": block.get("id") or f"call_{index}",
+                                "name": str(block.get("name") or ""),
+                                "input": block.get("input") if isinstance(block.get("input"), dict) else {},
+                                "arguments_text": "",
+                            }
+                        continue
+                    if event_type == "content_block_delta":
+                        index = int(chunk.get("index", 0) or 0)
+                        delta = chunk.get("delta") or {}
+                        if not isinstance(delta, dict):
+                            continue
+                        if delta.get("type") == "text_delta":
+                            text = str(delta.get("text") or "")
+                            if text:
+                                content_parts.append(text)
+                                streamed_any_text = True
+                                await _emit_stream_event(
+                                    stream_handler,
+                                    "text_delta",
+                                    {"content": text},
+                                )
+                        elif delta.get("type") == "input_json_delta":
+                            entry = tool_call_parts.setdefault(
+                                index,
+                                {
+                                    "id": f"call_{index}",
+                                    "name": "",
+                                    "input": {},
+                                    "arguments_text": "",
+                                },
+                            )
+                            entry["arguments_text"] += str(delta.get("partial_json") or "")
+                        continue
+                    if event_type == "message_delta":
+                        delta = chunk.get("delta") or {}
+                        if isinstance(delta, dict):
+                            finish_reason = str(delta.get("stop_reason") or finish_reason)
+                        if isinstance(chunk.get("usage"), dict):
+                            raw_usage.update(chunk["usage"])
+
+            content = "".join(content_parts)
+            parsed_tool_calls: Optional[List[Dict[str, Any]]] = None
+            if tool_call_parts:
+                parsed_tool_calls = []
+                for index in sorted(tool_call_parts):
+                    entry = tool_call_parts[index]
+                    name = str(entry.get("name") or "").strip()
+                    if not name:
+                        continue
+                    raw_arguments = str(entry.get("arguments_text") or "")
+                    if raw_arguments:
+                        try:
+                            arguments = json.loads(raw_arguments)
+                        except json.JSONDecodeError:
+                            arguments = {"_raw": raw_arguments}
+                    else:
+                        arguments = entry.get("input") or {}
+                    parsed_tool_calls.append({
+                        "id": entry.get("id") or f"call_{index}",
+                        "name": name,
+                        "arguments": arguments,
+                    })
+                if not parsed_tool_calls:
+                    parsed_tool_calls = None
+
+            usage = _usage_from_anthropic_response(
+                {"usage": raw_usage, "model": response_model},
+                model,
+            )
+            usage["finish_reason"] = finish_reason
+            streamed_completion_text = content + "".join(
+                str(entry.get("arguments_text") or "")
+                for entry in tool_call_parts.values()
+            )
+            _backfill_streamed_usage(
+                usage,
+                messages=messages,
+                content=streamed_completion_text,
+            )
+            if _is_empty_provider_response(content, finish_reason, usage):
+                raise RuntimeError(
+                    "empty Anthropic streaming response (no content, finish_reason, or usage)"
+                )
+            _record_llm_call(
+                call_type=call_type,
+                model=model,
+                usage=usage,
+                duration_ms=(time.time() - started) * 1000,
+                message_count=len(messages),
+                tool_count=len(anthropic_tools),
+                finish_reason=finish_reason,
+                success=True,
+            )
+            return content, parsed_tool_calls, usage
+        except LLMAuthConfigurationError:
+            raise
+        except Exception as stream_error:
+            if streamed_any_text:
+                await _emit_stream_event(stream_handler, "text_reset", {})
+            logger.warning(
+                "%s Anthropic stream path failed, falling back to buffered response: %s",
+                call_type,
+                stream_error,
+            )
+
     response = await _post_with_retry(
         f"{base_url}/messages",
         headers=headers,
@@ -2488,6 +2646,10 @@ class CreditExhaustedError(Exception):
         self.current = current
 
 
+class CreditCheckUnavailableError(RuntimeError):
+    """Raised when the fail-closed credit gate cannot verify current state."""
+
+
 def _usage_to_credit_estimate(usage: dict, model: str | None) -> int:
     """Estimate billable credits from a normalized LLM usage payload."""
     if not usage:
@@ -2573,32 +2735,37 @@ def release_billing_in_flight(billing: LLMBillingContext | None = None) -> None:
     _release_entity_in_flight_credits(billing.entity_id, credits)
 
 
-async def _preflight_credit_check() -> None:
+async def _preflight_credit_check(*, session_factory: Any | None = None) -> None:
     """Check credit balance before making an LLM call.
 
     Reads the billing context (entity_id) set by ensure_billing_context
     and queries the plan gate. Raises CreditExhaustedError if budget is
     exhausted so the caller can abort before burning provider tokens.
 
-    Skipped when:
-      - No billing context set (OSS, tests, or caller didn't set it)
-      - BYOK=True / native user key (provider charges the user directly)
-      - Non-cloud deployment
+    Tenant credit checks are skipped for BYOK and non-cloud deployments, but
+    an operator-configured Workspace USD budget is always enforced.
     """
     billing = _billing_ctx_var.get()
     if not billing:
         return
-    if getattr(billing, "byok", False) or _is_byok_call.get(False):
-        return
 
-    from packages.core.constants.plans import is_cloud
-    if not is_cloud():
+    from packages.core.constants.plans import ai_credit_limits_enabled, is_cloud
+    tenant_credit_check = (
+        is_cloud()
+        and not getattr(billing, "byok", False)
+        and not _is_byok_call.get(False)
+        and ai_credit_limits_enabled()
+    )
+    if not billing.workspace_id and not tenant_credit_check:
         return
 
     try:
-        from packages.core.database import async_session
+        if session_factory is None:
+            from packages.core.database import async_session
+
+            session_factory = async_session
         from packages.core.services.plan_gate import check
-        async with async_session() as db:
+        async with session_factory() as db:
             if billing.workspace_id:
                 try:
                     from packages.core.budget import check_workspace_budget
@@ -2614,15 +2781,19 @@ async def _preflight_credit_check() -> None:
                         )
                 except CreditExhaustedError:
                     raise
-                except Exception:
+                except Exception as exc:
                     logger.warning(
                         "Workspace budget check failed for %s",
                         billing.workspace_id,
                         exc_info=True,
                     )
-                    raise CreditExhaustedError(
-                        "Unable to verify workspace budget right now. Please try again shortly.",
-                    )
+                    raise CreditCheckUnavailableError(
+                        "credit_check_unavailable: Unable to verify workspace "
+                        "budget right now. Please try again shortly."
+                    ) from exc
+
+            if not tenant_credit_check:
+                return
 
             # Auto-recharge is threshold-based, not only "already exhausted".
             # Run it before the gate so balances below the user's configured
@@ -2713,18 +2884,25 @@ async def _preflight_credit_check() -> None:
                         limit=result.limit or 0,
                         current=result.current or 0,
                     )
-    except CreditExhaustedError:
+    except (CreditExhaustedError, CreditCheckUnavailableError):
         raise
     except Exception as exc:
         # Cloud mode must fail closed: if we cannot verify balance,
         # do not allow billable AI execution to continue.
         logger.warning("Pre-flight credit check failed (blocking): %s", exc, exc_info=True)
-        raise CreditExhaustedError(
-            "Unable to verify credit balance right now. Please try again shortly.",
-        )
+        raise CreditCheckUnavailableError(
+            "credit_check_unavailable: Unable to verify credit balance right "
+            "now. Please try again shortly."
+        ) from exc
 
 
-async def assert_credit_available(entity_id: str, *, source: str = "system", **kwargs: Any) -> None:
+async def assert_credit_available(
+    entity_id: str,
+    *,
+    source: str = "system",
+    session_factory: Any | None = None,
+    **kwargs: Any,
+) -> None:
     """Public preflight gate for non-chat AI paths (image/video/etc.).
 
     Runs the same credit check used by ``chat_completion`` without
@@ -2732,11 +2910,11 @@ async def assert_credit_available(entity_id: str, *, source: str = "system", **k
     """
     prev_ctx = _billing_ctx_var.get()
     if prev_ctx is not None:
-        await _preflight_credit_check()
+        await _preflight_credit_check(session_factory=session_factory)
         return
     token = _billing_ctx_var.set(LLMBillingContext(entity_id=entity_id, source=source, **kwargs))
     try:
-        await _preflight_credit_check()
+        await _preflight_credit_check(session_factory=session_factory)
     finally:
         _billing_ctx_var.reset(token)
 
@@ -3137,15 +3315,49 @@ def bind_llm_call_history(history: Optional[List[Dict[str, Any]]]):
 # HTTP retry logic
 # ---------------------------------------------------------------------------
 
+_SSE_HEARTBEAT_EVENT_TYPES = frozenset(
+    {"heartbeat", "keep_alive", "keep-alive", "keepalive", "ping"}
+)
+
+
+def _sse_data_line_is_heartbeat(line: str) -> bool:
+    """Return true for provider heartbeats encoded as SSE data payloads."""
+
+    stripped = str(line or "").strip()
+    if not stripped.startswith("data:"):
+        return False
+    payload = stripped[5:].strip()
+    if payload.lower() in _SSE_HEARTBEAT_EVENT_TYPES:
+        return True
+    try:
+        decoded = json.loads(payload)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return False
+    if not isinstance(decoded, dict):
+        return False
+    event_type = str(decoded.get("type") or decoded.get("event") or "").strip().lower()
+    return event_type in _SSE_HEARTBEAT_EVENT_TYPES
+
+
 async def _iter_stream_lines_with_idle_timeout(response: httpx.Response):
-    """Yield streaming lines, aborting when the provider accepts stream mode but stalls."""
+    """Yield meaningful SSE data lines and time out when only heartbeats arrive.
+
+    Providers and gateways commonly keep an otherwise stalled stream alive with
+    blank lines or ``: keep-alive`` comments.  Those transport heartbeats are
+    not model progress and must not reset the user-facing idle timeout.
+    """
 
     timeout = get_llm_stream_idle_timeout()
     iterator = response.aiter_lines().__aiter__()
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout if timeout > 0 else None
     while True:
         try:
-            if timeout > 0:
-                line = await asyncio.wait_for(iterator.__anext__(), timeout=timeout)
+            if deadline is not None:
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    raise asyncio.TimeoutError
+                line = await asyncio.wait_for(iterator.__anext__(), timeout=remaining)
             else:
                 line = await iterator.__anext__()
         except StopAsyncIteration:
@@ -3154,7 +3366,16 @@ async def _iter_stream_lines_with_idle_timeout(response: httpx.Response):
             raise TimeoutError(
                 f"LLM streaming response stalled for {timeout:.0f}s without a chunk"
             ) from exc
+        stripped = (line or "").strip()
+        if (
+            not stripped.startswith("data:")
+            or not stripped[5:].strip()
+            or _sse_data_line_is_heartbeat(stripped)
+        ):
+            continue
         yield line
+        if timeout > 0:
+            deadline = loop.time() + timeout
 
 async def _post_with_retry(url: str, headers: Dict[str, str], payload: Dict[str, Any]) -> httpx.Response:
     """
@@ -3256,6 +3477,7 @@ async def chat_completion(
     response_format: Optional[Dict[str, Any]] = None,
     max_tokens: Optional[int] = None,
     model: Optional[str] = None,
+    reasoning_effort: Optional[str] = None,
     stream_handler: _StreamHandler = None,
     metadata: Optional[Dict[str, Any]] = None,
 ) -> tuple[str, Dict[str, Any]]:
@@ -3303,6 +3525,8 @@ async def chat_completion(
         payload["response_format"] = response_format
     if max_tokens is not None:
         payload["max_tokens"] = max_tokens
+    if reasoning_effort is not None:
+        payload["reasoning_effort"] = reasoning_effort
     adapt_native_chat_completion_payload(
         payload,
         model_id=resolved_model,
@@ -3485,6 +3709,7 @@ async def chat_completion(
                 response_format=response_format,
                 max_tokens=max_tokens,
                 model=resolved_model,
+                reasoning_effort=reasoning_effort,
                 stream_handler=stream_handler,
                 metadata=metadata_for_call,
             ),

@@ -1,25 +1,22 @@
 import { useEffect } from "react";
 import { t } from "./lib/i18n";
 import { useToastStore } from "./stores/toast";
+import {
+  clearRecoverableErrorAutoReloadAttempt,
+  isRecoverableErrorAutoReloadScheduled,
+  isStatefulEditingRoute,
+  isStaleChunkError,
+  scheduleRecoverableErrorAutoReload,
+} from "./utils/recoverableErrors";
 
 const VERSION_POLL_INTERVAL_MS = 30_000;
 const VERSION_CHECK_TIMEOUT_MS = 10_000;
 const VERSION_DISMISS_KEY = "manor-version-refresh-dismissed";
 const CHUNK_DISMISS_KEY = "manor-chunk-refresh-dismissed";
 const CHUNK_ERROR_TOAST_ID = "app-chunk-load-failed";
-const CHUNK_AUTO_RELOAD_KEY = "manor-chunk-auto-reload-attempted";
-const CHUNK_AUTO_RELOAD_TTL_MS = 30_000;
-const STATEFUL_EDITING_PATHS = ["/video-editor", "/doc-editor"];
 
 function isChunkLoadFailureMessage(message: string) {
-  const normalized = message.toLowerCase();
-  return (
-    normalized.includes("failed to fetch dynamically imported module") ||
-    normalized.includes("importing a module script failed") ||
-    normalized.includes("loading chunk") ||
-    normalized.includes("chunkloaderror") ||
-    normalized.includes("dynamically imported module")
-  );
+  return isStaleChunkError(message);
 }
 
 function getErrorMessage(value: unknown): string {
@@ -95,32 +92,10 @@ function wasChunkDismissed(buildVersion: string) {
   return getSessionValue(CHUNK_DISMISS_KEY) === buildVersion;
 }
 
-function shouldAutoReloadForChunkFailure() {
-  const attemptedAtRaw = getSessionValue(CHUNK_AUTO_RELOAD_KEY);
-  if (!attemptedAtRaw) return true;
-
-  const attemptedAt = Number(attemptedAtRaw);
-  if (!Number.isFinite(attemptedAt)) return true;
-
-  return Date.now() - attemptedAt > CHUNK_AUTO_RELOAD_TTL_MS;
-}
-
-function markChunkAutoReloadAttempt() {
-  setSessionValue(CHUNK_AUTO_RELOAD_KEY, String(Date.now()));
-}
-
-function clearChunkAutoReloadAttempt() {
-  clearSessionValue(CHUNK_AUTO_RELOAD_KEY);
-}
-
-function isStatefulEditingRoute() {
-  return STATEFUL_EDITING_PATHS.some((path) => window.location.pathname.startsWith(path));
-}
-
 function reloadToLatestVersion() {
   clearSessionValue(VERSION_DISMISS_KEY);
   clearSessionValue(CHUNK_DISMISS_KEY);
-  markChunkAutoReloadAttempt();
+  clearRecoverableErrorAutoReloadAttempt();
   window.location.reload();
 }
 
@@ -131,10 +106,6 @@ export default function VersionRefreshManager() {
   useEffect(() => {
     let active = true;
     let currentVersionToastId: string | null = null;
-
-    if (!wasChunkDismissed(__APP_VERSION__)) {
-      clearChunkAutoReloadAttempt();
-    }
 
     const showUpdateToast = (nextVersion: string) => {
       if (currentVersionToastId || wasVersionDismissed(nextVersion)) return;
@@ -173,10 +144,9 @@ export default function VersionRefreshManager() {
     };
 
     const handleChunkFailure = () => {
-      if (!isStatefulEditingRoute() && shouldAutoReloadForChunkFailure()) {
-        markChunkAutoReloadAttempt();
-        window.location.reload();
-        return;
+      if (!isStatefulEditingRoute()) {
+        const reloadDelayMs = scheduleRecoverableErrorAutoReload();
+        if (reloadDelayMs !== null || isRecoverableErrorAutoReloadScheduled()) return;
       }
       showChunkFailureToast();
     };

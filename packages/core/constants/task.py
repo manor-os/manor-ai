@@ -139,6 +139,7 @@ class TaskType(str, Enum):
     INSPECTION = "inspection"
     FOLLOW_UP = "follow_up"
     APPROVAL = "approval"
+    INTERACTIVE = "interactive"
 
     @classmethod
     def values(cls) -> list[str]:

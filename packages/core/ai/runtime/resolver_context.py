@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 from typing import Any, Protocol
 
 from packages.core.ai.runtime.capabilities import (
+    allowed_tools_for_profile,
     capability_ids_for_profile_tools,
     unclassified_tool_names_for_profile,
 )
@@ -32,7 +33,10 @@ from packages.core.ai.runtime.subagents import (
     subagent_specs_for_surface,
     subagent_specs_to_trace,
 )
-from packages.core.ai.runtime.tool_bindings import tool_bindings_for_profile_tools
+from packages.core.ai.runtime.tool_bindings import (
+    RuntimeMCPProviderToolScope,
+    tool_bindings_for_profile_tools,
+)
 
 
 def tool_name_from_schema(schema: dict[str, Any]) -> str | None:
@@ -52,6 +56,8 @@ class RuntimeResolverContext:
     tool_schemas: tuple[dict[str, Any], ...] = ()
     incoming_allowed_tool_names: tuple[str, ...] = ()
     incoming_blocked_tool_names: tuple[str, ...] = ()
+    incoming_mcp_provider_scopes: tuple[RuntimeMCPProviderToolScope, ...] = ()
+    incoming_mcp_scope_unrestricted: bool = False
     skill_refs: tuple[dict[str, Any], ...] = ()
 
     profile: RuntimeProfile | None = None
@@ -59,6 +65,8 @@ class RuntimeResolverContext:
     tool_names: tuple[str, ...] = ()
     allowed_tool_names: tuple[str, ...] = ()
     blocked_tool_names: tuple[str, ...] = ()
+    mcp_provider_scopes: tuple[RuntimeMCPProviderToolScope, ...] = ()
+    mcp_scope_unrestricted: bool = False
     capability_ids: tuple[str, ...] = ()
     tool_bindings: tuple[dict[str, Any], ...] = ()
     unclassified_tool_names: tuple[str, ...] = ()
@@ -77,15 +85,22 @@ class RuntimeResolverContext:
         tool_schemas: Iterable[dict[str, Any]] | None = None,
         allowed_tool_names: Iterable[str] | None = None,
         blocked_tool_names: Iterable[str] | None = None,
+        mcp_provider_scopes: Iterable[RuntimeMCPProviderToolScope] | None = None,
+        mcp_scope_unrestricted: bool = False,
         skill_refs: Iterable[dict[str, Any]] | None = None,
     ) -> "RuntimeResolverContext":
+        resolved_mcp_provider_scopes = tuple(mcp_provider_scopes or ())
         return cls(
             request=request,
             tool_profile=tool_profile,
             tool_schemas=tuple(tool_schemas or ()),
             incoming_allowed_tool_names=tuple(str(name) for name in (allowed_tool_names or ()) if name),
             incoming_blocked_tool_names=tuple(str(name) for name in (blocked_tool_names or ()) if name),
+            incoming_mcp_provider_scopes=resolved_mcp_provider_scopes,
+            incoming_mcp_scope_unrestricted=bool(mcp_scope_unrestricted),
             skill_refs=tuple(skill_refs or ()),
+            mcp_provider_scopes=resolved_mcp_provider_scopes,
+            mcp_scope_unrestricted=bool(mcp_scope_unrestricted),
             metadata=dict(request.metadata),
         )
 
@@ -113,6 +128,8 @@ class RuntimeResolverContext:
             tool_names=self.tool_names,
             allowed_tool_names=self.allowed_tool_names,
             blocked_tool_names=self.blocked_tool_names,
+            mcp_provider_scopes=self.mcp_provider_scopes,
+            mcp_scope_unrestricted=self.mcp_scope_unrestricted,
             capability_ids=self.capability_ids,
             tool_bindings=self.tool_bindings,
             unclassified_tool_names=self.unclassified_tool_names,
@@ -171,12 +188,43 @@ class ToolResolverStage:
     def apply(self, context: RuntimeResolverContext) -> RuntimeResolverContext:
         profile = context.profile or profile_for_surface(context.request.surface)
         incoming_allowed = set(context.incoming_allowed_tool_names)
+        profile_extra_allowed_tool_names = set()
+        if (
+            profile == RuntimeProfile.FILE_EDITOR_PATCH
+            and bool(context.request.metadata.get("editor_image_generation"))
+        ):
+            # The execution policy separately restricts this override to
+            # generate_file(kind="image"). This stage only keeps that one
+            # turn-scoped schema visible to the editor model.
+            profile_extra_allowed_tool_names.add("generate_file")
         filtered_tools, filtered_allowed, runtime_blocked = filter_runtime_tools(
             surface=context.request.surface,
             profile=profile,
             tools=context.tool_schemas,
             allowed_tool_names=incoming_allowed,
+            profile_extra_allowed_tool_names=profile_extra_allowed_tool_names,
         )
+        editor_context = context.request.editor_context or {}
+        native_editor_patch_enabled = bool(
+            editor_context.get("supportsNativeFilePatch")
+            or editor_context.get("supports_native_file_patch")
+        )
+        patch_file_requested = "patch_file" in incoming_allowed or any(
+            tool_name_from_schema(schema) == "patch_file"
+            for schema in context.tool_schemas
+        )
+        if (
+            profile == RuntimeProfile.FILE_EDITOR_PATCH
+            and patch_file_requested
+            and not native_editor_patch_enabled
+        ):
+            runtime_blocked.add("patch_file")
+            filtered_tools = [
+                schema
+                for schema in filtered_tools
+                if tool_name_from_schema(schema) != "patch_file"
+            ]
+            filtered_allowed.discard("patch_file")
         blocked = set(context.incoming_blocked_tool_names)
         blocked.update(runtime_blocked)
         if blocked:
@@ -192,6 +240,15 @@ class ToolResolverStage:
         )
         context.allowed_tool_names = tuple(sorted(filtered_allowed))
         context.blocked_tool_names = tuple(sorted(blocked))
+        if allowed_tools_for_profile(profile) is None:
+            context.mcp_provider_scopes = context.incoming_mcp_provider_scopes
+            context.mcp_scope_unrestricted = context.incoming_mcp_scope_unrestricted
+        else:
+            # Hard-profile surfaces (external chat, editor, voice, etc.) may
+            # only use their enumerated names. A semantic provider wildcard
+            # must not reopen MCP discovery after the schema filter.
+            context.mcp_provider_scopes = ()
+            context.mcp_scope_unrestricted = False
         return context
 
 

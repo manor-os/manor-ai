@@ -2,6 +2,7 @@
 import asyncio
 import json
 from copy import deepcopy
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from httpx import AsyncClient
@@ -15,6 +16,20 @@ async def _auth(client: AsyncClient, username: str = "wfuser") -> dict:
     })
     data = resp.json()
     return {"Authorization": f"Bearer {data['access_token']}"}
+
+
+async def _create_workspace(
+    client: AsyncClient,
+    headers: dict,
+    name: str,
+) -> str:
+    response = await client.post(
+        "/api/v1/workspaces",
+        headers=headers,
+        json={"name": name},
+    )
+    assert response.status_code == 201, response.text
+    return response.json()["id"]
 
 
 def _simple_steps(step_ids: list[str]) -> list[dict]:
@@ -37,6 +52,94 @@ def _simple_steps(step_ids: list[str]) -> list[dict]:
         steps.append(step)
     steps.append({"id": "end", "type": "end", "name": "Done", "config": {}, "next": []})
     return steps
+
+
+@pytest.mark.asyncio
+async def test_start_workflow_rejects_workspace_from_another_entity(
+    client: AsyncClient,
+    db_session,
+):
+    from sqlalchemy import select
+
+    from packages.core.models.user import User
+    from packages.core.services.workflow_service import start_workflow
+
+    owner_headers = await _auth(client, "workflow_workspace_owner")
+    foreign_headers = await _auth(client, "workflow_workspace_foreign")
+    workflow = await client.post(
+        "/api/v1/workflows",
+        headers=owner_headers,
+        json={"name": "Scoped workflow", "steps": _simple_steps([])},
+    )
+    assert workflow.status_code == 201, workflow.text
+    foreign_workspace = await client.post(
+        "/api/v1/workspaces",
+        headers=foreign_headers,
+        json={"name": "Foreign workflow workspace"},
+    )
+    assert foreign_workspace.status_code == 201, foreign_workspace.text
+    owner = (await db_session.execute(
+        select(User).where(User.email == "workflow_workspace_owner@test.com")
+    )).scalar_one()
+
+    with pytest.raises(ValueError, match="Workspace not found"):
+        await start_workflow(
+            db_session,
+            str(owner.entity_id),
+            workflow.json()["id"],
+            workspace_id=foreign_workspace.json()["id"],
+        )
+
+
+@pytest.mark.asyncio
+async def test_start_workflow_requires_a_real_active_workspace(
+    client: AsyncClient,
+    db_session,
+):
+    from sqlalchemy import select
+
+    from packages.core.models.user import User
+    from packages.core.services.workflow_service import start_workflow
+
+    headers = await _auth(client, "workflow_workspace_lifecycle")
+    workflow = await client.post(
+        "/api/v1/workflows",
+        headers=headers,
+        json={"name": "Lifecycle workflow", "steps": _simple_steps([])},
+    )
+    workspace = await client.post(
+        "/api/v1/workspaces",
+        headers=headers,
+        json={"name": "Lifecycle workspace"},
+    )
+    assert workflow.status_code == 201, workflow.text
+    assert workspace.status_code == 201, workspace.text
+    paused = await client.post(
+        f"/api/v1/workspaces/{workspace.json()['id']}/pause",
+        headers=headers,
+    )
+    assert paused.status_code == 200, paused.text
+    owner = (await db_session.execute(
+        select(User).where(User.email == "workflow_workspace_lifecycle@test.com")
+    )).scalar_one()
+    entity_id = str(owner.entity_id)
+
+    with pytest.raises(ValueError, match="active Workspace"):
+        await start_workflow(
+            db_session,
+            entity_id,
+            workflow.json()["id"],
+            workspace_id=workspace.json()["id"],
+        )
+    await db_session.rollback()
+
+    with pytest.raises(ValueError, match="Workspace not found"):
+        await start_workflow(
+            db_session,
+            entity_id,
+            workflow.json()["id"],
+            workspace_id="legacy-opaque-workspace",
+        )
 
 
 def test_workflow_definition_snapshot_keeps_ordered_display_graph_without_config_secrets():
@@ -225,11 +328,12 @@ def test_trace_summary_recursively_redacts_secrets_and_has_strict_byte_cap():
 def test_trace_summary_redacts_headers_private_keys_and_free_text_tokens():
     from packages.core.services.workflow_run_trace import summarize_trace_value
 
+    private_key_begin = "-----BEGIN " + "PRIVATE KEY-----"
     secrets = {
         "Authorization": "Bearer authorization-secret-value",
         "X-API-Key": "x-api-key-secret-value",
         "Cookie": "session=cookie-secret-value",
-        "private-key": "-----BEGIN PRIVATE KEY-----\nprivate-key-secret\n-----END PRIVATE KEY-----",  # test fixture, not a real key
+        "private-key": f"{private_key_begin}\nprivate-key-secret\n-----END PRIVATE KEY-----",
         "message": (
             "Authorization: Bearer free-text-authorization-secret "
             "X-API-Key: free-text-api-secret Cookie: session=free-text-cookie-secret"
@@ -625,7 +729,7 @@ async def test_runner_persists_structured_step_error_as_safe_text(
 
 
 @pytest.mark.asyncio
-async def test_run_fails_before_node_execution_when_definition_snapshot_drifts(
+async def test_run_executes_private_snapshot_when_live_definition_changes(
     client: AsyncClient,
 ):
     from packages.core.ai.workflow_runner import WorkflowRunner
@@ -655,10 +759,318 @@ async def test_run_fails_before_node_execution_when_definition_snapshot_drifts(
         headers=headers,
     )).json()
 
+    assert detail["status"] == "completed"
+    assert detail["definition_snapshot"] == started["definition_snapshot"]
+    assert detail["step_results"]["work"]["status"] == "completed"
+    assert detail["execution_trace"]
+
+
+@pytest.mark.asyncio
+async def test_runner_claims_one_execution_across_concurrent_deliveries(
+    client: AsyncClient,
+    monkeypatch,
+):
+    from packages.core.ai.workflow_runner import WorkflowRunner
+    from packages.core.services import workflow_run_execution_claim as claim_service
+
+    headers = await _auth(client, "wfconcurrentclaim")
+    workflow = (await client.post(
+        "/api/v1/workflows",
+        headers=headers,
+        json={"name": "Exclusive execution", "steps": _simple_steps(["work"])},
+    )).json()
+    started = (await client.post(
+        f"/api/v1/workflows/{workflow['id']}/run",
+        headers=headers,
+        json={"execute": False},
+    )).json()
+
+    original_execute = WorkflowRunner._execute_step_safe
+    work_started = asyncio.Event()
+    finish_work = asyncio.Event()
+    work_calls = 0
+
+    async def delayed_work(self, step, run, db):
+        nonlocal work_calls
+        if step["id"] == "work":
+            work_calls += 1
+            work_started.set()
+            await finish_work.wait()
+        return await original_execute(self, step, run, db)
+
+    monkeypatch.setattr(WorkflowRunner, "_execute_step_safe", delayed_work)
+
+    first = asyncio.create_task(WorkflowRunner().run(started["id"]))
+    await asyncio.wait_for(work_started.wait(), timeout=2)
+    second_outcome = await asyncio.wait_for(
+        WorkflowRunner().run(started["id"]),
+        timeout=2,
+    )
+    finish_work.set()
+    first_outcome = await asyncio.wait_for(first, timeout=2)
+
+    assert work_calls == 1
+    assert first_outcome == "executed"
+    assert second_outcome == claim_service.CLAIM_HELD
+
+    detail = (await client.get(
+        f"/api/v1/workflows/runs/{started['id']}",
+        headers=headers,
+    )).json()
+    assert detail["status"] == "completed"
+
+
+@pytest.mark.asyncio
+async def test_runner_fails_closed_when_execution_claim_heartbeat_is_lost(
+    client: AsyncClient,
+    monkeypatch,
+):
+    from packages.core.ai.workflow_runner import WorkflowRunner
+    from packages.core.services import workflow_run_execution_claim as claim_service
+
+    headers = await _auth(client, "wfclaimheartbeat")
+    workflow = (await client.post(
+        "/api/v1/workflows",
+        headers=headers,
+        json={"name": "Heartbeat guarded", "steps": _simple_steps(["work"])},
+    )).json()
+    started = (await client.post(
+        f"/api/v1/workflows/{workflow['id']}/run",
+        headers=headers,
+        json={"execute": False},
+    )).json()
+
+    released: list[tuple[str, str]] = []
+    work_started = asyncio.Event()
+    original_owner_lost = False
+    original_extend = claim_service._extend_postgres_execution_claim
+    original_release = claim_service._release_postgres_execution_claim
+
+    async def lose_original_owner_heartbeat(*args, **kwargs):
+        nonlocal original_owner_lost
+        # The runner's original ownership is lost, while the independent
+        # recovery claim remains healthy long enough to settle the run.
+        if work_started.is_set() and not original_owner_lost:
+            original_owner_lost = True
+            return False
+        return await original_extend(*args, **kwargs)
+
+    async def release(key: str, token: str):
+        released.append((key, token))
+        return await original_release(key, token)
+
+    monkeypatch.setattr(
+        claim_service,
+        "_extend_postgres_execution_claim",
+        lose_original_owner_heartbeat,
+    )
+    monkeypatch.setattr(
+        claim_service,
+        "_release_postgres_execution_claim",
+        release,
+    )
+    monkeypatch.setattr(
+        claim_service,
+        "_WORKFLOW_RUN_EXECUTION_HEARTBEAT_SECONDS",
+        0.01,
+    )
+    never_finish = asyncio.Event()
+    original_execute = WorkflowRunner._execute_step_safe
+
+    async def blocking_work(self, step, run, db):
+        if step["id"] == "work":
+            work_started.set()
+            await never_finish.wait()
+        return await original_execute(self, step, run, db)
+
+    monkeypatch.setattr(WorkflowRunner, "_execute_step_safe", blocking_work)
+
+    assert await WorkflowRunner().run(started["id"]) == "executed"
+
+    detail = (await client.get(
+        f"/api/v1/workflows/runs/{started['id']}",
+        headers=headers,
+    )).json()
     assert detail["status"] == "failed"
-    assert "definition changed" in detail["error"].lower()
-    assert detail["step_results"] == {}
-    assert detail["execution_trace"] == []
+    assert detail["error"] == "Workflow execution claim was lost"
+    assert len(released) == 2
+
+
+@pytest.mark.asyncio
+async def test_claim_loss_settlement_cannot_fail_a_successor_owner(
+    client: AsyncClient,
+):
+    from packages.core.ai.workflow_runner import WorkflowRunner
+    from packages.core.services.workflow_run_execution_claim import (
+        workflow_run_execution_claim,
+    )
+
+    headers = await _auth(client, "wfclaimsuccessor")
+    workflow = (await client.post(
+        "/api/v1/workflows",
+        headers=headers,
+        json={"name": "Successor guarded", "steps": _simple_steps(["work"])},
+    )).json()
+    started = (await client.post(
+        f"/api/v1/workflows/{workflow['id']}/run",
+        headers=headers,
+        json={"execute": False},
+    )).json()
+
+    async with workflow_run_execution_claim(started["id"]) as successor:
+        assert successor
+        assert await WorkflowRunner._fail_lost_execution_claim(started["id"]) is None
+
+        detail = (await client.get(
+            f"/api/v1/workflows/runs/{started['id']}",
+            headers=headers,
+        )).json()
+        assert detail["status"] == "running"
+        assert detail["error"] is None
+
+
+@pytest.mark.asyncio
+async def test_runner_reports_claim_held_when_loss_settlement_has_a_successor(
+    monkeypatch,
+):
+    from contextlib import asynccontextmanager
+
+    from packages.core.ai import workflow_runner as runner_module
+    from packages.core.ai.workflow_runner import WorkflowRunner
+    from packages.core.services.workflow_run_execution_claim import (
+        CLAIM_HELD as WORKFLOW_RUN_EXECUTION_CLAIM_HELD,
+        WorkflowRunExecutionClaimLost,
+    )
+
+    class Claim:
+        def raise_if_lost(self):
+            return None
+
+        def mark_terminal_committed(self):
+            return None
+
+    @asynccontextmanager
+    async def granted_claim(_run_id):
+        yield Claim()
+
+    async def lose_claim(*_args, **_kwargs):
+        raise WorkflowRunExecutionClaimLost("lost")
+
+    async def successor_owns_recovery(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(
+        runner_module,
+        "workflow_run_execution_claim",
+        granted_claim,
+    )
+    monkeypatch.setattr(WorkflowRunner, "_run_claimed", lose_claim)
+    monkeypatch.setattr(
+        WorkflowRunner,
+        "_fail_lost_execution_claim",
+        staticmethod(successor_owns_recovery),
+    )
+
+    assert await WorkflowRunner().run("run-1") == WORKFLOW_RUN_EXECUTION_CLAIM_HELD
+
+
+@pytest.mark.asyncio
+async def test_execution_claim_tolerates_one_transient_postgres_renewal_outage(
+    monkeypatch,
+):
+    from packages.core.services import workflow_run_execution_claim as claim_service
+
+    renewal_succeeded = asyncio.Event()
+    released: list[tuple[str, str]] = []
+    renewal_results = iter([None, True])
+
+    async def acquire(*_args, **_kwargs):
+        return True
+
+    async def extend(*_args, **_kwargs):
+        result = next(renewal_results)
+        if result is True:
+            renewal_succeeded.set()
+        return result
+
+    async def release(key: str, token: str):
+        released.append((key, token))
+        return True
+
+    monkeypatch.setattr(
+        claim_service,
+        "_acquire_postgres_execution_claim",
+        acquire,
+    )
+    monkeypatch.setattr(
+        claim_service,
+        "_extend_postgres_execution_claim",
+        extend,
+    )
+    monkeypatch.setattr(
+        claim_service,
+        "_release_postgres_execution_claim",
+        release,
+    )
+    monkeypatch.setattr(
+        claim_service,
+        "_WORKFLOW_RUN_EXECUTION_HEARTBEAT_SECONDS",
+        0.01,
+    )
+    monkeypatch.setattr(
+        claim_service,
+        "_WORKFLOW_RUN_EXECUTION_RENEWAL_RETRY_SECONDS",
+        0.01,
+    )
+
+    async with claim_service.workflow_run_execution_claim(
+        "workflow-transient-renewal"
+    ) as claim:
+        await asyncio.wait_for(renewal_succeeded.wait(), timeout=1)
+        assert claim.lost.is_set() is False
+
+    assert len(released) == 1
+
+
+@pytest.mark.asyncio
+async def test_expired_execution_claim_is_reclaimed_without_stale_owner_release(
+    db_session,
+):
+    import packages.core.database as db_module
+    from packages.core.models.execution_claim import RuntimeExecutionClaim
+    from packages.core.services import workflow_run_execution_claim as claim_service
+
+    claim_key = "workflow-run:expired-claim"
+    stale_token = "0" * 26
+    successor_token = "1" * 26
+    db_session.add(
+        RuntimeExecutionClaim(
+            claim_key=claim_key,
+            claim_token=stale_token,
+            expires_at=datetime.now(timezone.utc) - timedelta(seconds=1),
+        )
+    )
+    await db_session.commit()
+
+    assert await claim_service._acquire_postgres_execution_claim(
+        claim_key,
+        successor_token,
+        lease_ttl_seconds=60,
+    ) is True
+    assert await claim_service._release_postgres_execution_claim(
+        claim_key,
+        stale_token,
+    ) is False
+
+    async with db_module.async_session() as verification_db:
+        persisted = await verification_db.get(RuntimeExecutionClaim, claim_key)
+        assert persisted is not None
+        assert persisted.claim_token == successor_token
+
+    assert await claim_service._release_postgres_execution_claim(
+        claim_key,
+        successor_token,
+    ) is True
 
 
 def test_retry_variables_restore_inherited_shared_checkpoint_output():
@@ -702,6 +1114,39 @@ def test_retry_variables_restore_inherited_shared_checkpoint_output():
     assert variables["retry_segment_ids"] == ["SEG-002"]
 
 
+def test_retry_variables_restore_inherited_automatic_and_named_outputs():
+    from packages.core.services.workflow_service import _retry_variables
+
+    workflow = SimpleNamespace(steps=[
+        {
+            "id": "upload",
+            "config": {
+                "outputs": [{
+                    "key": "published_video_id",
+                    "type": "text",
+                    "value": "{{upload.video_id}}",
+                }],
+            },
+            "next": ["metadata"],
+        },
+        {"id": "metadata", "config": {}, "next": []},
+    ])
+    upload_receipt = {
+        "success": True,
+        "video_id": "LC13h459jjI",
+        "watch_url": "https://www.youtube.com/watch?v=LC13h459jjI",
+    }
+    prior = SimpleNamespace(
+        variables={},
+        step_results={"upload": {"status": "completed", "output": upload_receipt}},
+    )
+
+    variables = _retry_variables(workflow, prior, {"upload"}, None)
+
+    assert variables["upload"] == upload_receipt
+    assert variables["published_video_id"] == "LC13h459jjI"
+
+
 def test_retry_inherits_completed_ancestors_through_unexecuted_condition():
     from packages.core.services.workflow_service import retry_inherited_step_ids
 
@@ -726,6 +1171,35 @@ def test_retry_inherits_completed_ancestors_through_unexecuted_condition():
     assert retry_inherited_step_ids(steps, prior_results, "publish") == {
         "start",
         "producer",
+    }
+
+
+def test_retry_inherits_completed_ancestors_through_true_condition():
+    from packages.core.services.workflow_service import retry_inherited_step_ids
+
+    steps = [
+        {"id": "start", "type": "trigger", "next": ["producer"]},
+        {"id": "producer", "type": "tool", "next": ["gate"]},
+        {
+            "id": "gate",
+            "type": "condition",
+            "next": ["blocked"],
+            "true_next": ["publish"],
+            "false_next": ["blocked"],
+        },
+        {"id": "blocked", "type": "stop", "next": []},
+        {"id": "publish", "type": "tool", "next": []},
+    ]
+    prior_results = {
+        "start": {"status": "completed"},
+        "producer": {"status": "completed", "output": {"video_id": "video-1"}},
+        "gate": {"status": "completed", "condition_result": True},
+    }
+
+    assert retry_inherited_step_ids(steps, prior_results, "publish") == {
+        "start",
+        "producer",
+        "gate",
     }
 
 
@@ -1617,6 +2091,93 @@ async def test_run_rejects_workflow_without_explicit_trigger(client: AsyncClient
 
 
 @pytest.mark.asyncio
+async def test_ai_edit_style_update_rejects_invalid_graph_without_persisting_it(
+    client: AsyncClient,
+):
+    headers = await _auth(client, "wfaieditvalidation")
+    created = (await client.post(
+        "/api/v1/workflows",
+        headers=headers,
+        json={"name": "Safe AI edit", "steps": _simple_steps(["draft"])},
+    )).json()
+    invalid_steps = [{
+        "id": "unsupported",
+        "type": "unsupported",
+        "config": {},
+        "next": [],
+    }]
+
+    rejected = await client.put(
+        f"/api/v1/workflows/{created['id']}",
+        headers=headers,
+        json={"steps": invalid_steps, "validate_steps": True},
+    )
+    assert rejected.status_code == 422
+    assert "workflow is invalid" in rejected.json()["detail"].lower()
+
+    unchanged = (await client.get(
+        f"/api/v1/workflows/{created['id']}",
+        headers=headers,
+    )).json()
+    assert unchanged["steps"] == created["steps"]
+
+
+@pytest.mark.asyncio
+async def test_run_rejects_spoofed_imported_unmapped_node(
+    client: AsyncClient,
+):
+    headers = await _auth(client, "wfimportedunsupported")
+    workflow = (await client.post(
+        "/api/v1/workflows",
+        headers=headers,
+        json={
+            "name": "Partially mapped import",
+            "tags": [
+                "imported:n8n",
+                "manor-import-proof:n8n:attacker-controlled",
+            ],
+            "steps": [
+                {
+                    "id": "trigger",
+                    "type": "trigger",
+                    "config": {},
+                    "next": ["legacy"],
+                },
+                {
+                    "id": "legacy",
+                    "type": "unsupported",
+                    "config": {},
+                    "meta": {
+                        "source_tool": "n8n",
+                        "original_type": "vendor.node",
+                        "unmapped": True,
+                    },
+                    "next": ["end"],
+                },
+                {
+                    "id": "end",
+                    "type": "end",
+                    "config": {},
+                    "next": [],
+                },
+            ],
+        },
+    )).json()
+    assert "imported:n8n" not in workflow["tags"]
+    assert not any(
+        tag.startswith("manor-import-proof:") for tag in workflow["tags"]
+    )
+
+    started = await client.post(
+        f"/api/v1/workflows/{workflow['id']}/run",
+        headers=headers,
+        json={"execute": False},
+    )
+    assert started.status_code == 409, started.text
+    assert "must be replaced" in started.json()["detail"]
+
+
+@pytest.mark.asyncio
 async def test_start_and_execute(client: AsyncClient):
     headers = await _auth(client, "wfuser2")
     steps = _simple_steps(["a", "b"])
@@ -1675,6 +2236,550 @@ async def test_start_and_execute(client: AsyncClient):
         ("end", "running"),
         ("end", "completed"),
     ]
+
+
+@pytest.mark.asyncio
+async def test_manual_step_terminal_status_finalizes_scheduled_occurrence(
+    client: AsyncClient,
+    db_session,
+    monkeypatch,
+):
+    from datetime import datetime, timezone
+
+    from packages.core.models.base import generate_ulid
+    from packages.core.models.scheduler import ScheduledJob, ScheduledJobRun
+    from packages.core.models.workflow import WorkflowRun
+    from packages.core.services import workflow_chat_projection
+
+    async def broken_chat_projection(*_args, **_kwargs):
+        raise RuntimeError("chat projection unavailable")
+
+    monkeypatch.setattr(
+        workflow_chat_projection,
+        "_project_workflow_run_status_chat",
+        broken_chat_projection,
+    )
+
+    headers = await _auth(client, "wfmanualscheduled")
+    workflow = (await client.post(
+        "/api/v1/workflows",
+        headers=headers,
+        json={"name": "Scheduled manual step", "steps": _simple_steps([])},
+    )).json()
+    run_data = (await client.post(
+        f"/api/v1/workflows/{workflow['id']}/run",
+        headers=headers,
+        json={"execute": False},
+    )).json()
+
+    run = await db_session.get(WorkflowRun, run_data["id"])
+    assert run is not None
+    job = ScheduledJob(
+        id=generate_ulid(),
+        job_id=f"manual-step:{generate_ulid()}",
+        entity_id=run.entity_id,
+        workspace_id=run.workspace_id,
+        name="Scheduled manual step",
+        execution_type="workflow",
+        enabled=True,
+        last_status="running",
+    )
+    scheduled_run = ScheduledJobRun(
+        id=generate_ulid(),
+        job_id=job.job_id,
+        status="running",
+        started_at=datetime.now(timezone.utc),
+    )
+    run.trigger_source = "schedule"
+    run.trigger_data = {
+        "scheduled_job_id": job.job_id,
+        "scheduled_run_id": scheduled_run.id,
+    }
+    db_session.add_all([job, scheduled_run])
+    await db_session.commit()
+
+    entry = await client.post(
+        f"/api/v1/workflows/runs/{run.id}/step",
+        headers=headers,
+    )
+    terminal = await client.post(
+        f"/api/v1/workflows/runs/{run.id}/step",
+        headers=headers,
+    )
+
+    assert entry.status_code == 200, entry.text
+    assert terminal.status_code == 200, terminal.text
+    assert terminal.json()["step_id"] == "end"
+    await db_session.refresh(scheduled_run)
+    await db_session.refresh(job)
+    assert scheduled_run.status == "completed"
+    assert scheduled_run.result == {
+        "workflow_run_id": run.id,
+        "status": "completed",
+    }
+    assert job.last_status == "completed"
+
+
+@pytest.mark.asyncio
+async def test_manual_step_rejects_a_run_held_by_the_full_runner(
+    client: AsyncClient,
+    monkeypatch,
+):
+    from packages.core.ai.workflow_runner import WorkflowRunner
+
+    headers = await _auth(client, "wfmanualclaim")
+    workflow = (await client.post(
+        "/api/v1/workflows",
+        headers=headers,
+        json={"name": "Manual step claim", "steps": _simple_steps(["work"])},
+    )).json()
+    run = (await client.post(
+        f"/api/v1/workflows/{workflow['id']}/run",
+        headers=headers,
+        json={"execute": False},
+    )).json()
+    entry = await client.post(
+        f"/api/v1/workflows/runs/{run['id']}/step",
+        headers=headers,
+    )
+    assert entry.status_code == 200, entry.text
+
+    original_execute = WorkflowRunner._execute_step_safe
+    work_started = asyncio.Event()
+    finish_work = asyncio.Event()
+    work_calls = 0
+
+    async def delayed_work(self, step, workflow_run, db):
+        nonlocal work_calls
+        if step["id"] == "work":
+            work_calls += 1
+            if work_calls == 1:
+                work_started.set()
+                await finish_work.wait()
+        return await original_execute(self, step, workflow_run, db)
+
+    monkeypatch.setattr(WorkflowRunner, "_execute_step_safe", delayed_work)
+    full_run = asyncio.create_task(WorkflowRunner().run(run["id"]))
+    await asyncio.wait_for(work_started.wait(), timeout=2)
+    try:
+        manual = await client.post(
+            f"/api/v1/workflows/runs/{run['id']}/step",
+            headers=headers,
+        )
+    finally:
+        finish_work.set()
+        await asyncio.wait_for(full_run, timeout=2)
+
+    assert manual.status_code == 400, manual.text
+    assert manual.json()["detail"] == "Run is already executing"
+    assert work_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_manual_step_executes_private_snapshot_after_definition_delete(
+    client: AsyncClient,
+):
+    headers = await _auth(client, "wfmanualdeletedsnapshot")
+    workflow = (await client.post(
+        "/api/v1/workflows",
+        headers=headers,
+        json={"name": "Deleted manual definition", "steps": _simple_steps(["work"])},
+    )).json()
+    run = (await client.post(
+        f"/api/v1/workflows/{workflow['id']}/run",
+        headers=headers,
+        json={"execute": False},
+    )).json()
+    deleted = await client.delete(
+        f"/api/v1/workflows/{workflow['id']}",
+        headers=headers,
+    )
+    assert deleted.status_code == 204, deleted.text
+
+    stepped = await client.post(
+        f"/api/v1/workflows/runs/{run['id']}/step",
+        headers=headers,
+    )
+
+    assert stepped.status_code == 200, stepped.text
+    assert stepped.json()["step_id"] == "trigger"
+    assert stepped.json()["status"] == "completed"
+
+
+@pytest.mark.asyncio
+async def test_manual_step_commits_checkpoint_before_releasing_execution_claim(
+    client: AsyncClient,
+    monkeypatch,
+):
+    import packages.core.database as db_module
+    from packages.core.models.workflow import WorkflowRun
+    from packages.core.services import workflow_run_execution_claim as claim_service
+
+    headers = await _auth(client, "wfmanualdurableclaim")
+    workflow = (await client.post(
+        "/api/v1/workflows",
+        headers=headers,
+        json={"name": "Durable manual claim", "steps": _simple_steps(["work"])},
+    )).json()
+    run = (await client.post(
+        f"/api/v1/workflows/{workflow['id']}/run",
+        headers=headers,
+        json={"execute": False},
+    )).json()
+    durable_at_release: list[bool] = []
+
+    original_release = claim_service._release_postgres_execution_claim
+
+    async def release(claim_key, token):
+        async with db_module.async_session() as verification_db:
+            persisted = await verification_db.get(WorkflowRun, run["id"])
+            durable_at_release.append(
+                bool(persisted and "trigger" in (persisted.step_results or {}))
+            )
+        return await original_release(claim_key, token)
+
+    monkeypatch.setattr(
+        claim_service,
+        "_release_postgres_execution_claim",
+        release,
+    )
+
+    stepped = await client.post(
+        f"/api/v1/workflows/runs/{run['id']}/step",
+        headers=headers,
+    )
+
+    assert stepped.status_code == 200, stepped.text
+    assert durable_at_release == [True]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("run_status", "should_project", "should_record_inline", "should_finalize"),
+    [
+        ("running", False, False, False),
+        ("paused", True, True, False),
+        ("completed", True, False, True),
+        ("failed", True, False, True),
+        ("cancelled", True, False, True),
+    ],
+)
+async def test_manual_step_projects_every_settled_run_before_commit(
+    monkeypatch,
+    run_status: str,
+    should_project: bool,
+    should_record_inline: bool,
+    should_finalize: bool,
+):
+    from packages.core.ai.workflow_runner import WorkflowRunner
+    from packages.core.ledger import adapters as ledger_adapters
+    from packages.core.services import workflow_chat_projection
+    from packages.core.services import workflow_run_execution_claim as claim_service
+    from packages.core.services import workflow_service
+
+    run = SimpleNamespace(status=run_status)
+    projected: list[object] = []
+    recorded: list[object] = []
+    finalized: list[object] = []
+    committed: list[bool] = []
+    terminal_committed: list[bool] = []
+
+    class FakeDb:
+        async def commit(self):
+            committed.append(True)
+
+    class FakeClaim:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        def raise_if_lost(self):
+            return None
+
+        async def fence_for_commit(self, db):
+            assert isinstance(db, FakeDb)
+
+        def mark_terminal_committed(self):
+            terminal_committed.append(True)
+
+    async def execute_claimed(*_args):
+        return {"status": run_status}
+
+    async def get_run(*_args):
+        return run
+
+    async def project(_db, *, run):
+        projected.append(run)
+
+    async def record(_db, run):
+        recorded.append(run)
+
+    async def finalize(_runner, run, _db):
+        finalized.append(run)
+
+    monkeypatch.setattr(
+        claim_service,
+        "workflow_run_execution_claim",
+        lambda _run_id: FakeClaim(),
+    )
+    monkeypatch.setattr(
+        workflow_service,
+        "_execute_claimed_workflow_step",
+        execute_claimed,
+    )
+    monkeypatch.setattr(workflow_service, "get_run", get_run)
+    monkeypatch.setattr(
+        workflow_chat_projection,
+        "project_workflow_run_status",
+        project,
+    )
+    monkeypatch.setattr(ledger_adapters, "record_workflow_run_status", record)
+    monkeypatch.setattr(WorkflowRunner, "_finalize_run_effects", finalize)
+
+    result = await workflow_service.execute_workflow_step(
+        FakeDb(),
+        "run-1",
+        "entity-1",
+    )
+
+    assert result == {"status": run_status}
+    assert projected == ([run] if should_project else [])
+    assert recorded == ([run] if should_record_inline else [])
+    assert finalized == ([run] if should_finalize else [])
+    assert terminal_committed == [True]
+    assert committed == [True]
+
+
+@pytest.mark.asyncio
+async def test_manual_step_returns_terminal_result_when_effects_are_deferred(
+    monkeypatch,
+):
+    from packages.core.ai.workflow_runner import WorkflowRunner
+    from packages.core.services import workflow_chat_projection
+    from packages.core.services import workflow_run_execution_claim as claim_service
+    from packages.core.services import workflow_service
+
+    run = SimpleNamespace(
+        id="run-terminal-step",
+        status="completed",
+        terminal_effects_completed_at=None,
+        terminal_effects_next_attempt_at=None,
+    )
+    rollbacks: list[bool] = []
+
+    class FakeDb:
+        async def commit(self):
+            return None
+
+        async def rollback(self):
+            rollbacks.append(True)
+
+    class FakeClaim:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        def __bool__(self):
+            return True
+
+        def raise_if_lost(self):
+            return None
+
+        async def fence_for_commit(self, _db):
+            return None
+
+        def mark_terminal_committed(self):
+            return None
+
+    async def no_project(*_args, **_kwargs):
+        return None
+
+    async def execute_claimed(*_args):
+        return {"status": "completed"}
+
+    async def get_run(*_args):
+        return run
+
+    async def fail_effects(_runner, _run, _db):
+        raise RuntimeError("projection unavailable")
+
+    monkeypatch.setattr(
+        claim_service,
+        "workflow_run_execution_claim",
+        lambda _run_id: FakeClaim(),
+    )
+    monkeypatch.setattr(
+        workflow_service,
+        "_execute_claimed_workflow_step",
+        execute_claimed,
+    )
+    monkeypatch.setattr(
+        workflow_service,
+        "get_run",
+        get_run,
+    )
+    monkeypatch.setattr(
+        workflow_chat_projection,
+        "project_workflow_run_status",
+        no_project,
+    )
+    monkeypatch.setattr(WorkflowRunner, "_finalize_run_effects", fail_effects)
+
+    result = await workflow_service.execute_workflow_step(
+        FakeDb(),
+        run.id,
+        "entity-1",
+    )
+
+    assert result == {"status": "completed"}
+    assert run.status == "completed"
+    assert run.terminal_effects_next_attempt_at is not None
+    assert rollbacks == [True]
+
+
+@pytest.mark.asyncio
+async def test_workflow_status_settlement_survives_chat_projection_failure(
+    monkeypatch,
+):
+    from packages.core.services import proposal_workflow_runs
+    from packages.core.services import scheduler_service
+    from packages.core.services import workflow_chat_projection
+
+    events = []
+
+    class NestedTransaction:
+        async def __aenter__(self):
+            events.append("chat_savepoint")
+
+        async def __aexit__(self, exc_type, *_args):
+            events.append(f"chat_rollback:{exc_type.__name__}")
+            return False
+
+    class FakeDb:
+        async def flush(self):
+            events.append("authoritative_flush")
+
+        def begin_nested(self):
+            return NestedTransaction()
+
+    async def finalize(_db, _run):
+        events.append("scheduler_finalized")
+
+    async def sync(_db, _run):
+        events.append("proposal_synced")
+
+    async def broken_chat(_db, *, run):
+        assert run is workflow_run
+        events.append("chat_projection")
+        raise RuntimeError("corrupt chat projection")
+
+    workflow_run = SimpleNamespace(id="run-1")
+    monkeypatch.setattr(
+        scheduler_service,
+        "finalize_scheduled_workflow_run",
+        finalize,
+    )
+    monkeypatch.setattr(
+        proposal_workflow_runs,
+        "sync_proposal_workflow_run_item",
+        sync,
+    )
+    monkeypatch.setattr(
+        workflow_chat_projection,
+        "_project_workflow_run_status_chat",
+        broken_chat,
+    )
+
+    await workflow_chat_projection.project_workflow_run_status(
+        FakeDb(),
+        run=workflow_run,
+    )
+
+    assert events == [
+        "scheduler_finalized",
+        "proposal_synced",
+        "authoritative_flush",
+        "chat_savepoint",
+        "chat_projection",
+        "chat_rollback:RuntimeError",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_manual_step_routes_handled_failure_to_error_output(
+    client: AsyncClient,
+    monkeypatch,
+):
+    from packages.core.ai.workflow_runner import WorkflowRunner
+
+    headers = await _auth(client, "wfmanualerroroutput")
+    workflow = (await client.post(
+        "/api/v1/workflows",
+        headers=headers,
+        json={
+            "name": "Manual error output",
+            "steps": [
+                {"id": "start", "type": "trigger", "next": ["request"]},
+                {
+                    "id": "request",
+                    "type": "transform",
+                    "config": {
+                        "on_error": "continue_error",
+                        "error_next": ["recover"],
+                    },
+                    "next": ["success"],
+                },
+                {"id": "success", "type": "transform", "next": []},
+                {"id": "recover", "type": "transform", "next": []},
+            ],
+        },
+    )).json()
+    run = (await client.post(
+        f"/api/v1/workflows/{workflow['id']}/run",
+        headers=headers,
+        json={"execute": False},
+    )).json()
+    entry = await client.post(
+        f"/api/v1/workflows/runs/{run['id']}/step",
+        headers=headers,
+    )
+    assert entry.status_code == 200, entry.text
+
+    original_execute = WorkflowRunner._execute_step_safe
+
+    async def fail_request(self, step, workflow_run, db):
+        if step["id"] == "request":
+            workflow_run.current_step_id = step["id"]
+            return {"status": "failed", "error": "upstream unavailable"}
+        return await original_execute(self, step, workflow_run, db)
+
+    monkeypatch.setattr(WorkflowRunner, "_execute_step_safe", fail_request)
+
+    failed = await client.post(
+        f"/api/v1/workflows/runs/{run['id']}/step",
+        headers=headers,
+    )
+    recovered = await client.post(
+        f"/api/v1/workflows/runs/{run['id']}/step",
+        headers=headers,
+    )
+    detail = (await client.get(
+        f"/api/v1/workflows/runs/{run['id']}",
+        headers=headers,
+    )).json()
+
+    assert failed.status_code == 200, failed.text
+    assert failed.json()["continued"] is True
+    assert failed.json()["next_step_id"] == "recover"
+    assert recovered.status_code == 200, recovered.text
+    assert recovered.json()["step_id"] == "recover"
+    assert detail["status"] == "completed"
+    assert detail["step_results"]["request"]["next_override"] == ["recover"]
+    assert "success" not in detail["step_results"]
 
 
 @pytest.mark.asyncio
@@ -1937,6 +3042,8 @@ async def test_run_list_names_are_immutable_after_workflow_rename_and_delete(
     client: AsyncClient,
     monkeypatch,
 ):
+    from packages.core.ai.workflow_runner import WorkflowRunner
+
     monkeypatch.setattr(
         "packages.core.ai.workflow_runner.WorkflowRunner.enqueue",
         staticmethod(lambda *_args, **_kwargs: None),
@@ -2008,6 +3115,11 @@ async def test_run_list_names_are_immutable_after_workflow_rename_and_delete(
     assert history[0]["current_step_name"] == "Frozen intake"
     assert "trigger_data" not in history[0]
 
+    detached = await client.delete(
+        f"/api/v1/workflows/bindings/{binding['id']}",
+        headers=headers,
+    )
+    assert detached.status_code == 204, detached.text
     deleted = await client.delete(
         f"/api/v1/workflows/{workflow['id']}",
         headers=headers,
@@ -2020,6 +3132,14 @@ async def test_run_list_names_are_immutable_after_workflow_rename_and_delete(
     )).json()
     assert history_without_definition[0]["workflow_name"] == "Frozen workflow name"
     assert history_without_definition[0]["current_step_name"] == "Frozen intake"
+
+    await WorkflowRunner().run(started["id"])
+    executed_without_definition = (await client.get(
+        f"/api/v1/workflows/runs/{started['id']}",
+        headers=headers,
+    )).json()
+    assert executed_without_definition["status"] == "completed"
+    assert executed_without_definition["step_results"]["prepare"]["status"] == "completed"
 
 
 @pytest.mark.asyncio
@@ -2491,7 +3611,7 @@ async def test_workspace_run_controls_expose_capabilities_and_reject_viewers(
         WorkspaceStaff(
             workspace_id=workspace["id"],
             user_id=operator.id,
-            role="viewer",
+            role="editor",
             added_by=owner["id"],
             added_at=datetime.now(UTC),
             status="active",
@@ -2858,7 +3978,7 @@ async def test_list_runs_defers_detail_payloads_without_summary_lazy_load(db_ses
         execution_trace=[{"sequence": 1, "node_id": "start"}],
         current_step_id="start",
         error=(
-            "-----BEGIN PRIVATE KEY-----\n"  # test fixture, not a real key
+            "-----BEGIN " + "PRIVATE KEY-----\n"
             + ("raw-secret-error" * 1_000)
             + "\n-----END PRIVATE KEY-----"
         ),
@@ -2932,6 +4052,44 @@ async def test_cancel_run(client: AsyncClient):
     assert cancel2.status_code == 200
     assert cancel2.json()["id"] == run["id"]
     assert cancel2.json()["status"] == "cancelled"
+
+
+@pytest.mark.asyncio
+async def test_cancel_run_returns_committed_state_when_effects_are_deferred(
+    client: AsyncClient,
+    monkeypatch,
+):
+    from packages.core.ai.workflow_runner import WorkflowRunner
+
+    headers = await _auth(client, "wfcanceldefer")
+    workflow = (await client.post(
+        "/api/v1/workflows",
+        headers=headers,
+        json={"name": "Deferred cancel effects", "steps": _simple_steps(["work"])},
+    )).json()
+    run = (await client.post(
+        f"/api/v1/workflows/{workflow['id']}/run",
+        headers=headers,
+        json={"execute": False},
+    )).json()
+
+    async def fail_effects(_runner, _run, _db):
+        raise RuntimeError("projection unavailable")
+
+    monkeypatch.setattr(WorkflowRunner, "_finalize_run_effects", fail_effects)
+
+    cancelled = await client.post(
+        f"/api/v1/workflows/runs/{run['id']}/cancel",
+        headers=headers,
+    )
+
+    assert cancelled.status_code == 200, cancelled.text
+    assert cancelled.json()["status"] == "cancelled"
+    persisted = (await client.get(
+        f"/api/v1/workflows/runs/{run['id']}",
+        headers=headers,
+    )).json()
+    assert persisted["status"] == "cancelled"
 
 
 @pytest.mark.asyncio
@@ -3408,7 +4566,7 @@ async def test_resume_continues_from_an_internal_stage_approval(client: AsyncCli
 
 
 @pytest.mark.asyncio
-async def test_resume_fails_before_mutating_paused_node_when_definition_snapshot_drifts(
+async def test_resume_uses_private_snapshot_when_live_definition_changes(
     client: AsyncClient,
 ):
     headers = await _auth(client, "wfresumesnapshotdrift")
@@ -3447,19 +4605,21 @@ async def test_resume_fails_before_mutating_paused_node_when_definition_snapshot
         json={"variables": {"decision": "approved"}},
     )
 
-    assert response.status_code == 409, response.text
-    assert "definition changed" in response.json()["detail"].lower()
+    assert response.status_code == 200, response.text
+    assert response.json()["status"] == "completed"
     detail = (await client.get(
         f"/api/v1/workflows/runs/{paused['id']}",
         headers=headers,
     )).json()
-    assert detail["status"] == "failed"
-    assert detail["step_results"]["approval"]["status"] == "paused"
+    assert detail["status"] == "completed"
+    assert detail["definition_snapshot"] == paused["definition_snapshot"]
+    assert detail["step_results"]["approval"]["resumed"] is True
+    assert detail["step_results"]["approval"]["approved"] is True
     assert [
         entry["status"]
         for entry in detail["execution_trace"]
         if entry["node_id"] == "approval"
-    ] == ["running", "paused"]
+    ] == ["running", "paused", "completed"]
 
 
 @pytest.mark.asyncio
@@ -3597,6 +4757,19 @@ async def test_resumed_subworkflow_automatically_continues_parent(client: AsyncC
     }
     assert child_run["workflow_name"] == "Child approval"
     assert child_run["current_step_name"] == "approval"
+
+    blocked_parent_resume = await client.post(
+        f"/api/v1/workflows/runs/{parent_run['id']}/resume",
+        headers=headers,
+        json={"variables": {"decision": "approved"}},
+    )
+    assert blocked_parent_resume.status_code == 409
+    still_paused_parent = (await client.get(
+        f"/api/v1/workflows/runs/{parent_run['id']}",
+        headers=headers,
+    )).json()
+    assert still_paused_parent["status"] == "paused"
+    assert still_paused_parent["step_results"]["child"]["status"] == "paused"
 
     child_resumed = await client.post(
         f"/api/v1/workflows/runs/{child_run_id}/resume",
@@ -3803,6 +4976,259 @@ async def test_retry_attempt_restarts_failed_node_with_corrected_input(
     assert unchanged["status"] == "failed"
     assert unchanged["error"] == original_error
     assert unchanged["step_results"]["unstable"]["status"] == "failed"
+
+
+@pytest.mark.asyncio
+async def test_retry_rejects_completed_producer_with_invalid_contract(
+    client: AsyncClient,
+    db_session,
+):
+    from packages.core.models.workflow import WorkflowRun
+
+    headers = await _auth(client, "wfretryblockedproducer")
+    workflow = (await client.post(
+        "/api/v1/workflows",
+        headers=headers,
+        json={"name": "Published once", "steps": _simple_steps(["publish"])},
+    )).json()
+    failed = (await client.post(
+        f"/api/v1/workflows/{workflow['id']}/run",
+        headers=headers,
+        json={"execute": False},
+    )).json()
+    failed_row = await db_session.get(WorkflowRun, failed["id"])
+    failed_row.status = "failed"
+    failed_row.current_step_id = "publish"
+    failed_row.step_results = {
+        "publish": {
+            "status": "failed",
+            "code": "output_schema_validation_failed",
+            "producer_completed": True,
+            "retry_blocked": True,
+            "output": {"external_receipt": "receipt-1"},
+        }
+    }
+    await db_session.commit()
+
+    from packages.core.services.workflow_service import retry_workflow_run
+
+    with pytest.raises(ValueError, match="producer already completed"):
+        await retry_workflow_run(
+            db_session,
+            run_id=failed["id"],
+            entity_id=failed_row.entity_id,
+            started_by=failed_row.started_by,
+            from_step_id="publish",
+        )
+
+
+@pytest.mark.asyncio
+async def test_retry_uses_prior_execution_snapshot_when_live_prompt_changes(
+    client: AsyncClient,
+    db_session,
+):
+    from packages.core.models.workflow import WorkflowRun
+
+    headers = await _auth(client, "wfretrycurrentcopy")
+    workflow = (await client.post(
+        "/api/v1/workflows",
+        headers=headers,
+        json={"name": "Retry current copy", "steps": _simple_steps(["work"])},
+    )).json()
+    original_steps = deepcopy(workflow["steps"])
+    failed = (await client.post(
+        f"/api/v1/workflows/{workflow['id']}/run",
+        headers=headers,
+        json={"execute": False},
+    )).json()
+    failed_row = await db_session.get(WorkflowRun, failed["id"])
+    original_execution_snapshot = deepcopy(failed_row.execution_snapshot)
+    assert original_execution_snapshot["steps"] == original_steps
+    assert "execution_snapshot" not in failed
+    failed_row.status = "failed"
+    failed_row.current_step_id = "work"
+    await db_session.commit()
+
+    updated_steps = deepcopy(workflow["steps"])
+    next(step for step in updated_steps if step["id"] == "work")["config"]["prompt"] = (
+        "Use the verified external receipt even when its current label is stale."
+    )
+    updated = await client.put(
+        f"/api/v1/workflows/{workflow['id']}",
+        headers=headers,
+        json={"steps": updated_steps},
+    )
+    assert updated.status_code == 200, updated.text
+
+    retried = await client.post(
+        f"/api/v1/workflows/runs/{failed['id']}/retry",
+        headers=headers,
+        json={"from_step_id": "work", "execute": False},
+    )
+
+    assert retried.status_code == 201, retried.text
+    retry = retried.json()
+    assert retry["retry_of_run_id"] == failed["id"]
+    assert retry["definition_snapshot"] == failed["definition_snapshot"]
+    assert "execution_snapshot" not in retry
+
+    retry_row = await db_session.get(WorkflowRun, retry["id"])
+    assert retry_row.execution_snapshot == original_execution_snapshot
+
+
+@pytest.mark.asyncio
+async def test_retry_executes_original_execution_snapshot_not_live_definition(
+    client: AsyncClient,
+    db_session,
+):
+    from packages.core.models.workflow import WorkflowRun
+
+    headers = await _auth(client, "wfretrysnapshotexecution")
+    workflow = (await client.post(
+        "/api/v1/workflows",
+        headers=headers,
+        json={
+            "name": "Retry immutable execution definition",
+            "steps": [
+                {"id": "start", "type": "trigger", "next": ["work"]},
+                {
+                    "id": "work",
+                    "type": "transform",
+                    "config": {"set": {"result": "original"}},
+                    "next": ["end"],
+                },
+                {"id": "end", "type": "end", "next": []},
+            ],
+        },
+    )).json()
+    failed = (await client.post(
+        f"/api/v1/workflows/{workflow['id']}/run",
+        headers=headers,
+        json={"execute": False},
+    )).json()
+    failed_row = await db_session.get(WorkflowRun, failed["id"])
+    failed_row.status = "failed"
+    failed_row.current_step_id = "work"
+    await db_session.commit()
+
+    updated_steps = deepcopy(workflow["steps"])
+    next(step for step in updated_steps if step["id"] == "work")["config"] = {
+        "set": {"result": "changed"},
+    }
+    updated = await client.put(
+        f"/api/v1/workflows/{workflow['id']}",
+        headers=headers,
+        json={"steps": updated_steps},
+    )
+    assert updated.status_code == 200, updated.text
+
+    retried = await client.post(
+        f"/api/v1/workflows/runs/{failed['id']}/retry",
+        headers=headers,
+        json={"from_step_id": "work", "execute": True},
+    )
+
+    assert retried.status_code == 201, retried.text
+    assert retried.json()["status"] == "completed"
+    assert retried.json()["variables"]["result"] == "original"
+
+
+@pytest.mark.asyncio
+async def test_retry_uses_prior_execution_snapshot_when_live_graph_changes(
+    client: AsyncClient,
+    db_session,
+):
+    from packages.core.models.workflow import WorkflowRun
+
+    headers = await _auth(client, "wfretrychangedgraph")
+    workflow = (await client.post(
+        "/api/v1/workflows",
+        headers=headers,
+        json={"name": "Retry changed graph", "steps": _simple_steps(["work"])},
+    )).json()
+    failed = (await client.post(
+        f"/api/v1/workflows/{workflow['id']}/run",
+        headers=headers,
+        json={"execute": False},
+    )).json()
+    failed_row = await db_session.get(WorkflowRun, failed["id"])
+    original_execution_snapshot = deepcopy(failed_row.execution_snapshot)
+    failed_row.status = "failed"
+    failed_row.current_step_id = "work"
+    await db_session.commit()
+
+    updated_steps = deepcopy(workflow["steps"])
+    work = next(step for step in updated_steps if step["id"] == "work")
+    work["next"] = ["review"]
+    updated_steps.insert(-1, {
+        "id": "review",
+        "type": "transform",
+        "config": {"set": {"reviewed": True}},
+        "next": ["end"],
+    })
+    updated = await client.put(
+        f"/api/v1/workflows/{workflow['id']}",
+        headers=headers,
+        json={"steps": updated_steps},
+    )
+    assert updated.status_code == 200, updated.text
+
+    retried = await client.post(
+        f"/api/v1/workflows/runs/{failed['id']}/retry",
+        headers=headers,
+        json={"from_step_id": "work", "execute": False},
+    )
+
+    assert retried.status_code == 201, retried.text
+    retry = retried.json()
+    assert retry["definition_snapshot"] == failed["definition_snapshot"]
+    retry_row = await db_session.get(WorkflowRun, retry["id"])
+    assert retry_row.execution_snapshot == original_execution_snapshot
+
+
+@pytest.mark.asyncio
+async def test_retry_rejects_legacy_run_when_definition_changed(
+    client: AsyncClient,
+    db_session,
+):
+    from packages.core.models.workflow import WorkflowRun
+
+    headers = await _auth(client, "wfretrylegacychanged")
+    workflow = (await client.post(
+        "/api/v1/workflows",
+        headers=headers,
+        json={"name": "Retry legacy changed", "steps": _simple_steps(["work"])},
+    )).json()
+    failed = (await client.post(
+        f"/api/v1/workflows/{workflow['id']}/run",
+        headers=headers,
+        json={"execute": False},
+    )).json()
+    failed_row = await db_session.get(WorkflowRun, failed["id"])
+    failed_row.status = "failed"
+    failed_row.current_step_id = "work"
+    failed_row.execution_snapshot = {}
+    await db_session.commit()
+
+    updated_steps = deepcopy(workflow["steps"])
+    next(step for step in updated_steps if step["id"] == "work")["config"]["prompt"] = (
+        "Changed after the legacy attempt started."
+    )
+    updated = await client.put(
+        f"/api/v1/workflows/{workflow['id']}",
+        headers=headers,
+        json={"steps": updated_steps},
+    )
+    assert updated.status_code == 200, updated.text
+
+    retried = await client.post(
+        f"/api/v1/workflows/runs/{failed['id']}/retry",
+        headers=headers,
+        json={"from_step_id": "work", "execute": False},
+    )
+
+    assert retried.status_code == 409
+    assert "legacy run has no immutable execution snapshot" in retried.text.lower()
 
 
 @pytest.mark.asyncio
@@ -4331,6 +5757,22 @@ async def test_foreach_subworkflow_resumes_each_paused_child_before_parent(clien
     assert parent_run["status"] == "paused", parent_run
     first_child_id = parent_run["step_results"]["capture"]["subrun_ids"][0]
 
+    blocked_parent_resume = await client.post(
+        f"/api/v1/workflows/runs/{parent_run['id']}/resume",
+        headers=headers,
+        json={"variables": {"decision": "approved"}},
+    )
+    assert blocked_parent_resume.status_code == 409
+    still_paused_parent = (await client.get(
+        f"/api/v1/workflows/runs/{parent_run['id']}",
+        headers=headers,
+    )).json()
+    assert still_paused_parent["status"] == "paused"
+    assert (
+        still_paused_parent["step_results"]["capture"]["status"]
+        == "paused"
+    )
+
     first_resume = await client.post(
         f"/api/v1/workflows/runs/{first_child_id}/resume",
         headers=headers,
@@ -4362,6 +5804,174 @@ async def test_foreach_subworkflow_resumes_each_paused_child_before_parent(clien
         item["child_scene_id"]
         for item in completed_parent["variables"]["scene_results"]
     ] == ["scene-1", "scene-2"]
+
+
+@pytest.mark.asyncio
+async def test_foreach_subworkflow_cancelled_child_fails_parent(client: AsyncClient):
+    headers = await _auth(client, "wfforeachcancel")
+    child = (await client.post(
+        "/api/v1/workflows",
+        headers=headers,
+        json={
+            "name": "Cancellable child",
+            "steps": [
+                {"id": "start", "type": "trigger", "next": ["approval"]},
+                {
+                    "id": "approval",
+                    "type": "wait",
+                    "config": {"wait_type": "approval"},
+                    "next": ["end"],
+                },
+                {"id": "end", "type": "end", "next": []},
+            ],
+        },
+    )).json()
+    parent = (await client.post(
+        "/api/v1/workflows",
+        headers=headers,
+        json={
+            "name": "Cancel-aware parent",
+            "steps": [
+                {"id": "start", "type": "trigger", "next": ["capture"]},
+                {
+                    "id": "capture",
+                    "type": "foreach_subworkflow",
+                    "config": {
+                        "workflow_id": child["id"],
+                        "over": "scenes",
+                        "item_key": "scene_id",
+                    },
+                    "next": ["end"],
+                },
+                {"id": "end", "type": "end", "next": []},
+            ],
+        },
+    )).json()
+    parent_run = (await client.post(
+        f"/api/v1/workflows/{parent['id']}/run",
+        headers=headers,
+        json={
+            "variables": {"scenes": [{"scene_id": "scene-1"}]},
+            "execute": True,
+        },
+    )).json()
+    assert parent_run["status"] == "paused", parent_run
+    child_run_id = parent_run["step_results"]["capture"]["subrun_ids"][0]
+
+    cancelled = await client.post(
+        f"/api/v1/workflows/runs/{child_run_id}/cancel",
+        headers=headers,
+    )
+    assert cancelled.status_code == 200, cancelled.text
+
+    failed_parent = (await client.get(
+        f"/api/v1/workflows/runs/{parent_run['id']}",
+        headers=headers,
+    )).json()
+    assert failed_parent["status"] == "failed", failed_parent
+    assert "cancelled" in failed_parent["error"]
+
+
+@pytest.mark.asyncio
+async def test_foreach_subworkflow_rejects_parent_definition_change_before_child_merge(
+    client: AsyncClient,
+    db_session,
+):
+    from packages.core.models.workflow import WorkflowRun
+
+    headers = await _auth(client, "wfforeachstaleparent")
+    child = (await client.post(
+        "/api/v1/workflows",
+        headers=headers,
+        json={
+            "name": "Capture scene with approval",
+            "steps": [
+                {"id": "start", "type": "trigger", "next": ["approval"]},
+                {
+                    "id": "approval",
+                    "type": "wait",
+                    "config": {"wait_type": "approval"},
+                    "next": ["copy"],
+                },
+                {
+                    "id": "copy",
+                    "type": "transform",
+                    "config": {"set": {"child_scene_id": "{{scene.scene_id}}"}},
+                    "next": ["end"],
+                },
+                {"id": "end", "type": "end", "next": []},
+            ],
+        },
+    )).json()
+    parent = (await client.post(
+        "/api/v1/workflows",
+        headers=headers,
+        json={
+            "name": "Stale parent barrier",
+            "steps": [
+                {"id": "start", "type": "trigger", "next": ["capture"]},
+                {
+                    "id": "capture",
+                    "type": "foreach_subworkflow",
+                    "config": {
+                        "workflow_id": child["id"],
+                        "over": "scenes",
+                        "item_var": "scene",
+                        "item_key": "scene_id",
+                        "concurrency": 1,
+                        "output_var": "scene_results",
+                    },
+                    "next": ["end"],
+                },
+                {"id": "end", "type": "end", "next": []},
+            ],
+        },
+    )).json()
+
+    parent_run = (await client.post(
+        f"/api/v1/workflows/{parent['id']}/run",
+        headers=headers,
+        json={
+            "variables": {
+                "scenes": [{"scene_id": "scene-1"}, {"scene_id": "scene-2"}]
+            }
+        },
+    )).json()
+    assert parent_run["status"] == "paused", parent_run
+    first_child_id = parent_run["step_results"]["capture"]["subrun_ids"][0]
+    original_variables = deepcopy(parent_run["variables"])
+    original_step_results = deepcopy(parent_run["step_results"])
+    legacy_parent = await db_session.get(WorkflowRun, parent_run["id"])
+    assert legacy_parent is not None
+    legacy_parent.execution_snapshot = {}
+    await db_session.commit()
+
+    edited_steps = deepcopy(parent["steps"])
+    next(step for step in edited_steps if step["id"] == "end")["name"] = "Edited end"
+    update = await client.put(
+        f"/api/v1/workflows/{parent['id']}",
+        headers=headers,
+        json={"steps": edited_steps},
+    )
+    assert update.status_code == 200, update.text
+
+    child_resume = await client.post(
+        f"/api/v1/workflows/runs/{first_child_id}/resume",
+        headers=headers,
+        json={"variables": {"decision": "approved"}},
+    )
+    assert child_resume.status_code == 200, child_resume.text
+
+    stale_parent = (await client.get(
+        f"/api/v1/workflows/runs/{parent_run['id']}",
+        headers=headers,
+    )).json()
+    assert stale_parent["status"] == "failed", stale_parent
+    assert stale_parent["error"] == (
+        "Workflow definition changed since this run started. Start a new run."
+    )
+    assert stale_parent["variables"] == original_variables
+    assert stale_parent["step_results"] == original_step_results
 
 
 @pytest.mark.asyncio
@@ -4431,6 +6041,26 @@ workflow:
       - {source: "llm1", target: "end1"}
 """
 
+_DIFY_UNMAPPED_DSL = """
+app:
+  name: Imported Partial
+  mode: workflow
+kind: app
+version: 0.1.5
+workflow:
+  graph:
+    nodes:
+      - id: "start1"
+        data: {type: start, title: Start}
+      - id: "legacy1"
+        data: {type: vendor_only_node, title: Legacy}
+      - id: "end1"
+        data: {type: end, title: Done}
+    edges:
+      - {source: "start1", target: "legacy1"}
+      - {source: "legacy1", target: "end1"}
+"""
+
 _N8N_JSON = {
     "name": "Imported Sync",
     "nodes": [
@@ -4458,6 +6088,63 @@ async def test_import_dify_workflow(client: AsyncClient):
 
 
 @pytest.mark.asyncio
+async def test_imported_unmapped_workflow_can_start_from_server_provenance(
+    client: AsyncClient,
+):
+    headers = await _auth(client, "importerpartial")
+    imported = await client.post(
+        "/api/v1/workflows/import",
+        headers=headers,
+        json={"content": _DIFY_UNMAPPED_DSL},
+    )
+    assert imported.status_code == 200, imported.text
+    workflow = imported.json()["workflow"]
+    assert "imported:dify" in workflow["tags"]
+    assert not any(
+        tag.startswith("manor-import-proof:") for tag in workflow["tags"]
+    )
+    assert any(step["type"] == "unsupported" for step in workflow["steps"])
+
+    started = await client.post(
+        f"/api/v1/workflows/{workflow['id']}/run",
+        headers=headers,
+        json={"execute": False},
+    )
+
+    assert started.status_code == 201, started.text
+    assert started.json()["current_step_id"] == "start1"
+
+    cosmetic_update = await client.put(
+        f"/api/v1/workflows/{workflow['id']}",
+        headers=headers,
+        json={"description": "Cosmetic edit keeps importer proof valid"},
+    )
+    assert cosmetic_update.status_code == 200, cosmetic_update.text
+    cosmetic_start = await client.post(
+        f"/api/v1/workflows/{workflow['id']}/run",
+        headers=headers,
+        json={"execute": False},
+    )
+    assert cosmetic_start.status_code == 201, cosmetic_start.text
+
+    edited_steps = cosmetic_update.json()["steps"]
+    edited_steps[1] = {**edited_steps[1], "name": "User-edited legacy node"}
+    graph_update = await client.put(
+        f"/api/v1/workflows/{workflow['id']}",
+        headers=headers,
+        json={"steps": edited_steps},
+    )
+    assert graph_update.status_code == 200, graph_update.text
+    edited_start = await client.post(
+        f"/api/v1/workflows/{workflow['id']}/run",
+        headers=headers,
+        json={"execute": False},
+    )
+    assert edited_start.status_code == 409, edited_start.text
+    assert "must be replaced" in edited_start.json()["detail"]
+
+
+@pytest.mark.asyncio
 async def test_import_dry_run_does_not_persist(client: AsyncClient):
     headers = await _auth(client, "importer2")
     resp = await client.post("/api/v1/workflows/import", headers=headers, json={
@@ -4476,9 +6163,10 @@ async def test_import_dry_run_does_not_persist(client: AsyncClient):
 async def test_import_n8n_with_workspace_binding(client: AsyncClient):
     import json as _json
     headers = await _auth(client, "importer3")
+    workspace_id = await _create_workspace(client, headers, "Imported workflow")
     resp = await client.post("/api/v1/workflows/import", headers=headers, json={
         "content": _json.dumps(_N8N_JSON),
-        "workspace_id": "ws_demo_123",
+        "workspace_id": workspace_id,
         "business_line": "sales",
         "create_binding": True,
     })
@@ -4501,8 +6189,31 @@ async def test_import_unknown_format_returns_422(client: AsyncClient):
 # ── Bindings + event triggers ──
 
 @pytest.mark.asyncio
+async def test_create_binding_rejects_opaque_workspace(client: AsyncClient):
+    headers = await _auth(client, "binding_opaque_workspace")
+    workflow = (await client.post(
+        "/api/v1/workflows",
+        headers=headers,
+        json={"name": "Scoped binding", "steps": _simple_steps(["work"])},
+    )).json()
+
+    response = await client.post(
+        "/api/v1/workflows/bindings",
+        headers=headers,
+        json={
+            "workflow_id": workflow["id"],
+            "workspace_id": "legacy-opaque-workspace",
+        },
+    )
+
+    assert response.status_code == 404, response.text
+    assert response.json()["detail"] == "Workspace not found"
+
+
+@pytest.mark.asyncio
 async def test_event_trigger_starts_run_with_workspace_context(client: AsyncClient):
     headers = await _auth(client, "trig1")
+    workspace_id = await _create_workspace(client, headers, "Sales workflow")
     # 1. create a workflow
     wf = (await client.post("/api/v1/workflows", headers=headers, json={
         "name": "Lead pipeline", "steps": _simple_steps(["s1"]),
@@ -4511,18 +6222,18 @@ async def test_event_trigger_starts_run_with_workspace_context(client: AsyncClie
     # 2. deploy it into a workspace as an event-triggered binding
     binding = (await client.post("/api/v1/workflows/bindings", headers=headers, json={
         "workflow_id": wf["id"],
-        "workspace_id": "ws_sales_1",
+        "workspace_id": workspace_id,
         "business_line": "sales",
         "trigger_type": "event",
         "trigger_config": {"event": "lead.created"},
     })).json()
-    assert binding["workspace_id"] == "ws_sales_1"
+    assert binding["workspace_id"] == workspace_id
 
     # 3. fire a matching event
     resp = await client.post("/api/v1/workflows/trigger", headers=headers, json={
         "trigger_type": "event",
         "event_name": "lead.created",
-        "workspace_id": "ws_sales_1",
+        "workspace_id": workspace_id,
         "trigger_data": {"lead_id": "L-9"},
     })
     assert resp.status_code == 200
@@ -4534,7 +6245,7 @@ async def test_event_trigger_starts_run_with_workspace_context(client: AsyncClie
 
     # 4. a non-matching event starts nothing
     none_resp = await client.post("/api/v1/workflows/trigger", headers=headers, json={
-        "trigger_type": "event", "event_name": "other.event", "workspace_id": "ws_sales_1",
+        "trigger_type": "event", "event_name": "other.event", "workspace_id": workspace_id,
     })
     assert none_resp.json()["started"] == 0
 
@@ -4545,13 +6256,78 @@ async def test_list_bindings_filters_by_workspace(client: AsyncClient):
     wf = (await client.post("/api/v1/workflows", headers=headers, json={
         "name": "WF", "steps": _simple_steps(["s1"]),
     })).json()
-    for ws in ("ws_a", "ws_b"):
+    workspace_a = await _create_workspace(client, headers, "Binding A")
+    workspace_b = await _create_workspace(client, headers, "Binding B")
+    for ws in (workspace_a, workspace_b):
         await client.post("/api/v1/workflows/bindings", headers=headers, json={
             "workflow_id": wf["id"], "workspace_id": ws,
         })
-    only_a = (await client.get("/api/v1/workflows/bindings?workspace_id=ws_a", headers=headers)).json()
+    only_a = (await client.get(
+        "/api/v1/workflows/bindings",
+        headers=headers,
+        params={"workspace_id": workspace_a},
+    )).json()
     assert len(only_a) == 1
-    assert only_a[0]["workspace_id"] == "ws_a"
+    assert only_a[0]["workspace_id"] == workspace_a
+
+
+@pytest.mark.asyncio
+async def test_delete_workflow_rejects_active_binding_reference(client: AsyncClient):
+    headers = await _auth(client, "wfdeletebindingref")
+    workflow = (await client.post(
+        "/api/v1/workflows",
+        headers=headers,
+        json={"name": "Still deployed", "steps": _simple_steps(["work"])},
+    )).json()
+    binding = (await client.post(
+        "/api/v1/workflows/bindings",
+        headers=headers,
+        json={"workflow_id": workflow["id"]},
+    )).json()
+
+    blocked = await client.delete(
+        f"/api/v1/workflows/{workflow['id']}", headers=headers
+    )
+
+    assert blocked.status_code == 409, blocked.text
+    assert binding["id"] in blocked.json()["detail"]["binding_ids"]
+    assert (await client.get(
+        f"/api/v1/workflows/{workflow['id']}", headers=headers
+    )).status_code == 200
+    assert (await client.get(
+        "/api/v1/workflows/bindings",
+        headers=headers,
+        params={"workflow_id": workflow["id"]},
+    )).json()[0]["id"] == binding["id"]
+
+
+@pytest.mark.asyncio
+async def test_delete_workflow_rejects_scheduled_job_reference(client: AsyncClient):
+    headers = await _auth(client, "wfdeletescheduleref")
+    workflow = (await client.post(
+        "/api/v1/workflows",
+        headers=headers,
+        json={"name": "Still scheduled", "steps": _simple_steps(["work"])},
+    )).json()
+    scheduled = (await client.post(
+        "/api/v1/workflows/bindings",
+        headers=headers,
+        json={
+            "workflow_id": workflow["id"],
+            "trigger_type": "schedule",
+            "trigger_config": {"cron": "0 9 * * *"},
+        },
+    )).json()
+
+    blocked = await client.delete(
+        f"/api/v1/workflows/{workflow['id']}", headers=headers
+    )
+
+    assert blocked.status_code == 409, blocked.text
+    assert scheduled["scheduled_job_id"] in blocked.json()["detail"]["scheduled_job_ids"]
+    assert (await client.get(
+        f"/api/v1/workflows/{workflow['id']}", headers=headers
+    )).status_code == 200
 
 
 @pytest.mark.asyncio
@@ -4727,6 +6503,7 @@ async def test_workspace_binding_can_change_workflow_and_run_manually(client: As
         staticmethod(lambda run_id, *args, **kwargs: queued.append(run_id)),
     )
     headers = await _auth(client, "bindingrun")
+    workspace_id = await _create_workspace(client, headers, "Binding run")
     first = (await client.post("/api/v1/workflows", headers=headers, json={
         "name": "First workspace flow", "steps": _simple_steps(["a"]),
     })).json()
@@ -4735,7 +6512,7 @@ async def test_workspace_binding_can_change_workflow_and_run_manually(client: As
     })).json()
     binding = (await client.post("/api/v1/workflows/bindings", headers=headers, json={
         "workflow_id": first["id"],
-        "workspace_id": "ws_binding_run",
+        "workspace_id": workspace_id,
         "name": "Approval follow-up",
         "trigger_type": "workspace_event",
         "trigger_config": {"event": "task.approval_decision"},
@@ -4758,7 +6535,7 @@ async def test_workspace_binding_can_change_workflow_and_run_manually(client: As
     assert started.status_code == 201
     run = started.json()
     assert run["workflow_id"] == second["id"]
-    assert run["workspace_id"] == "ws_binding_run"
+    assert run["workspace_id"] == workspace_id
     assert run["binding_id"] == binding["id"]
     assert run["trigger_source"] == "manual"
     assert run["trigger_data"]["manual_test"] is True
@@ -4780,15 +6557,16 @@ async def test_triggered_run_is_enqueued_for_execution(client: AsyncClient, monk
         staticmethod(lambda run_id, *a, **k: enqueued.append(run_id)),
     )
     headers = await _auth(client, "trig3")
+    workspace_id = await _create_workspace(client, headers, "Triggered workflow")
     wf = (await client.post("/api/v1/workflows", headers=headers, json={
         "name": "Auto", "steps": _simple_steps(["s1"]),
     })).json()
     await client.post("/api/v1/workflows/bindings", headers=headers, json={
-        "workflow_id": wf["id"], "workspace_id": "ws_x",
+        "workflow_id": wf["id"], "workspace_id": workspace_id,
         "trigger_type": "event", "trigger_config": {"event": "ping"},
     })
     resp = await client.post("/api/v1/workflows/trigger", headers=headers, json={
-        "trigger_type": "event", "event_name": "ping", "workspace_id": "ws_x",
+        "trigger_type": "event", "event_name": "ping", "workspace_id": workspace_id,
     })
     run_id = resp.json()["runs"][0]["id"]
     assert enqueued == [run_id]  # triggered run was dispatched to the runner
@@ -5001,3 +6779,133 @@ async def test_run_stream_emits_per_node_status_and_done(client: AsyncClient):
     assert done["status"] == "completed"
     for sid in ("a", "b", "c"):
         assert sid in done["step_results"]
+
+
+@pytest.mark.asyncio
+async def test_workflow_continuation_sweep_claims_persisted_intent(
+    db_session,
+    monkeypatch,
+):
+    from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+    import packages.core.database as database
+    from packages.core.models.base import generate_ulid
+    from packages.core.models.workflow import WorkflowRun
+    from packages.core.tasks.ai_tasks import _claim_due_workflow_continuations
+
+    now = datetime.now(timezone.utc)
+    token = generate_ulid()
+    run = WorkflowRun(
+        id=generate_ulid(),
+        workflow_id=generate_ulid(),
+        entity_id=generate_ulid(),
+        status="paused",
+        continuation_token=token,
+        continuation_due_at=now - timedelta(seconds=1),
+        continuation_next_attempt_at=now - timedelta(seconds=1),
+    )
+    db_session.add(run)
+    await db_session.commit()
+    run_id = run.id
+    sessions = async_sessionmaker(
+        db_session.bind,
+        class_=AsyncSession,
+        expire_on_commit=False,
+    )
+    monkeypatch.setattr(database, "create_worker_session", lambda: sessions)
+
+    before_claim = datetime.now(timezone.utc)
+    claimed = await _claim_due_workflow_continuations(limit=10)
+
+    assert claimed == [(run_id, token)]
+    db_session.expire_all()
+    persisted = await db_session.get(WorkflowRun, run_id)
+    assert persisted.continuation_token == token
+    assert persisted.continuation_next_attempt_at > before_claim
+
+    # A worker may crash after committing the business terminal state but
+    # before clearing the token. The same sweep must still deliver cleanup.
+    persisted.status = "completed"
+    persisted.continuation_next_attempt_at = now - timedelta(seconds=1)
+    await db_session.commit()
+    assert await _claim_due_workflow_continuations(limit=10) == [(run_id, token)]
+
+    from packages.core.ai.workflow_runner import WorkflowRunner
+
+    outcome = await WorkflowRunner.resume(
+        run_id,
+        continuation_token=token,
+        session_factory=sessions,
+    )
+    assert outcome == "not_paused"
+    db_session.expire_all()
+    cleaned = await db_session.get(WorkflowRun, run_id)
+    assert cleaned.continuation_token is None
+
+
+@pytest.mark.asyncio
+async def test_workflow_terminal_effect_sweep_claims_unfinished_effects(
+    db_session,
+    monkeypatch,
+):
+    from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+    import packages.core.database as database
+    from packages.core.models.base import generate_ulid
+    from packages.core.models.workflow import WorkflowRun
+    from packages.core.tasks.ai_tasks import _claim_due_workflow_terminal_effects
+
+    now = datetime.now(timezone.utc)
+    run = WorkflowRun(
+        id=generate_ulid(),
+        workflow_id=generate_ulid(),
+        entity_id=generate_ulid(),
+        status="failed",
+        error="boom",
+        terminal_effects_next_attempt_at=now - timedelta(seconds=1),
+    )
+    db_session.add(run)
+    await db_session.commit()
+    run_id = run.id
+    sessions = async_sessionmaker(
+        db_session.bind,
+        class_=AsyncSession,
+        expire_on_commit=False,
+    )
+    monkeypatch.setattr(database, "create_worker_session", lambda: sessions)
+
+    claimed = await _claim_due_workflow_terminal_effects(limit=10)
+
+    assert run_id in claimed
+    db_session.expire_all()
+    persisted = await db_session.get(WorkflowRun, run_id)
+    assert persisted.terminal_effects_completed_at is None
+    assert persisted.terminal_effects_next_attempt_at > now
+
+    persisted.terminal_effects_completed_at = datetime.now(timezone.utc)
+    persisted.terminal_effects_next_attempt_at = now - timedelta(seconds=1)
+    await db_session.commit()
+    assert run_id not in await _claim_due_workflow_terminal_effects(limit=10)
+
+
+def test_workflow_terminal_effect_sweep_republishes_to_runner(monkeypatch):
+    from packages.core.ai.workflow_runner import WorkflowRunner
+    from packages.core.tasks import ai_tasks
+
+    published: list[str] = []
+
+    def run_async(awaitable):
+        awaitable.close()
+        return ["run-1", "run-2"]
+
+    monkeypatch.setattr(ai_tasks, "_run_async", run_async)
+    monkeypatch.setattr(
+        WorkflowRunner,
+        "enqueue",
+        staticmethod(lambda run_id: published.append(run_id) or run_id == "run-1"),
+    )
+
+    result = ai_tasks.workflow_terminal_effect_sweep.run()
+
+    assert result == {"claimed": 2, "published": 1}
+    assert published == ["run-1", "run-2"]

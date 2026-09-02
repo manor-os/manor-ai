@@ -20,7 +20,7 @@ is the one in a non-terminal status; rolling history is preserved.
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Optional
+from typing import Any, Optional
 
 from sqlalchemy import (
     Boolean,
@@ -157,7 +157,10 @@ class ExecutionStep(Base, TimestampMixin):
     # catalog schemas when known, written by Planner LLM for llm/subagent
     # kinds when downstream steps consume structured output.
 
-    result: Mapped[Optional[dict]] = mapped_column(JSONB)
+    # JSON Schema output contracts may be object, array, scalar, or null.
+    # Keep the ORM annotation lossless; the contract, not Python typing,
+    # determines the value shape at runtime.
+    result: Mapped[Any] = mapped_column(JSONB, nullable=True)
     evidence_refs: Mapped[list] = mapped_column(
         JSONB, nullable=False, server_default="[]"
     )

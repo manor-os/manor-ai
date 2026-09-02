@@ -18,6 +18,10 @@ class SandboxSecurityError(SandboxError):
     """Security check failed (HTTP 403)."""
 
 
+class SandboxCapacityError(SandboxError):
+    """Sandbox capacity exhausted (HTTP 429)."""
+
+
 class SandboxRuntimeError(SandboxError):
     """Server-side runtime error (HTTP 500)."""
 

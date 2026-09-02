@@ -25,9 +25,18 @@ RUNTIME_DOCUMENT_AI_DRAFT_FORMAT_HINTS: dict[str, str] = {
         "IMPORTANT: Output ONLY valid HTML. No markdown fences, no explanation."
     ),
     "xlsx": (
-        "IMPORTANT: Output ONLY valid CSV (comma-separated values). First row must "
-        "be column headers. No markdown, no explanation. The data will be "
-        "converted to a spreadsheet."
+        "IMPORTANT: Output ONLY valid JSON with this shape: "
+        "{\"data\":[[cell,...],...],\"charts\":[{\"type\":\"bar|line|pie\","
+        "\"title\":\"...\",\"labelColumn\":0,\"valueColumn\":1,\"startRow\":1,"
+        "\"endRow\":10}],\"styles\":{\"row:column\":{\"bold\":true,"
+        "\"color\":\"FFFFFF\",\"fill\":\"0F766E\",\"align\":\"left|center|right\","
+        "\"numberFormat\":\"0.0%\",\"wrapText\":true}},\"settings\":{"
+        "\"sheetName\":\"Dashboard\",\"freezePane\":\"A2\","
+        "\"showGridLines\":false,\"autoFilter\":\"A1:F20\","
+        "\"columnWidths\":{\"A\":24}}}. Use typed JSON numbers and booleans. "
+        "Write derived cells as Excel formula strings beginning with =, keep assumptions "
+        "in visible cells, format headers and key outputs, and include a chart only when it "
+        "clarifies the data. Omit unused optional fields. No markdown fences or explanation."
     ),
 }
 
@@ -89,8 +98,38 @@ def runtime_docgen_format_hint(format_name: str) -> str:
     if format_name == "pptx":
         return (
             "Structure your output with ## headings for each slide. "
-            "Use bullet points under each heading. Keep text concise — "
-            "these will become presentation slides."
+            "Start with one # deck title. Before writing, infer the audience, the "
+            "communication job, the desired audience outcome, the central takeaway, "
+            "and a cumulative narrative arc. Give every slide one narrative job and "
+            "one claim-led title; keep titles short enough for one line (roughly 8-10 "
+            "English words or 18-24 CJK characters). Use 2-5 concise audience-facing "
+            "points under each heading. Use numbered points for a true sequence and a "
+            "Markdown table only when comparison or evidence is clearer as a table. "
+            "Vary the information structure across adjacent slides instead of repeating "
+            "the same card grid. Open with context or stakes and close with a decision, "
+            "recommendation, synthesis, or explicit next action; do not end with a generic "
+            "Thank You slide. Keep text concise — these will become presentation slides. "
+            "For speaker notes, add an optional ### Notes block inside that slide. For "
+            "every externally sourced non-trivial claim or asset, add a ### Sources block "
+            "with the exact URLs supplied by the user. Never invent citations or URLs."
+        )
+    if format_name == "docx":
+        return (
+            "Write for a polished editable Word document. Do not repeat the document "
+            "title; the renderer adds the title block separately. Begin with a concise "
+            "lead paragraph or the first ## section. Build a clear heading hierarchy, "
+            "short readable paragraphs, and real bullet or numbered lists. Use a table "
+            "only for genuinely comparable rows with shared fields; do not package normal "
+            "prose in tables. Match the document archetype (memo, proposal, SOP, report, "
+            "manual, or brief). When the request matches a photo report, experiment report, "
+            "investment committee memo, legal memo, or formal business letter, preserve its "
+            "native structure: photo/cover metadata; hypothesis/method/results/limitations; "
+            "decision metadata and underwriting; legal question/facts/analysis; or true "
+            "letterhead/recipient/salutation/signature fields respectively. Surface the "
+            "recommendation or reader action early, and "
+            "end with concrete next steps when appropriate. Keep externally sourced "
+            "claims attributable using only URLs or sources supplied by the user; never "
+            "invent citations. Do not emit placeholders, TODOs, or production notes."
         )
     return (
         "Use markdown formatting: # for title, ## for sections, "

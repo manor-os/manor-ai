@@ -30,6 +30,7 @@ import base64
 import argparse
 from pathlib import Path
 from xml.etree import ElementTree as ET
+from defusedxml import ElementTree as SafeET
 
 # Try to import PIL for getting image dimensions
 try:
@@ -229,7 +230,7 @@ def fix_image_aspect_in_svg(svg_path: str, dry_run: bool = False, verbose: bool 
             ET.register_namespace('', uri)
     
     try:
-        tree = ET.parse(svg_path)
+        tree = SafeET.parse(svg_path)
         root = tree.getroot()
     except ET.ParseError as e:
         print(f"  [ERROR] Cannot parse SVG: {e}")

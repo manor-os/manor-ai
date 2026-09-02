@@ -16,6 +16,7 @@ RUNTIME_WORKFLOW_CONTEXT_KEYS = (
     "workflow_project_id",
     "workflow_project_root",
     "workflow_action_grant_id",
+    "workflow_step_id",
     "workflow_scene_id",
     "workflow_batch_capture",
     "approved_plan_version",
@@ -26,6 +27,7 @@ RUNTIME_WORKFLOW_TOOL_CONTEXT_ARGUMENTS = {
     "workflow_project_id": "_workflow_project_id_from_context",
     "workflow_project_root": "_workflow_project_root_from_context",
     "workflow_action_grant_id": "_workflow_action_grant_id_from_context",
+    "workflow_step_id": "_workflow_step_id_from_context",
     "workflow_scene_id": "_workflow_scene_id_from_context",
     "workflow_batch_capture": "_workflow_batch_capture_from_context",
     "approved_plan_version": "_approved_plan_version_from_context",
@@ -36,7 +38,8 @@ RUNTIME_WORKFLOW_TOOL_CONTEXT_ARGUMENTS = {
 class RuntimeWorkflowToolStepResult:
     """Result for a workflow step that executes one Runtime-scoped tool."""
 
-    output: str
+    output: Any
+    structured_output: Any | None
     envelope: RuntimeEnvelope
     allowed_tool_names: set[str]
 
@@ -104,6 +107,7 @@ def runtime_workflow_run_context(run: Any) -> dict[str, str | None]:
         "workflow_project_id",
         "workflow_project_root",
         "workflow_action_grant_id",
+        "workflow_step_id",
         "workflow_scene_id",
         "workflow_batch_capture",
         "approved_plan_version",
@@ -155,6 +159,7 @@ async def runtime_execute_workflow_tool_step(
     )
     return RuntimeWorkflowToolStepResult(
         output=output,
+        structured_output=getattr(output, "structured_content", None),
         envelope=surface.envelope,
         allowed_tool_names=surface.allowed_tool_names,
     )

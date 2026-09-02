@@ -2,7 +2,7 @@
 //
 // Quickstart:
 //
-//   import { ManorWorker, NeedHumanInput } from "@manor/worker-sdk";
+//   import { LeaseResultFactory, ManorWorker, NeedHumanInput } from "@manor/worker-sdk";
 //
 //   const worker = new ManorWorker({
 //     endpoint: "https://manor.example.com",
@@ -14,7 +14,10 @@
 //     const action = lease.action_key!;
 //     const creds = lease.credentials[0]?.value;
 //     // ...do the work...
-//     return { result: { order_id: "..." }, cost: { api_calls: 1, usd: 0 } };
+//     return LeaseResultFactory.envelope({
+//       result: { order_id: "..." },
+//       cost: { api_calls: 1, usd: 0 },
+//     });
 //   });
 //
 //   await worker.runForever();
@@ -29,6 +32,7 @@ export type {
   ManorWorkerOptions,
 } from "./worker.js";
 export {
+  LeaseResultFactory,
   NeedHumanInput,
   NoHandlerError,
   WorkerClientError,
@@ -48,5 +52,6 @@ export type {
   LeaseKind,
   LeaseResult,
   RiskLevel,
+  TaskOutputValueKind,
   WorkerState,
 } from "./types.js";

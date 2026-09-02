@@ -216,6 +216,7 @@ async def runtime_workspace_delegate_service_action(
         from packages.core.ai.context import build_agent_context
         from packages.core.ai.runtime.harness import runtime_execute_chat_agent_loop
         from packages.core.ai.runtime.output_policy import (
+            runtime_is_internal_failure_detail,
             runtime_sanitize_assistant_content_after_loop,
         )
         from packages.core.ai.runtime.streams import (
@@ -353,9 +354,15 @@ async def runtime_workspace_delegate_service_action(
             on_tool_start=on_tool_start,
             on_tool_end=on_tool_end,
         )
+        internal_failure_seen = any(
+            isinstance(runtime_message, dict)
+            and runtime_message.get("role") == "tool"
+            and runtime_is_internal_failure_detail(runtime_message.get("content"))
+            for runtime_message in (result.messages or [])
+        )
         content = runtime_sanitize_assistant_content_after_loop(
             result.content or "",
-            result.tool_calls_made or [],
+            internal_failure_seen=internal_failure_seen,
         )
         run_status = (
             "failed"

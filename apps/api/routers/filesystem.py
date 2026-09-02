@@ -22,36 +22,67 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import fcntl
+import hashlib
 import json as json_mod
 import logging
 import mimetypes
 import os
 import shutil
 import tempfile
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path as _Path
+from types import SimpleNamespace
 from typing import Any
 from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, UploadFile
 from fastapi.responses import FileResponse, Response as RawResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, model_validator
 from sqlalchemy import or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from apps.api.deps import get_current_user
+from apps.api.deps import (
+    authenticated_user_credential_from_claims,
+    get_current_user,
+    require_workspace_readable,
+)
+from apps.api.file_responses import (
+    EntitySnapshotFileResponse as _ReadLockedFileResponse,
+    entity_filesystem_read_boundary as _entity_filesystem_read_boundary,
+)
 from packages.core.database import get_db
+from packages.core.models.document import Document
 from packages.core.models.staff import Staff
 from packages.core.models.user import User
+from packages.core.services.actor_authorization import (
+    AuthenticatedUserCredential,
+    resolve_current_user_actor,
+)
+from packages.core.services.permission_gate import ResourcePermissionGate
+from packages.core.services.filesystem_access import (
+    FilesystemAccessDenied,
+    require_directory_write_access as require_fs_directory_write_access,
+    require_path_mutation_access as require_fs_path_mutation_access,
+    require_path_write_access as require_fs_path_write_access,
+)
 from packages.core.services.entity_fs import (
     EntityFilesystemError,
+    EntityFilesystemBusyError,
+    EntityFileWriteLockMode,
+    EditorWriteIntentStatus,
     SYSTEM_DIRS,
     SYSTEM_FILES,
     assert_entity_filesystem_ready,
     copy_entity_file_atomic,
+    claim_editor_write_intent,
+    entity_filesystem_mutation_lock,
+    finish_entity_filesystem_mutation,
     get_entity_root,
     is_fs_enabled,
     is_system_path,
+    mark_editor_write_intent_committed,
     resolve_path,
     append_log,
     write_entity_file_atomic,
@@ -62,10 +93,16 @@ from packages.core.services.knowledge_visibility import (
     normalize_rel_path,
 )
 from packages.core.services.file_access_tokens import verify_file_access_token
+from packages.core.permissions import user_is_effective_entity_admin
 
 logger = logging.getLogger(__name__)
 
+_finish_filesystem_mutation = finish_entity_filesystem_mutation
+_PATH_WRITE_LOCK_RETRY_SECONDS = 0.01
+_PATH_WRITE_LOCK_TIMEOUT_SECONDS = 5.0
+
 router = APIRouter(prefix="/api/v1/fs", tags=["filesystem"])
+
 
 _ACTIVE_PUBLIC_EXTENSIONS = {
     ".html", ".htm", ".svg", ".xml", ".xhtml", ".js", ".mjs", ".css",
@@ -95,9 +132,178 @@ def _require_fs_ready_for_mutation() -> None:
         ) from exc
 
 
+@asynccontextmanager
+async def _entity_filesystem_mutation_boundary(root: str):
+    """Wait cancellably for the entity mutation lock, mapping contention to 423."""
+    try:
+        async with entity_filesystem_mutation_lock(root):
+            yield
+    except EntityFilesystemBusyError as exc:
+        raise HTTPException(
+            status_code=423,
+            detail="Entity filesystem is busy with another mutation; retry shortly",
+        ) from exc
+
+
+def _try_acquire_path_write_lock(root: str, rel_path: str):
+    """Try once to acquire a cross-process lock without blocking a worker."""
+    lock_dir = os.path.join(root, ".ai", "write-locks")
+    os.makedirs(lock_dir, exist_ok=True)
+    path_hash = hashlib.sha256(rel_path.encode("utf-8")).hexdigest()
+    handle = open(os.path.join(lock_dir, f"{path_hash}.lock"), "a+b")
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        handle.close()
+        return None
+    except Exception:
+        handle.close()
+        raise
+    return handle
+
+
+async def _acquire_path_write_lock(
+    root: str,
+    rel_path: str,
+    *,
+    timeout_seconds: float = _PATH_WRITE_LOCK_TIMEOUT_SECONDS,
+):
+    """Acquire one cancellable, bounded path lock without blocking a worker."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + max(timeout_seconds, 0)
+    while True:
+        handle = await _try_acquire_path_write_lock_cancellably(root, rel_path)
+        if handle is not None:
+            return handle
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            raise HTTPException(
+                status_code=423,
+                detail="File is busy with another mutation; retry shortly",
+            )
+        await asyncio.sleep(min(_PATH_WRITE_LOCK_RETRY_SECONDS, remaining))
+
+
+def _release_path_write_lock(handle) -> None:
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    finally:
+        handle.close()
+
+
+def _release_abandoned_path_write_lock(attempt: asyncio.Task) -> None:
+    """Release a lock acquired after its awaiting request was cancelled."""
+    try:
+        handle = attempt.result()
+    except BaseException:
+        return
+    if handle is not None:
+        _release_path_write_lock(handle)
+
+
+async def _try_acquire_path_write_lock_cancellably(root: str, rel_path: str):
+    attempt = asyncio.create_task(asyncio.to_thread(
+        _try_acquire_path_write_lock,
+        root,
+        rel_path,
+    ))
+    try:
+        return await asyncio.shield(attempt)
+    except asyncio.CancelledError:
+        # asyncio cannot stop a worker thread already performing the nonblocking
+        # filesystem call. Clean up if that thread wins the lock after cancellation.
+        attempt.add_done_callback(_release_abandoned_path_write_lock)
+        raise
+
+
+async def _acquire_path_mutation_locks(
+    root: str,
+    *rel_paths: str,
+    timeout_seconds: float = _PATH_WRITE_LOCK_TIMEOUT_SECONDS,
+):
+    """Acquire path locks in stable order without leaking partial acquisitions."""
+    handles = []
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + max(timeout_seconds, 0)
+    try:
+        for rel_path in sorted(set(rel_paths)):
+            handles.append(await _acquire_path_write_lock(
+                root,
+                rel_path,
+                timeout_seconds=max(deadline - loop.time(), 0),
+            ))
+    except BaseException:
+        for handle in reversed(handles):
+            _release_path_write_lock(handle)
+        raise
+    return handles
+
+
+def _release_path_mutation_locks(handles) -> None:
+    for handle in reversed(handles):
+        _release_path_write_lock(handle)
+
+
 def _file_not_found() -> HTTPException:
     """Return an uncacheable 404 for file-serving misses."""
     return HTTPException(404, "File not found", headers={"Cache-Control": "no-store"})
+
+
+async def _require_path_write_access(
+    db: AsyncSession,
+    *,
+    user: User,
+    rel_path: str,
+    exists: bool,
+) -> None:
+    try:
+        await require_fs_path_write_access(
+            db,
+            user=user,
+            rel_path=rel_path,
+            exists=exists,
+        )
+    except FilesystemAccessDenied as exc:
+        raise HTTPException(exc.status_code, exc.detail) from exc
+
+
+async def _require_directory_write_access(
+    db: AsyncSession,
+    *,
+    user: User,
+    rel_path: str,
+) -> None:
+    try:
+        await require_fs_directory_write_access(
+            db,
+            user=user,
+            rel_path=rel_path,
+        )
+    except FilesystemAccessDenied as exc:
+        raise HTTPException(exc.status_code, exc.detail) from exc
+
+
+async def _require_path_mutation_access(
+    db: AsyncSession,
+    *,
+    user: User,
+    rel_path: str,
+    full_path: str,
+    action: str,
+    destination_rel_path: str | None = None,
+) -> list[Document]:
+    try:
+        return await require_fs_path_mutation_access(
+            db,
+            user=user,
+            rel_path=rel_path,
+            full_path=full_path,
+            entity_root=_entity_root(user.entity_id),
+            action=action,
+            destination_rel_path=destination_rel_path,
+        )
+    except FilesystemAccessDenied as exc:
+        raise HTTPException(exc.status_code, exc.detail) from exc
 
 
 def _signed_file_response_metadata(
@@ -222,53 +428,71 @@ async def _unreadable_doc_paths(
     entity_id: str,
     rel_paths: list[str],
     user: User,
+    *,
+    directory_paths: list[str] | None = None,
+    credential: AuthenticatedUserCredential | None = None,
 ) -> set[str]:
-    """Of ``rel_paths``, return the normalized paths that map to a Knowledge
-    ``Document`` the caller may NOT read.
-
-    Knowledge documents live as real files under the entity FS root, so the
-    raw ``/fs/*`` surface would otherwise serve a document's bytes without
-    consulting ``Document.visibility`` — letting a same-entity member read a
-    private file they cannot see in the Knowledge Base. We gate each path on
-    the same ``user_can_read_document`` guard the ``/documents`` API uses.
-
-    Paths with no matching ``Document`` row (avatars, workspace artifacts,
-    agent scratch) are never blocked here — the existing entity + hidden-path
-    checks already scope those.
-    """
-    from packages.core.models.document import Document
-    from packages.core.services.document_access import user_can_read_document
-
-    wanted = {normalize_rel_path(p) for p in rel_paths if p}
-    if not wanted:
-        return set()
-    rows = (
-        await db.execute(
-            select(Document).where(
-                Document.entity_id == entity_id,
-                Document.fs_path.in_(wanted),
-                Document.is_trashed == False,  # noqa: E712
-            )
-        )
-    ).scalars().all()
+    """Apply the canonical Knowledge/Workspace ACL to raw filesystem paths."""
+    credential = credential or AuthenticatedUserCredential.from_user(user)
+    if credential.entity_id != str(entity_id):
+        raise _file_not_found()
     blocked: set[str] = set()
-    for doc in rows:
-        if not await user_can_read_document(
-            db, doc, entity_id=entity_id, user_id=user.id, role=user.role
-        ):
-            blocked.add(normalize_rel_path(doc.fs_path))
+    directories = directory_paths or []
+    if not rel_paths and not directories:
+        authorized = await ResourcePermissionGate.authorize_filesystem_path_batch(
+            db,
+            credential=credential,
+            rel_paths=[],
+        )
+        if authorized is None:
+            raise _file_not_found()
+        return blocked
+    for start in range(0, len(rel_paths), 400):
+        batch = rel_paths[start:start + 400]
+        authorized = await ResourcePermissionGate.authorize_filesystem_path_batch(
+            db,
+            credential=credential,
+            rel_paths=batch,
+        )
+        if authorized is None:
+            raise _file_not_found()
+        blocked.update(authorized.unreadable_paths)
+    for start in range(0, len(directories), 400):
+        batch = directories[start:start + 400]
+        authorized = await ResourcePermissionGate.authorize_filesystem_path_batch(
+            db,
+            credential=credential,
+            rel_paths=[],
+            directory_paths=batch,
+        )
+        if authorized is None:
+            raise _file_not_found()
+        blocked.update(authorized.unreadable_paths)
     return blocked
 
 
 async def _assert_path_readable(
-    db: AsyncSession, entity_id: str, rel_path: str, user: User
+    db: AsyncSession,
+    entity_id: str,
+    rel_path: str,
+    user: User,
+    *,
+    is_dir: bool = False,
+    credential: AuthenticatedUserCredential | None = None,
 ) -> None:
     """404 if ``rel_path`` is a Knowledge document the caller cannot read.
 
     Raises the same not-found error as a missing file so the endpoint never
     confirms the existence of a private document to an unauthorized member.
     """
-    if await _unreadable_doc_paths(db, entity_id, [rel_path], user):
+    if await _unreadable_doc_paths(
+        db,
+        entity_id,
+        [] if is_dir else [rel_path],
+        user,
+        directory_paths=[rel_path] if is_dir else None,
+        credential=credential,
+    ):
         raise _file_not_found()
 
 
@@ -285,7 +509,10 @@ def _is_public_raw_file_path(rel_path: str) -> bool:
     return any(rel == prefix.rstrip("/") or rel.startswith(prefix) for prefix in _PUBLIC_RAW_PREFIXES)
 
 
-async def _optional_user_from_bearer(request: Request, db: AsyncSession) -> User | None:
+async def _optional_user_from_bearer(
+    request: Request,
+    db: AsyncSession,
+) -> tuple[Any, AuthenticatedUserCredential] | None:
     """Best-effort auth for raw file URLs.
 
     Raw file serving needs a public exception for avatars, but every
@@ -303,9 +530,24 @@ async def _optional_user_from_bearer(request: Request, db: AsyncSession) -> User
     if not user_id:
         return None
     user = await get_user_by_id(db, user_id)
-    if not user or user.status != "active":
+    token_entity_id = str(claims.get("entity_id") or getattr(user, "entity_id", "") or "")
+    credential = authenticated_user_credential_from_claims(
+        user_id=str(user_id),
+        entity_id=token_entity_id,
+        claims=claims,
+    )
+    actor = await resolve_current_user_actor(db, credential)
+    if not user or actor is None:
         return None
-    return user
+    return (
+        SimpleNamespace(
+            id=actor.user_id,
+            entity_id=actor.entity_id,
+            role=actor.role,
+            token_version=credential.token_version,
+        ),
+        credential,
+    )
 
 
 def _file_info(full_path: str, root: str) -> dict[str, Any]:
@@ -315,21 +557,15 @@ def _file_info(full_path: str, root: str) -> dict[str, Any]:
     is_dir = os.path.isdir(full_path)
     try:
         stat = os.stat(full_path)
-        item_count = None
-        if is_dir:
-            try:
-                item_count = len([
-                    e for e in os.listdir(full_path)
-                    if _is_visible_browser_item(os.path.join(full_path, e), root)
-                ])
-            except OSError:
-                item_count = 0
         return {
             "name": name,
             "path": rel,
             "type": "directory" if is_dir else "file",
             "size": stat.st_size if not is_dir else None,
-            "item_count": item_count,
+            # A raw child count leaks the existence of entries removed by the
+            # Document/folder ACL pass. Callers can derive authorized children
+            # by listing the directory instead.
+            "item_count": None,
             "modified": datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).isoformat(),
             "created": datetime.fromtimestamp(stat.st_ctime, tz=timezone.utc).isoformat(),
             "mime_type": mimetypes.guess_type(name)[0] if not is_dir else None,
@@ -345,6 +581,14 @@ def _file_info(full_path: str, root: str) -> dict[str, Any]:
 class WriteRequest(BaseModel):
     path: str
     content: str
+    save_session_id: str | None = Field(default=None, min_length=1, max_length=128)
+    save_sequence: int | None = Field(default=None, ge=1, le=9_007_199_254_740_991)
+
+    @model_validator(mode="after")
+    def validate_save_intent(self):
+        if (self.save_session_id is None) != (self.save_sequence is None):
+            raise ValueError("save_session_id and save_sequence must be provided together")
+        return self
 
 
 class MkdirRequest(BaseModel):
@@ -370,6 +614,7 @@ async def list_directory(
     db: AsyncSession = Depends(get_db),
 ):
     """List contents of a directory."""
+    credential = AuthenticatedUserCredential.from_user(user)
     _require_fs()
     root = _entity_root(user.entity_id)
     full = _resolve(user.entity_id, path)
@@ -389,19 +634,27 @@ async def list_directory(
         items.sort(key=lambda x: (0 if x["type"] == "directory" else 1, x["name"].lower()))
         return items
 
-    items = await asyncio.to_thread(_list)
-    if items is None:
-        raise HTTPException(404, f"Directory not found: {path}")
-    # Drop files that map to a Knowledge document the caller cannot read.
-    blocked = await _unreadable_doc_paths(
-        db,
-        user.entity_id,
-        [i["path"] for i in items if i["type"] != "directory"],
-        user,
-    )
-    if blocked:
-        items = [i for i in items if normalize_rel_path(i["path"]) not in blocked]
-    return {"items": items, "path": os.path.relpath(full, root), "count": len(items)}
+    async with _entity_filesystem_read_boundary(root):
+        if rel:
+            await _assert_path_readable(
+                db, user.entity_id, rel, user, is_dir=True
+                , credential=credential
+            )
+        items = await asyncio.to_thread(_list)
+        if items is None:
+            raise HTTPException(404, f"Directory not found: {path}")
+        # Drop files that map to a Knowledge document the caller cannot read.
+        blocked = await _unreadable_doc_paths(
+            db,
+            user.entity_id,
+            [i["path"] for i in items if i["type"] != "directory"],
+            user,
+            directory_paths=[i["path"] for i in items if i["type"] == "directory"],
+            credential=credential,
+        )
+        if blocked:
+            items = [i for i in items if normalize_rel_path(i["path"]) not in blocked]
+        return {"items": items, "path": os.path.relpath(full, root), "count": len(items)}
 
 
 @router.get("/tree")
@@ -412,61 +665,83 @@ async def directory_tree(
     db: AsyncSession = Depends(get_db),
 ):
     """Full directory tree for sidebar file browser."""
+    credential = AuthenticatedUserCredential.from_user(user)
     _require_fs()
     root = _entity_root(user.entity_id)
 
-    def walk(dir_path: str, depth: int) -> list[dict]:
-        if depth > max_depth:
-            return []
-        items = []
-        try:
-            entries = sorted(os.listdir(dir_path))
-        except OSError:
-            return []
-        for name in entries:
-            if _is_hidden(name, show_system):
+    def scan_level(
+        parents: list[tuple[str, list[dict[str, Any]]]],
+    ) -> list[tuple[list[dict[str, Any]], dict[str, Any], str]]:
+        candidates = []
+        for dir_path, target in parents:
+            try:
+                with os.scandir(dir_path) as entries:
+                    level_entries = sorted(entries, key=lambda entry: entry.name.lower())
+            except OSError:
                 continue
-            full = os.path.join(dir_path, name)
-            if not _is_visible_browser_item(full, root, show_system=show_system):
-                continue
-            rel = os.path.relpath(full, root)
-            is_dir = os.path.isdir(full)
-            node: dict[str, Any] = {"name": name, "path": rel, "type": "directory" if is_dir else "file"}
-            if is_dir:
-                node["children"] = walk(full, depth + 1)
-            else:
-                node["extension"] = os.path.splitext(name)[1]
-            items.append(node)
-        items.sort(key=lambda x: (0 if x["type"] == "directory" else 1, x["name"].lower()))
-        return items
+            nodes = []
+            for entry in level_entries:
+                name = entry.name
+                if _is_hidden(name, show_system):
+                    continue
+                full = entry.path
+                if not _is_visible_browser_item(
+                    full,
+                    root,
+                    show_system=show_system,
+                ):
+                    continue
+                rel = os.path.relpath(full, root)
+                is_dir = entry.is_dir(follow_symlinks=False)
+                node: dict[str, Any] = {
+                    "name": name,
+                    "path": rel,
+                    "type": "directory" if is_dir else "file",
+                }
+                if is_dir:
+                    node["children"] = []
+                else:
+                    node["extension"] = os.path.splitext(name)[1]
+                nodes.append((target, node, full))
+            nodes.sort(key=lambda item: (
+                0 if item[1]["type"] == "directory" else 1,
+                item[1]["name"].lower(),
+            ))
+            candidates.extend(nodes)
+        return candidates
 
-    tree = await asyncio.to_thread(walk, root, 1)
-
-    # Prune files that map to a Knowledge document the caller cannot read.
-    file_paths: list[str] = []
-
-    def _collect(nodes: list[dict]) -> None:
-        for node in nodes:
-            if node["type"] == "directory":
-                _collect(node.get("children", []))
-            else:
-                file_paths.append(node["path"])
-
-    _collect(tree)
-    blocked = await _unreadable_doc_paths(db, user.entity_id, file_paths, user)
-    if blocked:
-        def _prune(nodes: list[dict]) -> list[dict]:
-            kept = []
-            for node in nodes:
+    async with _entity_filesystem_read_boundary(root):
+        tree: list[dict[str, Any]] = []
+        parents = [(root, tree)]
+        for _depth in range(1, max_depth + 1):
+            candidates = await asyncio.to_thread(scan_level, parents)
+            blocked = await _unreadable_doc_paths(
+                db,
+                user.entity_id,
+                [
+                    node["path"]
+                    for _target, node, _full in candidates
+                    if node["type"] == "file"
+                ],
+                user,
+                directory_paths=[
+                    node["path"]
+                    for _target, node, _full in candidates
+                    if node["type"] == "directory"
+                ],
+                credential=credential,
+            )
+            next_parents = []
+            for target, node, full in candidates:
+                if normalize_rel_path(node["path"]) in blocked:
+                    continue
+                target.append(node)
                 if node["type"] == "directory":
-                    node["children"] = _prune(node.get("children", []))
-                    kept.append(node)
-                elif normalize_rel_path(node["path"]) not in blocked:
-                    kept.append(node)
-            return kept
-
-        tree = _prune(tree)
-    return {"tree": tree, "entity_id": user.entity_id}
+                    next_parents.append((full, node["children"]))
+            parents = next_parents
+            if not parents:
+                break
+        return {"tree": tree, "entity_id": user.entity_id}
 
 
 @router.get("/read")
@@ -476,13 +751,12 @@ async def read_file(
     db: AsyncSession = Depends(get_db),
 ):
     """Read file content. Returns text for text files, base64 for binary."""
+    credential = AuthenticatedUserCredential.from_user(user)
     _require_fs()
     full = _resolve(user.entity_id, path)
     root = _entity_root(user.entity_id)
     rel = normalize_rel_path(os.path.relpath(full, root))
     _assert_user_visible_rel(rel, is_dir=False, action="read")
-    await _assert_path_readable(db, user.entity_id, rel, user)
-
     def _read():
         if not os.path.isfile(full):
             return None
@@ -505,10 +779,17 @@ async def read_file(
             data = f.read()
         return {**meta, "content": base64.b64encode(data).decode("ascii"), "encoding": "base64"}
 
-    result = await asyncio.to_thread(_read)
-    if result is None:
-        raise HTTPException(404, f"File not found: {path}")
-    return result
+    async with _entity_filesystem_read_boundary(root):
+        await _assert_path_readable(
+            db, user.entity_id, rel, user, credential=credential,
+        )
+        result = await asyncio.to_thread(_read)
+        if result is None:
+            raise HTTPException(404, f"File not found: {path}")
+        await _assert_path_readable(
+            db, user.entity_id, rel, user, credential=credential,
+        )
+        return result
 
 
 @router.get("/info")
@@ -518,24 +799,39 @@ async def file_info(
     db: AsyncSession = Depends(get_db),
 ):
     """Get file/directory metadata."""
+    credential = AuthenticatedUserCredential.from_user(user)
     _require_fs()
     full = _resolve(user.entity_id, path)
     root = _entity_root(user.entity_id)
-    if os.path.exists(full):
-        rel = normalize_rel_path(os.path.relpath(full, root))
-        _assert_user_visible_rel(rel, is_dir=os.path.isdir(full), action="inspect")
-        if not os.path.isdir(full):
-            await _assert_path_readable(db, user.entity_id, rel, user)
-
     def _info():
         if not os.path.exists(full):
             return None
         return _file_info(full, root)
 
-    result = await asyncio.to_thread(_info)
-    if result is None:
-        raise HTTPException(404, f"Not found: {path}")
-    return result
+    async with _entity_filesystem_read_boundary(root):
+        if os.path.exists(full):
+            rel = normalize_rel_path(os.path.relpath(full, root))
+            _assert_user_visible_rel(rel, is_dir=os.path.isdir(full), action="inspect")
+            await _assert_path_readable(
+                db,
+                user.entity_id,
+                rel,
+                user,
+                is_dir=os.path.isdir(full),
+                credential=credential,
+            )
+        result = await asyncio.to_thread(_info)
+        if result is None:
+            raise HTTPException(404, f"Not found: {path}")
+        await _assert_path_readable(
+            db,
+            user.entity_id,
+            normalize_rel_path(os.path.relpath(full, root)),
+            user,
+            is_dir=os.path.isdir(full),
+            credential=credential,
+        )
+        return result
 
 
 @router.post("/write")
@@ -552,37 +848,133 @@ async def write_file(
     _assert_user_visible_rel(rel, is_dir=False, action="write")
     content_bytes = req.content.encode("utf-8")
 
-    def _write():
-        target = write_entity_file_atomic(
-            user.entity_id,
-            rel,
-            content_bytes,
-            expected_size=len(content_bytes),
-            allow_empty=True,
-        )
-        append_log(user.entity_id, "WRITE", f"{user.email} wrote {req.path}")
-        return target
+    async def _persist_write_and_sync():
+        staging_dir: str | None = None
+        backup_path: str | None = None
+        if os.path.exists(full):
+            staging_root = os.path.join(root, ".trash", "filesystem-write")
+            os.makedirs(staging_root, exist_ok=True)
+            staging_dir = tempfile.mkdtemp(prefix="write-", dir=staging_root)
+            backup_path = os.path.join(staging_dir, os.path.basename(full))
+            await asyncio.to_thread(os.replace, full, backup_path)
 
-    full = await asyncio.to_thread(_write)
-    sync_info = {"synced": False, "reason": "not_synced"}
-    try:
-        from packages.core.services.knowledge_sync import sync_file_to_knowledge
-        sync = await sync_file_to_knowledge(
-            entity_id=user.entity_id,
-            abs_path=full,
-            entity_root=_entity_root(user.entity_id),
-            source="manual",
-            created_by=(user.display_name or user.email),
-            force=True,
+        def _write():
+            try:
+                return write_entity_file_atomic(
+                    user.entity_id,
+                    rel,
+                    content_bytes,
+                    expected_size=len(content_bytes),
+                    allow_empty=True,
+                    lock_mode=EntityFileWriteLockMode.ALREADY_HELD,
+                )
+            except Exception:
+                if backup_path is not None:
+                    os.makedirs(os.path.dirname(full), exist_ok=True)
+                    os.replace(backup_path, full)
+                if staging_dir is not None:
+                    shutil.rmtree(staging_dir, ignore_errors=True)
+                raise
+
+        written_path = await asyncio.to_thread(_write)
+        try:
+            from packages.core.services.knowledge_sync import sync_file_to_knowledge
+            sync = await sync_file_to_knowledge(
+                entity_id=user.entity_id,
+                abs_path=written_path,
+                entity_root=_entity_root(user.entity_id),
+                source="manual",
+                created_by=user.id,
+                user_id=user.id,
+                force=True,
+                db=db,
+                commit=True,
+            )
+            if not sync.synced:
+                raise RuntimeError(sync.reason or "Knowledge projection was not created")
+        except Exception as exc:
+            try:
+                if os.path.exists(written_path):
+                    await asyncio.to_thread(os.remove, written_path)
+                if backup_path is not None:
+                    os.makedirs(os.path.dirname(full), exist_ok=True)
+                    await asyncio.to_thread(os.replace, backup_path, full)
+                if staging_dir is not None:
+                    await asyncio.to_thread(shutil.rmtree, staging_dir, True)
+            except Exception:
+                logger.critical("filesystem write rollback failed", exc_info=True)
+            raise HTTPException(
+                status_code=500,
+                detail="Write could not be synchronized with Knowledge",
+            ) from exc
+        if staging_dir is not None:
+            await asyncio.to_thread(shutil.rmtree, staging_dir, True)
+        append_log(user.entity_id, "WRITE", f"{user.email} wrote {req.path}")
+        return sync
+
+    async with _entity_filesystem_mutation_boundary(root):
+        await _require_path_write_access(
+            db,
+            user=user,
+            rel_path=rel,
+            exists=os.path.exists(full),
         )
-        sync_info = {"synced": sync.synced, "document_id": sync.document_id, "reason": sync.reason}
-    except Exception:
-        logger.warning("filesystem write sync failed", exc_info=True)
+        if os.path.isdir(full):
+            raise HTTPException(
+                status_code=409,
+                detail="A directory already exists at this path",
+            )
+        lock_handles = await _acquire_path_mutation_locks(root, rel)
+        lock_handle = lock_handles[0]
+        try:
+            async def _write_and_sync():
+                claim_result = None
+                if req.save_session_id is not None and req.save_sequence is not None:
+                    claim_result = await asyncio.to_thread(
+                        claim_editor_write_intent,
+                        lock_handle,
+                        req.save_session_id,
+                        req.save_sequence,
+                        req.content,
+                    )
+                    if claim_result.status is EditorWriteIntentStatus.STALE:
+                        raise HTTPException(
+                            status_code=409,
+                            detail={
+                                "code": "stale_write_intent",
+                                "message": "A newer save already exists for this file",
+                            },
+                        )
+                    if claim_result.status is EditorWriteIntentStatus.REPLAYED:
+                        return claim_result.receipt or {}
+                sync_result = await _persist_write_and_sync()
+                receipt = {
+                    "document_id": sync_result.document_id,
+                    "reason": sync_result.reason,
+                }
+                if req.save_session_id is not None and req.save_sequence is not None:
+                    await asyncio.to_thread(
+                        mark_editor_write_intent_committed,
+                        lock_handle,
+                        req.save_session_id,
+                        req.save_sequence,
+                        req.content,
+                        receipt=receipt,
+                    )
+                return receipt
+
+            sync_receipt = await _finish_filesystem_mutation(_write_and_sync())
+        finally:
+            _release_path_mutation_locks(lock_handles)
     return {
         "status": "ok",
         "path": req.path,
         "size": len(req.content.encode("utf-8")),
-        "knowledge_sync": sync_info,
+        "knowledge_sync": {
+            "synced": True,
+            "document_id": sync_receipt.get("document_id"),
+            "reason": sync_receipt.get("reason"),
+        },
     }
 
 
@@ -590,6 +982,7 @@ async def write_file(
 async def make_directory(
     req: MkdirRequest,
     user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
 ):
     """Create a directory (and parents)."""
     _require_fs_ready_for_mutation()
@@ -597,12 +990,41 @@ async def make_directory(
     root = _entity_root(user.entity_id)
     rel = normalize_rel_path(os.path.relpath(full, root))
     _assert_user_visible_rel(rel, is_dir=True, action="create")
-    await asyncio.to_thread(os.makedirs, full, exist_ok=True)
-    try:
-        from packages.core.services.knowledge_sync import ensure_folder_path
-        await ensure_folder_path(user.entity_id, os.path.relpath(full, _entity_root(user.entity_id)))
-    except Exception:
-        logger.warning("filesystem mkdir sync failed", exc_info=True)
+
+    async with _entity_filesystem_mutation_boundary(root):
+        lock_handles = await _acquire_path_mutation_locks(root, rel)
+        try:
+            existed = os.path.isdir(full)
+            await _require_directory_write_access(
+                db,
+                user=user,
+                rel_path=rel if existed else os.path.dirname(rel),
+            )
+
+            async def _mkdir_and_sync():
+                await asyncio.to_thread(os.makedirs, full, exist_ok=True)
+                try:
+                    from packages.core.services.knowledge_sync import ensure_folder_path
+                    folder_id = await ensure_folder_path(
+                        user.entity_id,
+                        os.path.relpath(full, _entity_root(user.entity_id)),
+                        owner_id=user.id,
+                        db=db,
+                    )
+                    if not folder_id:
+                        raise RuntimeError("Knowledge folder projection was not created")
+                    await db.commit()
+                except Exception as exc:
+                    if not existed:
+                        await asyncio.to_thread(shutil.rmtree, full, True)
+                    raise HTTPException(
+                        status_code=500,
+                        detail="Directory could not be synchronized with Knowledge",
+                    ) from exc
+
+            await _finish_filesystem_mutation(_mkdir_and_sync())
+        finally:
+            _release_path_mutation_locks(lock_handles)
     return {"status": "ok", "path": req.path}
 
 
@@ -610,31 +1032,81 @@ async def make_directory(
 async def move_file(
     req: MoveRequest,
     user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
 ):
     """Move or rename a file/directory."""
     _require_fs_ready_for_mutation()
     src = _resolve(user.entity_id, req.src)
     dest = _resolve(user.entity_id, req.dest)
-    if not os.path.exists(src):
-        raise HTTPException(404, f"Source not found: {req.src}")
-    src_is_dir = os.path.isdir(src)
-    _assert_user_visible_rel(req.src, is_dir=src_is_dir, action="move")
-    _assert_user_visible_rel(req.dest, is_dir=src_is_dir, action="move to")
+    root = _entity_root(user.entity_id)
+    src_rel = normalize_rel_path(os.path.relpath(src, root))
+    dest_rel = normalize_rel_path(os.path.relpath(dest, root))
 
-    def _move():
-        os.makedirs(os.path.dirname(dest), exist_ok=True)
-        shutil.move(src, dest)
-        append_log(user.entity_id, "MOVE", f"{user.email} moved {req.src} → {req.dest}")
-        return True
+    async with _entity_filesystem_mutation_boundary(root):
+        lock_handles = await _acquire_path_mutation_locks(root, src_rel, dest_rel)
+        try:
+            if not os.path.exists(src):
+                raise HTTPException(404, f"Source not found: {req.src}")
+            src_is_dir = os.path.isdir(src)
+            _assert_user_visible_rel(src_rel, is_dir=src_is_dir, action="move")
+            _assert_user_visible_rel(dest_rel, is_dir=src_is_dir, action="move to")
+            source_documents = await _require_path_mutation_access(
+                db,
+                user=user,
+                rel_path=src_rel,
+                full_path=src,
+                action="move",
+                destination_rel_path=dest_rel,
+            )
+            if src == dest:
+                return {"status": "ok", "src": req.src, "dest": req.dest}
+            if os.path.exists(dest):
+                raise HTTPException(
+                    status_code=409,
+                    detail="Move destination already exists; delete it explicitly before replacing it",
+                )
+            if (
+                not await user_is_effective_entity_admin(db, user)
+                and os.path.dirname(src_rel) != os.path.dirname(dest_rel)
+            ):
+                raise HTTPException(
+                    status_code=403,
+                    detail="Move files through Knowledge when changing their parent folder",
+                )
 
-    await asyncio.to_thread(_move)
+            def _move():
+                os.makedirs(os.path.dirname(dest), exist_ok=True)
+                shutil.move(src, dest)
+                return True
 
-    # Keep Knowledge projection in sync with filesystem moves/renames.
-    try:
-        from packages.core.services.knowledge_sync import move_path
-        await move_path(user.entity_id, req.src, req.dest)
-    except Exception:
-        logger.warning("filesystem move sync failed", exc_info=True)
+            async def _move_and_sync():
+                await asyncio.to_thread(_move)
+                try:
+                    from packages.core.services.knowledge_sync import move_path
+                    changed = await move_path(
+                        user.entity_id,
+                        src_rel,
+                        dest_rel,
+                        db=db,
+                        commit=True,
+                    )
+                    if source_documents and not changed:
+                        raise RuntimeError("Knowledge projection did not move")
+                except Exception as exc:
+                    try:
+                        os.makedirs(os.path.dirname(src), exist_ok=True)
+                        await asyncio.to_thread(os.replace, dest, src)
+                    except Exception:
+                        logger.critical("filesystem move rollback failed", exc_info=True)
+                    raise HTTPException(
+                        status_code=500,
+                        detail="Move could not be synchronized with Knowledge",
+                    ) from exc
+                append_log(user.entity_id, "MOVE", f"{user.email} moved {req.src} → {req.dest}")
+
+            await _finish_filesystem_mutation(_move_and_sync())
+        finally:
+            _release_path_mutation_locks(lock_handles)
 
     return {"status": "ok", "src": req.src, "dest": req.dest}
 
@@ -644,6 +1116,7 @@ async def move_file(
 async def delete_file(
     req: DeleteRequest,
     user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
 ):
     """Delete a file or directory. System files are protected."""
     _require_fs_ready_for_mutation()
@@ -651,26 +1124,58 @@ async def delete_file(
     if basename in SYSTEM_FILES or basename in SYSTEM_DIRS:
         raise HTTPException(403, f"Cannot delete system file: {basename}")
     full = _resolve(user.entity_id, req.path)
-    if not os.path.exists(full):
-        raise HTTPException(404, f"Not found: {req.path}")
-    _assert_user_visible_rel(req.path, is_dir=os.path.isdir(full), action="delete")
+    root = _entity_root(user.entity_id)
+    rel = normalize_rel_path(os.path.relpath(full, root))
 
-    def _delete():
-        if os.path.isdir(full):
-            shutil.rmtree(full)
-        else:
-            os.remove(full)
-        append_log(user.entity_id, "DELETE", f"{user.email} deleted {req.path}")
-        return True
+    async with _entity_filesystem_mutation_boundary(root):
+        lock_handles = await _acquire_path_mutation_locks(root, rel)
+        try:
+            if not os.path.exists(full):
+                raise HTTPException(404, f"Not found: {req.path}")
+            _assert_user_visible_rel(rel, is_dir=os.path.isdir(full), action="delete")
+            source_documents = await _require_path_mutation_access(
+                db,
+                user=user,
+                rel_path=rel,
+                full_path=full,
+                action="delete",
+            )
 
-    await asyncio.to_thread(_delete)
+            async def _delete_and_sync():
+                staging_root = os.path.join(root, ".trash", "filesystem-delete")
+                os.makedirs(staging_root, exist_ok=True)
+                staging_dir = tempfile.mkdtemp(prefix="delete-", dir=staging_root)
+                staged = os.path.join(staging_dir, os.path.basename(full))
+                await asyncio.to_thread(os.replace, full, staged)
+                try:
+                    from packages.core.services.knowledge_sync import trash_path
+                    changed = await trash_path(
+                        user.entity_id,
+                        rel,
+                        is_directory=os.path.isdir(staged),
+                        db=db,
+                        commit=True,
+                    )
+                    if source_documents and not changed:
+                        raise RuntimeError("Knowledge projection did not move to Trash")
+                except Exception as exc:
+                    try:
+                        os.makedirs(os.path.dirname(full), exist_ok=True)
+                        await asyncio.to_thread(os.replace, staged, full)
+                        await asyncio.to_thread(shutil.rmtree, staging_dir, True)
+                    except Exception:
+                        logger.critical("filesystem delete rollback failed", exc_info=True)
+                    raise HTTPException(
+                        status_code=500,
+                        detail="Delete could not be synchronized with Knowledge",
+                    ) from exc
 
-    # Keep Knowledge projection in sync with filesystem deletes.
-    try:
-        from packages.core.services.knowledge_sync import trash_path
-        await trash_path(user.entity_id, req.path)
-    except Exception:
-        logger.warning("filesystem delete sync failed", exc_info=True)
+                await asyncio.to_thread(shutil.rmtree, staging_dir, True)
+                append_log(user.entity_id, "DELETE", f"{user.email} deleted {req.path}")
+
+            await _finish_filesystem_mutation(_delete_and_sync())
+        finally:
+            _release_path_mutation_locks(lock_handles)
 
     return {"status": "ok", "path": req.path}
 
@@ -681,6 +1186,7 @@ async def upload_file(
     user: User = Depends(get_current_user),
     path: str = Query(".", description="Target directory path"),
     file: UploadFile = File(...),
+    db: AsyncSession = Depends(get_db),
 ):
     """Upload a binary file to the entity filesystem."""
     _require_fs_ready_for_mutation()
@@ -688,6 +1194,11 @@ async def upload_file(
     root = _entity_root(user.entity_id)
     target_rel = normalize_rel_path(os.path.relpath(target_dir, root))
     _assert_user_visible_rel(target_rel, is_dir=True, action="upload to")
+    await _require_directory_write_access(
+        db,
+        user=user,
+        rel_path=target_rel,
+    )
     filename = os.path.basename(file.filename or "upload")
     if not filename:
         raise HTTPException(400, "Invalid filename")
@@ -695,14 +1206,12 @@ async def upload_file(
     _assert_user_visible_rel(candidate_rel, is_dir=False, action="upload")
 
     def _prepare_rel():
-        os.makedirs(target_dir, exist_ok=True)
         t = os.path.join(target_dir, filename)
         if os.path.exists(t):
             base_name, ext = os.path.splitext(filename)
             t = os.path.join(target_dir, f"{base_name}_{int(datetime.now().timestamp())}{ext}")
         return normalize_rel_path(os.path.relpath(t, root))
 
-    rel_target = await asyncio.to_thread(_prepare_rel)
     fd, tmp_path = tempfile.mkstemp(prefix="manor-upload-", suffix=".tmp")
     os.close(fd)
     total = 0
@@ -727,44 +1236,85 @@ async def upload_file(
         except UploadSecurityError as exc:
             raise HTTPException(exc.status_code, str(exc)) from exc
 
-        def _persist_upload():
-            target = copy_entity_file_atomic(
-                user.entity_id,
-                rel_target,
-                tmp_path,
-                expected_size=total,
-                allow_empty=True,
-            )
-            rel = normalize_rel_path(os.path.relpath(target, root))
-            append_log(user.entity_id, "UPLOAD", f"{user.email} uploaded {rel}")
-            return target, rel
+        async with _entity_filesystem_mutation_boundary(root):
+            # Serialize destination selection with writes and moves so a
+            # collision cannot change between naming and persistence.
+            rel_target = await asyncio.to_thread(_prepare_rel)
 
-        target, rel_path = await asyncio.to_thread(_persist_upload)
+            def _persist_upload():
+                target = copy_entity_file_atomic(
+                    user.entity_id,
+                    rel_target,
+                    tmp_path,
+                    expected_size=total,
+                    allow_empty=True,
+                    lock_mode=EntityFileWriteLockMode.ALREADY_HELD,
+                )
+                rel = normalize_rel_path(os.path.relpath(target, root))
+                return target, rel
+
+            lock_handles = await _acquire_path_mutation_locks(root, rel_target)
+            try:
+                await _require_directory_write_access(
+                    db,
+                    user=user,
+                    rel_path=target_rel,
+                )
+                if os.path.exists(_resolve(user.entity_id, rel_target)):
+                    raise HTTPException(
+                        status_code=409,
+                        detail="Upload destination changed; retry the upload",
+                    )
+
+                async def _upload_and_sync():
+                    target, rel_path = await asyncio.to_thread(_persist_upload)
+                    try:
+                        from packages.core.services.knowledge_sync import sync_file_to_knowledge
+                        sync = await sync_file_to_knowledge(
+                            entity_id=user.entity_id,
+                            abs_path=target,
+                            entity_root=_entity_root(user.entity_id),
+                            source="upload",
+                            created_by=user.id,
+                            user_id=user.id,
+                            force=True,
+                            db=db,
+                            commit=True,
+                        )
+                        if not sync.synced:
+                            raise RuntimeError(sync.reason or "Knowledge projection was not created")
+                    except Exception as exc:
+                        try:
+                            await asyncio.to_thread(os.remove, target)
+                        except OSError:
+                            logger.critical("filesystem upload rollback failed", exc_info=True)
+                        raise HTTPException(
+                            status_code=500,
+                            detail="Upload could not be synchronized with Knowledge",
+                        ) from exc
+                    append_log(user.entity_id, "UPLOAD", f"{user.email} uploaded {rel_path}")
+                    return target, rel_path, sync
+
+                target, rel_path, sync = await _finish_filesystem_mutation(
+                    _upload_and_sync(),
+                )
+            finally:
+                _release_path_mutation_locks(lock_handles)
     finally:
         try:
             os.remove(tmp_path)
         except OSError:
             pass
-    sync_info = {"synced": False, "reason": "not_synced"}
-    try:
-        from packages.core.services.knowledge_sync import sync_file_to_knowledge
-        sync = await sync_file_to_knowledge(
-            entity_id=user.entity_id,
-            abs_path=target,
-            entity_root=_entity_root(user.entity_id),
-            source="upload",
-            created_by=(user.display_name or user.email),
-            force=True,
-        )
-        sync_info = {"synced": sync.synced, "document_id": sync.document_id, "reason": sync.reason}
-    except Exception:
-        logger.warning("filesystem upload sync failed", exc_info=True)
     return {
         "status": "ok",
         "path": rel_path,
         "filename": os.path.basename(target),
         "size": total,
-        "knowledge_sync": sync_info,
+        "knowledge_sync": {
+            "synced": True,
+            "document_id": sync.document_id,
+            "reason": sync.reason,
+        },
     }
 
 
@@ -777,50 +1327,53 @@ async def search_files(
     db: AsyncSession = Depends(get_db),
 ):
     """Search file contents using ripgrep."""
+    credential = AuthenticatedUserCredential.from_user(user)
     _require_fs()
     root = _entity_root(user.entity_id)
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            "rg", "--json", "--max-count", "3", "--glob", glob_pattern,
-            "--max-filesize", "1M", query, root,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
-    except asyncio.TimeoutError:
-        return {"results": [], "error": "Search timed out"}
-    except FileNotFoundError:
-        return {"results": [], "error": "ripgrep not installed"}
-
-    results = []
-    for line in stdout.decode("utf-8", errors="replace").splitlines():
+    async with _entity_filesystem_read_boundary(root):
         try:
-            msg = json_mod.loads(line)
-            if msg.get("type") == "match":
-                data = msg["data"]
-                rel_path = os.path.relpath(data["path"]["text"], root)
-                # Search results are user-facing; do not leak hidden/runtime files.
-                if not is_user_visible_path(rel_path):
-                    continue
-                results.append({
-                    "path": rel_path,
-                    "line": data["line_number"],
-                    "text": data["lines"]["text"].strip()[:200],
-                })
-        except Exception:
-            continue
-        if len(results) >= max_results:
-            break
+            proc = await asyncio.create_subprocess_exec(
+                "rg", "--json", "--max-count", "3", "--glob", glob_pattern,
+                "--max-filesize", "1M", query, root,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
+        except asyncio.TimeoutError:
+            return {"results": [], "error": "Search timed out"}
+        except FileNotFoundError:
+            return {"results": [], "error": "ripgrep not installed"}
 
-    # Drop hits inside Knowledge documents the caller cannot read — otherwise
-    # ripgrep would leak private-document content snippets across the entity.
-    blocked = await _unreadable_doc_paths(
-        db, user.entity_id, [r["path"] for r in results], user
-    )
-    if blocked:
-        results = [r for r in results if normalize_rel_path(r["path"]) not in blocked]
+        results = []
+        for line in stdout.decode("utf-8", errors="replace").splitlines():
+            try:
+                msg = json_mod.loads(line)
+                if msg.get("type") == "match":
+                    data = msg["data"]
+                    rel_path = os.path.relpath(data["path"]["text"], root)
+                    # Search results are user-facing; do not leak hidden/runtime files.
+                    if not is_user_visible_path(rel_path):
+                        continue
+                    results.append({
+                        "path": rel_path,
+                        "line": data["line_number"],
+                        "text": data["lines"]["text"].strip()[:200],
+                    })
+            except Exception:
+                continue
+            if len(results) >= max_results:
+                break
 
-    return {"results": results, "query": query, "count": len(results)}
+        # Drop hits inside Knowledge documents the caller cannot read — otherwise
+        # ripgrep would leak private-document content snippets across the entity.
+        blocked = await _unreadable_doc_paths(
+            db, user.entity_id, [r["path"] for r in results], user,
+            credential=credential,
+        )
+        if blocked:
+            results = [r for r in results if normalize_rel_path(r["path"]) not in blocked]
+
+        return {"results": results, "query": query, "count": len(results)}
 
 
 @router.get("/wiki-links")
@@ -830,75 +1383,130 @@ async def resolve_wiki_links(
     path: str = Query(..., description="Path to .md file"),
 ):
     """Resolve [[wiki links]] in a markdown file to actual paths."""
+    credential = AuthenticatedUserCredential.from_user(user)
     _require_fs()
+    root = _entity_root(user.entity_id)
     full = _resolve(user.entity_id, path)
     _assert_user_visible_rel(path, is_dir=False, action="read")
-    await _assert_path_readable(
-        db, user.entity_id, normalize_rel_path(path), user
-    )
+    async with _entity_filesystem_read_boundary(root):
+        await _assert_path_readable(
+            db, user.entity_id, normalize_rel_path(path), user,
+            credential=credential,
+        )
 
-    from packages.core.models.document import Document
-    from packages.core.services.document_service import get_document_content
-    from packages.core.services.wiki_service import extract_wiki_links, resolve_link, build_file_index
+        from packages.core.models.document import Document
+        from packages.core.services.document_service import get_document_content
+        from packages.core.services.wiki_service import (
+            build_file_index,
+            extract_wiki_links,
+            list_wiki_pages,
+            resolve_link,
+        )
 
-    content: str | None = None
-    if os.path.isfile(full):
-        def _read_source_file():
-            with open(full, "r", encoding="utf-8", errors="replace") as f:
-                return f.read()
+        content: str | None = None
+        if os.path.isfile(full):
+            def _read_source_file():
+                with open(full, "r", encoding="utf-8", errors="replace") as f:
+                    return f.read()
 
-        content = await asyncio.to_thread(_read_source_file)
-    else:
-        doc = (await db.execute(
-            select(Document).where(
-                Document.entity_id == user.entity_id,
-                Document.fs_path == path,
-                Document.is_trashed.is_(False),
-            ).limit(1)
-        )).scalar_one_or_none()
-        if doc:
-            content = await get_document_content(db, doc.id, user.entity_id)
-    if content is None:
-        raise HTTPException(404, f"File not found: {path}")
+            content = await asyncio.to_thread(_read_source_file)
+        else:
+            doc = (await db.execute(
+                select(Document).where(
+                    Document.entity_id == user.entity_id,
+                    Document.fs_path == path,
+                    Document.is_trashed.is_(False),
+                ).limit(1)
+            )).scalar_one_or_none()
+            if doc:
+                content = await get_document_content(db, doc.id, user.entity_id)
+        if content is None:
+            raise HTTPException(404, f"File not found: {path}")
 
-    def _resolve_links():
-        links = extract_wiki_links(content)
-        file_index = build_file_index(user.entity_id)
-        resolved = []
-        for target, display in links:
-            resolved_path = resolve_link(target, user.entity_id, file_index)
-            resolved.append({
-                "target": target,
-                "display": display,
-                "resolved_path": resolved_path,
-                "exists": resolved_path is not None,
-            })
-        return resolved
+        candidate_paths = await asyncio.to_thread(list_wiki_pages, user.entity_id)
+        blocked_candidate_paths = await _unreadable_doc_paths(
+            db,
+            user.entity_id,
+            candidate_paths,
+            user,
+            credential=credential,
+        )
+        allowed_paths = {
+            normalize_rel_path(candidate_path)
+            for candidate_path in candidate_paths
+            if normalize_rel_path(candidate_path) not in blocked_candidate_paths
+        }
 
-    resolved = await asyncio.to_thread(_resolve_links)
-    resolved_paths = sorted({
-        item["resolved_path"]
-        for item in resolved
-        if item.get("resolved_path")
-    })
-    docs_by_path: dict[str, Any] = {}
-    if resolved_paths:
-        docs = (await db.execute(
-            select(Document).where(
-                Document.entity_id == user.entity_id,
-                Document.fs_path.in_(resolved_paths),
-                Document.is_trashed.is_(False),
+        def _resolve_links():
+            links = extract_wiki_links(content)
+            file_index = build_file_index(
+                user.entity_id,
+                allowed_paths=allowed_paths,
             )
-        )).scalars().all()
-        docs_by_path = {doc.fs_path: doc for doc in docs if doc.fs_path}
+            resolved = []
+            for target, display in links:
+                resolved_path = resolve_link(
+                    target,
+                    user.entity_id,
+                    file_index,
+                    allowed_paths=allowed_paths,
+                )
+                resolved.append({
+                    "target": target,
+                    "display": display,
+                    "resolved_path": resolved_path,
+                    "exists": resolved_path is not None,
+                })
+            return resolved
 
-    for item in resolved:
-        doc = docs_by_path.get(item.get("resolved_path"))
-        item["document_id"] = doc.id if doc else None
-        item["document_name"] = doc.name if doc else None
-        item["file_type"] = doc.file_type if doc else None
-        item["vector_status"] = doc.vector_status if doc else None
-    return {"links": resolved, "file": path, "count": len(resolved)}
+        resolved = await asyncio.to_thread(_resolve_links)
+        resolved_paths = sorted({
+            item["resolved_path"]
+            for item in resolved
+            if item.get("resolved_path")
+        })
+        blocked_paths = await _unreadable_doc_paths(
+            db,
+            user.entity_id,
+            resolved_paths,
+            user,
+            credential=credential,
+        )
+        if blocked_paths:
+            for item in resolved:
+                if normalize_rel_path(item.get("resolved_path") or "") in blocked_paths:
+                    item["resolved_path"] = None
+                    item["exists"] = False
+            resolved_paths = [
+                path
+                for path in resolved_paths
+                if normalize_rel_path(path) not in blocked_paths
+            ]
+        docs_by_path: dict[str, Any] = {}
+        if resolved_paths:
+            docs = (await db.execute(
+                select(Document).where(
+                    Document.entity_id == user.entity_id,
+                    Document.fs_path.in_(resolved_paths),
+                    Document.is_trashed.is_(False),
+                )
+            )).scalars().all()
+            docs_by_path = {doc.fs_path: doc for doc in docs if doc.fs_path}
+
+        for item in resolved:
+            doc = docs_by_path.get(item.get("resolved_path"))
+            item["document_id"] = doc.id if doc else None
+            item["document_name"] = doc.name if doc else None
+            item["file_type"] = doc.file_type if doc else None
+            item["vector_status"] = doc.vector_status if doc else None
+        await _assert_path_readable(
+            db,
+            user.entity_id,
+            normalize_rel_path(path),
+            user,
+            credential=credential,
+        )
+        return {"links": resolved, "file": path, "count": len(resolved)}
 
 
 def _looks_like_markdown_doc(*, name: str | None, file_type: str | None, mime_type: str | None = None, fs_path: str | None = None) -> bool:
@@ -1084,15 +1692,58 @@ async def wiki_index(
     workspace_id: str | None = Query(None, description="Optional workspace scope; uses that workspace's Knowledge Nets."),
 ):
     """Return the user-visible markdown wiki graph for navigation/search."""
+    credential = AuthenticatedUserCredential.from_user(user)
+    await require_workspace_readable(db, user, workspace_id)
     _require_fs()
+    async with _entity_filesystem_read_boundary(_entity_root(user.entity_id)):
+        return await _wiki_index_consistent(
+            user=user,
+            db=db,
+            net_id=net_id,
+            group_id=group_id,
+            workspace_id=workspace_id,
+            credential=credential,
+        )
+
+
+async def _wiki_index_consistent(
+    *,
+    user: User,
+    db: AsyncSession,
+    net_id: str | None,
+    group_id: str | None,
+    workspace_id: str | None,
+    credential: AuthenticatedUserCredential | None = None,
+):
+    """Build the graph while its Document paths and physical files are stable."""
 
     from packages.core.models.document import Document, DocumentGroup, DocumentGroupMember
+    from packages.core.services.document_access import DocumentAccessContext
     from packages.core.services.wiki_service import build_wiki_graph
+
+    credential = credential or AuthenticatedUserCredential.from_user(user)
+    actor = await resolve_current_user_actor(db, credential)
+    if actor is None:
+        raise HTTPException(404, "Workspace not found")
 
     def _split_ids(value: str | None) -> list[str]:
         return [item.strip() for item in (value or "").split(",") if item.strip()]
 
     requested_net_ids = list(dict.fromkeys([*_split_ids(net_id), *_split_ids(group_id)]))
+    if workspace_id and await ResourcePermissionGate.authorize_workspace_read(
+        db,
+        credential=credential,
+        workspace_id=workspace_id,
+    ) is None:
+        raise HTTPException(404, "Workspace not found")
+
+    access_ctx = await DocumentAccessContext.load(
+        db,
+        entity_id=user.entity_id,
+        user_id=user.id,
+        role=user.role,
+        _actor=actor,
+    )
     allowed_paths: set[str] | None = None
     allowed_doc_ids: set[str] | None = None
     scope_group_ids: list[str] = []
@@ -1103,6 +1754,17 @@ async def wiki_index(
         if workspace_id:
             group_stmt = group_stmt.where(DocumentGroup.workspace_id == workspace_id)
         groups = (await db.execute(group_stmt)).scalars().all()
+        for scoped_workspace_id in {
+            str(group.workspace_id)
+            for group in groups
+            if group.workspace_id
+        }:
+            if await ResourcePermissionGate.authorize_workspace_read(
+                db,
+                credential=credential,
+                workspace_id=scoped_workspace_id,
+            ) is None:
+                raise HTTPException(404, "Workspace not found")
         scope_group_ids = [
             group.id for group in groups
             if not (group.settings or {}).get("workspace_file_bucket")
@@ -1143,17 +1805,22 @@ async def wiki_index(
             p.get("path") for p in _graph_pages if isinstance(p, dict) and p.get("path")
         ]
         _blocked_pages = await _unreadable_doc_paths(
-            db, user.entity_id, _page_paths, user
+            db, user.entity_id, _page_paths, user, credential=credential,
         )
         if _blocked_pages:
-            graph["pages"] = [
-                p
-                for p in _graph_pages
-                if not (
-                    isinstance(p, dict)
-                    and normalize_rel_path(str(p.get("path") or "")) in _blocked_pages
-                )
-            ]
+            readable_page_paths = {
+                normalize_rel_path(str(page.get("path") or ""))
+                for page in _graph_pages
+                if isinstance(page, dict)
+                and normalize_rel_path(str(page.get("path") or "")) not in _blocked_pages
+            }
+            # Rebuild instead of removing only page rows: backlinks, missing
+            # links, orphan paths, and counts are all derived from the page set.
+            graph = await asyncio.to_thread(
+                build_wiki_graph,
+                user.entity_id,
+                allowed_paths=readable_page_paths,
+            )
     if requested_net_ids or workspace_id:
         graph["scope"] = {
             "kind": "knowledge_net" if requested_net_ids else "workspace",
@@ -1183,6 +1850,12 @@ async def wiki_index(
                 Document.is_trashed.is_(False),
             )
         )).scalars().all()
+        await access_ctx.preload_documents(db, list(docs))
+        docs = [
+            doc
+            for doc in docs
+            if await access_ctx.can_read_document(db, doc)
+        ]
         docs_by_path = {doc.fs_path: doc for doc in docs if doc.fs_path}
 
     for page in page_rows:
@@ -1220,26 +1893,41 @@ async def wiki_index(
         else:
             doc_stmt = None
     markdown_docs = (await db.execute(doc_stmt)).scalars().all() if doc_stmt is not None else []
+    await access_ctx.preload_documents(db, list(markdown_docs))
+    markdown_docs = [
+        doc
+        for doc in markdown_docs
+        if await access_ctx.can_read_document(db, doc, allow_redacted=False)
+    ]
     _merge_document_markdown_pages(graph, list(markdown_docs))
+
+    if await resolve_current_user_actor(db, credential) != actor:
+        raise HTTPException(404, "Workspace not found")
 
     return graph
 
 
 @router.get("/lint")
-async def lint_knowledge_base(user: User = Depends(get_current_user)):
+async def lint_knowledge_base(
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
     """Run knowledge base health check."""
     _require_fs()
+    if not await user_is_effective_entity_admin(db, user):
+        raise HTTPException(403, "Entity admin access required")
     from packages.core.services.wiki_service import lint_entity
-    result = await asyncio.to_thread(lint_entity, user.entity_id)
-    return {
-        "entity_id": user.entity_id,
-        "broken_links": result["broken_links"][:20],
-        "broken_links_count": len(result["broken_links"]),
-        "orphaned_pages": result["orphaned_pages"][:20],
-        "orphaned_pages_count": len(result["orphaned_pages"]),
-        "unprocessed_files": result["unprocessed_files"][:20],
-        "unprocessed_files_count": len(result["unprocessed_files"]),
-    }
+    async with _entity_filesystem_read_boundary(_entity_root(user.entity_id)):
+        result = await asyncio.to_thread(lint_entity, user.entity_id)
+        return {
+            "entity_id": user.entity_id,
+            "broken_links": result["broken_links"][:20],
+            "broken_links_count": len(result["broken_links"]),
+            "orphaned_pages": result["orphaned_pages"][:20],
+            "orphaned_pages_count": len(result["orphaned_pages"]),
+            "unprocessed_files": result["unprocessed_files"][:20],
+            "unprocessed_files_count": len(result["unprocessed_files"]),
+        }
 
 
 # ── Raw file serving (avatars, uploads, etc.) ──
@@ -1269,11 +1957,42 @@ def _resolve_signed_entity_file(token: str) -> tuple[_Path, str, int]:
     return file_path, content_type, file_path.stat().st_size
 
 
+async def _assert_signed_entity_file_readable(
+    token: str,
+    db: AsyncSession,
+) -> None:
+    """Revalidate actor-bound download tokens against current ACL/state."""
+    payload = verify_file_access_token(token)
+    if not payload:
+        raise HTTPException(403, "Invalid or expired file token")
+    user_id = str(payload.get("user_id") or "").strip()
+    if not user_id:
+        # Legacy provider/media tokens remain exact-path, short-lived bearer
+        # tokens. Local Knowledge exports always carry an actor claim.
+        return
+    from packages.core.services.document_access import unreadable_document_paths
+
+    blocked = await unreadable_document_paths(
+        db,
+        entity_id=str(payload["entity_id"]),
+        rel_paths=[str(payload["path"])],
+        user_id=user_id,
+        actor_type="agent",
+    )
+    if blocked:
+        raise _file_not_found()
+
+
 @router.head("/public/{token}")
 @router.head("/public/{token}/{filename:path}")
-async def head_signed_entity_file(token: str, filename: str | None = None):
+async def head_signed_entity_file(
+    token: str,
+    filename: str | None = None,
+    db: AsyncSession = Depends(get_db),
+):
     """Allow media providers to preflight signed image URLs before GET."""
     file_path, content_type, file_size = _resolve_signed_entity_file(token)
+    await _assert_signed_entity_file_readable(token, db)
     response_type, headers = _signed_file_response_metadata(file_path, content_type)
     headers["Content-Length"] = str(file_size)
     return RawResponse(
@@ -1285,9 +2004,14 @@ async def head_signed_entity_file(token: str, filename: str | None = None):
 
 @router.get("/public/{token}")
 @router.get("/public/{token}/{filename:path}")
-async def serve_signed_entity_file(token: str, filename: str | None = None):
+async def serve_signed_entity_file(
+    token: str,
+    filename: str | None = None,
+    db: AsyncSession = Depends(get_db),
+):
     """Serve a short-lived signed file URL for external media providers."""
     file_path, content_type, _file_size = _resolve_signed_entity_file(token)
+    await _assert_signed_entity_file_readable(token, db)
     response_type, headers = _signed_file_response_metadata(file_path, content_type)
     return FileResponse(
         path=str(file_path),
@@ -1346,23 +2070,46 @@ async def serve_entity_file(
     rel_path = normalize_rel_path(str(rel_path_obj))
     is_public = _is_public_raw_file_path(rel_path)
     if not is_public:
-        user = await _optional_user_from_bearer(request, db)
-        if not user:
+        authenticated = await _optional_user_from_bearer(request, db)
+        if not authenticated:
             raise HTTPException(401, "Not authenticated")
+        user, credential = authenticated
         if user.entity_id != entity_id:
             raise HTTPException(403, "Access denied")
         if not is_user_visible_path(rel_path):
             raise HTTPException(403, "Access denied")
-        # A Knowledge document served as raw bytes must still honor
-        # Document.visibility — otherwise a same-entity member could fetch a
-        # private file directly by URL.
-        await _assert_path_readable(db, entity_id, rel_path, user)
+        read_boundary = _entity_filesystem_read_boundary(str(entity_root))
+        await read_boundary.__aenter__()
+        try:
+            if not file_path.is_file():
+                raise _file_not_found()
+            # A Knowledge document served as raw bytes must still honor
+            # Document.visibility — otherwise a same-entity member could fetch a
+            # private file directly by URL.
+            await _assert_path_readable(
+                db,
+                entity_id,
+                rel_path,
+                user,
+                credential=credential,
+            )
+            content_type = mimetypes.guess_type(str(file_path))[0] or "application/octet-stream"
+            response_type, security_headers = _signed_file_response_metadata(file_path, content_type)
+            security_headers["Cache-Control"] = "private, no-store"
+
+            return _ReadLockedFileResponse(
+                path=str(file_path),
+                media_type=response_type,
+                headers=security_headers,
+                read_boundary=read_boundary,
+            )
+        except BaseException:
+            await read_boundary.__aexit__(None, None, None)
+            raise
 
     content_type = mimetypes.guess_type(str(file_path))[0] or "application/octet-stream"
     response_type, security_headers = _signed_file_response_metadata(file_path, content_type)
-    security_headers["Cache-Control"] = (
-        "public, max-age=86400" if is_public else "private, no-store"
-    )
+    security_headers["Cache-Control"] = "public, max-age=86400"
     return FileResponse(
         path=str(file_path),
         media_type=response_type,

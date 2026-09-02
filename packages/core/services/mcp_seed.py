@@ -5,7 +5,9 @@ whenever ``scripts/init_db.py`` runs or the API boots fresh. The row set
 must match the catalog the UI renders; empty table → empty "For Agents"
 tab on the Integrations page.
 
-Uses ``ON CONFLICT DO NOTHING`` — safe to call any number of times.
+Base inserts use ``ON CONFLICT DO NOTHING``; selected shipped catalog rows are
+refreshed explicitly so existing deployments receive auth-contract and managed
+remote-endpoint changes. The seeder remains safe to call repeatedly.
 """
 from __future__ import annotations
 
@@ -15,6 +17,10 @@ from sqlalchemy.engine import Engine
 from sqlalchemy import text
 
 from packages.core.integrations.registry import register_integration
+from packages.core.services.official_remote_mcp import (
+    OfficialRemoteMCPFactory,
+    OfficialRemoteMCPProvider,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -38,8 +44,14 @@ _MCP_CATALOG: list[tuple[str, str, str, str, str, str, str | None]] = [
      "Manage Manor calendar settings, booking links, working hours, "
      "daily agenda, and booking records.",
      "builtin", "packages.core.ai.mcp.manor_mcp_calendar", "none", None),
+
+    ("manor_mcp_minutes", "Manor Minutes",
+     "Meeting notes from Minutes: search meetings, read transcripts, "
+     "summaries, key points, and action items; ask questions about a meeting.",
+     "builtin", "packages.core.ai.mcp.manor_mcp_minutes", "none", None),
     ("google_drive", "Google Drive",
-     "Read and write Drive files.",
+     "Search and read user-requested Drive files; create and manage files "
+     "that Manor creates or the user explicitly opens or shares with Manor.",
      "builtin", "packages.core.ai.mcp.google_drive", "oauth2",
      "https://www.googleapis.com/auth/drive.file,"
      "https://www.googleapis.com/auth/drive.readonly"),
@@ -51,8 +63,7 @@ _MCP_CATALOG: list[tuple[str, str, str, str, str, str, str | None]] = [
      "People/company search, third-party profile reads, jobs, DMs, "
      "and feed browsing are not available through LinkedIn's official API.",
      "builtin", "packages.core.ai.mcp.linkedin", "oauth2",
-     "w_member_social,openid,profile,email,"
-     "r_organization_admin,r_organization_social,w_organization_social"),
+     "w_member_social,openid,profile,email"),
     ("github", "GitHub",
      "GitHub repos, issues, pull requests.",
      "builtin", "packages.core.ai.mcp.github", "oauth2",
@@ -71,24 +82,32 @@ _MCP_CATALOG: list[tuple[str, str, str, str, str, str, str | None]] = [
     # is no longer surfaced in the catalog — kept on disk so any
     # existing Integration rows continue to import without crashing,
     # but new connects always go through OAuth.
-    ("stripe", "Stripe",
+    (OfficialRemoteMCPProvider.STRIPE.value, "Stripe",
      "Manage your Stripe payments, customers, subscriptions, invoices, "
      "and disputes — agents can run charges, issue refunds, update "
      "billing, and pull revenue reports.",
-     "http", "https://mcp.stripe.com", "oauth2", "read_write"),
+     "http", OfficialRemoteMCPFactory.create(OfficialRemoteMCPProvider.STRIPE).endpoint,
+     "oauth2", "read_write"),
     # PayPal remote MCP — only path Manor offers for PayPal (no
-    # in-process wrapper). Sandbox vs Live OAuth URL is decided in
-    # oauth_provider_config based on PAYPAL_ENVIRONMENT.
-    ("paypal", "PayPal",
+    # in-process wrapper). Sandbox vs live OAuth and MCP endpoints are
+    # selected from PAYPAL_ENVIRONMENT by OfficialRemoteMCPFactory.
+    (OfficialRemoteMCPProvider.PAYPAL.value, "PayPal",
      "Manage PayPal orders, invoices, subscriptions, disputes, and "
      "transactions — let agents create invoices, refund payments, and "
      "pull payout reports.",
-     "http", "https://mcp.paypal.com", "oauth2",
-     "openid profile email https://uri.paypal.com/services/payments/realtimepayment"),
+     "http", OfficialRemoteMCPFactory.create(OfficialRemoteMCPProvider.PAYPAL).endpoint,
+     "oauth2", OfficialRemoteMCPFactory.paypal_oauth().scopes),
+    (OfficialRemoteMCPProvider.ROBINHOOD.value, "Robinhood",
+     "Connect your own Robinhood accounts through the official Trading MCP. "
+     "Read portfolios, watchlists and market data; account consent may also "
+     "permit Agentic trading. External writes follow Manor approval policy.",
+     "http", OfficialRemoteMCPFactory.create(OfficialRemoteMCPProvider.ROBINHOOD).endpoint,
+     "oauth2", "internal"),
     ("slack", "Slack",
      "Send messages to channels, react, post to threads.",
      "builtin", "packages.core.ai.mcp.slack", "oauth2",
-     "chat:write,channels:read,channels:history,users:read"),
+     "chat:write,channels:read,channels:history,users:read,"
+     "app_mentions:read,im:history"),
     ("notion", "Notion",
      "Read/write Notion pages and databases.",
      "builtin", "packages.core.ai.mcp.notion", "oauth2",
@@ -96,15 +115,17 @@ _MCP_CATALOG: list[tuple[str, str, str, str, str, str, str | None]] = [
     ("twilio", "Twilio",
      "SMS and voice via Twilio.",
      "builtin", "packages.core.ai.mcp.twilio", "api_key", None),
-    ("whatsapp", "WhatsApp",
+    ("whatsapp", "WhatsApp Business",
      "Send WhatsApp Cloud messages and manage Meta message templates.",
      "builtin", "packages.core.ai.mcp.whatsapp", "api_key", None),
     ("webhook", "Webhook",
      "Generic outbound HTTP webhook calls.",
      "builtin", "packages.core.ai.mcp.webhook", "bearer", None),
     ("discord", "Discord",
-     "Post messages, react, and manage Discord channels via a bot token.",
-     "builtin", "packages.core.ai.mcp.discord", "api_key", None),
+     "Inspect the connected Discord Server, list its channels, send messages, "
+     "and add reactions within that Server.",
+     "builtin", "packages.core.ai.mcp.discord", "oauth2",
+     "bot,applications.commands"),
     ("telegram", "Telegram",
      "Send messages, photos, and files via Telegram Bot API.",
      "builtin", "packages.core.ai.mcp.telegram", "api_key", None),
@@ -150,6 +171,18 @@ _MCP_CATALOG: list[tuple[str, str, str, str, str, str, str | None]] = [
      "snippets, optional inline article body, and a 1-sentence answer. "
      "Free tier: 1000 calls/month — enough for most agent workloads.",
      "builtin", "packages.core.ai.mcp.tavily", "api_key", None),
+    ("alpaca_market_data", "Alpaca Market Data",
+     "Read-only US stock quotes, trades, snapshots, bars, and news. "
+     "This integration cannot access brokerage accounts or place orders.",
+     "builtin", "packages.core.ai.mcp.alpaca_market_data", "credentials", None),
+    ("alpha_vantage", "Alpha Vantage",
+     "Read-only global equity quotes, daily history, company overviews, "
+     "and reported fundamentals.",
+     "builtin", "packages.core.ai.mcp.alpha_vantage", "api_key", None),
+    ("twelve_data", "Twelve Data",
+     "Read-only quotes, prices, historical OHLCV, and technical indicators "
+     "for stocks, ETFs, forex, and crypto.",
+     "builtin", "packages.core.ai.mcp.twelve_data", "api_key", None),
 
     # Jimeng has a reverse-engineered HTTP gateway (iptag/jimeng-api
     # sidecar; --profile jimeng) so we treat it as a normal api_key
@@ -271,6 +304,13 @@ _MCP_CATALOG: list[tuple[str, str, str, str, str, str, str | None]] = [
      "Files.ReadWrite Files.ReadWrite.All User.Read offline_access"),
 ]
 
+_MANAGED_MCP_SERVER_KEYS = frozenset(row[0] for row in _MCP_CATALOG)
+
+
+def is_managed_mcp_server_key(server_key: object) -> bool:
+    """Return whether ``server_key`` belongs to Manor's managed catalog."""
+    return str(server_key or "").strip().lower() in _MANAGED_MCP_SERVER_KEYS
+
 # The MCP catalog is the built-in Integration identity catalog. Register every
 # server key even when it has no dedicated health checker or Stat measurer so
 # callers can distinguish "known but unsupported" from a truly unknown key.
@@ -293,6 +333,31 @@ async def seed_mcp_catalog(engine: Engine) -> int:
         # transaction to avoid Postgres deadlocks during parallel boot.
         await conn.execute(text(
             "SELECT pg_advisory_xact_lock(hashtext('manor.mcp_seed_catalog'), 0)"
+        ))
+
+        # File operations use native tools; retire the duplicate internal MCP.
+        await conn.execute(text(
+            "DELETE FROM mcp_servers WHERE server_key = 'manor_mcp_file_engine'"
+        ))
+
+        # The old generic local-browser MCP was superseded by the explicit
+        # Chrome MCP. Remove the catalog row and any stale private bindings;
+        # no runtime alias remains after this migration.
+        await conn.execute(text(
+            "DELETE FROM agent_mcp_bindings WHERE mcp_server_id IN ("
+            "SELECT id FROM mcp_servers WHERE server_key = 'local_browser')"
+        ))
+        await conn.execute(text(
+            "DELETE FROM mcp_account_tool_catalogs WHERE provider = 'local_browser'"
+        ))
+        await conn.execute(text(
+            "DELETE FROM integrations WHERE provider = 'local_browser'"
+        ))
+        await conn.execute(text(
+            "DELETE FROM oauth_accounts WHERE provider = 'local_browser'"
+        ))
+        await conn.execute(text(
+            "DELETE FROM mcp_servers WHERE server_key = 'local_browser'"
         ))
 
         # One-time migration: the SMTP-only provider was merged into a
@@ -352,26 +417,49 @@ async def seed_mcp_catalog(engine: Engine) -> int:
             "WHERE mcp_server_id IN "
             "(SELECT id FROM mcp_servers WHERE server_key = 'jimeng')"
         ))
-        # Stripe consolidation: the legacy api_key/builtin row and the
-        # interim ``stripe_mcp`` row are merged into one ``stripe`` row
-        # using the official remote MCP at mcp.stripe.com via OAuth.
-        # Drop the orphan stripe_mcp row, then point ``stripe`` at the
-        # new transport.
+        # Stripe consolidation: drop the retired interim row. Then refresh
+        # both vendor-hosted MCP rows so existing installs receive endpoint
+        # and environment changes despite the INSERT ... DO NOTHING below.
         await conn.execute(text(
             "DELETE FROM mcp_servers WHERE server_key = 'stripe_mcp'"
         ))
-        await conn.execute(text(
-            "UPDATE mcp_servers "
-            "SET transport = 'http', "
-            "    endpoint  = 'https://mcp.stripe.com', "
-            "    auth_type = 'oauth2', "
-            "    scopes    = 'read_write', "
-            "    name      = 'Stripe', "
-            "    description = 'Stripe payments, customers, subscriptions, "
-            "invoices, disputes — full tool catalog auto-discovered from "
-            "Stripe''s official MCP.' "
-            "WHERE server_key = 'stripe'"
-        ))
+        refreshed_catalog_keys = {
+            *(provider.value for provider in OfficialRemoteMCPProvider),
+            # Keep the user-visible Google catalog aligned with the exact
+            # reviewed static manifest. Historical installs were initially
+            # seeded with redundant/full scopes, so INSERT ... DO NOTHING is
+            # insufficient for those existing rows.
+            "gmail",
+            "google_calendar",
+            "google_drive",
+            "youtube",
+            "whatsapp",
+        }
+        for key, name, desc, transport, endpoint, auth_type, scopes in _MCP_CATALOG:
+            if key not in refreshed_catalog_keys:
+                continue
+            await conn.execute(
+                text("""
+                    UPDATE mcp_servers
+                    SET name = :name,
+                        description = :description,
+                        transport = :transport,
+                        endpoint = :endpoint,
+                        auth_type = :auth_type,
+                        scopes = :scopes,
+                        updated_at = now()
+                    WHERE server_key = :server_key
+                """),
+                {
+                    "server_key": key,
+                    "name": name,
+                    "description": desc,
+                    "transport": transport,
+                    "endpoint": endpoint,
+                    "auth_type": auth_type,
+                    "scopes": scopes,
+                },
+            )
 
         cli_spec_count = 0
 
@@ -399,6 +487,60 @@ async def seed_mcp_catalog(engine: Engine) -> int:
             )
             if result.rowcount and result.rowcount > 0:
                 inserted += 1
+
+        # Workflow/Planner surfaces read ``tools_cached`` rather than the Chat
+        # ToolPool. Seed a credential-free fallback for official providers, but
+        # never overwrite a non-empty catalog discovered from the live vendor.
+        for provider in OfficialRemoteMCPProvider:
+            tools_cached = _json(OfficialRemoteMCPFactory.tools_cache(provider))
+            await conn.execute(
+                text("""
+                    UPDATE mcp_servers
+                    SET tools_cached = CASE
+                            WHEN tools_cached IS NULL
+                              OR tools_cached IN ('{}'::jsonb, '[]'::jsonb)
+                              OR tools_cached->>'source' = 'official_fallback'
+                            THEN CAST(:tools_cached AS jsonb)
+                            ELSE tools_cached
+                        END,
+                        tools_cached_at = CASE
+                            WHEN tools_cached IS NULL
+                              OR tools_cached IN ('{}'::jsonb, '[]'::jsonb)
+                              OR tools_cached->>'source' = 'official_fallback'
+                            THEN NULL
+                            ELSE tools_cached_at
+                        END,
+                        updated_at = now()
+                    WHERE server_key = :server_key
+                """),
+                {
+                    "server_key": provider.value,
+                    "tools_cached": tools_cached,
+                },
+            )
+
+        discord_row = next(row for row in _MCP_CATALOG if row[0] == "discord")
+        await conn.execute(
+            text("""
+                UPDATE mcp_servers
+                SET name = :name,
+                    description = :description,
+                    transport = :transport,
+                    endpoint = :endpoint,
+                    auth_type = :auth_type,
+                    scopes = :scopes,
+                    updated_at = now()
+                WHERE server_key = 'discord'
+            """),
+            {
+                "name": discord_row[1],
+                "description": discord_row[2],
+                "transport": discord_row[3],
+                "endpoint": discord_row[4],
+                "auth_type": discord_row[5],
+                "scopes": discord_row[6],
+            },
+        )
 
         await conn.execute(text("""
             UPDATE mcp_servers

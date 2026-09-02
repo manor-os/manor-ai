@@ -28,10 +28,24 @@ from apps.api.deps import (
 )
 from packages.core.database import get_db
 from packages.core.goals import service as goal_service
+from packages.core.goals.commands import GoalUpdateValidationError
+from packages.core.goals.factory import (
+    GoalIdentityValidationError,
+    GoalKeyConflictError,
+)
+from packages.core.goals.numbers import (
+    GoalNumberInput,
+    GoalNumberJSON,
+    goal_number_to_json,
+    project_stat_value_to_goal_number,
+)
+from packages.core.goals.scheduling import GoalMeasurementCadenceInput
+from packages.core.goals.service import GoalLifecycleError
 from packages.core.models.base import generate_ulid
 from packages.core.models.goal import Goal, GoalTaskLink
 from packages.core.models.task import Task
 from packages.core.models.user import User
+from packages.core.models.workspace import Workspace
 
 
 router = APIRouter(prefix="/api/v1/goals", tags=["goals"])
@@ -47,10 +61,11 @@ class GoalResponse(BaseModel):
     stat_id: Optional[str]
     title: str
     description: Optional[str]
+    goal_key: str
     metric_key: str
-    target_value: float
-    baseline_value: Optional[float]
-    current_value: Optional[float]
+    target_value: GoalNumberJSON
+    baseline_value: Optional[GoalNumberJSON]
+    current_value: Optional[GoalNumberJSON]
     current_value_updated_at: Optional[datetime]
     deadline: Optional[date]
     pace_status: Optional[str]
@@ -74,14 +89,15 @@ class GoalCreateRequest(BaseModel):
     goal: Optional[str] = None
     goal_id: Optional[str] = None
     description: Optional[str] = None
+    goal_key: Optional[str] = Field(default=None, max_length=100)
     metric_key: str = "completion"
-    target_value: float = 1.0
-    baseline_value: Optional[float] = None
+    target_value: GoalNumberInput = 1
+    baseline_value: Optional[GoalNumberInput] = None
     deadline: Optional[date] = None
     workspace_id: Optional[str] = None
     stat_id: Optional[str] = None
     measurement_source: Optional[dict] = None
-    measurement_cadence: Optional[str] = None
+    measurement_cadence: Optional[GoalMeasurementCadenceInput] = None
     priority: int = Field(default=3, ge=1, le=5)
     context: Optional[dict] = None
     steps: Optional[list[dict]] = None
@@ -92,11 +108,11 @@ class GoalUpdateRequest(BaseModel):
     goal: Optional[str] = None
     description: Optional[str] = None
     stat_id: Optional[str] = None
-    target_value: Optional[float] = None
+    target_value: Optional[GoalNumberInput] = None
     deadline: Optional[date] = None
     status: Optional[str] = None
     measurement_source: Optional[dict] = None
-    measurement_cadence: Optional[str] = None
+    measurement_cadence: Optional[GoalMeasurementCadenceInput] = None
     priority: Optional[int] = Field(default=None, ge=1, le=5)
     current_step_id: Optional[str] = None
     current_agent_id: Optional[str] = None
@@ -105,13 +121,13 @@ class GoalUpdateRequest(BaseModel):
 
 class MeasurementResponse(BaseModel):
     measured_at: datetime
-    value: float
+    value: GoalNumberJSON
     source: Optional[str]
     meta: Optional[dict]
 
 
 class MeasurementCreateRequest(BaseModel):
-    value: float
+    value: GoalNumberInput
     source: str = "manual"
     note: Optional[str] = None
 
@@ -127,10 +143,11 @@ def _to_response(g: Goal, link_summary: Optional[dict[str, Any]] = None) -> Goal
         stat_id=g.stat_id,
         title=g.title,
         description=g.description,
+        goal_key=g.goal_key,
         metric_key=g.metric_key,
-        target_value=float(g.target_value),
-        baseline_value=float(g.baseline_value) if g.baseline_value is not None else None,
-        current_value=float(g.current_value) if g.current_value is not None else None,
+        target_value=goal_number_to_json(g.target_value),
+        baseline_value=goal_number_to_json(g.baseline_value),
+        current_value=goal_number_to_json(g.current_value),
         current_value_updated_at=g.current_value_updated_at,
         deadline=g.deadline,
         pace_status=g.pace_status,
@@ -167,6 +184,30 @@ def _legacy_goal_for_user(goal_id: str, user: User) -> dict[str, Any] | None:
 
 def _legacy_goal_response(row: dict[str, Any]) -> dict[str, Any]:
     return {**row, "steps": list(row.get("steps") or [])}
+
+
+async def _sync_workspace_runtime_for_goal(
+    db: AsyncSession,
+    *,
+    workspace_id: str | None,
+    entity_id: str,
+) -> None:
+    """Keep Goal measurement schedules aligned with Workspace runtime state."""
+    if not workspace_id:
+        return
+    workspace = (await db.execute(
+        select(Workspace).where(
+            Workspace.id == workspace_id,
+            Workspace.entity_id == entity_id,
+            Workspace.deleted_at.is_(None),
+        )
+    )).scalar_one_or_none()
+    if workspace is None:
+        return
+
+    from packages.core.services.workspace_runtime import sync_workspace_runtime_schedules
+
+    await sync_workspace_runtime_schedules(db, workspace)
 
 
 async def _goal_link_summaries(
@@ -330,28 +371,49 @@ async def create_goal(
             raise HTTPException(400, "stat_id must reference a stat in the selected workspace")
         if not linked_stat.goal_eligible:
             raise HTTPException(400, "the selected stat is not goal eligible")
-    goal = await goal_service.create_goal(
+    try:
+        goal = await goal_service.create_goal(
+            db,
+            entity_id=user.entity_id,
+            title=req.title,
+            goal_key=req.goal_key,
+            metric_key=(
+                linked_stat.key
+                if linked_stat is not None and "metric_key" not in req.model_fields_set
+                else (
+                    None
+                    if req.workspace_id and "metric_key" not in req.model_fields_set
+                    else req.metric_key
+                )
+            ),
+            target_value=req.target_value,
+            workspace_id=req.workspace_id,
+            stat_id=req.stat_id,
+            description=req.description,
+            baseline_value=(
+                project_stat_value_to_goal_number(linked_stat.current_value)
+                if (
+                    linked_stat is not None
+                    and linked_stat.current_value is not None
+                    and req.baseline_value is None
+                )
+                else req.baseline_value
+            ),
+            deadline=req.deadline,
+            measurement_source=req.measurement_source,
+            measurement_cadence=req.measurement_cadence,
+            priority=req.priority,
+        )
+    except GoalKeyConflictError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except GoalIdentityValidationError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    await _sync_workspace_runtime_for_goal(
         db,
+        workspace_id=goal.workspace_id,
         entity_id=user.entity_id,
-        title=req.title,
-        metric_key=(
-            linked_stat.key
-            if linked_stat is not None and "metric_key" not in req.model_fields_set
-            else req.metric_key
-        ),
-        target_value=req.target_value,
-        workspace_id=req.workspace_id,
-        stat_id=req.stat_id,
-        description=req.description,
-        baseline_value=(
-            linked_stat.current_value
-            if linked_stat is not None and req.baseline_value is None
-            else req.baseline_value
-        ),
-        deadline=req.deadline,
-        measurement_source=req.measurement_source,
-        measurement_cadence=req.measurement_cadence,
-        priority=req.priority,
     )
     await db.commit()
     await db.refresh(goal)
@@ -370,6 +432,7 @@ async def get_goal(
     goal = await goal_service.get_goal(db, goal_id, user.entity_id)
     if not goal:
         raise HTTPException(404, "goal not found")
+    await require_workspace_readable(db, user, goal.workspace_id)
     summaries = await _goal_link_summaries(
         db,
         entity_id=user.entity_id,
@@ -412,9 +475,17 @@ async def update_goal(
             raise HTTPException(400, "stat_id must reference a stat in this workspace")
         if not linked_stat.goal_eligible:
             raise HTTPException(400, "the selected stat is not goal eligible")
-    goal = await goal_service.update_goal(db, goal_id, user.entity_id, **payload)
+    try:
+        goal = await goal_service.update_goal(db, goal_id, user.entity_id, **payload)
+    except GoalUpdateValidationError as exc:
+        raise HTTPException(422, str(exc)) from exc
     if not goal:
         raise HTTPException(404, "goal not found")
+    await _sync_workspace_runtime_for_goal(
+        db,
+        workspace_id=goal.workspace_id,
+        entity_id=user.entity_id,
+    )
     await db.commit()
     await db.refresh(goal)
     return _to_response(goal)
@@ -477,6 +548,11 @@ async def delete_goal(
     ok = await goal_service.delete_goal(db, goal_id, user.entity_id)
     if not ok:
         raise HTTPException(404, "goal not found")
+    await _sync_workspace_runtime_for_goal(
+        db,
+        workspace_id=existing.workspace_id,
+        entity_id=user.entity_id,
+    )
     await db.commit()
 
 
@@ -490,11 +566,12 @@ async def list_measurements(
     goal = await goal_service.get_goal(db, goal_id, user.entity_id)
     if not goal:
         raise HTTPException(404, "goal not found")
+    await require_workspace_readable(db, user, goal.workspace_id)
     rows = await goal_service.list_measurements(db, goal_id, limit=limit)
     return [
         MeasurementResponse(
             measured_at=m.measured_at,
-            value=float(m.value),
+            value=goal_number_to_json(m.value),
             source=m.source,
             meta=m.meta,
         )
@@ -512,15 +589,19 @@ async def record_measurement(
     goal = await goal_service.get_goal(db, goal_id, user.entity_id)
     if not goal:
         raise HTTPException(404, "goal not found")
+    await require_workspace_writable(db, user, goal.workspace_id)
 
-    measurement = await goal_service.record_measurement(
-        db, goal,
-        value=req.value, source=req.source,
-        meta={"note": req.note} if req.note else None,
-    )
+    try:
+        measurement = await goal_service.record_measurement(
+            db, goal,
+            value=req.value, source=req.source,
+            meta={"note": req.note} if req.note else None,
+        )
+    except GoalLifecycleError as exc:
+        raise HTTPException(409, str(exc)) from exc
     await db.commit()
     return {
         "measured_at": measurement.measured_at.isoformat(),
-        "value": float(measurement.value),
+        "value": goal_number_to_json(measurement.value),
         "pace_status": goal.pace_status,
     }

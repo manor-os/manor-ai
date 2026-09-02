@@ -7,23 +7,25 @@
  * No auth required. The token itself is the entitlement; backend verifies
  * its sha256 hash, expiry, max_uses, and revocation state.
  *
- * UX intentionally minimal: a single panel listing direct child documents
- * and subfolders. Confidential+ folders never reach this page (their
- * share creation is blocked or routed through approval). Watermark is
- * absent in this prototype because docs inside aren't previewed yet —
- * deep file preview would require additional auth wiring (signed URLs).
+ * Browsing and previews retain the original folder token. Every child read
+ * revalidates ancestry, classification, lifecycle and the share's audience.
  */
-import { useEffect, useState } from "react";
-import { useParams } from "react-router-dom";
-import { ClassificationBadge } from "../components/permissions";
+import { useEffect, useMemo, useState } from "react";
+import { useParams, useSearchParams } from "react-router-dom";
+import { ClassificationBadge, WatermarkLayer } from "../components/permissions";
 import { IconFolder, IconDocument } from "../components/icons";
 import { t } from "../lib/i18n";
+import ShareOtpGate from "../components/permissions/ShareOtpGate";
+import ReadOnlyFilePreview from "../components/file-preview/ReadOnlyFilePreview";
+import Button from "../components/ui/Button";
+import Modal from "../components/ui/Modal";
 
 interface PublicDoc {
   id: string;
   name: string;
   file_size?: number;
   file_type?: string;
+  mime_type?: string;
   classification?: string;
 }
 
@@ -35,6 +37,7 @@ interface SharedFolderResponse {
   watermark: boolean;
   allow_download: boolean;
   expires_at?: string;
+  parent_id?: string | null;
   documents: PublicDoc[];
   subfolders: { id: string; name: string }[];
 }
@@ -48,23 +51,36 @@ function formatSize(bytes?: number): string {
 
 export default function SharedFolder() {
   const { token } = useParams<{ token: string }>();
+  const [searchParams, setSearchParams] = useSearchParams();
+  const folderId = searchParams.get("folder");
+  const [selectedDocument, setSelectedDocument] = useState<PublicDoc | null>(null);
   const [state, setState] = useState<
     | { kind: "loading" }
+    | { kind: "verification" }
     | { kind: "ok"; data: SharedFolderResponse }
     | { kind: "error"; status: number; message: string }
   >({ kind: "loading" });
+  const [verificationVersion, setVerificationVersion] = useState(0);
 
   useEffect(() => {
     if (!token) return;
+    const controller = new AbortController();
+    setState({ kind: "loading" });
+    setSelectedDocument(null);
     (async () => {
       try {
         const res = await fetch(
-          `/api/v1/shared-folder/${encodeURIComponent(token)}`,
-          { headers: { Accept: "application/json" } },
+          `/api/v1/shared-folder/${encodeURIComponent(token)}${folderId ? `?folder_id=${encodeURIComponent(folderId)}` : ""}`,
+          { headers: { Accept: "application/json" }, signal: controller.signal },
         );
         if (!res.ok) {
           const body = await res.json().catch(() => ({}));
+          if (controller.signal.aborted) return;
           const detail = body?.detail;
+          if (res.status === 401 && detail?.code === "permissions.error.share.verification_required") {
+            setState({ kind: "verification" });
+            return;
+          }
           // Backend CodedError shape: { code, message, vars? }
           // Older clients / non-coded errors: detail is a plain string.
           let message: string;
@@ -89,8 +105,9 @@ export default function SharedFolder() {
           return;
         }
         const data: SharedFolderResponse = await res.json();
-        setState({ kind: "ok", data });
+        if (!controller.signal.aborted) setState({ kind: "ok", data });
       } catch (e: any) {
+        if (controller.signal.aborted) return;
         setState({
           kind: "error",
           status: 0,
@@ -98,7 +115,14 @@ export default function SharedFolder() {
         });
       }
     })();
-  }, [token]);
+    return () => controller.abort();
+  }, [token, folderId, verificationVersion]);
+
+  const fileBaseUrl = token && selectedDocument
+    ? `/api/v1/shared-folder/${encodeURIComponent(token)}/documents/${encodeURIComponent(selectedDocument.id)}`
+    : "";
+  const previewSource = useMemo(() => ({ contentUrl: `${fileBaseUrl}/content` }), [fileBaseUrl]);
+  const canDownload = state.kind === "ok" && state.data.allow_download && state.data.capabilities.includes("download");
 
   return (
     <div
@@ -128,6 +152,16 @@ export default function SharedFolder() {
           </p>
         )}
 
+        {state.kind === "verification" && token && (
+          <ShareOtpGate
+            endpoint={`/api/v1/shared-folder/${encodeURIComponent(token)}`}
+            onVerified={() => {
+              setState({ kind: "loading" });
+              setVerificationVersion((version) => version + 1);
+            }}
+          />
+        )}
+
         {state.kind === "error" && (
           <div style={{ padding: "32px 0", textAlign: "center" }}>
             <p style={{ fontSize: 18, fontWeight: 600, color: "#292524", margin: "0 0 4px" }}>
@@ -141,6 +175,11 @@ export default function SharedFolder() {
 
         {state.kind === "ok" && (
           <>
+            {state.data.parent_id && (
+              <Button variant="ghost" onClick={() => setSearchParams({ folder: state.data.parent_id! })}>
+                {t("page.file_viewer.go_back")}
+              </Button>
+            )}
             <h2 style={{ fontSize: 22, fontWeight: 700, color: "#1c1917", margin: "8px 0 4px" }}>
               {state.data.name}
             </h2>
@@ -165,10 +204,9 @@ export default function SharedFolder() {
                   {state.data.subfolders.map((sf) => (
                     <li key={sf.id} style={ROW_STYLE}>
                       <IconFolder size={16} />
-                      <span style={{ fontSize: 14, color: "#57534e" }}>{sf.name}</span>
-                      <span style={{ fontSize: 11, color: "#d6d3d1", marginLeft: "auto" }}>
-                        {t("page.shared_folder.subfolder_hint")}
-                      </span>
+                      <Button variant="ghost" className="min-w-0 truncate" title={sf.name} onClick={() => setSearchParams({ folder: sf.id })}>
+                        {sf.name}
+                      </Button>
                     </li>
                   ))}
                 </ul>
@@ -188,9 +226,9 @@ export default function SharedFolder() {
                   {state.data.documents.map((d) => (
                     <li key={d.id} style={ROW_STYLE}>
                       <IconDocument size={16} />
-                      <span style={{ fontSize: 14, color: "#292524", fontWeight: 500 }}>
+                      <Button variant="ghost" className="min-w-0 truncate" title={d.name} onClick={() => setSelectedDocument(d)}>
                         {d.name}
-                      </span>
+                      </Button>
                       <ClassificationBadge level={d.classification} size="sm" />
                       <span style={{ fontSize: 11, color: "#a8a29e", marginLeft: "auto" }}>
                         {formatSize(d.file_size)}
@@ -215,6 +253,26 @@ export default function SharedFolder() {
           </>
         )}
       </div>
+      <Modal
+        open={selectedDocument !== null}
+        onClose={() => setSelectedDocument(null)}
+        title={selectedDocument?.name || t("page.shared_folder.brand_header")}
+        maxWidth="1000px"
+        footer={canDownload && selectedDocument ? (
+          <a className="btn-manor" href={`${fileBaseUrl}/download`} download={selectedDocument.name}>
+            {t("page.shared_doc.download_button")}
+          </a>
+        ) : undefined}
+      >
+        {selectedDocument && (
+          <div style={{ position: "relative", minWidth: 0 }}>
+            <ReadOnlyFilePreview key={fileBaseUrl} file={selectedDocument} source={previewSource} canDownload={canDownload} />
+            {state.kind === "ok" && state.data.watermark && (
+              <WatermarkLayer viewerEmail={t("page.shared_folder.brand_header")} />
+            )}
+          </div>
+        )}
+      </Modal>
     </div>
   );
 }

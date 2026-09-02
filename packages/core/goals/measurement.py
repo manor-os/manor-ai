@@ -8,6 +8,7 @@ achievements.
 from __future__ import annotations
 
 import logging
+from copy import deepcopy
 from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Optional
@@ -15,11 +16,18 @@ from typing import Optional
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from packages.core.constants.goals import GoalStatus
 from packages.core.database import async_session
 from packages.core.goals import measurers as measurer_registry
+from packages.core.goals.numbers import goal_number_to_json
 from packages.core.goals.service import record_measurement
 from packages.core.models.document import Integration
 from packages.core.models.goal import Goal
+from packages.core.services.workspace_autonomy import (
+    WorkspaceAutonomyState,
+    workspace_autonomy_skip_reason,
+    workspace_autonomy_state,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -31,7 +39,28 @@ class MeasurementError(Exception):
     differently — measurement errors don't auto-retry forever."""
 
 
-async def measure_goal(goal_id: str, db: Optional[AsyncSession] = None) -> dict:
+def _workspace_measurement_skip_reason(
+    workspace,
+    *,
+    require_autonomous_runtime: bool,
+) -> str | None:
+    autonomy_state = workspace_autonomy_state(workspace)
+    if autonomy_state is WorkspaceAutonomyState.RUNNING:
+        return None
+    if (
+        autonomy_state is WorkspaceAutonomyState.DISABLED
+        and not require_autonomous_runtime
+    ):
+        return None
+    return workspace_autonomy_skip_reason(workspace)
+
+
+async def measure_goal(
+    goal_id: str,
+    db: Optional[AsyncSession] = None,
+    *,
+    require_autonomous_runtime: bool = True,
+) -> dict:
     """Run one measurement cycle for a goal.
 
     Caller may pass a DB session to participate in an outer transaction;
@@ -39,11 +68,27 @@ async def measure_goal(goal_id: str, db: Optional[AsyncSession] = None) -> dict:
     """
     if db is None:
         async with async_session() as owned_db:
-            return await _measure(owned_db, goal_id, commit=True)
-    return await _measure(db, goal_id, commit=False)
+            return await _measure(
+                owned_db,
+                goal_id,
+                commit=True,
+                require_autonomous_runtime=require_autonomous_runtime,
+            )
+    return await _measure(
+        db,
+        goal_id,
+        commit=False,
+        require_autonomous_runtime=require_autonomous_runtime,
+    )
 
 
-async def _measure(db: AsyncSession, goal_id: str, *, commit: bool) -> dict:
+async def _measure(
+    db: AsyncSession,
+    goal_id: str,
+    *,
+    commit: bool,
+    require_autonomous_runtime: bool,
+) -> dict:
     prev_pace_status: Optional[str] = None
     new_pace_status: Optional[str] = None
     achieved_now = False
@@ -55,7 +100,7 @@ async def _measure(db: AsyncSession, goal_id: str, *, commit: bool) -> dict:
 
         if goal is None:
             raise MeasurementError(f"goal {goal_id} not found")
-        if goal.status != "active":
+        if goal.status != GoalStatus.ACTIVE.value:
             from packages.core.goals.scheduling import remove_measurement_schedule
             await remove_measurement_schedule(db, goal)
             if commit:
@@ -71,28 +116,44 @@ async def _measure(db: AsyncSession, goal_id: str, *, commit: bool) -> dict:
             )).scalar_one_or_none()
             if workspace is None:
                 return {"goal_id": goal_id, "skipped": True, "reason": "workspace_not_found"}
-            if workspace.status != "active":
+            runtime_skip_reason = _workspace_measurement_skip_reason(
+                workspace,
+                require_autonomous_runtime=require_autonomous_runtime,
+            )
+            if runtime_skip_reason:
                 return {
                     "goal_id": goal_id,
                     "skipped": True,
-                    "reason": f"workspace_{workspace.status}",
+                    "reason": runtime_skip_reason,
                 }
+
+        source = deepcopy(goal.measurement_source or {})
+        measured_metric_key = goal.metric_key
+        measured_stat_id = goal.stat_id
+        measured_goal_state = (
+            goal.baseline_value,
+            goal.current_value,
+            goal.target_value,
+            goal.deadline,
+            goal.created_at,
+        )
+        value_depends_on_goal_state = False
+        from packages.core.goals.scheduling import (
+            is_auto_measurement_source,
+            is_workspace_internal_measurement_source,
+        )
 
         # Sandbox workspaces never call real integrations — generate
         # a plausible value from the goal's pace curve so the demo
         # shows realistic-looking measurements + pace transitions.
         sandbox_value = await _maybe_simulate(db, goal)
         if sandbox_value is not None:
+            value_depends_on_goal_state = True
             value = sandbox_value
             measurement_source_label = "simulated"
             params = {}
             provider = "_sandbox"
         else:
-            source = goal.measurement_source or {}
-            from packages.core.goals.scheduling import (
-                is_auto_measurement_source,
-                is_workspace_internal_measurement_source,
-            )
             if not is_auto_measurement_source(source):
                 return {
                     "goal_id": goal_id,
@@ -106,6 +167,7 @@ async def _measure(db: AsyncSession, goal_id: str, *, commit: bool) -> dict:
                 )
 
             if is_workspace_internal_measurement_source(source):
+                value_depends_on_goal_state = True
                 internal = await _measure_workspace_internal(db, goal)
                 if internal is None:
                     return {
@@ -116,8 +178,6 @@ async def _measure(db: AsyncSession, goal_id: str, *, commit: bool) -> dict:
                 value = internal["value"]
                 params = internal["meta"]
                 measurement_source_label = "workspace_internal"
-                if goal.baseline_value is None:
-                    goal.baseline_value = Decimal("0")
             else:
                 measurer = measurer_registry.get(provider)
                 if measurer is None:
@@ -136,20 +196,95 @@ async def _measure(db: AsyncSession, goal_id: str, *, commit: bool) -> dict:
                 value = await measurer(integration, params, goal.metric_key)
                 measurement_source_label = f"integration:{provider}"
 
+        if goal.workspace_id:
+            # Provider calls can take long enough for the operator to stop the
+            # Workspace after the first check. Fence the final write behind
+            # the same Workspace -> Goal lock order used by lifecycle changes.
+            from packages.core.goals.locking import lock_workspace_for_goal_mutation
+
+            workspace = await lock_workspace_for_goal_mutation(
+                db,
+                workspace_id=goal.workspace_id,
+                entity_id=goal.entity_id,
+            )
+            if workspace is None:
+                return {
+                    "goal_id": goal_id,
+                    "skipped": True,
+                    "reason": "workspace_not_found",
+                }
+            await db.refresh(workspace)
+            runtime_skip_reason = _workspace_measurement_skip_reason(
+                workspace,
+                require_autonomous_runtime=require_autonomous_runtime,
+            )
+            if runtime_skip_reason:
+                return {
+                    "goal_id": goal_id,
+                    "skipped": True,
+                    "reason": runtime_skip_reason,
+                }
+
+        from packages.core.goals.locking import lock_goal_for_mutation
+
+        locked_goal = await lock_goal_for_mutation(
+            db,
+            goal_id,
+            entity_id=goal.entity_id,
+        )
+        if locked_goal is None:
+            return {
+                "goal_id": goal_id,
+                "skipped": True,
+                "reason": "goal_not_found",
+            }
+        if locked_goal.status != GoalStatus.ACTIVE.value:
+            return {
+                "goal_id": goal_id,
+                "skipped": True,
+                "reason": f"status={locked_goal.status}",
+            }
+        if (
+            (locked_goal.measurement_source or {}) != source
+            or locked_goal.metric_key != measured_metric_key
+            or locked_goal.stat_id != measured_stat_id
+            or (
+                value_depends_on_goal_state
+                and (
+                    locked_goal.baseline_value,
+                    locked_goal.current_value,
+                    locked_goal.target_value,
+                    locked_goal.deadline,
+                    locked_goal.created_at,
+                ) != measured_goal_state
+            )
+        ):
+            return {
+                "goal_id": goal_id,
+                "skipped": True,
+                "reason": "goal_measurement_config_changed",
+            }
+        goal = locked_goal
+
         prev_pace_status = goal.pace_status
-        await record_measurement(
+        measurement = await record_measurement(
             db,
             goal,
             value=value,
             source=measurement_source_label,
             meta={
-                "measurement_source": goal.measurement_source,
+                "measurement_source": source,
                 "provider": provider,
                 "measurement": params,
             },
+            baseline_value_if_missing=(
+                Decimal("0")
+                if is_workspace_internal_measurement_source(source)
+                else None
+            ),
         )
         new_pace_status = goal.pace_status
-        achieved_now = goal.status == "achieved" and goal.achieved_at is not None and (
+        achieved_now = goal.status == GoalStatus.ACHIEVED.value and goal.achieved_at is not None and (
             (datetime.now(timezone.utc) - goal.achieved_at).total_seconds() < 60
         )
 
@@ -163,7 +298,7 @@ async def _measure(db: AsyncSession, goal_id: str, *, commit: bool) -> dict:
             goal_id=goal_id,
             workspace_id=goal.workspace_id,
             metric_key=goal.metric_key,
-            value=float(value),
+            value=measurement.value,
             prev_pace=prev_pace_status,
             new_pace=new_pace_status,
             achieved_now=achieved_now,
@@ -171,7 +306,7 @@ async def _measure(db: AsyncSession, goal_id: str, *, commit: bool) -> dict:
 
         return {
             "goal_id": goal_id,
-            "value": float(value),
+            "value": goal_number_to_json(measurement.value),
             "pace": new_pace_status,
             "achieved": achieved_now,
         }
@@ -300,7 +435,7 @@ async def _maybe_emit_events(
     goal_id: str,
     workspace_id: Optional[str],
     metric_key: str,
-    value: float,
+    value: Decimal,
     prev_pace: Optional[str],
     new_pace: Optional[str],
     achieved_now: bool,

@@ -29,6 +29,8 @@ from sqlalchemy import DateTime, Index, Integer, String, Text, func, text
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
+from packages.core.constants.review import ReviewRunStatus
+
 from .base import Base, generate_ulid
 
 
@@ -43,6 +45,16 @@ class ReviewRun(Base):
             postgresql_where=text("status = 'running'"),
         ),
         Index("ix_review_runs_workspace_created", "workspace_id", "created_at"),
+        Index(
+            "uq_review_runs_workspace_delivery_live_or_terminal",
+            "workspace_id",
+            "delivery_id",
+            unique=True,
+            postgresql_where=text(
+                "delivery_id IS NOT NULL "
+                "AND status IN ('running', 'succeeded', 'skipped')"
+            ),
+        ),
     )
 
     id: Mapped[str] = mapped_column(String(26), primary_key=True, default=generate_ulid)
@@ -57,7 +69,9 @@ class ReviewRun(Base):
     # Free text for display + audit only. Nothing branches on it.
     trigger_detail: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     # running|succeeded|failed|skipped
-    status: Mapped[str] = mapped_column(String(16), nullable=False, default="running")
+    status: Mapped[str] = mapped_column(
+        String(16), nullable=False, default=ReviewRunStatus.RUNNING
+    )
     skip_reason: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
 
     # ── frozen snapshot ────────────────────────────────────────────────
@@ -68,6 +82,16 @@ class ReviewRun(Base):
     watermark_end: Mapped[Optional[str]] = mapped_column(String(26), nullable=True)
     workspace_revision: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     policy_revision: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+
+    # Durable execution lease. The owner is one task delivery; the expiry is
+    # renewed while the review is alive and fenced before side effects commit.
+    # ``delivery_id`` remains after terminal success/skip so a worker loss
+    # between database commit and Celery ACK cannot replay the same cohort.
+    delivery_id: Mapped[Optional[str]] = mapped_column(String(120), nullable=True)
+    lease_owner: Mapped[Optional[str]] = mapped_column(String(120), nullable=True)
+    lease_expires_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
 
     # ── outputs ────────────────────────────────────────────────────────
     briefing: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)  # M5 product (frozen)

@@ -10,11 +10,12 @@ These tests pin the CROSS-PLANE claims that motivated the rewrite:
     call re-asks;
   * re-tripping the guard for the identical call reuses ONE open request
     (badge honesty);
-  * legacy blob approvals (paused before the deploy) still resolve/consume
-    via the fallback shim;
+  * legacy blob approvals are retired by a one-time cleanup migration; the
+    runtime resolver ignores any synthetic leftovers;
   * a step-origin request id is invisible to the runtime resolver (foreign
     ids fall through the chat resolver chain).
 """
+
 from __future__ import annotations
 
 import json
@@ -27,8 +28,22 @@ from packages.core.governance import WorkspacePolicy, update_policy
 from packages.core.models.hitl_request import HitlRequest
 from packages.core.models.base import generate_ulid
 from packages.core.models.task import Conversation
-from packages.core.models.user import User
+from packages.core.models.user import Entity, User, UserMembership
 from packages.core.models.workspace import Workspace
+from packages.core.services.runtime_authorization import (
+    AuthorizationRule,
+    PermissionDecision,
+)
+
+
+async def _resolve_step_approval(*args, **kwargs):
+    kwargs.setdefault(
+        "permission_decision",
+        PermissionDecision.allow(AuthorizationRule.DISPATCHER_WORKER),
+    )
+    from packages.core.governance.approvals import resolve_approval
+
+    return await resolve_approval(*args, **kwargs)
 
 
 class _SessionContext:
@@ -47,9 +62,17 @@ async def _fixture(db, *, with_workspace: bool = True, hitl_capability: str | No
     user_id = generate_ulid()
     conversation_id = generate_ulid()
     workspace_id = generate_ulid() if with_workspace else None
+    db.add(Entity(id=entity_id, name="Unified approval test"))
     db.add(User(
         id=user_id, entity_id=entity_id, email=f"{user_id}@example.com",
-        password_hash="x", role="owner",
+        password_hash="x", role="owner", status="active",
+    ))
+    db.add(UserMembership(
+        user_id=user_id,
+        entity_id=entity_id,
+        role="owner",
+        status="active",
+        is_primary=True,
     ))
     if workspace_id:
         db.add(Workspace(
@@ -82,6 +105,36 @@ async def _guard(ids, arguments, *, name="mcp__twitter_x__create_tweet"):
         user_id=ids["user_id"],
         workspace_id=ids["workspace_id"],
         conversation_id=ids["conversation_id"],
+        runtime_envelope=_runtime_envelope(ids, name=name),
+    )
+
+
+def _runtime_envelope(ids, *, name: str, task_id: str | None = None):
+    from packages.core.ai.runtime.envelope import RuntimeEnvelope
+    from packages.core.ai.runtime.principals import RuntimePrincipal
+    from packages.core.ai.runtime.profiles import RuntimeProfile
+    from packages.core.ai.runtime.surfaces import ChatSurface
+    from packages.core.constants.agents import MANOR_AGENT_ID
+    from packages.core.constants.runtime_principal import RuntimePrincipalKind
+
+    return RuntimeEnvelope(
+        surface=ChatSurface.WORKSPACE_CHAT,
+        principal=RuntimePrincipal(
+            kind=RuntimePrincipalKind.WORKSPACE_MEMBER,
+            entity_id=ids["entity_id"],
+            actor_user_id=ids["user_id"],
+            execution_user_id=ids["user_id"],
+            agent_id=MANOR_AGENT_ID,
+            workspace_id=ids["workspace_id"],
+        ),
+        profile=RuntimeProfile.WORKSPACE_OPERATOR,
+        entity_id=ids["entity_id"],
+        user_id=ids["user_id"],
+        agent_id=MANOR_AGENT_ID,
+        workspace_id=ids["workspace_id"],
+        conversation_id=ids["conversation_id"],
+        task_id=task_id,
+        allowed_tool_names=(name,),
     )
 
 
@@ -152,6 +205,83 @@ async def test_chat_approve_once_grants_consumes_then_reasks(db_session, monkeyp
 
 
 @pytest.mark.asyncio
+async def test_chat_approval_resumes_exact_typed_arguments_without_model_rewrite(
+    db_session,
+    monkeypatch,
+):
+    monkeypatch.setattr(database, "async_session", lambda: _SessionContext(db_session))
+    from packages.core.ai.runtime.approval_service import resolve_runtime_approval_turn
+
+    ids = await _fixture(db_session, hitl_capability="external.email")
+    args = {
+        "to": "reviewer@example.test",
+        "subject": "Candidate",
+        "body": "Please review.",
+        "attachments": [{"filename": "candidate.txt", "data_base64": "YQ=="}],
+    }
+    blocked = json.loads(
+        await _guard(ids, dict(args), name="mcp__email__send_email") or "{}"
+    )
+
+    resolution = await resolve_runtime_approval_turn(
+        db_session,
+        conversation_id=ids["conversation_id"],
+        entity_id=ids["entity_id"],
+        user_id=ids["user_id"],
+        hitl_id=blocked["approval_token"],
+        action="approve",
+    )
+
+    assert resolution is not None
+    assert resolution.runtime_metadata is not None
+    forced = resolution.runtime_metadata["forced_tool_calls"]
+    assert len(forced) == 1
+    assert forced[0]["name"] == "mcp__email__send_email"
+    assert forced[0]["arguments"]["attachments"] == [
+        {"filename": "candidate.txt", "data_base64": "YQ=="}
+    ]
+    assert forced[0]["arguments"]["approval_token"] == blocked["approval_token"]
+
+
+@pytest.mark.asyncio
+async def test_legacy_invalid_email_approval_expires_without_consuming_or_replaying(
+    db_session,
+    monkeypatch,
+):
+    monkeypatch.setattr(database, "async_session", lambda: _SessionContext(db_session))
+    from packages.core.ai.runtime.approval_service import resolve_runtime_approval_turn
+
+    ids = await _fixture(db_session, hitl_capability="external.email")
+    args = {
+        "to": "reviewer@example.test",
+        "subject": "Candidate",
+        "body": "Please review.",
+        "attachments": '[{"document_id":"document-1"}]',
+    }
+    blocked = json.loads(
+        await _guard(ids, dict(args), name="mcp__email__send_email") or "{}"
+    )
+    token = blocked["approval_token"]
+
+    resolution = await resolve_runtime_approval_turn(
+        db_session,
+        conversation_id=ids["conversation_id"],
+        entity_id=ids["entity_id"],
+        user_id=ids["user_id"],
+        hitl_id=token,
+        action="approve",
+    )
+
+    assert resolution is not None
+    assert resolution.runtime_metadata is None
+    assert "stored tool input is invalid" in resolution.message
+    request = await db_session.get(HitlRequest, token)
+    assert request.status == "expired"
+    assert request.resolved_reason == "approved_tool_input_invalid"
+    assert request.consumed_at is None
+
+
+@pytest.mark.asyncio
 async def test_workspace_always_is_honored_by_the_dispatcher_gate_too(db_session, monkeypatch):
     """THE unification: 'Always approve' on a runtime chat card writes the
     workspace policy auto-approve set, so the DISPATCHER's step gate allows
@@ -164,7 +294,7 @@ async def test_workspace_always_is_honored_by_the_dispatcher_gate_too(db_session
     identical call sails through on."""
     monkeypatch.setattr(database, "async_session", lambda: _SessionContext(db_session))
     from packages.core.ai.runtime.approval_service import resolve_runtime_approval_message
-    from packages.core.governance.approvals import ApprovalOrigin, ApprovalSubject, resolve_approval
+    from packages.core.governance.approvals import ApprovalOrigin, ApprovalSubject
 
     ids = await _fixture(db_session, hitl_capability="external.social")
 
@@ -183,7 +313,7 @@ async def test_workspace_always_is_honored_by_the_dispatcher_gate_too(db_session
     assert await _guard(ids, {"text": "another post"}) is None
 
     # dispatcher plane: a STEP with the same subject is allowed by the same store
-    step_decision = await resolve_approval(
+    step_decision = await _resolve_step_approval(
         db_session,
         subject=ApprovalSubject(
             entity_id=ids["entity_id"], workspace_id=ids["workspace_id"],
@@ -228,9 +358,8 @@ async def test_legacy_blob_token_is_ignored_and_gate_decides_fresh(db_session, m
 
 
 @pytest.mark.asyncio
-async def test_legacy_blob_card_click_gets_tombstone(db_session, monkeypatch):
-    """Clicking a card minted before the upgrade closes it with an upgrade
-    notice — the retry then goes through the unified gate for a fresh card."""
+async def test_legacy_blob_card_click_is_ignored(db_session, monkeypatch):
+    """A legacy blob-only card is no longer actionable."""
     monkeypatch.setattr(database, "async_session", lambda: _SessionContext(db_session))
     from packages.core.ai.runtime.approval_service import resolve_runtime_approval_turn
 
@@ -252,13 +381,15 @@ async def test_legacy_blob_card_click_gets_tombstone(db_session, monkeypatch):
 
     resolution = await resolve_runtime_approval_turn(
         db_session,
-        conversation_id=ids["conversation_id"], entity_id=ids["entity_id"],
-        user_id=ids["user_id"], hitl_id=legacy_token, action="approve",
+        conversation_id=ids["conversation_id"],
+        entity_id=ids["entity_id"],
+        user_id=ids["user_id"],
+        hitl_id=legacy_token,
+        action="approve",
     )
-    assert resolution is not None
-    assert "predates the approval-system upgrade" in resolution.message
+    assert resolution is None
     refreshed = await db_session.get(Conversation, ids["conversation_id"])
-    assert refreshed.meta["runtime_approvals"][legacy_token]["status"] == "expired"
+    assert refreshed.meta["runtime_approvals"][legacy_token]["status"] == "pending"
 
 
 @pytest.mark.asyncio
@@ -267,11 +398,11 @@ async def test_step_origin_request_is_invisible_to_runtime_resolver(db_session, 
     (returns None) so the chat resolver chain routes it to the right handler."""
     monkeypatch.setattr(database, "async_session", lambda: _SessionContext(db_session))
     from packages.core.ai.runtime.approval_service import resolve_runtime_approval_turn
-    from packages.core.governance.approvals import ApprovalOrigin, ApprovalSubject, resolve_approval
+    from packages.core.governance.approvals import ApprovalOrigin, ApprovalSubject
 
     ids = await _fixture(db_session)
 
-    step_decision = await resolve_approval(
+    step_decision = await _resolve_step_approval(
         db_session,
         subject=ApprovalSubject(
             entity_id=ids["entity_id"], workspace_id=ids["workspace_id"],
@@ -386,6 +517,120 @@ async def test_tokenless_identical_retry_consumes_the_grant_once(db_session, mon
 
 
 @pytest.mark.asyncio
+async def test_concurrent_tokenless_retries_have_one_grant_consumer(
+    db_session,
+    monkeypatch,
+):
+    """The stale-token compatibility lookup must serialize on the matched row."""
+
+    from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+    from packages.core.ai.runtime.approval_service import (
+        consume_runtime_approval,
+        resolve_runtime_approval_message,
+    )
+    from packages.core.ai.runtime.approvals import RuntimeApprovalAction
+
+    monkeypatch.setattr(database, "async_session", lambda: _SessionContext(db_session))
+    ids = await _fixture(db_session, hitl_capability="external.social")
+    args = {"text": "one concurrent post"}
+    blocked = json.loads(await _guard(ids, dict(args)) or "{}")
+    token = blocked["approval_token"]
+    await resolve_runtime_approval_message(
+        db_session,
+        conversation_id=ids["conversation_id"],
+        entity_id=ids["entity_id"],
+        user_id=ids["user_id"],
+        hitl_id=token,
+        action="approve",
+    )
+    await db_session.commit()
+
+    session_factory = async_sessionmaker(
+        db_session.bind,
+        class_=AsyncSession,
+        expire_on_commit=False,
+    )
+    action = RuntimeApprovalAction(
+        kind="action",
+        action_key="social_post.publish",
+        risk_level="high",
+        title="Publish social post",
+        capability_id="external.social",
+    )
+    permission = PermissionDecision.allow(AuthorizationRule.HITL_REQUEST_OWNER)
+
+    async def consume_once() -> str | None:
+        async with session_factory() as worker_db:
+            result = await consume_runtime_approval(
+                worker_db,
+                conversation_id=ids["conversation_id"],
+                entity_id=ids["entity_id"],
+                user_id=ids["user_id"],
+                hitl_id=generate_ulid(),
+                tool_name="mcp__twitter_x__create_tweet",
+                arguments=dict(args),
+                action=action,
+                permission_decision=permission,
+            )
+            await worker_db.commit()
+            return result
+
+    import asyncio
+
+    outcomes = await asyncio.gather(consume_once(), consume_once())
+    assert outcomes.count(None) == 1
+    async with session_factory() as check_db:
+        assert (await check_db.get(HitlRequest, token)).status == "consumed"
+
+
+@pytest.mark.asyncio
+async def test_approval_expires_when_actor_scoped_schema_is_unavailable(
+    db_session,
+    monkeypatch,
+):
+    from packages.core.ai.runtime import tool_registry
+    from packages.core.ai.runtime.approval_service import resolve_runtime_approval_turn
+
+    monkeypatch.setattr(database, "async_session", lambda: _SessionContext(db_session))
+    ids = await _fixture(db_session, hitl_capability="external.email")
+    args = {
+        "to": "reviewer@example.test",
+        "subject": "Candidate",
+        "body": "Please review.",
+    }
+    blocked = json.loads(
+        await _guard(ids, dict(args), name="mcp__email__send_email") or "{}"
+    )
+
+    async def unavailable_schema(name: str, *, entity_id: str, user_id: str):
+        assert name == "mcp__email__send_email"
+        assert entity_id == ids["entity_id"]
+        assert user_id == ids["user_id"]
+        return None
+
+    monkeypatch.setattr(
+        tool_registry,
+        "runtime_tool_schema_for_actor",
+        unavailable_schema,
+    )
+    resolution = await resolve_runtime_approval_turn(
+        db_session,
+        conversation_id=ids["conversation_id"],
+        entity_id=ids["entity_id"],
+        user_id=ids["user_id"],
+        hitl_id=blocked["approval_token"],
+        action="approve",
+    )
+
+    assert resolution.runtime_metadata is None
+    assert "current tool schema is unavailable" in resolution.message
+    request = await db_session.get(HitlRequest, blocked["approval_token"])
+    assert request.status == "expired"
+    assert request.resolved_reason == "approved_tool_schema_unavailable"
+
+
+@pytest.mark.asyncio
 async def test_standing_grant_scope_is_the_displayed_action_not_the_capability(db_session, monkeypatch):
     """'Always approve' on one action must not silently pre-approve every
     other action in the same capability family."""
@@ -394,7 +639,12 @@ async def test_standing_grant_scope_is_the_displayed_action_not_the_capability(d
 
     ids = await _fixture(db_session, hitl_capability="automation.manage")
 
-    create_args = {"name": "job", "cron": "0 * * * *", "prompt": "run"}
+    create_args = {
+        "name": "job",
+        "schedule_kind": "cron",
+        "cron_expr": "0 * * * *",
+        "payload_message": "run",
+    }
     blocked = json.loads(await _guard(
         ids, dict(create_args), name="create_scheduled_job",
     ) or "{}")
@@ -412,7 +662,7 @@ async def test_standing_grant_scope_is_the_displayed_action_not_the_capability(d
         ids, {"job_id": "job-1"}, name="cancel_scheduled_job",
     )
     payload = json.loads(cancel_blocked or "{}")
-    assert payload["__hitl__"] is True
+    assert payload.get("__hitl__") is True, payload
     assert payload["hitl"]["action"] == "workspace.automation.delete"
 
 
@@ -422,34 +672,41 @@ async def test_task_runtime_rules_gate_the_runtime_plane_too(db_session, monkeyp
     (approval_required / deny) bind chat tool calls, not just plan steps."""
     monkeypatch.setattr(database, "async_session", lambda: _SessionContext(db_session))
     from packages.core.ai.runtime.approval_service import guard_runtime_tool_action
+    from packages.core.constants.agents import MANOR_AGENT_ID
     from packages.core.models.task import Task
 
     ids = await _fixture(db_session)  # no policy rule — task rule is the only gate
     task_id = generate_ulid()
     db_session.add(Task(
         id=task_id, entity_id=ids["entity_id"], workspace_id=ids["workspace_id"],
+        agent_id=MANOR_AGENT_ID,
         title="rule-bound task",
         details={"runtime_context": {"rules": [{
-            "rule_key": "review_social",
+            "rule_key": "review_automation",
             "rule_type": "approval_required",
-            "description": "Social publishes need review in this task.",
-            "action_patterns": ["social_post.publish"],
+            "description": "Automation creation needs review in this task.",
+            "action_patterns": ["workspace.automation.create"],
         }]}},
     ))
     await db_session.flush()
 
     blocked = await guard_runtime_tool_action(
-        name="mcp__twitter_x__create_tweet",
-        arguments={"text": "task-scoped"},
+        name="create_scheduled_job",
+        arguments={"name": "task-scoped", "cron": "0 * * * *", "prompt": "run"},
         entity_id=ids["entity_id"],
         user_id=ids["user_id"],
         workspace_id=ids["workspace_id"],
         conversation_id=ids["conversation_id"],
         task_id=task_id,
+        runtime_envelope=_runtime_envelope(
+            ids,
+            name="create_scheduled_job",
+            task_id=task_id,
+        ),
     )
     payload = json.loads(blocked or "{}")
-    assert payload["__hitl__"] is True
-    assert payload["operation"]["matched_rule"] == "review_social"
+    assert payload.get("__hitl__") is True, payload
+    assert payload["operation"]["matched_rule"] == "review_automation"
     row = await db_session.get(HitlRequest, payload["approval_token"])
     assert row.origin_task_id == task_id
 
@@ -458,16 +715,29 @@ async def test_task_runtime_rules_gate_the_runtime_plane_too(db_session, monkeyp
 async def test_terminal_origin_revokes_granted_unconsumed_requests(db_session):
     """A grant whose origin died must be revoked, not left findable forever."""
     from packages.core.governance.approvals import (
-        grant_approval, resolve_approval, resolve_origin_requests,
+        grant_approval, resolve_origin_requests,
         ApprovalOrigin, ApprovalSubject,
     )
     from packages.core.models.workspace import Workspace
 
     entity_id, workspace_id = generate_ulid(), generate_ulid()
+    db_session.add(User(
+        id="op",
+        entity_id=entity_id,
+        email=f"op-{entity_id}@example.com",
+        password_hash="x",
+        role="owner",
+    ))
+    db_session.add(UserMembership(
+        user_id="op",
+        entity_id=entity_id,
+        role="owner",
+        status="active",
+    ))
     db_session.add(Workspace(id=workspace_id, entity_id=entity_id, name="WS", operating_model={}))
     await db_session.flush()
     step_id = generate_ulid()
-    d = await resolve_approval(
+    d = await _resolve_step_approval(
         db_session,
         subject=ApprovalSubject(
             entity_id=entity_id, workspace_id=workspace_id,
@@ -511,16 +781,18 @@ async def test_reply_approve_on_legacy_blob_pending_gets_tombstone(db_session, m
 
     resolution = await resolve_pending_runtime_approval_turn_from_reply(
         db_session,
-        conversation_id=ids["conversation_id"], entity_id=ids["entity_id"],
-        user_id=ids["user_id"], message="approve",
+        conversation_id=ids["conversation_id"],
+        entity_id=ids["entity_id"],
+        user_id=ids["user_id"],
+        message="approve",
     )
-    assert resolution is not None
-    assert "predates the approval-system upgrade" in resolution.message
+    assert resolution is None
 
 
 @pytest.mark.asyncio
 async def test_retry_while_still_pending_re_surfaces_the_same_card(
-    db_session, monkeypatch,
+    db_session,
+    monkeypatch,
 ):
     """The second half of the workspace-email incident.
 

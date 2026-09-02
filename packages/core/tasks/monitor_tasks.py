@@ -12,11 +12,14 @@ Tasks:
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import logging
 import os
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+from packages.core.constants.goals import GoalStatus
 from packages.core.constants.task import TaskLogType, TaskStatus
 from packages.core.constants.execution import (
     ExecutionPlanStatus,
@@ -790,7 +793,6 @@ async def _async_hitl_waiting_reminder(
         )).all())
 
         delivered = 0
-        webhook_events: list[tuple[str, str, dict[str, Any]]] = []
         for step, plan, task in rows:
             wait_started_at = _hitl_wait_started_at(step)
             last_reminded_at = _hitl_last_reminded_at(plan, step.id)
@@ -804,7 +806,7 @@ async def _async_hitl_waiting_reminder(
                 continue
 
             wait_minutes = max(0, int((current - wait_started_at).total_seconds() // 60))
-            count, event_payload = await _deliver_hitl_reminder(
+            count, _event_payload = await _deliver_hitl_reminder(
                 db,
                 task=task,
                 plan=plan,
@@ -815,17 +817,9 @@ async def _async_hitl_waiting_reminder(
             if count:
                 _record_hitl_reminder(plan, step.id, now=current, wait_minutes=wait_minutes)
                 delivered += count
-                webhook_events.append((task.entity_id, "task.hitl_reminder", event_payload))
 
         if delivered:
             await db.commit()
-            from packages.core.services.event_emitter import (
-                deliver_task_external_event,
-                deliver_webhook_event,
-            )
-            for entity_id, event_type, payload in webhook_events:
-                await deliver_webhook_event(entity_id, event_type, payload)
-                await deliver_task_external_event(entity_id, event_type, payload)
         return delivered
 
 
@@ -867,6 +861,8 @@ async def _deliver_hitl_reminder(
         "task.hitl_reminder",
         source="hitl_waiting_reminder",
         payload=meta,
+        workspace_id=task.workspace_id,
+        deliver_after_commit=True,
     )
     return delivered, meta
 
@@ -942,15 +938,23 @@ async def _async_readiness_check() -> int:
     from packages.core.models.workspace import Workspace, AgentSubscription
     from packages.core.models.goal import Goal
     from packages.core.models.document import Integration
+    from packages.core.services.notification_service import create_notification_once
+    from packages.core.services.workspace_readiness import (
+        evaluate_workspace_blocking_setup,
+    )
 
     triggered = 0
     async with create_worker_session()() as db:
-        # Active workspaces with heartbeat on (skip soft-deleted ones —
-        # they're in the trash grace window and shouldn't run jobs).
+        # Connection monitoring applies to every live Blueprint Workspace;
+        # the legacy count-based Strategist trigger remains heartbeat-only.
         workspaces = list((await db.execute(
             select(Workspace).where(
-                Workspace.status == "active",
-                Workspace.heartbeat_enabled.is_(True),
+                Workspace.status.in_((
+                    "active",
+                    "paused",
+                    "provisioning",
+                    "needs_setup",
+                )),
                 Workspace.deleted_at.is_(None),
             )
         )).scalars().all())
@@ -958,39 +962,37 @@ async def _async_readiness_check() -> int:
         for ws in workspaces:
             settings = ws.settings or {}
             last_check = settings.get("_readiness_snapshot", {})
-
-            # Current state (cheap counts)
-            agent_count = (await db.execute(
-                select(func.count()).select_from(AgentSubscription).where(
-                    AgentSubscription.workspace_id == ws.id,
-                    AgentSubscription.status == "active",
-                )
-            )).scalar_one()
-            goal_count = (await db.execute(
-                select(func.count()).select_from(Goal).where(
-                    Goal.workspace_id == ws.id,
-                    Goal.status == "active",
-                )
-            )).scalar_one()
-            integration_count = (await db.execute(
-                select(func.count()).select_from(Integration).where(
-                    Integration.entity_id == ws.entity_id,
-                    Integration.status == "active",
-                )
-            )).scalar_one()
-
-            current = {
-                "agents": agent_count,
-                "goals": goal_count,
-                "integrations": integration_count,
-            }
-
-            # Compare: did anything increase since last check?
+            last_check = last_check if isinstance(last_check, dict) else {}
+            current = dict(last_check) if isinstance(last_check, dict) else {}
             changed = False
-            for key in ("agents", "goals", "integrations"):
-                if current[key] > last_check.get(key, 0):
-                    changed = True
-                    break
+            if ws.heartbeat_enabled and ws.status == "active":
+                agent_count = (await db.execute(
+                    select(func.count()).select_from(AgentSubscription).where(
+                        AgentSubscription.workspace_id == ws.id,
+                        AgentSubscription.status == "active",
+                    )
+                )).scalar_one()
+                goal_count = (await db.execute(
+                    select(func.count()).select_from(Goal).where(
+                        Goal.workspace_id == ws.id,
+                        Goal.status == GoalStatus.ACTIVE.value,
+                    )
+                )).scalar_one()
+                integration_count = (await db.execute(
+                    select(func.count()).select_from(Integration).where(
+                        Integration.entity_id == ws.entity_id,
+                        Integration.status == "active",
+                    )
+                )).scalar_one()
+                current = {
+                    "agents": agent_count,
+                    "goals": goal_count,
+                    "integrations": integration_count,
+                }
+                changed = any(
+                    current[key] > last_check.get(key, 0)
+                    for key in ("agents", "goals", "integrations")
+                )
 
             if changed:
                 # Something new was added — trigger Strategist
@@ -1021,12 +1023,173 @@ async def _async_readiness_check() -> int:
                     )
 
             # Save snapshot for next check
-            new_settings = dict(settings)
-            new_settings["_readiness_snapshot"] = current
-            ws.settings = new_settings
+            from packages.core.services.workspace_access import (
+                lock_workspace_access_boundary,
+            )
 
-        await db.commit()
+            locked_ws = await lock_workspace_access_boundary(
+                db,
+                workspace_id=ws.id,
+                entity_id=ws.entity_id,
+            )
+            if locked_ws is None or locked_ws.deleted_at is not None:
+                await db.rollback()
+                continue
+            new_settings = dict(locked_ws.settings or {})
+            new_settings["_readiness_snapshot"] = current
+            blueprint = new_settings.get("_blueprint")
+            if isinstance(blueprint, dict):
+                setup_status = await evaluate_workspace_blocking_setup(
+                    db,
+                    locked_ws,
+                )
+                previous_monitor = blueprint.get("setup_monitor")
+                monitor, incident_started = _workspace_setup_monitor_state(
+                    setup_status,
+                    previous_monitor if isinstance(previous_monitor, dict) else {},
+                )
+                blueprint = dict(blueprint)
+                blueprint["setup_monitor"] = monitor
+                new_settings["_blueprint"] = blueprint
+                if incident_started:
+                    recipient = str(
+                        new_settings.get("created_by_user_id") or ""
+                    ).strip()
+                    if recipient:
+                        labels = [
+                            item.get("label") or item.get("provider") or item.get("todo_kind")
+                            for item in monitor["incomplete"]
+                        ]
+                        labels = [str(label) for label in labels if label]
+                        await create_notification_once(
+                            db,
+                            locked_ws.entity_id,
+                            recipient,
+                            "workspace_setup_required",
+                            f"{locked_ws.name} needs a connection update",
+                            body=(
+                                "Reconnect or configure the required Blueprint "
+                                "dependencies before normal Workspace work resumes."
+                            ),
+                            link=f"/workspaces/{locked_ws.id}?tab=overview",
+                            meta={
+                                "incident": monitor["incident"],
+                                "requirements": monitor["incomplete"],
+                                "labels": labels,
+                            },
+                            workspace_id=locked_ws.id,
+                            idempotency_key=(
+                                f"workspace-setup:{locked_ws.id}:"
+                                f"{monitor['incident']}"
+                            ),
+                        )
+            locked_ws.settings = new_settings
+            startup_workspace_id = str(locked_ws.id)
+            await db.commit()
+            await _reconcile_blueprint_startup_after_monitor(
+                db,
+                workspace_id=startup_workspace_id,
+                settings=new_settings,
+            )
+
     return triggered
+
+
+async def _reconcile_blueprint_startup_after_monitor(
+    db,
+    *,
+    workspace_id: str,
+    settings: dict[str, Any] | None,
+) -> None:
+    current_settings = settings if isinstance(settings, dict) else {}
+    startup = current_settings.get("blocking_setup")
+    if not isinstance(startup, dict):
+        return
+    checks = startup.get("checks")
+    opted_in = bool(str(startup.get("on_ready_job_id") or "").strip()) or any(
+        isinstance(check, dict)
+        and str(check.get("setup_job_id") or "").strip()
+        for check in (checks if isinstance(checks, list) else [])
+    )
+    if not opted_in:
+        return
+    try:
+        from packages.core.services.blueprint_startup_service import (
+            reconcile_blueprint_startup,
+        )
+
+        await reconcile_blueprint_startup(
+            db,
+            workspace_id=workspace_id,
+            trigger="readiness_monitor",
+        )
+    except Exception:
+        await db.rollback()
+        logger.exception(
+            "workspace_readiness_check: Blueprint startup reconciliation "
+            "failed for %s",
+            workspace_id,
+        )
+
+
+def _workspace_setup_monitor_state(
+    setup_status: Any,
+    previous: dict[str, Any],
+) -> tuple[dict[str, Any], bool]:
+    """Return a stable connection-incident snapshot and transition signal."""
+    details = getattr(setup_status, "details", None)
+    raw_incomplete = (
+        details.get("incomplete_checks")
+        if isinstance(details, dict)
+        else []
+    )
+    connection_todo_kinds = {
+        "channel",
+        "browser_session",
+        "missing_integration",
+        "mcp_server",
+        "mcp_configuration",
+    }
+    incomplete: list[dict[str, str]] = []
+    for check in raw_incomplete or []:
+        if not isinstance(check, dict):
+            continue
+        kind = str(check.get("kind") or "").strip()
+        todo_kind = str(check.get("todo_kind") or "").strip()
+        if kind != "integration_provider" and todo_kind not in connection_todo_kinds:
+            continue
+        incomplete.append({
+            key: str(check.get(key) or "").strip()
+            for key in (
+                "key",
+                "kind",
+                "todo_kind",
+                "provider",
+                "setup_kind",
+                "label",
+            )
+            if str(check.get(key) or "").strip()
+        })
+    incomplete.sort(key=lambda item: json.dumps(item, sort_keys=True))
+    fingerprint = (
+        hashlib.sha256(
+            json.dumps(incomplete, sort_keys=True).encode("utf-8")
+        ).hexdigest()[:24]
+        if incomplete
+        else ""
+    )
+    prior_fingerprint = str(previous.get("fingerprint") or "")
+    incident = int(previous.get("incident") or 0)
+    incident_started = bool(fingerprint and fingerprint != prior_fingerprint)
+    if incident_started:
+        incident += 1
+    return ({
+        "ready": not incomplete,
+        "fingerprint": fingerprint,
+        "incident": incident,
+        "incomplete": incomplete,
+        "checked_at": datetime.now(timezone.utc).isoformat(),
+    }, incident_started)
 
 
 # ---------------------------------------------------------------------------

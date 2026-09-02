@@ -14,7 +14,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 import bcrypt
-from sqlalchemy import desc, select
+from sqlalchemy import and_, desc, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from packages.core.constants.execution import (
@@ -27,12 +27,18 @@ from packages.core.models.worker import (
     Worker,
     WorkerActivityLog,
 )
+from packages.core.workers.protocol import (
+    CURRENT_WORKER_PROTOCOL_VERSION,
+    require_current_worker_protocol,
+)
 
 logger = logging.getLogger(__name__)
 
 
 INTERNAL_WORKER_KIND = "internal"
 """Reserved kind for the always-on, in-process worker."""
+
+STALE_EXTERNAL_WORKER_SECONDS = 300
 
 
 def _internal_supported_kinds() -> list[str]:
@@ -57,7 +63,7 @@ DEFAULT_INTERNAL_CAPABILITIES: dict[str, Any] = {
     "max_risk_level": "high",
     "uses_manor_credentials": True,
     "deployment": "local",
-    "protocol_version": 1,
+    "protocol_version": int(CURRENT_WORKER_PROTOCOL_VERSION),
 }
 
 
@@ -81,6 +87,9 @@ async def ensure_internal_worker(
     if existing:
         if existing.status != "active":
             existing.status = WorkerStatus.ACTIVE.value
+        capabilities = dict(existing.capabilities or {})
+        capabilities["protocol_version"] = int(CURRENT_WORKER_PROTOCOL_VERSION)
+        existing.capabilities = capabilities
         await _bind_active_subscriptions_to_worker(db, entity_id, existing.id)
         return existing
 
@@ -157,6 +166,7 @@ async def register_external_worker(
     """
     if kind == INTERNAL_WORKER_KIND:
         raise ValueError("internal workers are bootstrapped via ensure_internal_worker")
+    require_current_worker_protocol(capabilities)
 
     secret = secrets.token_urlsafe(32)
     secret_hash = bcrypt.hashpw(secret.encode(), bcrypt.gensalt()).decode()
@@ -168,7 +178,7 @@ async def register_external_worker(
         display_name=display_name,
         description=description,
         version=version,
-        capabilities=capabilities,
+        capabilities=dict(capabilities),
         secret_hash=secret_hash,
         trust_level=trust_level,
         allowed_ips=allowed_ips,
@@ -326,3 +336,41 @@ async def update_worker_status(
     ))
     await db.flush()
     return worker
+
+
+async def mark_stale_external_workers_offline(
+    db: AsyncSession,
+    *,
+    now: datetime | None = None,
+    stale_after_seconds: int = STALE_EXTERNAL_WORKER_SECONDS,
+    limit: int = 100,
+) -> int:
+    """Project missing external heartbeats into an inspectable offline state."""
+    current = now or datetime.now(timezone.utc)
+    cutoff = current - timedelta(seconds=max(int(stale_after_seconds), 1))
+    workers = list((await db.execute(
+        select(Worker)
+        .where(
+            Worker.kind != INTERNAL_WORKER_KIND,
+            Worker.status == WorkerStatus.ACTIVE.value,
+            or_(
+                Worker.last_heartbeat_at < cutoff,
+                and_(
+                    Worker.last_heartbeat_at.is_(None),
+                    Worker.created_at < cutoff,
+                ),
+            ),
+        )
+        .order_by(Worker.last_heartbeat_at.asc().nullsfirst(), Worker.id.asc())
+        .limit(max(int(limit), 1))
+        .with_for_update(skip_locked=True)
+    )).scalars().all())
+    for worker in workers:
+        worker.status = WorkerStatus.OFFLINE.value
+        db.add(WorkerActivityLog(
+            worker_id=worker.id,
+            event=WorkerStatus.OFFLINE.value,
+            payload_summary={"reason": "heartbeat_stale"},
+        ))
+    await db.flush()
+    return len(workers)

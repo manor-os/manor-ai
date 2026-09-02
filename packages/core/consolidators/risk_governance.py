@@ -20,6 +20,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from packages.core.constants.approvals import ApprovalStatus, is_governance_hitl
+from packages.core.constants.review import ConsolidationReportStatus
 from packages.core.consolidators.base import SnapshotContext, age_hours, evidence_ids
 from packages.core.consolidators.contract import (
     ConsolidationReportModel,
@@ -148,7 +149,7 @@ class RiskGovernanceConsolidator:
         }
         return ConsolidationReportModel(
             domain=self.domain,
-            status="complete",
+            status=ConsolidationReportStatus.COMPLETE,
             summary=(
                 f"{len(open_approvals)} open approval(s); {len(granted)} granted, "
                 f"{len(denied)} denied this window; "

@@ -21,6 +21,17 @@ from typing import Optional
 from packages.core.constants.pending_actions import PendingActionKind
 
 
+class ApprovalOutcome(str, Enum):
+    """Result of the combined permission, policy, and consent gate."""
+
+    ALLOW = "allow"
+    DENY = "deny"
+    NEEDS_HUMAN = "needs_human"
+
+    __str__ = str.__str__
+    __format__ = str.__format__
+
+
 class ApprovalStatus(str, Enum):
     """Every state a HitlRequest row can hold."""
 

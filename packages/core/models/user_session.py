@@ -4,7 +4,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Optional
 
-from sqlalchemy import DateTime, Float, Index, Integer, String, Text, func
+from sqlalchemy import DateTime, Float, ForeignKey, Index, Integer, String, Text, func
 from sqlalchemy.orm import Mapped, mapped_column
 
 from .base import Base, generate_ulid
@@ -13,11 +13,11 @@ from .base import Base, generate_ulid
 class UserSessionLog(Base):
     """One browser usage window for a user.
 
-    Created when the first WebSocket connection for a user comes online
-    in an API process, refreshed by presence heartbeats, and closed when
-    the last connection disconnects. It is intentionally append-only-ish:
-    rows are updated only to keep the live duration/last_seen fields
-    current for admin analytics.
+    Created or reused when a WebSocket connection for a user comes online,
+    refreshed by presence heartbeats, and closed after the final live API
+    process lease is released. It is intentionally append-only-ish: rows are
+    updated only to keep the live duration/last_seen fields current for admin
+    analytics.
     """
     __tablename__ = "user_session_logs"
     __table_args__ = (
@@ -64,6 +64,38 @@ class UserSessionLog(Base):
     # of name-based geocoding on the fly.
     latitude: Mapped[Optional[float]] = mapped_column(Float)
     longitude: Mapped[Optional[float]] = mapped_column(Float)
+
+
+class UserSessionLease(Base):
+    """One live API-process claim on a shared browser usage session."""
+
+    __tablename__ = "user_session_leases"
+    __table_args__ = (
+        Index("ix_user_session_lease_session", "session_id"),
+        Index("ix_user_session_lease_expires", "expires_at"),
+        Index(
+            "ix_user_session_lease_scope_expiry",
+            "entity_id",
+            "user_id",
+            "expires_at",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    entity_id: Mapped[str] = mapped_column(String(26), nullable=False)
+    user_id: Mapped[str] = mapped_column(String(26), nullable=False)
+    session_id: Mapped[str] = mapped_column(
+        String(26),
+        ForeignKey("user_session_logs.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), onupdate=func.now()
+    )
 
 
 class UserPageViewLog(Base):

@@ -125,7 +125,11 @@ async def accumulate_step_cost(
 
     # ── Threshold detection ──
     alert = None
-    if workspace.monthly_budget_usd and workspace.monthly_budget_usd > 0 and notify:
+    if (
+        workspace.monthly_budget_usd
+        and workspace.monthly_budget_usd > 0
+        and notify
+    ):
         budget = workspace.monthly_budget_usd
         new_pct = new_spent / budget if budget > 0 else Decimal(0)
 
@@ -197,7 +201,11 @@ async def accumulate_workspace_ai_cost(
     workspace.monthly_spent_usd = new_spent
 
     alert = None
-    if workspace.monthly_budget_usd and workspace.monthly_budget_usd > 0 and notify:
+    if (
+        workspace.monthly_budget_usd
+        and workspace.monthly_budget_usd > 0
+        and notify
+    ):
         budget = workspace.monthly_budget_usd
         new_pct = new_spent / budget if budget > 0 else Decimal(0)
         prev_state = workspace.budget_alert_state or "normal"

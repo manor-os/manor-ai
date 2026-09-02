@@ -1,12 +1,18 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, field
-from typing import Any, Protocol
+from dataclasses import dataclass, field, replace
+from typing import TYPE_CHECKING, Any, Protocol
 
 from packages.core.ai.runtime.approval_catalog import direct_chat_default_approval_mode
 from packages.core.ai.runtime.envelope import RuntimeEnvelope
 from packages.core.ai.runtime.events import RuntimeEventType
+
+if TYPE_CHECKING:
+    from packages.core.ai.runtime.approval_classifier import RuntimeToolClassification
+    from packages.core.ai.runtime.tool_effect_classification import (
+        RuntimeWorkspaceFileScope,
+    )
 
 
 _ACTION_KEY_CAPABILITY_ALIASES: dict[str, str] = {
@@ -28,15 +34,21 @@ _ACTION_KEY_CAPABILITY_ALIASES: dict[str, str] = {
     "browse_web": "web.safe_search",
     "write_file": "file.write",
     "edit_file": "file.write",
+    "patch_file": "file.write",
     "delete_file": "file.write",
     "generate_file": "file.write",
     "sandbox_create": "sandbox.execute",
+    "sandbox": "sandbox.execute",
     "sandbox_exec": "sandbox.execute",
+    "sandbox_status": "sandbox.execute",
+    "sandbox_respond": "sandbox.execute",
+    "sandbox_cancel": "sandbox.execute",
     "sandbox_read_file": "sandbox.execute",
     "sandbox_write_file": "sandbox.execute",
     "sandbox_save_result": "sandbox.execute",
     "sandbox_destroy": "sandbox.execute",
     "video_edit": "sandbox.execute",
+    "coding_based_video": "sandbox.execute",
     "create_scheduled_job": "automation.manage",
     "list_scheduled_jobs": "automation.manage",
     "cancel_scheduled_job": "automation.manage",
@@ -103,8 +115,10 @@ class RuntimeApprovalRequest:
     workspace_id: str | None = None
     conversation_id: str | None = None
     task_id: str | None = None
-    step_id: str | None = None
     envelope: RuntimeEnvelope | None = None
+    declared_effect: str | None = None
+    classification: "RuntimeToolClassification | None" = None
+    workspace_file_scope: "RuntimeWorkspaceFileScope | None" = None
 
 
 @dataclass(frozen=True)
@@ -167,7 +181,7 @@ def runtime_capability_id_for_action_key(
         return "external.message"
     if key == "cli.exec":
         return "cli.execute"
-    if provider_key in {"chrome", "browser_mcp", "local_browser", "browser"}:
+    if provider_key in {"chrome", "browser_mcp"}:
         return "manor.composite"
     if resource in {"file", "workspace_file"}:
         return "file.write"
@@ -212,19 +226,33 @@ def runtime_requires_baseline_approval(action: RuntimeApprovalAction) -> bool:
 @dataclass(frozen=True)
 class RuntimeApprovalDecision:
     allowed: bool
+    classification: "RuntimeToolClassification"
     blocked_result: str | None = None
     event: RuntimeToolBlockEvent | None = None
+    request: RuntimeApprovalRequest | None = None
 
     @classmethod
-    def allow(cls) -> "RuntimeApprovalDecision":
-        return cls(allowed=True)
+    def allow(
+        cls,
+        classification: "RuntimeToolClassification",
+        request: RuntimeApprovalRequest | None = None,
+    ) -> "RuntimeApprovalDecision":
+        return cls(allowed=True, classification=classification, request=request)
 
     @classmethod
-    def block(cls, tool_name: str, blocked_result: str) -> "RuntimeApprovalDecision":
+    def block(
+        cls,
+        tool_name: str,
+        blocked_result: str,
+        classification: "RuntimeToolClassification",
+        request: RuntimeApprovalRequest | None = None,
+    ) -> "RuntimeApprovalDecision":
         return cls(
             allowed=False,
+            classification=classification,
             blocked_result=blocked_result,
             event=runtime_event_from_tool_block_result(tool_name, blocked_result),
+            request=request,
         )
 
 
@@ -232,7 +260,7 @@ class RuntimeApprovalPolicyAdapter(Protocol):
     def classify_request(
         self,
         request: RuntimeApprovalRequest,
-    ) -> RuntimeApprovalAction | None:
+    ) -> "RuntimeToolClassification":
         ...
 
     async def guard_request(
@@ -249,15 +277,33 @@ class LegacyWorkspaceApprovalPolicyAdapter:
     def classify_request(
         self,
         request: RuntimeApprovalRequest,
-    ) -> RuntimeApprovalAction | None:
-        from packages.core.ai.runtime.approval_classifier import classify_runtime_tool_action
+    ) -> "RuntimeToolClassification":
+        from packages.core.ai.runtime.approval_classifier import classify_runtime_tool
 
-        action = classify_runtime_tool_action(
+        discovered_grants = getattr(
+            request.envelope,
+            "discovered_tool_grants",
+            None,
+        )
+        discovered = (
+            discovered_grants.metadata(request.tool_name)
+            if discovered_grants is not None
+            else None
+        )
+
+        return classify_runtime_tool(
             request.tool_name,
             request.arguments,
             entity_id=request.entity_id,
+            workspace_id=request.workspace_id,
+            task_id=request.task_id,
+            workspace_file_scope=request.workspace_file_scope,
+            declared_effect=(
+                request.declared_effect
+                if request.declared_effect is not None
+                else (discovered.effect if discovered is not None else None)
+            ),
         )
-        return action
 
     async def guard_request(
         self,
@@ -273,7 +319,8 @@ class LegacyWorkspaceApprovalPolicyAdapter:
             workspace_id=request.workspace_id,
             conversation_id=request.conversation_id,
             task_id=request.task_id,
-            step_id=request.step_id,
+            runtime_envelope=request.envelope,
+            classification=request.classification,
         )
 
 
@@ -294,15 +341,46 @@ class RuntimeApprovalMiddleware:
         request: RuntimeApprovalRequest,
     ) -> RuntimeApprovalDecision:
         """Run approval policy and return a structured runtime decision."""
-        blocked = await self.policy_adapter.guard_request(request)
+        from packages.core.ai.runtime.tool_effect_classification import (
+            RuntimeToolClassification,
+        )
+
+        resolved_request = request
+        if isinstance(self.policy_adapter, LegacyWorkspaceApprovalPolicyAdapter):
+            from packages.core.ai.runtime.approval_classifier import (
+                resolve_runtime_workspace_file_scope,
+            )
+
+            resolved_request = replace(
+                request,
+                workspace_file_scope=await resolve_runtime_workspace_file_scope(
+                    tool_name=request.tool_name,
+                    arguments=request.arguments,
+                    entity_id=request.entity_id,
+                    workspace_id=request.workspace_id,
+                    task_id=request.task_id,
+                ),
+            )
+        classification = self.policy_adapter.classify_request(resolved_request)
+        if not isinstance(classification, RuntimeToolClassification):
+            raise TypeError(
+                "Runtime approval adapters must return RuntimeToolClassification"
+            )
+        guarded_request = replace(resolved_request, classification=classification)
+        blocked = await self.policy_adapter.guard_request(guarded_request)
         if blocked:
-            return RuntimeApprovalDecision.block(request.tool_name, blocked)
-        return RuntimeApprovalDecision.allow()
+            return RuntimeApprovalDecision.block(
+                request.tool_name,
+                blocked,
+                classification,
+                guarded_request,
+            )
+        return RuntimeApprovalDecision.allow(classification, guarded_request)
 
     def classify_request(
         self,
         request: RuntimeApprovalRequest,
-    ) -> RuntimeApprovalAction | None:
+    ) -> "RuntimeToolClassification":
         return self.policy_adapter.classify_request(request)
 
     async def guard_tool_action(
@@ -315,7 +393,7 @@ class RuntimeApprovalMiddleware:
         workspace_id: str | None,
         conversation_id: str | None,
         task_id: str | None = None,
-        step_id: str | None = None,
+        runtime_envelope: RuntimeEnvelope | None = None,
     ) -> str | None:
         """Run the Manor runtime approval gate for a concrete tool call.
 
@@ -330,7 +408,7 @@ class RuntimeApprovalMiddleware:
             workspace_id=workspace_id,
             conversation_id=conversation_id,
             task_id=task_id,
-            step_id=step_id,
+            envelope=runtime_envelope,
         ))
         return decision.blocked_result
 
@@ -367,7 +445,12 @@ def runtime_event_from_tool_block_result(
         provider_approval_runtime_event_data,
     )
 
-    provider_approval = normalize_provider_approval(tool_name, None, payload)
+    # Runtime events only need the provider approval's public projection. The
+    # durable continuation path receives the original typed arguments through
+    # ProviderApprovalCollector; this result-only path does not. Use an empty
+    # argument object here so legacy provider receipts still emit a truthful
+    # approval_required event without weakening persisted replay validation.
+    provider_approval = normalize_provider_approval(tool_name, {}, payload)
     if provider_approval is not None:
         return RuntimeToolBlockEvent(
             type="approval_required",
@@ -399,7 +482,7 @@ def runtime_event_from_tool_block_result(
             data={
                 "tool_name": tool_name,
                 "code": error,
-                "reason": payload.get("message"),
+                "reason": payload.get("message") or payload.get("reason"),
             },
         )
     return None

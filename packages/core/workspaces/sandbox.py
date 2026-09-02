@@ -1,15 +1,14 @@
-"""Sandbox workspace mode — safe end-to-end demo without real side effects.
+"""Workspace simulation mode — end-to-end demos without real side effects.
 
-The ``settings.sandbox`` boolean on ``Workspace`` is the orthogonal
-toggle. ``kind`` stays a semantic label (`social_media`, `property`, …)
-so a sandbox can mirror the same kind as a real workspace and exercise
-the same code paths.
+The legacy ``settings.sandbox`` boolean remains the persisted compatibility
+toggle. ``kind`` stays a semantic label (`social_media`, `property`, …) so a
+simulation can mirror a live workspace and exercise the same code paths.
 
 Three behaviours change when ``is_sandbox_workspace(ws)`` is true:
 
-  1. Plan creation: ``execution_mode`` defaults to ``"sandbox"`` instead
-     of ``"live"``. PlanExecutor's existing dry-run path takes over —
-     action steps call adapter ``simulate_tool`` (Phase 3d).
+  1. Plan creation: the compatibility ``execution_mode`` value defaults to
+     ``"sandbox"`` instead of ``"live"``. PlanExecutor's dry-run path takes
+     over and action steps call adapter ``simulate_tool`` (Phase 3d).
 
   2. Goal measurement: skips real integrations. ``simulate_goal_value``
      returns a value that follows the goal's pace curve with light
@@ -20,9 +19,9 @@ Three behaviours change when ``is_sandbox_workspace(ws)`` is true:
      workspace (workspace + agent + subscription + goal + 1 task) in
      one call so the "Try a demo" button has a backend.
 
-Sandbox workspaces are not second-class — they share schema, services,
-chat, and execution paths with live workspaces. The only difference is
-where side effects land.
+Workspace simulations share schema, services, chat, and execution paths with
+live workspaces. The difference is where side effects land. They are distinct
+from the isolated execution environment used to run task code.
 """
 from __future__ import annotations
 
@@ -33,9 +32,11 @@ from typing import Optional
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from packages.core.constants.channels import ExternalMessageActionKey
+from packages.core.constants.document_groups import WorkspaceDocumentGroupKind
 from packages.core.constants.pending_actions import PendingActionKind
 from packages.core.models.base import generate_ulid
-from packages.core.models.channel import ChannelConfig
+from packages.core.models.channel import ChannelConfig, ChannelContact
 from packages.core.models.document import Channel, Document, DocumentGroup, DocumentGroupMember, VectorStatus
 from packages.core.models.goal import Goal, GoalMeasurement, GoalTaskLink
 from packages.core.models.runtime_learning import AgentLearningCandidate, RuntimeEvidence
@@ -67,14 +68,14 @@ LEASING_DEMO_KIND_ALIASES = {
 
 
 def sandbox_demo_name(kind: str | None) -> str:
-    """Default display name for a sandbox demo kind."""
+    """Default display name for a Workspace simulation scenario."""
     if (kind or "").lower() in LEASING_DEMO_KIND_ALIASES:
-        return "Leasing Consultant — Sandbox Demo"
-    return "Twitter Growth — Sandbox Demo"
+        return "Leasing Consultant — Workspace Simulation"
+    return "Twitter Growth — Workspace Simulation"
 
 
 def sandbox_demo_services(kind: str | None) -> list[dict]:
-    """Services to seed into workspace memory for a sandbox demo kind."""
+    """Services to seed into a Workspace simulation scenario."""
     if (kind or "").lower() in LEASING_DEMO_KIND_ALIASES:
         return [
             {
@@ -113,7 +114,7 @@ def sandbox_demo_services(kind: str | None) -> list[dict]:
 # ── Detection ─────────────────────────────────────────────────────────
 
 def is_sandbox_workspace(workspace: Workspace) -> bool:
-    """True if the workspace should run in sandbox mode.
+    """True if the workspace should run in Workspace simulation mode.
 
     Two ways to flag:
       * ``workspace.kind == 'sandbox'``       — the whole workspace IS
@@ -138,7 +139,7 @@ def default_execution_mode(workspace: Workspace) -> str:
 # ── Goal measurement simulation ───────────────────────────────────────
 
 def simulate_goal_value(goal: Goal, *, today: Optional[date] = None) -> Decimal:
-    """Generate a plausible measurement for a sandbox goal.
+    """Generate a plausible measurement for a Workspace simulation Goal.
 
     Strategy:
       * If a current value is already seeded, treat it as the latest
@@ -154,13 +155,17 @@ def simulate_goal_value(goal: Goal, *, today: Optional[date] = None) -> Decimal:
     chat feed if a measurement gets re-fired).
     """
     today = today or date.today()
-    baseline = float(goal.baseline_value or goal.current_value or 0)
-    target = float(goal.target_value or 0)
+    baseline = (
+        goal.baseline_value
+        if goal.baseline_value is not None
+        else goal.current_value if goal.current_value is not None else Decimal("0")
+    )
+    target = goal.target_value if goal.target_value is not None else Decimal("0")
     if target == baseline:
-        return Decimal(str(target))
+        return target
     lower_is_better = target < baseline
 
-    def _cap(value: float) -> float:
+    def _cap(value: Decimal) -> Decimal:
         if lower_is_better:
             return min(baseline, max(target, value))
         return max(baseline, min(target, value))
@@ -169,29 +174,28 @@ def simulate_goal_value(goal: Goal, *, today: Optional[date] = None) -> Decimal:
         # Seeded demo goals start with a plausible current value. A fresh
         # measurement should never erase that reality by snapping back to the
         # baseline, nor should a lower-is-better goal jump straight to target.
-        cur = float(goal.current_value)
-        increment = (target - cur) * 0.05
-        return Decimal(f"{_cap(cur + increment):.4f}")
+        cur = goal.current_value
+        increment = (target - cur) * Decimal("0.05")
+        return _cap(cur + increment).quantize(Decimal("0.0001"))
 
     if goal.deadline is None:
         # No deadline and no current value → use baseline as the first point.
-        return Decimal(f"{_cap(baseline):.4f}")
+        return _cap(baseline).quantize(Decimal("0.0001"))
 
     start = goal.created_at.date() if isinstance(goal.created_at, datetime) else goal.created_at
     total_days = max(1, (goal.deadline - start).days)
     elapsed = max(0, (today - start).days)
-    elapsed_frac = min(1.0, elapsed / total_days)
+    elapsed_frac = min(Decimal("1"), Decimal(elapsed) / Decimal(total_days))
 
     # Expected linear progress.
     expected = baseline + (target - baseline) * elapsed_frac
 
     rng = random.Random(f"{goal.id}-{today.isoformat()}")
-    drift = rng.uniform(0.85, 1.15)   # ±15% pace
-    jitter = rng.uniform(0.95, 1.05)  # ±5% noise
+    drift = Decimal(str(rng.uniform(0.85, 1.15)))   # ±15% pace
+    jitter = Decimal(str(rng.uniform(0.95, 1.05)))  # ±5% noise
     value = baseline + (expected - baseline) * drift * jitter
 
-    value = _cap(value)
-    return Decimal(f"{value:.4f}")
+    return _cap(value).quantize(Decimal("0.0001"))
 
 
 # ── Demo seed ─────────────────────────────────────────────────────────
@@ -200,7 +204,7 @@ async def create_sandbox_workspace(
     db: AsyncSession,
     *,
     entity_id: str,
-    name: str = "Twitter Growth — Sandbox Demo",
+    name: str = "Twitter Growth — Workspace Simulation",
     kind: str = "social_media",
     seed_task_title: str = "Publish your first AI-agent tutorial tweet",
 ) -> dict:
@@ -209,7 +213,7 @@ async def create_sandbox_workspace(
     Creates everything needed to watch the full pipeline from a single
     button click in the UI:
 
-      * Workspace flagged ``settings.sandbox=true``
+      * Workspace simulation flagged by legacy ``settings.sandbox=true``
       * One Agent template + AgentSubscription (service_key=content_creator)
       * One Goal (10k followers in 6mo)
       * One starter Task in ``status='pending'`` so the auto-trigger
@@ -224,7 +228,10 @@ async def create_sandbox_workspace(
     """
     kind_key = (kind or "").lower()
     if kind_key in LEASING_DEMO_KIND_ALIASES:
-        if name == "Twitter Growth — Sandbox Demo":
+        if name in {
+            "Twitter Growth — Workspace Simulation",
+            "Twitter Growth — Sandbox Demo",
+        }:
             name = sandbox_demo_name(kind_key)
         return await _create_leasing_sandbox_workspace(
             db,
@@ -241,14 +248,15 @@ async def create_sandbox_workspace(
     workspace_id = generate_ulid()
     agent_id = generate_ulid()
     sub_id = generate_ulid()
-    goal_id = generate_ulid()
     task_id = generate_ulid()
     channel_config_id = generate_ulid()
     channel_id = generate_ulid()
+    channel_contact_id = generate_ulid()
     conv_id = generate_ulid()
     approval_msg_id = generate_ulid()
+    goal_deadline = date.today() + timedelta(days=180)
 
-    db.add(Workspace(
+    workspace = Workspace(
         id=workspace_id,
         entity_id=entity_id,
         name=name,
@@ -265,12 +273,39 @@ async def create_sandbox_workspace(
             "sandbox_started_at": datetime.now(timezone.utc).isoformat(),
         }),
         status="active",
-    ))
+    )
+    db.add(workspace)
+    await db.flush([workspace])
+
+    from packages.core.goals.service import create_goal
+
+    goal = await create_goal(
+        db,
+        entity_id=entity_id,
+        workspace_id=workspace_id,
+        title="Reach 10,000 Twitter followers",
+        description="Demo goal — values are simulated.",
+        goal_key="twitter_follower_growth",
+        metric_key="followers_count",
+        target_value=Decimal("10000"),
+        baseline_value=Decimal("1000"),
+        deadline=goal_deadline,
+        measurement_source={
+            "provider": "twitter_x",
+            "action": "get_profile_stats",
+            "_sandbox": True,
+        },
+        measurement_cadence="daily",
+        priority=2,
+        install_schedule=False,
+    )
+    goal.current_value = Decimal("1000")
+    goal_id = goal.id
 
     db.add(Agent(
         id=agent_id,
         entity_id=entity_id,
-        name="Content Creator (sandbox)",
+        name="Content Creator (Workspace simulation)",
         system_prompt=(
             "You are a content creator for a solo founder. Draft tweets in "
             "the workspace voice (see workspace memory). Keep them short, "
@@ -292,35 +327,13 @@ async def create_sandbox_workspace(
         status="active",
     ))
 
-    db.add(Goal(
-        id=goal_id,
-        entity_id=entity_id,
-        workspace_id=workspace_id,
-        title="Reach 10,000 Twitter followers",
-        description="Demo goal — values are simulated.",
-        metric_key="followers_count",
-        target_value=Decimal("10000"),
-        baseline_value=Decimal("1000"),
-        current_value=Decimal("1000"),
-        deadline=date.today() + timedelta(days=180),
-        measurement_source={
-            "provider": "twitter_x",
-            "action": "get_profile_stats",
-            "_sandbox": True,
-        },
-        measurement_cadence="daily",
-        priority=2,
-        status="active",
-        pace_status="unknown",
-    ))
-
     db.add(ChannelConfig(
         id=channel_config_id,
         entity_id=entity_id,
         workspace_id=workspace_id,
         channel_type="twitter_x",
         provider="sandbox_social",
-        name="Sandbox X account",
+        name="Workspace simulation X account",
         config={"handle": "@sandbox_founder", "sandbox": True},
         credentials={},
         status="active",
@@ -330,12 +343,32 @@ async def create_sandbox_workspace(
         entity_id=entity_id,
         workspace_id=workspace_id,
         type="twitter_x",
-        name="Sandbox X publishing channel",
+        name="Workspace simulation X publishing channel",
         config={"channel_config_id": channel_config_id, "sandbox": True},
         agent_id=agent_id,
         agent_subscription_id=sub_id,
         status="active",
     ))
+    db.add(ChannelContact(
+        id=channel_contact_id,
+        entity_id=entity_id,
+        channel_config_id=channel_config_id,
+        channel_type="twitter_x",
+        source_id="sandbox_x_account",
+        display_name="Workspace simulation X account",
+        agent_subscription_id=sub_id,
+        status="active",
+    ))
+
+    from packages.core.services.channel_outbound_delivery import (
+        build_channel_reply_route_snapshot,
+    )
+
+    reply_route_snapshot = build_channel_reply_route_snapshot(
+        config_workspace_id=workspace_id,
+        binding_workspace_id=workspace_id,
+        runtime_workspace_id=workspace_id,
+    )
 
     # Starter task lands in 'pending' so the existing auto-trigger
     # (task_service.update_task hook) fires plan_and_run_task as soon
@@ -349,7 +382,7 @@ async def create_sandbox_workspace(
         workspace_id=workspace_id,
         title=seed_task_title,
         description=(
-            "Sandbox demo task — Planner will draft a tweet, Executor will "
+            "Workspace simulation task — Planner will draft a tweet, Executor will "
             "'post' it (simulated). Approve the proposal in chat to watch "
             "the full pipeline."
         ),
@@ -371,7 +404,7 @@ async def create_sandbox_workspace(
         id=conv_id,
         entity_id=entity_id,
         workspace_id=workspace_id,
-        title="Social growth demo workspace chat",
+        title="Social growth Workspace simulation chat",
         channel="workspace",
         scope="workspace_main",
         meta={"demo": True},
@@ -381,7 +414,7 @@ async def create_sandbox_workspace(
         conversation_id=conv_id,
         role="system",
         content=(
-            "Sandbox demo initialized. The content agent drafted a simulated X post; "
+            "Workspace simulation initialized. The content agent drafted a simulated X post; "
             "review the approval card below before anything is published."
         ),
         author_kind="system",
@@ -393,7 +426,7 @@ async def create_sandbox_workspace(
         conversation_id=conv_id,
         role="assistant",
         content=(
-            "I drafted the first AI-agent tutorial post for the sandbox X account. "
+            "I drafted the first AI-agent tutorial post for the Workspace simulation X account. "
             "Because public publishing is approval-gated, please approve or reject this draft."
         ),
         author_kind="agent",
@@ -405,13 +438,18 @@ async def create_sandbox_workspace(
         ],
         pending_action={
             "kind": PendingActionKind.EXTERNAL_MESSAGE_APPROVAL.value,
-            "action_key": "social_post.publish",
+            "action_key": ExternalMessageActionKey.SEND.value,
             "channel_config_id": channel_config_id,
+            "channel_binding_id": channel_id,
+            "channel_contact_id": channel_contact_id,
             "channel_type": "twitter_x",
             "channel_conversation_id": conv_id,
             "chat_id": "sandbox_x_account",
             "sender_id": "sandbox_x_account",
+            "agent_id": agent_id,
             "agent_subscription_id": sub_id,
+            "route_snapshot": reply_route_snapshot,
+            "workspace_id": workspace_id,
             "task_ids": [task_id],
             "reply_text": (
                 "AI agents are most useful when they do the boring follow-through: "
@@ -432,7 +470,7 @@ async def create_sandbox_workspace(
         evidence_type="chat_run",
         source="sandbox_demo",
         status="blocked",
-        summary="Sandbox social post draft is waiting for operator approval.",
+        summary="Workspace simulation social post draft is waiting for operator approval.",
         details={
             "task_id": task_id,
             "pending_message_id": approval_msg_id,
@@ -446,11 +484,11 @@ async def create_sandbox_workspace(
         workspace_id=workspace_id,
         entity_id=entity_id,
         event_type="approval_requested",
-        summary="Sandbox X post is waiting for operator approval.",
+        summary="Workspace simulation X post is waiting for operator approval.",
         details={
             "message_id": approval_msg_id,
             "task_id": task_id,
-            "action_key": "social_post.publish",
+            "action_key": ExternalMessageActionKey.SEND.value,
         },
         agent_id=sub_id,
     ))
@@ -478,13 +516,14 @@ async def _create_leasing_sandbox_workspace(
     kind: str,
     seed_task_title: str,
 ) -> dict:
-    """Seed a realistic leasing workspace demo.
+    """Seed a realistic leasing Workspace simulation.
 
     This deliberately exercises the same surfaces a live workspace uses:
     goals, services, channels, knowledge nets, chat approvals, work batches,
     runtime evidence, and learning candidates. Nothing here is a separate demo
     schema; every row is production-shaped and safe because
-    ``settings.sandbox=true`` plus review-required rules prevent side effects.
+    the legacy ``settings.sandbox=true`` flag plus review-required rules
+    prevent side effects.
     """
     now = datetime.now(timezone.utc)
     deadline = date.today() + timedelta(days=90)
@@ -567,12 +606,12 @@ async def _create_leasing_sandbox_workspace(
         for spec in service_specs
     ]
 
-    db.add(Workspace(
+    workspace = Workspace(
         id=workspace_id,
         entity_id=entity_id,
         name=name,
         description=(
-            "Sandbox leasing operation that shows how Manor tracks goals, works through tasks, "
+            "Workspace simulation for leasing that shows how Manor tracks goals, works through tasks, "
             "uses knowledge nets, asks for approval, and learns from runtime evidence."
         ),
         category="Leasing",
@@ -581,58 +620,6 @@ async def _create_leasing_sandbox_workspace(
         primary_work="Respond to renter inquiries, recommend units, schedule tours, and improve pipeline conversion.",
         operating_model={
             "services": workspace_services,
-            "goals": [
-                {
-                    "goal_key": "lead_response_time",
-                    "title": "Reply to qualified leasing leads within 2 hours",
-                    "metric_key": "avg_draft_response_time_hours",
-                    "target_value": 2,
-                    "baseline_value": 6,
-                    "measurement_source": {"provider": "sandbox_leasing", "action": "leasing.get_response_time"},
-                    "cadence": "daily",
-                    "owner_service_key": "lead_intake",
-                },
-                {
-                    "goal_key": "lead_to_tour_conversion",
-                    "title": "Lift lead-to-tour conversion to 40%",
-                    "metric_key": "lead_to_tour_conversion_pct",
-                    "target_value": 40,
-                    "baseline_value": 22,
-                    "measurement_source": {"provider": "sandbox_leasing", "action": "leasing.get_pipeline_stats"},
-                    "cadence": "daily",
-                    "owner_service_key": "tour_scheduling",
-                },
-                {
-                    "goal_key": "tour_to_application_conversion",
-                    "title": "Lift tour-to-application conversion to 30%",
-                    "metric_key": "tour_to_application_conversion_pct",
-                    "target_value": 30,
-                    "baseline_value": 14,
-                    "measurement_source": {"provider": "sandbox_leasing", "action": "leasing.get_pipeline_stats"},
-                    "cadence": "daily",
-                    "owner_service_key": "followup_drafting",
-                },
-                {
-                    "goal_key": "active_pipeline_size",
-                    "title": "Maintain at least 50 active qualified leads",
-                    "metric_key": "active_qualified_leads",
-                    "target_value": 50,
-                    "baseline_value": 20,
-                    "measurement_source": {"provider": "sandbox_leasing", "action": "leasing.get_pipeline_stats"},
-                    "cadence": "daily",
-                    "owner_service_key": "pipeline_tracking",
-                },
-                {
-                    "goal_key": "stale_lead_rate",
-                    "title": "Reduce stale lead rate below 10%",
-                    "metric_key": "stale_lead_rate_pct",
-                    "target_value": 10,
-                    "baseline_value": 31,
-                    "measurement_source": {"provider": "sandbox_leasing", "action": "leasing.get_stale_leads"},
-                    "cadence": "daily",
-                    "owner_service_key": "followup_drafting",
-                },
-            ],
             "rules": [
                 {
                     "id": "demo_approval_external_messages",
@@ -648,7 +635,7 @@ async def _create_leasing_sandbox_workspace(
                 },
                 {
                     "id": "demo_no_destructive_files",
-                    "summary": "Agents may create workspace files but must not delete or overwrite files in sandbox demo.",
+                    "summary": "Agents may create Workspace files but must not delete or overwrite files in Workspace simulation.",
                     "action_keys": ["workspace_file.delete", "workspace_file.overwrite"],
                     "enforcement": "blocked",
                 },
@@ -665,7 +652,7 @@ async def _create_leasing_sandbox_workspace(
                 "primary_external_channel": {
                     "channel_type": "webchat",
                     "provider": "manor_public_chat",
-                    "name": "Sandbox leasing webchat",
+                    "name": "Workspace simulation leasing webchat",
                     "linked_service_key": "lead_intake",
                     "purpose": "Inbound leasing inquiries from renters.",
                 },
@@ -711,7 +698,9 @@ async def _create_leasing_sandbox_workspace(
         budget_reset_at=now + timedelta(days=19),
         auto_pause_on_budget=True,
         budget_alert_state="normal",
-    ))
+    )
+    db.add(workspace)
+    await db.flush([workspace])
 
     subscriptions: dict[str, tuple[str, str]] = {}
     for spec in service_specs:
@@ -720,7 +709,7 @@ async def _create_leasing_sandbox_workspace(
         db.add(Agent(
             id=agent_id,
             entity_id=entity_id,
-            name=f"{spec['name']} (sandbox)",
+            name=f"{spec['name']} (Workspace simulation)",
             description=spec["description"],
             system_prompt=spec["prompt"],
             config={
@@ -754,6 +743,7 @@ async def _create_leasing_sandbox_workspace(
 
     goal_specs = [
         {
+            "goal_key": "lead_response_time",
             "title": "Reply to qualified leasing leads within 2 hours",
             "description": "Average first-draft response time across inbound rental prospects.",
             "metric_key": "avg_draft_response_time_hours",
@@ -765,6 +755,7 @@ async def _create_leasing_sandbox_workspace(
             "owner": "lead_intake",
         },
         {
+            "goal_key": "lead_to_tour_conversion",
             "title": "Lift lead-to-tour conversion to 40%",
             "description": "Share of qualified leads that book a tour.",
             "metric_key": "lead_to_tour_conversion_pct",
@@ -776,6 +767,7 @@ async def _create_leasing_sandbox_workspace(
             "owner": "tour_scheduling",
         },
         {
+            "goal_key": "tour_to_application_conversion",
             "title": "Lift tour-to-application conversion to 30%",
             "description": "Share of completed tours that submit an application.",
             "metric_key": "tour_to_application_conversion_pct",
@@ -787,6 +779,7 @@ async def _create_leasing_sandbox_workspace(
             "owner": "followup_drafting",
         },
         {
+            "goal_key": "active_pipeline_size",
             "title": "Maintain at least 50 active qualified leads",
             "description": "Healthy open pipeline count for the demo property.",
             "metric_key": "active_qualified_leads",
@@ -798,6 +791,7 @@ async def _create_leasing_sandbox_workspace(
             "owner": "pipeline_tracking",
         },
         {
+            "goal_key": "stale_lead_rate",
             "title": "Reduce stale lead rate below 10%",
             "description": "Qualified leads without a helpful follow-up in 72 hours.",
             "metric_key": "stale_lead_rate_pct",
@@ -811,20 +805,19 @@ async def _create_leasing_sandbox_workspace(
     ]
 
     goal_ids: list[str] = []
+    from packages.core.goals.service import create_goal
+
     for spec in goal_specs:
-        goal_id = generate_ulid()
-        goal_ids.append(goal_id)
-        db.add(Goal(
-            id=goal_id,
+        goal = await create_goal(
+            db,
             entity_id=entity_id,
             workspace_id=workspace_id,
             title=spec["title"],
             description=spec["description"],
+            goal_key=spec["goal_key"],
             metric_key=spec["metric_key"],
             target_value=Decimal(spec["target"]),
             baseline_value=Decimal(spec["baseline"]),
-            current_value=Decimal(spec["current"]),
-            current_value_updated_at=now - timedelta(hours=3),
             deadline=deadline,
             measurement_source={
                 "provider": "sandbox_leasing",
@@ -834,10 +827,14 @@ async def _create_leasing_sandbox_workspace(
             },
             measurement_cadence="daily",
             priority=2,
-            status="active",
-            pace_status=spec["pace"],
-            pace_computed_at=now - timedelta(hours=3),
-        ))
+            install_schedule=False,
+        )
+        goal.current_value = Decimal(spec["current"])
+        goal.current_value_updated_at = now - timedelta(hours=3)
+        goal.pace_status = spec["pace"]
+        goal.pace_computed_at = now - timedelta(hours=3)
+        goal_id = goal.id
+        goal_ids.append(goal_id)
         db.add(GoalMeasurement(
             goal_id=goal_id,
             measured_at=now - timedelta(days=7),
@@ -912,7 +909,7 @@ async def _create_leasing_sandbox_workspace(
             workspace_id=workspace_id,
             name=group_name,
             settings={
-                "kind": "knowledge_net",
+                "kind": WorkspaceDocumentGroupKind.KNOWLEDGE_NET.value,
                 "network_type": "workspace",
                 "purpose": purpose,
                 "user_manageable": True,
@@ -953,7 +950,7 @@ async def _create_leasing_sandbox_workspace(
         workspace_id=workspace_id,
         channel_type="webchat",
         provider="manor_public_chat",
-        name="Sandbox leasing webchat",
+        name="Workspace simulation leasing webchat",
         config={
             "public_token": public_token,
             "welcome_message": "Hi! Tell me your move-in date, budget, and bedroom needs.",
@@ -972,7 +969,7 @@ async def _create_leasing_sandbox_workspace(
         entity_id=entity_id,
         workspace_id=workspace_id,
         type="webchat",
-        name="Sandbox leasing webchat",
+        name="Workspace simulation leasing webchat",
         config={
             "channel_config_id": webchat_cc_id,
             "role": "primary_external",
@@ -1027,7 +1024,7 @@ async def _create_leasing_sandbox_workspace(
         name="Workspace Files",
         settings={
             "workspace_file_bucket": True,
-            "kind": "workspace_files",
+            "kind": WorkspaceDocumentGroupKind.FILE_BUCKET.value,
             "user_manageable": False,
             "demo": True,
             "purpose": "Generated files and runtime artifacts for this workspace.",
@@ -1044,7 +1041,7 @@ async def _create_leasing_sandbox_workspace(
             "output": {"summary": "12 qualified leads, 4 need same-day replies, 3 likely fit Unit 4C."},
             "artifact": {
                 "name": "Daily Lead Audit Summary.md",
-                "fs_path": "Workspaces/Leasing Sandbox/artifacts/daily-lead-audit-summary.md",
+                "fs_path": "Workspaces/Leasing Workspace Simulation/artifacts/daily-lead-audit-summary.md",
                 "file_type": "md",
                 "mime_type": "text/markdown",
                 "role": "final",
@@ -1067,7 +1064,7 @@ async def _create_leasing_sandbox_workspace(
             "output": {"summary": "Drafted Maya Chen follow-up and paused for operator approval."},
             "artifact": {
                 "name": "Maya Chen Follow-up Draft.md",
-                "fs_path": "Workspaces/Leasing Sandbox/artifacts/maya-chen-follow-up-draft.md",
+                "fs_path": "Workspaces/Leasing Workspace Simulation/artifacts/maya-chen-follow-up-draft.md",
                 "file_type": "md",
                 "mime_type": "text/markdown",
                 "role": "draft",
@@ -1217,7 +1214,7 @@ async def _create_leasing_sandbox_workspace(
         conversation_id=conv_id,
         role="system",
         content=(
-            "Sandbox demo initialized. This workspace has leasing goals, knowledge nets, agents, "
+            "Workspace simulation initialized. This Workspace has leasing goals, knowledge nets, agents, "
             "channels, a work batch, runtime evidence, and one approval waiting below."
         ),
         author_kind="system",
@@ -1363,7 +1360,7 @@ async def _create_leasing_sandbox_workspace(
     ))
 
     for event_type, summary, details in [
-        ("workspace_created", "Leasing sandbox workspace created.", {"demo": True}),
+        ("workspace_created", "Leasing Workspace simulation created.", {"demo": True}),
         ("knowledge_seeded", "Three workspace Knowledge Nets were seeded for leasing demo.", {"group_count": 3}),
         ("batch_started", "Demo work batch started and will trigger Strategist after all tasks complete.", {"task_ids": task_ids}),
         ("approval_requested", "External renter reply is waiting for operator approval.", {"message_kind": "hitl_request"}),

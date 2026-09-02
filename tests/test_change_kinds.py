@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from datetime import date
+from datetime import date, datetime, timezone
 from types import SimpleNamespace
 
 import pytest
@@ -41,6 +41,7 @@ from packages.core.models.feature_flag import FeatureFlag
 from packages.core.models.goal import Goal
 from packages.core.models.proposal import ProposalItemRecord, ProposalRecord
 from packages.core.models.scheduler import ScheduledJob
+from packages.core.models.user import User, UserMembership
 from packages.core.models.workflow import WorkflowBinding, WorkflowDefinition
 from packages.core.models.workspace import Agent, AgentSubscription, Workspace
 from packages.core.models.workspace_event import WorkspaceEvent
@@ -386,6 +387,9 @@ async def _config_events(db, workspace, event_type=et.CONFIG_CHANGED) -> list[Wo
 async def test_schedule_update_bumps_revision_audits_and_refreshes_index(db_session):
     workspace = await _seed_workspace(db_session)
     job = await _seed_job(db_session, workspace)
+    job.last_run_at = datetime.now(timezone.utc)
+    job.last_status = "dispatched"
+    await db_session.flush()
     record = await _proposal_record(db_session, workspace)
     item = await _make_item(db_session, workspace, record, _automation_change(job.id))
 
@@ -401,6 +405,8 @@ async def test_schedule_update_bumps_revision_audits_and_refreshes_index(db_sess
     await db_session.refresh(job)
     assert job.cron_expr == "0 9 * * 1"
     assert job.revision == 2
+    assert job.last_run_at is None
+    assert job.last_status is None
 
     audits = list((await db_session.execute(
         select(AutomationRevision).where(AutomationRevision.target_id == job.id)
@@ -802,6 +808,20 @@ async def test_v2_review_needs_human_then_cohort_approval_applies_change(db_sess
     assert job.cron_expr == "0 6 * * *"  # nothing applied yet
 
     actor = generate_ulid()
+    db_session.add(User(
+        id=actor,
+        entity_id=workspace.entity_id,
+        email=f"{actor}@example.com",
+        password_hash="x",
+        role="owner",
+    ))
+    db_session.add(UserMembership(
+        user_id=actor,
+        entity_id=workspace.entity_id,
+        role="owner",
+        status="active",
+    ))
+    await db_session.flush()
     await strategist_service.approve_proposal(
         db_session,
         entity_id=workspace.entity_id,
@@ -877,6 +897,21 @@ async def test_v2_review_reject_flow_denies_change_item(db_session, monkeypatch)
         db_session, monkeypatch, workspace, payload=_review_payload(job.id),
     )
     request_id = (await _change_items(db_session, result["review_id"]))[0].approval_request_id
+    actor = generate_ulid()
+    db_session.add(User(
+        id=actor,
+        entity_id=workspace.entity_id,
+        email=f"{actor}@example.com",
+        password_hash="x",
+        role="owner",
+    ))
+    db_session.add(UserMembership(
+        user_id=actor,
+        entity_id=workspace.entity_id,
+        role="owner",
+        status="active",
+    ))
+    await db_session.flush()
 
     await strategist_service.reject_proposal(
         db_session,
@@ -885,7 +920,7 @@ async def test_v2_review_reject_flow_denies_change_item(db_session, monkeypatch)
         reason="Not this cycle.",
         reason_code="BAD_TIMING",
         actor_kind="user",
-        actor_id=generate_ulid(),
+        actor_id=actor,
     )
     await db_session.commit()
 

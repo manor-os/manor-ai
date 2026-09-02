@@ -184,6 +184,7 @@ export default function WorkspaceStatsPanel({ workspaceId, canManage, context = 
     mutationFn: (stat: WorkspaceStatDefinition) => api.workspaces.stats.collect(workspaceId, stat.id),
     onSuccess: ({ stat }) => {
       void refreshStats();
+      void queryClient.invalidateQueries({ queryKey: ["workspace-goals", workspaceId] });
       void queryClient.invalidateQueries({ queryKey: ["workspace-stat-observations", workspaceId, stat.id] });
       setSelectedStat(stat);
       toast.success(t("page.workspace_stats.collected"));
@@ -209,6 +210,7 @@ export default function WorkspaceStatsPanel({ workspaceId, canManage, context = 
       setValueNote("");
       setSelectedStat(stat);
       void refreshStats();
+      void queryClient.invalidateQueries({ queryKey: ["workspace-goals", workspaceId] });
       void queryClient.invalidateQueries({ queryKey: ["workspace-stat-observations", workspaceId, stat.id] });
       toast.success(t("page.workspace_stats.value_recorded"));
     },

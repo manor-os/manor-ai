@@ -1,9 +1,12 @@
 """Gmail MCP server — in-process MCP for Gmail API v1.
 
-Scopes used:
-  - https://www.googleapis.com/auth/gmail.send
-  - https://www.googleapis.com/auth/gmail.readonly
+Scope used:
   - https://www.googleapis.com/auth/gmail.modify
+
+``gmail.modify`` covers every operation exposed here, including reading,
+sending, drafts, labels, and reversible message/thread trash operations.  This
+server deliberately does not expose the permanently destructive
+``messages.delete`` or ``messages.batchDelete`` methods.
 
 Auth: Google OAuth access_token (from oauth_accounts or Integration credentials,
 auto-refreshed via _google_auth._refresh if needed).
@@ -15,6 +18,7 @@ import json
 import logging
 from email.mime.text import MIMEText
 from typing import Any, Dict, List, Optional
+from urllib.parse import quote
 
 import httpx
 
@@ -22,6 +26,11 @@ logger = logging.getLogger(__name__)
 
 _API = "https://gmail.googleapis.com/gmail/v1"
 _MAX_CHARS = 12_000
+
+
+def _path_segment(value: Any) -> str:
+    """Encode an opaque Gmail resource id as one URL path segment."""
+    return quote(str(value), safe="")
 
 
 # ── MCP Protocol ─────────────────────────────────────────────────────────────
@@ -259,17 +268,48 @@ async def call_tool(
     arguments: Dict[str, Any],
     bearer_token: str,
 ) -> Dict[str, Any]:
+    token = bearer_token.strip() if isinstance(bearer_token, str) else ""
+    if not token:
+        return _error(
+            "Gmail access token is missing. Reconnect Google under Settings → Integrations."
+        )
+
     handler = _HANDLERS.get(name)
     if not handler:
         return _error(f"Unknown tool: {name}")
+    if not isinstance(arguments, dict):
+        return _error("arguments must be an object")
+    arguments = dict(arguments)
 
     spec = _TOOLS.get(name, {})
-    missing = [p for p in spec.get("required", []) if arguments.get(p) in (None, "")]
+    missing = [
+        p
+        for p in spec.get("required", [])
+        if _is_blank(arguments.get(p))
+    ]
     if missing:
         return _error(f"Missing required params: {', '.join(missing)}")
+    for field, property_spec in (spec.get("properties") or {}).items():
+        value = arguments.get(field)
+        if value is None:
+            continue
+        property_type = property_spec.get("type")
+        if property_type == "string" and not isinstance(value, str):
+            return _error(f"{field} must be a string")
+        if property_type == "boolean" and not isinstance(value, bool):
+            return _error(f"{field} must be a boolean")
+        if property_type == "array":
+            # message_ids historically accepts a comma-separated string too.
+            if field == "message_ids":
+                if not isinstance(value, (list, str)):
+                    return _error(f"{field} must be an array or comma-separated string")
+                if isinstance(value, list) and any(not isinstance(item, str) for item in value):
+                    return _error(f"{field} items must be strings")
+            elif not isinstance(value, list):
+                return _error(f"{field} must be an array")
 
     try:
-        text = await handler(bearer_token, arguments)
+        text = await handler(token, arguments)
         return {"content": [{"type": "text", "text": text}], "isError": False}
     except Exception as e:
         logger.exception("Gmail MCP tool %s failed", name)
@@ -278,6 +318,10 @@ async def call_tool(
 
 def _error(msg: str) -> Dict[str, Any]:
     return {"content": [{"type": "text", "text": msg}], "isError": True}
+
+
+def _is_blank(value: Any) -> bool:
+    return value is None or (isinstance(value, str) and not value.strip())
 
 
 # ── Simulation (dry_run / sandbox plans) ────────────────────────────────────
@@ -381,9 +425,8 @@ def _sim_reply_to_message(args: Dict) -> str:
 # Realistic-looking mixed inbox: one urgent, one routine question, one
 # transactional, one promotional. Briefing should triage these into
 # different action buckets.
-import base64 as _b64
 def _b64body(text: str) -> str:
-    return _b64.urlsafe_b64encode(text.encode("utf-8")).decode("ascii")
+    return base64.urlsafe_b64encode(text.encode("utf-8")).decode("ascii")
 
 
 _DEMO_INBOX: List[Dict[str, Any]] = [
@@ -500,7 +543,7 @@ async def _api(
 # ── Tool handlers ────────────────────────────────────────────────────────────
 
 async def _list_messages(token: str, args: Dict) -> str:
-    max_results = min(int(args.get("max_results") or 20), 100)
+    max_results = _max_results(args.get("max_results"))
     params = {
         "q": args["query"],
         "maxResults": max_results,
@@ -531,7 +574,7 @@ async def _list_messages(token: str, args: Dict) -> str:
         detail_text = await _api(
             token,
             "GET",
-            f"users/me/messages/{message_id}",
+            f"users/me/messages/{_path_segment(message_id)}",
             params={
                 "format": "metadata",
                 "metadataHeaders": ["From", "Subject", "Date"],
@@ -570,7 +613,7 @@ async def _get_message(token: str, args: Dict) -> str:
     fmt = args.get("format") or "full"
     return await _api(
         token, "GET",
-        f"users/me/messages/{args['message_id']}",
+        f"users/me/messages/{_path_segment(args['message_id'])}",
         params={"format": fmt},
     )
 
@@ -589,7 +632,7 @@ async def _send_message(token: str, args: Dict) -> str:
     }
     if args.get("reply_to_message_id"):
         thread_resp = await _api(
-            token, "GET", f"users/me/messages/{args['reply_to_message_id']}",
+            token, "GET", f"users/me/messages/{_path_segment(args['reply_to_message_id'])}",
             params={"format": "metadata"},
         )
         try:
@@ -603,7 +646,7 @@ async def _send_message(token: str, args: Dict) -> str:
 async def _reply_to_message(token: str, args: Dict) -> str:
     # Look up thread id + original headers so the reply threads properly
     meta = await _api(
-        token, "GET", f"users/me/messages/{args['message_id']}",
+        token, "GET", f"users/me/messages/{_path_segment(args['message_id'])}",
         params={"format": "metadata",
                 "metadataHeaders": ["Subject", "From", "Message-ID", "References"]},
     )
@@ -651,8 +694,11 @@ async def _resolve_label_ids(
         labels = json.loads(labels_resp).get("labels", [])
     except Exception:
         labels = []
-    by_id = {l.get("id"): l for l in labels}
-    by_name = {(l.get("name") or "").lower(): l for l in labels}
+    by_id = {label.get("id"): label for label in labels}
+    by_name = {
+        (label.get("name") or "").lower(): label
+        for label in labels
+    }
     out: List[str] = []
     for tok in names_or_ids:
         if not tok:
@@ -676,13 +722,29 @@ def _csv_list(v: Any) -> List[str]:
     return [s.strip() for s in str(v).split(",") if s.strip()]
 
 
+def _max_results(value: Any, *, default: int = 20) -> int:
+    if value is None or value == "":
+        return default
+    if isinstance(value, bool):
+        raise ValueError("max_results must be an integer between 1 and 100")
+    try:
+        count = int(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("max_results must be an integer between 1 and 100") from exc
+    if isinstance(value, float) and value != count:
+        raise ValueError("max_results must be an integer between 1 and 100")
+    if count < 1:
+        raise ValueError("max_results must be at least 1")
+    return min(count, 100)
+
+
 async def _add_label(token: str, args: Dict) -> str:
     ids = await _resolve_label_ids(token, [args["label"]])
     if not ids:
         return f"Label not found: {args['label']}"
     return await _api(
         token, "POST",
-        f"users/me/messages/{args['message_id']}/modify",
+        f"users/me/messages/{_path_segment(args['message_id'])}/modify",
         body={"addLabelIds": ids},
     )
 
@@ -693,7 +755,7 @@ async def _remove_label(token: str, args: Dict) -> str:
         return f"Label not found: {args['label']}"
     return await _api(
         token, "POST",
-        f"users/me/messages/{args['message_id']}/modify",
+        f"users/me/messages/{_path_segment(args['message_id'])}/modify",
         body={"removeLabelIds": ids},
     )
 
@@ -709,7 +771,7 @@ async def _modify_message(
         body["addLabelIds"] = add
     if remove:
         body["removeLabelIds"] = remove
-    return await _api(token, "POST", f"users/me/messages/{message_id}/modify", body=body)
+    return await _api(token, "POST", f"users/me/messages/{_path_segment(message_id)}/modify", body=body)
 
 
 async def _mark_read(token: str, args: Dict) -> str:
@@ -731,11 +793,11 @@ async def _mark_spam(token: str, args: Dict) -> str:
 
 
 async def _trash_message(token: str, args: Dict) -> str:
-    return await _api(token, "POST", f"users/me/messages/{args['message_id']}/trash")
+    return await _api(token, "POST", f"users/me/messages/{_path_segment(args['message_id'])}/trash")
 
 
 async def _untrash_message(token: str, args: Dict) -> str:
-    return await _api(token, "POST", f"users/me/messages/{args['message_id']}/untrash")
+    return await _api(token, "POST", f"users/me/messages/{_path_segment(args['message_id'])}/untrash")
 
 
 async def _batch_modify(token: str, args: Dict) -> str:
@@ -769,7 +831,7 @@ def _build_raw_message(args: Dict) -> str:
 
 async def _list_drafts(token: str, args: Dict) -> str:
     params: Dict[str, Any] = {
-        "maxResults": min(int(args.get("max_results") or 20), 100),
+        "maxResults": _max_results(args.get("max_results")),
     }
     if args.get("query"):
         params["q"] = args["query"]
@@ -778,7 +840,7 @@ async def _list_drafts(token: str, args: Dict) -> str:
 
 async def _get_draft(token: str, args: Dict) -> str:
     return await _api(
-        token, "GET", f"users/me/drafts/{args['draft_id']}",
+        token, "GET", f"users/me/drafts/{_path_segment(args['draft_id'])}",
         params={"format": args.get("format") or "full"},
     )
 
@@ -788,7 +850,7 @@ async def _create_draft(token: str, args: Dict) -> str:
     body: Dict[str, Any] = {"message": {"raw": raw}}
     if args.get("thread_message_id"):
         meta = await _api(
-            token, "GET", f"users/me/messages/{args['thread_message_id']}",
+            token, "GET", f"users/me/messages/{_path_segment(args['thread_message_id'])}",
             params={"format": "metadata"},
         )
         try:
@@ -804,7 +866,7 @@ async def _update_draft(token: str, args: Dict) -> str:
     raw = _build_raw_message(args)
     body: Dict[str, Any] = {"message": {"raw": raw}}
     return await _api(
-        token, "PUT", f"users/me/drafts/{args['draft_id']}", body=body,
+        token, "PUT", f"users/me/drafts/{_path_segment(args['draft_id'])}", body=body,
     )
 
 
@@ -815,7 +877,7 @@ async def _send_draft(token: str, args: Dict) -> str:
 
 
 async def _delete_draft(token: str, args: Dict) -> str:
-    return await _api(token, "DELETE", f"users/me/drafts/{args['draft_id']}")
+    return await _api(token, "DELETE", f"users/me/drafts/{_path_segment(args['draft_id'])}")
 
 
 # ── Threads ─────────────────────────────────────────────────────────────────
@@ -825,21 +887,21 @@ async def _list_threads(token: str, args: Dict) -> str:
         token, "GET", "users/me/threads",
         params={
             "q": args["query"],
-            "maxResults": min(int(args.get("max_results") or 20), 100),
+            "maxResults": _max_results(args.get("max_results")),
         },
     )
 
 
 async def _get_thread(token: str, args: Dict) -> str:
     return await _api(
-        token, "GET", f"users/me/threads/{args['thread_id']}",
+        token, "GET", f"users/me/threads/{_path_segment(args['thread_id'])}",
         params={"format": args.get("format") or "full"},
     )
 
 
 async def _trash_thread(token: str, args: Dict) -> str:
     return await _api(
-        token, "POST", f"users/me/threads/{args['thread_id']}/trash",
+        token, "POST", f"users/me/threads/{_path_segment(args['thread_id'])}/trash",
     )
 
 
@@ -848,7 +910,7 @@ async def _trash_thread(token: str, args: Dict) -> str:
 async def _download_attachment(token: str, args: Dict) -> str:
     return await _api(
         token, "GET",
-        f"users/me/messages/{args['message_id']}/attachments/{args['attachment_id']}",
+        f"users/me/messages/{_path_segment(args['message_id'])}/attachments/{_path_segment(args['attachment_id'])}",
     )
 
 
@@ -868,7 +930,7 @@ async def _create_label(token: str, args: Dict) -> str:
 
 
 async def _delete_label(token: str, args: Dict) -> str:
-    return await _api(token, "DELETE", f"users/me/labels/{args['label_id']}")
+    return await _api(token, "DELETE", f"users/me/labels/{_path_segment(args['label_id'])}")
 
 
 # ── Profile ─────────────────────────────────────────────────────────────────

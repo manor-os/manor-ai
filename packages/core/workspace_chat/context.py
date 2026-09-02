@@ -8,6 +8,7 @@ Cache: in-memory dict with 5-min TTL. Invalidated on task/goal/proposal
 changes so the chat stays fresh without re-querying on every message.
 """
 from __future__ import annotations
+from packages.core.constants.goals import GoalStatus
 from packages.core.constants.task import TaskStatus
 from packages.core.constants.execution import (
     ExecutionPlanStatus,
@@ -140,7 +141,7 @@ async def _build_summary(db: AsyncSession, workspace_id: str, entity_id: str) ->
         .where(
             Goal.entity_id == entity_id,
             Goal.workspace_id == workspace_id,
-            Goal.status == "active",
+            Goal.status == GoalStatus.ACTIVE.value,
         )
     )).all()
     if goals:
@@ -233,7 +234,7 @@ async def _build_summary(db: AsyncSession, workspace_id: str, entity_id: str) ->
                 f"  - service_key={service_key} agent=\"{agent_name}\" subscription_id={sub.id}"
             )
         if len(subs) > len(service_lines):
-            service_lines.append("  - use workspace_search(category='agents') for the full list")
+            service_lines.append("  - use manor Workspace search with category='agents' for the full list")
         parts.append(f"Agents/services ({len(subs)}):\n" + "\n".join(service_lines))
     else:
         parts.append("Agents: none assigned")
@@ -268,7 +269,11 @@ async def _build_summary(db: AsyncSession, workspace_id: str, entity_id: str) ->
     try:
         from packages.core.services.workspace_readiness import list_configured_workspace_channels
 
-        channels = await list_configured_workspace_channels(db, ws)
+        # Channel configuration is optional prompt context. Isolate its read so
+        # a schema/provider failure cannot poison the transaction used by the
+        # rest of Chat context assembly and conversation history.
+        async with db.begin_nested():
+            channels = await list_configured_workspace_channels(db, ws)
         if channels:
             channel_lines: list[str] = []
             for ch in channels[:8]:
@@ -294,7 +299,12 @@ async def _build_summary(db: AsyncSession, workspace_id: str, entity_id: str) ->
 
     try:
         from packages.core.governance import get_policy
-        policy = await get_policy(db, workspace_id)
+
+        # Governance summary is also best-effort prompt context. Keep a failed
+        # read inside its savepoint rather than leaving the caller's session in
+        # PostgreSQL's aborted-transaction state.
+        async with db.begin_nested():
+            policy = await get_policy(db, workspace_id)
         guardrails: list[str] = []
         if policy.never_allow_actions:
             guardrails.append(f"never allow {_compact_patterns(policy.never_allow_actions)}")
@@ -316,9 +326,9 @@ async def _build_summary(db: AsyncSession, workspace_id: str, entity_id: str) ->
         logger.debug("Workspace governance summary failed", exc_info=True)
 
     parts.append(
-        "\nUse workspace_search to look up goals, tasks, agents, knowledge, artifacts/files, plans, rules, "
-        "runtime evidence, or learning candidates. Use workspace_agent for persistent workspace changes "
-        "such as tasks, rules, or knowledge bindings."
+        "\nUse manor(action='workspace') with its search action to look up goals, tasks, agents, "
+        "knowledge, artifacts/files, plans, rules, runtime evidence, or learning candidates. "
+        "Use the same gateway for persistent workspace changes such as tasks, rules, or knowledge bindings."
     )
 
     return "\n".join(parts)
@@ -423,7 +433,7 @@ async def _search_goals(db: AsyncSession, ws_id: str, entity_id: str, q: str, li
         select(Goal).where(
             Goal.entity_id == entity_id,
             Goal.workspace_id == ws_id,
-            Goal.status == "active",
+            Goal.status == GoalStatus.ACTIVE.value,
         )
         .order_by(Goal.priority.asc()).limit(limit)
     )).scalars().all()
@@ -598,12 +608,28 @@ async def _search_knowledge(
                     )
                 )
             ]
-        doc_count = len(group_docs) if client_visible_only else (await db.execute(
-            select(func.count()).select_from(DocumentGroupMember)
-            .join(Document, Document.id == DocumentGroupMember.document_id)
-            .where(DocumentGroupMember.group_id == g.id)
-            .where(Document.entity_id == entity_id, Document.is_trashed.is_(False))
-        )).scalar_one()
+        elif user_id:
+            readable_group_docs = []
+            for doc in group_docs:
+                if await user_can_read_document(
+                    db,
+                    doc,
+                    entity_id=entity_id,
+                    user_id=user_id,
+                    workspace_id=ws_id,
+                    actor_type="agent",
+                ):
+                    readable_group_docs.append(doc)
+            group_docs = readable_group_docs
+        if client_visible_only or user_id:
+            doc_count = len(group_docs)
+        else:
+            doc_count = (await db.execute(
+                select(func.count()).select_from(DocumentGroupMember)
+                .join(Document, Document.id == DocumentGroupMember.document_id)
+                .where(DocumentGroupMember.group_id == g.id)
+                .where(Document.entity_id == entity_id, Document.is_trashed.is_(False))
+            )).scalar_one()
         if client_visible_only and doc_count == 0:
             continue
         doc_stmt = (
@@ -645,14 +671,8 @@ async def _search_knowledge(
         elif user_id:
             # Internal caller with a known user: never surface a document
             # (name or fs_path) the user cannot read in the Knowledge Base.
-            filtered = []
-            for doc in docs:
-                if await user_can_read_document(
-                    db, doc, entity_id=entity_id,
-                    user_id=user_id, workspace_id=ws_id, actor_type="agent",
-                ):
-                    filtered.append(doc)
-            docs = filtered
+            readable_group_doc_ids = {str(doc.id) for doc in group_docs}
+            docs = [doc for doc in docs if str(doc.id) in readable_group_doc_ids]
         if q and not group_matches and not docs:
             continue
         line = f"- **{g.name}** ({doc_count} docs)"
@@ -778,10 +798,19 @@ async def _search_rules(db: AsyncSession, ws_id: str, entity_id: str, q: str) ->
     rules = (ws.operating_model or {}).get("rules") or []
     lines = ["## Rules"]
     for r in rules:
-        desc = r.get("description", "")
-        if q and q not in desc.lower() and q not in (r.get("rule_key") or "").lower():
+        if isinstance(r, str):
+            desc = r
+            rule_key = ""
+            severity = "?"
+        elif isinstance(r, dict):
+            desc = r.get("description", "")
+            rule_key = r.get("rule_key") or ""
+            severity = r.get("severity", "?")
+        else:
             continue
-        lines.append(f"- [{r.get('severity', '?')}] {desc[:200]}")
+        if q and q not in desc.lower() and q not in rule_key.lower():
+            continue
+        lines.append(f"- [{severity}] {desc[:200]}")
     policy = await get_policy(db, ws_id)
     policy_lines: list[str] = []
     if policy.never_allow_actions:

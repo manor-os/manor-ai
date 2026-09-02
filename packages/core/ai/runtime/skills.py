@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+from enum import StrEnum
+from uuid import UUID
 from collections.abc import Awaitable, Callable, Iterable, Mapping
 from copy import deepcopy
 from dataclasses import dataclass, field, replace
@@ -9,6 +11,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 from sqlalchemy.ext.asyncio import AsyncSession
+from ulid import ULID
 
 from packages.core.ai.runtime.capabilities import (
     allowed_tools_for_profile,
@@ -29,25 +32,48 @@ from packages.core.ai.runtime.skill_routing import filter_skills_for_runtime_tur
 from packages.core.ai.runtime.skill_routing import (
     external_platform_action_intent,
     is_chrome_skill,
+    is_integration_child_skill,
+    is_integration_parent_skill,
+    is_linkedin_platform_skill,
+    is_linkedin_route_skill,
     is_local_coding_skill,
-    is_youtube_publisher_skill,
+    is_presentation_skill,
+    is_social_platform_skill,
+    is_social_platform_route_skill,
+    is_youtube_platform_skill,
     is_youtube_route_skill,
     local_coding_cli_intent,
+    linkedin_platform_operation_intent,
+    named_integration_operation_intent,
+    presentation_artifact_intent,
+    presentation_fresh_creation_intent,
     runtime_approval_resume_intent,
+    social_platform_action_intent,
     should_route_external_action_to_integration,
     skill_slug_and_name,
     youtube_platform_action_intent,
+)
+from packages.core.ai.runtime.integration_skill_registry import (
+    integration_skill_route_for_message,
 )
 from packages.core.ai.runtime.skill_invocation_policy import (
     retain_required_skill_invocation_policies,
     render_skill_invocation_policy,
     trusted_skill_invocation_policy,
 )
+from packages.core.ai.runtime.skill_capability_companion import (
+    trusted_integration_provider_keys,
+    trusted_skill_capability_companion,
+)
 from packages.core.ai.runtime.chrome_routing import detect_chrome_local_browser_route
 from packages.core.ai.runtime.surfaces import ChatSurface
 from packages.core.ai.runtime.tool_context import (
     RUNTIME_TOOL_CONTEXT_KEYS,
     runtime_tool_call_context_from_kwargs,
+)
+from packages.core.ai.runtime.tool_bindings import (
+    RuntimeDynamicMCPDiscoveryScopeFactory,
+    RuntimeSearchToolBindingScope,
 )
 from packages.core.services.skill_bundle import parse_clarifying_questions
 
@@ -139,7 +165,7 @@ output exactly: READY"""
 
 async def runtime_invoke_skill(
     db: AsyncSession,
-    skill_id_or_slug: str,
+    skill_id: str,
     entity_id: str,
     input_text: str,
     **kwargs: Any,
@@ -150,7 +176,7 @@ async def runtime_invoke_skill(
 
     return await invoke_skill(
         db,
-        skill_id_or_slug,
+        skill_id,
         entity_id,
         input_text,
         **kwargs,
@@ -170,12 +196,25 @@ async def runtime_list_skills(
     return await list_skills(db, entity_id, category=category or None)
 
 
-async def runtime_get_skill(db: AsyncSession, skill_id: str) -> Any | None:
+async def runtime_get_skill(
+    db: AsyncSession,
+    skill_id: str,
+    *,
+    entity_id: str | None = None,
+) -> Any | None:
     """Load a skill through the Runtime skill lifecycle boundary."""
 
     from packages.core.services.skill_service import get_skill
 
-    return await get_skill(db, skill_id)
+    skill = await get_skill(db, skill_id)
+    if skill is None or getattr(skill, "status", "active") != "active":
+        return None
+    if entity_id is not None and getattr(skill, "entity_id", None) not in {
+        None,
+        entity_id,
+    }:
+        return None
+    return skill
 
 
 async def runtime_generate_skill(
@@ -229,8 +268,9 @@ async def runtime_delete_skill(
 async def runtime_invoke_skill_action(
     *,
     entity_id: str,
-    skill: str,
-    input_text: str,
+    skill_id: str | None = None,
+    skill: str | None = None,
+    input_text: str = "",
     skill_params: Any | None = None,
     runtime_context: Any | None = None,
     user_id: str | None = None,
@@ -238,51 +278,128 @@ async def runtime_invoke_skill_action(
 ) -> str:
     """Invoke a skill and format the tool result through Runtime."""
 
+    # The public invoke_skill handler historically used ``skill=`` while the
+    # runtime helper was renamed to ``skill_id``. Accept both at this boundary
+    # so registered-tool dispatch remains backwards compatible.
+    skill_id = str(skill_id or skill or "").strip()
+
+    manually_selected_ids = {
+        str(value).strip().lower()
+        for value in (getattr(runtime_context, "manual_skill_ids", None) or ())
+        if str(value or "").strip()
+    }
     manually_selected_slugs = {
         str(value).strip().lower()
         for value in (getattr(runtime_context, "manual_skill_slugs", None) or ())
         if str(value or "").strip()
     }
+    manually_selected_refs = manually_selected_ids | manually_selected_slugs
     if (
         bool(getattr(runtime_context, "manual_skill_selected", False))
-        and manually_selected_slugs
-        and str(skill or "").strip().lower() not in manually_selected_slugs
+        and manually_selected_refs
+        and str(skill_id or "").strip().lower() not in manually_selected_refs
     ):
-        return f"Error invoking skill '{skill}': skill was not selected for this turn"
+        return f"Error invoking skill '{skill_id}': skill was not selected for this turn"
 
+    active_user_message = str(
+        getattr(runtime_context, "active_user_message", "") or ""
+    ).strip()
     effective_input_text = str(input_text or "").strip()
     if not effective_input_text:
-        effective_input_text = str(getattr(runtime_context, "active_user_message", "") or "").strip()
-    effective_input_text = runtime_skill_input_with_params(effective_input_text, skill_params)
-    effective_input_text = runtime_input_with_artifact_context(
-        effective_input_text,
-        runtime_artifact_urls=getattr(runtime_context, "runtime_artifact_urls", None),
-        dependency_artifact_urls=getattr(runtime_context, "dependency_artifact_urls", None),
-    )
+        effective_input_text = active_user_message
 
-    skip_result = runtime_external_action_skill_skip_result(
-        active_user_message=getattr(runtime_context, "active_user_message", None),
-        skill=skill,
-        manual_skill_selected=bool(getattr(runtime_context, "manual_skill_selected", False)),
-    )
-    if skip_result is not None:
-        return skip_result
+    # Reject an accidental writing-skill route before touching the database.
+    # Besides avoiding unnecessary work, this keeps the safety handoff
+    # deterministic when the workspace database is unavailable: external
+    # publish/send requests must yield to the integration tools regardless of
+    # whether the named skill can be resolved.
+    # Opaque UUID/ULID references need to be resolved first: the row may be a
+    # legitimate platform route even though its identifier is not recognizable
+    # by the routing classifier. Human-readable slugs can be rejected eagerly.
+    opaque_skill_reference = False
+    try:
+        UUID(skill_id)
+        opaque_skill_reference = True
+    except (ValueError, AttributeError, TypeError):
+        try:
+            ULID.from_str(skill_id)
+            opaque_skill_reference = True
+        except (ValueError, AttributeError, TypeError):
+            pass
+    if not opaque_skill_reference:
+        early_skip_result = runtime_external_action_skill_skip_result(
+            active_user_message=active_user_message,
+            skill=skill_id,
+            manual_skill_selected=bool(
+                getattr(runtime_context, "manual_skill_selected", False)
+            ),
+        )
+        if early_skip_result is not None:
+            return early_skip_result
 
     from packages.core.database import async_session
     from packages.core.ai.runtime.workflow_tools import runtime_workflow_tool_context_args
+    from packages.core.services.skill_service import get_skill, get_skill_by_slug
 
     runtime_tool_context = runtime_workflow_tool_context_args({
+        "workflow_run_id": getattr(runtime_context, "workflow_run_id", None),
+        "workflow_lineage_root_run_id": getattr(
+            runtime_context, "workflow_lineage_root_run_id", None
+        ),
         "workflow_project_id": getattr(runtime_context, "workflow_project_id", None),
         "workflow_action_grant_id": getattr(runtime_context, "workflow_action_grant_id", None),
+        "workflow_step_id": getattr(runtime_context, "workflow_step_id", None),
         "workflow_scene_id": getattr(runtime_context, "workflow_scene_id", None),
         "workflow_batch_capture": getattr(runtime_context, "workflow_batch_capture", None),
         "approved_plan_version": getattr(runtime_context, "approved_plan_version", None),
     })
+    if getattr(runtime_context, "runtime_run_id", None):
+        runtime_tool_context.update(
+            {
+                "_runtime_run_id_from_context": runtime_context.runtime_run_id,
+                "_runtime_tool_call_id_from_context": runtime_context.runtime_tool_call_id,
+                "_runtime_tool_attempt_from_context": runtime_context.runtime_tool_attempt,
+            }
+        )
 
     async with async_session() as db:
+        skill_row = await get_skill(db, skill_id)
+        if skill_row is None:
+            skill_row = await get_skill_by_slug(db, skill_id, entity_id)
+        if (
+            skill_row is None
+            or getattr(skill_row, "status", None) != "active"
+            or getattr(skill_row, "entity_id", None) not in {None, entity_id}
+        ):
+            return f"Error invoking skill '{skill_id}': Skill not found"
+        skill_key = str(skill_row.slug or skill_row.name or skill_row.id)
+        skill_params = runtime_skill_params_for_active_turn(
+            skill_key,
+            skill_params,
+            active_user_message=active_user_message,
+        )
+        effective_input_text = runtime_skill_input_with_params(effective_input_text, skill_params)
+        effective_input_text = runtime_input_with_artifact_context(
+            effective_input_text,
+            runtime_artifact_urls=getattr(runtime_context, "runtime_artifact_urls", None),
+            dependency_artifact_urls=getattr(runtime_context, "dependency_artifact_urls", None),
+        )
+        skip_result = runtime_external_action_skill_skip_result(
+            active_user_message=getattr(runtime_context, "active_user_message", None),
+            skill=skill_key,
+            manual_skill_selected=bool(
+                getattr(runtime_context, "manual_skill_selected", False)
+            ),
+        )
+        if skip_result is not None:
+            return skip_result
+        skill_model = await runtime_manual_skill_execution_model(
+            db,
+            runtime_context=runtime_context,
+        )
         result = await runtime_invoke_skill(
             db,
-            skill,
+            skill_id,
             entity_id,
             effective_input_text,
             agent_id=getattr(runtime_context, "agent_id", None),
@@ -296,11 +413,174 @@ async def runtime_invoke_skill_action(
             allowed_tool_names=getattr(runtime_context, "allowed_tool_names", None),
             runtime_envelope=getattr(runtime_context, "runtime_envelope", None),
             metadata=runtime_skill_invocation_metadata(runtime_context),
-            model=getattr(runtime_context, "llm_model", None),
+            model=skill_model,
             active_user_message=getattr(runtime_context, "active_user_message", None),
             runtime_tool_context=runtime_tool_context,
         )
-    return runtime_format_invoke_skill_result(skill, result)
+    from packages.core.ai.runtime.nested_usage import runtime_record_nested_usage
+    from packages.core.ai.runtime.control import is_runtime_tool_suspension
+
+    if is_runtime_tool_suspension(result):
+        return result
+
+    if runtime_activate_sandbox_skill_handoff(runtime_context, result):
+        result = {
+            **result,
+            "loaded_tools": ["sandbox"],
+        }
+    runtime_record_nested_usage(result.get("usage") if isinstance(result, dict) else None)
+    if runtime_manual_skill_result_stops_parent(runtime_context, result):
+        result = {
+            **result,
+            "stop_parent": True,
+            "stop_reason": result.get("stop_reason") or "manual_skill_completed",
+            "replace_visible_text": True,
+        }
+    return runtime_format_invoke_skill_result(skill_key, result)
+
+
+def runtime_activate_sandbox_skill_handoff(
+    runtime_context: Any | None,
+    result: Any,
+) -> bool:
+    """Grant the composite Sandbox tool after a verified Skill admission.
+
+    This is deliberately run-local.  ``invoke_skill`` has already checked the
+    Skill's current visibility/binding and created a conversation-owned
+    sandbox.  The execution gate still revalidates that Skill context and the
+    sandbox handler checks the exact sandbox id before every action.
+    """
+
+    if not isinstance(result, dict):
+        return False
+    if (
+        str(result.get("stop_reason") or "") != "sandbox_ready"
+        or not str(result.get("sandbox_id") or "").strip()
+    ):
+        return False
+    envelope = getattr(runtime_context, "runtime_envelope", None)
+    grants = getattr(envelope, "discovered_tool_grants", None)
+    grant = getattr(grants, "grant", None)
+    if not callable(grant):
+        return False
+    grant(["sandbox"])
+    return True
+
+
+async def runtime_manual_skill_execution_model(
+    db: Any,
+    *,
+    runtime_context: Any | None,
+) -> str | None:
+    """Use dedicated high-capability models for bounded Research/Slides Skills.
+
+    The model and native BYOK credential are resolved as one route. This keeps
+    a Slides turn from inheriting a cheap Primary model from another provider,
+    which otherwise fails before PowerPoint authoring even starts.
+    """
+
+    current_model = str(getattr(runtime_context, "llm_model", "") or "").strip()
+    envelope = getattr(runtime_context, "runtime_envelope", None)
+    metadata = getattr(envelope, "metadata", None)
+    plan = metadata.get("turn_execution_plan") if isinstance(metadata, dict) else None
+    dedicated_research = (
+        str((metadata or {}).get("chat_mode") or "").strip().lower()
+        == "research"
+    )
+    dedicated_slides = (
+        str((metadata or {}).get("chat_mode") or "").strip().lower()
+        == "slides"
+    )
+    bounded_manual_research = bool(
+        bool(getattr(runtime_context, "manual_skill_selected", False))
+        and isinstance(plan, dict)
+        and plan.get("tool_catalog_mode") == "web_research"
+    )
+    if not (dedicated_research or bounded_manual_research or dedicated_slides):
+        return current_model or None
+
+    try:
+        from packages.core.services.model_gateway import (
+            detect_provider_from_key,
+            provider_for_model,
+        )
+        from packages.core.services.model_settings import (
+            get_model_settings_cached,
+            is_model_disabled,
+            presentation_model,
+            research_model,
+        )
+
+        settings = await get_model_settings_cached(db)
+        candidate = (
+            presentation_model(settings)
+            if dedicated_slides
+            else research_model(settings)
+        )
+        if is_model_disabled(settings, "primary", candidate):
+            return current_model or None
+
+        raw_llm_metadata = getattr(runtime_context, "llm_metadata", None)
+        byok_key = (
+            raw_llm_metadata.get("llm_api_key")
+            or raw_llm_metadata.get("api_key")
+            or raw_llm_metadata.get("_resolved_api_key")
+            if isinstance(raw_llm_metadata, dict)
+            else None
+        )
+        if byok_key:
+            key_provider = detect_provider_from_key(str(byok_key))
+            candidate_provider = provider_for_model(candidate)
+            current_provider = provider_for_model(current_model)
+            if key_provider and key_provider != "openrouter":
+                if candidate_provider == key_provider:
+                    return candidate
+                if current_model and current_provider == key_provider:
+                    return current_model
+                # No compatible route is available. Keep the current model so
+                # the lower routing layer emits its explicit provider mismatch
+                # instead of silently sending a native key to the wrong model.
+                return current_model or None
+            if current_model and candidate_provider != current_provider:
+                return current_model
+        return candidate
+    except Exception:
+        return current_model or None
+
+
+def _runtime_skill_tool_error_control(result: Any) -> dict[str, Any] | None:
+    if not isinstance(result, dict):
+        return None
+    control = result.get("control")
+    if not isinstance(control, dict) or control.get("kind") != "tool_error":
+        return None
+    return control
+
+
+def runtime_manual_skill_result_stops_parent(
+    runtime_context: Any | None,
+    result: Any,
+) -> bool:
+    """Stop duplicate parent research after a selected web Skill succeeds."""
+
+    if not bool(getattr(runtime_context, "manual_skill_selected", False)):
+        return False
+    if (
+        not isinstance(result, dict)
+        or result.get("error")
+        or result.get("sandbox_id")
+        or _runtime_skill_tool_error_control(result) is not None
+    ):
+        return False
+    if not str(result.get("content") or "").strip():
+        return False
+    envelope = getattr(runtime_context, "runtime_envelope", None)
+    metadata = getattr(envelope, "metadata", None)
+    plan = metadata.get("turn_execution_plan") if isinstance(metadata, dict) else None
+    return bool(
+        isinstance(plan, dict)
+        and plan.get("tool_catalog_mode") == "web_research"
+    )
 
 
 def runtime_skill_input_with_params(input_text: str, skill_params: Any | None) -> str:
@@ -326,6 +606,28 @@ def runtime_skill_input_with_params(input_text: str, skill_params: Any | None) -
     merged_params.update(skill_params)
     payload["params"] = merged_params
     return json.dumps(payload, ensure_ascii=False, indent=2)
+
+
+def runtime_skill_params_for_active_turn(
+    skill: str,
+    skill_params: Any | None,
+    *,
+    active_user_message: str | None,
+) -> Any | None:
+    """Drop stale PPTX resume identity from an explicit fresh-deck request."""
+
+    if not isinstance(skill_params, dict):
+        return skill_params
+    if not (
+        is_presentation_skill(str(skill or ""), str(skill or ""))
+        and presentation_fresh_creation_intent(active_user_message)
+    ):
+        return skill_params
+    return {
+        key: value
+        for key, value in skill_params.items()
+        if key not in {"sandbox_id", "project", "project_path"}
+    }
 
 
 async def runtime_create_skill_action(
@@ -433,6 +735,7 @@ async def runtime_delete_skill_action(
 
 async def runtime_get_skill_details_action(
     *,
+    entity_id: str,
     skill_id: str,
     tool_kwargs: dict[str, Any] | None = None,
 ) -> str:
@@ -443,12 +746,12 @@ async def runtime_get_skill_details_action(
     async with async_session() as db:
         runtime_descriptors = await runtime_skill_descriptors_from_tool_kwargs(db, tool_kwargs or {})
         if runtime_descriptors is not None:
-            key = str(skill_id or "").strip().lower()
+            resolved_id = str(skill_id or "").strip()
             for descriptor in runtime_descriptors:
-                if runtime_skill_descriptor_matches(descriptor, key):
+                if runtime_skill_descriptor_id_matches(descriptor, resolved_id):
                     return runtime_format_skill_descriptor_detail(descriptor)
             return f"Skill '{skill_id}' is not visible in this runtime."
-        skill = await runtime_get_skill(db, skill_id)
+        skill = await runtime_get_skill(db, skill_id, entity_id=entity_id)
 
     if not skill:
         return f"Skill '{skill_id}' not found."
@@ -745,9 +1048,24 @@ _LOCAL_CODING_TERMINAL_TOOL_RESULT_POLICY: dict[str, Any] = {
                 "mcp__codex_cli__review",
                 "mcp__claude_code__run",
                 "mcp__claude_code__review",
+                "mcp__gemini_cli__run",
+                "mcp__cursor_cli__run",
+                "mcp__aider__run",
+                "mcp__continue_cli__run",
             ],
             "statuses": ["running", "queued", "pending"],
-            "json_equals": {"tool": ["codex_cli", "claude_code"]},
+            "json_equals": {
+                "tool": [
+                    "codex_cli",
+                    "claude_code",
+                    "gemini_cli",
+                    "cursor",
+                    "cursor_cli",
+                    "aider",
+                    "continue",
+                    "continue_cli",
+                ]
+            },
             "stop_reason": LOCAL_CODING_DISPATCHED_STOP_REASON,
             "stop_parent": True,
             "replace_visible_text": True,
@@ -819,8 +1137,10 @@ def runtime_available_skills_omission_section(
     if (
         external_platform_action_intent(active_user_message)
         and not youtube_platform_action_intent(active_user_message)
+        and not linkedin_platform_operation_intent(active_user_message)
+        and not named_integration_operation_intent(active_user_message)
+        and not social_platform_action_intent(active_user_message)
         and not chrome_local_route
-        and not youtube_platform_action_intent(active_user_message)
     ):
         return _runtime_available_skills_section(
             "Optional Skills are not offered for this turn because the latest "
@@ -862,7 +1182,22 @@ def _filter_skills_for_prompt(
             or _is_mcp_guidance_pack(skill)
             or (
                 youtube_platform_action_intent(active_user_message)
-                and is_youtube_publisher_skill(*skill_slug_and_name(skill))
+                and is_youtube_platform_skill(*skill_slug_and_name(skill))
+            )
+            or (
+                linkedin_platform_operation_intent(active_user_message)
+                and is_linkedin_platform_skill(*skill_slug_and_name(skill))
+            )
+            or (
+                social_platform_action_intent(active_user_message)
+                and is_social_platform_skill(*skill_slug_and_name(skill))
+            )
+            or (
+                named_integration_operation_intent(active_user_message)
+                and is_integration_parent_skill(
+                    integration_skill_route_for_message(active_user_message),
+                    *skill_slug_and_name(skill),
+                )
             )
         ]
         filtered = retain_required_skill_invocation_policies(items, selected)
@@ -883,11 +1218,58 @@ def _filter_skills_for_prompt(
         filtered = retain_required_skill_invocation_policies(items, selected)
         if not selected:
             return filtered, _runtime_available_skills_section(
-                "The optional youtube-studio-publisher Skill is not installed, "
-                "but that does not block this request. Recommend it as a "
-                "professional workflow enhancement, then continue with any "
-                "verified YouTube MCP or local Chrome capability available for "
-                "the requested operation."
+                "No internal YouTube platform route is available. Report that "
+                "platform-youtube and its verified mcp_youtube or Chrome child "
+                "routes are unavailable; do not recommend a Marketplace install."
+            )
+        return filtered, None
+
+    if linkedin_platform_operation_intent(active_user_message):
+        selected = [
+            skill
+            for skill in items
+            if is_linkedin_route_skill(*skill_slug_and_name(skill))
+        ]
+        filtered = retain_required_skill_invocation_policies(items, selected)
+        if not selected:
+            return filtered, _runtime_available_skills_section(
+                "No internal LinkedIn platform route is available. Report that "
+                "platform-linkedin and its verified mcp_linkedin or Chrome child "
+                "routes are unavailable; do not recommend a Marketplace install."
+            )
+        return filtered, None
+
+    if social_platform_action_intent(active_user_message):
+        selected = [
+            skill
+            for skill in items
+            if is_social_platform_route_skill(
+                active_user_message, *skill_slug_and_name(skill)
+            )
+        ]
+        filtered = retain_required_skill_invocation_policies(items, selected)
+        if not selected:
+            return filtered, _runtime_available_skills_section(
+                "Optional Skills are not offered for this external platform action. No internal "
+                "social-platform route is available. Report that "
+                "platform-social and its verified platform MCP or Chrome child "
+                "routes are unavailable; use `search_tools` to discover a verified "
+                "Integration/MCP route when one is connected; do not recommend a Marketplace install."
+            )
+        return filtered, None
+
+    if presentation_artifact_intent(active_user_message):
+        selected = [
+            skill
+            for skill in items
+            if is_presentation_skill(*skill_slug_and_name(skill))
+        ]
+        filtered = retain_required_skill_invocation_policies(items, selected)
+        if not selected:
+            return filtered, _runtime_available_skills_section(
+                "No built-in PPTX workflow is available. Report that the PPTX "
+                "skill is unavailable; do not route the presentation request "
+                "through platform-development or a generic coding provider."
             )
         return filtered, None
 
@@ -895,14 +1277,38 @@ def _filter_skills_for_prompt(
         selected = [
             skill
             for skill in items
-            if is_local_coding_skill(*skill_slug_and_name(skill)) or _is_mcp_guidance_pack(skill)
+            if is_local_coding_skill(*skill_slug_and_name(skill))
+            or str(skill_slug_and_name(skill)[0] or "").startswith(("mcp_", "mcp-"))
         ]
         filtered = retain_required_skill_invocation_policies(items, selected)
         if not selected:
             return filtered, _runtime_available_skills_section(
-                "No local coding operations skill is available. Use "
-                "`search_tools` for `mcp__codex_cli__check_path`/`run` or "
-                "`mcp__claude_code__check_path`/`run`."
+                "No internal development route is available. Report that "
+                "platform-development and its paired local coding children are "
+                "unavailable; do not recommend a Marketplace install."
+            )
+        return filtered, None
+
+    if named_integration_operation_intent(active_user_message):
+        route = integration_skill_route_for_message(active_user_message)
+        selected = [
+            skill
+            for skill in items
+            if is_integration_parent_skill(route, *skill_slug_and_name(skill))
+            or is_integration_child_skill(route, *skill_slug_and_name(skill))
+            or (
+                route is not None
+                and route.chrome_fallback
+                and is_chrome_skill(*skill_slug_and_name(skill))
+            )
+        ]
+        filtered = retain_required_skill_invocation_policies(items, selected)
+        if not selected:
+            provider = route.provider_key if route else "requested"
+            return filtered, _runtime_available_skills_section(
+                f"No internal executable Skill route is available for {provider}. "
+                "Report the missing Integration capability or connection; do not "
+                "recommend a Marketplace install or invent MCP tools."
             )
         return filtered, None
 
@@ -923,6 +1329,12 @@ def runtime_skill_descriptor_key_values(descriptor: Any) -> set[str]:
 
 def runtime_skill_descriptor_matches(descriptor: Any, key: str) -> bool:
     return str(key or "").strip().lower() in runtime_skill_descriptor_key_values(descriptor)
+
+
+def runtime_skill_descriptor_id_matches(descriptor: Any, skill_id: str) -> bool:
+    """Match a runtime Skill descriptor strictly by its stable database ID."""
+
+    return str(getattr(descriptor, "id", "") or "").strip() == str(skill_id or "").strip()
 
 
 def runtime_skill_source_for_skill(
@@ -998,8 +1410,8 @@ def runtime_format_skill_descriptor_list(
         suffix = f" ({category_label})" if category_label else ""
         source_label = _runtime_skill_source_label(descriptor)
         lines.append(
-            f"- [{descriptor.slug or descriptor.name}] [{source_label}] "
-            f"{descriptor.name or descriptor.slug} - "
+            f"- [{descriptor.id}] [{source_label}] "
+            f"{descriptor.name or descriptor.slug} (`{descriptor.slug}`) - "
             f"{descriptor.description or 'No description'}{suffix}"
         )
     lines.append("\nFull skill instructions are loaded only by `invoke_skill`.")
@@ -1050,11 +1462,11 @@ def runtime_skill_descriptor_list_payload(
 def runtime_skill_descriptor_detail_payload(
     descriptors: Iterable[Any],
     *,
-    skill_key: str,
+    skill_id: str,
 ) -> dict[str, Any]:
-    key = str(skill_key or "").strip().lower()
+    resolved_id = str(skill_id or "").strip()
     for descriptor in descriptors or ():
-        if runtime_skill_descriptor_matches(descriptor, key):
+        if runtime_skill_descriptor_id_matches(descriptor, resolved_id):
             payload = runtime_skill_descriptor_dict(descriptor)
             payload["runtime_scoped"] = True
             payload["instructions"] = (
@@ -1063,7 +1475,7 @@ def runtime_skill_descriptor_detail_payload(
             return payload
     return {
         "error": "Skill not visible in this runtime",
-        "skill_id": key,
+        "skill_id": resolved_id,
         "runtime_scoped": True,
     }
 
@@ -1090,12 +1502,12 @@ def runtime_external_action_skill_skip_result(
                 "This turn asks for an external platform workflow. "
                 "Do not invoke a writing skill as the primary route; call "
                 "search_tools for publish/send actions, or create a durable "
-                "draft bundle with write_file/generate_file for copy/image "
+                "draft bundle with generate_file for copy/image "
                 "requests. Use a skill only if the user manually selected it "
                 "or explicitly named it."
             ),
             "suggested_next_tool": "search_tools",
-            "suggested_next_tools": ["write_file", "generate_file", "search_tools"],
+            "suggested_next_tools": ["generate_file", "search_tools"],
         },
         ensure_ascii=False,
     )
@@ -1104,7 +1516,48 @@ def runtime_external_action_skill_skip_result(
 def runtime_format_invoke_skill_result(skill: str, result: dict) -> str:
     import json
 
+    chrome_outcome = result.get("chrome_outcome")
+    if isinstance(chrome_outcome, dict):
+        payload = dict(chrome_outcome)
+        payload.setdefault("skill", result.get("skill") or skill)
+        for key in ("stop_parent", "stop_reason", "notice_key", "replace_visible_text", "control"):
+            if key in result:
+                payload[key] = result.get(key)
+        return json.dumps(payload, ensure_ascii=False)
+
     stop_reason = result.get("stop_reason")
+    tool_error_control = _runtime_skill_tool_error_control(result)
+    if tool_error_control is not None:
+        normalized_stop_reason = str(stop_reason or "").strip()
+        if not normalized_stop_reason or normalized_stop_reason == "completed":
+            normalized_stop_reason = "tool_error"
+        return json.dumps(
+            {
+                "status": "failed",
+                "skill": result.get("skill") or skill,
+                "content": result.get("content") or "",
+                "error": (
+                    result.get("error")
+                    or tool_error_control.get("error_reason")
+                    or "tool_error"
+                ),
+                "stop_parent": False,
+                "stop_reason": normalized_stop_reason,
+                "control": tool_error_control,
+            },
+            ensure_ascii=False,
+        )
+    if stop_reason == "sandbox_ready" and result.get("sandbox_id"):
+        return json.dumps(
+            {
+                "status": "sandbox_ready",
+                "skill": result.get("skill") or skill,
+                "content": result.get("content") or "",
+                "sandbox_id": result.get("sandbox_id"),
+                "loaded_tools": ["sandbox"],
+            },
+            ensure_ascii=False,
+        )
     if result.get("stop_parent"):
         return json.dumps(
             {
@@ -1165,7 +1618,7 @@ def runtime_terminal_tool_result_policy_for_skill(skill) -> dict[str, Any] | Non
 
     config = getattr(skill, "config", None) or {}
     runtime = config.get("runtime") if isinstance(config, dict) else None
-    if isinstance(runtime, dict) and runtime:
+    if isinstance(runtime, dict) and runtime.get("terminal_tool_results"):
         return runtime
     if is_local_coding_skill(*skill_slug_and_name(skill)):
         return _LOCAL_CODING_TERMINAL_TOOL_RESULT_POLICY
@@ -1191,6 +1644,33 @@ async def runtime_skill_descriptors_from_tool_kwargs(
     )
 
 
+async def runtime_searchable_skill_descriptors_from_tool_kwargs(
+    db: AsyncSession | None,
+    kwargs: dict[str, Any],
+    *,
+    limit: int = 200,
+) -> list[SkillDescriptor]:
+    """Resolve the authorized lightweight Skill catalog for search_tools.
+
+    The query is intentionally not used during authorization. Search ranking
+    happens afterward over descriptors, and invoke_skill revalidates the same
+    runtime boundaries at execution time.
+    """
+
+    runtime_context = runtime_tool_call_context_from_kwargs(kwargs)
+    if runtime_context.runtime_envelope is None:
+        return []
+    return await resolve_skill_descriptors_for_envelope(
+        db,
+        runtime_context.runtime_envelope,
+        allowed_tool_names=runtime_context.allowed_tool_names,
+        active_user_message=None,
+        manual_skill_selected=False,
+        limit=limit,
+        raise_on_error=True,
+    )
+
+
 def _mcp_server_prefixes(tool_names: Iterable[str] | None) -> set[str]:
     """Collapse ``mcp__<server>__<tool>`` names to their ``mcp__<server>__`` prefix."""
     prefixes: set[str] = set()
@@ -1202,9 +1682,9 @@ def _mcp_server_prefixes(tool_names: Iterable[str] | None) -> set[str]:
 
 
 def _is_mcp_guidance_pack(skill) -> bool:
-    """A per-MCP built-in guidance pack uses the ``mcp_<server_key>`` slug convention."""
+    """A per-MCP built-in guidance pack uses an ``mcp_*`` or ``mcp-*`` slug."""
     slug, _name = skill_slug_and_name(skill)
-    return str(slug or "").startswith("mcp_")
+    return str(slug or "").startswith(("mcp_", "mcp-"))
 
 
 def _pack_declared_tool_names(skill) -> tuple[str, ...]:
@@ -1217,14 +1697,26 @@ def _pack_declared_tool_names(skill) -> tuple[str, ...]:
 def _mcp_pack_tools_available(skill, available_prefixes: set[str]) -> bool:
     """True when the pack's MCP is connectable this turn (its tools are available).
 
-    A pack declares its MCP via ``mcp__<server>__*`` tools in ``config.json``.
-    If it declares none, it is not gated (shown). Otherwise it is shown only
-    when at least one of its servers appears in the available tool surface.
+    A pack declares its MCP via concrete ``mcp__<server>__*`` tools or, for a
+    discovery-only vendor surface, ``discoverable_tool_prefixes``. If it
+    declares neither, it is not gated (shown). Otherwise it is shown only when
+    at least one of its servers appears in the available tool surface.
     """
     declared = _mcp_server_prefixes(_pack_declared_tool_names(skill))
-    if not declared:
+    metadata = getattr(skill, "metadata", None)
+    config = getattr(skill, "config", None)
+    discovery_config = config if isinstance(config, dict) else metadata
+    discoverable = {
+        str(prefix).strip()
+        for prefix in (
+            (discovery_config or {}).get("discoverable_tool_prefixes") or ()
+        )
+        if str(prefix or "").strip().startswith("mcp__")
+    }
+    required = declared | discoverable
+    if not required:
         return True
-    return bool(declared & available_prefixes)
+    return bool(required & available_prefixes)
 
 
 def render_runtime_available_skills_section(
@@ -1234,10 +1726,13 @@ def render_runtime_available_skills_section(
     manual_skill_selected: bool = False,
     loaded_tool_names: Iterable[str] | None = None,
     available_tool_names: Iterable[str] | None = None,
+    include_ordinary: bool = True,
 ) -> str | None:
-    """Render prompt-visible skill descriptors without loading full instructions.
+    """Render bounded Skill descriptors without loading their instructions.
 
-    ``available_tool_names`` is the connectable tool surface for the turn
+    Runtime prompt assembly passes ``include_ordinary=False`` because ordinary
+    Skills are discovered through ``search_tools``. The default remains useful
+    for explicit catalog and diagnostic rendering. ``available_tool_names`` is the connectable tool surface for the turn
     (loaded ∪ allowed). When provided, per-MCP guidance packs (``mcp_*`` slugs)
     are listed only if their MCP's tools are available — so a pack never shows
     for an MCP the agent has not connected. When ``None``, no MCP gating is
@@ -1269,6 +1764,17 @@ def render_runtime_available_skills_section(
             if not _is_mcp_guidance_pack(skill) or _mcp_pack_tools_available(skill, available_prefixes)
         ]
 
+    if not manual_skill_selected and not include_ordinary:
+        required = retain_required_skill_invocation_policies(filtered, ())
+        required_ids = {id(skill) for skill in required}
+        filtered = [
+            skill
+            for skill in filtered
+            if id(skill) in required_ids
+            or str(getattr(skill, "source", "") or "")
+            in {"agent_binding", "workspace_operation"}
+        ]
+
     if not filtered:
         return routing_message
 
@@ -1287,10 +1793,10 @@ def render_runtime_available_skills_section(
             policy = trusted_skill_invocation_policy(skill)
             if policy is None:
                 continue
-            slug, _name = skill_slug_and_name(skill)
+            skill_id = str(getattr(skill, "id", "") or "")
             invocation_policy_lines.append(
                 render_skill_invocation_policy(
-                    skill_slug=slug,
+                    skill_id=skill_id,
                     policy=policy,
                 )
             )
@@ -1312,7 +1818,8 @@ def render_runtime_available_skills_section(
         if len(short) > 120:
             short = short[:117] + "..."
         source_label = _runtime_skill_source_label(skill)
-        lines.append(f"- **{slug}** [{source_label}]: {short}")
+        skill_id = str(getattr(skill, "id", "") or "")
+        lines.append(f"- **{skill_id}** (`{slug}`) [{source_label}]: {short}")
     return "\n".join(lines)
 
 
@@ -1388,6 +1895,39 @@ def _prompt_skill_declared_tool_names(skill) -> tuple[str, ...]:
     return tuple(declared)
 
 
+def _prompt_skill_discovery_policy(
+    skill,
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    config = getattr(skill, "config", None) or {}
+    configured_providers = (
+        tuple(
+            str(provider).strip()
+            for provider in (config.get("discoverable_provider_keys") or ())
+            if str(provider or "").strip()
+        )
+        if isinstance(config, dict)
+        else ()
+    )
+    configured_prefixes = (
+        tuple(
+            str(prefix).strip()
+            for prefix in (config.get("discoverable_tool_prefixes") or ())
+            if str(prefix or "").strip()
+        )
+        if isinstance(config, dict)
+        else ()
+    )
+    providers = tuple(
+        dict.fromkeys((*configured_providers, *trusted_integration_provider_keys(skill)))
+    )
+    prefixes = tuple(
+        dict.fromkeys(
+            (*configured_prefixes, *(f"mcp__{provider}__" for provider in providers))
+        )
+    )
+    return providers, prefixes
+
+
 def _prompt_skill_discoverable_tool_names(
     skill,
     allowed_tool_names: Iterable[str] | None,
@@ -1395,33 +1935,25 @@ def _prompt_skill_discoverable_tool_names(
     runtime_envelope: RuntimeEnvelope | None = None,
     registered_tool_names: Iterable[str] = (),
 ) -> tuple[str, ...]:
-    config = getattr(skill, "config", None) or {}
-    if not isinstance(config, dict):
-        return ()
-    prefixes = tuple(
-        str(prefix).strip()
-        for prefix in (config.get("discoverable_tool_prefixes") or ())
-        if str(prefix or "").strip()
-    )
+    provider_keys, prefixes = _prompt_skill_discovery_policy(skill)
     if not prefixes:
         return ()
-    provider_keys = {
-        str(provider).strip()
-        for provider in (config.get("discoverable_provider_keys") or ())
-        if str(provider or "").strip()
-    }
     declared = set(_prompt_skill_declared_tool_names(skill))
     candidates = {
         str(tool_name).strip()
         for tool_name in registered_tool_names
         if str(tool_name or "").strip()
     }
-    profile = getattr(runtime_envelope, "profile", None)
-    if profile in {
-        RuntimeProfile.EXTERNAL_CUSTOMER_SAFE,
-        RuntimeProfile.EXTERNAL_CHANNEL_SAFE,
-    }:
-        candidates &= set(_runtime_allowed_tool_name_set(allowed_tool_names) or ())
+    allowed = _runtime_allowed_tool_name_set(allowed_tool_names)
+    if allowed is not None:
+        candidates &= set(allowed) | set(
+            _prompt_skill_semantically_authorized_mcp_tools(
+                skill,
+                candidates,
+                allowed_tool_names=allowed,
+                runtime_envelope=runtime_envelope,
+            )
+        )
     if provider_keys:
         from packages.core.ai.runtime.tool_discovery import runtime_mcp_provider_from_tool_name
 
@@ -1445,24 +1977,89 @@ def _runtime_allowed_tool_name_set(
     return frozenset(str(tool_name) for tool_name in allowed_tool_names if str(tool_name or "").strip())
 
 
+def _prompt_skill_semantically_authorized_mcp_tools(
+    skill,
+    candidate_tool_names: Iterable[str],
+    *,
+    allowed_tool_names: Iterable[str] | None,
+    runtime_envelope: RuntimeEnvelope | None,
+) -> frozenset[str]:
+    """Materialize an existing parent MCP scope for one trusted child Skill."""
+
+    if runtime_envelope is None or not trusted_integration_provider_keys(skill):
+        return frozenset()
+    provider_keys, prefixes = _prompt_skill_discovery_policy(skill)
+    if not provider_keys or not prefixes:
+        return frozenset()
+
+    allowed = _runtime_allowed_tool_name_set(allowed_tool_names)
+    concrete_allowed = frozenset(allowed or ())
+    binding_scope = RuntimeSearchToolBindingScope(
+        bound_tool_names=concrete_allowed,
+        mcp_allowed_names=frozenset(
+            name for name in concrete_allowed if name.startswith("mcp__")
+        ),
+        mcp_provider_scopes=tuple(
+            getattr(runtime_envelope, "mcp_provider_scopes", ()) or ()
+        ),
+        is_master=bool(
+            getattr(runtime_envelope, "mcp_scope_unrestricted", False)
+        ),
+        source="prompt_skill_parent",
+    )
+    dynamic_scope = RuntimeDynamicMCPDiscoveryScopeFactory.create(
+        binding_scope,
+        runtime_envelope,
+    )
+
+    from packages.core.ai.runtime.tool_discovery import (
+        runtime_mcp_provider_from_tool_name,
+    )
+
+    materialized: set[str] = set()
+    for raw_name in candidate_tool_names:
+        tool_name = str(raw_name or "").strip()
+        provider = runtime_mcp_provider_from_tool_name(tool_name)
+        if (
+            not tool_name
+            or provider not in provider_keys
+            or not tool_name.startswith(prefixes)
+        ):
+            continue
+        action = tool_name.split("__", 2)[2]
+        if dynamic_scope.allows(
+            tool_name,
+            provider=provider,
+            action=action,
+        ):
+            materialized.add(tool_name)
+    return frozenset(materialized)
+
+
 def _prompt_skill_effective_allowed_tools(
+    skill,
     declared_tool_names: Iterable[str],
     allowed_tool_names: Iterable[str] | None,
     runtime_envelope: RuntimeEnvelope | None = None,
 ) -> frozenset[str] | None:
+    # A Skill describes how to use tools; it is never an authorization grant.
+    # ``None`` means the parent runtime is intentionally unrestricted. A
+    # concrete allowlist may be extended only by the parent's existing semantic
+    # MCP scope, and only for the repository-owned Integration child Skill.
     allowed = _runtime_allowed_tool_name_set(allowed_tool_names)
-    declared = {str(tool_name) for tool_name in declared_tool_names if str(tool_name or "").strip()}
-    if not declared:
-        return allowed
-    profile = getattr(runtime_envelope, "profile", None)
-    if profile in {
-        RuntimeProfile.EXTERNAL_CUSTOMER_SAFE,
-        RuntimeProfile.EXTERNAL_CHANNEL_SAFE,
-    }:
-        return allowed
-    expanded = set(allowed or ())
-    expanded.update(declared)
-    return frozenset(expanded)
+    if allowed is None:
+        return None
+    return frozenset(
+        set(allowed)
+        | set(
+            _prompt_skill_semantically_authorized_mcp_tools(
+                skill,
+                declared_tool_names,
+                allowed_tool_names=allowed,
+                runtime_envelope=runtime_envelope,
+            )
+        )
+    )
 
 
 def _runtime_visible_declared_tools(
@@ -1504,8 +2101,9 @@ def _prompt_skill_runtime_envelope(
         if discovery_policy is not None
         else set(runtime_envelope.tool_names or ()) | set(skill_tool_names)
     )
+    # Chrome Skill child loops continue the same Browser Group/Harness run.
+    # Keep the state in the isolated child envelope; never mutate the parent.
     metadata = deepcopy(runtime_envelope.metadata)
-    metadata.pop("chrome_runtime_contract_v1", None)
     if discovery_policy is not None:
         metadata["prompt_skill_tool_discovery"] = {
             key: list(values)
@@ -1553,13 +2151,14 @@ def runtime_prepare_prompt_skill_tool_surface(
 ) -> RuntimePromptSkillToolSurface:
     """Prepare the schema-visible tool surface for a prompt skill.
 
-    Internal prompt skill invocations inherit the parent runtime policy scope
-    and add the skill's declared tools as the child skill's visible tool surface.
-    External customer/channel profiles keep the existing runtime allowlist.
+    Prompt skill invocations inherit the parent runtime policy scope.  Declared
+    tools describe what the Skill can use inside that scope; they never expand
+    the Agent's authorization.
     """
 
     declared = _prompt_skill_declared_tool_names(skill)
     parent_allowed = _prompt_skill_effective_allowed_tools(
+        skill,
         declared,
         allowed_tool_names,
         runtime_envelope,
@@ -1579,20 +2178,14 @@ def runtime_prepare_prompt_skill_tool_surface(
         runtime_envelope=runtime_envelope,
         registered_tool_names=get_registered_tool_names(),
     )
-    config = getattr(skill, "config", None) or {}
+    discovery_provider_keys, discovery_tool_prefixes = (
+        _prompt_skill_discovery_policy(skill)
+    )
     discovery_policy = None
-    if discoverable or (isinstance(config, dict) and config.get("discoverable_tool_prefixes")):
+    if discoverable or discovery_tool_prefixes:
         discovery_policy = {
-            "provider_keys": tuple(
-                str(value).strip()
-                for value in (config.get("discoverable_provider_keys") or ())
-                if str(value or "").strip()
-            ),
-            "tool_prefixes": tuple(
-                str(value).strip()
-                for value in (config.get("discoverable_tool_prefixes") or ())
-                if str(value or "").strip()
-            ),
+            "provider_keys": discovery_provider_keys,
+            "tool_prefixes": discovery_tool_prefixes,
         }
         allowed = frozenset((*skill_tool_names, *discoverable))
     else:
@@ -1622,6 +2215,7 @@ def runtime_prompt_skill_tool_schema_resolver(
     declared_tool_names: Iterable[str],
     allowed_tool_names: Iterable[str] | None = None,
     get_schema: Callable[[str], dict[str, Any] | None] | None = None,
+    required_arguments_by_tool: Mapping[str, Iterable[str]] | None = None,
 ) -> Callable[[str], dict[str, Any] | None]:
     """Build a resolver for skill-declared tools plus parent-visible MCP tools."""
 
@@ -1631,6 +2225,14 @@ def runtime_prompt_skill_tool_schema_resolver(
         get_schema = runtime_tool_schema
     declared = {str(tool_name) for tool_name in declared_tool_names if str(tool_name or "").strip()}
     allowed = _runtime_allowed_tool_name_set(allowed_tool_names)
+    required_arguments = {
+        str(tool_name): {
+            str(argument)
+            for argument in arguments
+            if str(argument or "").strip()
+        }
+        for tool_name, arguments in dict(required_arguments_by_tool or {}).items()
+    }
 
     def _resolver(name: str) -> dict[str, Any] | None:
         tool_name = str(name or "").strip()
@@ -1639,18 +2241,37 @@ def runtime_prompt_skill_tool_schema_resolver(
         if allowed is not None and tool_name not in allowed:
             return None
         if tool_name.startswith("mcp__") or tool_name in declared:
-            return get_schema(tool_name)
+            schema = get_schema(tool_name)
+            additions = required_arguments.get(tool_name) or set()
+            if schema is None or not additions:
+                return schema
+            resolved = deepcopy(schema)
+            function = resolved.get("function") if isinstance(resolved, dict) else None
+            parameters = function.get("parameters") if isinstance(function, dict) else None
+            if not isinstance(parameters, dict):
+                return resolved
+            current = parameters.get("required")
+            required = [
+                str(value)
+                for value in (current if isinstance(current, list) else [])
+                if str(value or "").strip()
+            ]
+            for argument in sorted(additions):
+                if argument not in required:
+                    required.append(argument)
+            parameters["required"] = required
+            return resolved
         return None
 
     return _resolver
 
 
-# Document/office skills assemble decks, docs, and sheets — they legitimately
-# generate images, but they have no business producing video or audio. Left
-# unguarded, a stuck pptx/docx run can flail into generate_file(kind="video")
-# with a prompt bled from earlier in the conversation, producing a deck request
-# that ends in an unrelated clip. Deny those media kinds outright for these
-# skills (slug or built-in alias).
+# Document/office skills assemble decks, docs, PDFs, and sheets - they
+# legitimately generate images, but they have no business producing video or
+# audio. Left unguarded, a stuck document run can flail into
+# generate_file(kind="video") with a prompt bled from earlier in the
+# conversation, producing a document request that ends in an unrelated clip.
+# Deny those media kinds outright for these skills (slug or built-in alias).
 _DOCUMENT_SKILL_SLUGS = frozenset(
     {
         "pptx",
@@ -1658,6 +2279,7 @@ _DOCUMENT_SKILL_SLUGS = frozenset(
         "docx",
         "word_document",
         "doc",
+        "pdf",
         "xlsx",
         "spreadsheet",
     }
@@ -1685,9 +2307,491 @@ def document_skill_media_guard(skill_slug: str | None, tool_name: str, args: Any
                 f"generate_file(kind='{kind}') is not allowed inside the "
                 f"'{slug}' skill. This skill produces documents; it must not "
                 "generate video or audio. If you are stuck assembling the "
-                "deck, stop and report what is missing — do not switch to an "
+                "document, stop and report what is missing — do not switch to an "
                 "unrelated media artifact."
             )
+        },
+        ensure_ascii=False,
+    )
+
+
+class RuntimePromptSkillExecutionContractKind(StrEnum):
+    STICKMAN_VIDEO = "stickman_video"
+
+
+_STICKMAN_PROMPT_SKILL_SLUGS = frozenset({
+    "stickman-video-creator",
+    "stickman_video_creator",
+})
+_STICKMAN_PROMPT_EXECUTION_CONTRACT: dict[str, Any] = {
+    "kind": RuntimePromptSkillExecutionContractKind.STICKMAN_VIDEO.value,
+    "guidance": (
+        "The authoritative Workflow artifact prefix for this run is "
+        "{run_artifact_prefix}. Keep every run-owned derivative inside it."
+    ),
+    "artifact_scope": {
+        "prefix_directory": "runs",
+        "lineage_context_keys": [
+            "_workflow_lineage_root_run_id_from_context",
+            "_workflow_run_id_from_context",
+        ],
+        "generated_directories": [
+            "audio", "final", "images", "qa", "subtitles", "technical", "video",
+        ],
+        "path_arguments": [
+            "audio_path", "cues_name", "directory", "filename", "input_path",
+            "manifest_name", "media_path", "name", "output_dir", "output_name",
+            "path", "subtitle_path", "timeline_name", "transcript_path",
+        ],
+        "defaultable_arguments": [
+            "filename", "name", "output_dir", "output_name", "path",
+        ],
+        "default_directories_by_tool": {
+            "align_subtitles": "technical",
+            "build_narration_timeline": "technical",
+            "compose_video_timeline": "final",
+            "generate_file": "technical",
+            "generate_image": "images",
+            "generate_video": "video",
+            "merge_videos": "video",
+            "normalize_audio_loudness": "audio/normalized",
+            "render_frame_samples": "qa",
+            "still_to_video": "video",
+            "patch_file": "technical",
+        },
+        "default_directory_rules": [
+            {"tool": "generate_file", "when": {"kind": "audio"}, "directory": "audio"},
+        ],
+    },
+    "required_output_rules": [
+        {
+            "tool": "generate_file",
+            "when": {"kind": "audio", "purpose": "narration"},
+            "output_arguments": ["output_name", "name", "filename"],
+            "directory": "audio",
+            "code": "stickman_run_output_name_required",
+            "error": (
+                "{tool_name} requires an explicit stable name inside "
+                "{run_artifact_prefix}/{directory}. Retry this call with the "
+                "manifest segment or scene number in the filename; unnamed "
+                "provider defaults are not valid Stickman Workflow artifacts."
+            ),
+        },
+        {
+            "tool": "generate_video",
+            "output_arguments": ["output_name", "name", "filename"],
+            "directory": "video",
+            "code": "stickman_run_output_name_required",
+            "error": (
+                "{tool_name} requires an explicit stable name inside "
+                "{run_artifact_prefix}/{directory}. Retry this call with the "
+                "manifest segment or scene number in the filename; unnamed "
+                "provider defaults are not valid Stickman Workflow artifacts."
+            ),
+        },
+    ],
+    "prerequisites": [
+        {
+            "before_tool": "generate_video",
+            "path": "technical/narration-timeline.json",
+            "limit": 10000,
+            "max_chars": 200000,
+            "required_non_empty_array_groups": [
+                ["cues", "subtitle_cues"],
+                "audio_tracks",
+            ],
+            "code": "stickman_narration_timeline_required",
+            "invalid_json_reason": "narration-timeline.json is not valid JSON",
+            "invalid_content_reason": (
+                "narration-timeline.json has no measured cues or audio tracks"
+            ),
+            "error": (
+                "generate_video is blocked until build_narration_timeline "
+                "succeeds for {required_path}: {reason}. Build the timeline "
+                "from every normalized narration segment, then retry."
+            ),
+        },
+    ],
+    "result_receipts": [
+        {
+            "after_tool": "generate_image",
+            "when": {
+                "reused_workspace_asset": True,
+                "workspace_asset_key": "stickman_character",
+            },
+            "source_fields": ["image_url", "result_url"],
+            "path": "technical/person-reference-url.txt",
+            "max_chars": 4096,
+            "code": "workspace_identity_receipt_write_failed",
+            "error": (
+                "The reusable Workspace Stickman was resolved, but its "
+                "run-scoped durable person-reference receipt could not be "
+                "written and read back. Stop before paid media calls."
+            ),
+            "result_fields": {
+                "durable_person_reference_path": "{receipt_path}",
+                "durable_person_reference_verified": True,
+            },
+        },
+    ],
+}
+
+
+class RuntimePromptSkillExecutionContractFactory:
+    """Resolve configured contracts with typed built-in compatibility defaults."""
+
+    @staticmethod
+    def create(
+        *,
+        skill: Any | None = None,
+        skill_slug: str | None = None,
+        configured_contract: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        if isinstance(configured_contract, Mapping) and configured_contract:
+            return deepcopy(dict(configured_contract))
+        slug = str(
+            skill_slug
+            or getattr(skill, "slug", "")
+            or getattr(skill, "name", "")
+            or ""
+        ).strip().lower()
+        if slug in _STICKMAN_PROMPT_SKILL_SLUGS:
+            return deepcopy(_STICKMAN_PROMPT_EXECUTION_CONTRACT)
+        return {}
+
+
+def runtime_prompt_skill_execution_contract(skill: Any) -> dict[str, Any]:
+    """Return the configured or typed built-in prompt execution contract."""
+
+    config = getattr(skill, "config", None)
+    runtime = config.get("runtime") if isinstance(config, dict) else None
+    configured = (
+        runtime.get("prompt_skill_execution")
+        if isinstance(runtime, dict)
+        else None
+    )
+    return RuntimePromptSkillExecutionContractFactory.create(
+        skill=skill,
+        configured_contract=configured,
+    )
+
+
+def _execution_contract_artifact_prefix(
+    contract: Mapping[str, Any] | None,
+    runtime_tool_context: Mapping[str, Any] | None,
+) -> str | None:
+    scope = dict((contract or {}).get("artifact_scope") or {})
+    if not scope:
+        return None
+    context = dict(runtime_tool_context or {})
+    context_keys = scope.get("lineage_context_keys") or [
+        "_workflow_lineage_root_run_id_from_context",
+        "_workflow_run_id_from_context",
+    ]
+    lineage_root = next(
+        (
+            str(context.get(str(key)) or "").strip()
+            for key in context_keys
+            if str(context.get(str(key)) or "").strip()
+        ),
+        "",
+    )
+    if not lineage_root:
+        return None
+    prefix_directory = str(scope.get("prefix_directory") or "runs").strip("/")
+    return f"{prefix_directory}/{lineage_root}"
+
+
+def _execution_contract_text(value: Any, **tokens: Any) -> str:
+    text = str(value or "")
+    for key, token in tokens.items():
+        text = text.replace("{" + key + "}", str(token))
+    return text
+
+
+def _execution_contract_matches(
+    values: Mapping[str, Any],
+    conditions: Mapping[str, Any] | None,
+) -> bool:
+    for key, expected in dict(conditions or {}).items():
+        actual = values.get(str(key))
+        if isinstance(expected, list):
+            if actual not in expected:
+                return False
+        elif actual != expected:
+            return False
+    return True
+
+
+def runtime_prompt_skill_execution_guidance(
+    contract: Mapping[str, Any] | None,
+    runtime_tool_context: Mapping[str, Any] | None,
+) -> str | None:
+    """Render optional Skill-owned guidance for the resolved artifact scope."""
+
+    run_prefix = _execution_contract_artifact_prefix(
+        contract,
+        runtime_tool_context,
+    )
+    guidance = str((contract or {}).get("guidance") or "").strip()
+    if not run_prefix or not guidance:
+        return None
+    return _execution_contract_text(
+        guidance,
+        run_artifact_prefix=run_prefix,
+    )
+
+
+def runtime_prompt_skill_required_arguments(
+    contract: Mapping[str, Any] | None,
+) -> dict[str, set[str]]:
+    """Return declarative required tool arguments for schema projection."""
+
+    configured = (contract or {}).get("required_arguments_by_tool") or {}
+    if not isinstance(configured, dict):
+        return {}
+    return {
+        str(tool_name): {
+            str(argument)
+            for argument in arguments
+            if str(argument or "").strip()
+        }
+        for tool_name, arguments in configured.items()
+        if isinstance(arguments, list)
+    }
+
+
+def _scope_execution_contract_artifact_path(
+    value: str,
+    *,
+    run_prefix: str,
+    generated_directories: set[str],
+    simple_default_dir: str | None = None,
+) -> str:
+    original = str(value or "")
+    normalized = original.replace("\\", "/").strip()
+    if not normalized or "://" in normalized or normalized.startswith("data:"):
+        return original
+    if normalized == run_prefix or normalized.startswith(f"{run_prefix}/"):
+        return normalized
+
+    prefix_directory, run_root = run_prefix.split("/", 1)
+    run_marker = f"/{prefix_directory}/"
+    if normalized.startswith(f"{prefix_directory}/"):
+        parts = normalized.split("/")
+        suffix = "/".join(parts[2:])
+        return run_prefix if not suffix else f"{run_prefix}/{suffix}"
+    if run_marker in normalized:
+        base, remainder = normalized.split(run_marker, 1)
+        suffix = "/".join(remainder.split("/")[1:])
+        scoped = f"{base}/{prefix_directory}/{run_root}"
+        return scoped if not suffix else f"{scoped}/{suffix}"
+
+    for artifact_dir in sorted(generated_directories):
+        if normalized == artifact_dir or normalized.startswith(f"{artifact_dir}/"):
+            return f"{run_prefix}/{normalized}"
+        marker = f"/{artifact_dir}/"
+        if marker in normalized:
+            base, suffix = normalized.split(marker, 1)
+            return f"{base}/{run_prefix}/{artifact_dir}/{suffix}"
+
+    if "/" not in normalized and simple_default_dir:
+        return f"{run_prefix}/{simple_default_dir}/{normalized}"
+    return original
+
+
+def _scope_execution_contract_artifact_args(
+    *,
+    contract: Mapping[str, Any] | None,
+    tool_name: str,
+    args: Mapping[str, Any],
+    runtime_tool_context: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    scope = dict((contract or {}).get("artifact_scope") or {})
+    run_prefix = _execution_contract_artifact_prefix(
+        contract,
+        runtime_tool_context,
+    )
+    copied = deepcopy(dict(args))
+    if not scope or run_prefix is None:
+        return copied
+
+    generated_directories = {
+        str(value).strip("/")
+        for value in scope.get("generated_directories") or []
+        if str(value or "").strip("/")
+    }
+    path_arguments = {
+        str(value)
+        for value in scope.get("path_arguments") or []
+        if str(value or "").strip()
+    }
+    default_dir = str(
+        dict(scope.get("default_directories_by_tool") or {}).get(tool_name)
+        or ""
+    ).strip("/") or None
+    for rule in scope.get("default_directory_rules") or []:
+        if not isinstance(rule, dict):
+            continue
+        if str(rule.get("tool") or "").strip() != tool_name:
+            continue
+        if _execution_contract_matches(copied, rule.get("when")):
+            default_dir = str(rule.get("directory") or "").strip("/") or None
+            break
+
+    defaultable_arguments = {
+        str(value)
+        for value in scope.get("defaultable_arguments")
+        or ["filename", "name", "output_dir", "output_name", "path"]
+    }
+
+    def _visit(value: Any, key: str | None = None) -> Any:
+        if isinstance(value, dict):
+            return {
+                item_key: _visit(item_value, item_key)
+                for item_key, item_value in value.items()
+            }
+        if isinstance(value, list):
+            return [_visit(item, key) for item in value]
+        if not isinstance(value, str):
+            return value
+        if key not in path_arguments and not str(key or "").endswith("_path"):
+            return value
+        return _scope_execution_contract_artifact_path(
+            value,
+            run_prefix=run_prefix,
+            generated_directories=generated_directories,
+            simple_default_dir=default_dir if key in defaultable_arguments else None,
+        )
+
+    return _visit(copied)
+
+
+def _execution_contract_required_output_guard(
+    *,
+    contract: Mapping[str, Any] | None,
+    tool_name: str,
+    args: Mapping[str, Any],
+    runtime_tool_context: Mapping[str, Any] | None,
+) -> str | None:
+    run_prefix = _execution_contract_artifact_prefix(
+        contract,
+        runtime_tool_context,
+    )
+    if run_prefix is None:
+        return None
+    for rule in (contract or {}).get("required_output_rules") or []:
+        if not isinstance(rule, dict):
+            continue
+        if str(rule.get("tool") or "").strip() != tool_name:
+            continue
+        if not _execution_contract_matches(args, rule.get("when")):
+            continue
+        output_arguments = rule.get("output_arguments") or [
+            "output_name",
+            "name",
+            "filename",
+        ]
+        if any(str(args.get(str(key)) or "").strip() for key in output_arguments):
+            continue
+        directory = str(rule.get("directory") or "").strip("/")
+        error = _execution_contract_text(
+            rule.get("error"),
+            tool_name=tool_name,
+            run_artifact_prefix=run_prefix,
+            directory=directory,
+        )
+        return json.dumps(
+            {
+                "status": "blocked",
+                "code": str(rule.get("code") or "run_output_name_required"),
+                "error": error,
+                "run_artifact_prefix": run_prefix,
+            },
+            ensure_ascii=False,
+        )
+    return None
+
+
+def _execution_contract_json_value(
+    payload: Mapping[str, Any],
+    dotted_path: str,
+) -> Any:
+    value: Any = payload
+    for part in str(dotted_path).split("."):
+        if not isinstance(value, dict):
+            return None
+        value = value.get(part)
+    return value
+
+
+def _execution_contract_prerequisite_error(
+    *,
+    rule: Mapping[str, Any],
+    run_prefix: str,
+    required_path: str,
+    read_result: str,
+) -> str | None:
+    invalid_reason = str(
+        rule.get("invalid_json_reason") or "the receipt is not valid JSON"
+    )
+    try:
+        read_payload = json.loads(read_result)
+    except (TypeError, ValueError):
+        read_payload = None
+        reason = str(rule.get("unreadable_reason") or "the receipt could not be read")
+    else:
+        reason = ""
+
+    receipt_payload: Any = None
+    if isinstance(read_payload, dict):
+        if read_payload.get("error"):
+            reason = str(read_payload.get("error"))
+        else:
+            try:
+                receipt_payload = json.loads(str(read_payload.get("content") or ""))
+            except (TypeError, ValueError):
+                reason = invalid_reason
+    elif not reason:
+        reason = str(
+            rule.get("unstructured_reason")
+            or "the receipt response was not structured JSON"
+        )
+
+    if isinstance(receipt_payload, dict):
+        valid = True
+        for group in rule.get("required_non_empty_array_groups") or []:
+            alternatives = group if isinstance(group, list) else [group]
+            if not any(
+                isinstance(
+                    _execution_contract_json_value(receipt_payload, str(path)),
+                    list,
+                )
+                and bool(_execution_contract_json_value(receipt_payload, str(path)))
+                for path in alternatives
+            ):
+                valid = False
+                break
+        if valid:
+            return None
+        reason = str(
+            rule.get("invalid_content_reason")
+            or "the receipt is missing required content"
+        )
+
+    error = _execution_contract_text(
+        rule.get("error"),
+        reason=reason,
+        required_path=required_path,
+        run_artifact_prefix=run_prefix,
+    )
+    return json.dumps(
+        {
+            "status": "blocked",
+            "code": str(rule.get("code") or "required_receipt_missing"),
+            "error": error,
+            "run_artifact_prefix": run_prefix,
+            "required_path": required_path,
         },
         ensure_ascii=False,
     )
@@ -1708,21 +2812,27 @@ def runtime_prompt_skill_registered_tool_executor(
     runtime_envelope: RuntimeEnvelope | None = None,
     skill_slug: str | None = None,
     runtime_tool_context: Mapping[str, Any] | None = None,
+    execution_contract: Mapping[str, Any] | None = None,
 ) -> Callable[[str, Any], Awaitable[str]]:
     """Build the registered-tool executor used inside prompt-skill runs."""
 
-    stickman_timeline_ready = False
+    completed_prerequisites: set[int] = set()
+    verified_result_receipts: dict[str, tuple[str, int]] = {}
+    contract = RuntimePromptSkillExecutionContractFactory.create(
+        skill_slug=skill_slug,
+        configured_contract=execution_contract,
+    )
 
     async def _execute(tool_name: str, args: Any) -> str:
-        nonlocal stickman_timeline_ready
         guard = document_skill_media_guard(skill_slug, tool_name, args)
         if guard is not None:
             return guard
 
-        guard = runtime_stickman_workflow_artifact_guard(
-            skill_slug=skill_slug,
+        values = dict(args) if isinstance(args, dict) else {}
+        guard = _execution_contract_required_output_guard(
+            contract=contract,
             tool_name=tool_name,
-            args=args,
+            args=values,
             runtime_tool_context=runtime_tool_context,
         )
         if guard is not None:
@@ -1730,41 +2840,84 @@ def runtime_prompt_skill_registered_tool_executor(
 
         from packages.core.ai.runtime.tool_registry import runtime_execute_tool
 
-        tool_args = dict(args) if isinstance(args, dict) else {}
-        tool_args = runtime_scope_stickman_workflow_artifact_args(
-            skill_slug=skill_slug,
+        tool_args = _scope_execution_contract_artifact_args(
+            contract=contract,
             tool_name=tool_name,
-            args=tool_args,
+            args=values,
             runtime_tool_context=runtime_tool_context,
         )
-        tool_args.update({
+        context_args = {
             key: value
             for key, value in dict(runtime_tool_context or {}).items()
             if key in RUNTIME_TOOL_CONTEXT_KEYS
-        })
+        }
+        tool_args.update(context_args)
 
-        run_prefix = _stickman_workflow_artifact_prefix(
-            skill_slug,
+        if tool_name == "write_file":
+            receipt_path = str(tool_args.get("path") or "").strip()
+            receipt_content = str(tool_args.get("content") or "")
+            verified_receipt = verified_result_receipts.get(receipt_path)
+            if verified_receipt is not None and verified_receipt[0] == receipt_content:
+                read_result = await runtime_execute_tool(
+                    "read_file",
+                    {
+                        "path": receipt_path,
+                        "max_chars": verified_receipt[1],
+                        **context_args,
+                    },
+                    entity_id=entity_id,
+                    user_id=user_id,
+                    agent_id=agent_id,
+                    workspace_id=workspace_id,
+                    conversation_id=conversation_id,
+                    task_id=task_id,
+                    active_user_message=active_user_message,
+                    manual_skill_selected=manual_skill_selected,
+                    tool_profile=tool_profile,
+                    allowed_tool_names=allowed_tool_names,
+                    runtime_envelope=runtime_envelope,
+                )
+                try:
+                    existing_receipt = json.loads(read_result)
+                except (TypeError, ValueError):
+                    existing_receipt = None
+                if (
+                    isinstance(existing_receipt, dict)
+                    and str(existing_receipt.get("content") or "") == receipt_content
+                ):
+                    return json.dumps(
+                        {
+                            "written": False,
+                            "idempotent": True,
+                            "unchanged": True,
+                            "path": receipt_path,
+                        },
+                        ensure_ascii=False,
+                    )
+
+        run_prefix = _execution_contract_artifact_prefix(
+            contract,
             runtime_tool_context,
         )
-        if (
-            str(tool_name or "").strip() == "generate_video"
-            and run_prefix is not None
-            and not stickman_timeline_ready
-        ):
-            prerequisite_args = {
-                "path": f"{run_prefix}/technical/narration-timeline.json",
-                "limit": 10000,
-                "max_chars": 200000,
-            }
-            prerequisite_args.update({
-                key: value
-                for key, value in dict(runtime_tool_context or {}).items()
-                if key in RUNTIME_TOOL_CONTEXT_KEYS
-            })
+        for index, rule in enumerate(contract.get("prerequisites") or []):
+            if not isinstance(rule, dict) or index in completed_prerequisites:
+                continue
+            if str(rule.get("before_tool") or "").strip() != tool_name:
+                continue
+            if not _execution_contract_matches(values, rule.get("when")):
+                continue
+            if run_prefix is None:
+                continue
+            relative_path = str(rule.get("path") or "").strip("/")
+            required_path = f"{run_prefix}/{relative_path}"
             prerequisite_result = await runtime_execute_tool(
                 "read_file",
-                prerequisite_args,
+                {
+                    "path": required_path,
+                    "limit": int(rule.get("limit") or 10000),
+                    "max_chars": int(rule.get("max_chars") or 200000),
+                    **context_args,
+                },
                 entity_id=entity_id,
                 user_id=user_id,
                 agent_id=agent_id,
@@ -1777,13 +2930,15 @@ def runtime_prompt_skill_registered_tool_executor(
                 allowed_tool_names=allowed_tool_names,
                 runtime_envelope=runtime_envelope,
             )
-            prerequisite_error = runtime_stickman_video_timeline_prerequisite_error(
+            prerequisite_error = _execution_contract_prerequisite_error(
+                rule=rule,
                 run_prefix=run_prefix,
+                required_path=required_path,
                 read_result=prerequisite_result,
             )
             if prerequisite_error is not None:
                 return prerequisite_error
-            stickman_timeline_ready = True
+            completed_prerequisites.add(index)
 
         result = await runtime_execute_tool(
             tool_name,
@@ -1800,36 +2955,82 @@ def runtime_prompt_skill_registered_tool_executor(
             allowed_tool_names=allowed_tool_names,
             runtime_envelope=runtime_envelope,
         )
-        if str(tool_name or "").strip() == "generate_image" and run_prefix is not None:
+
+        for rule in contract.get("result_receipts") or []:
+            if not isinstance(rule, dict):
+                continue
+            if str(rule.get("after_tool") or "").strip() != tool_name:
+                continue
+            if run_prefix is None:
+                continue
             try:
-                image_payload = json.loads(result)
+                result_payload = json.loads(result)
             except (TypeError, ValueError):
-                image_payload = None
-            image_url = str(
-                image_payload.get("image_url") or image_payload.get("result_url") or ""
-            ).strip() if isinstance(image_payload, dict) else ""
-            reusable_person = bool(
-                isinstance(image_payload, dict)
-                and image_payload.get("reused_workspace_asset") is True
-                and str(image_payload.get("workspace_asset_key") or "").strip()
-                == "stickman_character"
-                and image_url
+                continue
+            if not isinstance(result_payload, dict):
+                continue
+            if not _execution_contract_matches(result_payload, rule.get("when")):
+                continue
+            source_value = next(
+                (
+                    str(result_payload.get(str(field)) or "").strip()
+                    for field in rule.get("source_fields") or []
+                    if str(result_payload.get(str(field)) or "").strip()
+                ),
+                "",
             )
-            if reusable_person:
-                receipt_path = f"{run_prefix}/technical/person-reference-url.txt"
-                receipt_context = {
-                    key: value
-                    for key, value in dict(runtime_tool_context or {}).items()
-                    if key in RUNTIME_TOOL_CONTEXT_KEYS
-                }
-                write_args = {
+            if not source_value:
+                continue
+            relative_path = str(rule.get("path") or "").strip("/")
+            receipt_path = f"{run_prefix}/{relative_path}"
+            receipt_max_chars = int(rule.get("max_chars") or 4096)
+            await runtime_execute_tool(
+                "generate_file",
+                {"kind": "document", "name": receipt_path, "content": source_value, **context_args},
+                entity_id=entity_id,
+                user_id=user_id,
+                agent_id=agent_id,
+                workspace_id=workspace_id,
+                conversation_id=conversation_id,
+                task_id=task_id,
+                active_user_message=active_user_message,
+                manual_skill_selected=manual_skill_selected,
+                tool_profile=tool_profile,
+                allowed_tool_names=allowed_tool_names,
+                runtime_envelope=runtime_envelope,
+            )
+            read_result = await runtime_execute_tool(
+                "read_file",
+                {
                     "path": receipt_path,
-                    "content": image_url,
-                    **receipt_context,
-                }
+                    "max_chars": receipt_max_chars,
+                    **context_args,
+                },
+                entity_id=entity_id,
+                user_id=user_id,
+                agent_id=agent_id,
+                workspace_id=workspace_id,
+                conversation_id=conversation_id,
+                task_id=task_id,
+                active_user_message=active_user_message,
+                manual_skill_selected=manual_skill_selected,
+                tool_profile=tool_profile,
+                allowed_tool_names=allowed_tool_names,
+                runtime_envelope=runtime_envelope,
+            )
+            try:
+                receipt_payload = json.loads(read_result)
+            except (TypeError, ValueError):
+                receipt_payload = None
+            verified = bool(
+                isinstance(receipt_payload, dict)
+                and str(receipt_payload.get("content") or "").strip()
+                == source_value
+            )
+            if not verified:
                 await runtime_execute_tool(
                     "write_file",
-                    write_args,
+                    {"path": receipt_path, "content": source_value, **context_args},
                     entity_id=entity_id,
                     user_id=user_id,
                     agent_id=agent_id,
@@ -1844,7 +3045,11 @@ def runtime_prompt_skill_registered_tool_executor(
                 )
                 read_result = await runtime_execute_tool(
                     "read_file",
-                    {"path": receipt_path, "max_chars": 4096, **receipt_context},
+                    {
+                        "path": receipt_path,
+                        "max_chars": receipt_max_chars,
+                        **context_args,
+                    },
                     entity_id=entity_id,
                     user_id=user_id,
                     agent_id=agent_id,
@@ -1863,274 +3068,47 @@ def runtime_prompt_skill_registered_tool_executor(
                     receipt_payload = None
                 verified = bool(
                     isinstance(receipt_payload, dict)
-                    and str(receipt_payload.get("content") or "").strip() == image_url
+                    and str(receipt_payload.get("content") or "").strip()
+                    == source_value
                 )
-                if not verified:
-                    return json.dumps(
-                        {
-                            "status": "blocked",
-                            "code": "workspace_identity_receipt_write_failed",
-                            "error": (
-                                "The reusable Workspace Stickman was resolved, but its "
-                                "run-scoped durable person-reference receipt could not be "
-                                "written and read back. Stop before paid media calls."
-                            ),
-                            "run_artifact_prefix": run_prefix,
-                            "required_path": receipt_path,
-                        },
-                        ensure_ascii=False,
+            if not verified:
+                error = _execution_contract_text(
+                    rule.get("error"),
+                    receipt_path=receipt_path,
+                    run_artifact_prefix=run_prefix,
+                )
+                return json.dumps(
+                    {
+                        "status": "blocked",
+                        "code": str(
+                            rule.get("code") or "result_receipt_write_failed"
+                        ),
+                        "error": error,
+                        "run_artifact_prefix": run_prefix,
+                        "required_path": receipt_path,
+                    },
+                    ensure_ascii=False,
+                )
+            verified_result_receipts[receipt_path] = (
+                source_value,
+                receipt_max_chars,
+            )
+            for result_field, configured_value in dict(
+                rule.get("result_fields") or {}
+            ).items():
+                result_payload[str(result_field)] = (
+                    _execution_contract_text(
+                        configured_value,
+                        receipt_path=receipt_path,
+                        run_artifact_prefix=run_prefix,
                     )
-                image_payload["durable_person_reference_path"] = receipt_path
-                image_payload["durable_person_reference_verified"] = True
-                result = json.dumps(image_payload, ensure_ascii=False)
+                    if isinstance(configured_value, str)
+                    else configured_value
+                )
+            result = json.dumps(result_payload, ensure_ascii=False)
         return result
 
     return _execute
-
-
-def runtime_stickman_video_timeline_prerequisite_error(
-    *,
-    run_prefix: str,
-    read_result: str,
-) -> str | None:
-    """Require a non-empty measured narration timeline before paid video calls."""
-
-    reason = ""
-    try:
-        read_payload = json.loads(read_result)
-    except (TypeError, ValueError):
-        read_payload = None
-        reason = "the narration timeline receipt could not be read"
-
-    timeline_payload: Any = None
-    if isinstance(read_payload, dict):
-        if read_payload.get("error"):
-            reason = str(read_payload.get("error"))
-        else:
-            try:
-                timeline_payload = json.loads(str(read_payload.get("content") or ""))
-            except (TypeError, ValueError):
-                reason = "narration-timeline.json is not valid JSON"
-    elif not reason:
-        reason = "the narration timeline receipt was not structured JSON"
-
-    if isinstance(timeline_payload, dict):
-        cues = timeline_payload.get("cues") or timeline_payload.get("subtitle_cues")
-        audio_tracks = timeline_payload.get("audio_tracks")
-        if isinstance(cues, list) and cues and isinstance(audio_tracks, list) and audio_tracks:
-            return None
-        reason = "narration-timeline.json has no measured cues or audio tracks"
-
-    return json.dumps(
-        {
-            "status": "blocked",
-            "code": "stickman_narration_timeline_required",
-            "error": (
-                "generate_video is blocked until build_narration_timeline succeeds "
-                f"for {run_prefix}/technical/narration-timeline.json: {reason}. "
-                "Build the timeline from every normalized narration segment, then retry."
-            ),
-            "run_artifact_prefix": run_prefix,
-            "required_path": f"{run_prefix}/technical/narration-timeline.json",
-        },
-        ensure_ascii=False,
-    )
-
-
-_STICKMAN_WORKFLOW_SCOPED_SKILLS = frozenset(
-    {"stickman-video-creator", "stickman_video_creator"}
-)
-_STICKMAN_GENERATED_ARTIFACT_DIRS = frozenset(
-    {"audio", "final", "images", "qa", "subtitles", "technical", "video"}
-)
-_STICKMAN_PATH_ARGUMENTS = frozenset(
-    {
-        "audio_path",
-        "cues_name",
-        "directory",
-        "filename",
-        "input_path",
-        "manifest_name",
-        "media_path",
-        "name",
-        "output_dir",
-        "output_name",
-        "path",
-        "subtitle_path",
-        "timeline_name",
-        "transcript_path",
-    }
-)
-_STICKMAN_SIMPLE_OUTPUT_DIRS = {
-    "align_subtitles": "technical",
-    "build_narration_timeline": "technical",
-    "compose_video_timeline": "final",
-    "generate_image": "images",
-    "generate_video": "video",
-    "merge_videos": "video",
-    "normalize_audio_loudness": "audio/normalized",
-    "render_frame_samples": "qa",
-    "still_to_video": "video",
-    "write_file": "technical",
-}
-
-
-def _stickman_workflow_artifact_prefix(
-    skill_slug: str | None,
-    runtime_tool_context: Mapping[str, Any] | None,
-) -> str | None:
-    slug = str(skill_slug or "").strip().lower()
-    if slug not in _STICKMAN_WORKFLOW_SCOPED_SKILLS:
-        return None
-    context = dict(runtime_tool_context or {})
-    lineage_root = str(
-        context.get("_workflow_lineage_root_run_id_from_context")
-        or context.get("_workflow_run_id_from_context")
-        or ""
-    ).strip()
-    if not lineage_root:
-        return None
-    return f"runs/{lineage_root}"
-
-
-def _scope_stickman_artifact_path(
-    value: str,
-    *,
-    run_prefix: str,
-    simple_default_dir: str | None = None,
-) -> str:
-    original = str(value or "")
-    normalized = original.replace("\\", "/").strip()
-    if not normalized or "://" in normalized or normalized.startswith("data:"):
-        return original
-
-    run_root = run_prefix.split("/", 1)[1]
-    if normalized == run_prefix or normalized.startswith(f"{run_prefix}/"):
-        return normalized
-
-    # Keep an absolute Workspace prefix, but replace any caller-authored run
-    # slug with the durable Workflow lineage root.
-    run_marker = "/runs/"
-    if normalized.startswith("runs/"):
-        parts = normalized.split("/")
-        suffix = "/".join(parts[2:])
-        return run_prefix if not suffix else f"{run_prefix}/{suffix}"
-    if run_marker in normalized:
-        base, remainder = normalized.split(run_marker, 1)
-        suffix_parts = remainder.split("/")[1:]
-        suffix = "/".join(suffix_parts)
-        scoped = f"{base}/runs/{run_root}"
-        return scoped if not suffix else f"{scoped}/{suffix}"
-
-    # Legacy generated folders are never valid recovery sources for this
-    # Workflow. Transparently redirect them into the current durable run so a
-    # stale root-level final cannot satisfy QA or publication gates.
-    for artifact_dir in sorted(_STICKMAN_GENERATED_ARTIFACT_DIRS):
-        if normalized == artifact_dir or normalized.startswith(f"{artifact_dir}/"):
-            return f"{run_prefix}/{normalized}"
-        marker = f"/{artifact_dir}/"
-        if marker in normalized:
-            base, suffix = normalized.split(marker, 1)
-            return f"{base}/{run_prefix}/{artifact_dir}/{suffix}"
-
-    if "/" not in normalized and simple_default_dir:
-        return f"{run_prefix}/{simple_default_dir}/{normalized}"
-    return original
-
-
-def runtime_scope_stickman_workflow_artifact_args(
-    *,
-    skill_slug: str | None,
-    tool_name: str,
-    args: Mapping[str, Any],
-    runtime_tool_context: Mapping[str, Any] | None,
-) -> dict[str, Any]:
-    """Pin Stickman media artifacts to one retry-stable Workflow run.
-
-    The prompt still communicates the namespace to the model, while this
-    boundary makes path safety deterministic across context compaction and
-    retries. Workspace-owned identity assets and remote reference URLs remain
-    outside the run namespace.
-    """
-
-    run_prefix = _stickman_workflow_artifact_prefix(skill_slug, runtime_tool_context)
-    copied = deepcopy(dict(args))
-    if run_prefix is None:
-        return copied
-
-    default_dir = _STICKMAN_SIMPLE_OUTPUT_DIRS.get(str(tool_name or "").strip())
-    if tool_name == "generate_file":
-        kind = str(copied.get("kind") or "").strip().lower()
-        default_dir = "audio" if kind == "audio" else "technical"
-
-    def _visit(value: Any, key: str | None = None) -> Any:
-        if isinstance(value, dict):
-            return {item_key: _visit(item_value, item_key) for item_key, item_value in value.items()}
-        if isinstance(value, list):
-            return [_visit(item, key) for item in value]
-        if not isinstance(value, str):
-            return value
-        path_argument = bool(
-            key in _STICKMAN_PATH_ARGUMENTS
-            or str(key or "").endswith("_path")
-        )
-        if not path_argument:
-            return value
-        use_default = default_dir if key in {"filename", "name", "output_dir", "output_name", "path"} else None
-        return _scope_stickman_artifact_path(
-            value,
-            run_prefix=run_prefix,
-            simple_default_dir=use_default,
-        )
-
-    return _visit(copied)
-
-
-def runtime_stickman_workflow_artifact_guard(
-    *,
-    skill_slug: str | None,
-    tool_name: str,
-    args: Any,
-    runtime_tool_context: Mapping[str, Any] | None,
-) -> str | None:
-    """Reject unnamed paid media that would escape the durable run scope."""
-
-    run_prefix = _stickman_workflow_artifact_prefix(skill_slug, runtime_tool_context)
-    if run_prefix is None:
-        return None
-    values = dict(args) if isinstance(args, dict) else {}
-    normalized_tool = str(tool_name or "").strip()
-    is_narration = (
-        normalized_tool == "generate_file"
-        and str(values.get("kind") or "").strip().lower() == "audio"
-        and str(values.get("purpose") or "").strip().lower() == "narration"
-    )
-    requires_named_output = is_narration or normalized_tool == "generate_video"
-    if not requires_named_output:
-        return None
-    requested_name = str(
-        values.get("output_name")
-        or values.get("name")
-        or values.get("filename")
-        or ""
-    ).strip()
-    if requested_name:
-        return None
-    media_dir = "audio" if is_narration else "video"
-    return json.dumps(
-        {
-            "status": "blocked",
-            "code": "stickman_run_output_name_required",
-            "error": (
-                f"{normalized_tool} requires an explicit stable name inside "
-                f"{run_prefix}/{media_dir}. Retry this call with the manifest segment "
-                "or scene number in the filename; unnamed provider defaults are not "
-                "valid Stickman Workflow artifacts."
-            ),
-            "run_artifact_prefix": run_prefix,
-        },
-        ensure_ascii=False,
-    )
 
 
 def runtime_prompt_skill_bundle_tool_result(
@@ -2213,6 +3191,16 @@ def descriptor_from_skill(
         "category": str(getattr(skill, "category", "") or ""),
         "output_format": str(getattr(skill, "output_format", "") or ""),
     }
+    discovery_provider_keys, discovery_tool_prefixes = (
+        _prompt_skill_discovery_policy(skill)
+    )
+    if discovery_provider_keys:
+        metadata["discoverable_provider_keys"] = discovery_provider_keys
+    if discovery_tool_prefixes:
+        metadata["discoverable_tool_prefixes"] = discovery_tool_prefixes
+    capability_companion = trusted_skill_capability_companion(skill)
+    if capability_companion is not None:
+        metadata["capability_companion"] = capability_companion.to_dict()
     invocation_policy = trusted_skill_invocation_policy(skill, source=source)
     if invocation_policy is not None:
         metadata["invocation_policy"] = invocation_policy.to_dict()
@@ -2298,6 +3286,155 @@ async def runtime_agent_has_surface_bound_skill(
     return False
 
 
+def runtime_filter_skills_for_installed_ledgers(
+    skills: Iterable[Any],
+    installed_contract_ids: Iterable[str],
+) -> list[Any]:
+    """Keep repository Ledger Skills beside their installed contract only.
+
+    ``ledger_contracts`` is trusted only on built-in Skills. Entity and
+    Marketplace Skills cannot hide themselves behind Workspace configuration
+    or turn their config into runtime policy.
+    """
+
+    installed = {
+        str(contract_id).strip()
+        for contract_id in installed_contract_ids
+        if str(contract_id or "").strip()
+    }
+    filtered: list[Any] = []
+    for skill in skills:
+        config = getattr(skill, "config", None)
+        required = (
+            config.get("ledger_contracts")
+            if (
+                getattr(skill, "entity_id", "missing") is None
+                and isinstance(config, dict)
+                and config.get("source") == "builtin"
+            )
+            else None
+        )
+        if not required:
+            filtered.append(skill)
+            continue
+        if not isinstance(required, list):
+            continue
+        required_ids = {
+            str(contract_id).strip()
+            for contract_id in required
+            if str(contract_id or "").strip()
+        }
+        if required_ids and required_ids.issubset(installed):
+            filtered.append(skill)
+    return filtered
+
+
+def _runtime_skills_need_installed_ledger_contracts(
+    skills: Iterable[Any],
+) -> bool:
+    """Return whether runtime Skill filtering needs Workspace Ledger state."""
+
+    for skill in skills:
+        config = getattr(skill, "config", None)
+        if (
+            getattr(skill, "entity_id", "missing") is None
+            and isinstance(config, dict)
+            and config.get("source") == "builtin"
+            and bool(config.get("ledger_contracts"))
+        ):
+            return True
+    return False
+
+
+async def _runtime_workspace_ledger_contract_ids(
+    db: AsyncSession | None,
+    *,
+    entity_id: str | None,
+    workspace_id: str | None,
+) -> set[str]:
+    if not db or not entity_id or not workspace_id:
+        return set()
+
+    from sqlalchemy import select
+
+    from packages.core.models.workspace import Workspace
+    from packages.core.services.ledger_query_service import (
+        workspace_queryable_ledger_configs,
+    )
+
+    settings = (await db.execute(
+        select(Workspace.settings).where(
+            Workspace.id == workspace_id,
+            Workspace.entity_id == entity_id,
+            Workspace.deleted_at.is_(None),
+        )
+    )).scalar_one_or_none()
+    return set(workspace_queryable_ledger_configs(settings))
+
+
+async def runtime_skill_is_eligible(
+    db: AsyncSession,
+    skill: Any,
+    *,
+    entity_id: str,
+    workspace_id: str | None,
+    user_id: str | None = None,
+    enforce_user_access: bool = False,
+    readable_skill_ids: set[str] | None = None,
+    installed_ledger_contract_ids: Iterable[str] | None = None,
+) -> tuple[bool, str]:
+    """Enforce the shared runtime admission policy for one Skill."""
+
+    skill_entity_id = getattr(skill, "entity_id", None)
+    if (
+        getattr(skill, "status", None) != "active"
+        or skill_entity_id not in {None, entity_id}
+    ):
+        return False, "skill_not_found"
+
+    if enforce_user_access and skill_entity_id is not None:
+        if not user_id:
+            return False, "skill_not_allowed"
+        skill_id = str(getattr(skill, "id", "") or "")
+        if readable_skill_ids is not None:
+            if skill_id not in readable_skill_ids:
+                return False, "skill_not_allowed"
+        else:
+            from packages.core.models.permission import Capability, ResourceType
+            from packages.core.services.resource_access import (
+                ResourceDescriptor,
+                user_can_access_resource,
+            )
+
+            if not await user_can_access_resource(
+                db,
+                descriptor=ResourceDescriptor.from_row(skill, ResourceType.SKILL),
+                entity_id=entity_id,
+                user_id=user_id,
+                capability=Capability.VIEW,
+            ):
+                return False, "skill_not_allowed"
+
+    if _runtime_skills_need_installed_ledger_contracts((skill,)):
+        installed = (
+            {
+                str(contract_id).strip()
+                for contract_id in installed_ledger_contract_ids
+                if str(contract_id or "").strip()
+            }
+            if installed_ledger_contract_ids is not None
+            else await _runtime_workspace_ledger_contract_ids(
+                db,
+                entity_id=entity_id,
+                workspace_id=workspace_id,
+            )
+        )
+        if not runtime_filter_skills_for_installed_ledgers((skill,), installed):
+            return False, "skill_workspace_contract_missing"
+
+    return True, ""
+
+
 async def resolve_skill_descriptors(
     db: AsyncSession | None,
     *,
@@ -2306,11 +3443,15 @@ async def resolve_skill_descriptors(
     workspace_id: str | None,
     surface: ChatSurface,
     invoke_skill_visible: bool,
+    agent_subscription_id: str | None = None,
     profile: RuntimeProfile | None = None,
     allowed_tool_names: set[str] | None = None,
     active_user_message: str | None = None,
     manual_skill_selected: bool = False,
+    user_id: str | None = None,
+    enforce_user_access: bool = False,
     limit: int = 8,
+    raise_on_error: bool = False,
 ) -> list[SkillDescriptor]:
     """Resolve lightweight skill descriptors for a runtime surface.
 
@@ -2331,12 +3472,66 @@ async def resolve_skill_descriptors(
                 entity_id,
                 agent_id,
                 workspace_id=workspace_id,
+                **(
+                    {"agent_subscription_id": agent_subscription_id}
+                    if agent_subscription_id
+                    else {}
+                ),
             )
         else:
             from packages.core.services.skill_service import list_skills
 
             skills = await list_skills(db, entity_id)
+        installed_ledger_contract_ids: set[str] | None = None
+        if _runtime_skills_need_installed_ledger_contracts(skills):
+            installed_ledger_contract_ids = await _runtime_workspace_ledger_contract_ids(
+                db,
+                entity_id=entity_id,
+                workspace_id=workspace_id,
+            )
+        readable_skill_ids: set[str] | None = None
+        if enforce_user_access:
+            from packages.core.models.permission import ResourceType
+            from packages.core.services.resource_access import (
+                ResourceDescriptor,
+                readable_resource_ids,
+            )
+
+            entity_skills = [
+                skill for skill in skills
+                if getattr(skill, "entity_id", None) is not None
+            ]
+            readable_skill_ids = (
+                await readable_resource_ids(
+                    db,
+                    descriptors=[
+                        ResourceDescriptor.from_row(skill, ResourceType.SKILL)
+                        for skill in entity_skills
+                    ],
+                    entity_id=entity_id,
+                    user_id=user_id,
+                )
+                if user_id and entity_skills
+                else set()
+            )
+        eligible_skills: list[Any] = []
+        for skill in skills:
+            eligible, _reason = await runtime_skill_is_eligible(
+                db,
+                skill,
+                entity_id=entity_id,
+                workspace_id=workspace_id,
+                user_id=user_id,
+                enforce_user_access=enforce_user_access,
+                readable_skill_ids=readable_skill_ids,
+                installed_ledger_contract_ids=installed_ledger_contract_ids,
+            )
+            if eligible:
+                eligible_skills.append(skill)
+        skills = eligible_skills
     except Exception:
+        if raise_on_error:
+            raise
         return []
 
     skills = filter_skills_for_runtime_turn(
@@ -2349,6 +3544,8 @@ async def resolve_skill_descriptors(
     try:
         agent_bound_skill_ids = await runtime_agent_bound_skill_ids(db, agent_id)
     except Exception:
+        if raise_on_error:
+            raise
         agent_bound_skill_ids = set()
     if public_customer_surface:
         if not agent_id:
@@ -2362,6 +3559,7 @@ async def resolve_skill_descriptors(
     )
 
     required_descriptors: list[SkillDescriptor] = []
+    bound_descriptors: list[SkillDescriptor] = []
     ordinary_descriptors: list[SkillDescriptor] = []
     for skill in skills:
         if not runtime_skill_allowed_on_surface(skill, surface):
@@ -2392,14 +3590,25 @@ async def resolve_skill_descriptors(
             and trusted_skill_invocation_policy(skill) is not None
         ):
             required_descriptors.append(descriptor)
+        elif not manual_skill_selected and descriptor.source == "agent_binding":
+            # An explicit agent binding is stronger routing intent than a
+            # generally visible entity or built-in catalog entry. Keep bound
+            # skills inside the prompt budget even when many built-ins share
+            # the same creation timestamp and appear first in query order.
+            bound_descriptors.append(descriptor)
         elif len(ordinary_descriptors) < max_count:
             ordinary_descriptors.append(descriptor)
 
     # ``limit`` is a soft prompt-catalog budget, not permission to violate a
     # required-before-answer policy. Required descriptors are always retained;
     # ordinary descriptors fill whatever portion of the budget remains.
-    ordinary_slots = max(max_count - len(required_descriptors), 0)
-    return required_descriptors + ordinary_descriptors[:ordinary_slots]
+    bound_slots = max(max_count - len(required_descriptors), 0)
+    selected_bound = bound_descriptors[:bound_slots]
+    ordinary_slots = max(
+        max_count - len(required_descriptors) - len(selected_bound),
+        0,
+    )
+    return required_descriptors + selected_bound + ordinary_descriptors[:ordinary_slots]
 
 
 def invoke_skill_visible_for_runtime(
@@ -2433,6 +3642,7 @@ async def resolve_skill_descriptors_for_envelope(
     active_user_message: str | None = None,
     manual_skill_selected: bool = False,
     limit: int = 8,
+    raise_on_error: bool = False,
 ) -> list[SkillDescriptor]:
     """Resolve descriptors from the RuntimeEnvelope instead of entrypoint args.
 
@@ -2459,6 +3669,11 @@ async def resolve_skill_descriptors_for_envelope(
         db,
         entity_id=envelope.entity_id,
         agent_id=envelope.agent_id,
+        agent_subscription_id=(
+            envelope.metadata.get("agent_subscription_id")
+            if isinstance(envelope.metadata, dict)
+            else None
+        ),
         workspace_id=envelope.workspace_id,
         surface=envelope.surface,
         invoke_skill_visible=visible,
@@ -2466,7 +3681,13 @@ async def resolve_skill_descriptors_for_envelope(
         allowed_tool_names=effective_allowed,
         active_user_message=active_user_message,
         manual_skill_selected=manual_skill_selected,
+        user_id=envelope.user_id,
+        enforce_user_access=bool(
+            manual_skill_selected
+            or (envelope.user_id and not envelope.agent_id)
+        ),
         limit=limit,
+        raise_on_error=raise_on_error,
     )
 
 

@@ -75,7 +75,23 @@ def is_cloud() -> bool:
 
 def is_dev() -> bool:
     """MANOR_ENV=dev → cloud-in-dev (plan gates active, Stripe bypassed)."""
-    return os.getenv("MANOR_ENV", "").lower() in ("dev", "development", "local")
+    return os.getenv("MANOR_ENV", "").lower() in (
+        "dev",
+        "development",
+        "local",
+        "local-k8s",
+    )
+
+
+def ai_credit_limits_enabled() -> bool:
+    """Whether tenant-level Manor AI credit balances must be enforced.
+
+    Local Cloud-shaped environments keep Cloud feature surfaces available for
+    development, but their accounts are not billable tenants and must not be
+    blocked by seeded or stale credit ledgers. Production-like Cloud
+    environments remain fail-closed.
+    """
+    return is_cloud() and not is_dev()
 
 
 # ── Sync API (consumed everywhere — must stay sync) ───────────────────

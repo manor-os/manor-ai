@@ -25,6 +25,7 @@ from typing import Callable
 from packages.core.governance.policy import (
     DEFAULT_AUTO_APPROVE_CAPABILITIES,
     WorkspacePolicy,
+    with_default_auto_approve_capabilities,
 )
 
 PresetTransform = Callable[[WorkspacePolicy], WorkspacePolicy]
@@ -89,16 +90,7 @@ def _standard(base: WorkspacePolicy) -> WorkspacePolicy:
     """Ship the blueprint author's policy as-is, plus the default capability
     grants (file.write, manor.composite, …) so a standard workspace stops
     prompting for routine workspace file/doc operations."""
-    missing = [
-        c for c in DEFAULT_AUTO_APPROVE_CAPABILITIES
-        if c not in base.auto_approve_capabilities
-    ]
-    if not missing:
-        return base
-    return replace(
-        base,
-        auto_approve_capabilities=base.auto_approve_capabilities + missing,
-    )
+    return with_default_auto_approve_capabilities(base)
 
 
 def _aggressive(base: WorkspacePolicy) -> WorkspacePolicy:
@@ -124,16 +116,11 @@ def _aggressive(base: WorkspacePolicy) -> WorkspacePolicy:
             continue
         if pattern not in auto_capabilities:
             auto_capabilities.append(pattern)
-    # Aggressive always grants the default auto-approve capabilities.
-    for cap in DEFAULT_AUTO_APPROVE_CAPABILITIES:
-        if cap not in auto_capabilities:
-            auto_capabilities.append(cap)
-
     caps = dict(base.budget_caps_per_kind)
     for k, v in list(caps.items()):
         caps[k] = v * 2
 
-    return replace(
+    aggressive = replace(
         base,
         max_risk_level="high",
         # Keep never_allow as the author wrote it — that's a hard ceiling.
@@ -144,6 +131,7 @@ def _aggressive(base: WorkspacePolicy) -> WorkspacePolicy:
         auto_approve_capabilities=auto_capabilities,
         budget_caps_per_kind=caps,
     )
+    return with_default_auto_approve_capabilities(aggressive)
 
 
 # ── Registry ─────────────────────────────────────────────────────────

@@ -6,7 +6,6 @@ import { build } from "esbuild";
 const entryPoint = `
   export {
     applyEditorLivePatch,
-    buildEditorLiveEditFallbackContent,
     buildEditorLiveEditRequest,
     extractEditorLivePatchPayloads,
     stripEditorLiveEditBlocks,
@@ -32,7 +31,6 @@ const moduleUrl = `data:text/javascript;base64,${Buffer.from(
 
 const {
   applyEditorLivePatch,
-  buildEditorLiveEditFallbackContent,
   buildEditorLiveEditRequest,
   extractEditorLivePatchPayloads,
   stripEditorLiveEditBlocks,
@@ -75,18 +73,6 @@ function assertPatchCase(testCase) {
   if (testCase.detail.supportsImageGeneration) {
     assert.doesNotMatch(prompt, /hidden current-image attachment/, `${testCase.label} omits image attachment hint`);
   }
-}
-
-function assertFallbackCase(testCase) {
-  const next = buildEditorLiveEditFallbackContent(
-    testCase.detail,
-    testCase.request,
-    testCase.content,
-  );
-  assert.equal(typeof next, "string", `${testCase.label} fallback should produce content`);
-  assert.notEqual(next, testCase.content, `${testCase.label} fallback should change content`);
-  assert.match(next, testCase.expected, `${testCase.label} fallback content`);
-  if (testCase.validateJson) assertValidJson(next, testCase.label);
 }
 
 function assertStrictPatchProtocolSchema() {
@@ -323,6 +309,16 @@ const liveEditCases = [
     validateJson: true,
   },
   {
+    label: "audio edit state",
+    detail: { documentName: "interview.wav", fileType: "audio", editorType: "Audio" },
+    content: '{ "format": "manor-audio-edit-v1", "edits": { "trimStart": 0, "trimEnd": 30, "volume": 1 } }\n',
+    find: '"volume": 1',
+    replace: '"volume": 0.8',
+    request: "set volume to 80%",
+    expected: /"volume": 0\.8/,
+    validateJson: true,
+  },
+  {
     label: "video recipe",
     detail: { documentName: "story.video-edit.json", fileType: "video", editorType: "Video" },
     content: '{ "version": 1, "title": "Old title", "clips": [] }\n',
@@ -334,74 +330,19 @@ const liveEditCases = [
   },
 ];
 
-const fallbackCases = [
-  {
-    label: "generic quoted text fallback",
-    detail: { documentName: "notes.txt", fileType: "text", editorType: "Text" },
-    content: "Old title\nstatus: draft\n",
-    request: 'replace "Old title" with "New title"',
-    expected: /New title/,
-  },
-  {
-    label: "html visual fallback",
-    detail: { documentName: "index.html", fileType: "html", editorType: "Code" },
-    content: "<!doctype html><html><head></head><body><h1>Hello</h1></body></html>",
-    request: "make this page beautiful",
-    expected: /manor-ai-polish/,
-  },
-  {
-    label: "pdf local edit fallback",
-    detail: {
-      documentName: "contract.pdf",
-      fileType: "pdf",
-      editorType: "PDF",
-      localEditContent: () => JSON.stringify({
-        format: "manor-pdf-overlay-v1",
-        annotations: [{ kind: "text", text: "Reviewed" }],
-      }),
-    },
-    content: '{ "format": "manor-pdf-overlay-v1", "annotations": [] }',
-    request: 'add text "Reviewed"',
-    expected: /Reviewed/,
-    validateJson: true,
-  },
-  {
-    label: "image local edit fallback",
-    detail: {
-      documentName: "photo.png",
-      fileType: "image",
-      editorType: "Image",
-      supportsImageGeneration: true,
-      localEditContent: () => JSON.stringify({
-        format: "manor-image-edit-v1",
-        edits: { brightness: 118 },
-      }),
-    },
-    content: '{ "format": "manor-image-edit-v1", "edits": { "brightness": 100 } }',
-    request: "brighten the image",
-    expected: /118/,
-    validateJson: true,
-  },
-];
-
 for (const testCase of liveEditCases) {
   assertPatchCase(testCase);
 }
 
-for (const testCase of fallbackCases) {
-  assertFallbackCase(testCase);
-}
-
 assertStrictPatchProtocolSchema();
 
-const unsupported = ["audio", "unsupported"];
+const unsupported = ["unsupported"];
 
 console.log(
   JSON.stringify(
     {
       ok: true,
       patchedFileTypes: liveEditCases.map((testCase) => testCase.label),
-      fallbackPaths: fallbackCases.map((testCase) => testCase.label),
       noAiEditSurface: unsupported,
     },
     null,

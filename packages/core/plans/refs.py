@@ -80,6 +80,32 @@ def extract_step_refs(value: Any) -> list[tuple[str, str | None]]:
     return refs
 
 
+def extract_step_ref_paths(value: Any) -> list[tuple[str, str | None]]:
+    """Return ``(step_key, full_path)`` for every step result reference.
+
+    ``extract_step_refs`` intentionally keeps its historical top-level-field
+    API for callers that only need shape inference.  The contract linker uses
+    this richer form as well, so nested paths can be checked against the
+    producer schema instead of being accepted merely because the first field
+    exists.
+    """
+    refs: list[tuple[str, str | None]] = []
+
+    def walk(node: Any) -> None:
+        if isinstance(node, dict):
+            for v in node.values():
+                walk(v)
+        elif isinstance(node, list):
+            for v in node:
+                walk(v)
+        elif isinstance(node, str):
+            for match in _REF_RE.finditer(node):
+                refs.append((match.group(1), match.group(2)))
+
+    walk(value)
+    return refs
+
+
 def resolve_refs(value: Any, prior_results: dict[str, Any]) -> Any:
     """Recursively resolve refs inside arbitrary JSON-shaped data.
 

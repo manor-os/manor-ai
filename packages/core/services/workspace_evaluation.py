@@ -392,11 +392,12 @@ def _build_goal_impact(
         current = _decimal_to_float(goal.current_value)
         target = _decimal_to_float(goal.target_value)
         baseline = _decimal_to_float(goal.baseline_value) or 0.0
+        measurement_count = len(ms) if current is not None else 0
         progress = _progress_fraction(baseline, current, target)
         if progress is not None:
             progress_values.append(progress)
             progress_points += max(0.0, min(1.0, progress)) * 100.0
-        if ms or goal.current_value is not None:
+        if current is not None:
             measured += 1
 
         rows.append({
@@ -411,13 +412,13 @@ def _build_goal_impact(
             "progress_pct": _pct(progress),
             "pace_status": goal.pace_status or "unknown",
             "deadline": goal.deadline.isoformat() if goal.deadline else None,
-            "measurement_count": len(ms),
-            "last_measured_at": ms[-1].measured_at.isoformat() if ms else (
+            "measurement_count": measurement_count,
+            "last_measured_at": ms[-1].measured_at.isoformat() if measurement_count else (
                 goal.current_value_updated_at.isoformat() if goal.current_value_updated_at else None
             ),
             "measurement_source": goal.measurement_source or {},
             "measurement_cadence": goal.measurement_cadence,
-            "confidence": _goal_confidence(goal, len(ms)),
+            "confidence": _goal_confidence(goal, measurement_count),
             "linked_task_count": len(links),
             "linked_task_status_counts": dict(status_counts),
             "completed_linked_task_count": status_counts.get("completed", 0),
@@ -771,6 +772,25 @@ def _build_overall(dimensions: dict[str, dict[str, Any]]) -> dict[str, Any]:
         "governance": 0.06,
         "learning": 0.04,
     }
+    execution = dimensions["execution_health"]
+    cost = dimensions["cost_efficiency"]
+    # Goal measurements describe observed business metrics, but on their own
+    # do not prove that this Workspace executed work. A health score requires
+    # runtime evidence rather than a manually entered goal value.
+    has_observed_evidence = any((
+        execution["completed_task_count"] > 0,
+        execution["failed_task_count"] > 0,
+        execution["step_count"] > 0,
+        float(cost.get("window_usd") or 0) > 0,
+    ))
+    if not has_observed_evidence:
+        return {
+            "score": None,
+            "confidence": "insufficient",
+            "summary": "Workspace health is unavailable until measured execution evidence exists",
+            "weights": weights,
+        }
+
     weighted = 0.0
     used = 0.0
     for key, weight in weights.items():

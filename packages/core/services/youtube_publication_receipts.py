@@ -258,9 +258,9 @@ async def write_publication_receipt(
         tool_name="record_youtube_publication",
     )
     document_id = (
-        document.get("document_id") or document.get("id")
+        document.get("document_id")
         if isinstance(document, dict)
-        else getattr(document, "id", None)
+        else getattr(document, "document_id", None)
     )
     return {
         "path": rel_path,

@@ -34,19 +34,58 @@ The HITL approval flow then either:
 from __future__ import annotations
 
 import logging
+from types import SimpleNamespace
 from typing import Any
 
+from celery.exceptions import SoftTimeLimitExceeded
 from sqlalchemy import select
 
+from packages.core.constants.channels import ExternalMessageActionKey
+from packages.core.constants.notification_types import (
+    NotificationCallbackDisposition,
+)
 from packages.core.constants.pending_actions import PendingActionKind
 from packages.core.database import async_session
-from packages.core.services.hitl_options import approval_notification_actions
+from packages.core.services.hitl_options import (
+    HumanDecisionIntent,
+    approval_notification_actions,
+    external_reply_decision_intent,
+)
 from packages.core.services.notification_callbacks import register_callback
 
 logger = logging.getLogger(__name__)
 
 
 CALLBACK_KIND = "workspace.hitl.resolve_message"
+
+
+def _approval_claim_conflict_result(reason: str) -> dict[str, Any]:
+    if reason == "approval_delivery_in_progress":
+        return {
+            "ok": False,
+            "disposition": NotificationCallbackDisposition.RETRYABLE.value,
+            "error": reason,
+            "message": (
+                "External reply delivery is already in progress; "
+                "please retry shortly."
+            ),
+        }
+    if reason == "approval_delivery_outcome_unknown":
+        return {
+            "ok": False,
+            "disposition": NotificationCallbackDisposition.TERMINAL_FAILURE.value,
+            "error": reason,
+            "message": (
+                "External reply delivery outcome is unknown and requires "
+                "manual reconciliation; it will not retry automatically."
+            ),
+        }
+    return {
+        "ok": False,
+        "disposition": NotificationCallbackDisposition.TERMINAL_FAILURE.value,
+        "error": reason,
+        "message": "That approval is no longer available.",
+    }
 
 
 async def _resolve_message_via_chat_service(
@@ -68,8 +107,13 @@ async def _resolve_message_via_chat_service(
     sees what happened right inside their chat.
     """
     chat_message_id = str(payload.get("chat_message_id") or "")
-    if not chat_message_id:
-        return {"ok": False, "error": "missing_chat_message_id"}
+    payload_entity_id = str(payload.get("entity_id") or "")
+    workspace_id = str(payload.get("workspace_id") or "")
+    context_entity_id = str(context.get("entity_id") or "")
+    if not chat_message_id or not payload_entity_id or not workspace_id:
+        return {"ok": False, "error": "invalid_callback_scope"}
+    if context_entity_id != payload_entity_id:
+        return {"ok": False, "error": "callback_scope_mismatch"}
 
     responder = context.get("responder") or {}
     responder_user_id = responder.get("user_id")
@@ -85,13 +129,81 @@ async def _resolve_message_via_chat_service(
             ),
         }
 
-    from packages.core.models.task import Message
+    from packages.core.humans import participant_can
+    from packages.core.humans.authority import ParticipantAuthority
+    from packages.core.models.task import Conversation, Message
+    from packages.core.models.user import User, UserMembership
+    from packages.core.models.workspace import Workspace
+    from packages.core.services.workspace_access import (
+        user_can_read_workspace_by_identity,
+    )
     from packages.core.workspace_chat import service as chat_service
 
     resolution = {"choice": action_key}
     async with async_session() as db:
+        user = (await db.execute(
+            select(User).where(
+                User.id == responder_user_id,
+                User.status == "active",
+                User.deleted_at.is_(None),
+            )
+        )).scalar_one_or_none()
+        if user is None:
+            return {"ok": False, "error": "responder_inactive"}
+        membership = (await db.execute(
+            select(UserMembership).where(
+                UserMembership.user_id == responder_user_id,
+                UserMembership.entity_id == payload_entity_id,
+            )
+        )).scalar_one_or_none()
+        if membership is not None and (
+            membership.status != "active" or membership.deleted_at is not None
+        ):
+            return {"ok": False, "error": "responder_membership_inactive"}
+        if membership is None and user.entity_id != payload_entity_id:
+            return {"ok": False, "error": "responder_membership_inactive"}
+        entity_role = membership.role if membership is not None else user.role
+        actor = SimpleNamespace(
+            id=user.id,
+            entity_id=payload_entity_id,
+            role=entity_role,
+        )
+        workspace = (await db.execute(
+            select(Workspace).where(
+                Workspace.id == workspace_id,
+                Workspace.entity_id == payload_entity_id,
+                Workspace.deleted_at.is_(None),
+                Workspace.status == "active",
+            )
+        )).scalar_one_or_none()
+        if workspace is None:
+            return {"ok": False, "error": "workspace_unavailable"}
+        if not await user_can_read_workspace_by_identity(
+            db,
+            workspace=workspace,
+            entity_id=payload_entity_id,
+            user_id=user.id,
+            role=entity_role,
+        ):
+            return {"ok": False, "error": "workspace_access_revoked"}
+        if not await participant_can(
+            db,
+            user=actor,
+            entity_id=payload_entity_id,
+            workspace_id=workspace_id,
+            permission_key=ParticipantAuthority.APPROVE_EXTERNAL_PUBLISH.value,
+        ):
+            return {"ok": False, "error": "external_publish_authority_required"}
+
         msg = (await db.execute(
-            select(Message).where(Message.id == chat_message_id)
+            select(Message)
+            .join(Conversation, Conversation.id == Message.conversation_id)
+            .where(
+                Message.id == chat_message_id,
+                Conversation.entity_id == payload_entity_id,
+                Conversation.workspace_id == workspace_id,
+            )
+            .execution_options(populate_existing=True)
         )).scalar_one_or_none()
         if msg is None:
             return {"ok": False, "error": "chat_message_not_found"}
@@ -101,20 +213,285 @@ async def _resolve_message_via_chat_service(
                 "error": "already_resolved",
                 "message": "That approval was already handled.",
             }
+        kind = (msg.pending_action or {}).get("kind") if isinstance(msg.pending_action, dict) else None
+        if kind != PendingActionKind.EXTERNAL_MESSAGE_APPROVAL:
+            return {"ok": False, "error": "callback_action_kind_mismatch"}
+        ack_message = "Recorded your response."
+        decision_intent = external_reply_decision_intent(action_key)
+        approved = decision_intent in {
+            HumanDecisionIntent.APPROVE,
+            HumanDecisionIntent.APPROVE_STANDING,
+        }
+        standing = decision_intent is HumanDecisionIntent.APPROVE_STANDING
+        if decision_intent not in {
+            HumanDecisionIntent.APPROVE,
+            HumanDecisionIntent.APPROVE_STANDING,
+            HumanDecisionIntent.DENY,
+            HumanDecisionIntent.CANCEL,
+        }:
+            return {
+                "ok": False,
+                "disposition": (
+                    NotificationCallbackDisposition.TERMINAL_FAILURE.value
+                ),
+                "error": "invalid_external_reply_decision",
+                "message": "That approval response is not valid.",
+            }
+        if standing and not await participant_can(
+            db,
+            user=actor,
+            entity_id=payload_entity_id,
+            workspace_id=workspace_id,
+            permission_key=ParticipantAuthority.MANAGE_STANDING_GRANTS.value,
+        ):
+            return {
+                "ok": False,
+                "error": "standing_grant_authority_required",
+            }
+        pending_action = (
+            msg.pending_action if isinstance(msg.pending_action, dict) else {}
+        )
+        standing_resource_id = str(
+            pending_action.get("channel_config_id") or ""
+        ).strip()
+        if standing and not standing_resource_id:
+            return {
+                "ok": False,
+                "disposition": NotificationCallbackDisposition.TERMINAL_FAILURE.value,
+                "error": "external_reply_account_scope_missing",
+                "message": (
+                    "The channel account scope is missing; reconnect the "
+                    "channel before creating a standing grant."
+                ),
+            }
+        if approved:
+            from packages.core.services.channel_outbound_delivery import (
+                ApprovedExternalReplyDeliveryDisposition,
+                ApprovedExternalReplyDeliveryError,
+                ApprovedExternalReplyOutcomeUnknownError,
+                ApprovedExternalReplySameKeyRetryRequired,
+                approved_external_reply_delivery_disposition,
+                claim_external_reply_approval,
+                external_reply_approval_claim_owner_conflict_reason,
+                mark_external_reply_approval_same_key_retry_required,
+                release_external_reply_approval_claim,
+            )
 
+            claim = await claim_external_reply_approval(
+                db,
+                message_id=msg.id,
+                entity_id=payload_entity_id,
+                workspace_id=workspace_id,
+                user_id=responder_user_id,
+            )
+            if not claim["acquired"]:
+                return _approval_claim_conflict_result(claim["reason"])
+            claim_id = claim["claim_id"]
+            assert claim_id is not None
+            claimed_pending_action = claim.get("pending_action")
+            if not isinstance(claimed_pending_action, dict):
+                await release_external_reply_approval_claim(
+                    db,
+                    message_id=chat_message_id,
+                    entity_id=payload_entity_id,
+                    workspace_id=workspace_id,
+                    claim_id=claim_id,
+                )
+                return {
+                    "ok": False,
+                    "disposition": NotificationCallbackDisposition.RETRYABLE.value,
+                    "error": "external_reply_payload_unavailable",
+                    "message": "The approval is still open; please retry.",
+                }
+            pending_action = claimed_pending_action
+            standing_resource_id = str(
+                pending_action.get("channel_config_id") or ""
+            ).strip()
+            if standing and not standing_resource_id:
+                await release_external_reply_approval_claim(
+                    db,
+                    message_id=chat_message_id,
+                    entity_id=payload_entity_id,
+                    workspace_id=workspace_id,
+                    claim_id=claim_id,
+                )
+                return {
+                    "ok": False,
+                    "disposition": (
+                        NotificationCallbackDisposition.TERMINAL_FAILURE.value
+                    ),
+                    "error": "external_reply_account_scope_missing",
+                    "message": (
+                        "The channel account scope is missing; reconnect the "
+                        "channel before creating a standing grant."
+                    ),
+                }
+            try:
+                delivery_result = await _resolve_external_message_action(
+                    db,
+                    msg=msg,
+                    pending_action=pending_action,
+                    approval_claim_id=claim_id,
+                    retry_mode=claim.get("retry_mode"),
+                )
+                from packages.core.services.channel_outbound_delivery import (
+                    approved_external_reply_outcome_message,
+                )
+
+                ack_message = approved_external_reply_outcome_message(delivery_result)
+            except SoftTimeLimitExceeded:
+                # Provider acceptance is ambiguous. Keep rejection blocked,
+                # but allow another approval to reuse the same provider key.
+                await mark_external_reply_approval_same_key_retry_required(
+                    db,
+                    message_id=chat_message_id,
+                    entity_id=payload_entity_id,
+                    workspace_id=workspace_id,
+                    claim_id=claim_id,
+                    error="external reply delivery timed out",
+                )
+                raise
+            except ApprovedExternalReplyOutcomeUnknownError:
+                return _approval_claim_conflict_result(
+                    "approval_delivery_outcome_unknown"
+                )
+            except ApprovedExternalReplySameKeyRetryRequired as exc:
+                await mark_external_reply_approval_same_key_retry_required(
+                    db,
+                    message_id=chat_message_id,
+                    entity_id=payload_entity_id,
+                    workspace_id=workspace_id,
+                    claim_id=claim_id,
+                    error=str(exc),
+                )
+                return {
+                    "ok": False,
+                    "disposition": NotificationCallbackDisposition.RETRYABLE.value,
+                    "error": "external_reply_retryable",
+                    "message": (
+                        "The channel provider did not confirm the reply. "
+                        "Retrying will reuse the same delivery key."
+                    ),
+                }
+            except ApprovedExternalReplyDeliveryError as exc:
+                await release_external_reply_approval_claim(
+                    db,
+                    message_id=chat_message_id,
+                    entity_id=payload_entity_id,
+                    workspace_id=workspace_id,
+                    claim_id=claim_id,
+                )
+                if exc.reason_code == "whatsapp_template_required":
+                    return {
+                        "ok": False,
+                        "disposition": NotificationCallbackDisposition.RETRYABLE.value,
+                        "error": exc.reason_code,
+                        "message": (
+                            "The 24-hour WhatsApp customer-service window has "
+                            "closed. Send an approved WhatsApp template instead; "
+                            "the approval remains open."
+                        ),
+                    }
+                return {
+                    "ok": False,
+                    "disposition": NotificationCallbackDisposition.RETRYABLE.value,
+                    "error": "external_reply_retryable",
+                    "message": (
+                        "The channel provider did not accept the reply. "
+                        "The approval is still open; please retry."
+                    ),
+                }
+            delivery_disposition = approved_external_reply_delivery_disposition(
+                delivery_result
+            )
+            if (
+                delivery_disposition
+                is ApprovedExternalReplyDeliveryDisposition.RETRYABLE_FAILURE
+            ):
+                await release_external_reply_approval_claim(
+                    db,
+                    message_id=chat_message_id,
+                    entity_id=payload_entity_id,
+                    workspace_id=workspace_id,
+                    claim_id=claim_id,
+                )
+                return {
+                    "ok": False,
+                    "disposition": NotificationCallbackDisposition.RETRYABLE.value,
+                    "error": "external_reply_retryable",
+                    "message": (
+                        "The external reply was not sent. The approval is still "
+                        "open; please retry."
+                    ),
+                }
+            if (
+                delivery_disposition
+                is ApprovedExternalReplyDeliveryDisposition.OUTCOME_UNKNOWN
+            ):
+                resolution.update({
+                    "delivery_outcome": "unknown",
+                    "message_log_id": delivery_result.get("message_log_id"),
+                    "delivery_error": delivery_result.get("error"),
+                })
+        else:
+            ack_message = "Rejected — the draft external reply was not sent."
+        # Provider I/O above ran without a Message lock or staged approval
+        # write. Lock and revalidate immediately before single consumption.
+        msg = (await db.execute(
+            select(Message)
+            .join(Conversation, Conversation.id == Message.conversation_id)
+            .where(
+                Message.id == chat_message_id,
+                Conversation.entity_id == payload_entity_id,
+                Conversation.workspace_id == workspace_id,
+            )
+            .with_for_update(of=Message)
+            .execution_options(populate_existing=True)
+        )).scalar_one_or_none()
+        if msg is None:
+            await db.rollback()
+            return {"ok": False, "error": "chat_message_not_found"}
+        if msg.resolved_at is not None:
+            await db.rollback()
+            return {
+                "ok": False,
+                "error": "already_resolved",
+                "message": "That approval was already handled.",
+            }
+        if not approved:
+            from packages.core.services.channel_outbound_delivery import (
+                external_reply_approval_claim_conflict_reason,
+            )
+
+            conflict_reason = external_reply_approval_claim_conflict_reason(msg)
+            if conflict_reason is not None:
+                await db.rollback()
+                return _approval_claim_conflict_result(conflict_reason)
+        else:
+            claim_conflict = external_reply_approval_claim_owner_conflict_reason(
+                msg,
+                claim_id,
+            )
+            if claim_conflict is not None:
+                await db.rollback()
+                return _approval_claim_conflict_result(claim_conflict)
+        if standing:
+            from packages.core.governance import add_auto_approve_action
+
+            await add_auto_approve_action(
+                db,
+                entity_id=payload_entity_id,
+                workspace_id=workspace_id,
+                action_key=ExternalMessageActionKey.SEND.value,
+                resource_id=standing_resource_id,
+                changed_by=responder_user_id,
+            )
         await chat_service.resolve_pending_action(
             db,
             message_id=chat_message_id,
             user_id=responder_user_id,
             resolution=resolution,
         )
-
-        kind = (msg.pending_action or {}).get("kind") if isinstance(msg.pending_action, dict) else None
-        ack_message = "Recorded your response."
-        if kind == PendingActionKind.EXTERNAL_MESSAGE_APPROVAL:
-            ack_message = await _resolve_external_message_action(
-                db, msg=msg, action_key=action_key, responder_user_id=responder_user_id,
-            )
         await db.commit()
 
     return {"ok": True, "message": ack_message}
@@ -124,9 +501,10 @@ async def _resolve_external_message_action(
     db,
     *,
     msg,
-    action_key: str,
-    responder_user_id: str,
-) -> str:
+    pending_action: dict[str, Any],
+    approval_claim_id: str,
+    retry_mode=None,
+) -> dict[str, Any]:
     """Run the side effects for an external_message_approval card.
 
     Mirrors the matching branch in
@@ -135,54 +513,63 @@ async def _resolve_external_message_action(
     sender hanging (no automatic apology message; producers can layer one
     on later).
     """
-    pa = msg.pending_action or {}
-    approved_choices = {"approve", "approved", "yes", "accept", "confirm"}
-    if action_key.lower() in approved_choices:
-        from packages.core.models.task import Conversation, Message as ChatMessage
-        from packages.core.services.channel_outbound_delivery import (
-            deliver_approved_external_reply,
-        )
+    pa = pending_action
+    from packages.core.models.task import Conversation, Message as ChatMessage
+    from packages.core.services.channel_outbound_delivery import (
+        ApprovedExternalReplyDeliveryDisposition,
+        ApprovedExternalReplyDeliveryError,
+        approved_external_reply_delivery_disposition,
+        approved_external_reply_outcome_message,
+        deliver_approved_external_reply,
+    )
 
-        entity_id_value = pa.get("entity_id")
-        if not entity_id_value:
-            conv = (await db.execute(
-                select(Conversation).where(Conversation.id == msg.conversation_id)
-            )).scalar_one_or_none()
-            entity_id_value = conv.entity_id if conv else ""
+    entity_id_value = pa.get("entity_id")
+    if not entity_id_value:
+        conv = (await db.execute(
+            select(Conversation).where(Conversation.id == msg.conversation_id)
+        )).scalar_one_or_none()
+        entity_id_value = conv.entity_id if conv else ""
 
-        result = await deliver_approved_external_reply(
-            db,
-            entity_id=str(entity_id_value or ""),
-            channel_config_id=str(pa.get("channel_config_id") or ""),
-            channel_type=str(pa.get("channel_type") or ""),
-            channel_conversation_id=str(pa.get("channel_conversation_id") or ""),
-            chat_id=str(pa.get("chat_id") or pa.get("sender_id") or ""),
-            text=str(pa.get("reply_text") or ""),
-            agent_subscription_id=pa.get("agent_subscription_id"),
-        )
-        if result.get("sent"):
-            body = "Approved — the external reply was just sent."
-        else:
-            body = (
-                "Approved, but the channel adapter did not ship the reply: "
-                f"{result.get('reason') or result.get('error') or 'unknown'}"
-            )
-        db.add(ChatMessage(
-            conversation_id=msg.conversation_id,
-            role="system",
-            content=body,
-            author_kind="system",
-            message_kind="system",
-            refs=[
-                {"type": "message", "id": msg.id},
-                {"type": "channel_conversation", "id": pa.get("channel_conversation_id")},
-                {"type": "message_log", "id": result.get("message_log_id")},
-            ],
-        ))
-        await db.flush()
-        return body
-
-    return "Rejected — the draft external reply was not sent."
+    result = await deliver_approved_external_reply(
+        db,
+        entity_id=str(entity_id_value or ""),
+        channel_config_id=str(pa.get("channel_config_id") or ""),
+        channel_type=str(pa.get("channel_type") or ""),
+        channel_conversation_id=str(pa.get("channel_conversation_id") or ""),
+        chat_id=str(pa.get("chat_id") or pa.get("sender_id") or ""),
+        text=str(pa.get("reply_text") or ""),
+        channel_binding_id=pa.get("channel_binding_id"),
+        channel_contact_id=pa.get("channel_contact_id"),
+        agent_id=pa.get("agent_id"),
+        agent_subscription_id=pa.get("agent_subscription_id"),
+        route_snapshot=pa.get("route_snapshot"),
+        workspace_id=pa.get("workspace_id"),
+        thread_ts=pa.get("thread_ts"),
+        idempotency_key=msg.id,
+        approval_claim_id=approval_claim_id,
+        retry_mode=retry_mode,
+    )
+    if (
+        approved_external_reply_delivery_disposition(result)
+        is ApprovedExternalReplyDeliveryDisposition.RETRYABLE_FAILURE
+    ):
+        reason = str(result.get("reason") or result.get("error") or "unknown")
+        raise ApprovedExternalReplyDeliveryError(reason)
+    body = approved_external_reply_outcome_message(result)
+    db.add(ChatMessage(
+        conversation_id=msg.conversation_id,
+        role="system",
+        content=body,
+        author_kind="system",
+        message_kind="system",
+        refs=[
+            {"type": "message", "id": msg.id},
+            {"type": "channel_conversation", "id": pa.get("channel_conversation_id")},
+            {"type": "message_log", "id": result.get("message_log_id")},
+        ],
+    ))
+    await db.flush()
+    return result
 
 
 register_callback(CALLBACK_KIND, _resolve_message_via_chat_service)
@@ -276,6 +663,7 @@ async def notify_workspace_hitl_approvers(
                     "workspace_id": workspace_id,
                     "entity_id": entity_id,
                 },
+                idempotency_key=f"workspace-hitl:{chat_message_id}",
                 # Approval prompts shouldn't linger forever — a stale one
                 # could cause an "approve" reply meant for something else
                 # to release an unrelated message.

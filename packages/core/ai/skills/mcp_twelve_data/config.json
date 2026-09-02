@@ -1,0 +1,15 @@
+{
+  "id": "mcp_twelve_data",
+  "name": "mcp_twelve_data",
+  "type": "runtime_guidance",
+  "description": "Read-only prices, quotes, bounded OHLCV history, and technical indicators from Twelve Data.",
+  "category": "market-data",
+  "output_format": "guidance",
+  "tags": ["twelve-data", "stocks", "forex", "crypto", "read-only", "runtime-guidance", "builtin", "mcp"],
+  "tools": [
+    "mcp__twelve_data__get_price",
+    "mcp__twelve_data__get_quote",
+    "mcp__twelve_data__get_time_series",
+    "mcp__twelve_data__get_technical_indicator"
+  ]
+}

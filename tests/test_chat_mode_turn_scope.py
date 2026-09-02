@@ -4,8 +4,10 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from packages.core.models.task import Message
+from packages.core.models.document import Document, VectorStatus
+from packages.core.models.task import Conversation, Message
 from packages.core.services.conversation_history import (
+    ATTACHMENT_HISTORY_INSTRUCTION,
     COMPLETED_TOOL_ACTIVITY_FRAME,
     load_conversation_history,
 )
@@ -167,6 +169,236 @@ async def test_new_turn_does_not_replay_previous_tool_activity_even_for_continue
     # so "继续" cannot be read as re-running the finished search.
     assert COMPLETED_TOOL_ACTIVITY_FRAME in history[0]["content"]
     assert "Meta careers Senior Software Engineer" in history[0]["content"]
+
+
+@pytest.mark.asyncio
+async def test_chat_history_does_not_lookup_inline_file_tokens_without_persisted_attachment(db_session):
+    start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    conversation_id = "conv_inline_file_ref"
+    doc_id = "doc_inline_video"
+    entity_id = "entity_inline_file"
+    db_session.add_all(
+        [
+            Conversation(
+                id=conversation_id,
+                entity_id=entity_id,
+                user_id="user_inline_file",
+                title="Inline file ref",
+                channel="web",
+                scope="channel",
+            ),
+            Document(
+                id=doc_id,
+                entity_id=entity_id,
+                name="daily-stickman-video.mp4",
+                fs_path="uploads/chat/daily-stickman-video.mp4",
+                file_type="mp4",
+                mime_type="video/mp4",
+                source="chat_upload",
+                vector_status=VectorStatus.READY,
+            ),
+            Message(
+                id="msg_inline_file",
+                conversation_id=conversation_id,
+                role="user",
+                content="使用Chrome将 #daily-stickman-video.mp4 上传到草稿箱",
+                created_at=start,
+            ),
+        ]
+    )
+    await db_session.commit()
+
+    history = await load_conversation_history(
+        db_session,
+        conversation_id,
+        latest_user_message="上传到youtube",
+    )
+
+    assert "[Attached file context]" not in history[0]["content"]
+    assert f"document_id={doc_id}" not in history[0]["content"]
+    assert "path=uploads/chat/daily-stickman-video.mp4" not in history[0]["content"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("document_key", ["document_id", "id"])
+async def test_chat_history_uses_persisted_attachment_refs_when_available(
+    db_session,
+    document_key,
+):
+    start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    suffix = "legacy" if document_key == "id" else "canon"
+    conversation_id = f"conv_attach_{suffix}"
+    doc_id = f"doc_attach_{suffix}"
+    entity_id = f"ent_attach_{suffix}"
+    db_session.add_all(
+        [
+            Conversation(
+                id=conversation_id,
+                entity_id=entity_id,
+                user_id="user_attachment_refs",
+                title="Attachment refs",
+                channel="web",
+                scope="channel",
+            ),
+            Document(
+                id=doc_id,
+                entity_id=entity_id,
+                name="reference.pdf",
+                fs_path="uploads/chat/reference.pdf",
+                file_type="pdf",
+                mime_type="application/pdf",
+                source="chat_upload",
+                vector_status=VectorStatus.READY,
+            ),
+            Message(
+                id=f"msg_attach_{suffix}",
+                conversation_id=conversation_id,
+                role="user",
+                content="请看这份文件",
+                attachments=[
+                    {
+                        "name": "reference.pdf",
+                        document_key: doc_id,
+                        "type": "knowledge",
+                    }
+                ],
+                created_at=start,
+            ),
+        ]
+    )
+    await db_session.commit()
+
+    history = await load_conversation_history(db_session, conversation_id)
+
+    assert "[Attached file context]" in history[0]["content"]
+    assert ATTACHMENT_HISTORY_INSTRUCTION in history[0]["content"]
+    assert "reference.pdf" in history[0]["content"]
+    assert f"document_id={doc_id}" in history[0]["content"]
+    assert "path=uploads/chat/reference.pdf" in history[0]["content"]
+    assert f"url=/api/v1/fs/{entity_id}/uploads/chat/reference.pdf" in history[0]["content"]
+
+
+@pytest.mark.asyncio
+async def test_chat_history_drops_cross_entity_attachment_even_with_persisted_path(db_session):
+    start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    conversation_id = "conv_attach_cross_entity"
+    document_id = "doc_attach_other_entity"
+    db_session.add_all(
+        [
+            Conversation(
+                id=conversation_id,
+                entity_id="entity_attachment_owner",
+                user_id="user_attachment_owner",
+                title="Attachment tenant boundary",
+                channel="web",
+                scope="channel",
+                created_at=start,
+            ),
+            Document(
+                id=document_id,
+                entity_id="entity_attachment_other",
+                name="private.pdf",
+                fs_path="private/private.pdf",
+                file_type="pdf",
+                mime_type="application/pdf",
+                source="chat_upload",
+                vector_status=VectorStatus.READY,
+            ),
+            Message(
+                id="msg_attach_cross_entity",
+                conversation_id=conversation_id,
+                role="user",
+                content="请看这份文件",
+                attachments=[
+                    {
+                        "name": "private.pdf",
+                        "id": document_id,
+                        "path": "private/private.pdf",
+                        "type": "knowledge",
+                    }
+                ],
+                created_at=start,
+            ),
+        ]
+    )
+    await db_session.commit()
+
+    history = await load_conversation_history(db_session, conversation_id)
+
+    assert "[Attached file context]" not in history[0]["content"]
+    assert document_id not in history[0]["content"]
+    assert "private/private.pdf" not in history[0]["content"]
+
+
+@pytest.mark.asyncio
+async def test_chat_history_prefers_persisted_attachments_over_inline_name_lookup(db_session):
+    start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    conversation_id = "conv_attach_precedence"
+    entity_id = "entity_attach_precedence"
+    attached_doc_id = "doc_attached_video"
+    unrelated_doc_id = "doc_same_name_wrong"
+    db_session.add_all(
+        [
+            Conversation(
+                id=conversation_id,
+                entity_id=entity_id,
+                user_id="user_attach_precedence",
+                title="Attachment precedence",
+                channel="web",
+                scope="channel",
+            ),
+            Document(
+                id=attached_doc_id,
+                entity_id=entity_id,
+                name="daily-stickman-video.mp4",
+                fs_path="Workspaces/right/daily-stickman-video.mp4",
+                file_type="mp4",
+                mime_type="video/mp4",
+                source="ai_generated",
+                vector_status=VectorStatus.READY,
+                created_at=start,
+            ),
+            Document(
+                id=unrelated_doc_id,
+                entity_id=entity_id,
+                name="daily-stickman-video.mp4",
+                fs_path="Workspaces/wrong/daily-stickman-video.mp4",
+                file_type="mp4",
+                mime_type="video/mp4",
+                source="ai_generated",
+                vector_status=VectorStatus.READY,
+                created_at=start + timedelta(seconds=1),
+            ),
+            Message(
+                id="msg_attachment_precedence",
+                conversation_id=conversation_id,
+                role="user",
+                content="使用Chrome将 #daily-stickman-video.mp4 上传到草稿箱",
+                attachments=[
+                    {
+                        "kind": "knowledge_document",
+                        "name": "daily-stickman-video.mp4",
+                        "document_id": attached_doc_id,
+                        "path": "Workspaces/right/daily-stickman-video.mp4",
+                        "mime": "video/mp4",
+                    }
+                ],
+                created_at=start + timedelta(seconds=2),
+            ),
+        ]
+    )
+    await db_session.commit()
+
+    history = await load_conversation_history(
+        db_session,
+        conversation_id,
+        latest_user_message="上传到youtube",
+    )
+
+    assert f"document_id={attached_doc_id}" in history[0]["content"]
+    assert "path=Workspaces/right/daily-stickman-video.mp4" in history[0]["content"]
+    assert unrelated_doc_id not in history[0]["content"]
+    assert "path=Workspaces/wrong/daily-stickman-video.mp4" not in history[0]["content"]
 
 
 @pytest.mark.asyncio

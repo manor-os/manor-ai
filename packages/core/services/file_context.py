@@ -28,13 +28,15 @@ from dataclasses import dataclass, field
 from typing import Any, Optional
 
 from fastapi import HTTPException, UploadFile
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from packages.core.ai.runtime import (
+    ChatSurface,
     RUNTIME_CHAT_ATTACHMENT_VOICE_SOURCE,
     runtime_assert_credit_available,
 )
+from packages.core.constants.document_groups import WorkspaceDocumentGroupKind
 from packages.core.models.document import Document, DocumentGroup, DocumentGroupMember
 from packages.core.models.workspace import Workspace
 from packages.core.services.document_metadata import merge_document_metadata
@@ -127,7 +129,7 @@ _VIDEO_EXTENSIONS = {"mp4", "mov", "m4v", "webm", "avi", "mkv"}
 _AUDIO_EXTENSIONS = {"mp3", "wav", "m4a", "aac", "ogg", "opus", "flac", "webm"}
 _IMAGE_EXTENSIONS = {"png", "jpg", "jpeg", "webp", "gif", "bmp", "tif", "tiff", "avif"}
 _WORKSPACE_DEFAULT_COLLECTION_NAME = "Workspace Knowledge"
-_WORKSPACE_GROUP_DEFAULT_KIND = "workspace_collection"
+_WORKSPACE_GROUP_DEFAULT_KIND = WorkspaceDocumentGroupKind.DEFAULT_COLLECTION.value
 _ATTACHMENT_TEXT_READY_NOTE = (
     "Attachment text below was extracted by the backend for this turn. "
     "Use it directly for ordinary analysis, summarization, and Q&A; invoke a skill only "
@@ -299,10 +301,18 @@ async def _register_workspace_chat_upload(
     if ext and len(ext) > 20:
         ext = ext[:20]
     existing = (await db.execute(
-        select(Document).where(
+        select(Document)
+        .where(
             Document.entity_id == entity_id,
             Document.fs_path == saved_rel_path,
-        ).limit(1)
+        )
+        .order_by(
+            Document.is_trashed.asc(),
+            func.coalesce(Document.updated_at, Document.created_at).desc(),
+            Document.created_at.desc(),
+            Document.id.desc(),
+        )
+        .limit(1)
     )).scalar_one_or_none()
 
     origin = {
@@ -463,6 +473,7 @@ async def build_file_context(
     *,
     workspace_id: Optional[str] = None,
     user_id: Optional[str] = None,
+    surface: ChatSurface | None = None,
 ) -> FileAttachments:
     """Build attachments from uploaded files and/or KB document IDs.
 
@@ -771,16 +782,29 @@ async def build_file_context(
     # KB documents — resolve through document ACL before injecting content into chat.
     docs_by_id: dict = {}
     if document_ids:
-        from packages.core.services.document_access import get_visible_document
+        from packages.core.services.document_access import (
+            document_is_public_agent_visible,
+            get_visible_document,
+        )
+        from packages.core.services.document_service import get_document
 
         for document_id in document_ids:
-            document = await get_visible_document(
-                db,
-                document_id,
-                entity_id,
-                user_id=user_id,
-                workspace_id=workspace_id,
-            )
+            if surface == ChatSurface.PUBLIC_CUSTOMER_CHAT:
+                # Public entrypoints never inherit legacy user-less access or
+                # a signed-in owner's broader document permissions.
+                document = await get_document(db, document_id, entity_id)
+                if not await document_is_public_agent_visible(
+                    db, document, entity_id=entity_id, workspace_id=workspace_id,
+                ):
+                    continue
+            else:
+                document = await get_visible_document(
+                    db,
+                    document_id,
+                    entity_id,
+                    user_id=user_id,
+                    workspace_id=workspace_id,
+                )
             if document:
                 docs_by_id[document.id] = document
 
@@ -906,6 +930,21 @@ async def build_file_context(
                 text_parts.append(image_reference_line)
                 continue
 
+        kb_url = f"/api/v1/fs/{entity_id}/{doc.fs_path}" if doc.fs_path else doc.file_url
+        reference_parts = [f"document_id={doc.id}"]
+        if doc.fs_path:
+            reference_parts.append(f"path={doc.fs_path}")
+        if kb_url:
+            reference_parts.append(f"url={kb_url}")
+        out.add_attachment_ref(
+            kind="knowledge_document",
+            name=doc.name,
+            mime=doc.mime_type,
+            path=doc.fs_path,
+            url=kb_url,
+            document_id=doc.id,
+            text=True,
+        )
         text = ""
         if doc.fs_path:
             full_path = os.path.join(fs_root, entity_id, doc.fs_path)
@@ -919,18 +958,6 @@ async def build_file_context(
                     text = value[:100_000]
                     break
         if text:
-            reference_parts = [f"document_id={doc.id}"]
-            if doc.fs_path:
-                reference_parts.append(f"path={doc.fs_path}")
-            out.add_attachment_ref(
-                kind="knowledge_document",
-                name=doc.name,
-                mime=doc.mime_type,
-                path=doc.fs_path,
-                url=doc.file_url,
-                document_id=doc.id,
-                text=True,
-            )
             append_text("Document", doc.name, text, reference="; ".join(reference_parts))
         else:
             out.unread_filenames.append(f"KB: {doc.name}")

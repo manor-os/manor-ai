@@ -19,6 +19,7 @@ from packages.core.governance.policy import (
     policy_to_dict,
 )
 from packages.core.governance.policy import policy_auto_approves
+from packages.core.governance.policy_cache import GovernancePolicyCacheUnavailable
 from packages.core.governance.service import (
     add_auto_approve_action,
     add_auto_approve_capability,
@@ -43,15 +44,17 @@ from packages.core.governance.approvals import (
     resolve_approval,
     resolve_origin_requests,
 )
+from packages.core.constants.approvals import ApprovalOutcome
 
 __all__ = [
-    "ApprovalDecision", "ApprovalOrigin", "ApprovalSubject",
+    "ApprovalDecision", "ApprovalOrigin", "ApprovalOutcome", "ApprovalSubject",
     "resolve_approval", "grant_approval", "deny_approval", "consume_approval",
     "resolve_origin_requests", "count_open_requests",
     "DEFAULT_POLICY",
     "PolicyDecision",
     "PolicyError",
     "WorkspacePolicy",
+    "GovernancePolicyCacheUnavailable",
     "policy_from_dict",
     "policy_to_dict",
     "policy_auto_approves",

@@ -37,6 +37,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import contextvars
 from typing import Any, Dict, List, Optional
 
 import httpx
@@ -49,6 +50,95 @@ logger = logging.getLogger(__name__)
 _NANGO_BASE = os.environ.get("NANGO_BASE_URL", "http://nango-server:3003").rstrip("/")
 _TIMEOUT = 30.0
 _MAX_PAYLOAD_CHARS = 12_000
+
+_call_context_var: contextvars.ContextVar[Dict[str, Any]] = contextvars.ContextVar(
+    "nango_mcp_call_context",
+    default={},
+)
+
+
+def set_call_context(ctx: Dict[str, Any]) -> None:
+    """Set the user/entity scope supplied by the MCP dispatcher."""
+    _call_context_var.set(dict(ctx or {}))
+
+
+def clear_call_context() -> None:
+    _call_context_var.set({})
+
+
+def _call_context() -> Dict[str, Any]:
+    return _call_context_var.get()
+
+
+def _connection_id_matches_context(connection_id: str, provider_config_key: str) -> bool:
+    """Check tenant/provider identity encoded in Manor-issued connection IDs."""
+    ctx = _call_context()
+    entity_id = str(ctx.get("entity_id") or "").strip()
+    if not entity_id:
+        return True
+    parts = connection_id.split("--", 3)
+    if len(parts) != 4:
+        return False
+    from packages.core.services.provider_keys import canonical_provider_key
+
+    return (
+        parts[0] == entity_id
+        and canonical_provider_key(parts[2])
+        == canonical_provider_key(provider_config_key)
+    )
+
+
+async def _authorized_connection_ids() -> set[str] | None:
+    """Resolve the current actor's mirrored Nango connections."""
+    ctx = _call_context()
+    explicit = ctx.get("nango_allowed_connection_ids")
+    if isinstance(explicit, (list, tuple, set, frozenset)):
+        return {str(value).strip() for value in explicit if str(value).strip()}
+    entity_id = str(ctx.get("entity_id") or "").strip()
+    user_id = str(ctx.get("user_id") or "").strip()
+    if not entity_id or not user_id:
+        return None
+
+    try:
+        from sqlalchemy import select
+        from packages.core.database import async_session
+        from packages.core.models.document import Integration
+        from packages.core.services.integration_access import resolve_integration_access
+
+        async with async_session() as db:
+            query = select(Integration).where(
+                Integration.entity_id == entity_id,
+                Integration.status == "active",
+            )
+            rows = (await db.execute(query)).scalars().all()
+            allowed: set[str] = set()
+            for row in rows:
+                config = row.config if isinstance(row.config, dict) else {}
+                nango_meta = config.get("nango")
+                if not isinstance(nango_meta, dict):
+                    continue
+                connection_id = str(nango_meta.get("connection_id") or "").strip()
+                provider_key = str(
+                    nango_meta.get("provider_config_key") or row.provider or ""
+                ).strip()
+                if not connection_id or not _connection_id_matches_context(
+                    connection_id, provider_key
+                ):
+                    continue
+                decision = await resolve_integration_access(
+                    db,
+                    kind="integration",
+                    connection_id=row.id,
+                    entity_id=entity_id,
+                    user_id=user_id,
+                    action="use",
+                )
+                if decision.allowed:
+                    allowed.add(connection_id)
+            return allowed
+    except Exception:  # noqa: BLE001
+        logger.exception("Could not resolve Nango connection scope")
+        return set()
 
 
 async def get_nango_secret(db: Any = None, entity_id: str | None = None) -> Optional[str]:
@@ -190,8 +280,19 @@ async def _list_providers(args: Dict[str, Any], secret_key: str) -> Dict[str, An
         r.raise_for_status()
         body = r.json()
 
+    if isinstance(body, dict):
+        raw_configs = body.get("configs") or []
+    elif isinstance(body, list):
+        raw_configs = body
+    else:
+        raise ValueError("Nango config response must be an object or list")
+    if not isinstance(raw_configs, list):
+        raise ValueError("Nango config response 'configs' must be a list")
+
     providers = []
-    for cfg in (body.get("configs") or body if isinstance(body, list) else []):
+    for cfg in raw_configs:
+        if not isinstance(cfg, dict):
+            continue
         providers.append({
             "provider_config_key": cfg.get("unique_key") or cfg.get("provider_config_key"),
             "provider": cfg.get("provider"),
@@ -215,7 +316,23 @@ async def _list_connections(args: Dict[str, Any], secret_key: str) -> Dict[str, 
         body = r.json()
 
     conns = []
-    for c in (body.get("connections") or body if isinstance(body, list) else []):
+    allowed_ids = await _authorized_connection_ids()
+    raw_connections = body.get("connections") if isinstance(body, dict) else body
+    for c in (raw_connections or []):
+        connection_id = str(c.get("connection_id") or "").strip()
+        provider_config_key = str(
+            c.get("provider_config_key") or c.get("provider") or ""
+        ).strip()
+        if (
+            allowed_ids is not None
+            and (
+                connection_id not in allowed_ids
+                or not _connection_id_matches_context(
+                    connection_id, provider_config_key
+                )
+            )
+        ):
+            continue
         conns.append({
             "connection_id": c.get("connection_id"),
             "provider_config_key": c.get("provider_config_key"),
@@ -231,7 +348,17 @@ async def _proxy(args: Dict[str, Any], secret_key: str) -> Dict[str, Any]:
     method = (args.get("method") or "GET").upper()
     endpoint = (args.get("endpoint") or "").strip()
     if not (pck and conn and endpoint):
-        return {"error": "provider_config_key, connection_id, endpoint are required"}
+        raise ValueError("provider_config_key, connection_id, endpoint are required")
+
+    allowed_ids = await _authorized_connection_ids()
+    if (
+        allowed_ids is not None
+        and (
+            conn not in allowed_ids
+            or not _connection_id_matches_context(conn, pck)
+        )
+    ):
+        raise PermissionError("connection_not_authorized")
 
     headers = {
         "Authorization": f"Bearer {secret_key}",
@@ -253,6 +380,7 @@ async def _proxy(args: Dict[str, Any], secret_key: str) -> Dict[str, Any]:
             json=args.get("data") if method in ("POST", "PUT", "PATCH") else None,
             headers=headers,
         )
+    r.raise_for_status()
 
     # Try JSON, fall back to text. Truncate huge bodies before returning.
     try:

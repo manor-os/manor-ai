@@ -7,7 +7,10 @@ module-level ``pytestmark`` that parametrizes the ``client`` fixture with
 accept a ``client`` parameter.
 """
 
-from packages.core.services.email_service import _render_announcement_body_html
+from packages.core.services.email_service import (
+    _render_announcement_body_html,
+    render_announcement_email_html,
+)
 
 # ── Markdown renderer (unit) ─────────────────────────────────────────
 
@@ -39,3 +42,22 @@ def test_md_still_escapes_raw_html():
     out = _render_announcement_body_html('<script>alert(1)</script>')
     assert "<script>" not in out
     assert "&lt;script&gt;" in out
+
+
+
+
+def test_announcement_render_uses_reviewed_email_safe_manor_template():
+    out = render_announcement_email_html(
+        title="Manor AI Monthly",
+        body_md="## Product update\n\nA calmer, faster workflow.",
+        severity="info",
+        cta_url="https://manor.ai/changelog",
+        cta_label="View changelog",
+    )
+
+    assert 'role="presentation"' in out
+    assert "<!--[if mso]>" in out
+    assert "fonts.googleapis.com" not in out
+    assert "background-color:#f7f6f3" in out
+    assert "background-color:#436b65" in out
+    assert "View changelog" in out

@@ -173,16 +173,6 @@ def _normalize_membership_role(role: str | None, default: str = "member") -> str
     return value if value in _MEMBERSHIP_ROLES else default
 
 
-async def _has_any_membership(db: AsyncSession, user_id: str) -> bool:
-    return (
-        await db.execute(
-            select(UserMembership.id)
-            .where(UserMembership.user_id == user_id)
-            .limit(1)
-        )
-    ).scalar_one_or_none() is not None
-
-
 async def _has_primary_membership(db: AsyncSession, user_id: str) -> bool:
     return (
         await db.execute(
@@ -194,22 +184,6 @@ async def _has_primary_membership(db: AsyncSession, user_id: str) -> bool:
             .limit(1)
         )
     ).scalar_one_or_none() is not None
-
-
-async def _membership_for_entity(
-    db: AsyncSession,
-    *,
-    user_id: str,
-    entity_id: str,
-) -> UserMembership | None:
-    return (
-        await db.execute(
-            select(UserMembership).where(
-                UserMembership.user_id == user_id,
-                UserMembership.entity_id == entity_id,
-            )
-        )
-    ).scalar_one_or_none()
 
 
 async def _role_for_staff_membership(db: AsyncSession, staff) -> str:
@@ -315,20 +289,11 @@ async def get_user_membership(
     entity_id: str,
     include_inactive: bool = False,
 ) -> UserMembership | None:
-    if await _membership_for_entity(db, user_id=user.id, entity_id=user.entity_id) is None:
-        mark_primary = not await _has_any_membership(db, user.id)
-        await ensure_user_membership(
-            db,
-            user=user,
-            entity_id=user.entity_id,
-            role=user.role,
-            status=user.status if user.status in {"active", "invited"} else "inactive",
-            is_primary=mark_primary,
-        )
-    await reconcile_staff_memberships_for_user(db, user)
+    """Read one persisted membership without repairing authorization state."""
     stmt = select(UserMembership).where(
         UserMembership.user_id == user.id,
         UserMembership.entity_id == entity_id,
+        UserMembership.deleted_at.is_(None),
     )
     if not include_inactive:
         stmt = stmt.where(UserMembership.status == "active")
@@ -339,18 +304,7 @@ async def list_user_memberships(
     db: AsyncSession,
     user: User,
 ) -> list[tuple[UserMembership, Entity | None]]:
-    if await _membership_for_entity(db, user_id=user.id, entity_id=user.entity_id) is None:
-        mark_primary = not await _has_any_membership(db, user.id)
-        await ensure_user_membership(
-            db,
-            user=user,
-            entity_id=user.entity_id,
-            role=user.role,
-            status=user.status if user.status in {"active", "invited"} else "inactive",
-            is_primary=mark_primary,
-        )
-    await reconcile_staff_memberships_for_user(db, user)
-
+    """List persisted memberships without creating or reactivating rows."""
     rows = (
         await db.execute(
             select(UserMembership, Entity)
@@ -358,6 +312,7 @@ async def list_user_memberships(
             .where(
                 UserMembership.user_id == user.id,
                 UserMembership.status.in_(("active", "invited")),
+                UserMembership.deleted_at.is_(None),
             )
             .order_by(UserMembership.is_primary.desc(), Entity.name.asc().nulls_last())
         )

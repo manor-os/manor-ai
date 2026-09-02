@@ -445,6 +445,66 @@ def test_product_video_studio_template_registered_without_compatibility_alias():
     assert "product_demo_video_studio" not in REGISTRY
 
 
+@pytest.mark.asyncio
+async def test_product_video_role_agent_identity_is_workspace_scoped(db_session):
+    from packages.core.models.base import generate_ulid
+    from packages.core.models.workspace import Agent, Workspace
+
+    entity_id = generate_ulid()
+    workspace_a = Workspace(
+        id=generate_ulid(),
+        entity_id=entity_id,
+        name="Product Video A",
+        kind="general",
+        operating_context="",
+        primary_work="",
+        operating_model={},
+        settings={},
+    )
+    workspace_b = Workspace(
+        id=generate_ulid(),
+        entity_id=entity_id,
+        name="Product Video B",
+        kind="general",
+        operating_context="",
+        primary_work="",
+        operating_model={},
+        settings={},
+    )
+    db_session.add_all([workspace_a, workspace_b])
+    await db_session.commit()
+
+    role = template.ROLE_SPECS[0]
+    first = await template._provision_role_agent(
+        db_session,
+        entity_id=entity_id,
+        workspace_id=workspace_a.id,
+        role=role,
+    )
+    await db_session.commit()
+    retried = await template._provision_role_agent(
+        db_session,
+        entity_id=entity_id,
+        workspace_id=workspace_a.id,
+        role=role,
+    )
+    await db_session.commit()
+    other_workspace = await template._provision_role_agent(
+        db_session,
+        entity_id=entity_id,
+        workspace_id=workspace_b.id,
+        role=role,
+    )
+    await db_session.commit()
+
+    assert retried["agent_id"] == first["agent_id"]
+    assert other_workspace["agent_id"] != first["agent_id"]
+    first_agent = await db_session.get(Agent, first["agent_id"])
+    other_agent = await db_session.get(Agent, other_workspace["agent_id"])
+    assert first_agent is not None and first_agent.workspace_id == workspace_a.id
+    assert other_agent is not None and other_agent.workspace_id == workspace_b.id
+
+
 @pytest.mark.parametrize(
     "schema",
     [

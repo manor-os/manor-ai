@@ -78,6 +78,74 @@ def test_manor_mcp_calendar_tools_are_registered_in_mcp_catalog():
     assert "mcp__manor_mcp_calendar__create_booking_link" in registered
 
 
+def test_manor_mcp_calendar_preserves_booking_host_identity():
+    booking = manor_mcp_calendar._booking_record({
+        "id": "booking-id",
+        "booking_link_id": "link-id",
+        "booking_link_slug": "intro-call",
+        "guest_name": "Guest Booker",
+        "guest_email": "guest@example.com",
+        "starts_at": "2026-08-24T16:00:00+00:00",
+        "ends_at": "2026-08-24T16:30:00+00:00",
+        "timezone": "UTC",
+        "guest_timezone": "America/New_York",
+        "host_email": "host@example.com",
+        "calendar_event_intent": {
+            "provider": "google_calendar",
+            "account_id": "host-account",
+            "calendar_id": "primary",
+            "summary": "Intro call with Guest Booker",
+            "description": "Booked via Manor AI.",
+            "location": "Video meeting",
+            "create_online_meeting": True,
+            "timezone": "UTC",
+        },
+    })
+
+    assert booking["guest_timezone"] == "America/New_York"
+    assert booking["host_email"] == "host@example.com"
+    assert booking["calendar_event_intent"]["account_id"] == "host-account"
+
+
+def test_manor_mcp_calendar_preserves_per_link_availability():
+    custom_hours = [
+        {
+            "day_of_week": day,
+            "enabled": day < 5,
+            "start": "10:00",
+            "end": "16:00",
+        }
+        for day in range(7)
+    ]
+    unavailable_times = [
+        {"date": "2026-08-25", "start": "13:00", "end": "14:30"},
+    ]
+    link = manor_mcp_calendar._booking_link(
+        {
+            "id": "link-id",
+            "slug": "custom-hours",
+            "name": "Custom hours",
+            "availability_mode": "custom",
+            "working_hours": custom_hours,
+            "unavailable_dates": ["2026-08-26"],
+            "unavailable_times": unavailable_times,
+        },
+        {
+            "duration_minutes": 30,
+            "buffer_before_minutes": 0,
+            "buffer_after_minutes": 10,
+            "min_notice_minutes": 120,
+            "rolling_window_days": 30,
+        },
+        0,
+    )
+
+    assert link["availability_mode"] == "custom"
+    assert link["working_hours"] == custom_hours
+    assert link["unavailable_dates"] == ["2026-08-26"]
+    assert link["unavailable_times"] == unavailable_times
+
+
 @pytest.mark.asyncio
 async def test_manor_mcp_calendar_is_internal_mcp_not_external_integration(client: AsyncClient):
     headers, _user_id, _entity_id = await _register_owner(client, "manor_mcp_calendar_catalog")

@@ -240,6 +240,27 @@ test("History deep links select one aggregate record and details start with its 
   assert.match(workspaceSource, /family\.artifactCount !== null/);
 });
 
+test("failed runs without editable corrections retain a direct retry action", () => {
+  const retryableRun = {
+    id: "visibility-retry",
+    status: "failed",
+    current_step_id: "set_youtube_visibility",
+    retry_from_step_id: "set_youtube_visibility",
+    error: "YouTube visibility could not be verified. Retry only this step.",
+    capabilities: { can_control: true },
+  };
+
+  assert.equal(
+    displayModule.canShowDirectWorkflowRetry(retryableRun, false),
+    true,
+  );
+  assert.equal(
+    displayModule.canShowDirectWorkflowRetry(retryableRun, true),
+    false,
+  );
+  assert.match(detailSource, /canShowDirectWorkflowRetry\(/);
+});
+
 test("run selection replaces the History list with a full-width detail in the workspace page", () => {
   assert.match(workspaceSource, /selectedRunId/);
   assert.match(workspaceSource, /<WorkflowRunDetail/);
@@ -409,7 +430,7 @@ test("History retry remains capability and intervention-schema gated", () => {
   assert.match(interventionSource, /editable_input_schema/);
   assert.match(detailSource, /retry_from_step_id/);
   assert.match(detailSource, /api\.workflows\.retryRun/);
-  assert.match(detailSource, /canRetryWithoutCorrection/);
+  assert.match(detailSource, /canShowDirectWorkflowRetry/);
   assert.match(detailSource, /showControlSurface/);
   assert.doesNotMatch(detailSource, /capabilities\?\.can_control !== false/);
 });

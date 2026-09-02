@@ -48,6 +48,18 @@ def index_exists(index_name: str) -> bool:
     return result.fetchone() is not None
 
 
+def foreign_key_exists(table_name: str, constraint_name: str) -> bool:
+    """Check whether a named foreign-key constraint exists on a table."""
+    conn = op.get_bind()
+    inspector = sa.inspect(conn)
+    if not inspector.has_table(table_name):
+        return False
+    return any(
+        constraint.get("name") == constraint_name
+        for constraint in inspector.get_foreign_keys(table_name)
+    )
+
+
 def add_column_if_not_exists(
     table_name: str, column: sa.Column
 ) -> None:

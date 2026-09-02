@@ -1,0 +1,33 @@
+{
+  "id": "content-ledger",
+  "name": "content-ledger",
+  "display_name": "Content Ledger",
+  "type": "runtime_guidance",
+  "execution_mode": "instructions_only",
+  "description": "Use the active Workspace Content Ledger as the durable source for content identities, reservations, lifecycle events, evidence, and duplicate prevention.",
+  "category": "workspace-ledger",
+  "output_format": "guidance",
+  "tags": [
+    "content-ledger",
+    "content",
+    "publishing",
+    "workspace-ledger",
+    "runtime-guidance",
+    "builtin"
+  ],
+  "tools": [
+    "read_content_ledger",
+    "record_content_ledger",
+    "query_ledger",
+    "visualize_workspace_ledgers"
+  ],
+  "ledger_contracts": [
+    "manor.content_ledger/v1"
+  ],
+  "capability_companion": {
+    "tool_names": [
+      "read_content_ledger",
+      "record_content_ledger"
+    ]
+  }
+}

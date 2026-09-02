@@ -9,6 +9,39 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 
+async def runtime_query_agent_capabilities_action(
+    *,
+    entity_id: str,
+    user_id: str,
+) -> str:
+    """Return the exact actor-scoped ids accepted by ``provision_agent``."""
+
+    if not entity_id:
+        return json.dumps({"ok": False, "error": "entity_id missing from tool context"})
+    if not user_id:
+        return json.dumps({"ok": False, "error": "user_id missing from tool context"})
+
+    from packages.core.database import async_session
+    from packages.core.services.agent_capability_catalog import (
+        AgentCapabilityCatalogFactory,
+    )
+
+    async with async_session() as db:
+        catalog = await AgentCapabilityCatalogFactory.create(
+            db,
+            entity_id=entity_id,
+            user_id=user_id,
+        )
+    return json.dumps({
+        "ok": True,
+        "selection_contract": (
+            "Choose exact ids from capabilities and pass them unchanged as "
+            "capability_ids to provision_agent. Do not invent or rewrite ids."
+        ),
+        "capabilities": catalog.prompt_payload(),
+    }, ensure_ascii=False)
+
+
 async def runtime_query_entity_agents_action(
     *,
     entity_id: str,
@@ -111,12 +144,15 @@ async def runtime_query_entity_agents_action(
 async def runtime_provision_agent_action(
     *,
     entity_id: str,
+    user_id: str,
     params: dict[str, Any] | None = None,
 ) -> str:
     """Create a custom agent through the Runtime action boundary."""
 
     if not entity_id:
         return json.dumps({"ok": False, "error": "entity_id missing from tool context"})
+    if not user_id:
+        return json.dumps({"ok": False, "error": "user_id missing from tool context"})
 
     raw_params = dict(params or {})
     agent_name = (raw_params.get("agent_name") or "").strip()
@@ -126,32 +162,78 @@ async def runtime_provision_agent_action(
 
     try:
         from packages.core.database import async_session
+        from packages.core.services.agent_capability_catalog import (
+            AgentCapabilityCatalogFactory,
+            AgentCapabilitySelectionError,
+        )
         from packages.core.services.agent_provisioning_service import (
             CustomAgentSpec,
             provision_custom_agent,
         )
 
-        spec = CustomAgentSpec(
-            agent_name=agent_name,
-            system_prompt=system_prompt,
-            description=(raw_params.get("description") or "").strip(),
-            category=raw_params.get("category"),
-            tags=list(raw_params.get("tags") or []),
-            tool_bindings=list(raw_params.get("tool_bindings") or []),
-            skill_bindings=list(raw_params.get("skill_bindings") or []),
-            mcp_bindings=list(raw_params.get("mcp_bindings") or []),
-            missing_skill_specs=list(raw_params.get("missing_skill_specs") or []),
-            source="chat_tool",
-        )
-
         async with async_session() as db:
             try:
-                result = await provision_custom_agent(db, entity_id=entity_id, spec=spec)
+                catalog = await AgentCapabilityCatalogFactory.create(
+                    db,
+                    entity_id=entity_id,
+                    user_id=user_id,
+                )
+                capability_ids = list(raw_params.get("capability_ids") or [])
+                if capability_ids:
+                    plan = catalog.resolve(capability_ids)
+                else:
+                    plan = catalog.resolve_exact_refs(
+                        tool_names=list(raw_params.get("tool_bindings") or []),
+                        business_capability_ids=list(
+                            raw_params.get("business_capabilities") or []
+                        ),
+                        skill_ids=list(raw_params.get("skill_bindings") or []),
+                        mcp_server_keys=list(raw_params.get("mcp_bindings") or []),
+                    )
+
+                spec = CustomAgentSpec(
+                    agent_name=agent_name,
+                    system_prompt=system_prompt,
+                    description=(raw_params.get("description") or "").strip(),
+                    category=raw_params.get("category"),
+                    tags=list(raw_params.get("tags") or []),
+                    tool_bindings=list(plan.tool_names),
+                    business_capabilities=list(plan.business_capability_ids),
+                    skill_bindings=list(plan.skill_ids),
+                    skill_binding_refs=[
+                        dict(ref)
+                        for ref in raw_params.get("skill_binding_refs") or []
+                        if isinstance(ref, dict)
+                    ],
+                    mcp_bindings=list(plan.mcp_server_keys),
+                    mcp_allowed_tools={
+                        key: (list(value) if value is not None else None)
+                        for key, value in plan.mcp_allowed_tools.items()
+                    },
+                    missing_skill_specs=list(raw_params.get("missing_skill_specs") or []),
+                    source="chat_tool",
+                )
+                result = await provision_custom_agent(
+                    db,
+                    entity_id=entity_id,
+                    spec=spec,
+                    requester_user_id=user_id,
+                )
                 await db.commit()
+            except AgentCapabilitySelectionError:
+                await db.rollback()
+                raise
             except Exception as exc:
                 await db.rollback()
                 raise exc
 
+        logger.info(
+            "provision_agent capability plan entity=%s user=%s status=%s selected=%s",
+            entity_id,
+            user_id,
+            plan.status.value,
+            list(plan.selected_catalog_ids),
+        )
         return json.dumps({
             "ok": True,
             "agent_id": result.agent_id,
@@ -161,6 +243,8 @@ async def runtime_provision_agent_action(
             "created_skills": result.created_skills,
             "bound_mcp_servers": result.bound_mcp_servers,
             "warnings": result.warnings,
+            "capability_plan_status": plan.status.value,
+            "setup_required": list(plan.setup_required),
         }, ensure_ascii=False)
     except Exception as exc:
         logger.exception("provision_agent failed")

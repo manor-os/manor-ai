@@ -38,7 +38,16 @@ def run_in_worker(coro: Awaitable[Any]) -> Any:
         try:
             return await coro
         finally:
-            # Close anything we opened before the loop is torn down.
-            await engine.dispose()
+            try:
+                # Transaction callbacks schedule committed external delivery.
+                # Drain it before this per-task event loop is torn down.
+                from packages.core.services.event_emitter import (
+                    drain_external_event_deliveries,
+                )
+
+                await drain_external_event_deliveries()
+            finally:
+                # Close anything we opened before the loop is torn down.
+                await engine.dispose()
 
     return asyncio.run(_wrapped())

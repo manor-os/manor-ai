@@ -23,12 +23,13 @@ from sqlalchemy import select
 
 from packages.core.ledger import event_types as et
 from packages.core.ledger import record_event
-from packages.core.models.hitl_request import HitlRequest
 from packages.core.models.base import generate_ulid
 from packages.core.models.feature_flag import FeatureFlag
 from packages.core.models.goal import Goal
+from packages.core.models.hitl_request import HitlRequest
 from packages.core.models.proposal import ProposalItemRecord, ProposalRecord
 from packages.core.models.task import Task
+from packages.core.models.user import User, UserMembership
 from packages.core.models.workspace import Agent, AgentSubscription, Workspace
 from packages.core.models.workspace_event import WorkspaceEvent
 from packages.core.proposals.service import decide_items
@@ -44,6 +45,7 @@ _seq = 0
 
 async def _seed_workspace(db, *, settings: dict | None = None) -> Workspace:
     entity_id = generate_ulid()
+    actor_id = entity_id
     workspace = Workspace(
         id=generate_ulid(),
         entity_id=entity_id,
@@ -73,7 +75,26 @@ async def _seed_workspace(db, *, settings: dict | None = None) -> Workspace:
         service_key="ops",
         status="active",
     )
-    db.add_all([workspace, goal, agent, subscription])
+    db.add_all([
+        User(
+            id=actor_id,
+            entity_id=entity_id,
+            email=f"{actor_id}@example.com",
+            password_hash="test-only",
+            role="owner",
+            status="active",
+        ),
+        UserMembership(
+            user_id=actor_id,
+            entity_id=entity_id,
+            role="owner",
+            status="active",
+        ),
+        workspace,
+        goal,
+        agent,
+        subscription,
+    ])
     await db.commit()
     return workspace
 
@@ -269,6 +290,93 @@ async def test_workflow_run_proposal_item_persists_with_wr_prefix(db_session) ->
     assert items[0].risk_level == "medium"
 
 
+async def test_public_workflow_run_proposal_uses_declared_external_risk(db_session) -> None:
+    from packages.core.models.workflow import WorkflowBinding, WorkflowDefinition
+    from packages.core.proposals.service import create_workflow_run_items
+    from packages.core.strategist.proposal import ProposedWorkflowRun
+
+    workspace = await _seed_workspace(db_session)
+    workspace.settings = {
+        **dict(workspace.settings or {}),
+        "_blueprint": {"blueprint_slug": "video-studio-v1"},
+    }
+    workflow = WorkflowDefinition(
+        entity_id=workspace.entity_id,
+        workspace_id=workspace.id,
+        created_by=workspace.entity_id,
+        name="publish-video-v1",
+        variables={},
+        steps=[
+            {"id": "start", "type": "trigger", "config": {}},
+            {"id": "upload_youtube_video", "type": "agent", "config": {}},
+            {"id": "set_youtube_visibility", "type": "agent", "config": {}},
+        ],
+        status="active",
+        is_active=True,
+    )
+    db_session.add(workflow)
+    await db_session.flush()
+    db_session.add(WorkflowBinding(
+        entity_id=workspace.entity_id,
+        workflow_id=workflow.id,
+        workspace_id=workspace.id,
+        name="Publish video",
+        trigger_type="manual",
+        enabled=True,
+        status="active",
+        config={
+            "workspace_blueprint_workflow_slug": "publish-video-v1",
+            "chat_entrypoint": {
+                "enabled": True,
+                "title": "Publish video",
+                "run_inputs": [{
+                    "key": "youtube_visibility",
+                    "type": "string",
+                    "required": True,
+                    "target": "request.youtube_visibility",
+                }],
+            },
+            "proposal_authorization": {
+                "kind": "youtube_publication_v1",
+                "action_key": "workspace.proposal.workflow_run.external",
+                "when": {"input_key": "youtube_visibility", "equals": "public"},
+                "destination": "studio.youtube.com",
+                "upload_step_id": "upload_youtube_video",
+                "publish_step_id": "set_youtube_visibility",
+                "ttl_seconds": 86400,
+            },
+        },
+    ))
+    record = ProposalRecord(
+        entity_id=workspace.entity_id,
+        workspace_id=workspace.id,
+        review_id=generate_ulid(),
+        summary="Publish a video",
+        status="open",
+    )
+    db_session.add(record)
+    await db_session.flush()
+
+    items = await create_workflow_run_items(
+        db_session,
+        record=record,
+        proposed_runs=[ProposedWorkflowRun.model_validate({
+            "run_key": "publish_video",
+            "workflow_ref": {
+                "blueprint_slug": "video-studio-v1",
+                "workflow_slug": "publish-video-v1",
+            },
+            "inputs": {"youtube_visibility": "public"},
+            "source_brief": "Publish today's verified video.",
+            "rationale": "Run the installed Flow.",
+        })],
+    )
+
+    assert items[0].risk_level == "high"
+    assert items[0].action_key == "workspace.proposal.workflow_run.external"
+    assert items[0].payload["_proposal_authorization_binding"]["revision"] == 1
+
+
 async def test_approved_workflow_run_item_dispatches_once_through_shared_launcher(
     db_session,
     monkeypatch,
@@ -279,7 +387,10 @@ async def test_approved_workflow_run_item_dispatches_once_through_shared_launche
     from packages.core.models.workflow import WorkflowBinding, WorkflowDefinition
     from packages.core.proposals.service import create_workflow_run_items
     from packages.core.services.auth_service import hash_password
-    from packages.core.services.proposal_workflow_runs import dispatch_workflow_run_item
+    from packages.core.services.proposal_workflow_runs import (
+        ProposalWorkflowRunConflict,
+        dispatch_workflow_run_item,
+    )
     from packages.core.strategist.proposal import ProposedWorkflowRun
 
     workspace = await _seed_workspace(db_session)
@@ -381,12 +492,20 @@ async def test_approved_workflow_run_item_dispatches_once_through_shared_launche
         started_by=user.id,
         lineage_root_run_id=None,
     )
-    db_session.add(launched_run)
-    await db_session.commit()
-    launch = AsyncMock(return_value=SimpleNamespace(run=launched_run, created=True))
+    async def _launch(*_args, **_kwargs):
+        db_session.add(launched_run)
+        await db_session.flush()
+        return SimpleNamespace(run=launched_run, created=True)
+
+    launch = AsyncMock(side_effect=_launch)
     monkeypatch.setattr(
         "packages.core.services.workspace_flow_launcher.launch_workspace_flow",
         launch,
+    )
+    enqueue = AsyncMock(return_value=True)
+    monkeypatch.setattr(
+        "packages.core.services.workspace_flow_launcher.enqueue_workspace_flow_launch",
+        enqueue,
     )
 
     first = await dispatch_workflow_run_item(
@@ -404,10 +523,42 @@ async def test_approved_workflow_run_item_dispatches_once_through_shared_launche
     assert second.id == launched_run.id
     assert launch.await_count == 1
     assert launch.await_args.kwargs["starter_policy"] == "only_missing"
+    assert launch.await_args.kwargs["transaction_owner"] == "caller"
     assert launch.await_args.kwargs["proposal_context"]["proposal_item_id"] == item.id
     await db_session.refresh(item)
     assert item.status == "executing"
     assert item.execution_root_id == launched_run.id
+    enqueue.assert_awaited_once()
+
+    # Exactly-once is per proposal item, while the binding-level lock and
+    # final live-run check stop a different item from racing a second lineage.
+    duplicate = (await create_workflow_run_items(
+        db_session,
+        record=record,
+        proposed_runs=[ProposedWorkflowRun.model_validate({
+            "run_key": "duplicate_product_video",
+            "workflow_ref": {
+                "blueprint_slug": "product-video-studio-v1",
+                "workflow_slug": "create-product-video-v1",
+            },
+            "inputs": {"product_name": "Manor"},
+            "source_brief": "Duplicate the Manor product video.",
+            "rationale": "Exercise the final dispatch guard.",
+        })],
+    ))[0]
+    duplicate.status = "approved"
+    await db_session.flush()
+
+    import pytest
+
+    with pytest.raises(ProposalWorkflowRunConflict) as exc_info:
+        await dispatch_workflow_run_item(
+            db_session,
+            item_id=duplicate.id,
+            actor_id=user.id,
+        )
+    assert exc_info.value.run_id == launched_run.id
+    assert launch.await_count == 1
 
 
 async def test_workflow_run_item_lifecycle_tracks_retry_lineage(db_session) -> None:
@@ -620,7 +771,10 @@ async def test_strategist_persists_installed_flow_run_behind_item_approval(
     workspace = await _seed_workspace(db_session)
     workspace.settings = {
         **dict(workspace.settings or {}),
-        "_blueprint": {"blueprint_slug": "product-video-studio-v1"},
+        "_blueprint": {
+            "blueprint_slug": "product-video-studio-v1",
+            "live_setup_requirements": [],
+        },
     }
     workflow = WorkflowDefinition(
         entity_id=workspace.entity_id,
@@ -797,7 +951,7 @@ async def test_external_proposal_task_is_high_risk_and_approval_mints_single_use
     assert request.action_key == "workspace.proposal.task.external"
     assert request.risk_level == "high"
 
-    actor_id = generate_ulid()
+    actor_id = workspace.entity_id
     await strategist_service.approve_proposal(
         db_session,
         entity_id=workspace.entity_id,
@@ -935,7 +1089,7 @@ async def test_legacy_user_approval_mints_review_bound_external_scope(
     db_session.add_all([render_task, publish_task])
     await db_session.commit()
 
-    actor_id = generate_ulid()
+    actor_id = workspace.entity_id
     moved = await strategist_service.approve_proposal(
         db_session,
         entity_id=workspace.entity_id,
@@ -1031,7 +1185,7 @@ async def test_no_grant_leaves_items_proposed_then_card_approve(db_session, monk
     assert {t.status for t in tasks.values()} == {"proposed"}
 
     # Operator clicks approve on the existing chat card.
-    user_id = generate_ulid()
+    user_id = workspace.entity_id
     moved = await strategist_service.approve_proposal(
         db_session,
         entity_id=workspace.entity_id,
@@ -1062,7 +1216,7 @@ async def test_reject_records_reason_and_denies_request(db_session, monkeypatch)
     req = await _proposal_request(db_session, result["proposal_id"])
     assert req is not None and req.status == "pending"
 
-    user_id = generate_ulid()
+    user_id = workspace.entity_id
     cancelled = await strategist_service.reject_proposal(
         db_session,
         entity_id=workspace.entity_id,

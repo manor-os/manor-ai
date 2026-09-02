@@ -169,7 +169,11 @@ async def call_tool(
     arguments: Dict[str, Any],
     bearer_token: str,
 ) -> Dict[str, Any]:
-    if not bearer_token:
+    if not isinstance(arguments, dict):
+        return _error("arguments must be an object")
+    arguments = dict(arguments)
+    token = bearer_token.strip() if isinstance(bearer_token, str) else ""
+    if not token:
         return _error(
             "Product Hunt is not connected. Visit /integrations → "
             "Product Hunt → Connect to authorize Manor."
@@ -178,7 +182,7 @@ async def call_tool(
     if handler is None:
         return _error(f"Unknown product_hunt tool: {name}")
     try:
-        return _content(await handler(arguments, bearer_token))
+        return _content(await handler(arguments, token))
     except httpx.HTTPStatusError as exc:
         body = exc.response.text[:500] if exc.response is not None else ""
         return _error(f"Product Hunt HTTP {exc.response.status_code}: {body}")

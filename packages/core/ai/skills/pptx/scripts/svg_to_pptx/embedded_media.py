@@ -17,6 +17,7 @@ from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 from xml.etree import ElementTree as ET
+from defusedxml import ElementTree as SafeET
 
 from PIL import Image
 from pptx import Presentation
@@ -74,7 +75,7 @@ def _slide_lookup(svg_files: Iterable[Path]) -> dict[str, tuple[int, Path]]:
 
 def _svg_viewbox_and_slots(svg_path: Path) -> tuple[tuple[float, float], dict[str, dict[str, float]]]:
     try:
-        root = ET.parse(svg_path).getroot()
+        root = SafeET.parse(svg_path).getroot()
     except (OSError, ET.ParseError) as exc:
         raise EmbeddedMediaSpecError(f"Cannot parse SVG video slots in {svg_path}: {exc}") from exc
     values = str(root.get("viewBox") or "").replace(",", " ").split()

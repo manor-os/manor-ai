@@ -23,6 +23,7 @@ import sys
 import argparse
 from pathlib import Path
 from xml.etree import ElementTree as ET
+from defusedxml import ElementTree as SafeET
 from urllib.parse import unquote
 
 try:
@@ -169,7 +170,7 @@ def process_svg_images(
     try:
         ET.register_namespace('', 'http://www.w3.org/2000/svg')
         ET.register_namespace('xlink', 'http://www.w3.org/1999/xlink')
-        tree = ET.parse(str(svg_path))
+        tree = SafeET.parse(str(svg_path))
         root = tree.getroot()
     except Exception as e:
         if verbose:

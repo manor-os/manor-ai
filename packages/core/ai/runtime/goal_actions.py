@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import date, datetime, timezone
+from datetime import date
 from decimal import Decimal
 from typing import Any
+
+from packages.core.constants.goals import GoalStatus
 
 logger = logging.getLogger(__name__)
 
@@ -35,30 +37,28 @@ async def runtime_create_goal_action(
 
     try:
         from packages.core.database import async_session
-        from packages.core.models.base import generate_ulid
-        from packages.core.models.goal import Goal
+        from packages.core.goals.service import create_goal
 
         async with async_session() as db:
-            goal = Goal(
-                id=generate_ulid(),
+            goal = await create_goal(
+                db,
                 entity_id=entity_id,
                 workspace_id=raw_params.get("workspace_id") or None,
                 title=raw_params["title"],
+                goal_key=raw_params.get("goal_key") or None,
                 description=raw_params.get("description"),
                 metric_key=raw_params["metric_key"],
                 target_value=Decimal(str(target)),
                 deadline=deadline,
                 measurement_source=raw_params.get("measurement_source") or None,
                 measurement_cadence=raw_params.get("measurement_cadence") or None,
-                pace_status="unknown",
-                status="active",
             )
-            db.add(goal)
             await db.commit()
             await db.refresh(goal)
 
         return json.dumps({
             "goal_id": goal.id,
+            "goal_key": goal.goal_key,
             "title": goal.title,
             "metric_key": goal.metric_key,
             "target_value": float(goal.target_value),
@@ -89,7 +89,7 @@ async def runtime_get_goal_status_action(
             if raw_params.get("goal_id"):
                 stmt = stmt.where(Goal.id == raw_params["goal_id"])
             else:
-                stmt = stmt.where(Goal.status == "active")
+                stmt = stmt.where(Goal.status == GoalStatus.ACTIVE.value)
             if raw_params.get("workspace_id"):
                 stmt = stmt.where(Goal.workspace_id == raw_params["workspace_id"])
 
@@ -102,6 +102,7 @@ async def runtime_get_goal_status_action(
             "goals": [
                 {
                     "id": goal.id,
+                    "goal_key": goal.goal_key,
                     "title": goal.title,
                     "metric_key": goal.metric_key,
                     "target_value": float(goal.target_value),
@@ -152,7 +153,8 @@ async def runtime_update_goal_value_action(
         from sqlalchemy import select
 
         from packages.core.database import async_session
-        from packages.core.models.goal import Goal, GoalMeasurement
+        from packages.core.goals.service import record_measurement
+        from packages.core.models.goal import Goal
 
         async with async_session() as db:
             stmt = select(Goal).where(Goal.id == goal_id, Goal.entity_id == entity_id)
@@ -162,19 +164,15 @@ async def runtime_update_goal_value_action(
             if not goal:
                 return json.dumps({"error": "goal not found"})
 
-            now = datetime.now(timezone.utc)
             recorded_workspace_id = goal.workspace_id
-            db.add(GoalMeasurement(
-                goal_id=goal.id,
-                measured_at=now,
+            measurement = await record_measurement(
+                db,
+                goal,
                 value=Decimal(str(value)),
                 source="manual",
                 meta={"note": raw_params.get("note")} if raw_params.get("note") else None,
-            ))
-            if goal.baseline_value is None:
-                goal.baseline_value = Decimal(str(value))
-            goal.current_value = Decimal(str(value))
-            goal.current_value_updated_at = now
+            )
+            now = measurement.measured_at
             await db.commit()
 
         return json.dumps({

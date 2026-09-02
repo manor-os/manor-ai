@@ -8,6 +8,8 @@ Covers:
 * previous_decisions derived from proposal_item_* ledger facts
   (approved + rejected with rejection_reason), newest first
 * open_approvals digest (pending only, max 10, oldest first)
+* Workflow run snapshots include active/paused/failed/completed outcomes,
+  latest retry state, and bounded/redacted result payloads
 * size budget: oversized metric values dropped, then Top-K reduced;
   hard cap raises BriefingTooLarge
 * render_briefing_markdown: deterministic, section headers, evidence
@@ -19,8 +21,6 @@ import asyncio
 from datetime import datetime, timedelta, timezone
 
 import pytest
-from sqlalchemy import select
-
 from packages.core.consolidators import run_all
 from packages.core.ledger import event_types as et
 from packages.core.ledger import record_event
@@ -28,6 +28,7 @@ from packages.core.models.hitl_request import HitlRequest
 from packages.core.models.base import generate_ulid
 from packages.core.models.consolidation_report import ConsolidationReport
 from packages.core.models.review_run import ReviewRun
+from packages.core.models.workflow import WorkflowBinding, WorkflowDefinition, WorkflowRun
 from packages.core.models.workspace import Workspace
 from packages.core.review import begin_review
 from packages.core.review.briefing import (
@@ -244,6 +245,240 @@ async def test_coverage_gaps_failed_partial_and_reused(db_session):
     ]
     assert briefing.reports["capacity_cost"].reused is True
     assert briefing.reports["risk_governance"].reused is False
+
+
+# ── Workflow run execution evidence ───────────────────────────────────
+
+
+async def test_workflow_runs_include_state_results_and_latest_retry(db_session):
+    workspace = await _workspace(db_session)
+    workspace.settings = {
+        "_blueprint": {"blueprint_slug": "faceless-stickman-video-studio"},
+    }
+    workflow = WorkflowDefinition(
+        entity_id=ENTITY_ID,
+        workspace_id=workspace.id,
+        name="Create Stickman Video → YouTube",
+        steps=[
+            {"id": "research", "name": "Research topic", "type": "agent"},
+            {"id": "publish", "name": "Publish video", "type": "tool"},
+        ],
+        tags=[],
+    )
+    db_session.add(workflow)
+    await db_session.flush()
+    binding = WorkflowBinding(
+        entity_id=ENTITY_ID,
+        workflow_id=workflow.id,
+        workspace_id=workspace.id,
+        name="Daily video",
+        config={"workspace_blueprint_workflow_slug": "create-stickman-video"},
+    )
+    db_session.add(binding)
+    await db_session.flush()
+
+    now = datetime.now(timezone.utc)
+    snapshot = {
+        "name": "Create Stickman Video → YouTube",
+        "nodes": [
+            {
+                "id": "research",
+                "name": "Research topic",
+                "chat_projection": "progress",
+            },
+            {
+                "id": "publish",
+                "name": "Publish video",
+                "chat_projection": "output",
+            },
+        ],
+    }
+
+    running_id = generate_ulid()
+    completed_id = generate_ulid()
+    failed_id = generate_ulid()
+    retry_root_id = generate_ulid()
+    retry_id = generate_ulid()
+    db_session.add_all(
+        [
+            WorkflowRun(
+                id=running_id,
+                workflow_id=workflow.id,
+                entity_id=ENTITY_ID,
+                workspace_id=workspace.id,
+                binding_id=binding.id,
+                trigger_source="schedule",
+                status="running",
+                current_step_id="research",
+                variables={},
+                step_results={},
+                trigger_data={"scheduled_job_id": "daily-video-7am"},
+                definition_snapshot=snapshot,
+                execution_trace=[],
+                lineage_root_run_id=running_id,
+                lineage_is_legacy=False,
+                started_at=now - timedelta(minutes=5),
+            ),
+            WorkflowRun(
+                id=completed_id,
+                workflow_id=workflow.id,
+                entity_id=ENTITY_ID,
+                workspace_id=workspace.id,
+                binding_id=binding.id,
+                trigger_source="schedule",
+                status="completed",
+                variables={
+                    "period_key": "2026-08-13",
+                    "__result": {
+                        "youtube_url": "https://youtu.be/abc123",
+                        "api_key": "must-not-enter-briefing",
+                        "receipt": "r" * 3000,
+                    },
+                    "project": {"state": {"business_outcome": "published"}},
+                },
+                step_results={"publish": {"status": "completed"}},
+                trigger_data={"scheduled_job_id": "daily-video-7am"},
+                definition_snapshot=snapshot,
+                execution_trace=[],
+                lineage_root_run_id=completed_id,
+                lineage_is_legacy=False,
+                started_at=now - timedelta(hours=1),
+                completed_at=now - timedelta(minutes=40),
+            ),
+            WorkflowRun(
+                id=failed_id,
+                workflow_id=workflow.id,
+                entity_id=ENTITY_ID,
+                workspace_id=workspace.id,
+                binding_id=binding.id,
+                trigger_source="manual",
+                status="failed",
+                current_step_id="publish",
+                variables={},
+                step_results={},
+                trigger_data={},
+                definition_snapshot=snapshot,
+                execution_trace=[],
+                lineage_root_run_id=failed_id,
+                lineage_is_legacy=False,
+                error=(
+                    "YouTube upload failed: "
+                    "Authorization: Bearer abcdefghijklmnop"
+                ),
+                started_at=now - timedelta(hours=2),
+                completed_at=now - timedelta(hours=1, minutes=50),
+            ),
+            # This older failed attempt must be replaced by its paused retry.
+            WorkflowRun(
+                id=retry_root_id,
+                workflow_id=workflow.id,
+                entity_id=ENTITY_ID,
+                workspace_id=workspace.id,
+                binding_id=binding.id,
+                trigger_source="manual",
+                status="failed",
+                current_step_id="publish",
+                variables={},
+                step_results={},
+                trigger_data={},
+                definition_snapshot=snapshot,
+                execution_trace=[],
+                lineage_root_run_id=retry_root_id,
+                lineage_is_legacy=False,
+                error="initial failure",
+                attempt_number=1,
+                started_at=now - timedelta(hours=3),
+                completed_at=now - timedelta(hours=2, minutes=50),
+            ),
+            WorkflowRun(
+                id=retry_id,
+                workflow_id=workflow.id,
+                entity_id=ENTITY_ID,
+                workspace_id=workspace.id,
+                binding_id=binding.id,
+                trigger_source="manual",
+                status="paused",
+                current_step_id="publish",
+                variables={
+                    "project": {
+                        "state": {
+                            "business_outcome": "needs_input",
+                            "retry_state": {
+                                "observed_problem": "Chrome is not connected",
+                                "retry_from_step_id": "publish",
+                            },
+                        },
+                    },
+                },
+                step_results={},
+                trigger_data={},
+                definition_snapshot=snapshot,
+                execution_trace=[],
+                retry_of_run_id=retry_root_id,
+                retry_from_step_id="publish",
+                lineage_root_run_id=retry_root_id,
+                lineage_is_legacy=False,
+                attempt_number=2,
+                started_at=now - timedelta(minutes=20),
+            ),
+        ]
+    )
+    await db_session.flush()
+    # Freeze a review window after the terminal runs settled.
+    await _emit(
+        db_session,
+        workspace.id,
+        event_type=et.WORKFLOW_RUN_COMPLETED,
+        source_kind="workflow",
+        source_id=binding.id,
+    )
+    review = await _begin(db_session, workspace.id)
+
+    briefing = await build_briefing(
+        db_session,
+        review,
+        [_report_row(review, domain="execution")],
+    )
+
+    by_id = {run.run_id: run for run in briefing.workflow_runs}
+    assert running_id in by_id
+    assert completed_id in by_id
+    assert failed_id in by_id
+    assert retry_id in by_id
+    assert retry_root_id not in by_id
+
+    running = by_id[running_id]
+    assert running.current_step_name == "Research topic"
+    assert running.scheduled_job_id == "daily-video-7am"
+    assert running.workflow_slug == "create-stickman-video"
+    assert running.blueprint_slug == "faceless-stickman-video-studio"
+
+    completed = by_id[completed_id]
+    assert completed.business_outcome == "published"
+    assert completed.period_key == "2026-08-13"
+    completed_json = completed.model_dump_json()
+    assert "https://youtu.be/abc123" in completed_json
+    assert "must-not-enter-briefing" not in completed_json
+    assert "[REDACTED]" in completed_json
+    assert len(completed_json) < 3000
+
+    failed = by_id[failed_id]
+    assert "abcdefghijklmnop" not in (failed.error or "")
+    assert "[REDACTED]" in (failed.error or "")
+
+    paused = by_id[retry_id]
+    assert paused.status == "paused"
+    assert paused.attempt_number == 2
+    assert paused.retry_from_step_id == "publish"
+    assert paused.business_outcome == "needs_input"
+    assert paused.blocker == "Chrome is not connected"
+
+    rendered = render_briefing_markdown(briefing)
+    assert "## Workflow runs" in rendered
+    assert "[running] flow=create-stickman-video" in rendered
+    assert "business_outcome=published" in rendered
+    assert "https://youtu.be/abc123" in rendered
+    assert "Chrome is not connected" in rendered
 
 
 # ── size budget ────────────────────────────────────────────────────────

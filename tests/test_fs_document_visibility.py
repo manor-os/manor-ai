@@ -18,6 +18,7 @@ import pytest
 from httpx import AsyncClient
 
 from packages.core.config import get_settings
+from packages.core.services.file_access_tokens import create_file_access_token
 from tests.test_document_permissions import _auth, _invite_and_accept_member
 
 
@@ -131,3 +132,141 @@ async def test_member_can_read_entity_doc_via_fs(client: AsyncClient, fs_enabled
     r = await client.get("/api/v1/fs/list", headers=member, params={"path": "."})
     names = {i["name"] for i in r.json()["items"]}
     assert "shared-handbook.md" in names
+
+
+@pytest.mark.asyncio
+async def test_unprojected_file_is_not_a_raw_fs_acl_bypass(client: AsyncClient, fs_enabled):
+    owner = await _auth(client, "fsvis_unprojected_owner")
+    me = (await client.get("/api/v1/auth/me", headers=owner)).json()
+    entity_id = me["entity_id"]
+    folder = await client.post(
+        "/api/v1/documents/folders",
+        headers=owner,
+        json={"name": "Readable Folder"},
+    )
+    assert folder.status_code == 201, folder.text
+    loose_file = (
+        __import__("pathlib").Path(fs_enabled.MANOR_FS_ROOT)
+        / entity_id
+        / "unprojected-secret.md"
+    )
+    loose_file.parent.mkdir(parents=True, exist_ok=True)
+    loose_file.write_text("not projected", encoding="utf-8")
+    nested_loose_file = loose_file.parent / "Readable Folder" / "nested-secret.md"
+    nested_loose_file.parent.mkdir(parents=True, exist_ok=True)
+    nested_loose_file.write_text("also not projected", encoding="utf-8")
+    member, _ = await _invite_and_accept_member(
+        client, owner, "fsvis.unprojected@test.com"
+    )
+
+    # Entity admins can diagnose loose bytes, but ordinary members cannot use
+    # an absent Document row as an authorization bypass.
+    assert (
+        await client.get("/api/v1/fs/read", headers=owner, params={"path": loose_file.name})
+    ).status_code == 200
+    denied = await client.get(
+        "/api/v1/fs/read", headers=member, params={"path": loose_file.name}
+    )
+    assert denied.status_code == 404
+    nested_denied = await client.get(
+        "/api/v1/fs/read",
+        headers=member,
+        params={"path": "Readable Folder/nested-secret.md"},
+    )
+    assert nested_denied.status_code == 404
+    listed = await client.get("/api/v1/fs/list", headers=member, params={"path": "."})
+    assert loose_file.name not in {item["name"] for item in listed.json()["items"]}
+    readable_folder = next(
+        item for item in listed.json()["items"] if item["name"] == "Readable Folder"
+    )
+    assert readable_folder["item_count"] in {None, 0}
+    nested_listed = await client.get(
+        "/api/v1/fs/list", headers=member, params={"path": "Readable Folder"}
+    )
+    assert nested_listed.status_code == 200, nested_listed.text
+    assert "nested-secret.md" not in {
+        item["name"] for item in nested_listed.json()["items"]
+    }
+    folder_info = await client.get(
+        "/api/v1/fs/info", headers=member, params={"path": "Readable Folder"}
+    )
+    assert folder_info.status_code == 200, folder_info.text
+    assert folder_info.json()["item_count"] in {None, 0}
+
+
+@pytest.mark.asyncio
+async def test_actor_bound_signed_url_revalidates_current_document_acl(
+    client: AsyncClient,
+    fs_enabled,
+):
+    owner = await _auth(client, "fsvis_signed_owner")
+    doc = await _upload_private(client, owner, "signed-private.md")
+    member_headers, member = await _invite_and_accept_member(
+        client, owner, "fsvis.signed.member@test.com"
+    )
+    owner_me = (await client.get("/api/v1/auth/me", headers=owner)).json()
+    owner_id = owner_me.get("user_id") or owner_me["id"]
+
+    member_token = create_file_access_token(
+        entity_id=owner_me["entity_id"],
+        rel_path=doc["fs_path"],
+        user_id=member.get("user_id") or member["id"],
+    )
+    owner_token = create_file_access_token(
+        entity_id=owner_me["entity_id"],
+        rel_path=doc["fs_path"],
+        user_id=owner_id,
+    )
+    assert (await client.get(f"/api/v1/fs/public/{member_token}")).status_code == 404
+    allowed = await client.get(f"/api/v1/fs/public/{owner_token}")
+    assert allowed.status_code == 200
+    assert SECRET.encode("utf-8") in allowed.content
+
+    from sqlalchemy import update
+
+    import packages.core.database as db_module
+    from packages.core.models.user import User
+
+    async with db_module.async_session() as db:
+        await db.execute(
+            update(User).where(User.id == owner_id).values(status="inactive")
+        )
+        await db.commit()
+
+    assert (await client.get(f"/api/v1/fs/public/{owner_token}")).status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_fs_acl_batches_large_tree_candidate_sets(monkeypatch):
+    from types import SimpleNamespace
+
+    import apps.api.routers.filesystem as filesystem_router
+
+    calls = []
+
+    async def fake_authorize(_db, **kwargs):
+        files = list(kwargs["rel_paths"])
+        directories = list(kwargs.get("directory_paths") or [])
+        calls.append((files, directories))
+        return SimpleNamespace(unreadable_paths=frozenset())
+
+    monkeypatch.setattr(
+        filesystem_router.ResourcePermissionGate,
+        "authorize_filesystem_path_batch",
+        fake_authorize,
+    )
+    files = [f"files/file-{index}.txt" for index in range(1001)]
+    directories = [f"folders/folder-{index}" for index in range(801)]
+    blocked = await filesystem_router._unreadable_doc_paths(
+        object(),
+        "ent_1",
+        files,
+        SimpleNamespace(id="user_1", entity_id="ent_1", role="member"),
+        directory_paths=directories,
+    )
+
+    assert blocked == set()
+    assert max(len(file_batch) for file_batch, _dirs in calls) <= 400
+    assert max(len(dir_batch) for _files, dir_batch in calls) <= 400
+    assert sum(len(file_batch) for file_batch, _dirs in calls) == len(files)
+    assert sum(len(dir_batch) for _files, dir_batch in calls) == len(directories)

@@ -16,6 +16,8 @@ the Strategist output schema, the M7 validator and the M10 executor.
 """
 from __future__ import annotations
 
+from packages.core.constants.proposal import ProposalItemKind, ProposalItemStatus
+
 REASON_CODES: frozenset[str] = frozenset({
     "WRONG_DIRECTION",
     "DUPLICATE",
@@ -49,21 +51,10 @@ USER_REASON_CODES: tuple[str, ...] = (
 # Strategist to avoid perfectly sound proposals.
 LEARNING_EXCLUDED_REASON_CODES: frozenset[str] = frozenset({"SUPERSEDED"})
 
-ITEM_KINDS: tuple[str, ...] = (
-    "task",
-    "human_request",
-    "automation_change",
-    "workflow_change",
-    "goal_change",
-    "experiment",
-    "workflow_run",
-)
+ITEM_KINDS: tuple[str, ...] = tuple(ProposalItemKind.values())
 
 # proposal item statuses (lifecycle vocabulary; v1 uses the first three)
-ITEM_STATUSES: tuple[str, ...] = (
-    "proposed", "approved", "rejected", "expired",
-    "executing", "succeeded", "failed", "cancelled",
-)
+ITEM_STATUSES: tuple[str, ...] = tuple(ProposalItemStatus.values())
 
 # kind (or "kind.operation" for change kinds) → governance action_key.
 # Per the M8 catalog table. Note: pause AND resume share the
@@ -91,6 +82,7 @@ ACTION_KEY_BY_KIND: dict[str, str | None] = {
     "goal_change.archive": "workspace.proposal.goal_change.archive",
     "experiment": "workspace.proposal.experiment",
     "workflow_run": "workspace.proposal.workflow_run",
+    "workflow_run.external": "workspace.proposal.workflow_run.external",
 }
 
 TASK_ACTION_KEY = ACTION_KEY_BY_KIND["task"]
@@ -125,6 +117,7 @@ STRATEGIST_ACTION_LABELS: dict[str, str] = {
     "workspace.proposal.goal_change.archive": "Archive goals",
     "workspace.proposal.experiment": "Start experiments",
     "workspace.proposal.workflow_run": "Run Workspace Flows",
+    "workspace.proposal.workflow_run.external": "Run Workspace Flows that publish externally",
 }
 
 
@@ -152,7 +145,7 @@ def strategist_approval_catalog() -> list[dict[str, str]]:
             risk = change_risk_level(operation)
         elif spec == "task":
             risk = "low"
-        elif spec == "task.external":
+        elif spec in {"task.external", "workflow_run.external"}:
             risk = "high"
         else:
             risk = "medium"
@@ -256,6 +249,7 @@ def change_action_key(kind: str, operation: str) -> str:
 
 EXPERIMENT_ACTION_KEY = ACTION_KEY_BY_KIND["experiment"]
 WORKFLOW_RUN_ACTION_KEY = ACTION_KEY_BY_KIND["workflow_run"]
+WORKFLOW_RUN_EXTERNAL_ACTION_KEY = ACTION_KEY_BY_KIND["workflow_run.external"]
 
 # M8 catalog: guardrails.max_cost at or below this keeps an experiment item
 # at medium risk; anything above is high risk (standing grants for high-risk

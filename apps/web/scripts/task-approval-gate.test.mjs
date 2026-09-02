@@ -38,12 +38,15 @@ test("task detail does not infer approval behavior from user-authored prose", ()
   assert.doesNotMatch(taskDetail, /instructions[^;\n]*includes\(["']approval["']\)/);
 });
 
-test("stale HITL history cannot hide failed-task recovery controls", () => {
+test("only resolved Plan decision state can expose task recovery controls", () => {
   assert.match(
     taskDetail,
     /const actionableInputRequest = canResumePendingInput \? pendingInputRequest : null;/,
   );
-  assert.match(taskDetail, /const showTaskRecoveryPanel = !actionableInputRequest;/);
+  assert.match(
+    taskDetail,
+    /const showTaskRecoveryPanel = planDecisionStateResolved\s*&& hasTaskRecoveryOrigin\s*&& !actionableInputRequest\s*&& \(!hasPendingTypedDecision \|\| canResumePendingInput\);/,
+  );
   assert.match(taskDetail, /hasPendingInput=\{!!actionableInputRequest\}/);
 });
 

@@ -14,7 +14,9 @@ from packages.core.ai.task_runner import TaskRunner
 from packages.core.models.base import generate_ulid
 from packages.core.models.runtime_learning import RuntimeEvidence
 from packages.core.models.task import Task
+from packages.core.models.user import User
 from packages.core.models.workspace import Agent, Workspace
+from packages.core.services.auth_service import hash_password
 
 
 class _FakeTaskEngine:
@@ -165,6 +167,52 @@ def test_planner_fallback_keeps_runtime_context_in_prompt():
     assert "doc:leasing-faq" in plan.steps[0].params["prompt"]
 
 
+@pytest.mark.asyncio
+async def test_missing_scheduled_skill_transitions_task_to_failed(
+    db_session,
+    monkeypatch,
+):
+    import packages.core.ai.task_runner as task_runner_module
+    import packages.core.database as db_module
+
+    task_id = generate_ulid()
+    task = Task(
+        id=task_id,
+        entity_id=generate_ulid(),
+        title="Run removed scheduled Skill",
+        status="pending",
+        priority=2,
+        task_type="general",
+        details={"scheduled_skill_id": generate_ulid()},
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    async def fake_resolve_billable_user_id(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(
+        task_runner_module,
+        "runtime_resolve_task_billable_user_id",
+        fake_resolve_billable_user_id,
+    )
+
+    result = await TaskRunner(
+        engine=_FakeTaskEngine(),
+        session_factory=db_module.async_session,
+    ).run(task_id)
+
+    db_session.expire_all()
+    persisted = await db_session.get(Task, task_id)
+    assert result == {
+        "task_id": task_id,
+        "status": "failed",
+        "error": "scheduled skill not found",
+    }
+    assert persisted.status == "failed"
+    assert persisted.details["failure_reason"] == "scheduled skill not found"
+
+
 def test_task_runner_propagates_proposal_external_authorization_as_runtime_metadata():
     from packages.core.ai.task_runner import _task_runtime_metadata
 
@@ -206,6 +254,7 @@ async def test_task_runner_records_runtime_evidence_for_legacy_tasks(client, db_
                 id=workspace_id,
                 entity_id=entity_id,
                 name="Founder OS",
+                kind="sandbox",
                 operating_model={},
                 settings={},
                 status="active",
@@ -219,7 +268,10 @@ async def test_task_runner_records_runtime_evidence_for_legacy_tasks(client, db_
                 status="pending",
                 priority=4,
                 task_type="general",
-                details={"done_when": "A concrete brief exists."},
+                details={
+                    "done_when": "A concrete brief exists.",
+                    "seeded_by": "sandbox_demo",
+                },
                 owner_service_key="content",
                 delegate_service_keys=["research"],
             ),
@@ -240,10 +292,17 @@ async def test_task_runner_records_runtime_evidence_for_legacy_tasks(client, db_
 
     monkeypatch.setattr(workspace_runtime, "resolve_workspace_runtime", _fake_runtime)
 
-    runner = TaskRunner(engine=_FakeTaskEngine(), session_factory=db_module.async_session)
+    terminal_fence_events = []
+    runner = TaskRunner(
+        engine=_FakeTaskEngine(),
+        session_factory=db_module.async_session,
+        before_terminal_commit=lambda: terminal_fence_events.append("before"),
+        after_terminal_commit=lambda: terminal_fence_events.append("after"),
+    )
     result = await runner.run(task_id)
 
     assert result["status"] == "completed"
+    assert terminal_fence_events == ["before", "after"]
 
     task = (await db_session.execute(select(Task).where(Task.id == task_id))).scalar_one()
     assert task.status == "completed"
@@ -300,6 +359,15 @@ async def test_task_runner_uses_owner_user_when_creator_is_missing(
                 name="Owner BYOK Workspace",
                 operating_model={},
                 settings={},
+                status="active",
+            ),
+            User(
+                id=owner_user_id,
+                entity_id=entity_id,
+                email="owner-task-fallback@test.com",
+                display_name="Owner Task Fallback",
+                password_hash=hash_password("pass123"),
+                role="owner",
                 status="active",
             ),
             Task(
@@ -410,6 +478,7 @@ async def test_task_runner_prefers_fixed_agent_runtime_config(
     entity_id = generate_ulid()
     workspace_id = generate_ulid()
     agent_id = generate_ulid()
+    creator_user_id = generate_ulid()
     task_id = generate_ulid()
     db_session.add_all(
         [
@@ -419,6 +488,15 @@ async def test_task_runner_prefers_fixed_agent_runtime_config(
                 name="Fixed Agent Workspace",
                 operating_model={},
                 settings={},
+                status="active",
+            ),
+            User(
+                id=creator_user_id,
+                entity_id=entity_id,
+                email="fixed-agent-task-creator@test.com",
+                display_name="Fixed Agent Task Creator",
+                password_hash=hash_password("pass123"),
+                role="owner",
                 status="active",
             ),
             Agent(
@@ -443,6 +521,8 @@ async def test_task_runner_prefers_fixed_agent_runtime_config(
                 priority=4,
                 task_type="general",
                 details={"done_when": "The fixed Agent run completes."},
+                creator_id=creator_user_id,
+                owner_id=creator_user_id,
                 owner_service_key="content",
                 delegate_service_keys=[],
             ),

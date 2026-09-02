@@ -145,9 +145,25 @@ async def test_manor_lists_ready_integrations_for_current_user(client):
     from packages.core.ai.tools.manor_tool import _dispatch_action
     from packages.core.models.base import generate_ulid
     from packages.core.models.document import Integration
+    from auth_helpers import register_user_and_get_token
 
-    entity_id = "ent_ready_integrations"
-    user_id = "user_ready_integrations"
+    registration = await register_user_and_get_token(
+        client,
+        json={
+            "username": "ready_integrations_owner",
+            "email": "ready_integrations_owner@example.test",
+            "password": "TestPassword123!",
+            "entity_name": "Ready integrations QA",
+        },
+    )
+    data = registration.json()
+    user_id = data["user_id"]
+    me = await client.get(
+        "/api/v1/auth/me",
+        headers={"Authorization": f"Bearer {data['access_token']}"},
+    )
+    assert me.status_code == 200, me.text
+    entity_id = me.json()["entity_id"]
 
     telegram_account_id = generate_ulid()
     async with db_module.async_session() as db:
@@ -155,9 +171,10 @@ async def test_manor_lists_ready_integrations_for_current_user(client):
             Integration(
                 id=telegram_account_id,
                 entity_id=entity_id,
+                owner_user_id=user_id,
                 provider="telegram",
                 status="active",
-                config={},
+                config={"is_default": True},
                 credentials={"bot_token": "test-token"},
             )
         )
@@ -168,7 +185,7 @@ async def test_manor_lists_ready_integrations_for_current_user(client):
                 provider="discord",
                 status="active",
                 config={},
-                credentials={},
+                credentials={"bot_token": "another-users-token"},
             )
         )
         await db.commit()
@@ -193,8 +210,10 @@ async def test_manor_lists_ready_integrations_for_current_user(client):
         {
             "id": telegram_account_id,
             "display_name": f"telegram account {telegram_account_id[-6:]}",
+            "kind": "integration",
             "scope": "entity",
-            "is_default": False,
+            "ownership": "mine",
+            "is_default": True,
         }
     ]
     assert "discord" not in ready_mcp

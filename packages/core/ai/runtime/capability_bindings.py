@@ -17,6 +17,7 @@ _CAPABILITY_KEYS = (
     "capability",
     "capability_key",
     "tool_name",
+    "skill_id",
     "skill_key",
     "integration_key",
     "channel_type",
@@ -46,7 +47,7 @@ _KNOWN_INTEGRATION_SERVER_KEYS = frozenset({
     "wechat_personal", "telegram", "replicate", "elevenlabs", "tavily", "jimeng",
     "claude_code", "codex_cli", "gemini_cli", "cursor_cli", "aider", "continue_cli",
     "producthunt", "facebook", "chrome", "chrome_knowledge_local", "knowledge_local",
-    "local_browser", "youtube", "tiktok", "shopify", "woocommerce", "square",
+    "youtube", "tiktok", "shopify", "woocommerce", "square",
     "tiktok_shop", "amazon",
 })
 
@@ -119,6 +120,7 @@ WORKSPACE_CUSTOM_AGENT_BASE_TOOL_NAMES = (
     "workspace_operation",
     "rag",
     "generate_file",
+    "patch_file",
 )
 
 
@@ -187,13 +189,7 @@ def _normalize_capability_type(
 
 
 def runtime_skill_binding_ref(binding: dict[str, Any]) -> str:
-    return str(
-        binding.get("skill_id")
-        or binding.get("skill_key")
-        or binding.get("capability_key")
-        or binding.get("name")
-        or ""
-    ).strip()
+    return str(binding.get("skill_id") or "").strip()
 
 
 def runtime_binding_owner_matches(
@@ -205,6 +201,7 @@ def runtime_binding_owner_matches(
     current_service_keys: set[str] | frozenset[str] | None = None,
     task_service_keys: set[str] | frozenset[str] | None = None,
     subscription_agent_ids_by_id: dict[str, str | None] | None = None,
+    current_subscription_id: str | None = None,
 ) -> bool:
     owner_scope = str(binding.get("owner_scope") or "").strip()
     current_service_keys = set(current_service_keys or set())
@@ -225,6 +222,8 @@ def runtime_binding_owner_matches(
     if owner_scope == "agent":
         owner_agent_id = str(binding.get("agent_id") or binding.get("owner_id") or "").strip()
         owner_sub_id = str(binding.get("agent_subscription_id") or "").strip()
+        if owner_sub_id and current_subscription_id is not None:
+            return owner_sub_id == current_subscription_id
         if owner_agent_id and owner_agent_id == str(agent_id or ""):
             return True
         if owner_sub_id and owner_sub_id in subscription_agent_ids_by_id:

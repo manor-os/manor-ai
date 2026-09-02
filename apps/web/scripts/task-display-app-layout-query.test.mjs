@@ -1,12 +1,14 @@
 #!/usr/bin/env node
 import assert from "node:assert/strict";
 import { Buffer } from "node:buffer";
+import { readFile } from "node:fs/promises";
 import { test } from "node:test";
 import { build } from "esbuild";
 
 const entryPoint = `
   export { formatTaskOutputSummary, formatUserFacingStructuredText } from "../src/lib/taskDisplay.ts";
   export { parseAppLayoutChatTarget } from "../src/layouts/appLayoutChatQuery.ts";
+  export { redactInternalAssistantErrorDetails } from "../src/lib/assistant-visible-text.mjs";
 `;
 
 const bundled = await build({
@@ -26,7 +28,24 @@ const moduleUrl = `data:text/javascript;base64,${Buffer.from(
   bundled.outputFiles[0].text,
 ).toString("base64")}`;
 
-const { formatTaskOutputSummary, formatUserFacingStructuredText, parseAppLayoutChatTarget } = await import(moduleUrl);
+const {
+  formatTaskOutputSummary,
+  formatUserFacingStructuredText,
+  parseAppLayoutChatTarget,
+  redactInternalAssistantErrorDetails,
+} = await import(moduleUrl);
+const appLayoutSource = await readFile(
+  new URL("../src/layouts/AppLayout.tsx", import.meta.url),
+  "utf8",
+);
+const tasksPageSource = await readFile(
+  new URL("../src/pages/Tasks.tsx", import.meta.url),
+  "utf8",
+);
+const taskPropertiesSource = await readFile(
+  new URL("../src/components/task/TaskPropertiesPanel.tsx", import.meta.url),
+  "utf8",
+);
 
 test("task display renders nested plain objects without [object Object]", () => {
   const text = formatUserFacingStructuredText({
@@ -41,6 +60,56 @@ test("task display renders nested plain objects without [object Object]", () => 
   assert.match(text, /Approval Pack/);
   assert.match(text, /Alex Rivera/);
   assert.match(text, /Lease renewal approval/);
+});
+
+test("assistant display hides internal database details but keeps actionable errors", () => {
+  const internalError = [
+    "Sorry, the request failed. Please try again.",
+    "",
+    "Error detail: Internal error: (sqlalchemy.dialects.postgresql.asyncpg.Error)",
+    "[SQL: SELECT messages.id FROM messages]",
+    "[parameters: ('private-value',)]",
+  ].join("\n");
+  const actionableError = [
+    "Sorry, the request failed. Please try again.",
+    "",
+    "Error detail: calendar provider timed out",
+  ].join("\n");
+  const diagnosticAnswer = [
+    "Here is the diagnosis.",
+    "",
+    "Error detail: sqlalchemy could not execute the query.",
+  ].join("\n");
+
+  assert.equal(
+    redactInternalAssistantErrorDetails(internalError),
+    "Sorry, the request failed. Please try again.",
+  );
+  assert.equal(redactInternalAssistantErrorDetails(actionableError), actionableError);
+  assert.equal(redactInternalAssistantErrorDetails(diagnosticAnswer), diagnosticAnswer);
+});
+
+test("sidebar workspace selection persists the workspace chat query", () => {
+  assert.match(
+    appLayoutSource,
+    /const openWorkspace = \(\) => \{[\s\S]*?navigate\(`\/chat\?workspace=\$\{encodeURIComponent\(ws\.id\)\}`\);/,
+  );
+});
+
+test("tasks board only shows Running now for an active execution", () => {
+  assert.match(tasksPageSource, /task\.execution_active === true/);
+  assert.doesNotMatch(tasksPageSource, /const isProcessingGlow = \(isAI \|\| isWorkspaceTask\) && task\.status === "in_progress"/);
+});
+
+test("workspace assignee picker filters agents to active workspace subscriptions", () => {
+  assert.match(taskPropertiesSource, /workspaceAgentIds/);
+  assert.match(taskPropertiesSource, /filterWorkspaceScopedAgents/);
+});
+
+test("new workspace task form filters agents to active workspace subscriptions", () => {
+  assert.match(tasksPageSource, /workspace-assignable-agents", formWorkspace/);
+  assert.match(tasksPageSource, /const formAssignableAgents = useMemo/);
+  assert.match(tasksPageSource, /formAssignableAgents\.map\(\(agent: any\) =>/);
 });
 
 test("task display falls back to readable JSON for deeply nested objects", () => {

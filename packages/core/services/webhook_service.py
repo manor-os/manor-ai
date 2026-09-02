@@ -9,6 +9,7 @@ import secrets
 import time
 from datetime import datetime, timezone
 from typing import Optional
+from urllib.parse import urlsplit
 
 import httpx
 from sqlalchemy import select
@@ -22,6 +23,23 @@ logger = logging.getLogger(__name__)
 MAX_CONSECUTIVE_FAILURES = 10
 DELIVERY_TIMEOUT_SECONDS = 10
 MAX_RESPONSE_BODY_LENGTH = 1000
+
+
+def _validate_webhook_url(url: str) -> str:
+    """Validate and normalize a webhook URL before storing or delivering it."""
+    if not isinstance(url, str):
+        raise ValueError("Webhook URL must be a string")
+
+    normalized = url.strip()
+    try:
+        parsed = urlsplit(normalized)
+        hostname = parsed.hostname
+    except ValueError as exc:
+        raise ValueError("Webhook URL must be a valid absolute HTTP(S) URL") from exc
+
+    if parsed.scheme.casefold() not in {"http", "https"} or not hostname:
+        raise ValueError("Webhook URL must be a valid absolute HTTP(S) URL")
+    return normalized
 
 
 # ── Endpoint CRUD ──
@@ -38,6 +56,7 @@ async def create_endpoint(
     description: Optional[str] = None,
 ) -> WebhookEndpoint:
     """Register a new webhook endpoint."""
+    url = _validate_webhook_url(url)
     secret = secret or secrets.token_hex(32)
     endpoint = WebhookEndpoint(
         id=generate_ulid(),
@@ -87,6 +106,8 @@ async def update_endpoint(
     endpoint = await get_endpoint(db, endpoint_id, entity_id)
     if not endpoint:
         return None
+    if "url" in kwargs and kwargs["url"] is not None:
+        kwargs = {**kwargs, "url": _validate_webhook_url(kwargs["url"])}
     for key, value in kwargs.items():
         if hasattr(endpoint, key):
             setattr(endpoint, key, value)
@@ -183,31 +204,38 @@ async def test_endpoint(
     }
 
 
-async def deliver_event(entity_id: str, event_type: str, payload: dict):
+async def deliver_event(entity_id: str, event_type: str, payload: dict) -> dict[str, int]:
     """Deliver an event to all subscribed webhook endpoints for this entity.
 
     Runs in its own session (fire-and-forget from event emitter).
     """
-    try:
-        from packages.core.database import async_session
-        async with async_session() as db:
-            result = await db.execute(
-                select(WebhookEndpoint).where(
-                    WebhookEndpoint.entity_id == entity_id,
-                    WebhookEndpoint.enabled.is_(True),
-                )
+    from packages.core.database import async_session
+
+    attempted = 0
+    delivered = 0
+    async with async_session() as db:
+        result = await db.execute(
+            select(WebhookEndpoint).where(
+                WebhookEndpoint.entity_id == entity_id,
+                WebhookEndpoint.enabled.is_(True),
             )
-            endpoints = result.scalars().all()
+        )
+        endpoints = result.scalars().all()
 
-            for endpoint in endpoints:
-                # If endpoint subscribes to specific events, check membership
-                if endpoint.events and event_type not in endpoint.events:
-                    continue
-                await _deliver_to_endpoint(db, endpoint, event_type, payload)
+        for endpoint in endpoints:
+            # If endpoint subscribes to specific events, check membership
+            if endpoint.events and event_type not in endpoint.events:
+                continue
+            attempted += 1
+            if await _deliver_to_endpoint(db, endpoint, event_type, payload):
+                delivered += 1
 
-            await db.commit()
-    except Exception as e:
-        logger.debug("Webhook delivery failed: %s", e)
+        await db.commit()
+    return {
+        "attempted": attempted,
+        "delivered": delivered,
+        "failed": attempted - delivered,
+    }
 
 
 async def _deliver_to_endpoint(
@@ -215,7 +243,7 @@ async def _deliver_to_endpoint(
     endpoint: WebhookEndpoint,
     event_type: str,
     payload: dict,
-):
+) -> bool:
     """Deliver a single event to a single endpoint."""
     delivery_id = generate_ulid()
     full_payload = {
@@ -283,6 +311,7 @@ async def _deliver_to_endpoint(
         )
 
     db.add(delivery)
+    return delivery.status == "success"
 
 
 async def list_deliveries(

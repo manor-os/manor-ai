@@ -188,6 +188,7 @@ function workflowProjectionForGroup(
     nodes,
     workflowId: workflowIdForMessage(activityMessage) || workflowIdForMessage(actionMessage),
     currentNodeId: nonEmptyString(meta.workflow_current_step_id || actionStepId) || null,
+    retryFromStepId: nonEmptyString(action?.retry_from_step_id) || null,
     attemptNumber: Math.max(1, Number(meta.workflow_attempt_number || 1)),
     startedAt: activityMessage?.created_at || null,
     businessOutcome: nonEmptyString(
@@ -377,6 +378,9 @@ export function reconcileWorkspaceWorkflowRunGroups(
           currentNodeId: Object.hasOwn(latestRun, "current_step_id")
             ? nonEmptyString(latestRun.current_step_id) || null
             : group.projection.currentNodeId,
+          retryFromStepId: nonEmptyString(latestRun.retry_from_step_id)
+            || group.projection.retryFromStepId
+            || null,
           attemptNumber: Math.max(
             1,
             Number(latestRun.attempt_number || group.projection.attemptNumber || 1),
@@ -577,6 +581,9 @@ export function mergeWorkflowRunView(
       : hasAuthoritativeCurrentNode
         ? nonEmptyString(detail.current_step_id) || null
         : projection.currentNodeId || null,
+    retryFromStepId: projectionIsNewer
+      ? projection.retryFromStepId || null
+      : nonEmptyString(detail.retry_from_step_id) || projection.retryFromStepId || null,
     attemptNumber: Math.max(1, Number(detail.attempt_number || projection.attemptNumber || 1)),
     startedAt: nonEmptyString(detail.started_at) || projection.startedAt || null,
     completedAt: nonEmptyString(detail.completed_at) || projection.completedAt || null,
@@ -619,6 +626,16 @@ export function workflowApprovalReviewFromRunDetail(
 }
 
 function directInterventionAction(run: WorkflowRunView): WorkflowRunAction | null {
+  if (run.status === "failed" && run.currentNodeId) {
+    return {
+      kind: "workflow_retry",
+      workflow_run_id: run.id,
+      step_id: run.currentNodeId,
+      retry_from_step_id: run.retryFromStepId || run.currentNodeId,
+      editable_input_schema: { type: "object", properties: {} },
+      options: ["retry"],
+    };
+  }
   if (run.status === "failed") {
     return {
       kind: "workflow_cancel",
@@ -665,6 +682,7 @@ export interface WorkflowRunInvalidationContext {
 
 interface WorkspaceWorkflowRunHostProps {
   workspaceId?: string;
+  workspacePaused?: boolean;
   conversationId?: string;
   groups: WorkspaceWorkflowRunGroup[];
   onResolveMessage: (
@@ -685,6 +703,12 @@ interface WorkspaceWorkflowRunHostProps {
 type CancelRunMutationVariables = {
   runId: string;
   source: "direct" | "intervention";
+};
+
+type RetryRunMutationVariables = {
+  runId: string;
+  action: WorkflowRunAction;
+  variables?: Record<string, unknown>;
 };
 
 type CancelConfirmationIdentity = {
@@ -743,6 +767,7 @@ function runSwitcherLabel(run: WorkflowRunView): string {
 
 export default function WorkspaceWorkflowRunHost({
   workspaceId,
+  workspacePaused = false,
   conversationId,
   groups,
   onResolveMessage,
@@ -979,6 +1004,18 @@ export default function WorkspaceWorkflowRunHost({
       await invalidateRunSurfaces(foregroundRunId);
     },
   });
+  const retryMutation = useMutation({
+    mutationFn: ({ runId, action, variables }: RetryRunMutationVariables) => (
+      api.workflows.retryRun(runId, {
+        from_step_id: action.retry_from_step_id || action.step_id,
+        variables,
+        execute: true,
+      })
+    ),
+    onSuccess: async (_result, { runId }) => {
+      await invalidateRunSurfaces(runId);
+    },
+  });
 
   useEffect(() => {
     if (previousForegroundRunIdRef.current === foregroundRunId) return;
@@ -989,6 +1026,7 @@ export default function WorkspaceWorkflowRunHost({
     cancelMutation.reset();
     pauseMutation.reset();
     resumeMutation.reset();
+    retryMutation.reset();
     onRunChange?.();
   }, [foregroundRunId, onRunChange]);
 
@@ -1012,14 +1050,18 @@ export default function WorkspaceWorkflowRunHost({
   const interventionCancelError = cancelMutation.variables?.source === "intervention"
     ? cancelMutation.error
     : null;
-  const directActionError = interventionCancelError || pauseMutation.error || resumeMutation.error;
+  const directActionError = interventionCancelError
+    || pauseMutation.error
+    || resumeMutation.error
+    || retryMutation.error;
   const resolvingMessage = Boolean(
     actionMessageId && actionMessageId === resolveMessageId && resolveLoading,
   );
   const resolving = resolvingMessage
     || cancelMutation.isPending
     || pauseMutation.isPending
-    || resumeMutation.isPending;
+    || resumeMutation.isPending
+    || retryMutation.isPending;
   const scopedResolveError = actionMessageId === resolveMessageId ? resolveError : null;
   const workflowHref = foregroundRun.workflowId
     ? `/flows?workflow=${encodeURIComponent(foregroundRun.workflowId)}`
@@ -1056,6 +1098,12 @@ export default function WorkspaceWorkflowRunHost({
     const normalizedChoice = normalizeWorkflowActionChoice(choice);
     if (normalizedChoice === "resume") {
       await resumeMutation.mutateAsync();
+    } else if (normalizedChoice === "retry" && interventionAction?.kind === "workflow_retry") {
+      await retryMutation.mutateAsync({
+        runId: foregroundRunId,
+        action: interventionAction,
+        variables: payload?.variables as Record<string, unknown> | undefined,
+      });
     } else if (normalizedChoice === "cancel") {
       await cancelMutation.mutateAsync({
         runId: foregroundRunId,
@@ -1173,7 +1221,7 @@ export default function WorkspaceWorkflowRunHost({
                   className="workflow-run-pause-action"
                   title={t("component.workflow_run.action.pause")}
                   aria-label={t("component.workflow_run.action.pause")}
-                  disabled={resolving}
+                  disabled={workspacePaused || resolving}
                   onClick={() => pauseMutation.mutate()}
                 >
                   {pauseMutation.isPending
@@ -1186,7 +1234,7 @@ export default function WorkspaceWorkflowRunHost({
                 className="workflow-run-cancel-action"
                 title={cancelActionLabel}
                 aria-label={cancelActionLabel}
-                disabled={resolving}
+                disabled={workspacePaused || resolving}
                 onClick={openCancellationConfirmation}
               >
                 {cancelMutation.isPending
@@ -1207,7 +1255,7 @@ export default function WorkspaceWorkflowRunHost({
             run={foregroundRun}
             action={headerInterventionAction}
             onResolve={resolveIntervention}
-            disabled={resolving || !canControl}
+            disabled={workspacePaused || resolving || !canControl}
             loading={resolving}
             error={scopedResolveError || directActionError}
             historyHref={historyHref}

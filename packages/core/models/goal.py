@@ -1,7 +1,7 @@
 """Persistent business goals — the north-star layer of the runtime.
 
-A Goal is a metric the workspace commits to moving (e.g. "10k Twitter
-followers by Oct 24"). The Strategist reads active goals + their pace
+A Goal is an outcome the workspace commits to reaching, measured by a metric
+(e.g. "10k Twitter followers by Oct 24"). The Strategist reads active goals + their pace
 to propose weekly tasks; the measurement service appends
 ``goal_measurements`` rows on a cadence; goal_task_links attribute
 impact back to specific tasks.
@@ -16,9 +16,11 @@ from datetime import date, datetime
 from decimal import Decimal
 from typing import Optional
 
-from sqlalchemy import Date, DateTime, Index, Integer, Numeric, SmallInteger, String, Text, func
+from sqlalchemy import Date, DateTime, Index, Integer, Numeric, SmallInteger, String, Text, func, text
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
+
+from packages.core.constants.goals import GoalStatus
 
 from .base import Base, TimestampMixin, generate_ulid
 
@@ -31,6 +33,22 @@ class Goal(Base, TimestampMixin):
         Index("ix_goals_workspace_status", "workspace_id", "status"),
         Index("ix_goals_entity_status", "entity_id", "status"),
         Index("ix_goals_stat_id", "stat_id"),
+        Index(
+            "uq_goals_workspace_goal_key",
+            "workspace_id",
+            "goal_key",
+            unique=True,
+            postgresql_where=text("workspace_id IS NOT NULL"),
+            sqlite_where=text("workspace_id IS NOT NULL"),
+        ),
+        Index(
+            "uq_goals_entity_goal_key",
+            "entity_id",
+            "goal_key",
+            unique=True,
+            postgresql_where=text("workspace_id IS NULL"),
+            sqlite_where=text("workspace_id IS NULL"),
+        ),
     )
 
     id: Mapped[str] = mapped_column(String(26), primary_key=True, default=generate_ulid)
@@ -47,8 +65,18 @@ class Goal(Base, TimestampMixin):
     title: Mapped[str] = mapped_column(String(255), nullable=False)
     description: Mapped[Optional[str]] = mapped_column(Text)
 
+    goal_key: Mapped[str] = mapped_column(
+        String(100),
+        nullable=False,
+        default=lambda: f"goal_{generate_ulid().lower()}",
+    )
+    # Stable logical identity used by Workspace contracts and Blueprints.
+    # Unlike metric_key, this is unique within a Workspace (or entity scope)
+    # and never changes when the measured metric changes.
+
     metric_key: Mapped[str] = mapped_column(String(100), nullable=False)
     # Canonical key like 'follower_count' | 'mrr' | 'engagement_rate'.
+    # Multiple Goals may intentionally share the same metric_key.
     # Matches the key used by measurement_source + the corresponding
     # integration adapter's result shape.
 
@@ -64,7 +92,11 @@ class Goal(Base, TimestampMixin):
     # 'on_track' | 'behind' | 'ahead' | 'at_risk' | 'achieved' | 'unknown'
     pace_computed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
 
-    status: Mapped[str] = mapped_column(String(20), nullable=False, default="active")
+    status: Mapped[str] = mapped_column(
+        String(20),
+        nullable=False,
+        default=GoalStatus.ACTIVE.value,
+    )
     # 'active' | 'achieved' | 'abandoned' | 'paused'
 
     measurement_source: Mapped[Optional[dict]] = mapped_column(JSONB)

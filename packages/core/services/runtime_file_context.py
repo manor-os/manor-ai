@@ -7,7 +7,7 @@ from typing import Any
 from fastapi import UploadFile
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from packages.core.ai.runtime import RUNTIME_ATTACHMENT_CONTEXT_METADATA_KEY
+from packages.core.ai.runtime import ChatSurface, RUNTIME_ATTACHMENT_CONTEXT_METADATA_KEY
 from packages.core.services.file_context import FileAttachments, build_file_context
 
 
@@ -51,6 +51,7 @@ async def prepare_runtime_file_context_turn(
     db: AsyncSession,
     workspace_id: str | None = None,
     user_id: str | None = None,
+    surface: ChatSurface | None = None,
 ) -> RuntimeFileContextTurn:
     cleaned_message, inline_doc_ids = extract_runtime_inline_document_refs(message)
     doc_ids = _normalize_document_ids(document_ids)
@@ -62,6 +63,7 @@ async def prepare_runtime_file_context_turn(
         db,
         workspace_id=workspace_id,
         user_id=user_id,
+        surface=surface,
     )
     return RuntimeFileContextTurn(
         cleaned_message=cleaned_message,

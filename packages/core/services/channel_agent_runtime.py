@@ -30,6 +30,7 @@ class ChannelAgentRunResult:
     content: str
     runtime_meta: dict[str, Any] | None = None
     runtime_envelope: Any | None = None
+    stop_reason: str | None = None
 
 
 async def run_channel_agent_turn(
@@ -42,6 +43,8 @@ async def run_channel_agent_turn(
     history: list[dict],
     sender_ctx: Optional[dict] = None,
     subscription: Optional[ResolvedSubscription] = None,
+    reply_route: dict[str, Any] | None = None,
+    runtime_metadata: dict[str, Any] | None = None,
 ) -> Optional[ChannelAgentRunResult]:
     """Run the bound channel agent through the Runtime Harness."""
     from packages.core.constants.agents import is_master_agent
@@ -97,11 +100,12 @@ async def run_channel_agent_turn(
     attachment_handler = None
     extra_tool_schemas: list[dict] = []
     extra_allowed_tool_names: set[str] = set()
-    if channel_cc is not None and channel_reply_to:
+    if channel_cc is not None and channel_reply_to and reply_route is not None:
         attachment_tool_schema, attachment_handler = build_channel_attachment_tool(
             channel_cc,
             channel_adapter_key,
             channel_reply_to,
+            reply_route=reply_route,
         )
         extra_tool_schemas.append(attachment_tool_schema)
         extra_allowed_tool_names.add(RUNTIME_CHANNEL_ATTACHMENT_TOOL_NAME)
@@ -118,6 +122,7 @@ async def run_channel_agent_turn(
         message=current_message,
         sender_context=sender_ctx,
         legacy_path="channel_agent_runtime.run_channel_agent_turn",
+        metadata=runtime_metadata,
     )
     async with async_session() as db:
         appendix = await runtime_prepare_prompt_appendix_for_turn(
@@ -128,6 +133,10 @@ async def run_channel_agent_turn(
             bound_tool_names=runtime.bound_tool_names,
             is_master=runtime.is_master,
             mcp_allowed_names=runtime.mcp_allowed_names,
+            mcp_provider_scopes=getattr(runtime, "mcp_provider_scopes", ()),
+            mcp_scope_unrestricted=bool(
+                getattr(runtime, "mcp_scope_unrestricted", False)
+            ),
             active_user_message=current_message,
             legacy_extra_context=runtime.extra_context,
             extra_tool_schemas=extra_tool_schemas,
@@ -147,6 +156,43 @@ async def run_channel_agent_turn(
         attachment_handler = None
 
     system_prompt = runtime_merge_prompt_appendix(base_prompt, appendix)
+
+    is_cancelled = None
+    if (
+        (runtime_metadata or {}).get("voice_session_mode") == "chat_gateway"
+        and (runtime_metadata or {}).get("voice_origin_message_id")
+    ):
+        from packages.core.services.voice.work_queue import (
+            voice_work_was_interrupted,
+        )
+
+        voice_origin_message_id = str(
+            (runtime_metadata or {}).get("voice_origin_message_id")
+        )
+        twilio_call_session_id = str(
+            (runtime_metadata or {}).get("twilio_call_session_id") or ""
+        ).strip()
+
+        async def voice_turn_cancelled() -> bool:
+            async with async_session() as cancel_db:
+                interrupted = await voice_work_was_interrupted(
+                    cancel_db,
+                    message_id=voice_origin_message_id,
+                    conversation_id=conversation_id,
+                )
+                if interrupted or not twilio_call_session_id:
+                    return interrupted
+                from packages.core.services.voice.binding import (
+                    twilio_call_binding_is_valid,
+                )
+
+                return not await twilio_call_binding_is_valid(
+                    cancel_db,
+                    twilio_call_session_id,
+                    conversation_id=conversation_id,
+                )
+
+        is_cancelled = voice_turn_cancelled
 
     result = await runtime_execute_channel_agent_loop(
         runtime_envelope=runtime_envelope,
@@ -172,14 +218,17 @@ async def run_channel_agent_turn(
             if attachment_handler is not None
             else None
         ),
+        is_cancelled=is_cancelled,
     )
     content = (result.content or "").strip()
-    if not content:
+    stop_reason = str(getattr(result, "stop_reason", "") or "").strip() or None
+    if not content and stop_reason not in {"cancelled", "canceled"}:
         return None
     return ChannelAgentRunResult(
         content=content,
         runtime_meta=runtime_envelope_meta(runtime_envelope),
         runtime_envelope=runtime_envelope,
+        stop_reason=stop_reason,
     )
 
 
@@ -221,9 +270,29 @@ async def resolve_channel_base_prompt(
     return fallback
 
 
-def build_channel_attachment_tool(cc, channel_type: str, reply_to: str):
+def build_channel_attachment_tool(
+    cc,
+    channel_type: str,
+    reply_to: str,
+    *,
+    reply_route: dict[str, Any],
+):
     """Return a channel-local attachment sender tool schema and handler."""
     schema = runtime_channel_attachment_tool_schema()
+
+    async def route_is_active() -> bool:
+        from packages.core.services.channel_outbound_delivery import (
+            channel_reply_route_is_active,
+        )
+
+        try:
+            return await channel_reply_route_is_active(**reply_route)
+        except Exception:
+            logger.warning(
+                "Channel attachment route validation failed",
+                exc_info=True,
+            )
+            return False
 
     async def handler(args: dict) -> str:
         adapter = ADAPTERS.get(channel_type)
@@ -234,6 +303,8 @@ def build_channel_attachment_tool(cc, channel_type: str, reply_to: str):
         caption = args.get("caption")
         if not url:
             return json.dumps({"error": "url is required"})
+        if not await route_is_active():
+            return json.dumps({"error": "reply route unavailable"})
         try:
             result = await adapter.send_attachment(
                 cc,
@@ -244,6 +315,8 @@ def build_channel_attachment_tool(cc, channel_type: str, reply_to: str):
             )
         except NotImplementedError as exc:
             fallback = (caption + "\n\n" if caption else "") + str(url)
+            if not await route_is_active():
+                return json.dumps({"error": "reply route unavailable"})
             try:
                 await adapter.send_text(cc, reply_to, fallback)
                 return json.dumps({

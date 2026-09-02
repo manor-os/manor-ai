@@ -21,8 +21,9 @@ flows. Do not commit provider credentials into source control.
 
 ## Public URLs
 
-Providers need a stable HTTPS callback URL. Set `PUBLIC_BASE_URL` to the
-external URL for your deployment.
+First-party OAuth providers need a stable callback URL based on `APP_URL`:
+`{APP_URL}/api/v1/integrations/oauth/{server_key}/callback`. Inbound webhook
+providers need `PUBLIC_BASE_URL` to point at the externally reachable API URL.
 
 ## Local Testing
 

@@ -7,10 +7,11 @@ Ported from Java backend:
   - WhatsAppAnnouncementServiceImpl (broadcast announcements)
 
 Configuration:
-  Per-entity credentials are stored in ChannelConfig.credentials (encrypted JSONB).
-  Global fallback env vars:
-    TWILIO_ACCOUNT_SID / TWILIO_AUTH_TOKEN   — default Twilio credentials
-    WHATSAPP_API_TOKEN / WHATSAPP_PHONE_ID   — WhatsApp Cloud API defaults
+  Source-linked ChannelConfigs lease credentials from their owner Integration.
+  Legacy standalone ChannelConfigs remain supported through the same lease API.
+  WhatsApp still supports its documented deployment-level defaults for
+  backwards compatibility; Twilio credentials are never read from deployment
+  environment variables.
 """
 from __future__ import annotations
 
@@ -21,7 +22,7 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from typing import Optional
 
-from sqlalchemy import func, select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from packages.core.models.base import generate_ulid
@@ -32,13 +33,14 @@ from packages.core.models.channel import (
     MessageLog,
     PhoneNumber,
 )
+from packages.core.services.channel_credentials import lease_channel_config_credentials
+from packages.core.services import smtp_transport
 
 logger = logging.getLogger(__name__)
 
 _SMS_CHANNEL_TYPES = {"sms", "twilio_sms"}
 _VOICE_CHANNEL_TYPES = {"voice", "twilio_voice"}
 
-# Optional heavy imports — fail gracefully if not installed
 try:
     import aiosmtplib
 except ImportError:
@@ -269,15 +271,12 @@ async def _send_email(
     attachments: list[dict] | None,
 ) -> dict:
     """Send email via SMTP. Config maps from Java ClientEmailConfig / SysSourceConfig."""
-    if aiosmtplib is None:
-        return {"error": "aiosmtplib is not installed"}
-
-    # The Integration→ChannelConfig bridge stores the whole IMAP+SMTP
-    # bundle in ``credentials``; older hand-made rows put the non-secret
-    # half in ``config``. Check both before falling back to platform env,
-    # otherwise an entity's own mail server is silently ignored.
+    # Source-linked bridges keep this token bundle on their Integration;
+    # standalone legacy rows are handled by the same lease helper.
     cfg = config.config or {}
-    creds = config.credentials or {}
+    creds = await lease_channel_config_credentials(
+        config, reason="channel_service.email.send",
+    )
 
     def _setting(key: str, env: str, default: str = "") -> str:
         value = cfg.get(key, creds.get(key))
@@ -322,15 +321,31 @@ async def _send_email(
         msg.attach(MIMEText(html_content, "html"))
 
     try:
-        await aiosmtplib.send(
-            msg,
-            hostname=smtp_host,
-            port=smtp_port,
-            username=username or None,
-            password=password or None,
-            use_tls=use_ssl,
-            start_tls=use_starttls,
-        )
+        # The normal product path uses aiosmtplib. Keep the optional SOCKS
+        # transport for cloud environments that explicitly enable it.
+        if smtp_transport.proxy_settings() is not None:
+            await smtp_transport.send_message_async(
+                message=msg,
+                host=smtp_host,
+                port=smtp_port,
+                username=username or None,
+                password=password or None,
+                use_starttls=use_starttls,
+                use_ssl=use_ssl,
+                timeout=20,
+            )
+        elif aiosmtplib is None:
+            return {"error": "aiosmtplib is not installed", "from_address": from_email}
+        else:
+            await aiosmtplib.send(
+                msg,
+                hostname=smtp_host,
+                port=smtp_port,
+                username=username or None,
+                password=password or None,
+                use_tls=use_ssl,
+                start_tls=use_starttls,
+            )
         return {"from_address": from_email}
     except Exception as exc:
         return {"error": f"SMTP send failed: {exc}", "from_address": from_email}
@@ -341,12 +356,15 @@ async def _send_sms(config: ChannelConfig, *, to: str, content: str) -> dict:
     if TwilioClient is None:
         return {"error": "twilio library is not installed"}
 
-    account_sid = config.credentials.get("account_sid", os.getenv("TWILIO_ACCOUNT_SID", ""))
-    auth_token = config.credentials.get("auth_token", os.getenv("TWILIO_AUTH_TOKEN", ""))
+    credentials = await lease_channel_config_credentials(
+        config, reason="channel_service.twilio_sms.send",
+    )
+    account_sid = credentials.get("account_sid", "")
+    auth_token = credentials.get("auth_token", "")
     from_number = (
         config.config.get("phone_number", "")
-        or config.credentials.get("phone_number", "")
-        or config.credentials.get("from_number", "")
+        or credentials.get("phone_number", "")
+        or credentials.get("from_number", "")
     )
 
     if not account_sid or not auth_token:
@@ -379,8 +397,20 @@ async def _send_whatsapp(config: ChannelConfig, *, to: str, content: str) -> dic
     if httpx is None:
         return {"error": "httpx library is not installed"}
 
-    api_token = config.credentials.get("api_token", os.getenv("WHATSAPP_API_TOKEN", ""))
-    phone_number_id = config.config.get("phone_number_id", os.getenv("WHATSAPP_PHONE_ID", ""))
+    credentials = await lease_channel_config_credentials(
+        config,
+        reason="channel_service.whatsapp.send",
+        resolve_nango=True,
+    )
+    api_token = (
+        credentials.get("access_token")
+        or credentials.get("api_token")
+    )
+    phone_number_id = (
+        config.config.get("phone_number_id")
+        or credentials.get("phone_number_id")
+        or credentials.get("phone_id")
+    )
     api_version = config.config.get("api_version", "v21.0")
 
     if not api_token:
@@ -421,12 +451,15 @@ async def _send_voice_call(config: ChannelConfig, *, to: str, twiml_url: str) ->
     if TwilioClient is None:
         return {"error": "twilio library is not installed"}
 
-    account_sid = config.credentials.get("account_sid", os.getenv("TWILIO_ACCOUNT_SID", ""))
-    auth_token = config.credentials.get("auth_token", os.getenv("TWILIO_AUTH_TOKEN", ""))
+    credentials = await lease_channel_config_credentials(
+        config, reason="channel_service.twilio_voice.send",
+    )
+    account_sid = credentials.get("account_sid", "")
+    auth_token = credentials.get("auth_token", "")
     from_number = (
         config.config.get("phone_number", "")
-        or config.credentials.get("phone_number", "")
-        or config.credentials.get("from_number", "")
+        or credentials.get("phone_number", "")
+        or credentials.get("from_number", "")
     )
 
     if not account_sid or not auth_token:
@@ -478,6 +511,21 @@ async def handle_inbound_message(
         or payload.get("external_id")
     )
 
+    raw_attachments = payload.get("attachments")
+    logged_attachments = None
+    if isinstance(raw_attachments, list) and raw_attachments:
+        logged_attachments = {
+            "items": [
+                {
+                    key: value
+                    for key, value in item.items()
+                    if key not in {"data_base64", "content_base64"}
+                }
+                for item in raw_attachments
+                if isinstance(item, dict)
+            ]
+        }
+
     log_entry = MessageLog(
         id=generate_ulid(),
         entity_id=entity_id,
@@ -490,6 +538,7 @@ async def handle_inbound_message(
         subject=subject,
         content=content,
         html_content=payload.get("html_content"),
+        attachments=logged_attachments,
         external_id=external_id,
         status="received",
     )
@@ -505,6 +554,7 @@ async def handle_inbound_message(
 async def list_messages(
     db: AsyncSession,
     entity_id: str,
+    user_id: str,
     *,
     conversation_id: str | None = None,
     channel_type: str | None = None,
@@ -513,7 +563,23 @@ async def list_messages(
     offset: int = 0,
 ) -> list[MessageLog]:
     """List message logs with optional filters."""
-    q = select(MessageLog).where(MessageLog.entity_id == entity_id)
+    q = (
+        select(MessageLog)
+        .outerjoin(ChannelConfig, MessageLog.channel_config_id == ChannelConfig.id)
+        .where(
+            MessageLog.entity_id == entity_id,
+            or_(
+                MessageLog.channel_config_id.is_(None),
+                ChannelConfig.owner_user_id == user_id,
+                and_(
+                    ChannelConfig.id.is_not(None),
+                    ChannelConfig.owner_user_id.is_(None),
+                    ChannelConfig.credential_source_kind.is_(None),
+                    ChannelConfig.credential_source_id.is_(None),
+                ),
+            ),
+        )
+    )
     if conversation_id:
         q = q.where(MessageLog.conversation_id == conversation_id)
     if channel_type:
@@ -532,7 +598,6 @@ async def get_message_stats(
     days: int = 30,
 ) -> dict:
     """Aggregate message statistics for the last N days."""
-    cutoff = func.now() - func.cast(f"{days} days", func.literal_column("INTERVAL"))
     # Simpler approach: just count by status and channel_type
     q = (
         select(

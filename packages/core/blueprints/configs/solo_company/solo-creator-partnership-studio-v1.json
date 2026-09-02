@@ -1,0 +1,1107 @@
+{
+  "manifest": {
+    "blueprint_version": "1.1",
+    "slug": "solo-creator-partnership-studio-v1",
+    "title": "Creator Partnership Deal Room",
+    "summary": "A demo workspace that takes a creator partnership from opportunity discovery through proposal approval, negotiation, campaign delivery, and performance recap.",
+    "use_when": "Use this demo to show creators, brands, and partners how Manor closes a commercial collaboration loop with human approval at every external or financial decision.",
+    "description": "Runs a fictional creator-brand collaboration from a qualified opportunity to an approved commercial proposal, agreement summary, campaign delivery, receipt, and performance recap. The sandbox walkthrough is deterministic and does not contact a real brand or publish externally.",
+    "tags": [
+      "creator",
+      "partnerships",
+      "brand-deals",
+      "demo"
+    ],
+    "kind": "one_person_company",
+    "category": "solo.creator_partnerships",
+    "author": {
+      "handle": "manor",
+      "display_name": "Manor AI"
+    },
+    "cover_image_url": null,
+    "forked_from_id": null,
+    "changelog": "Frozen on 2026-08-09: first end-to-end creator partnership demo with opportunity, approval, negotiation, delivery, receipt, and recap stages."
+  },
+  "contract": {
+    "variables": [
+      {
+        "key": "business_name",
+        "label": "Business name",
+        "required": false,
+        "default": "Luma Creator Studio"
+      },
+      {
+        "key": "operator_timezone",
+        "label": "Operator timezone",
+        "required": false,
+        "default": "America/Los_Angeles"
+      }
+    ],
+    "channels": [
+      {
+        "channel_type": "telegram",
+        "purpose": "approval alerts for outreach, commercial terms, and campaign delivery",
+        "required": false
+      }
+    ],
+    "sessions": [
+      {
+        "provider": "linkedin",
+        "label": "main",
+        "purpose": "Brand and partner research when paired.",
+        "required": false
+      },
+      {
+        "provider": "gmail",
+        "label": "main",
+        "purpose": "Approved partner outreach and negotiation when paired.",
+        "required": false
+      },
+      {
+        "provider": "stripe",
+        "label": "main",
+        "purpose": "Deposit and payment-status review when paired.",
+        "required": false
+      }
+    ],
+    "requires": {
+      "manor_min_version": "1.0",
+      "tools": [
+        "read_finance_ledger",
+        "record_finance_ledger",
+        "read_relationship_ledger",
+        "record_relationship_ledger"
+      ],
+      "mcp_servers": [],
+      "skills": [],
+      "agents": []
+    }
+  },
+  "embedded": {
+    "skills": [
+      {
+        "slug": "creator-partnership-closer-playbook-v1",
+        "name": "Creator Partnership Closer Playbook",
+        "display_name": "Creator Partnership Closer Playbook",
+        "description": "Qualifies brand fit, packages a creator offer, protects commercial terms, and closes the delivery loop with evidence.",
+        "system_prompt": "Operate a creator partnership pipeline from fit assessment to verified delivery. Read the relationship ledger before partner follow-up and append confirmed interactions with stable identity keys and evidence references. Use the finance ledger for validated invoices, deposits, payments, and receipts, citing Knowledge evidence. Tie every opportunity to audience fit, campaign outcome, deliverables, usage rights, exclusivity, price, payment terms, approval, and evidence. Never send outreach, accept terms, publish content, grant rights, or claim payment without explicit operator approval and a durable receipt.",
+        "tools": [
+          "read_finance_ledger",
+          "record_finance_ledger",
+          "read_relationship_ledger",
+          "record_relationship_ledger"
+        ],
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "request": {
+              "type": "string"
+            },
+            "workspace_context": {
+              "type": "object"
+            }
+          }
+        },
+        "output_format": "markdown",
+        "category": "one-person-company",
+        "tags": [
+          "workspace-blueprint",
+          "solo-creator-partnership-studio-v1"
+        ],
+        "version": "1.0.0",
+        "config": {
+          "frozen_at": "2026-08-09"
+        },
+        "status": "active"
+      }
+    ],
+    "agents": [
+      {
+        "slug": "creator-partnership-scout-v1",
+        "name": "Partnership Scout",
+        "description": "Finds and qualifies partnership opportunities against audience and brand-fit rules.",
+        "system_prompt": "Own opportunity discovery and qualification for a creator business. Produce shortlists with fit, audience overlap, campaign hypothesis, commercial signal, risk, and next action. Mark all disconnected-source findings as simulation assumptions.",
+        "config": {
+          "model_mode": "inherit",
+          "temperature": 0.2
+        },
+        "category": "one-person-company",
+        "tags": [
+          "workspace-blueprint",
+          "solo-creator-partnership-studio-v1"
+        ],
+        "version": "1.0",
+        "tool_bindings": [],
+        "mcp_bindings": [],
+        "skill_bindings": [
+          "creator-partnership-closer-playbook-v1"
+        ],
+        "starter_memory": [
+          {
+            "memory_type": "instruction",
+            "scope": "commercial_safety",
+            "content": "A promising logo is not a qualified opportunity. Require audience fit, a concrete campaign outcome, plausible budget, and a named next step before recommending outreach.",
+            "importance": 9,
+            "confidence": 1.0
+          }
+        ]
+      },
+      {
+        "slug": "creator-deal-manager-v1",
+        "name": "Creator Deal Manager",
+        "description": "Builds the proposal, negotiation packet, usage-rights guardrails, and agreement summary.",
+        "system_prompt": "Own creator partnership proposals and negotiation. Make fee, deliverables, schedule, revisions, usage rights, exclusivity, cancellation, deposit, and payment timing explicit. Prepare review packets but never send or accept commercial terms without operator approval.",
+        "config": {
+          "model_mode": "inherit",
+          "temperature": 0.2
+        },
+        "category": "one-person-company",
+        "tags": [
+          "workspace-blueprint",
+          "solo-creator-partnership-studio-v1"
+        ],
+        "version": "1.0",
+        "tool_bindings": [],
+        "mcp_bindings": [],
+        "skill_bindings": [
+          "creator-partnership-closer-playbook-v1"
+        ],
+        "starter_memory": []
+      },
+      {
+        "slug": "creator-campaign-operator-v1",
+        "name": "Campaign Delivery Operator",
+        "description": "Coordinates approved deliverables, review, delivery evidence, and the post-campaign recap.",
+        "system_prompt": "Own approved campaign delivery. Convert the agreement summary into a production checklist, keep every asset tied to a deliverable, obtain exact-output approval before external delivery, record receipts, and close with a performance recap and next-partnership recommendation.",
+        "config": {
+          "model_mode": "inherit",
+          "temperature": 0.2
+        },
+        "category": "one-person-company",
+        "tags": [
+          "workspace-blueprint",
+          "solo-creator-partnership-studio-v1"
+        ],
+        "version": "1.0",
+        "tool_bindings": [],
+        "mcp_bindings": [],
+        "skill_bindings": [
+          "creator-partnership-closer-playbook-v1"
+        ],
+        "starter_memory": []
+      }
+    ],
+    "knowledge_packs": [
+      {
+        "slug": "creator-partnership-demo-room",
+        "title": "Creator Partnership Demo Room",
+        "purpose": "Store the fictional creator profile, partner criteria, commercial guardrails, delivery checklist, and recap template used by the demo.",
+        "mode": "inline_text",
+        "folder_structure": [
+          "creator-profile/",
+          "opportunities/",
+          "commercial/",
+          "campaigns/",
+          "recaps/",
+          "relationship-ledger/",
+          "finance-ledger/"
+        ],
+        "starter_documents": [
+          {
+            "path": "creator-profile/luma-studio-profile.md",
+            "body_md": "# Luma Creator Studio — Demo Profile\n\n> Fictional sandbox data for product demonstration only.\n\n## Audience\n185,000 total followers across short-form video and newsletter. Core audience: US-based creative professionals and independent founders aged 24–39.\n\n## Content promise\nPractical, calm systems for creative work and sustainable productivity.\n\n## Partnership fit\nStrong: creator tools, design software, workspace products, coffee and wellness brands with measurable trial or lead goals.\n\n## Guardrails\nNo gambling, speculative finance, deceptive wellness, undisclosed sponsorships, or perpetual paid-media usage rights.\n"
+          },
+          {
+            "path": "commercial/rate-card-and-rights.md",
+            "body_md": "# Demo Rate Card and Rights Guardrails\n\n> Fictional values; not a real offer.\n\n- One short-form video: $8,500 base.\n- Newsletter integration: $4,000 base.\n- Bundle: $11,500 before usage rights.\n- Paid usage: priced separately by channel and duration.\n- Exclusivity: priced separately and limited to a named category and period.\n- Payment: 50% deposit, balance net 15 after approved delivery.\n- Two revision rounds included; scope changes require a written change order.\n"
+          },
+          {
+            "path": "opportunities/qualification-scorecard.md",
+            "body_md": "# Partnership Qualification Scorecard\n\nScore each opportunity from 0–5 on audience fit, product credibility, campaign outcome clarity, budget signal, creative fit, rights risk, and delivery feasibility.\n\nAdvance only when the opportunity has a score of 24 or higher, no prohibited-category conflict, and a named human next step.\n"
+          },
+          {
+            "path": "campaigns/delivery-and-recap-checklist.md",
+            "body_md": "# Campaign Delivery and Recap Checklist\n\n## Before production\nConfirm exact deliverables, claims, disclosure, due dates, review window, usage rights, links, and measurement window.\n\n## Before delivery\nObtain Creator approval on the exact assets. Confirm no customer or private data appears.\n\n## Closeout\nRecord delivery receipt, approval status, payment status, measured results or missing-data note, learning, and recommended next partnership action.\n"
+          },
+          {
+            "path": "relationship-ledger/README.md",
+            "body_md": "# Relationship Ledger\n\nUse `read_relationship_ledger` before qualifying or following up with a partner. Record confirmed calls, proposals, approvals, delivery receipts, and next actions with `record_relationship_ledger`; preserve a stable identity key and evidence references. Do not treat an unverified lead note as a commitment.\n"
+          },
+          {
+            "path": "finance-ledger/README.md",
+            "body_md": "# Finance Ledger\n\nUse `read_finance_ledger` for validated invoices, deposits, payments, refunds, and receipts. Record entries with `record_finance_ledger` and cite the supporting Knowledge invoice, bill, receipt, or agreement. Keep commercial approval separate from bookkeeping or tax advice.\n"
+          }
+        ],
+        "external_source": null
+      }
+    ]
+  },
+  "recipe": {
+    "operating_model": {
+      "kind": "one_person_company",
+      "context": "A fictional creator studio is seeking a values-aligned paid brand collaboration and needs to turn opportunity discovery into a controlled, evidence-backed delivery loop.",
+      "primary_work": "Qualify a creator partnership, approve the exact commercial proposal, negotiate guardrails, deliver the campaign, record a receipt, and convert results into the next opportunity.",
+      "settings": {
+        "timezone": "America/Los_Angeles",
+        "blueprint_frozen": true,
+        "frozen_at": "2026-08-09",
+        "install_expectation": "simulate_first_then_promote",
+        "ledger_contracts": [
+          {
+            "contract_id": "manor.relationship_ledger/v1",
+            "schema_version": 1,
+            "directory": "relationship-ledger",
+            "knowledge_path": "relationship-ledger/README.md",
+            "subject_types": ["person", "organization", "customer", "partner", "prospect", "lead"]
+          },
+          {
+            "contract_id": "manor.finance_ledger/v1",
+            "schema_version": 1,
+            "directory": "finance-ledger",
+            "knowledge_path": "finance-ledger/README.md"
+          }
+        ]
+      },
+      "services": [
+        {
+          "key": "partnerships.discovery",
+          "name": "Opportunity discovery",
+          "description": "Find and qualify brand opportunities against audience fit and commercial rules."
+        },
+        {
+          "key": "partnerships.deal",
+          "name": "Proposal and negotiation",
+          "description": "Prepare the commercial proposal, review terms, and protect usage rights and payment."
+        },
+        {
+          "key": "partnerships.delivery",
+          "name": "Campaign delivery and recap",
+          "description": "Coordinate approved deliverables, receipts, measurement, and the follow-on recommendation."
+        }
+      ],
+      "rules": [
+        "Every opportunity must pass audience-fit, commercial-signal, rights-risk, and delivery-feasibility checks.",
+        "Outreach, pricing, usage rights, exclusivity, agreement acceptance, publishing, and delivery require Creator approval.",
+        "A partnership is not complete until the delivery receipt, payment status, result evidence, and next action are recorded."
+      ],
+      "review_cadence": {
+        "daily": "Review decisions and blockers on active deals.",
+        "weekly": "Review qualified opportunities, deal movement, delivery status, and follow-on potential."
+      }
+    },
+    "strategist": {
+      "business_model": {
+        "model_type": "services_delivery",
+        "primary_metric": "partnerships_closed",
+        "secondary_metrics": [
+          "qualified_opportunities",
+          "proposal_acceptance_rate",
+          "campaigns_delivered_on_time"
+        ],
+        "revenue_model": "Paid creator partnerships with separately priced usage rights and deposit-first terms."
+      },
+      "cadence": {
+        "schedule": "weekly",
+        "trigger_conditions": [
+          "qualified_pipeline_below_target",
+          "proposal_waiting_over_seven_days",
+          "campaign_delivery_at_risk"
+        ]
+      },
+      "proposal_shape": "next_best_partnership_action",
+      "priors": [
+        "One well-matched partnership is more valuable than a large generic outreach list.",
+        "Rights, scope, approval, delivery evidence, and payment status are part of the same deal loop."
+      ],
+      "evaluation_rubric": {
+        "weights": {
+          "audience_fit": 0.3,
+          "commercial_value": 0.3,
+          "delivery_fit": 0.25,
+          "risk": 0.15
+        }
+      },
+      "do_not_propose": [
+        "Mass outreach without a brand-specific fit reason.",
+        "Perpetual usage rights or undefined exclusivity without explicit review."
+      ],
+      "voice": "commercial, creator-protective, concise"
+    },
+    "prompts": [
+      {
+        "key": "weekly_partnership_review",
+        "title": "Weekly partnership review",
+        "body": "Summarize qualified opportunities, proposal movement, delivery status, money and rights risks, and the single next decision required from the Creator."
+      }
+    ],
+    "subscriptions": [
+      {
+        "service_key": "partnerships.discovery",
+        "agent_slug": "creator-partnership-scout-v1",
+        "custom_prompt": "Run opportunity discovery in sandbox-first mode. Label fictional and disconnected-source data clearly. Do not contact a brand.",
+        "config": {
+          "workspace_blueprint_slug": "solo-creator-partnership-studio-v1",
+          "primary_service": "partnerships.discovery",
+          "service_name": "Opportunity discovery"
+        }
+      },
+      {
+        "service_key": "partnerships.deal",
+        "agent_slug": "creator-deal-manager-v1",
+        "custom_prompt": "Prepare proposals and negotiation packets in sandbox-first mode. Do not send, accept, sign, or promise terms without Creator approval.",
+        "config": {
+          "workspace_blueprint_slug": "solo-creator-partnership-studio-v1",
+          "primary_service": "partnerships.deal",
+          "service_name": "Proposal and negotiation"
+        }
+      },
+      {
+        "service_key": "partnerships.delivery",
+        "agent_slug": "creator-campaign-operator-v1",
+        "custom_prompt": "Run approved delivery and recap work in sandbox-first mode. Require exact-output approval and record simulated receipts.",
+        "config": {
+          "workspace_blueprint_slug": "solo-creator-partnership-studio-v1",
+          "primary_service": "partnerships.delivery",
+          "service_name": "Campaign delivery and recap"
+        }
+      }
+    ],
+    "scheduled_jobs": [
+      {
+        "job_id": "creator-partnership-weekly-pipeline-review",
+        "name": "Weekly partnership pipeline review",
+        "job_type": "cron",
+        "schedule_kind": "cron",
+        "cron_expr": "0 9 * * 1",
+        "timezone": "America/Los_Angeles",
+        "execution_type": "agent",
+        "execution_target": {
+          "service_key": "partnerships.discovery",
+          "max_turns": 6,
+          "deliverable": "Inline markdown partnership review in workspace_chat. Include qualified opportunities, fit reasons, deal stage, blocker, rights or money risk, and next Creator decision. No file attachment is required.",
+          "done_when": "The workspace_chat response identifies the next partnership decision, marks disconnected-source facts as simulation or unknown, and does not require or claim any external outreach, deal acceptance, publishing, payment, or file attachment.",
+          "delivery_mode": "workspace_chat"
+        },
+        "payload_message": "Prepare the weekly partnership pipeline review in workspace_chat. Do not contact brands, send proposals, accept terms, publish content, collect payment, or modify external systems. Clearly label simulation assumptions.",
+        "default_delivery_mode": "workspace_chat"
+      },
+      {
+        "job_id": "creator-partnership-monthly-recap",
+        "name": "Monthly partnership performance recap",
+        "job_type": "cron",
+        "schedule_kind": "cron",
+        "cron_expr": "0 10 1 * *",
+        "timezone": "America/Los_Angeles",
+        "execution_type": "agent",
+        "execution_target": {
+          "service_key": "partnerships.delivery",
+          "max_turns": 6,
+          "deliverable": "Inline markdown campaign recap in workspace_chat. Include delivered work, receipts, payment status, measured outcomes or missing-data notes, learning, and the next partnership action. No file attachment is required.",
+          "done_when": "The workspace_chat response closes the campaign evidence loop, labels missing external metrics as unknown, and does not require or claim any publishing, payment, messaging, or file side effect.",
+          "delivery_mode": "workspace_chat"
+        },
+        "payload_message": "Prepare the monthly partnership recap in workspace_chat. Do not invent campaign performance, payment, or delivery receipts and do not modify external systems. Use Unknown when evidence is missing.",
+        "default_delivery_mode": "workspace_chat"
+      }
+    ],
+    "workflows": [
+      {
+        "slug": "creator-partnership-opportunity-to-agreement-v1",
+        "description": "Turn one qualified creator partnership opportunity into an approved commercial agreement summary.",
+        "trigger_type": "manual",
+        "variables": [
+          {
+            "key": "brand_name",
+            "default": "Northstar Coffee (fictional demo brand)"
+          }
+        ],
+        "steps": [
+          {
+            "id": "qualify",
+            "name": "Qualify the opportunity",
+            "kind": "agent_call",
+            "service_key": "partnerships.discovery",
+            "input": "Score audience fit, campaign outcome, budget signal, rights risk, and delivery feasibility."
+          },
+          {
+            "id": "proposal",
+            "name": "Prepare commercial proposal",
+            "kind": "agent_call",
+            "depends_on": [
+              "qualify"
+            ],
+            "service_key": "partnerships.deal",
+            "input": "Draft scope, deliverables, fee, deposit, schedule, revisions, usage rights, exclusivity, and next step."
+          },
+          {
+            "id": "review",
+            "name": "Creator approves exact proposal",
+            "kind": "hitl_approval",
+            "depends_on": [
+              "proposal"
+            ],
+            "channel": "workspace_chat",
+            "timeout_minutes": 1440
+          }
+        ]
+      },
+      {
+        "slug": "creator-partnership-agreement-to-recap-v1",
+        "description": "Turn an approved agreement summary into reviewed campaign delivery, receipt, and performance recap.",
+        "trigger_type": "manual",
+        "variables": [
+          {
+            "key": "campaign_name",
+            "default": "Northstar Focus Ritual"
+          }
+        ],
+        "steps": [
+          {
+            "id": "plan",
+            "name": "Build delivery plan",
+            "kind": "agent_call",
+            "service_key": "partnerships.delivery",
+            "input": "Convert the approved agreement summary into a deliverable checklist and evidence plan."
+          },
+          {
+            "id": "prepare",
+            "name": "Prepare campaign packet",
+            "kind": "agent_call",
+            "depends_on": [
+              "plan"
+            ],
+            "service_key": "partnerships.delivery",
+            "input": "Prepare the exact campaign deliverables and a final approval checklist."
+          },
+          {
+            "id": "approve",
+            "name": "Creator approves exact delivery",
+            "kind": "hitl_approval",
+            "depends_on": [
+              "prepare"
+            ],
+            "channel": "workspace_chat",
+            "timeout_minutes": 1440
+          },
+          {
+            "id": "recap",
+            "name": "Record receipt and recap",
+            "kind": "agent_call",
+            "depends_on": [
+              "approve"
+            ],
+            "service_key": "partnerships.delivery",
+            "input": "Record the delivery receipt, known payment status, measured results or missing-data note, learning, and next action."
+          }
+        ]
+      }
+    ],
+    "goals": [
+      {
+        "title": "Close and deliver one qualified creator partnership",
+        "description": "Move one values-aligned brand opportunity through approved terms, campaign delivery, receipt, and recap.",
+        "metric_key": "partnerships_closed",
+        "target_value": 1,
+        "baseline_value": 0,
+        "deadline": "2027-03-31",
+        "measurement_source": {
+          "type": "manual",
+          "metric": "verified_partnership_close_count"
+        },
+        "measurement_cadence": "weekly",
+        "priority": 1
+      },
+      {
+        "title": "Maintain five qualified partnership opportunities",
+        "description": "Keep a small, high-fit pipeline with a named next step for every opportunity.",
+        "metric_key": "qualified_opportunities",
+        "target_value": 5,
+        "baseline_value": 1,
+        "deadline": "2027-03-31",
+        "measurement_source": {
+          "type": "manual",
+          "metric": "qualified_partnership_pipeline_count"
+        },
+        "measurement_cadence": "weekly",
+        "priority": 2
+      }
+    ],
+    "task_categories": [],
+    "custom_fields": [
+      {
+        "name": "partnership_stage",
+        "display_name": "Partnership stage",
+        "field_type": "select",
+        "target": "task",
+        "options": [
+          "qualified",
+          "proposal",
+          "negotiation",
+          "agreement",
+          "delivery",
+          "recap",
+          "closed"
+        ],
+        "sort_order": 10
+      },
+      {
+        "name": "creator_decision",
+        "display_name": "Creator decision",
+        "field_type": "select",
+        "target": "task",
+        "options": [
+          "not_needed",
+          "waiting",
+          "approved",
+          "revise",
+          "rejected"
+        ],
+        "sort_order": 20
+      },
+      {
+        "name": "evidence_status",
+        "display_name": "Evidence status",
+        "field_type": "select",
+        "target": "task",
+        "options": [
+          "missing",
+          "draft",
+          "verified"
+        ],
+        "sort_order": 30
+      }
+    ],
+    "sla_policies": [],
+    "escalation_rules": [],
+    "simulation_experience": {
+      "schema_version": "1.0",
+      "title": "Creator partnership: opportunity to verified delivery",
+      "sample_prompt": "Find one high-fit brand partnership for Luma Creator Studio and take it from qualification through approved terms, campaign delivery, receipt, and recap.",
+      "artifacts": [
+        {
+          "id": "partner-shortlist",
+          "kind": "document",
+          "title": "Qualified partner shortlist",
+          "filename": "qualified-partner-shortlist.md",
+          "mime_type": "text/markdown",
+          "summary": "Three fictional brand opportunities scored for audience fit, campaign outcome, budget signal, rights risk, and next action.",
+          "stage": "opportunity"
+        },
+        {
+          "id": "commercial-proposal",
+          "kind": "presentation",
+          "title": "Northstar commercial proposal",
+          "filename": "northstar-commercial-proposal.pptx",
+          "mime_type": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+          "summary": "A review-ready proposal with campaign idea, deliverables, fee, schedule, usage rights, and measurement plan.",
+          "stage": "proposal"
+        },
+        {
+          "id": "agreement-summary",
+          "kind": "document",
+          "title": "Approved agreement summary",
+          "filename": "approved-agreement-summary.md",
+          "mime_type": "text/markdown",
+          "summary": "Creator-approved scope, fee, deposit, revisions, usage rights, exclusivity, and due dates.",
+          "stage": "agreement"
+        },
+        {
+          "id": "campaign-preview",
+          "kind": "image",
+          "title": "Campaign deliverable preview",
+          "filename": "northstar-campaign-preview.png",
+          "mime_type": "image/png",
+          "summary": "A fictional review preview of the approved creator campaign deliverable.",
+          "stage": "delivery"
+        },
+        {
+          "id": "campaign-recap",
+          "kind": "spreadsheet",
+          "title": "Campaign delivery and performance recap",
+          "filename": "campaign-delivery-recap.xlsx",
+          "mime_type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+          "summary": "Delivery receipt, payment-status field, result evidence, learning, and next-partnership recommendation.",
+          "stage": "recap"
+        }
+      ],
+      "stages": [
+        {
+          "id": "partnership-request",
+          "kind": "request",
+          "title": "Creator asks Manor to find and close a partnership",
+          "author": "user",
+          "body": "Find one high-fit paid partnership for **Luma Creator Studio**. Keep audience fit, pricing, rights, approvals, delivery evidence, and the final recap visible in Workspace Chat."
+        },
+        {
+          "id": "opportunity-plan",
+          "kind": "proposal",
+          "title": "Opportunity search plan",
+          "author": "agent",
+          "service_key": "partnerships.discovery",
+          "body": "I translated the Creator profile into a narrow opportunity search. Approve the qualification work before I prepare the shortlist.",
+          "pending_action": {
+            "kind": "approve_proposals",
+            "review_id": "simulation-partnership-opportunity-plan",
+            "items": [
+              {
+                "item_id": "screen-fit",
+                "kind": "task",
+                "risk_level": "low",
+                "summary": "Screen brands for audience fit, campaign outcome, credibility, budget signal, and category conflicts."
+              },
+              {
+                "item_id": "score-rights-risk",
+                "kind": "task",
+                "risk_level": "low",
+                "summary": "Flag usage-rights, exclusivity, claims, and delivery risks before outreach."
+              }
+            ],
+            "options": [
+              "approve",
+              "always_approve",
+              "reject"
+            ]
+          }
+        },
+        {
+          "id": "creator-context",
+          "kind": "context",
+          "title": "Creator profile and commercial guardrails retrieved",
+          "author": "agent",
+          "service_key": "partnerships.discovery",
+          "body": "Workspace Knowledge supplied the audience profile, prohibited categories, fictional rate card, rights guardrails, and qualification threshold. No external brand data was contacted."
+        },
+        {
+          "id": "shortlist-ready",
+          "kind": "artifact",
+          "title": "Three opportunities qualified",
+          "author": "agent",
+          "service_key": "partnerships.discovery",
+          "body": "The shortlist contains three fictional opportunities. **Northstar Coffee** ranks first because the audience, calm-work ritual, creative format, and measurement plan align; all market facts are marked as simulation assumptions.",
+          "artifact_ids": [
+            "partner-shortlist"
+          ]
+        },
+        {
+          "id": "choose-partner",
+          "kind": "input",
+          "title": "Creator chooses the deal direction",
+          "author": "agent",
+          "service_key": "partnerships.discovery",
+          "body": "Choose which opportunity should enter the commercial proposal stage and set the non-negotiable term.",
+          "pending_action": {
+            "kind": "needs_input",
+            "title": "Select the partnership to pursue",
+            "context_summary": "The selected opportunity and guardrail will be carried into the proposal without repeating the completed qualification work.",
+            "questions": [
+              {
+                "key": "partner",
+                "label": "Partner",
+                "type": "select",
+                "required": true,
+                "options": [
+                  {
+                    "label": "Northstar Coffee — highest fit",
+                    "value": "northstar"
+                  },
+                  {
+                    "label": "Orbit Notes — software fit",
+                    "value": "orbit"
+                  }
+                ]
+              },
+              {
+                "key": "guardrail",
+                "label": "Non-negotiable term",
+                "type": "select",
+                "required": true,
+                "options": [
+                  {
+                    "label": "No perpetual paid usage rights",
+                    "value": "limited_usage"
+                  },
+                  {
+                    "label": "50% deposit before production",
+                    "value": "deposit_first"
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "id": "proposal-workflow",
+          "kind": "workflow",
+          "title": "Commercial proposal assembled",
+          "author": "agent",
+          "service_key": "partnerships.deal",
+          "message_kind": "workflow_activity",
+          "body": "The approved opportunity was converted into a campaign concept, deliverable bundle, fee, deposit, schedule, revisions, usage-rights window, exclusivity boundary, and result plan.",
+          "meta": {
+            "workflow_title": "Opportunity to commercial proposal",
+            "workflow_status": "completed",
+            "workflow_business_outcome": "review_ready",
+            "workflow_attempt_number": 1,
+            "workflow_current_step_id": "proposal_ready",
+            "workflow_steps": [
+              {
+                "id": "qualify",
+                "name": "Qualify opportunity",
+                "status": "completed"
+              },
+              {
+                "id": "package",
+                "name": "Package offer",
+                "status": "completed"
+              },
+              {
+                "id": "proposal_ready",
+                "name": "Prepare exact proposal",
+                "status": "completed"
+              }
+            ]
+          }
+        },
+        {
+          "id": "proposal-artifact",
+          "kind": "artifact",
+          "title": "Commercial proposal ready",
+          "author": "agent",
+          "service_key": "partnerships.deal",
+          "body": "The proposal asks for **$11,500**, defines a 50% deposit, limits paid usage to three months, includes two revision rounds, and connects each deliverable to a campaign outcome. Fictional demo values are clearly marked.",
+          "artifact_ids": [
+            "commercial-proposal"
+          ]
+        },
+        {
+          "id": "approve-proposal",
+          "kind": "approval",
+          "title": "Creator approves the exact commercial proposal",
+          "author": "agent",
+          "service_key": "partnerships.deal",
+          "body": "Nothing is sent until the Creator approves the exact price, scope, and rights package.",
+          "pending_action": {
+            "kind": "governance_approval",
+            "hitl_type": "review",
+            "prompt": "Approve this exact simulated proposal for the outreach step?",
+            "review_title": "Northstar Focus Ritual proposal",
+            "review": {
+              "summary": "$11,500 bundle · 50% deposit · two revisions · three-month paid usage · no broad exclusivity",
+              "checks": [
+                "Audience and campaign outcome fit",
+                "Fee and payment terms are explicit",
+                "Usage rights and exclusivity are bounded",
+                "No real message will be sent in simulation"
+              ]
+            },
+            "options": [
+              "approve",
+              "revise",
+              "reject"
+            ]
+          }
+        },
+        {
+          "id": "partner-reply",
+          "kind": "receipt",
+          "title": "Simulated partner reply received",
+          "author": "system",
+          "body": "Sandbox receipt: Northstar is interested and requests a four-month paid-usage window while accepting the proposed fee, deposit, deliverables, and schedule. No real email was sent or received."
+        },
+        {
+          "id": "counter-decision",
+          "kind": "input",
+          "title": "Creator decides the negotiated rights window",
+          "author": "agent",
+          "service_key": "partnerships.deal",
+          "body": "The simulated counter changes one material term. Choose whether to accept four months or counter at three months plus an extension fee.",
+          "pending_action": {
+            "kind": "needs_input",
+            "title": "Decide the rights counter",
+            "context_summary": "The decision will be recorded in the agreement summary and used by the delivery plan.",
+            "questions": [
+              {
+                "key": "rights_decision",
+                "label": "Paid usage window",
+                "type": "select",
+                "required": true,
+                "options": [
+                  {
+                    "label": "Accept four months at the current fee",
+                    "value": "accept_four_months"
+                  },
+                  {
+                    "label": "Keep three months; price extension separately",
+                    "value": "counter_three_months"
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "id": "agreement-workflow",
+          "kind": "workflow",
+          "title": "Negotiation decision carried into agreement",
+          "author": "agent",
+          "service_key": "partnerships.deal",
+          "message_kind": "workflow_activity",
+          "body": "The Creator decision was applied to the commercial record. The agreement summary now has one source of truth for production, review, rights, payment, and measurement.",
+          "meta": {
+            "workflow_title": "Proposal to agreement summary",
+            "workflow_status": "completed",
+            "workflow_business_outcome": "agreement_ready",
+            "workflow_attempt_number": 1,
+            "workflow_current_step_id": "agreement_ready",
+            "workflow_steps": [
+              {
+                "id": "read_counter",
+                "name": "Read partner counter",
+                "status": "completed"
+              },
+              {
+                "id": "record_decision",
+                "name": "Record Creator decision",
+                "status": "completed"
+              },
+              {
+                "id": "agreement_ready",
+                "name": "Prepare agreement summary",
+                "status": "completed"
+              }
+            ]
+          }
+        },
+        {
+          "id": "agreement-artifact",
+          "kind": "artifact",
+          "title": "Agreement summary becomes delivery source of truth",
+          "author": "agent",
+          "service_key": "partnerships.deal",
+          "body": "The approved commercial decisions are now captured in a reviewable agreement summary and linked to the campaign delivery workflow.",
+          "artifact_ids": [
+            "agreement-summary"
+          ]
+        },
+        {
+          "id": "delivery-plan",
+          "kind": "proposal",
+          "title": "Campaign delivery plan",
+          "author": "agent",
+          "service_key": "partnerships.delivery",
+          "body": "The agreement summary has been translated into a production checklist. Approve the work that should produce and verify the deliverable.",
+          "pending_action": {
+            "kind": "approve_proposals",
+            "review_id": "simulation-partnership-delivery-plan",
+            "items": [
+              {
+                "item_id": "produce-campaign",
+                "kind": "task",
+                "risk_level": "low",
+                "summary": "Prepare the campaign asset against the exact approved claims, format, links, disclosure, and due date."
+              },
+              {
+                "item_id": "verify-deliverable",
+                "kind": "task",
+                "risk_level": "low",
+                "summary": "Verify the asset against the agreement summary and prepare an exact-output approval card."
+              }
+            ],
+            "options": [
+              "approve",
+              "always_approve",
+              "reject"
+            ]
+          }
+        },
+        {
+          "id": "campaign-production",
+          "kind": "workflow",
+          "title": "Campaign deliverable produced and checked",
+          "author": "agent",
+          "service_key": "partnerships.delivery",
+          "message_kind": "workflow_activity",
+          "body": "The delivery workflow produced a fictional campaign preview and checked it against disclosure, claims, dimensions, links, due date, and rights constraints.",
+          "meta": {
+            "workflow_title": "Agreement to campaign delivery",
+            "workflow_status": "completed",
+            "workflow_business_outcome": "awaiting_exact_output_approval",
+            "workflow_attempt_number": 1,
+            "workflow_current_step_id": "quality_check",
+            "workflow_steps": [
+              {
+                "id": "delivery_plan",
+                "name": "Build delivery plan",
+                "status": "completed"
+              },
+              {
+                "id": "produce",
+                "name": "Produce campaign asset",
+                "status": "completed"
+              },
+              {
+                "id": "quality_check",
+                "name": "Verify against agreement",
+                "status": "completed"
+              }
+            ]
+          }
+        },
+        {
+          "id": "campaign-preview-artifact",
+          "kind": "artifact",
+          "title": "Exact campaign preview ready",
+          "author": "agent",
+          "service_key": "partnerships.delivery",
+          "body": "This is the exact simulated asset waiting for Creator approval. The external delivery step remains blocked.",
+          "artifact_ids": [
+            "campaign-preview"
+          ]
+        },
+        {
+          "id": "approve-delivery",
+          "kind": "approval",
+          "title": "Creator approves the exact campaign deliverable",
+          "author": "agent",
+          "service_key": "partnerships.delivery",
+          "body": "Approve, revise, or reject the exact output before the simulated delivery receipt is created.",
+          "pending_action": {
+            "kind": "governance_approval",
+            "hitl_type": "review",
+            "prompt": "Approve this exact simulated campaign deliverable?",
+            "review_title": "Northstar campaign preview",
+            "review": {
+              "summary": "One approved campaign preview tied to the agreement summary",
+              "checks": [
+                "Disclosure is visible",
+                "Claims match the approved brief",
+                "Links and call to action are correct",
+                "Rights window matches the recorded decision"
+              ]
+            },
+            "options": [
+              "approve",
+              "revise",
+              "reject"
+            ]
+          }
+        },
+        {
+          "id": "delivery-receipt",
+          "kind": "receipt",
+          "title": "Verified simulated delivery receipt",
+          "author": "system",
+          "body": "Sandbox receipt: the Creator-approved asset was delivered to the fictional partner review step, the exact approved version was recorded, and no real post, email, invoice, payment, or external account was changed."
+        },
+        {
+          "id": "recap-artifact",
+          "kind": "artifact",
+          "title": "Campaign closed with evidence and a next action",
+          "author": "agent",
+          "service_key": "partnerships.delivery",
+          "body": "The recap records the delivery receipt, payment status as simulated/unknown, measurement window, available evidence, learning, and a recommendation to prepare a renewal only after real results are connected.",
+          "artifact_ids": [
+            "campaign-recap"
+          ]
+        },
+        {
+          "id": "partnership-goal-completed",
+          "kind": "goal",
+          "title": "Partnership loop completed",
+          "author": "system",
+          "message_kind": "goal_alert",
+          "body": "**Goal completed (simulation)**\n\nOne creator partnership moved through qualification → Creator-selected opportunity → approved commercial proposal → negotiated rights decision → agreement summary → approved campaign delivery → receipt → recap. The final result and every human decision remain attributable in Workspace Chat."
+        }
+      ],
+      "completion_summary": "The creator partnership demo completes qualification, approval, negotiation, delivery, receipt, and recap inside Workspace Chat. All brands, values, replies, metrics, and receipts are fictional sandbox data; no external system is changed."
+    }
+  },
+  "policy": {
+    "governance": {
+      "never_allow_actions": [
+        "contract.sign_*",
+        "payments.capture_*",
+        "social.delete_*",
+        "billing.*"
+      ],
+      "hitl_required_actions": [
+        "email.send_*",
+        "social.publish_*",
+        "proposal.send_*",
+        "invoice.send_*",
+        "workspace.file.modify"
+      ],
+      "auto_approve_actions": [
+        "workspace.task.create",
+        "workspace.search"
+      ],
+      "max_risk_level": "medium",
+      "budget_caps_per_kind": {
+        "llm": 250,
+        "action": 100
+      }
+    },
+    "post_install_checks": [
+      {
+        "kind": "agent_callable",
+        "service_key": "partnerships.discovery"
+      },
+      {
+        "kind": "agent_callable",
+        "service_key": "partnerships.deal"
+      },
+      {
+        "kind": "agent_callable",
+        "service_key": "partnerships.delivery"
+      },
+      {
+        "kind": "cron_scheduled",
+        "job_id": "creator-partnership-weekly-pipeline-review"
+      },
+      {
+        "kind": "cron_scheduled",
+        "job_id": "creator-partnership-monthly-recap"
+      },
+      {
+        "kind": "workflow_present",
+        "workflow_slug": "creator-partnership-opportunity-to-agreement-v1"
+      },
+      {
+        "kind": "workflow_present",
+        "workflow_slug": "creator-partnership-agreement-to-recap-v1"
+      }
+    ],
+    "expected_baseline": {
+      "maturity_level": "Demo-ready closed loop",
+      "validation_summary": "Validated as a deterministic creator partnership sandbox that shows opportunity selection, human approval, commercial negotiation, delivery evidence, receipt, recap, and Goal attribution without external side effects.",
+      "runnable_in_simulation": true,
+      "blocking_todos_expected": 0,
+      "first_week_outputs": [
+        "qualified partner shortlist",
+        "Creator-approved commercial proposal",
+        "negotiated agreement summary",
+        "Creator-approved campaign preview",
+        "delivery receipt and performance recap"
+      ],
+      "validation_evidence": [
+        "Blueprint v1.1 validation passes with an authored simulation experience.",
+        "Every external or financial decision is represented by a Workspace Chat approval or input gate.",
+        "Knowledge includes fictional demo context, rate guardrails, qualification criteria, and a delivery checklist.",
+        "The final Goal event names the complete opportunity-to-recap chain."
+      ],
+      "acceptance_criteria": [
+        "Install in simulation with zero blocking todos.",
+        "Walkthrough pauses for opportunity selection, proposal approval, negotiated-rights decision, and exact-delivery approval.",
+        "Proposal, agreement, campaign preview, receipt, and recap remain visible in Workspace Chat.",
+        "All fictional data and simulated receipts are explicitly labelled.",
+        "No brand is contacted and no content, agreement, invoice, payment, or external account is changed."
+      ],
+      "not_included": [
+        "No real brand or creator account is connected by default.",
+        "No legal advice, contract signature, real invoice, or payment collection.",
+        "No invented real campaign performance or payment status.",
+        "No external publishing without a promoted live workspace and explicit approval."
+      ]
+    }
+  }
+}

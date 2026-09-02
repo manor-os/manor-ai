@@ -103,6 +103,7 @@ function eventStartValue(ev: CalendarEvent): string {
 
 function eventDateKey(ev: CalendarEvent): string {
   const value = eventStartValue(ev);
+  if (ev.all_day) return value.slice(0, 10);
   const parsed = new Date(value);
   if (Number.isNaN(parsed.getTime())) return value.slice(0, 10);
   try {
@@ -120,6 +121,20 @@ function eventDateKey(ev: CalendarEvent): string {
     // Fall back to local browser time when an unavailable IANA timezone slips in.
   }
   return `${parsed.getFullYear()}-${String(parsed.getMonth() + 1).padStart(2, "0")}-${String(parsed.getDate()).padStart(2, "0")}`;
+}
+
+function formatCivilDate(value: string): string {
+  const [year, month, day] = value.slice(0, 10).split("-").map(Number);
+  const parsed = new Date(Date.UTC(year, month - 1, day, 12));
+  if (!year || !month || !day || Number.isNaN(parsed.getTime())) {
+    return value.slice(0, 10);
+  }
+  return parsed.toLocaleDateString("en-US", {
+    weekday: "short",
+    month: "short",
+    day: "numeric",
+    timeZone: "UTC",
+  });
 }
 
 function formatEventTime(ev: CalendarEvent): string | null {
@@ -147,6 +162,7 @@ function formatEventEndTime(ev: CalendarEvent): string | null {
 }
 
 function formatEventDateTime(ev: CalendarEvent): string {
+  if (ev.all_day) return `${formatCivilDate(eventStartValue(ev))}, All day`;
   const parsed = new Date(eventStartValue(ev));
   const startStr = formatEventTime(ev);
   const endStr = formatEventEndTime(ev);

@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef } from "react";
 import { useNavigate, useSearchParams, Link } from "react-router-dom";
 import { api } from "../lib/api";
+import { navigateAfterAuth, safeAuthRedirect } from "../lib/authNavigation";
 import { useAuthStore } from "../stores/auth";
 import LoadingSpinner from "../components/ui/LoadingSpinner";
 
@@ -9,8 +10,7 @@ import { t } from "../lib/i18n";
 function consumeOAuthNext(): string {
   const next = sessionStorage.getItem("oauth_next");
   sessionStorage.removeItem("oauth_next");
-  if (!next || !next.startsWith("/") || next.startsWith("//")) return "/chat";
-  return next;
+  return safeAuthRedirect(next);
 }
 
 export default function OAuthCallback() {
@@ -70,7 +70,7 @@ export default function OAuthCallback() {
         return checkAuth();
       })
       .then(() => {
-        navigate(consumeOAuthNext(), { replace: true });
+        navigateAfterAuth(consumeOAuthNext(), navigate);
       })
       .catch((err: any) => {
         const status = err?.status;
@@ -115,7 +115,7 @@ export default function OAuthCallback() {
       sessionStorage.removeItem("oauth_public_chat_token");
       sessionStorage.removeItem("oauth_remember_me");
       await checkAuth();
-      navigate(consumeOAuthNext(), { replace: true });
+      navigateAfterAuth(consumeOAuthNext(), navigate);
     } catch (err: any) {
       setInviteLoading(false);
       if (err?.status === 403) {

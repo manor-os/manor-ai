@@ -1,9 +1,7 @@
-"""Integrations record who connected them, without becoming personal.
+"""Integrations record provenance and remain private to their connector.
 
-An integration is a company-wide connection: every member shares it. The
-``created_by_user_id`` column answers "who set this up?" for audit and
-support, and must not narrow who can see or use it — that distinction is the
-whole point of these tests.
+``created_by_user_id`` is an audit field. Access is controlled separately by
+``owner_user_id`` and explicit use grants.
 """
 
 from __future__ import annotations
@@ -66,8 +64,8 @@ async def test_creator_name_is_resolved_for_list_and_detail(client: AsyncClient)
 
 
 @pytest.mark.asyncio
-async def test_integration_stays_shared_across_the_entity(client: AsyncClient):
-    """Recording a creator must not make the integration personal."""
+async def test_integration_is_private_to_owner_by_default(client: AsyncClient):
+    """A same-Entity member cannot see an owner's connection without a grant."""
     owner_headers = await _auth(client, "intprov_owner")
     owner = await _me(client, owner_headers)
 
@@ -79,24 +77,22 @@ async def test_integration_stays_shared_across_the_entity(client: AsyncClient):
     assert created.status_code == 201, created.text
     integration_id = created.json()["id"]
 
-    # A different member of the same entity sees it and can edit it.
+    # A different member of the same entity cannot see or manage it.
     colleague = await _create_entity_user(owner["entity_id"], "intprov_colleague", "member")
 
     listed = await client.get("/api/v1/integrations", headers=colleague["headers"])
     assert listed.status_code == 200, listed.text
-    assert integration_id in [i["id"] for i in listed.json()]
+    assert integration_id not in [i["id"] for i in listed.json()]
 
     detail = await client.get(
         f"/api/v1/integrations/{integration_id}", headers=colleague["headers"]
     )
-    assert detail.status_code == 200, detail.text
-    # ...and still attributes it to whoever connected it.
-    assert detail.json()["created_by_user_id"] == owner["id"]
+    assert detail.status_code == 404, detail.text
 
 
 @pytest.mark.asyncio
-async def test_row_without_a_recorded_creator_still_serializes(client: AsyncClient):
-    """Integrations connected before this column existed have no creator."""
+async def test_row_without_a_recorded_creator_is_hidden_until_repaired(client: AsyncClient):
+    """Unknown historical ownership must not become an Entity-wide fallback."""
     headers = await _auth(client, "intprov_legacy")
     me = await _me(client, headers)
 
@@ -113,6 +109,4 @@ async def test_row_without_a_recorded_creator_still_serializes(client: AsyncClie
         await db.commit()
 
     r = await client.get(f"/api/v1/integrations/{integration_id}", headers=headers)
-    assert r.status_code == 200, r.text
-    assert r.json()["created_by_user_id"] is None
-    assert r.json()["created_by_name"] is None
+    assert r.status_code == 404, r.text

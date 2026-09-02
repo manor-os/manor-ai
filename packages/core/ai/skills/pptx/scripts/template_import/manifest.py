@@ -30,6 +30,7 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any
 from xml.etree import ElementTree as ET
+from defusedxml import ElementTree as SafeET
 
 
 NS = {
@@ -122,7 +123,7 @@ def rels_path_for(part_path: str) -> str:
 def load_xml_from_zip(zf: zipfile.ZipFile, part_path: str) -> ET.Element | None:
     try:
         with zf.open(part_path) as fh:
-            return ET.parse(fh).getroot()
+            return SafeET.parse(fh).getroot()
     except KeyError:
         return None
     except ET.ParseError:

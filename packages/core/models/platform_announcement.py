@@ -22,7 +22,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Optional
 
-from sqlalchemy import Boolean, DateTime, Index, PrimaryKeyConstraint, String, Text, func
+from sqlalchemy import Boolean, DateTime, Index, Integer, PrimaryKeyConstraint, String, Text, func
 from sqlalchemy.orm import Mapped, mapped_column
 
 from .base import Base, TimestampMixin, generate_ulid
@@ -61,6 +61,7 @@ class PlatformAnnouncement(Base, TimestampMixin):
     send_email: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False, server_default="false",
     )
+
 
     starts_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     ends_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
@@ -134,3 +135,5 @@ class PlatformAnnouncementAudience(Base):
 
     announcement_id: Mapped[str] = mapped_column(String(26), nullable=False)
     term: Mapped[str] = mapped_column(String(80), nullable=False)
+
+

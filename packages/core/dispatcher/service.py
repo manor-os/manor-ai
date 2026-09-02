@@ -49,6 +49,7 @@ from packages.core.constants.execution import (
     WorkLeaseStatus,
     WorkerStatus,
 )
+from packages.core.constants.integrations import INTEGRATION_ACCOUNT_SELECTION_ARGUMENT
 from packages.core.ai.pending_action import (
     KIND_HUMAN_INPUT,
     LEASE_HITL_CLOSEABLE_KINDS,
@@ -60,7 +61,11 @@ from packages.core.ai.runtime import (
 )
 from packages.core.contracts.envelope import (
     envelope_indicates_failure,
-    is_step_result_envelope_schema,
+)
+from packages.core.contracts.task_output import (
+    TaskOutputValueKind,
+    TaskOutputProtocolError,
+    output_contract_for_schema,
 )
 from packages.core.dispatcher.output_coercion import coerce_step_output_for_schema
 from packages.core.dispatcher.validation import (
@@ -79,8 +84,65 @@ from packages.core.models.worker import (
 )
 from packages.core.plans.refs import ReferenceError as PlanReferenceError
 from packages.core.plans.refs import resolve_refs
+from packages.core.services.integration_account_service import (
+    IntegrationAccountFanoutResultFactory,
+)
 
 logger = logging.getLogger(__name__)
+
+
+class _MissingResult:
+    """Internal marker for an omitted worker ``result`` field.
+
+    ``None`` is a valid JSON value for nullable hard contracts, so API/SDK
+    boundaries pass this marker when the field was absent instead of collapsing
+    omission and explicit null into the same Python value.
+    """
+
+    def __repr__(self) -> str:  # pragma: no cover - diagnostics only
+        return "MISSING_RESULT"
+
+
+MISSING_RESULT: Any = _MissingResult()
+
+
+def _reported_worker_failure(
+    result: Any,
+    *,
+    step_kind: str,
+) -> dict[str, Any] | None:
+    """Interpret the closed StepResult status only for agent step kinds."""
+    if step_kind not in {"llm", "subagent"} or not isinstance(result, dict):
+        return None
+    raw_status = result.get("status")
+    if raw_status is None:
+        return None
+    from packages.core.contracts.envelope import StepResultStatus
+
+    try:
+        status = StepResultStatus(str(raw_status))
+    except ValueError:
+        return {
+            "type": "InvalidStepResultStatus",
+            "message": f"invalid StepResult status {raw_status!r}",
+        }
+    if status is not StepResultStatus.FAILED:
+        return None
+    failure = result.get("failure")
+    reason = (
+        str(failure.get("reason") or "").strip()
+        if isinstance(failure, dict)
+        else ""
+    )
+    error: dict[str, Any] = {
+        "type": "WorkerReportedFailure",
+        "message": reason or str(
+            result.get("summary") or "step reported a failed StepResult"
+        ),
+    }
+    if isinstance(failure, dict) and failure:
+        error["failure"] = failure
+    return error
 
 
 _RISK_RANK = {"low": 0, "medium": 1, "high": 2}
@@ -97,6 +159,10 @@ class NoMatchingSteps(DispatchError):
 
 class LeaseNotActive(DispatchError):
     """The lease being completed/failed/extended isn't in 'active' state."""
+
+
+class RuntimeActionSchemaUnavailable(DispatchError):
+    """An official action has neither materialized nor actor-scoped input schema."""
 
 
 def _counts_towards_worker_quarantine(error: dict | None) -> bool:
@@ -138,6 +204,52 @@ def _validation_failure_debug(result: Any) -> dict[str, Any]:
     return debug
 
 
+def _attach_knowledge_artifacts_for_contract(
+    result: dict[str, Any],
+    projection: Any,
+    *,
+    output_contract: Any,
+    step_kind: str | None = None,
+) -> dict[str, Any]:
+    """Attach knowledge handles without widening a native payload contract.
+
+    ``attach_knowledge_artifacts`` predates bare PlanStep/action contracts and
+    unconditionally adds envelope-era keys (``knowledge_artifacts``,
+    ``document_id``, ``viewer_url``, ...).  Those additions are useful on the
+    legacy StepResult and unmarked free-form agent paths, but they can turn a
+    validated ``additionalProperties: false`` native payload into a value that
+    no longer obeys its schema.  Keep the producer's original keys and permit
+    only fields explicitly declared by a native structured schema; the
+    Knowledge projection itself is still completed for indexing/evidence.
+    """
+    from packages.core.services.artifact_knowledge import attach_knowledge_artifacts
+
+    enriched = attach_knowledge_artifacts(result, projection)
+    if not output_contract.preserves_native_payload_for(step_kind):
+        return enriched
+
+    payload_schema = (
+        getattr(output_contract, "payload_schema", None)
+        or getattr(output_contract, "schema", None)
+    )
+    properties = (
+        payload_schema.get("properties")
+        if isinstance(payload_schema, dict)
+        else None
+    )
+    declared_keys = (
+        {str(key) for key in properties}
+        if isinstance(properties, dict)
+        else set()
+    )
+    original_keys = {str(key) for key in result}
+    return {
+        key: value
+        for key, value in enriched.items()
+        if str(key) in original_keys or str(key) in declared_keys
+    }
+
+
 def _target_worker_id_for_plan(plan: ExecutionPlan) -> str | None:
     """Return an explicit worker routing constraint for ad-hoc local actions."""
     for container in (plan.dispatcher_state, plan.plan_dag):
@@ -171,11 +283,9 @@ async def _hydrate_runtime_action_binding_schemas(
     db: AsyncSession,
     step: ExecutionStep,
 ) -> bool:
-    """Attach provider action schemas from Runtime binding catalog when absent."""
+    """Refresh action schemas without crossing the resolved actor boundary."""
 
     if step.kind != "action":
-        return False
-    if step.expected_input_schema and step.expected_output_schema:
         return False
     provider = str(step.provider or "").strip()
     action_key = str(step.action_key or "").strip()
@@ -184,14 +294,85 @@ async def _hydrate_runtime_action_binding_schemas(
 
     from packages.core.models.mcp import MCPServer
 
-    tools_cached = (
+    from packages.core.services.official_remote_mcp import OfficialRemoteMCPProvider
+
+    official_provider = provider in {
+        item.value for item in OfficialRemoteMCPProvider
+    }
+    server = (
         await db.execute(
-            select(MCPServer.tools_cached).where(
+            select(MCPServer).where(
                 MCPServer.server_key == provider,
                 MCPServer.status == "active",
             ).limit(1)
         )
     ).scalar_one_or_none()
+    if server is None:
+        if official_provider:
+            raise RuntimeActionSchemaUnavailable(
+                f"Active MCP server is unavailable for {provider}.{action_key}"
+            )
+        return False
+    tools_cached = server.tools_cached
+
+    if official_provider:
+        from packages.core.models.execution import ExecutionPlan
+        from packages.core.models.task import Task
+        from packages.core.services.mcp_account_tool_catalog import (
+            actor_provider_mcp_tool_caches,
+        )
+        from packages.core.services.task_requester_identity import (
+            TaskRequesterIdentityError,
+            resolve_task_execution_user_id,
+        )
+
+        task = (
+            await db.execute(
+                select(Task)
+                .join(ExecutionPlan, ExecutionPlan.task_id == Task.id)
+                .where(ExecutionPlan.id == step.plan_id)
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+        try:
+            actor_user_id = (
+                await resolve_task_execution_user_id(db, task)
+                if task is not None
+                else None
+            )
+        except TaskRequesterIdentityError:
+            logger.info(
+                "Dispatcher step %s has no executable user; account MCP catalog is unavailable",
+                step.id,
+            )
+            actor_user_id = None
+        discovered_caches: dict[str, dict[str, Any]] = {}
+        catalog_lookup_failed = False
+        if actor_user_id:
+            try:
+                discovered_caches = await actor_provider_mcp_tool_caches(
+                    db,
+                    provider_endpoints={provider: server.endpoint},
+                    user_id=str(actor_user_id),
+                    entity_id=step.entity_id,
+                )
+            except Exception:
+                catalog_lookup_failed = True
+                logger.warning(
+                    "Dispatcher could not load actor-scoped MCP catalog for %s; preserving materialized schemas",
+                    provider,
+                    exc_info=True,
+                )
+        tools_cached = discovered_caches.get(provider)
+        if not tools_cached:
+            if catalog_lookup_failed and isinstance(
+                step.expected_input_schema,
+                dict,
+            ):
+                return False
+            raise RuntimeActionSchemaUnavailable(
+                f"Actor-scoped schema is unavailable for {provider}.{action_key}"
+            )
     if not tools_cached:
         return False
 
@@ -203,14 +384,27 @@ async def _hydrate_runtime_action_binding_schemas(
         provider_action_specs={provider: action_specs},
     )
     if binding is None:
+        if official_provider:
+            raise RuntimeActionSchemaUnavailable(
+                f"Actor-scoped action is unavailable for {provider}.{action_key}"
+            )
         return False
 
     hydrated = False
-    if binding.input_schema is not None and not step.expected_input_schema:
-        step.expected_input_schema = binding.input_schema
+    selection = (step.params or {}).get(INTEGRATION_ACCOUNT_SELECTION_ARGUMENT)
+    input_schema = binding.input_schema_for(
+        step.integration_id,
+        selection=selection,
+    )
+    output_schema = binding.output_schema_for(
+        step.integration_id,
+        selection=selection,
+    )
+    if input_schema is not None and step.expected_input_schema != input_schema:
+        step.expected_input_schema = input_schema
         hydrated = True
-    if binding.output_schema is not None and not step.expected_output_schema:
-        step.expected_output_schema = binding.output_schema
+    if output_schema is not None and step.expected_output_schema != output_schema:
+        step.expected_output_schema = output_schema
         hydrated = True
     return hydrated
 
@@ -476,11 +670,21 @@ class Dispatcher:
         bound_sub_ids = set((await db.execute(bound_subs)).scalars().all())
 
         leased: list[tuple[WorkLease, ExecutionStep]] = []
+        workspace_setup_cache: dict[str, Any] = {}
         for step, plan in rows:
             if len(leased) >= max_n:
                 break
             now = datetime.now(timezone.utc)
             local_worker_plan = _plan_source(plan) == "local_worker"
+
+            # Materialize the canonical Runtime capability as soon as a
+            # candidate is inspected.  Some cloud-only provider/connection
+            # filters intentionally skip a step before the governance gate;
+            # leaving the derived id unset in that case makes persisted step
+            # metadata disagree with the action contract and worker filters.
+            step_capability_id = _step_runtime_capability_id(step)
+            if step_capability_id and not getattr(step, "capability_id", None):
+                step.capability_id = step_capability_id
 
             if worker.kind == "internal" and (local_worker_plan or step.provider == "browser_setup"):
                 continue
@@ -518,12 +722,28 @@ class Dispatcher:
             if step_risk > max_risk:
                 continue
 
-            # ── Workspace pause gate ──
+            # ── Workspace lifecycle + Blueprint setup admission ──
+            setup_status = None
             if step.workspace_id:
-                from packages.core.models.workspace import Workspace as _Ws
+                from packages.core.services.workspace_readiness import (
+                    evaluate_current_workspace_blocking_setup,
+                )
 
-                _ws = (await db.execute(select(_Ws.status).where(_Ws.id == step.workspace_id))).scalar_one_or_none()
-                if _ws and _ws != "active":
+                if step.workspace_id not in workspace_setup_cache:
+                    workspace_setup_cache[step.workspace_id] = (
+                        await evaluate_current_workspace_blocking_setup(
+                            db,
+                            workspace_id=str(step.workspace_id),
+                            entity_id=str(step.entity_id),
+                        )
+                    )
+                setup_status = workspace_setup_cache[step.workspace_id]
+                if setup_status is not None and setup_status.blocks_work:
+                    logger.info(
+                        "dispatcher: skipping step %s — %s",
+                        step.step_key,
+                        setup_status.summary,
+                    )
                     continue
 
             # ── Workspace-level budget gate ──
@@ -537,9 +757,6 @@ class Dispatcher:
                 logger.info("dispatcher: skipping step %s — %s", step.step_key, ws_reason)
                 continue
 
-            step_capability_id = _step_runtime_capability_id(step)
-            if step_capability_id and not getattr(step, "capability_id", None):
-                step.capability_id = step_capability_id
             if supported_capabilities is not None and not local_worker_plan:
                 if not step_capability_id or step_capability_id not in supported_capabilities:
                     continue
@@ -574,6 +791,9 @@ class Dispatcher:
                 classify_execution_error,
             )
             from packages.core.governance.service import post_hitl_card
+            from packages.core.constants.runtime_principal import RuntimePrincipalKind
+            from packages.core.services.runtime_authorization import authorize_runtime_action
+            from packages.core.services.runtime_authorization.domain import RuntimeAuthorizationAccess
 
             spent_credits_per_kind = (
                 await get_workspace_spent_credits_per_kind(db, step.workspace_id)
@@ -632,6 +852,17 @@ class Dispatcher:
                 # The exact Proposal scope still identifies this as the
                 # external.social operation for governance policy evaluation.
                 approval_capability_id = "external.social"
+            permission_decision = await authorize_runtime_action(
+                db,
+                entity_id=step.entity_id,
+                user_id=None,
+                workspace_id=step.workspace_id,
+                action_key=step.action_key,
+                capability_id=approval_capability_id,
+                access=RuntimeAuthorizationAccess.ACTION,
+                principal_kind=RuntimePrincipalKind.SYSTEM_WORKER,
+                task_id=plan.task_id,
+            )
             decision = await resolve_approval(
                 db,
                 subject=ApprovalSubject(
@@ -652,6 +883,7 @@ class Dispatcher:
                     task_id=plan.task_id,
                 ),
                 spent_credits=spent_credits_per_kind,
+                permission_decision=permission_decision,
                 intrinsic_high_risk_approved=proposal_high_risk_approved,
                 policy_hitl_preauthorized=proposal_high_risk_approved,
                 hitl_type=_hitl_type,
@@ -807,7 +1039,16 @@ class Dispatcher:
                     step.finished_at = now
                     continue
 
-            await _hydrate_runtime_action_binding_schemas(db, step)
+            try:
+                await _hydrate_runtime_action_binding_schemas(db, step)
+            except RuntimeActionSchemaUnavailable as exc:
+                step.step_status = ExecutionStepStatus.FAILED.value
+                step.error = {
+                    "type": "RuntimeActionSchemaUnavailable",
+                    "message": str(exc),
+                }
+                step.finished_at = now
+                continue
 
             # Optional input-schema validation, before the lease goes out.
             try:
@@ -868,6 +1109,11 @@ class Dispatcher:
                         "kind": step.kind,
                         "capability_id": _step_runtime_capability_id(step),
                         "plan_id": step.plan_id,
+                        "workspace_setup_admission": (
+                            setup_status.status
+                            if setup_status is not None
+                            else "not_required"
+                        ),
                         "max_runtime_seconds": step_deadline.max_runtime_seconds,
                         "max_runtime_source": step_deadline.source,
                     },
@@ -895,10 +1141,11 @@ class Dispatcher:
         db: AsyncSession,
         lease_id: str,
         *,
-        result: Optional[dict] = None,
+        result: Any = MISSING_RESULT,
         cost: Optional[dict] = None,
         evidence_refs: Optional[list[str]] = None,
         metadata: Optional[dict] = None,
+        task_output_value_kind: TaskOutputValueKind | str | None = None,
     ) -> WorkLease:
         """Worker reports success. Validates output against step schema,
         marks lease + step done, releases credential subleases. Caller commits."""
@@ -918,6 +1165,7 @@ class Dispatcher:
                 cost=cost,
                 evidence_refs=evidence_refs,
                 metadata=metadata,
+                task_output_value_kind=task_output_value_kind,
             )
 
     async def _complete_lease_inner(
@@ -925,19 +1173,81 @@ class Dispatcher:
         db: AsyncSession,
         lease_id: str,
         *,
-        result: Optional[dict],
+        result: Any,
         cost: Optional[dict],
         evidence_refs: Optional[list[str]],
         metadata: Optional[dict],
+        task_output_value_kind: TaskOutputValueKind | str | None = None,
     ) -> WorkLease:
         lease = await self._get_active_lease(db, lease_id)
         step = await self._get_step(db, lease.step_id)
         now = datetime.now(timezone.utc)
 
-        if result is not None:
-            result = coerce_step_output_for_schema(step.expected_output_schema, result)
+        output_contract = output_contract_for_schema(step.expected_output_schema)
+        omitted_result = result is MISSING_RESULT
+        if omitted_result:
+            # Keep legacy/no-schema completion behavior unchanged while making
+            # hard-contract omission an explicit validation failure. A worker
+            # that sent JSON ``null`` never enters this branch.
+            result = None
+            if output_contract.requires_submission_result_for(step.kind):
+                omission_error = {
+                    "type": "OutputSchemaError",
+                    "message": (
+                        f"step {step.step_key}: {output_contract.kind.value} "
+                        "contract requires submit_result.result; field was omitted"
+                    ),
+                    "errors": [
+                        {
+                            "path": "$.result",
+                            "message": "required result field was omitted",
+                        }
+                    ],
+                }
+                lease.result = None
+                step.result = None
+                return await self.fail_lease(
+                    db,
+                    lease_id,
+                    error=omission_error,
+                )
+        # A hard contract must validate even when the worker returned Python
+        # None: omitted ``result`` and explicit JSON null are distinct at the
+        # submit boundary, and only the schema can decide whether null is
+        # legal. The old ``result is not None`` guard marked omitted payloads
+        # complete without checking required fields.
+        # Preserve the pre-sentinel legacy behavior for an omitted result on
+        # advisory/envelope rows: only an explicitly supplied JSON null should
+        # enter schema validation there. Hard/structured omissions already
+        # returned through the controlled gate above.
+        if not omitted_result and (result is not None or output_contract.has_schema):
             try:
+                result = coerce_step_output_for_schema(
+                    step.expected_output_schema,
+                    result,
+                    step_kind=step.kind,
+                    task_output_value_kind=task_output_value_kind,
+                )
                 validate_step_output(step, result)
+            except TaskOutputProtocolError as exc:
+                lease.result = result
+                if cost:
+                    lease.cost = cost
+                return await self.fail_lease(
+                    db,
+                    lease_id,
+                    error={
+                        "type": "WorkerProtocolError",
+                        "message": str(exc),
+                        "errors": [
+                            {
+                                "path": "$.task_output_value_kind",
+                                "message": str(exc),
+                            }
+                        ],
+                    },
+                    will_retry=False,
+                )
             except SchemaError as exc:
                 if output_schema_is_advisory(step.kind, step.expected_output_schema):
                     # Unmarked legacy free-form schema: accept the real output
@@ -951,7 +1261,11 @@ class Dispatcher:
                     )
                 else:
                     # Structured kinds: schema is a hard contract — fail.
-                    lease.result = result if isinstance(result, dict) else {"value": result}
+                    lease.result = (
+                        result
+                        if output_contract.preserves_native_payload or isinstance(result, dict)
+                        else {"value": result}
+                    )
                     if cost:
                         lease.cost = cost
                     return await self.fail_lease(
@@ -965,6 +1279,32 @@ class Dispatcher:
                         },
                     )
 
+        if (
+            isinstance(step.expected_output_schema, dict)
+            and step.expected_output_schema.get(
+                IntegrationAccountFanoutResultFactory.SCHEMA_MARKER
+            )
+            is True
+            and not IntegrationAccountFanoutResultFactory.output_is_complete(result)
+        ):
+            lease.result = result
+            if cost:
+                lease.cost = cost
+            failed_lease = await self.fail_lease(
+                db,
+                lease_id,
+                error={
+                    "type": "IntegrationAccountFanoutIncomplete",
+                    "message": (
+                        "The all-account action did not return a complete, "
+                        "internally consistent account result."
+                    ),
+                    **_validation_failure_debug(result),
+                },
+            )
+            step.result = result
+            return failed_lease
+
         # ── StepResult envelope: status IS the control signal ──
         # For envelope-shaped steps (llm/subagent) the envelope's `status` is
         # the success/failure contract — `build_step_result_envelope` never
@@ -975,7 +1315,7 @@ class Dispatcher:
         # success: partial output is usable output. The gate is the SCHEMA, so
         # a custom/action schema carrying `status` as ordinary payload data
         # (e.g. a provider receipt) is unaffected.
-        if is_step_result_envelope_schema(step.expected_output_schema) and envelope_indicates_failure(result):
+        if output_contract.is_envelope and envelope_indicates_failure(result):
             lease.result = result
             if cost:
                 lease.cost = cost
@@ -984,13 +1324,21 @@ class Dispatcher:
                 "message": str(result.get("summary") or "step reported a failed StepResult"),
             }
             failure = result.get("failure")
+            will_retry = None
             if isinstance(failure, dict) and failure:
                 error["failure"] = failure
+                if isinstance(failure.get("retryable"), bool):
+                    will_retry = failure["retryable"]
             logger.warning(
                 "[dispatcher] step %s returned a failed StepResult envelope: %s",
                 step.step_key, error["message"],
             )
-            failed_lease = await self.fail_lease(db, lease_id, error=error)
+            failed_lease = await self.fail_lease(
+                db,
+                lease_id,
+                error=error,
+                will_retry=will_retry,
+            )
             # Keep the envelope on the step too — the operator needs to see
             # what actually came back, not just the derived error.
             step.result = result
@@ -1004,7 +1352,6 @@ class Dispatcher:
         if isinstance(result, dict):
             from packages.core.plans.executor import _artifact_refs_from_result
             from packages.core.services.artifact_knowledge import (
-                attach_knowledge_artifacts,
                 project_artifact_refs_to_knowledge,
             )
 
@@ -1042,7 +1389,12 @@ class Dispatcher:
                         },
                         will_retry=False,
                     )
-                result = attach_knowledge_artifacts(result, projection)
+                result = _attach_knowledge_artifacts_for_contract(
+                    result,
+                    projection,
+                    output_contract=output_contract,
+                    step_kind=step.kind,
+                )
 
         # Lease side
         lease.status = WorkLeaseStatus.COMPLETED.value
@@ -1055,7 +1407,16 @@ class Dispatcher:
         # Step side — mirror the result so PlanExecutor can pick it
         # up without joining work_leases on every cycle.
         step.step_status = ExecutionStepStatus.DONE.value
-        step.result = result if isinstance(result, dict) else ({"value": result} if result is not None else None)
+        # Explicit PlanStep payload contracts are bare values: persist the
+        # validated JSON value unchanged (including arrays, scalars, and
+        # null). Schema-less and explicit StepResult-envelope rows retain the
+        # historical ``value`` wrapper; any declared non-envelope schema keeps
+        # its native JSON type even when its legacy provenance marker is absent.
+        step.result = (
+            result
+            if output_contract.preserves_native_payload
+            else (result if isinstance(result, dict) else ({"value": result} if result is not None else None))
+        )
         step.finished_at = now
         if cost:
             step.cost = cost
@@ -1108,10 +1469,12 @@ class Dispatcher:
         dur = _duration(step)
         step_label = step.step_key.replace("_", " ").title()
         result_preview = ""
-        if step.result:
+        if isinstance(step.result, dict) and step.result:
             text = step.result.get("text") or step.result.get("value") or ""
             if isinstance(text, str) and text.strip():
                 result_preview = text.strip()[:300]
+        elif isinstance(step.result, str) and step.result.strip():
+            result_preview = step.result.strip()[:300]
         log_content = (
             f"✓ **{step_label}** completed"
             + (f" in {dur:.1f}s" if dur else "")

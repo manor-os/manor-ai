@@ -2,6 +2,9 @@
 
 import pytest
 from httpx import AsyncClient
+from sqlalchemy import select
+
+from packages.core.models.comment import Comment
 
 
 async def _auth(client: AsyncClient, username: str = "bulkuser") -> dict:
@@ -52,7 +55,7 @@ async def test_bulk_update_task_status(client: AsyncClient):
 
 
 @pytest.mark.asyncio
-async def test_bulk_delete_documents(client: AsyncClient):
+async def test_bulk_delete_documents(client: AsyncClient, db_session):
     headers = await _auth(client)
     # Upload 3 documents
     doc_ids = []
@@ -64,6 +67,16 @@ async def test_bulk_delete_documents(client: AsyncClient):
         )
         assert resp.status_code == 201
         doc_ids.append(resp.json()["id"])
+        comment = await client.post(
+            "/api/v1/comments",
+            headers=headers,
+            json={
+                "resource_type": "document",
+                "resource_id": resp.json()["id"],
+                "content": f"Comment {i}",
+            },
+        )
+        assert comment.status_code == 201, comment.text
 
     # Bulk delete 2
     resp = await client.post(
@@ -80,6 +93,10 @@ async def test_bulk_delete_documents(client: AsyncClient):
     resp = await client.get("/api/v1/documents", headers=headers)
     assert resp.json()["total"] == 1
     assert resp.json()["items"][0]["id"] == doc_ids[2]
+    remaining_comments = (await db_session.execute(
+        select(Comment).where(Comment.resource_id.in_(doc_ids))
+    )).scalars().all()
+    assert [comment.resource_id for comment in remaining_comments] == [doc_ids[2]]
 
 
 @pytest.mark.asyncio

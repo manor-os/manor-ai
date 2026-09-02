@@ -1,6 +1,6 @@
 ---
 name: mcp_stripe
-description: Operate Stripe through the official remote Stripe MCP (mcp.stripe.com). Use when the user asks to manage Stripe customers, products/prices, payment links, invoices, refunds, subscriptions, coupons, or disputes, check their balance, or look up Stripe documentation.
+description: Operate Stripe through the official remote Stripe MCP (mcp.stripe.com). Use when the user asks to read or update Stripe API resources, issue refunds, plan an integration, run reports, inspect the connected account, or search Stripe documentation.
 version: 1.0.0
 ---
 
@@ -12,7 +12,7 @@ Use this skill to operate **Stripe** through the official **remote** Stripe MCP 
 
 ## When To Use
 
-Use Stripe when the user wants to read or manage their Stripe account: customers, products/prices, payment links, invoices, refunds, subscriptions, coupons, disputes, balance, or to search Stripe's docs/knowledge base.
+Use Stripe when the user wants to read or manage Stripe resources, issue refunds, generate reports, plan an integration, or search Stripe's docs/knowledge base.
 
 ## Connection
 
@@ -20,42 +20,43 @@ Stripe connects via **OAuth** to the remote MCP. On an auth error, stop and ask 
 
 ## Core Tools
 
-Read / lookup:
-- `retrieve_balance`, `list_customers`, `list_products`, `list_prices`, `list_invoices`, `list_payment_intents`, `list_subscriptions`, `list_coupons`, `list_disputes`, `search_documentation` (Stripe docs/knowledge base).
+Account and reads:
+- `get_stripe_account_info`, `retrieve_balance`, and `list_*` inspect connected account resources.
+- `search_stripe_resources` and `fetch_stripe_resources` locate Stripe resources.
+- `search_stripe_documentation` answers implementation questions.
 
-Create / configure:
-- `create_customer`, `create_product`, `create_price`, `create_payment_link`, `create_invoice`, `create_invoice_item`, `finalize_invoice`, `create_coupon`.
+Writes:
+- `create_customer`, `create_product`, `create_price`, `create_payment_link`, `create_coupon`, `create_invoice`, and `create_invoice_item` create resources.
+- `finalize_invoice`, `update_dispute`, and `update_subscription` change lifecycle state.
+- `create_refund` refunds a payment; `cancel_subscription` terminates a subscription.
 
 Money / lifecycle (highest impact — see Guardrails):
-- `create_refund`, `cancel_subscription`, `update_subscription`, `update_dispute`.
+- `create_refund`, `finalize_invoice`, `update_dispute`, `update_subscription`, and `cancel_subscription`.
 
 ## Common Recipes
 
 **Create a payment link for a product**
-1. `create_product` → `create_price` (amount + currency). 2. `create_payment_link` for that price. 3. Return the URL.
+1. `create_product`. 2. Confirm amount/currency. 3. `create_price`. 4. `create_payment_link`. 5. Return the URL.
 
 **Invoice a customer**
-1. `list_customers` / `create_customer`. 2. `create_invoice` (draft) → `create_invoice_item` for each line. 3. **Confirm the amounts.** 4. `finalize_invoice` to issue it.
+1. Use `list_customers` or `create_customer`. 2. `create_invoice`. 3. `create_invoice_item`. 4. **Confirm the amounts.** 5. `finalize_invoice`.
 
 **Refund a payment**
-1. `list_payment_intents` to find the charge. 2. **Confirm the exact payment + amount with the user.** 3. `create_refund`.
+1. Discover and run the PaymentIntent read operation. 2. **Confirm the exact payment + amount with the user.** 3. `create_refund`.
 
 **Answer a "how do I…" Stripe question**
-1. `search_documentation` and cite the result.
+1. `search_stripe_documentation` and cite the result.
 
 ## Guardrails
 
 - **`create_refund` moves money back to a customer — never run it without explicit confirmation of the exact payment and amount.** No speculative or test refunds in live mode.
-- **`finalize_invoice` issues a real invoice** (can trigger charging/collection) — confirm line items and customer first; `create_invoice` alone leaves it as a safe draft.
-- `cancel_subscription` / `update_subscription` change a customer's billing — confirm which subscription and the effect (proration, immediate vs period-end).
-- `create_payment_link` produces a live, shareable checkout — confirm price/currency before sharing.
-- `update_dispute` submits evidence to a dispute with deadlines — get the evidence right; you usually can't resubmit.
+- **Create, update, finalize, refund, and cancel tools change real Stripe resources.** Show the exact effect and obtain confirmation before consequential writes.
 - **Verify test vs live mode** before any write; call out when an action is irreversible.
 - Don't expose secret keys; the OAuth connection handles auth.
 
 ## Edge Cases & Errors
 
 - Amounts are in the smallest currency unit (e.g. cents) — get the unit right or you'll over/undercharge.
-- A draft invoice (`create_invoice`) isn't sent until `finalize_invoice`; don't tell the user it's issued before then.
-- Idempotency: a failed-but-maybe-applied write should be re-checked with a `list_*` before retrying, so you don't double-charge/double-refund.
+- A draft invoice is not issued until its finalize operation succeeds; do not report it as issued before then.
+- Idempotency: a failed-but-maybe-applied write should be re-checked with `stripe_api_read` before retrying, so you don't double-charge or double-refund.
 - Auth/permission errors (restricted key scope, mode mismatch) → stop and tell the user; don't retry blindly.

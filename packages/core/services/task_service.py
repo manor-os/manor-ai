@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Sequence
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -16,16 +17,32 @@ from packages.core.constants.agents import (
 )
 from packages.core.constants.task_actors import TaskActor, task_actor_meta
 from packages.core.models.base import generate_ulid
-from packages.core.models.task import Task, TaskLog, TaskCategory, TaskSlaPolicy
-from packages.core.models.workspace import Workspace
+from packages.core.models.task import (
+    Conversation,
+    Task,
+    TaskCategory,
+    TaskLog,
+    TaskSlaPolicy,
+)
+from packages.core.models.workspace import AgentSubscription, Workspace
 from packages.core.services.task_dependencies import dependency_ids_from_details, details_with_dependency_state
 from packages.core.services.task_state_machine import (
     TERMINAL_STATUSES,
     TaskStatusTransitionError,
     apply_task_status_transition,
 )
+from packages.core.services.reusable_resource_locks import (
+    lock_reusable_resource_references,
+)
 
 logger = logging.getLogger(__name__)
+
+_TASK_ATTENTION_STATUSES = frozenset({
+    "waiting_on_customer",
+    "on_hold",
+    "blocked",
+    "failed",
+})
 
 
 def _exclude_trashed_workspace_tasks(query):
@@ -47,16 +64,34 @@ def _exclude_trashed_workspace_tasks(query):
 
 async def list_tasks(
     db: AsyncSession, entity_id: str, *,
+    query: str | None = None,
     status: str | None = None,
+    statuses: Sequence[str] | None = None,
     workspace_id: str | None = None,
+    workspace_ids: Sequence[str] | None = None,
     category_id: str | None = None,
+    category_ids: Sequence[str] | None = None,
     assignee_id: str | None = None,
+    assignee_ids: Sequence[str] | None = None,
+    task_type: str | None = None,
+    task_types: Sequence[str] | None = None,
+    priority: int | None = None,
+    priorities: Sequence[int] | None = None,
+    priority_min: int | None = None,
+    priority_max: int | None = None,
+    created_after: str | datetime | None = None,
+    created_before: str | datetime | None = None,
+    updated_after: str | datetime | None = None,
+    updated_before: str | datetime | None = None,
     completed_after: str | datetime | None = None,
     completed_before: str | datetime | None = None,
+    deadline_after: str | datetime | None = None,
+    deadline_before: str | datetime | None = None,
     parent_task_id: str | None = None,
     limit: int = 50,
     offset: int = 0,
     include_automations: bool = False,
+    attention_only: bool = False,
     readable_workspace_ids: set[str] | None = None,
 ) -> tuple[list[Task], int]:
     """List tasks for the Tasks page.
@@ -77,26 +112,70 @@ async def list_tasks(
     q = _exclude_trashed_workspace_tasks(q)
     count_q = _exclude_trashed_workspace_tasks(count_q)
 
-    if status:
-        q = q.where(Task.status == status)
-        count_q = count_q.where(Task.status == status)
-    if workspace_id:
-        q = q.where(Task.workspace_id == workspace_id)
-        count_q = count_q.where(Task.workspace_id == workspace_id)
-    if category_id:
-        q = q.where(Task.category_id == category_id)
-        count_q = count_q.where(Task.category_id == category_id)
-    if assignee_id:
-        q = q.where(Task.assignee_id == assignee_id)
-        count_q = count_q.where(Task.assignee_id == assignee_id)
-    if completed_after:
-        after_dt = _coerce_datetime(completed_after)
-        q = q.where(Task.completed_at.isnot(None), Task.completed_at >= after_dt)
-        count_q = count_q.where(Task.completed_at.isnot(None), Task.completed_at >= after_dt)
-    if completed_before:
-        before_dt = _coerce_datetime(completed_before)
-        q = q.where(Task.completed_at.isnot(None), Task.completed_at <= before_dt)
-        count_q = count_q.where(Task.completed_at.isnot(None), Task.completed_at <= before_dt)
+    text_query = str(query or "").strip()
+    if text_query:
+        text_filter = or_(
+            Task.title.icontains(text_query, autoescape=True),
+            Task.description.icontains(text_query, autoescape=True),
+        )
+        q = q.where(text_filter)
+        count_q = count_q.where(text_filter)
+
+    status_values = _merge_task_filter_values(status, statuses)
+    if status_values:
+        q = q.where(Task.status.in_(status_values))
+        count_q = count_q.where(Task.status.in_(status_values))
+    if attention_only:
+        q = q.where(Task.status.in_(_TASK_ATTENTION_STATUSES))
+        count_q = count_q.where(Task.status.in_(_TASK_ATTENTION_STATUSES))
+
+    workspace_values = _merge_task_filter_values(workspace_id, workspace_ids)
+    if workspace_values:
+        q = q.where(Task.workspace_id.in_(workspace_values))
+        count_q = count_q.where(Task.workspace_id.in_(workspace_values))
+
+    category_values = _merge_task_filter_values(category_id, category_ids)
+    if category_values:
+        q = q.where(Task.category_id.in_(category_values))
+        count_q = count_q.where(Task.category_id.in_(category_values))
+
+    assignee_values = _merge_task_filter_values(assignee_id, assignee_ids)
+    if assignee_values:
+        q = q.where(Task.assignee_id.in_(assignee_values))
+        count_q = count_q.where(Task.assignee_id.in_(assignee_values))
+
+    task_type_values = _merge_task_filter_values(task_type, task_types)
+    if task_type_values:
+        q = q.where(Task.task_type.in_(task_type_values))
+        count_q = count_q.where(Task.task_type.in_(task_type_values))
+
+    priority_values = _merge_task_filter_values(priority, priorities)
+    if priority_values:
+        q = q.where(Task.priority.in_(priority_values))
+        count_q = count_q.where(Task.priority.in_(priority_values))
+    if priority_min is not None and priority_max is not None and priority_min > priority_max:
+        raise ValueError("priority_min must be less than or equal to priority_max")
+    if priority_min is not None:
+        q = q.where(Task.priority >= priority_min)
+        count_q = count_q.where(Task.priority >= priority_min)
+    if priority_max is not None:
+        q = q.where(Task.priority <= priority_max)
+        count_q = count_q.where(Task.priority <= priority_max)
+
+    for column, after, before, field_name in (
+        (Task.created_at, created_after, created_before, "created"),
+        (Task.updated_at, updated_after, updated_before, "updated"),
+        (Task.completed_at, completed_after, completed_before, "completed"),
+        (Task.deadline, deadline_after, deadline_before, "deadline"),
+    ):
+        after_dt, before_dt = _coerce_datetime_range(after, before, field_name)
+        if after_dt is not None:
+            q = q.where(column.isnot(None), column >= after_dt)
+            count_q = count_q.where(column.isnot(None), column >= after_dt)
+        if before_dt is not None:
+            q = q.where(column.isnot(None), column <= before_dt)
+            count_q = count_q.where(column.isnot(None), column <= before_dt)
+
     if parent_task_id:
         q = q.where(Task.parent_task_id == parent_task_id)
         count_q = count_q.where(Task.parent_task_id == parent_task_id)
@@ -114,11 +193,53 @@ async def list_tasks(
         q = q.where(ws_scope)
         count_q = count_q.where(ws_scope)
 
-    q = q.order_by(Task.created_at.desc()).limit(limit).offset(offset)
+    if attention_only:
+        q = q.order_by(
+            Task.status_changed_at.desc().nullslast(),
+            Task.created_at.desc(),
+            Task.id.desc(),
+        )
+    else:
+        q = q.order_by(Task.created_at.desc(), Task.id.desc())
+    q = q.limit(limit).offset(offset)
 
     result = await db.execute(q)
     count_result = await db.execute(count_q)
     return list(result.scalars().all()), count_result.scalar_one()
+
+
+def _merge_task_filter_values(
+    single: object | None,
+    multiple: Sequence[object] | None,
+) -> tuple[object, ...]:
+    """Merge legacy singular and new multi-value filters without duplicates."""
+
+    values: list[object] = []
+    candidates: list[object] = []
+    if single not in (None, ""):
+        candidates.append(single)
+    if multiple:
+        if isinstance(multiple, (str, bytes)):
+            candidates.append(multiple)
+        else:
+            candidates.extend(multiple)
+    for value in candidates:
+        if value in (None, "") or value in values:
+            continue
+        values.append(value)
+    return tuple(values)
+
+
+def _coerce_datetime_range(
+    after: str | datetime | None,
+    before: str | datetime | None,
+    field_name: str,
+) -> tuple[datetime | None, datetime | None]:
+    after_dt = _coerce_datetime(after) if after is not None else None
+    before_dt = _coerce_datetime(before) if before is not None else None
+    if after_dt is not None and before_dt is not None and after_dt > before_dt:
+        raise ValueError(f"{field_name}_after must be before or equal to {field_name}_before")
+    return after_dt, before_dt
 
 
 def _coerce_datetime(value: str | datetime) -> datetime:
@@ -160,6 +281,35 @@ async def get_task(db: AsyncSession, task_id: str, entity_id: str) -> Optional[T
     return result.scalar_one_or_none()
 
 
+async def ensure_workspace_agent_assignment(
+    db: AsyncSession,
+    *,
+    entity_id: str,
+    workspace_id: str | None,
+    agent_id: str | None,
+) -> None:
+    """Reject assigning a Workspace Task to an undeployed Agent.
+
+    Entity-level Tasks retain their existing agent assignment behaviour.
+    Manor's built-in master is a platform runtime identity rather than an
+    ``AgentSubscription``, so it deliberately remains outside this lookup.
+    """
+    if not workspace_id or not agent_id or is_master_agent(agent_id):
+        return
+    subscription_id = (
+        await db.execute(
+            select(AgentSubscription.id).where(
+                AgentSubscription.entity_id == entity_id,
+                AgentSubscription.workspace_id == workspace_id,
+                AgentSubscription.agent_id == agent_id,
+                AgentSubscription.status == "active",
+            ).limit(1)
+        )
+    ).scalar_one_or_none()
+    if subscription_id is None:
+        raise ValueError("Selected Agent is not subscribed to this Workspace")
+
+
 async def create_task(
     db: AsyncSession, entity_id: str, *,
     title: str,
@@ -174,11 +324,22 @@ async def create_task(
     creator_id: str | None = None,
     creator_agent_id: str | None = None,
     conversation_id: str | None = None,
+    owner_service_key: str | None = None,
+    owner_subscription_id: str | None = None,
+    delegate_service_keys: list[str] | None = None,
     details: dict | None = None,
+    creation_log_metadata: dict | None = None,
+    creation_logged_by_system: bool = False,
     deadline: str | None = None,
     scheduled_at: str | None = None,
     duration_minutes: int | None = None,
 ) -> Task:
+    if agent_id and not is_master_agent(agent_id):
+        await lock_reusable_resource_references(
+            db,
+            entity_id=entity_id,
+            agent_ids=(agent_id,),
+        )
     merged_details = dict(details or {})
     if scheduled_at:
         merged_details["scheduled_at"] = scheduled_at
@@ -199,17 +360,41 @@ async def create_task(
         creator_id=creator_id,
         owner_id=creator_id,
         conversation_id=conversation_id,
+        owner_service_key=owner_service_key,
+        owner_subscription_id=owner_subscription_id,
+        delegate_service_keys=list(delegate_service_keys or []),
         details=merged_details,
         deadline=_coerce_datetime(deadline) if deadline else None,
     )
+    if workspace_id:
+        workspace = await db.get(Workspace, workspace_id)
+        if workspace is not None and workspace.entity_id == entity_id:
+            from packages.core.ai.runtime.task_requirements import (
+                apply_workspace_service_task_requirements,
+            )
+
+            apply_workspace_service_task_requirements(task, workspace)
+    from packages.core.services.task_session import validate_new_task_session
+
+    validate_new_task_session(task)
     db.add(task)
     await db.flush()
+    if task.task_type == TaskType.INTERACTIVE.value:
+        from packages.core.services.task_session import resolve_task_session_host
+
+        host = await resolve_task_session_host(db, task)
+        if host:
+            task.agent_id = host.agent_id
+            if host.agent_subscription_id:
+                task.owner_subscription_id = host.agent_subscription_id
 
     # Log creation. An agent-made task carries ``creator_agent_id``: the agent
     # that ran the create action, which the runtime always knows. ``creator_id``
     # stays a *user* id — the UI resolves creator_name from it — so the agent's
     # identity goes in the log rather than overwriting the person's.
-    if creator_agent_id:
+    if creation_logged_by_system:
+        creator_display, creator_meta, creator_actor = "system", None, TaskActor.SYSTEM
+    elif creator_agent_id:
         creator_display, creator_meta, creator_actor = await agent_log_authorship(
             db, creator_agent_id,
         )
@@ -219,7 +404,9 @@ async def create_task(
         creator_display, creator_meta, creator_actor = "system", None, TaskActor.SYSTEM
     await add_task_log(
         db, task.id, TaskLogType.CREATE, f"Task created: {title}",
-        actor=creator_actor, created_by=creator_display, metadata=creator_meta,
+        actor=creator_actor,
+        created_by=creator_display,
+        metadata={**(creation_log_metadata or {}), **(creator_meta or {})},
     )
 
     # An explicit approval Task is itself a HITL request.  Project it into the
@@ -244,31 +431,73 @@ async def create_task(
 
     # Real-time push — surfaces the new task in everyone's list without
     # waiting for the next poll. Fans out to creator + assignee (deduped)
-    # plus an entity-wide broadcast so admins on /tasks see it too.
-    from packages.core.services.realtime import (
-        broadcast_task_update, push_task_update_multi,
-    )
+    # plus a workspace-aware broadcast (entity-wide for standalone Tasks).
+    from packages.core.services.realtime import queue_task_update_after_commit
     summary = {
         "id": task.id, "title": task.title, "status": task.status,
         "priority": task.priority, "event": "created",
     }
-    await push_task_update_multi([creator_id, assignee_id], summary)
-    await broadcast_task_update(entity_id, summary)
+    queue_task_update_after_commit(
+        db,
+        entity_id,
+        summary,
+        workspace_id=task.workspace_id,
+        user_ids=(creator_id, assignee_id),
+    )
 
     return task
 
 
-async def update_task(db: AsyncSession, task_id: str, entity_id: str, *, user_id: str | None = None, **fields) -> Optional[Task]:
+async def update_task(
+    db: AsyncSession,
+    task_id: str,
+    entity_id: str,
+    *,
+    user_id: str | None = None,
+    dispatch_plan: bool = True,
+    **fields,
+) -> Optional[Task]:
     task = await get_task(db, task_id, entity_id)
     if not task:
         return None
+    if task.task_type == TaskType.INTERACTIVE.value:
+        task = (await db.execute(
+            select(Task).where(
+                Task.id == task_id,
+                Task.entity_id == entity_id,
+            ).with_for_update().execution_options(populate_existing=True)
+        )).scalar_one()
+
+    next_agent_id = fields.get("agent_id") if "agent_id" in fields else None
+    if (
+        next_agent_id
+        and next_agent_id != task.agent_id
+        and not is_master_agent(next_agent_id)
+    ):
+        await lock_reusable_resource_references(
+            db,
+            entity_id=entity_id,
+            agent_ids=(next_agent_id,),
+        )
 
     # Field-level change tracking
     from packages.core.services.change_tracker import track_changes, record_change
     changes = track_changes(task, fields)
 
     # Nullable fields that can be explicitly cleared (set to None)
-    _clearable = {"assignee_id", "agent_id", "agent_type", "deadline", "category_id", "vendor_id", "parent_task_id", "template_id", "actual_output"}
+    _clearable = {
+        "assignee_id",
+        "agent_id",
+        "agent_type",
+        "deadline",
+        "category_id",
+        "vendor_id",
+        "parent_task_id",
+        "template_id",
+        "actual_output",
+        "owner_service_key",
+        "owner_subscription_id",
+    }
 
     old_status = task.status
     old_assignee_id = task.assignee_id
@@ -279,6 +508,11 @@ async def update_task(db: AsyncSession, task_id: str, entity_id: str, *, user_id
             task, new_status, db=db,
             actor_kind="user" if user_id else "system", actor_id=user_id,
         )
+    elif fields:
+        # Keep API responses deterministic after non-status updates. Relying
+        # on SQLAlchemy's server-side ``onupdate`` expires the attribute after
+        # flush, which synchronous response serialization cannot lazy-load.
+        task.updated_at = datetime.now(timezone.utc)
 
     # M9.4 — human edit of an AI-generated task: capture WHICH content
     # fields the user is about to change (field names + size deltas only,
@@ -309,6 +543,30 @@ async def update_task(db: AsyncSession, task_id: str, entity_id: str, *, user_id
         if k == "deadline" and isinstance(v, str):
             v = _coerce_datetime(v)
         setattr(task, k, v)
+
+    if task.task_type == TaskType.INTERACTIVE.value:
+        from packages.core.services.task_session import resolve_task_session_host
+
+        host = await resolve_task_session_host(db, task)
+        if host:
+            task.agent_id = host.agent_id
+            if host.agent_subscription_id:
+                task.owner_subscription_id = host.agent_subscription_id
+            if task.conversation_id:
+                conversation = (await db.execute(
+                    select(Conversation).where(
+                        Conversation.id == task.conversation_id,
+                        Conversation.entity_id == task.entity_id,
+                        Conversation.workspace_id == task.workspace_id,
+                        Conversation.scope == "workspace_thread",
+                        Conversation.thread_ref_kind == "task",
+                        Conversation.thread_ref_id == task.id,
+                    ).with_for_update()
+                )).scalar_one()
+                conversation.agent_id = host.agent_id
+                conversation.agent_subscription_id = (
+                    host.agent_subscription_id
+                )
 
     if _contribution_diff:
         # Best-effort — a contribution-recording bug must never break the
@@ -360,6 +618,8 @@ async def update_task(db: AsyncSession, task_id: str, entity_id: str, *, user_id
         if (
             new_status == "in_progress"
             and old_status != "in_progress"
+            and dispatch_plan
+            and task.task_type != TaskType.INTERACTIVE.value
             and (task.owner_subscription_id or task.owner_service_key)
         ):
             try:
@@ -417,15 +677,18 @@ async def update_task(db: AsyncSession, task_id: str, entity_id: str, *, user_id
 
     # Real-time push — status / assignee / priority changes should
     # reflect immediately in Kanban boards + task detail pages.
-    from packages.core.services.realtime import (
-        broadcast_task_update, push_task_update_multi,
-    )
+    from packages.core.services.realtime import queue_task_update_after_commit
     summary = {
         "id": task.id, "title": task.title, "status": task.status,
         "priority": task.priority, "event": "updated",
     }
-    await push_task_update_multi([task.creator_id, task.assignee_id, user_id], summary)
-    await broadcast_task_update(entity_id, summary)
+    queue_task_update_after_commit(
+        db,
+        entity_id,
+        summary,
+        workspace_id=task.workspace_id,
+        user_ids=(task.creator_id, task.assignee_id, user_id),
+    )
 
     return task
 

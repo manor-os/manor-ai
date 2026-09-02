@@ -22,6 +22,13 @@ try {
   assert.deepEqual(Array.from(codec.encodeTextFile("A changed\nB", decoded.text, decoded.format).slice(0, 2)), [0xff, 0xfe]);
   assert.equal(codec.decodeTextFile(codec.encodeTextFile("A changed\nB", decoded.text, decoded.format)).text, "A changed\r\nB");
 
+  const invalidUtf8 = codec.decodeTextFile(Uint8Array.of(0xc3, 0x28));
+  assert.equal(invalidUtf8.format.safeToSave, false);
+  assert.equal(codec.textFileSaveStrategy(invalidUtf8.format), codec.TextFileSaveStrategy.NormalizeUtf8);
+  const normalizedUtf8 = codec.encodeTextFile("editable", invalidUtf8.text, invalidUtf8.format);
+  assert.equal(new TextDecoder().decode(normalizedUtf8), "editable");
+  assert.equal(codec.decodeTextFile(normalizedUtf8).format.safeToSave, true);
+
   const csv = 'name;note\r\nAlice;"line 1\r\nline 2"\r\nBob;"said ""hi"""\r\n';
   const parsed = codec.parseDelimitedText(csv);
   assert.equal(parsed.format.delimiter, ";");

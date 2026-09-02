@@ -7,6 +7,7 @@ external calendar provider; Google/Microsoft Calendar remain separate MCPs.
 """
 from __future__ import annotations
 
+import contextvars
 from datetime import date, datetime, time, timedelta, timezone
 import json
 import os
@@ -20,6 +21,7 @@ from packages.core.database import async_session
 from packages.core.models.base import generate_ulid
 from packages.core.models.task import Task
 from packages.core.models.user import User
+from packages.core.services.calendar_settings_lock import lock_calendar_settings_user
 from packages.core.services.settings_service import update_user_preferences
 
 
@@ -28,16 +30,20 @@ _DEFAULT_COLOR = "#4f7d75"
 _LOCATION_TYPES = {"none", "phone", "video", "in_person", "custom"}
 _SUPPORTED_PROVIDERS = {"", "google_calendar", "ms_calendar"}
 
-_call_ctx: Dict[str, str] = {}
+_call_ctx_var: contextvars.ContextVar[Dict[str, str]] = contextvars.ContextVar(
+    "manor_calendar_mcp_call_ctx",
+    default={},
+)
 
 
 def set_call_context(ctx: Dict[str, str]) -> None:
-    _call_ctx.clear()
-    _call_ctx.update({k: str(v) for k, v in (ctx or {}).items() if v is not None})
+    _call_ctx_var.set({
+        k: str(v) for k, v in (ctx or {}).items() if v is not None
+    })
 
 
 def clear_call_context() -> None:
-    _call_ctx.clear()
+    _call_ctx_var.set({})
 
 
 def list_tools() -> List[Dict[str, Any]]:
@@ -82,8 +88,9 @@ def _error(message: str) -> Dict[str, Any]:
 
 
 def _ctx() -> tuple[str, str]:
-    user_id = _call_ctx.get("user_id")
-    entity_id = _call_ctx.get("entity_id")
+    call_ctx = _call_ctx_var.get()
+    user_id = call_ctx.get("user_id")
+    entity_id = call_ctx.get("entity_id")
     if not user_id or not entity_id:
         raise RuntimeError("Manor Calendar MCP requires user_id and entity_id context.")
     return user_id, entity_id
@@ -211,7 +218,8 @@ def _booking_link(item: dict[str, Any], defaults: dict[str, int], idx: int) -> d
     location_type = str(item.get("location_type") or "video").strip()
     if location_type not in _LOCATION_TYPES:
         location_type = "video"
-    return {
+    normalized = dict(item)
+    normalized.update({
         "id": str(item.get("id") or generate_ulid()),
         "slug": _slugify(item.get("slug") or name) or f"booking-{idx + 1}",
         "name": name,
@@ -238,7 +246,8 @@ def _booking_link(item: dict[str, Any], defaults: dict[str, int], idx: int) -> d
         ),
         "created_at": _optional_str(item.get("created_at")),
         "updated_at": _optional_str(item.get("updated_at")),
-    }
+    })
+    return normalized
 
 
 def _booking_record(item: dict[str, Any]) -> dict[str, Any]:
@@ -252,13 +261,33 @@ def _booking_record(item: dict[str, Any]) -> dict[str, Any]:
         "starts_at": str(item.get("starts_at") or ""),
         "ends_at": str(item.get("ends_at") or ""),
         "timezone": str(item.get("timezone") or "UTC"),
+        "guest_timezone": _optional_str(item.get("guest_timezone")),
+        "buffer_before_minutes": (
+            _bounded_int(item.get("buffer_before_minutes"), 0, 0, 240)
+            if item.get("buffer_before_minutes") is not None
+            else None
+        ),
+        "buffer_after_minutes": (
+            _bounded_int(item.get("buffer_after_minutes"), 0, 0, 240)
+            if item.get("buffer_after_minutes") is not None
+            else None
+        ),
         "status": "cancelled" if item.get("status") == "cancelled" else "confirmed",
         "calendar_provider": _optional_str(item.get("calendar_provider")),
         "calendar_account_id": _optional_str(item.get("calendar_account_id")),
+        "calendar_event_intent": (
+            dict(item["calendar_event_intent"])
+            if isinstance(item.get("calendar_event_intent"), dict)
+            else None
+        ),
+        "host_email": _optional_str(item.get("host_email")),
         "calendar_event_id": _optional_str(item.get("calendar_event_id")),
         "calendar_event_url": _optional_str(item.get("calendar_event_url")),
         "meeting_url": _optional_str(item.get("meeting_url")),
         "calendar_event_created": bool(item.get("calendar_event_created", False)),
+        "calendar_metadata_sync_pending": bool(
+            item.get("calendar_metadata_sync_pending", False)
+        ),
         "email_sent": bool(item.get("email_sent", False)),
         "created_at": _optional_str(item.get("created_at")),
     }
@@ -347,7 +376,6 @@ def _save_payload(settings: dict[str, Any]) -> dict[str, Any]:
 async def _save_settings(db, user: User, settings: dict[str, Any]) -> dict[str, Any]:
     payload = _save_payload(settings)
     await update_user_preferences(db, user.id, {_PREF_KEY: payload})
-    user.preferences = {**(user.preferences or {}), _PREF_KEY: payload}
     await db.commit()
     return payload
 
@@ -431,7 +459,9 @@ async def _list_booking_links(args: dict[str, Any]) -> dict[str, Any]:
 async def _create_booking_link(args: dict[str, Any]) -> dict[str, Any]:
     user_id, _entity_id = _ctx()
     async with async_session() as db:
-        user = await _load_user(db, user_id)
+        user = await lock_calendar_settings_user(db, user_id)
+        if not user:
+            raise RuntimeError("User not found.")
         settings = _settings(user)
         defaults = settings["booking_defaults"]
         name = str(args.get("name") or "").strip()
@@ -483,7 +513,9 @@ async def _update_working_hours(args: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(raw, list):
         raise ValueError("working_hours must be an array.")
     async with async_session() as db:
-        user = await _load_user(db, user_id)
+        user = await lock_calendar_settings_user(db, user_id)
+        if not user:
+            raise RuntimeError("User not found.")
         settings = _settings(user)
         next_hours = _merge_working_hours(settings.get("working_hours"), raw)
         for item in next_hours:

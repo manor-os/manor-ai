@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import asdict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import json
 import logging
 import re
@@ -120,6 +120,7 @@ YOUTUBE_WORKSPACE_STAT_KEYS = {
     "likes": "youtube.latest_video_likes",
     "comments": "youtube.latest_video_comments",
 }
+YOUTUBE_WORKSPACE_DAILY_PUBLICATIONS_STAT_KEY = "youtube.daily_published_videos"
 
 
 
@@ -167,6 +168,52 @@ def _verified_publication_count(
     identities.discard("")
     if current_video_id:
         identities.add(current_video_id)
+    return len(identities)
+
+
+def _verified_publication_count_for_day(
+    publications: list[dict[str, Any]],
+    *,
+    receipt: dict[str, Any],
+    observed_at: datetime,
+) -> int:
+    """Count unique verified publications in the trailing 24-hour window."""
+
+    window_end = observed_at.astimezone(timezone.utc)
+    window_start = window_end - timedelta(hours=24)
+    identities: set[str] = set()
+    for item in publications:
+        try:
+            recorded_at = datetime.fromisoformat(
+                str(item.get("recorded_at") or "").replace("Z", "+00:00")
+            )
+        except (TypeError, ValueError):
+            continue
+        if recorded_at.tzinfo is None:
+            recorded_at = recorded_at.replace(tzinfo=timezone.utc)
+        recorded_at = recorded_at.astimezone(timezone.utc)
+        if not window_start <= recorded_at <= window_end:
+            continue
+        identity = str(item.get("video_id") or item.get("watch_url") or "").strip()
+        if identity:
+            identities.add(identity)
+
+    try:
+        published_at = datetime.fromisoformat(
+            str(receipt.get("published_at") or "").replace("Z", "+00:00")
+        )
+    except (TypeError, ValueError):
+        published_at = None
+    if published_at is not None:
+        if published_at.tzinfo is None:
+            published_at = published_at.replace(tzinfo=timezone.utc)
+        published_at = published_at.astimezone(timezone.utc)
+        if window_start <= published_at <= window_end:
+            identity = str(
+                receipt.get("video_id") or receipt.get("public_url") or ""
+            ).strip()
+            if identity:
+                identities.add(identity)
     return len(identities)
 
 
@@ -298,6 +345,7 @@ async def _record_workspace_metric_observations(
     receipt: dict[str, Any],
     metrics: Any,
     published_video_count: int,
+    daily_published_video_count: int | None = None,
 ) -> list[str]:
     """Append one daily public-metrics snapshot to configured Workspace Stats."""
 
@@ -335,6 +383,11 @@ async def _record_workspace_metric_observations(
         "likes": metrics.likes,
         "comments": metrics.comments,
     }
+    if (
+        daily_published_video_count is not None
+        and YOUTUBE_WORKSPACE_DAILY_PUBLICATIONS_STAT_KEY in stats
+    ):
+        values["daily_published_videos"] = daily_published_video_count
     evidence = {
         "provider": "youtube_public_watch_page",
         "video_id": metrics.video_id,
@@ -350,7 +403,11 @@ async def _record_workspace_metric_observations(
     for metric_name, value in values.items():
         if value is None:
             continue
-        stat_key = YOUTUBE_WORKSPACE_STAT_KEYS[metric_name]
+        stat_key = (
+            YOUTUBE_WORKSPACE_DAILY_PUBLICATIONS_STAT_KEY
+            if metric_name == "daily_published_videos"
+            else YOUTUBE_WORKSPACE_STAT_KEYS[metric_name]
+        )
         # A snapshot is idempotent for one public video on one UTC day.  Using
         # only the Workspace for lifetime/channel metrics would suppress a
         # second legitimate publication on the same day, leaving the
@@ -400,6 +457,22 @@ async def _record_youtube_workspace_metrics(
             publications,
             current_video_id=metrics.video_id,
         )
+        try:
+            metrics_observed_at = datetime.fromisoformat(
+                str(metrics.collected_at).replace("Z", "+00:00")
+            )
+        except (TypeError, ValueError) as exc:
+            raise YouTubePublicVideoError(
+                "invalid_collection_time",
+                "YouTube public metrics returned an invalid collection time",
+            ) from exc
+        if metrics_observed_at.tzinfo is None:
+            metrics_observed_at = metrics_observed_at.replace(tzinfo=timezone.utc)
+        daily_published_video_count = _verified_publication_count_for_day(
+            publications,
+            receipt=receipt,
+            observed_at=metrics_observed_at,
+        )
 
         from packages.core.database import async_session
 
@@ -411,6 +484,7 @@ async def _record_youtube_workspace_metrics(
                 receipt=receipt,
                 metrics=metrics,
                 published_video_count=published_video_count,
+                daily_published_video_count=daily_published_video_count,
             )
             await db.commit()
     except (
@@ -435,6 +509,7 @@ async def _record_youtube_workspace_metrics(
             "public_url": metrics.public_url,
             "title": metrics.title,
             "published_video_count": published_video_count,
+            "daily_published_video_count": daily_published_video_count,
             "views": metrics.views,
             "subscribers": metrics.subscribers,
             "likes": metrics.likes,

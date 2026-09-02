@@ -116,7 +116,7 @@ export interface NewExternalShareConfig {
   audience_type: "anonymous" | "email" | "domain";
   audience_value?: string;
   capabilities: ("view" | "comment" | "download")[];
-  expires_in_days: number;
+  expires_in_days: number | null;
   watermark: boolean;
   require_otp: boolean;
   approval_reason?: string;
@@ -142,6 +142,16 @@ function _anonRoleOptions(): { value: string; label: string }[] {
     { value: "view", label: t("permissions.role.viewer.label") },
     { value: "comment", label: t("permissions.role.commenter.label") },
     { value: "download", label: t("permissions.role.downloader.label") },
+  ];
+}
+
+function _externalExpiryOptions(): { value: string; label: string }[] {
+  return [
+    { value: "1", label: t("permissions.share.link_expiry.one_day") },
+    { value: "7", label: t("permissions.share.link_expiry.seven_days") },
+    { value: "30", label: t("permissions.share.link_expiry.thirty_days") },
+    { value: "90", label: t("permissions.share.link_expiry.ninety_days") },
+    { value: "never", label: t("permissions.share.link_expiry.never") },
   ];
 }
 
@@ -201,6 +211,7 @@ export default function ShareDialog({
 
   const [mode, setMode] = useState<GeneralAccessMode>(initialMode);
   const [anonRole, setAnonRole] = useState<AnonRole>(initialAnonRole);
+  const [externalExpiryDays, setExternalExpiryDays] = useState<number | null>(7);
   // Local copy of the resource's internal visibility. Callers often pass a
   // snapshot object (e.g. the context-menu target in Knowledge.tsx), so a
   // successful onChangeVisibility would not flow back through props —
@@ -238,6 +249,7 @@ export default function ShareDialog({
     if (open && !wasOpen) {
       setMode(initialMode);
       setAnonRole(initialAnonRole);
+      setExternalExpiryDays(7);
       setVis(effectiveVisibility(visibility));
       setError(null);
       setPendingNote(null);
@@ -315,9 +327,9 @@ export default function ShareDialog({
         audience_type,
         audience_value,
         capabilities: _anonRoleToCaps(nextRole),
-        expires_in_days: 7,
+        expires_in_days: externalExpiryDays,
         watermark: true,
-        require_otp: false,
+        require_otp: nextMode === "domain",
         approval_reason: externalShareNeedsApproval
           ? `General access -> ${nextMode === "domain" ? `@${audience_value}` : "anyone with link"} (${nextRole})`
           : undefined,
@@ -389,6 +401,7 @@ export default function ShareDialog({
       <GeneralAccessSection
         mode={mode}
         anonRole={anonRole}
+        externalExpiryDays={externalExpiryDays}
         visibility={vis}
         isRestrictedDoc={isRestrictedDoc}
         confidentialApproval={externalShareNeedsApproval}
@@ -402,6 +415,7 @@ export default function ShareDialog({
           setAnonRole(r);
           if (mode !== "restricted") applyGeneralAccess(mode, r);
         }}
+        onExpiryChange={setExternalExpiryDays}
         onVisibilityChange={onChangeVisibility ? changeVisibility : undefined}
       />
 
@@ -897,6 +911,7 @@ function _visibilityOptions(): { value: Visibility; label: string }[] {
 function GeneralAccessSection({
   mode,
   anonRole,
+  externalExpiryDays,
   visibility,
   isRestrictedDoc,
   confidentialApproval,
@@ -904,10 +919,12 @@ function GeneralAccessSection({
   busy,
   onModeChange,
   onRoleChange,
+  onExpiryChange,
   onVisibilityChange,
 }: {
   mode: GeneralAccessMode;
   anonRole: AnonRole;
+  externalExpiryDays: number | null;
   visibility: Visibility;
   isRestrictedDoc: boolean;
   confidentialApproval: boolean;
@@ -915,12 +932,18 @@ function GeneralAccessSection({
   busy: boolean;
   onModeChange: (m: GeneralAccessMode) => void;
   onRoleChange: (r: AnonRole) => void;
+  onExpiryChange: (days: number | null) => void;
   onVisibilityChange?: (v: Visibility) => void;
 }) {
   const modeOptions: { value: GeneralAccessMode; label: string }[] = [
     { value: "restricted", label: t("permissions.share.general.restricted") },
-    { value: "anyone_link", label: t("permissions.share.general.anyone_link") },
   ];
+  if (!confidentialApproval) {
+    modeOptions.push({
+      value: "anyone_link",
+      label: t("permissions.share.general.anyone_link"),
+    });
+  }
   if (entityDomain) {
     modeOptions.push({
       value: "domain",
@@ -1004,7 +1027,7 @@ function GeneralAccessSection({
         style={{
           marginTop: 10,
           display: "grid",
-          gridTemplateColumns: "1fr 120px",
+          gridTemplateColumns: mode !== "restricted" && !isRestrictedDoc ? "minmax(0, 1fr) 120px 148px" : "1fr",
           gap: 6,
         }}
       >
@@ -1018,6 +1041,14 @@ function GeneralAccessSection({
             value={anonRole}
             onChange={(v) => onRoleChange(v as AnonRole)}
             options={_anonRoleOptions()}
+          />
+        )}
+        {mode !== "restricted" && !isRestrictedDoc && (
+          <Select
+            value={externalExpiryDays === null ? "never" : String(externalExpiryDays)}
+            onChange={(value) => onExpiryChange(value === "never" ? null : Number(value))}
+            options={_externalExpiryOptions()}
+            ariaLabel={t("permissions.share.link_expiry_label")}
           />
         )}
       </div>

@@ -13,8 +13,13 @@ export enum TaskType {
   INSPECTION = "inspection",
   FOLLOW_UP = "follow_up",
   APPROVAL = "approval",
+  INTERACTIVE = "interactive",
 }
 
 export function isApprovalTaskType(value: unknown): boolean {
   return value === TaskType.APPROVAL;
+}
+
+export function isInteractiveTaskType(value: unknown): boolean {
+  return value === TaskType.INTERACTIVE;
 }

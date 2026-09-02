@@ -46,6 +46,11 @@ from typing import Any, Optional
 
 from sqlalchemy import select, tuple_
 
+from packages.core.constants.proposal import (
+    PROPOSAL_ITEM_OPEN_STATUSES,
+    ProposalDecisionKind,
+    ProposalItemStatus,
+)
 from packages.core.models.proposal import ProposalItemRecord
 from packages.core.proposals.constants import CHANGE_KINDS
 from packages.core.revisions import StaleRevisionError, assert_revision
@@ -54,7 +59,7 @@ logger = logging.getLogger(__name__)
 
 # A change item still "holds" its target while it is waiting for approval
 # or being applied. Terminal statuses (rejected/failed/succeeded/…) free it.
-OPEN_ITEM_STATUSES: tuple[str, ...] = ("proposed", "approved", "executing")
+OPEN_ITEM_STATUSES = PROPOSAL_ITEM_OPEN_STATUSES
 
 
 def _model_for(target_kind: str):
@@ -97,11 +102,11 @@ def target_in_scope(row: Any, *, entity_id: str, workspace_id: str) -> bool:
 
 def _reject(item: ProposalItemRecord, reason_code: str, comment: str) -> None:
     now = datetime.now(timezone.utc)
-    item.status = "rejected"
+    item.status = ProposalItemStatus.REJECTED
     item.decided_at = now
     item.decision = {
         "decided_by": None,
-        "decision": "rejected",
+        "decision": ProposalDecisionKind.REJECTED,
         "reason_code": reason_code,
         "comment": comment,
         "decided_at": now.isoformat(),
@@ -229,7 +234,7 @@ async def validate_items(
                 )
                 logger.info("Proposal validator: %s", note)
                 item.basis = {**basis, "report_refs": kept}
-        if item.kind in CHANGE_KINDS and item.status == "proposed":
+        if item.kind in CHANGE_KINDS and item.status == ProposalItemStatus.PROPOSED:
             change_note = await _validate_change_item(db, item)
             if change_note:
                 logger.info("Proposal validator rejected: %s", change_note)

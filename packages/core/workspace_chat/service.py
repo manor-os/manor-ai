@@ -22,7 +22,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from packages.core.constants.pending_actions import PendingActionKind
 from packages.core.models.base import generate_ulid
-from packages.core.models.task import Conversation, Message
+from packages.core.models.task import Conversation, Message, Task
 
 logger = logging.getLogger(__name__)
 
@@ -51,6 +51,48 @@ async def _publish_workspace_chat_event(entity_id: str, data: dict) -> None:
         )
     except Exception:
         logger.debug("workspace chat realtime publish skipped", exc_info=True)
+
+
+async def publish_workspace_chat_message_event(
+    entity_id: str,
+    *,
+    workspace_id: str,
+    message: Message,
+) -> None:
+    """Publish a persisted message event after its transaction commits.
+
+    Callers that own a transaction can opt out of ``post_message``'s
+    immediate best-effort fanout, commit, and then call this helper. This
+    prevents a realtime refetch from racing the message transaction.
+    """
+    action = (
+        message.pending_action
+        if isinstance(message.pending_action, dict) and message.pending_action.get("kind")
+        else None
+    )
+    meta = message.meta if isinstance(message.meta, dict) else {}
+    event_data = {
+        "workspace_id": workspace_id,
+        "message_id": message.id,
+        "message_kind": message.message_kind,
+        "author_kind": message.author_kind,
+        "has_pending_action": action is not None,
+        "action_kind": (action or {}).get("kind"),
+    }
+    if meta.get("agent_greeting") is True:
+        event_data.update({
+            "agent_greeting": True,
+            "agent_greeting_sequence": meta.get("agent_greeting_sequence"),
+            "agent_greeting_total": meta.get("agent_greeting_total"),
+        })
+    strategist_activity = meta.get("strategist_activity")
+    if isinstance(strategist_activity, dict):
+        event_data["strategist_activity"] = {
+            "stage": strategist_activity.get("stage"),
+            "state": strategist_activity.get("state"),
+            "review_id": strategist_activity.get("review_id"),
+        }
+    await _publish_workspace_chat_event(entity_id, event_data)
 
 
 # ── Conversation lifecycle ────────────────────────────────────────────
@@ -95,6 +137,20 @@ async def spawn_thread(
     if thread_ref_kind not in {"task", "plan", "goal"}:
         raise ValueError(f"unsupported thread_ref_kind={thread_ref_kind!r}")
 
+    # A Task is the durable authority for its thread. Lock it before the
+    # check/create sequence so simultaneous first turns cannot create two
+    # Conversations for the same Task.
+    if thread_ref_kind == "task":
+        task_id = (await db.execute(
+            select(Task.id).where(
+                Task.id == thread_ref_id,
+                Task.entity_id == entity_id,
+                Task.workspace_id == workspace_id,
+            ).with_for_update()
+        )).scalar_one_or_none()
+        if not task_id:
+            raise LookupError("Task not found")
+
     existing = (await db.execute(
         select(Conversation).where(
             Conversation.entity_id == entity_id,
@@ -105,20 +161,25 @@ async def spawn_thread(
         ).limit(1)
     )).scalar_one_or_none()
     if existing:
-        return existing
+        conv = existing
+    else:
+        conv = Conversation(
+            id=generate_ulid(),
+            entity_id=entity_id,
+            workspace_id=workspace_id,
+            title=title or f"{thread_ref_kind} {thread_ref_id[:8]}",
+            channel="workspace",
+            scope="workspace_thread",
+            thread_ref_kind=thread_ref_kind,
+            thread_ref_id=thread_ref_id,
+        )
+        db.add(conv)
+        await db.flush()
 
-    conv = Conversation(
-        id=generate_ulid(),
-        entity_id=entity_id,
-        workspace_id=workspace_id,
-        title=title or f"{thread_ref_kind} {thread_ref_id[:8]}",
-        channel="workspace",
-        scope="workspace_thread",
-        thread_ref_kind=thread_ref_kind,
-        thread_ref_id=thread_ref_id,
-    )
-    db.add(conv)
-    await db.flush()
+    if thread_ref_kind == "task":
+        from packages.core.services.task_session import bind_task_session_conversation
+
+        await bind_task_session_conversation(db, conv)
     return conv
 
 
@@ -140,6 +201,7 @@ async def post_message(
     meta: Optional[dict] = None,
     thread_ref_kind: Optional[str] = None,
     thread_ref_id: Optional[str] = None,
+    publish_event: bool = True,
 ) -> Message:
     """Post into the right conversation (thread or main). Caller commits."""
     if thread_ref_kind and thread_ref_id:
@@ -188,16 +250,50 @@ async def post_message(
     db.add(msg)
     await db.flush()
 
-    await _publish_workspace_chat_event(entity_id, {
-        "workspace_id": workspace_id,
-        "message_id": msg.id,
-        "message_kind": message_kind,
-        "author_kind": author_kind,
-        "has_pending_action": action is not None,
-        "action_kind": (action or {}).get("kind"),
-    })
+    if publish_event:
+        await publish_workspace_chat_message_event(
+            entity_id,
+            workspace_id=workspace_id,
+            message=msg,
+        )
 
     return msg
+
+
+async def post_workspace_lifecycle_activity(
+    db: AsyncSession,
+    *,
+    entity_id: str,
+    workspace_id: str,
+    body: str,
+    action: str,
+    phase: str,
+    transition_id: str | None = None,
+) -> Message:
+    """Create a durable Workspace start/pause activity row.
+
+    The caller commits and publishes the message after the surrounding
+    lifecycle operation succeeds. The transition id is metadata only; it lets
+    clients correlate a server row with an optimistic local animation.
+    """
+    meta = {
+        "workspace_lifecycle": True,
+        "workspace_lifecycle_phase": phase,
+        "workspace_lifecycle_action": action,
+    }
+    if transition_id:
+        meta["workspace_lifecycle_transition_id"] = transition_id
+    return await post_message(
+        db,
+        entity_id=entity_id,
+        workspace_id=workspace_id,
+        body=body,
+        message_kind="strategist_activity",
+        author_kind="system",
+        refs=[{"type": "workspace", "id": workspace_id}],
+        meta=meta,
+        publish_event=False,
+    )
 
 
 # ── Reads ─────────────────────────────────────────────────────────────

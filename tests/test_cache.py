@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -31,9 +32,11 @@ def _reset_global_redis():
     """Reset the module-level _redis singleton between tests."""
     cache_module._redis = None
     cache_module._redis_loop = None
+    cache_module._redis_by_loop = {}
     yield
     cache_module._redis = None
     cache_module._redis_loop = None
+    cache_module._redis_by_loop = {}
 
 
 # ── Tests ──
@@ -112,6 +115,28 @@ async def test_cache_touch_extends_prefixed_key_ttl():
 
     assert await Cache().touch("knowledge:key", 900) is True
     mock_redis.expire.assert_awaited_once_with("manor:knowledge:key", 900)
+
+
+@pytest.mark.asyncio
+async def test_cache_extend_lease_only_refreshes_the_current_owner():
+    mock_redis = _make_mock_redis()
+    mock_redis.eval = AsyncMock(side_effect=[1, 0])
+    cache_module._redis = mock_redis
+    cache_module._redis_loop = asyncio.get_running_loop()
+
+    cache = Cache()
+    assert await cache.extend_lease("availability", "owner-token", ttl=60) is True
+    assert await cache.extend_lease("availability", "stale-token", ttl=60) is False
+    assert mock_redis.eval.await_args_list[0].args[2:] == (
+        "manor:availability",
+        "owner-token",
+        60,
+    )
+    assert mock_redis.eval.await_args_list[1].args[2:] == (
+        "manor:availability",
+        "stale-token",
+        60,
+    )
 
 
 @pytest.mark.asyncio
@@ -206,5 +231,74 @@ async def test_cache_graceful_when_redis_unavailable():
         assert await c.get_many(["one", "two"]) == [None, None]
         assert await c.set_many({"one": 1}) is False
         assert await c.touch("any", 60) is False
+        assert await c.extend_lease("any", "token", 60) is None
         assert await c.delete("any") is False
         assert await c.delete_pattern("any:*") == 0
+
+
+def test_get_redis_does_not_close_client_owned_by_another_active_loop(monkeypatch):
+    """A concurrent loop must not close Redis while its owner is using it."""
+
+    class FakeRedis:
+        def __init__(self):
+            self.closed = False
+            self.close_calls = 0
+
+        async def ping(self):
+            if self.closed:
+                raise RuntimeError("Redis client was closed")
+
+        async def aclose(self):
+            self.close_calls += 1
+            self.closed = True
+
+    clients: list[FakeRedis] = []
+
+    def fake_from_url(*_args, **_kwargs):
+        client = FakeRedis()
+        clients.append(client)
+        return client
+
+    import redis.asyncio as aioredis
+
+    monkeypatch.setattr(aioredis, "from_url", fake_from_url)
+    first_ready = threading.Event()
+    second_finished = threading.Event()
+    failures: list[BaseException] = []
+
+    def run_first_loop():
+        async def use_client():
+            client = await cache_module._get_redis()
+            first_ready.set()
+            assert second_finished.wait(timeout=2)
+            await client.ping()
+
+        try:
+            asyncio.run(use_client())
+        except BaseException as exc:  # Thread failures are asserted below.
+            failures.append(exc)
+
+    def run_second_loop():
+        async def use_client():
+            assert first_ready.wait(timeout=2)
+            await cache_module._get_redis()
+            second_finished.set()
+
+        try:
+            asyncio.run(use_client())
+        except BaseException as exc:  # Thread failures are asserted below.
+            failures.append(exc)
+            second_finished.set()
+
+    first = threading.Thread(target=run_first_loop)
+    second = threading.Thread(target=run_second_loop)
+    first.start()
+    second.start()
+    first.join(timeout=2)
+    second.join(timeout=2)
+
+    assert not first.is_alive()
+    assert not second.is_alive()
+    assert not failures
+    assert len(clients) == 2
+    assert clients[0].close_calls == 0

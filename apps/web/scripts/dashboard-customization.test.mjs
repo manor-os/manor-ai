@@ -130,7 +130,9 @@ test("generated module readiness resets before iframe load events", () => {
     generatedModuleSource,
     /useLayoutEffect\(\(\) => \{\s*setFrameReady\(false\);[\s\S]*?\}, \[sourceDocument\]\);/,
   );
-  assert.match(generatedModuleSource, /onLoad=\{\(\) => setFrameReady\(true\)\}/);
+  assert.match(generatedModuleSource, /message\.type === "manor:dashboard:ready"[\s\S]*?setFrameReady\(true\)/);
+  assert.match(generatedModuleSource, /<IsolatedHtmlPreviewFrame[\s\S]*?preview=\{htmlPreview\}/);
+  assert.doesNotMatch(generatedModuleSource, /onLoad=\{\(\) => setFrameReady\(true\)\}/);
 });
 
 test("generated modules inherit the Manor visual contract", () => {

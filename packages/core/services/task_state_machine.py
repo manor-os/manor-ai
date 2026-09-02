@@ -145,6 +145,7 @@ async def apply_task_status_transition(
 
     ts = now or datetime.now(timezone.utc)
     task.status = new_status
+    task.status_changed_at = ts
     task.updated_at = ts
 
     if new_status == "in_progress" and not task.started_at:

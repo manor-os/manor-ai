@@ -209,10 +209,11 @@ async def log_token_usage(
             columns.append("rounds")
             values.append(":rounds")
             params["rounds"] = rounds
+        # Column and placeholder names come only from the fixed lists above.
         await db.execute(
             text(
                 "INSERT INTO token_usage_logs "
-                f"({', '.join(columns)}) VALUES ({', '.join(values)})"
+                f"({', '.join(columns)}) VALUES ({', '.join(values)})"  # nosec B608
             ),
             params,
         )
@@ -404,6 +405,7 @@ async def record_llm_usage(
     cache_creation = int(usage.get("cache_creation") or usage.get("cache_creation_input_tokens") or 0)
     audio_in = int(usage.get("audio_in") or usage.get("audio_input_tokens") or 0)
     audio_out = int(usage.get("audio_out") or usage.get("audio_output_tokens") or 0)
+    cached_audio_in = int(usage.get("cached_audio_input_tokens") or 0)
     context_breakdown = (
         usage.get("context_attribution_total")
         or usage.get("context_attribution")
@@ -457,6 +459,7 @@ async def record_llm_usage(
                 cache_creation_tokens=cache_creation,
                 audio_input_tokens=audio_in,
                 audio_output_tokens=audio_out,
+                cached_audio_input_tokens=cached_audio_in,
             )
         except Exception:
             logger.debug("record_llm_usage: cost estimate failed", exc_info=True)
@@ -509,6 +512,7 @@ async def record_llm_usage(
                 cache_creation_tokens=cache_creation,
                 audio_input_tokens=audio_in,
                 audio_output_tokens=audio_out,
+                cached_audio_input_tokens=cached_audio_in,
                 cost_usd=reported_cost,
                 business_type=source, duration_ms=duration_ms,
             )
@@ -524,6 +528,7 @@ async def record_llm_usage(
                     cache_creation_tokens=cache_creation,
                     audio_input_tokens=audio_in,
                     audio_output_tokens=audio_out,
+                    cached_audio_input_tokens=cached_audio_in,
                 )
             )
             if workspace_id:
@@ -534,7 +539,16 @@ async def record_llm_usage(
                     await accumulate_workspace_ai_cost(
                         db,
                         workspace_id=workspace_id,
-                        cost_usd=credits_to_usd(int(billing_log.total_credit or 0)),
+                        # Cloud billing returns the authoritative, margin-
+                        # adjusted credit charge.  The OSS facade deliberately
+                        # returns no billing row; local workspaces must still
+                        # account for provider-reported spend instead of
+                        # silently leaving their budget at zero.
+                        cost_usd=(
+                            credits_to_usd(int(billing_log.total_credit or 0))
+                            if billing_log is not None
+                            else provider_cost
+                        ),
                     )
                 except Exception:
                     logger.warning(
@@ -807,3 +821,5 @@ async def record_media_usage(
         logger.warning("record_media_usage: budget update failed", exc_info=True)
 
     return True
+
+

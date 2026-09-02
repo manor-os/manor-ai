@@ -658,7 +658,9 @@ async def get_automation_health(
 ):
     """Per enabled automation: schedule digest, 30-day run counts from one
     grouped ledger aggregation, failure streak, revision, experiment."""
-    await _require_workspace(db, workspace_id, user.entity_id)
+    workspace = await _require_workspace(db, workspace_id, user.entity_id)
+    if workspace.status != "active":
+        return {"automations": []}
 
     jobs = (await db.execute(
         select(ScheduledJob).where(

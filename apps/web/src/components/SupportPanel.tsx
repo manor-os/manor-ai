@@ -13,7 +13,13 @@
  * the shared <Button>, <Chip>, <EmptyState> primitives and .manor-input
  * / .manor-label form classes (#436b65 primary, Plus Jakarta Sans).
  */
-import { useEffect, useMemo, useRef, useState } from "react";
+import {
+  type RefObject,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { getAuthToken } from "../lib/authToken";
 import FloatingPanel from "./FloatingPanel";
@@ -138,8 +144,14 @@ function dayLabel(iso: string): string {
 
 
 export default function SupportPanel({
-  open, onClose,
-}: { open: boolean; onClose: () => void }) {
+  open,
+  onClose,
+  restoreFocusRef,
+}: {
+  open: boolean;
+  onClose: () => void;
+  restoreFocusRef?: RefObject<HTMLElement | null>;
+}) {
   const qc = useQueryClient();
   const [view, setView] = useState<"list" | "thread" | "new">("list");
   const [activeId, setActiveId] = useState<string | null>(null);
@@ -177,16 +189,15 @@ export default function SupportPanel({
     }
   }, [open]);
 
-  // Escape closes the floating panel.
-  useEffect(() => {
-    if (!open) return undefined;
-    const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") onClose(); };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [open, onClose]);
-
   return (
-    <FloatingPanel open={open} zIndex={1002} ariaLabel="Support">
+    <FloatingPanel
+      id="floating-support-panel"
+      open={open}
+      zIndex={1002}
+      ariaLabel="Support"
+      onClose={onClose}
+      restoreFocusRef={restoreFocusRef}
+    >
         <PanelHeader
           avatar={<ManorAvatar size={34} />}
           leading={

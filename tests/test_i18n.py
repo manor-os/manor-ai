@@ -31,6 +31,17 @@ def test_translate_zh():
     set_locale("en")
 
 
+def test_translate_fr():
+    """Setting locale to fr returns French translations."""
+    from packages.core.i18n import set_locale, t
+
+    set_locale("fr")
+    assert t("error.not_found") == "Introuvable"
+    assert t("task.created") == "Tâche créée avec succès"
+    assert t("auth.login_success") == "Connexion réussie"
+    set_locale("en")
+
+
 def test_translate_fallback():
     """Unknown key returns the key itself; missing locale key falls back to English."""
     from packages.core.i18n import set_locale, t
@@ -75,3 +86,12 @@ async def test_locale_detection(client: AsyncClient):
     )
     assert resp.status_code == 200
     assert resp.json()["current"] == "ja"
+
+    # French regional tags normalize to the shared French locale.
+    resp = await client.get(
+        "/api/v1/auth/locales",
+        headers={"Accept-Language": "fr-FR,fr;q=0.9,en;q=0.8"},
+    )
+    assert resp.status_code == 200
+    assert "fr" in resp.json()["supported"]
+    assert resp.json()["current"] == "fr"

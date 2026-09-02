@@ -30,9 +30,11 @@ Share (high-impact — see Guardrails):
 - `share_file` (req `file_id`), `list_permissions` (req `file_id`), `update_permission` (req `file_id`,`permission_id`,`role`), `delete_permission`.
 
 Delete / restore:
-- `delete_file` (req `file_id`, → trash), `restore_file` (req `file_id`), `delete_file_permanent`, `empty_trash`.
+- `delete_file` (req `file_id`, → trash), `restore_file` (req `file_id`), `delete_file_permanent`.
 
-Comments: `create_comment` (req `file_id`,`content`), `resolve_comment`, `create_reply`.
+Revisions: `list_revisions`, `get_revision`, `delete_revision`.
+
+Comments: `list_comments`, `create_comment` (req `file_id`,`content`), `resolve_comment`, `delete_comment`, `create_reply`.
 
 ## Common Recipes
 
@@ -48,7 +50,7 @@ Comments: `create_comment` (req `file_id`,`content`), `resolve_comment`, `create
 ## Guardrails
 
 - **Sharing changes who can see private files — confirm the recipient and role (viewer/commenter/editor) before `share_file` / `update_permission`.** Never widen access (e.g. "anyone with the link") without explicit instruction.
-- **Deletion**: `delete_file` moves to trash (recoverable via `restore_file`); `delete_file_permanent` and `empty_trash` are irreversible — require explicit confirmation and never run them speculatively.
+- **Deletion**: `delete_file` moves to trash (recoverable via `restore_file`); `delete_file_permanent` is irreversible and only applies to files Manor created or the user explicitly opened/shared with Manor — require explicit confirmation and never run it speculatively. The minimum-scope integration cannot empty the user's entire Trash.
 - Prefer `copy_file` before destructive edits to important files.
 - Privacy: read only the files the task needs; don't enumerate or export the whole Drive.
 

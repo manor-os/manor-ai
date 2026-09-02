@@ -144,6 +144,7 @@ async def test_ts_search_orders_signs_body_and_sends_as_content(http):
 async def test_ts_shop_scoped_requires_cipher(http):
     creds = json.dumps({"app_key": "ak", "app_secret": "s", "access_token": "t"})  # no shop_cipher
     out = await ts.call_tool("get_product", {"product_id": "p1"}, creds)
+    assert out["isError"] is True
     assert "shop_cipher" in out["content"][0]["text"]
     assert not http.calls
 
@@ -160,6 +161,45 @@ async def test_ts_update_price_body(http):
 async def test_ts_missing_credentials(http):
     out = await ts.call_tool("get_authorized_shops", {}, json.dumps({"app_key": "ak"}))
     assert out["isError"] is True and "app_secret" in out["content"][0]["text"]
+
+
+async def test_ts_blank_credentials_are_rejected_without_http(http):
+    creds = json.dumps({"app_key": "ak", "app_secret": "s", "access_token": "  "})
+    out = await ts.call_tool("get_authorized_shops", {}, creds)
+    assert out["isError"] is True
+    assert "access_token" in out["content"][0]["text"]
+    assert not http.calls
+
+
+async def test_ts_non_object_credentials_are_rejected_without_http(http):
+    out = await ts.call_tool("get_authorized_shops", {}, "[]")
+    assert out["isError"] is True
+    assert "malformed" in out["content"][0]["text"]
+    assert not http.calls
+
+
+@pytest.mark.parametrize("page_size", [0, -1, 101])
+async def test_ts_search_orders_rejects_invalid_page_size_without_http(http, page_size):
+    out = await ts.call_tool("search_orders", {"page_size": page_size}, TS_CREDS)
+    assert out["isError"] is True
+    assert "page_size" in out["content"][0]["text"]
+    assert not http.calls
+
+
+async def test_ts_non_2xx_surfaces_as_error(http):
+    http.response = _FakeResp(500, text="upstream down")
+    out = await ts.call_tool("get_authorized_shops", {}, TS_CREDS)
+    assert out["isError"] is True
+    assert "500" in out["content"][0]["text"]
+
+
+async def test_ts_http_200_business_error_surfaces_as_error(http):
+    http.response = _FakeResp(200, {"code": 36004004, "message": "invalid shop"})
+
+    out = await ts.call_tool("get_authorized_shops", {}, TS_CREDS)
+
+    assert out["isError"] is True
+    assert "36004004" in out["content"][0]["text"]
 
 
 # ── Amazon: token exchange + routing ──────────────────────────────────────────
@@ -229,7 +269,53 @@ async def test_az_token_is_cached_across_calls(http):
 
 async def test_az_get_orders_requires_marketplace(http):
     out = await az.call_tool("get_orders", {}, json.dumps({"access_token": "t", "region": "na"}))
+    assert out["isError"] is True
     assert "marketplace_id" in out["content"][0]["text"]
+    assert not http.calls
+
+
+async def test_az_inventory_requires_marketplace(http):
+    out = await az.call_tool(
+        "get_inventory_summaries",
+        {},
+        json.dumps({"access_token": "t", "region": "na"}),
+    )
+
+    assert out["isError"] is True
+    assert "marketplace_id" in out["content"][0]["text"]
+    assert not http.calls
+
+
+async def test_az_blank_credentials_are_rejected_without_http(http):
+    out = await az.call_tool("get_orders", {}, json.dumps({"access_token": "  ", "region": "na"}))
+    assert out["isError"] is True
+    assert "access_token" in out["content"][0]["text"]
+    assert not http.calls
+
+
+async def test_az_non_object_credentials_are_rejected_without_http(http):
+    out = await az.call_tool("get_orders", {}, "[]")
+    assert out["isError"] is True
+    assert "malformed" in out["content"][0]["text"]
+    assert not http.calls
+
+
+async def test_az_non_2xx_surfaces_as_error(http):
+    http.response = _FakeResp(500, text="upstream down")
+    out = await az.call_tool("get_orders", {}, AZ_DIRECT_CREDS)
+    assert out["isError"] is True
+    assert "500" in out["content"][0]["text"]
+
+
+@pytest.mark.parametrize("page_size", [0, -1, 21])
+async def test_az_catalog_rejects_invalid_page_size_without_http(http, page_size):
+    out = await az.call_tool(
+        "search_catalog_items",
+        {"keywords": "shoe", "page_size": page_size},
+        AZ_DIRECT_CREDS,
+    )
+    assert out["isError"] is True
+    assert "page_size" in out["content"][0]["text"]
     assert not http.calls
 
 

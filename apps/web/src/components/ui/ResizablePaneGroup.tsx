@@ -24,6 +24,11 @@ interface ActiveDrag {
   containerWidth: number;
 }
 
+interface PaneLayoutState {
+  paneKey: string;
+  sizes: number[];
+}
+
 function normalizedSizes(panes: ResizablePaneDefinition[]): number[] {
   const total = panes.reduce((sum, pane) => sum + Math.max(0, pane.initialSize), 0) || 1;
   return panes.map((pane) => (Math.max(0, pane.initialSize) / total) * 100);
@@ -50,14 +55,25 @@ function clamp(value: number, minimum: number, maximum: number): number {
 export default function ResizablePaneGroup({ panes, storageKey, className = "" }: ResizablePaneGroupProps) {
   const paneKey = useMemo(() => panes.map((pane) => pane.id).join("\0"), [panes]);
   const initialSizes = useMemo(() => normalizedSizes(panes), [paneKey]);
-  const [sizes, setSizes] = useState<number[]>(initialSizes);
+  const [layout, setLayout] = useState<PaneLayoutState>(() => ({ paneKey, sizes: initialSizes }));
+  const sizes = layout.paneKey === paneKey ? layout.sizes : initialSizes;
   const [draggingHandle, setDraggingHandle] = useState<number | null>(null);
   const rootRef = useRef<HTMLDivElement>(null);
   const dragRef = useRef<ActiveDrag | null>(null);
 
+  const setSizes = useCallback((next: number[] | ((current: number[]) => number[])) => {
+    setLayout((current) => {
+      const currentSizes = current.paneKey === paneKey ? current.sizes : initialSizes;
+      return {
+        paneKey,
+        sizes: typeof next === "function" ? next(currentSizes) : next,
+      };
+    });
+  }, [initialSizes, paneKey]);
+
   useEffect(() => {
     setSizes(readStoredSizes(storageKey, panes) || initialSizes);
-  }, [initialSizes, paneKey, storageKey]);
+  }, [initialSizes, paneKey, setSizes, storageKey]);
 
   const persistSizes = useCallback((nextSizes: number[]) => {
     try {
@@ -112,7 +128,7 @@ export default function ResizablePaneGroup({ panes, storageKey, className = "" }
       drag.startSizes,
       drag.containerWidth,
     ));
-  }, [resizePair]);
+  }, [resizePair, setSizes]);
 
   const endDrag = useCallback(() => {
     if (!dragRef.current) return;
@@ -122,7 +138,7 @@ export default function ResizablePaneGroup({ panes, storageKey, className = "" }
       persistSizes(current);
       return current;
     });
-  }, [persistSizes]);
+  }, [persistSizes, setSizes]);
 
   const handleKeyboardResize = useCallback((event: React.KeyboardEvent<HTMLDivElement>, handleIndex: number) => {
     if (!rootRef.current) return;
@@ -137,12 +153,12 @@ export default function ResizablePaneGroup({ panes, storageKey, className = "" }
     const next = resizePair(handleIndex, requested, sizes, rootRef.current.getBoundingClientRect().width);
     setSizes(next);
     persistSizes(next);
-  }, [persistSizes, resizePair, sizes]);
+  }, [persistSizes, resizePair, setSizes, sizes]);
 
   const resetSizes = useCallback(() => {
     setSizes(initialSizes);
     persistSizes(initialSizes);
-  }, [initialSizes, persistSizes]);
+  }, [initialSizes, persistSizes, setSizes]);
 
   return (
     <div

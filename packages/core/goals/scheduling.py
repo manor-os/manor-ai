@@ -11,10 +11,14 @@ idempotent and removal is by-id rather than by-content matching.
 from __future__ import annotations
 
 import logging
+from typing import Annotated
 
+from pydantic import BeforeValidator, StringConstraints
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from packages.core.constants.goals import GoalStatus
+from packages.core.cron import validate_cron_expression
 from packages.core.models.base import generate_ulid
 from packages.core.models.goal import Goal
 from packages.core.models.scheduler import ScheduledJob
@@ -47,17 +51,19 @@ def _cadence_to_schedule(cadence: str) -> tuple[str, dict]:
     """Translate a cadence string into ScheduledJob fields.
 
     Returns ``(schedule_kind, fields)`` where fields are columns to set.
-    Cron expressions pass through verbatim (5 or 6 whitespace-delimited
-    tokens); everything else is matched against the ``every_seconds``
-    table above.
+    Five-field cron expressions use the same grammar as the runtime scheduler;
+    everything else is matched against the ``every_seconds`` table above.
     """
     cadence = (cadence or "").strip().lower()
     if cadence in _CADENCE_TO_SECONDS:
         return "every", {"every_seconds": _CADENCE_TO_SECONDS[cadence]}
     if cadence in _CADENCE_TO_CRON:
         return "cron", {"cron_expr": _CADENCE_TO_CRON[cadence]}
-    if " " in cadence:
-        return "cron", {"cron_expr": cadence}
+    if len(cadence.split()) == 5:
+        try:
+            return "cron", {"cron_expr": validate_cron_expression(cadence)}
+        except ValueError:
+            pass
     raise ValueError(
         f"unsupported measurement_cadence={cadence!r} — expected one of "
         f"{sorted([*_CADENCE_TO_SECONDS, *_CADENCE_TO_CRON])} or a cron expression"
@@ -82,6 +88,24 @@ def is_manual_measurement_source(source: object) -> bool:
 def is_manual_measurement_cadence(cadence: object) -> bool:
     value = str(cadence or "").strip().lower()
     return bool(value and (value in MANUAL_MEASUREMENT_CADENCES or value.startswith("manual_")))
+
+
+def validate_measurement_cadence(cadence: object) -> str:
+    """Return a normalized cadence accepted by Goal scheduling."""
+    value = str(cadence or "").strip()
+    if len(value) > 64:
+        raise ValueError("measurement_cadence must be at most 64 characters")
+    if is_manual_measurement_cadence(value):
+        return value
+    _cadence_to_schedule(value)
+    return value
+
+
+GoalMeasurementCadenceInput = Annotated[
+    str,
+    StringConstraints(max_length=64),
+    BeforeValidator(validate_measurement_cadence),
+]
 
 
 def is_workspace_internal_measurement_source(source: object) -> bool:
@@ -153,7 +177,7 @@ def measurement_source_requires_external_provider(source: object) -> bool:
 
 def should_install_measurement_schedule(goal: Goal) -> bool:
     return bool(
-        getattr(goal, "status", None) == "active"
+        getattr(goal, "status", None) == GoalStatus.ACTIVE.value
         and goal.measurement_cadence
         and not is_manual_measurement_cadence(goal.measurement_cadence)
         and is_auto_measurement_source(goal.measurement_source)
@@ -162,7 +186,7 @@ def should_install_measurement_schedule(goal: Goal) -> bool:
 
 def measurement_schedule_skip_reason(goal: Goal) -> str:
     status = str(getattr(goal, "status", "") or "").strip().lower()
-    if status and status != "active":
+    if status and status != GoalStatus.ACTIVE.value:
         return f"goal_{status}"
     if not getattr(goal, "measurement_cadence", None):
         return "measurement_cadence_missing"
@@ -179,6 +203,16 @@ async def install_measurement_schedule(db: AsyncSession, goal: Goal) -> Schedule
     Idempotent — derived job_id means re-running just updates the
     schedule. Caller commits.
     """
+    from packages.core.goals.locking import lock_goal_for_mutation
+
+    locked_goal = await lock_goal_for_mutation(
+        db,
+        goal.id,
+        entity_id=goal.entity_id,
+    )
+    if locked_goal is None:
+        raise ValueError(f"goal {goal.id} no longer exists")
+    goal = locked_goal
     if not should_install_measurement_schedule(goal):
         raise ValueError(
             f"goal {goal.id} does not have an automatic measurement source"
@@ -192,26 +226,30 @@ async def install_measurement_schedule(db: AsyncSession, goal: Goal) -> Schedule
     )).scalar_one_or_none()
 
     if existing:
+        from packages.core.services.scheduler_service import (
+            ScheduledJobMutationFactory,
+        )
+
         updates = {
+            "entity_id": goal.entity_id,
+            "workspace_id": goal.workspace_id,
+            "name": f"Measure goal: {goal.title}",
+            "job_type": (
+                "interval" if schedule_kind in {"every", "interval"} else "cron"
+            ),
             "schedule_kind": schedule_kind,
             "cron_expr": schedule_fields.get("cron_expr"),
             "every_seconds": schedule_fields.get("every_seconds"),
             "execution_type": "goal_measurement",
             "execution_target": {"goal_id": goal.id},
+            "goal_id": goal.id,
             "enabled": True,
+            "consecutive_errors": 0,
         }
-        changed = {k: v for k, v in updates.items() if getattr(existing, k) != v}
-        existing.entity_id = goal.entity_id
-        existing.workspace_id = goal.workspace_id
-        existing.consecutive_errors = 0
-        for key, value in changed.items():
-            setattr(existing, key, value)
-        if changed:
-            # M11: config actually changed — bump the revision + audit.
-            from packages.core.revisions import bump_revision
-            await bump_revision(db, existing, patch=changed)
-        await db.flush()
-        return existing
+        result = await ScheduledJobMutationFactory.apply(db, existing, updates)
+        if result is None:
+            raise ValueError(f"scheduled job {job_id} no longer exists")
+        return result.job
 
     job = ScheduledJob(
         id=generate_ulid(),
@@ -228,8 +266,9 @@ async def install_measurement_schedule(db: AsyncSession, goal: Goal) -> Schedule
         goal_id=goal.id,
         enabled=True,
     )
-    db.add(job)
-    await db.flush()
+    from packages.core.services.product_growth import persist_scheduled_job
+
+    await persist_scheduled_job(db, job)
     return job
 
 

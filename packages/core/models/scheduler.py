@@ -16,6 +16,15 @@ from .base import Base, TimestampMixin, generate_ulid
 class ScheduledJob(Base, TimestampMixin):
     """A scheduled job definition."""
     __tablename__ = "scheduled_jobs"
+    __table_args__ = (
+        Index("ix_scheduled_jobs_due", "enabled", "next_run_at", "id"),
+        Index(
+            "ix_scheduled_jobs_skill_generation_due",
+            "enabled",
+            "skill_generation_next_attempt_at",
+            "id",
+        ),
+    )
 
     id: Mapped[str] = mapped_column(String(26), primary_key=True, default=generate_ulid)
     job_id: Mapped[str] = mapped_column(String(100), unique=True, nullable=False)
@@ -42,8 +51,17 @@ class ScheduledJob(Base, TimestampMixin):
     enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     delete_after_run: Mapped[Optional[bool]] = mapped_column(Boolean, default=False)
     last_run_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    next_run_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     last_status: Mapped[Optional[str]] = mapped_column(String(20))
     consecutive_errors: Mapped[int] = mapped_column(Integer, default=0)
+    skill_generation_revision: Mapped[Optional[int]] = mapped_column(Integer)
+    skill_generation_next_attempt_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True)
+    )
+    skill_generation_attempts: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    skill_generation_last_error: Mapped[Optional[str]] = mapped_column(Text)
     # M11 config revision — bumped via packages.core.revisions.bump_revision
     # on every operator/system config change; stamped into dispatch events.
     revision: Mapped[int] = mapped_column(

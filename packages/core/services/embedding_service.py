@@ -4,6 +4,9 @@ Uses OpenAI-compatible /embeddings endpoint (OpenRouter, OpenAI, or any compatib
 """
 from __future__ import annotations
 
+import asyncio
+import shutil
+import tempfile
 from collections.abc import Awaitable, Callable
 from datetime import datetime, timedelta, timezone
 import hashlib
@@ -584,22 +587,48 @@ async def _read_document_content(doc: Document) -> str:
 
     # Try fs_path with format-aware extraction
     if doc.fs_path:
-        candidates = _document_fs_candidates(doc)
-        found_file = False
-        for path in candidates:
-            if not os.path.isfile(path):
-                continue
-            found_file = True
-            content = await extract_text(path, mime_type=doc.mime_type, file_type=doc.file_type)
-            if content:
-                return content
+        from packages.core.services.entity_fs import (
+            entity_filesystem_read_lock,
+            get_entity_root,
+        )
 
-        if not found_file:
-            raise DocumentContentUnavailable(
-                status="missing",
-                fs_path=str(doc.fs_path),
-                path=candidates[0] if candidates else None,
-            )
+        snapshots: list[str] = []
+        candidates: list[str] = []
+        try:
+            # Keep the shared lock only long enough to capture stable bytes.
+            # Format parsing can be slow and must not block trash, restore, or edits.
+            async with entity_filesystem_read_lock(get_entity_root(doc.entity_id)):
+                candidates = _document_fs_candidates(doc)
+                for path in candidates:
+                    if not os.path.isfile(path):
+                        continue
+                    fd, snapshot_path = tempfile.mkstemp(suffix=os.path.splitext(path)[1])
+                    os.close(fd)
+                    try:
+                        await asyncio.to_thread(shutil.copyfile, path, snapshot_path)
+                    except BaseException:
+                        await asyncio.to_thread(os.unlink, snapshot_path)
+                        raise
+                    snapshots.append(snapshot_path)
+
+                if not snapshots:
+                    raise DocumentContentUnavailable(
+                        status="missing",
+                        fs_path=str(doc.fs_path),
+                        path=candidates[0] if candidates else None,
+                    )
+
+            for snapshot_path in snapshots:
+                content = await extract_text(
+                    snapshot_path,
+                    mime_type=doc.mime_type,
+                    file_type=doc.file_type,
+                )
+                if content:
+                    return content
+        finally:
+            for snapshot_path in snapshots:
+                await asyncio.to_thread(os.unlink, snapshot_path)
 
     # Fall back only for docs without a stale filesystem pointer, or for
     # existing files whose format has no extractable text (images/video).
@@ -886,6 +915,100 @@ async def _complete_document_indexing_without_vectors(
     await db.commit()
 
 
+async def _defer_document_indexing_for_deleted_workspace(
+    db: AsyncSession,
+    document: Document,
+    *,
+    run_id: str | None = None,
+) -> None:
+    """Leave deleted-Workspace indexing pending for a later restore."""
+    deferred_at = datetime.now(timezone.utc)
+    blocked_data = {
+        "step": "blocked",
+        "progress": 0,
+        "blocked_at": deferred_at.isoformat(),
+        "blocked_reason": "workspace_deleted",
+    }
+    if run_id is None:
+        if document.vector_status not in {
+            VectorStatus.PENDING,
+            VectorStatus.PROCESSING,
+            VectorStatus.FAILED,
+        }:
+            return
+        metadata = dict(document.metadata_ or {})
+        indexing = dict(metadata.get("indexing") or {})
+        indexing.update(blocked_data)
+        indexing.pop("run_id", None)
+        indexing.pop("heartbeat_at", None)
+        indexing.pop("heartbeat_epoch", None)
+        metadata["indexing"] = indexing
+        document.metadata_ = metadata
+        document.vector_status = VectorStatus.PENDING
+        await db.commit()
+        return
+
+    result = await db.execute(
+        text(
+            """
+            UPDATE documents
+               SET vector_status = :pending,
+                   metadata = jsonb_set(
+                       COALESCE(metadata, '{}'::jsonb),
+                       '{indexing}',
+                       (COALESCE(metadata->'indexing', '{}'::jsonb) - 'run_id'
+                           - 'heartbeat_at' - 'heartbeat_epoch')
+                           || CAST(:blocked_data AS jsonb),
+                       true
+                   ),
+                   updated_at = :deferred_at
+             WHERE id = :doc_id
+               AND is_trashed = false
+               AND vector_status = :processing
+               AND metadata->'indexing'->>'run_id' = :run_id
+            """
+        ),
+        {
+            "doc_id": document.id,
+            "run_id": run_id,
+            "pending": VectorStatus.PENDING,
+            "processing": VectorStatus.PROCESSING,
+            "blocked_data": json.dumps(blocked_data),
+            "deferred_at": deferred_at,
+        },
+    )
+    if result.rowcount != 1:
+        await db.rollback()
+        raise _IndexingClaimLost(document.id)
+    await db.commit()
+
+
+async def _defer_indexing_if_workspace_deleted(
+    db: AsyncSession,
+    document: Document,
+    *,
+    run_id: str | None = None,
+    lock_for_read: bool = False,
+) -> bool:
+    from packages.core.services.document_access import (
+        document_is_owned_by_deleted_workspace,
+    )
+
+    await db.refresh(document)
+    if not await document_is_owned_by_deleted_workspace(
+        db,
+        document,
+        lock_for_read=lock_for_read,
+    ):
+        return False
+    await _defer_document_indexing_for_deleted_workspace(
+        db,
+        document,
+        run_id=run_id,
+    )
+    return True
+
+
 async def _mark_document_indexing_failed(
     db: AsyncSession,
     document_id: str,
@@ -957,6 +1080,9 @@ async def index_document(
         doc.vector_status = VectorStatus.SKIPPED
         await db.commit()
         return True
+    if await _defer_indexing_if_workspace_deleted(db, doc):
+        logger.info("Deferring embedding for deleted-Workspace document %s", document_id)
+        return True
 
     run_id = await _claim_document_indexing(db, doc, allow_ready=allow_ready)
     if not run_id:
@@ -984,6 +1110,9 @@ async def index_document(
         )
 
     try:
+        if await _defer_indexing_if_workspace_deleted(db, doc, run_id=run_id):
+            logger.info("Deferring embedding for deleted-Workspace document %s", document_id)
+            return True
         # File availability is checked only after this delivery owns the run.
         # Otherwise a duplicate delivery could cancel a healthy active worker.
         _ensure_document_file_available(doc)
@@ -992,12 +1121,32 @@ async def index_document(
         # still work, so this is a successful terminal state.
         cfg = await _resolve_embedding_config()
         if not cfg:
+            if await _defer_indexing_if_workspace_deleted(
+                db,
+                doc,
+                run_id=run_id,
+                lock_for_read=True,
+            ):
+                return True
             logger.info("No embedding provider available — skipping vectorization for document %s", document_id)
             await _complete_document_indexing_without_vectors(db, document_id, run_id)
             return True
 
         await _update_progress("reading", 10)
+        if await _defer_indexing_if_workspace_deleted(
+            db,
+            doc,
+            run_id=run_id,
+            lock_for_read=True,
+        ):
+            return True
+        # The shared Workspace lifecycle lock only protects the ownership
+        # decision.  Release it before filesystem I/O so delete/restore is not
+        # blocked by a slow remote object-store read.
+        await db.commit()
         content = await _read_document_content(doc)
+        if await _defer_indexing_if_workspace_deleted(db, doc, run_id=run_id):
+            return True
 
         await _update_progress("chunking", 20)
         # Use smaller chunks for Ollama (limited context window)
@@ -1014,6 +1163,16 @@ async def index_document(
         batch_size = 100
         chunk_embeddings: list[list[float]] = []
         for i in range(0, total, batch_size):
+            if await _defer_indexing_if_workspace_deleted(
+                db,
+                doc,
+                run_id=run_id,
+                lock_for_read=True,
+            ):
+                return True
+            # Never carry a Workspace lifecycle lock into provider I/O.  The
+            # final storing check below reacquires it for the atomic write.
+            await db.commit()
             batch = chunks[i : i + batch_size]
             reported_done = i
 
@@ -1027,6 +1186,14 @@ async def index_document(
                     total_chunks=total,
                     current_chunk=reported_done,
                 )
+                if await _defer_indexing_if_workspace_deleted(
+                    db,
+                    doc,
+                    run_id=run_id,
+                    lock_for_read=True,
+                ):
+                    raise _IndexingClaimLost(document_id)
+                await db.commit()
 
             batch_embeddings = await generate_embeddings_batch(
                 batch,
@@ -1049,6 +1216,13 @@ async def index_document(
                 await _update_progress("embedding", pct, total_chunks=total, current_chunk=done)
 
         await _update_progress("storing", 95, total_chunks=total, current_chunk=total)
+        if await _defer_indexing_if_workspace_deleted(
+            db,
+            doc,
+            run_id=run_id,
+            lock_for_read=True,
+        ):
+            return True
 
         conn = await db.connection()
         # Replace this document's chunks wholesale — reindexing must not
@@ -1319,15 +1493,15 @@ async def search_similar_chunks(
     # this to the current transaction only, so it can't leak the setting onto
     # other queries sharing a pooled connection.
     await db.execute(text("SET LOCAL ivfflat.probes = 10"))
-    sql = text(f"""
-        SELECT dc.document_id, dc.content, d.name,
-               1 - (dc.embedding <=> CAST(:query_vec AS vector)) AS score
-        FROM document_chunks dc
-        JOIN documents d ON d.id = dc.document_id
-        WHERE {' AND '.join(conditions)}
-        ORDER BY dc.embedding <=> CAST(:query_vec AS vector)
-        LIMIT :lim
-    """)
+    # Only fixed predicates above are interpolated; every value remains bound.
+    statement = (
+        "SELECT dc.document_id, dc.content, d.name, "
+        "1 - (dc.embedding <=> CAST(:query_vec AS vector)) AS score "
+        "FROM document_chunks dc JOIN documents d ON d.id = dc.document_id "
+        f"WHERE {' AND '.join(conditions)} "  # nosec B608
+        "ORDER BY dc.embedding <=> CAST(:query_vec AS vector) LIMIT :lim"
+    )
+    sql = text(statement)
     rows = (await db.execute(sql, params)).fetchall()
     return [
         {
@@ -1364,15 +1538,15 @@ async def search_similar_trigram(
         conditions.append("dc.document_id = ANY(:doc_ids)")
         params["doc_ids"] = list(allowed_doc_ids)
 
-    sql = text(f"""
-        SELECT dc.document_id, dc.content, d.name,
-               similarity(dc.content, :query) AS score
-        FROM document_chunks dc
-        JOIN documents d ON d.id = dc.document_id
-        WHERE {' AND '.join(conditions)}
-        ORDER BY similarity(dc.content, :query) DESC
-        LIMIT :lim
-    """)
+    # Only fixed predicates above are interpolated; every value remains bound.
+    statement = (
+        "SELECT dc.document_id, dc.content, d.name, "
+        "similarity(dc.content, :query) AS score "
+        "FROM document_chunks dc JOIN documents d ON d.id = dc.document_id "
+        f"WHERE {' AND '.join(conditions)} "  # nosec B608
+        "ORDER BY similarity(dc.content, :query) DESC LIMIT :lim"
+    )
+    sql = text(statement)
     rows = (await db.execute(sql, params)).fetchall()
     return [
         {

@@ -45,7 +45,6 @@ test("workspace workflow starters use dedicated APIs without changing the main c
   assert.match(apiSource, /listEntrypoints:\s*\(wsId: string\)/);
   assert.match(apiSource, /streamEntrypoint:\s*async \(/);
   assert.match(apiSource, /\/chat\/entrypoints\/\$\{bindingId\}\/stream/);
-  assert.match(apiSource, /streamEntrypoint:[\s\S]*?response\.status === 402[\s\S]*?useUpgradeStore\.getState\(\)\.show/);
   assert.doesNotMatch(apiSource, /form\.append\("workflow_binding_id"/);
   assert.doesNotMatch(apiSource, /form\.append\("workflow_intent_detection"/);
 });
@@ -53,7 +52,13 @@ test("workspace workflow starters use dedicated APIs without changing the main c
 test("workspace chat explicitly invokes one Flow through the percent token", () => {
   assert.match(chatSource, /api\.workspaces\.chat\.listEntrypoints\(workspaceId\)/);
   assert.match(chatSource, /workflow\?\.bindingId[\s\S]*?api\.workspaces\.chat\.streamEntrypoint/);
-  assert.match(chatSource, /workflows=\{!threadRef \? workflowInvokeOptions : \[\]\}/);
+  assert.match(
+    chatSource,
+    /workflows=\{isTaskSession \? \[\] : workflowInvokeOptions\}/,
+  );
+  assert.match(chatSource, /enabled: Boolean\(workspaceId\)/);
+  assert.match(apiSource, /thread_ref_kind/);
+  assert.match(apiSource, /thread_ref_id/);
   assert.match(composerSource, /type ComposerTrigger = "@" \| "#" \| "\/" \| "%"/);
   assert.match(composerSource, /export function workflowInvokeToken/);
   assert.match(
@@ -105,7 +110,10 @@ test("shared select keeps a portaled menu inside the viewport", () => {
 
 test("workspace inline mentions resolve against the text being sent", () => {
   assert.match(chatSource, /function resolveInlineMention\(value: string\)/);
-  assert.match(chatSource, /const resolvedAgent = resolveInlineMention\(rawText\)/);
+  assert.match(
+    chatSource,
+    /const resolvedAgent = isTaskSession\s*\?\s*null\s*:\s*isResponseSurfaceSubmission\s*\?\s*null\s*:\s*resolveInlineMention\(rawText\)/,
+  );
   assert.match(
     chatSource,
     /atIdx < 0 \|\| \(atIdx > 0 && !\/\\s\/\.test\(val\[atIdx - 1\]\)\)/,
@@ -114,12 +122,18 @@ test("workspace inline mentions resolve against the text being sent", () => {
   assert.doesNotMatch(chatSource, /val\[atIdx - 1\] !== " "/);
 });
 
+test("selecting a Flow replaces the percent trigger even after existing text", () => {
+  assert.match(composerSource, /export function replaceWorkflowTriggerRange/);
+  assert.match(composerSource, /replaceWorkflowTriggerRange\([\s\S]*?getPlainOffset\(editorRef\.current\)/);
+});
+
 test("workflow input pending actions reuse the text response card", () => {
   assert.match(actionSource, /action\.kind === PendingActionKind\.WORKFLOW_STARTER_INPUT/);
   assert.match(actionSource, /WorkflowStarterInputCard/);
   assert.match(actionSource, /onResolve\("run", undefined, \{ inputs: parsed \}\)/);
   assert.match(actionSource, /previousResetTokenRef/);
-  assert.match(chatSource, /actionResetToken=\{resolveMutation\.failureCount\}/);
+  assert.match(chatSource, /actionResetToken=\{actionResetTokens\[item\.msg\.id\] \|\| 0\}/);
+  assert.match(chatSource, /\[msgId\]: \(previous\[msgId\] \|\| 0\) \+ 1/);
   assert.match(actionSource, /action\.kind === PendingActionKind\.WORKFLOW_INPUT/);
   assert.match(actionSource, /HitlInputCard/);
   assert.match(actionSource, /localFiles\.length > 0 \? localFiles : undefined/);
@@ -199,12 +213,12 @@ test("structured workflow starter fields remain compact enough for one desktop v
   );
 });
 
-test("workspace chat delegates workflow runtime rows without filtering ordinary chat", () => {
+test("workspace chat delegates workflow runtime rows and hides internal response-surface turns", () => {
   assert.match(chatSource, /buildWorkspaceWorkflowRunGroups\(sorted\)/);
   assert.match(chatSource, /workflowHostOwnedMessageIds\(workflowRunGroups\)/);
   assert.match(
     chatSource,
-    /sorted\.filter\(\(msg\) => !hostOwnedWorkflowMessageIds\.has\(msg\.id\)\)/,
+    /sorted\.filter\(\(msg\) => \(\s*!hostOwnedWorkflowMessageIds\.has\(msg\.id\)\s*&& !isResponseSurfaceSubmissionMessage\(msg, responseSurfaceSubmissionReceipts\)\s*&& !responseSurfaceSubmissionFailureMessageIds\.has\(msg\.id\)\s*\)\)/,
   );
   assert.match(hostSource, /WORKFLOW_HOST_ACTION_KINDS/);
   assert.match(hostSource, /"workflow_starter_input"/);

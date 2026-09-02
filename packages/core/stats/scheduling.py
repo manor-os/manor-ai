@@ -56,7 +56,8 @@ async def sync_stat_collection_schedule(db: AsyncSession, stat: WorkspaceStat) -
         return
 
     schedule_kind, fields = _schedule_fields(stat.collection_cadence or "")
-    if existing is None:
+    created = existing is None
+    if created:
         existing = ScheduledJob(
             id=generate_ulid(),
             job_id=_job_id(stat),
@@ -68,14 +69,37 @@ async def sync_stat_collection_schedule(db: AsyncSession, stat: WorkspaceStat) -
             execution_target={"stat_id": stat.id},
             enabled=True,
         )
-        db.add(existing)
-    existing.name = f"Collect stat: {stat.name}"
-    existing.schedule_kind = schedule_kind
-    existing.every_seconds = fields.get("every_seconds")
-    existing.cron_expr = fields.get("cron_expr")
-    existing.execution_target = {"stat_id": stat.id}
-    existing.enabled = True
-    await db.flush()
+    if created:
+        existing.schedule_kind = schedule_kind
+        existing.every_seconds = fields.get("every_seconds")
+        existing.cron_expr = fields.get("cron_expr")
+        from packages.core.services.product_growth import persist_scheduled_job
+
+        await persist_scheduled_job(db, existing)
+    else:
+        from packages.core.services.scheduler_service import (
+            ScheduledJobMutationFactory,
+        )
+
+        result = await ScheduledJobMutationFactory.apply(
+            db,
+            existing,
+            {
+                "entity_id": stat.entity_id,
+                "workspace_id": stat.workspace_id,
+                "name": f"Collect stat: {stat.name}",
+                "job_type": "interval" if schedule_kind == "every" else "cron",
+                "schedule_kind": schedule_kind,
+                "every_seconds": fields.get("every_seconds"),
+                "cron_expr": fields.get("cron_expr"),
+                "execution_type": "workspace_stat_collection",
+                "execution_target": {"stat_id": stat.id},
+                "enabled": True,
+                "consecutive_errors": 0,
+            },
+        )
+        if result is None:
+            raise ValueError(f"scheduled job {_job_id(stat)} no longer exists")
 
 
 async def remove_stat_collection_schedule(db: AsyncSession, stat: WorkspaceStat) -> None:

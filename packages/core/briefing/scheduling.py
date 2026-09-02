@@ -180,18 +180,27 @@ async def sync_user_briefing_schedules(
     )).all())
     updated: list[ScheduledJob] = []
     for job, workspace in rows:
+        from packages.core.services.scheduler_service import (
+            ScheduledJobMutationFactory,
+        )
+
         time_of_day, timezone = resolve_briefing_schedule_settings(
             workspace=workspace,
             user=user,
         )
-        job.cron_expr = _parse_time_to_cron(time_of_day)
-        job.timezone = timezone
-        job.execution_target = {"workspace_id": workspace.id}
-        job.schedule_kind = "cron"
-        job.every_seconds = None
-        updated.append(job)
-    if updated:
-        await db.flush()
+        result = await ScheduledJobMutationFactory.apply(
+            db,
+            job,
+            {
+                "cron_expr": _parse_time_to_cron(time_of_day),
+                "timezone": timezone,
+                "execution_target": {"workspace_id": workspace.id},
+                "schedule_kind": "cron",
+                "every_seconds": None,
+            },
+        )
+        if result is not None:
+            updated.append(result.job)
     return updated
 
 
@@ -212,23 +221,44 @@ async def install_briefing_schedule(
     job_id = _job_id_for(workspace.id)
 
     existing = (await db.execute(
-        select(ScheduledJob).where(ScheduledJob.job_id == job_id)
+        select(ScheduledJob).where(
+            ScheduledJob.job_id == job_id,
+            ScheduledJob.entity_id == workspace.entity_id,
+            ScheduledJob.workspace_id == workspace.id,
+        )
     )).scalar_one_or_none()
 
     if existing:
-        existing.entity_id = workspace.entity_id
-        existing.workspace_id = workspace.id
-        existing.schedule_kind = "cron"
-        existing.cron_expr = cron_expr
-        existing.every_seconds = None
-        existing.timezone = timezone
-        existing.execution_type = "briefing"
-        existing.execution_target = {"workspace_id": workspace.id}
+        from packages.core.services.scheduler_service import (
+            ScheduledJobMutationFactory,
+        )
+
+        updates: dict[str, Any] = {
+            "entity_id": workspace.entity_id,
+            "workspace_id": workspace.id,
+            "name": f"Morning briefing: {workspace.name}",
+            "job_type": "cron",
+            "schedule_kind": "cron",
+            "cron_expr": cron_expr,
+            "every_seconds": None,
+            "timezone": timezone,
+            "execution_type": "briefing",
+            "execution_target": {"workspace_id": workspace.id},
+            "enabled": True,
+            "consecutive_errors": 0,
+        }
         if user_id is not None:
-            existing.user_id = user_id
-        existing.enabled = True
-        existing.consecutive_errors = 0
-        await db.flush()
+            updates["user_id"] = user_id
+        result = await ScheduledJobMutationFactory.apply(db, existing, updates)
+        if result is None:
+            raise ValueError(f"scheduled job {job_id} no longer exists")
+        existing = result.job
+        if user_id is not None:
+            from packages.core.services.product_growth import (
+                record_scheduled_job_created_milestone,
+            )
+
+            await record_scheduled_job_created_milestone(db, existing)
         return existing
 
     job = ScheduledJob(
@@ -246,8 +276,9 @@ async def install_briefing_schedule(
         user_id=user_id,
         enabled=True,
     )
-    db.add(job)
-    await db.flush()
+    from packages.core.services.product_growth import persist_scheduled_job
+
+    await persist_scheduled_job(db, job)
     return job
 
 

@@ -14,7 +14,10 @@ test("new flows persist a visible trigger node", () => {
 });
 
 test("every flow launch surface blocks explicit-entry errors", () => {
-  assert.match(flowsSource, /disabled=\{streaming \|\| errorCount > 0\}/);
+  assert.match(
+    flowsSource,
+    /disabled=\{streaming \|\| errorCount > 0 \|\| Boolean\(workflowAiPreview\)\}/,
+  );
   assert.match(flowsSource, /disabled=\{streaming \|\| flowErrorCount > 0\}/);
   assert.match(flowsSource, /validateWorkflow\(flow\.steps \|\| \[\]\).*level === "error"/);
   assert.match(flowsSource, /if \(flowErrorCount === 0\) requestWorkflowRun\(flow\)/);

@@ -239,6 +239,14 @@ Use the optional `workflow_runs` array only for a Flow listed under Installed
 Workspace Flows. Reference its exact blueprint_slug and workflow_slug. Prefer
 workflow_run over decomposing an installed end-to-end Flow into ordinary tasks.
 Preserve the complete request in source_brief and use only declared input keys.
+Treat the briefing's Workflow runs as execution evidence:
+  * Never propose a fresh run of a Flow that already has a pending, running,
+    or paused run. It is work already in flight, even when it needs input.
+  * Never duplicate a completed scheduled Flow from the current review window
+    unless the evidence explicitly calls for an intentional rerun.
+  * For a failed, blocked, or needs_input run, address the recorded blocker
+    with a human request, configuration change, or recovery task; do not hide
+    the failure by launching an indistinguishable fresh run.
 Omit the field or return [] when no installed Flow matches."""
 
 
@@ -499,10 +507,17 @@ def runtime_strategist_template_block(ctx: Any) -> str:
         lines.append("# Business model for this workspace")
         if business_model.get("model_type"):
             lines.append(f"- Type: {business_model['model_type']}")
-        primary_signal = business_model.get("primary_signal") or business_model.get("primary_metric")
+        primary_signal = (
+            business_model.get("primary_signal")
+            or business_model.get("primary_metric")
+        )
         if primary_signal:
             lines.append(f"- Primary signal: {primary_signal}")
-        secondary = business_model.get("secondary_signals") or business_model.get("secondary_metrics") or []
+        secondary = (
+            business_model.get("secondary_signals")
+            or business_model.get("secondary_metrics")
+            or []
+        )
         if secondary:
             lines.append("- Secondary signals: " + ", ".join(str(item) for item in secondary))
         anti = business_model.get("anti_signals") or []
@@ -580,6 +595,22 @@ def runtime_strategist_user_prompt(ctx: Any, *, review_id: str) -> str:
     """Build the review-cycle user prompt from gathered Strategist context."""
 
     sections = [f"# Review trigger\n{ctx.trigger}\n\nreview_id to use: `{review_id}`"]
+    workspace_settings = getattr(getattr(ctx, "workspace", None), "settings", None)
+    personalization = (
+        workspace_settings.get("blueprint_personalization")
+        if isinstance(workspace_settings, dict)
+        else None
+    )
+    if isinstance(personalization, dict) and personalization:
+        sections.append(
+            "# Blueprint personalization\n"
+            + json.dumps(
+                personalization,
+                ensure_ascii=False,
+                sort_keys=True,
+                default=str,
+            )[:4000]
+        )
     readiness_section = _format_workspace_readiness(ctx)
     if readiness_section:
         sections.append("# Workspace readiness\n" + readiness_section)
@@ -704,6 +735,7 @@ def _missing_setup_sections(ctx: Any) -> list[str]:
             "no_goals": "No goals are defined yet",
             "no_channels": "Required workspace channel declarations are not configured yet",
             "no_integrations": "No external integrations are configured yet",
+            "blocking_setup_incomplete": "Blueprint-defined blocking Workspace setup is incomplete",
         }
         missing_text = "\n".join(
             f"- {missing_labels.get(item, item)}" for item in ctx.missing_setup
@@ -711,16 +743,60 @@ def _missing_setup_sections(ctx: Any) -> list[str]:
         sections.append(
             "# Workspace setup incomplete\n"
             f"The following are NOT ready:\n{missing_text}\n\n"
-            "DO NOT propose work tasks that depend on missing setup. "
-            "Instead, propose generic setup/configuration tasks (e.g. "
-            "'Configure the declared channel' or 'Define workspace goals') "
-            "or propose 0 tasks with a note explaining "
-            "what the operator needs to configure first."
+            "DO NOT propose Tasks while blocking setup is incomplete. "
+            "Automated setup runs only through the Blueprint's authorized setup job. "
+            "Use a human request for an operator configuration step, or propose "
+            "0 items with a note explaining what must be configured first."
         )
         missing_channels = getattr(ctx, "missing_channel_requirements", []) or []
         if missing_channels:
             sections.append("# Missing channel requirements\n" + _format_missing_channels(missing_channels))
+        blocking_setup = _blocking_setup_prompt_details(ctx)
+        if blocking_setup:
+            sections.append(blocking_setup)
     return sections
+
+
+def _blocking_setup_prompt_details(ctx: Any) -> str:
+    readiness = getattr(ctx, "workspace_readiness", None)
+    if not isinstance(readiness, dict):
+        return ""
+    part = next((
+        item
+        for item in readiness.get("parts") or []
+        if isinstance(item, dict) and item.get("key") == "blocking_setup"
+    ), None)
+    if not isinstance(part, dict) or part.get("status") != "missing":
+        return ""
+    details = part.get("details") if isinstance(part.get("details"), dict) else {}
+    incomplete_lines = []
+    for result in details.get("incomplete_checks") or []:
+        if not isinstance(result, dict):
+            continue
+        key = result.get("key") or "setup"
+        reason = result.get("reason") or "not ready"
+        incomplete_lines.append(f"- {key}: {reason}")
+    allowed = [
+        str(value or "").strip()
+        for value in details.get("allowed_setup_task_keys") or []
+        if str(value or "").strip()
+    ]
+    lines = [
+        "# Blocking setup gate (authoritative)",
+        *(incomplete_lines or ["- Blocking setup is not ready."]),
+        "Until every check is ready, do not propose any Tasks, workflow_runs, experiments, "
+        "or configuration changes. Automated setup is owned by the authorized setup job.",
+    ]
+    if allowed:
+        lines.append(
+            "You may emit only human requests whose request_key is exactly one of: "
+            + ", ".join(allowed)
+            + "."
+        )
+    else:
+        lines.append("Propose zero work items and explain the operator blocker in notes.")
+    lines.append("Never attach an external_action to a setup proposal.")
+    return "\n".join(lines)
 
 
 def runtime_strategist_services_block(ctx: Any) -> str:

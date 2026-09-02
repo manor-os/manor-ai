@@ -105,12 +105,74 @@ async def test_second_begin_while_running_raises_already_running(db_session):
 
 
 async def test_begin_succeeds_again_after_fail_review(db_session):
-    first = await _begin(db_session)
+    first = await begin_review(
+        db_session,
+        entity_id=ENTITY_ID,
+        workspace_id=WORKSPACE_ID,
+        trigger="scheduled",
+        delivery_id="worker-retry",
+        lease_owner="worker-retry",
+    )
     await fail_review(db_session, first, error="boom")
 
-    second = await _begin(db_session)
+    second = await begin_review(
+        db_session,
+        entity_id=ENTITY_ID,
+        workspace_id=WORKSPACE_ID,
+        trigger="scheduled",
+        delivery_id="worker-retry",
+        lease_owner="worker-retry",
+    )
     assert second.id != first.id
     assert second.status == "running"
+
+
+@pytest.mark.parametrize("terminal", ["succeeded", "skipped", "failed"])
+async def test_terminal_review_releases_execution_lease(db_session, terminal):
+    review = await begin_review(
+        db_session,
+        entity_id=ENTITY_ID,
+        workspace_id=WORKSPACE_ID,
+        trigger="scheduled",
+        delivery_id="worker-a",
+        lease_owner="worker-a",
+    )
+    assert review.delivery_id == "worker-a"
+    assert review.lease_owner == "worker-a"
+    assert review.lease_expires_at is not None
+
+    if terminal == "succeeded":
+        await complete_review(db_session, review)
+    elif terminal == "skipped":
+        await mark_review_skipped(db_session, review, reason="open_proposals")
+    else:
+        await fail_review(db_session, review, error="boom")
+
+    assert review.lease_owner is None
+    assert review.lease_expires_at is None
+    assert review.delivery_id == "worker-a"
+
+
+async def test_terminal_delivery_receipt_blocks_post_commit_replay(db_session):
+    review = await begin_review(
+        db_session,
+        entity_id=ENTITY_ID,
+        workspace_id=WORKSPACE_ID,
+        trigger="scheduled",
+        delivery_id="worker-committed",
+        lease_owner="worker-committed",
+    )
+    await complete_review(db_session, review)
+
+    with pytest.raises(ReviewAlreadyRunning):
+        await begin_review(
+            db_session,
+            entity_id=ENTITY_ID,
+            workspace_id=WORKSPACE_ID,
+            trigger="scheduled",
+            delivery_id="worker-committed",
+            lease_owner="worker-committed",
+        )
 
 
 async def test_other_workspace_running_review_does_not_block(db_session):

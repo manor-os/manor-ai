@@ -17,6 +17,7 @@ from packages.core.ai.runtime.resolver_context import (
     default_resolver_stages,
 )
 from packages.core.ai.runtime.envelope import RuntimeEnvelope
+from packages.core.ai.runtime.tool_bindings import RuntimeMCPProviderToolScope
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +46,8 @@ class RuntimeResolver:
         tool_schemas: Iterable[dict[str, Any]] | None = None,
         allowed_tool_names: Iterable[str] | None = None,
         blocked_tool_names: Iterable[str] | None = None,
+        mcp_provider_scopes: Iterable[RuntimeMCPProviderToolScope] | None = None,
+        mcp_scope_unrestricted: bool = False,
         skill_refs: Iterable[dict[str, Any]] | None = None,
     ) -> "ResolvedRuntimeToolSurface":
         context = self._resolve_context(
@@ -53,6 +56,8 @@ class RuntimeResolver:
             tool_schemas=tool_schemas,
             allowed_tool_names=allowed_tool_names,
             blocked_tool_names=blocked_tool_names,
+            mcp_provider_scopes=mcp_provider_scopes,
+            mcp_scope_unrestricted=mcp_scope_unrestricted,
             skill_refs=skill_refs,
         )
         envelope = self._envelope_from_context(context)
@@ -71,6 +76,8 @@ class RuntimeResolver:
         tool_schemas: Iterable[dict[str, Any]] | None = None,
         allowed_tool_names: Iterable[str] | None = None,
         blocked_tool_names: Iterable[str] | None = None,
+        mcp_provider_scopes: Iterable[RuntimeMCPProviderToolScope] | None = None,
+        mcp_scope_unrestricted: bool = False,
         skill_refs: Iterable[dict[str, Any]] | None = None,
     ) -> RuntimeEnvelope:
         return self._envelope_from_context(
@@ -80,6 +87,8 @@ class RuntimeResolver:
                 tool_schemas=tool_schemas,
                 allowed_tool_names=allowed_tool_names,
                 blocked_tool_names=blocked_tool_names,
+                mcp_provider_scopes=mcp_provider_scopes,
+                mcp_scope_unrestricted=mcp_scope_unrestricted,
                 skill_refs=skill_refs,
             )
         )
@@ -92,6 +101,8 @@ class RuntimeResolver:
         tool_schemas: Iterable[dict[str, Any]] | None = None,
         allowed_tool_names: Iterable[str] | None = None,
         blocked_tool_names: Iterable[str] | None = None,
+        mcp_provider_scopes: Iterable[RuntimeMCPProviderToolScope] | None = None,
+        mcp_scope_unrestricted: bool = False,
         skill_refs: Iterable[dict[str, Any]] | None = None,
     ) -> RuntimeResolverContext:
         context = RuntimeResolverContext.from_inputs(
@@ -100,6 +111,8 @@ class RuntimeResolver:
             tool_schemas=tool_schemas,
             allowed_tool_names=allowed_tool_names,
             blocked_tool_names=blocked_tool_names,
+            mcp_provider_scopes=mcp_provider_scopes,
+            mcp_scope_unrestricted=mcp_scope_unrestricted,
             skill_refs=skill_refs,
         )
         return apply_resolver_stages(context, self.resolver_stages)

@@ -66,7 +66,12 @@ _BATTERY = [
         "summary": 123,
         "outputs": {"text": {"nested": ["junk"]}, "files": "nope"},
         "progress": "half",
-        "failure": {"reason": 0, "blockers": "b", "retryable": "yes"},
+        "failure": {
+            "reason": 0,
+            "blockers": "b",
+            "retryable": "yes",
+            "requires_human": "yes",
+        },
         "next_steps": [1, "do the next thing"],
         "misc": {"deep": [{"weird": None}]},
     },

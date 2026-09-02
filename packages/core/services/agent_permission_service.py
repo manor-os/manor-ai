@@ -34,11 +34,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from packages.core.constants.execution import (
     WorkerStatus,
 )
-from packages.core.models.document import Integration
-from packages.core.services.provider_keys import canonical_provider_key, provider_key_aliases
+from packages.core.services.provider_keys import canonical_provider_key
 from packages.core.services.integration_account_service import (
-    entity_account_has_credentials,
-    list_runtime_integration_accounts,
+    RuntimeIntegrationRegistry,
+    load_runtime_integration_registry,
     select_runtime_integration_account,
 )
 
@@ -51,8 +50,9 @@ _ENV_TOKEN_VARS: dict[str, list[str]] = {
     "telegram":         ["TELEGRAM_BOT_TOKEN"],
     "wechat_personal":  ["WECHAT_BOT_TOKEN"],
     "wechat_official":  ["WECHAT_APP_SECRET"],
-    "whatsapp":         ["WHATSAPP_TOKEN", "TWILIO_AUTH_TOKEN"],
-    "twilio":           ["TWILIO_AUTH_TOKEN"],
+    "whatsapp":         ["WHATSAPP_TOKEN"],
+    # Twilio credentials are always resolved from the user's Integration.
+    # Keep this provider out of the env-token map to prevent shared-account access.
     "quickbooks":       ["QUICKBOOKS_ACCESS_TOKEN"],
     "gmail":            ["GMAIL_OAUTH_TOKEN"],
     "google_calendar":  ["GOOGLE_CALENDAR_OAUTH_TOKEN", "GOOGLE_OAUTH_TOKEN"],
@@ -82,6 +82,16 @@ _FIRST_PARTY_PROVIDER_PREFIXES: tuple[str, ...] = ("manor_mcp_",)
 def _is_first_party_provider(provider: str) -> bool:
     return provider == "manor" or provider.startswith(_FIRST_PARTY_PROVIDER_PREFIXES)
 
+
+
+def provider_requires_integration_account_registry(provider: str) -> bool:
+    """Return whether runtime auth for ``provider`` comes from account rows."""
+    canonical = canonical_provider_key(provider)
+    if _is_first_party_provider(canonical):
+        return False
+    return True
+
+
 def _env_token_for(provider: str) -> str | None:
     """Return the first non-empty env-var value for the provider, or None."""
     provider = canonical_provider_key(provider)
@@ -101,19 +111,8 @@ def _env_token_for(provider: str) -> str | None:
 class ToolAccessDecision:
     allowed: bool
     reason: str
-    scope: str = ""  # "user" | "entity" | "none" — which credential source resolved
+    scope: str = ""  # user/entity/platform/internal/cli_worker/env/none
     account_id: str | None = None
-
-
-def _entity_integration_has_usable_credentials(integration: Integration) -> bool:
-    """Return whether an entity Integration row can actually authenticate.
-
-    Some setup flows create an Integration row before credentials are
-    attached. Treating that placeholder as callable lets MCP dispatch reach a
-    provider with no token, so runtime gating mirrors the Integrations page's
-    ``agent_can_use`` check here.
-    """
-    return entity_account_has_credentials(integration)
 
 
 async def can_use_integration(
@@ -123,16 +122,14 @@ async def can_use_integration(
     entity_id: str,
     provider: str,
     integration_account_id: str | None = None,
+    integration_registry: RuntimeIntegrationRegistry | None = None,
     allow_env_fallback: bool = True,
 ) -> ToolAccessDecision:
     """Can the acting user use this integration via an agent right now?
 
     Resolution order:
-      1. Personal connection in ``oauth_accounts(user_id, provider)``
-         → always allowed if the token exists.
-      2. Entity-scope credential in ``integrations(entity_id, provider)``
-         → allowed only if the user's role satisfies
-         ``integrations.required_permission`` (if set).
+      2. An owned or explicitly shared OAuth/account connection selected from
+         ``list_runtime_integration_accounts``.
       3. Env fallback only when explicitly allowed by the caller and
          MANOR_ALLOW_ENV_TOKENS is enabled.
       4. Neither → denied with a "connect integration" hint.
@@ -145,69 +142,121 @@ async def can_use_integration(
             scope="internal",
         )
 
-    # 1–2. Resolve an explicitly selected account, or the ordered default.
-    # The account service includes personal OAuth and entity credentials and
-    # filters entity rows by the acting user's permission.
-    accounts = await list_runtime_integration_accounts(
-        db,
-        user_id=user_id,
-        entity_id=entity_id,
-        provider=provider,
-    )
+    # Resolve an explicit account or the ordered owner/shared default from the
+    # user-scoped registry. There is no implicit Entity-wide credential access.
+    registry_binding = None
+    if integration_registry is not None and integration_registry.covers(provider):
+        if (
+            integration_registry.user_id != user_id
+            or integration_registry.entity_id != entity_id
+        ):
+            return ToolAccessDecision(
+                allowed=False,
+                reason="The integration registry does not match the active runtime scope.",
+                scope="none",
+            )
+        registry_binding = integration_registry.integration(provider)
+        accounts = list(integration_registry.accounts_for(provider))
+    else:
+        resolved_registry = await load_runtime_integration_registry(
+            db,
+            user_id=user_id,
+            entity_id=entity_id,
+            provider_keys=[provider],
+        )
+        registry_binding = resolved_registry.integration(provider)
+        accounts = list(resolved_registry.accounts_for(provider))
+    if (
+        registry_binding is not None
+        and registry_binding.load_errors
+        and not str(integration_account_id or "").strip()
+    ):
+        return ToolAccessDecision(
+            allowed=False,
+            reason=(
+                f"The {provider} account registry is incomplete. "
+                "Select an exact known account or retry after the integration "
+                "service recovers."
+            ),
+            scope="none",
+        )
     selected, selection_error = select_runtime_integration_account(
         accounts,
         integration_account_id,
     )
     if selection_error:
+        selected_account_id = str(integration_account_id or "").strip()
+        if (
+            registry_binding is not None
+            and selected_account_id
+            in registry_binding.reconnect_required_account_ids
+        ):
+            return ToolAccessDecision(
+                allowed=False,
+                reason=(
+                    f"The {provider} connection is no longer available in Nango. "
+                    "Reconnect it under Settings → Integrations."
+                ),
+                scope="none",
+            )
         return ToolAccessDecision(
             allowed=False,
             reason=selection_error,
             scope="none",
         )
 
-    if selected and selected.scope == "user":
-        return ToolAccessDecision(
-            allowed=True,
-            reason=f"User has personal {provider} connection.",
-            scope="user",
-            account_id=selected.id,
+    if selected:
+        reason = (
+            f"User has personal {provider} connection."
+            if selected.ownership == "mine"
+            else f"User has shared access to a {provider} connection."
         )
-
-    if selected and selected.scope == "entity":
         return ToolAccessDecision(
             allowed=True,
-            reason=f"Using entity-level {provider} credentials.",
-            scope="entity",
+            reason=reason,
+            scope=selected.scope.value,
             account_id=selected.id,
         )
 
     if not accounts:
-        provider_aliases = provider_key_aliases(provider)
-        configured_rows = list((await db.execute(
-            select(Integration).where(
-                Integration.entity_id == entity_id,
-                Integration.provider.in_(provider_aliases),
-                Integration.status == "active",
-            ).order_by(Integration.created_at.desc())
-        )).scalars().all())
-        if configured_rows:
-            usable_rows = [
-                row for row in configured_rows
-                if _entity_integration_has_usable_credentials(row)
-            ]
-            if not usable_rows:
+        if registry_binding is not None:
+            if registry_binding.load_errors:
+                return ToolAccessDecision(
+                    allowed=False,
+                    reason=(
+                        f"The {provider} account registry is incomplete. "
+                        "Retry after the integration service recovers."
+                    ),
+                    scope="none",
+                )
+            configured_count = registry_binding.configured_entity_account_count
+            credentialed_count = registry_binding.credentialed_entity_account_count
+            required = next(iter(registry_binding.denied_permissions), None)
+        else:
+            # A registry that covers this provider is authoritative even when
+            # its full snapshot has no binding: no persisted account exists.
+            configured_count = 0
+            credentialed_count = 0
+            required = None
+        if configured_count:
+            if registry_binding.reconnect_required_account_ids:
+                return ToolAccessDecision(
+                    allowed=False,
+                    reason=(
+                        f"The {provider} connection is no longer available in Nango. "
+                        "Reconnect it under Settings → Integrations."
+                    ),
+                    scope="none",
+                )
+            if not credentialed_count:
                 return ToolAccessDecision(
                     allowed=False,
                     reason=(
                         f"The {provider} integration is configured but has no usable "
                         "credentials. Reconnect it under Settings → Integrations."
                     ),
-                    scope="entity",
+                    scope="none",
                 )
-            required = next(
-                (row.required_permission for row in usable_rows if row.required_permission),
-                None,
-            )
             if required:
                 return ToolAccessDecision(
                     allowed=False,
@@ -216,9 +265,9 @@ async def can_use_integration(
                         "which your role doesn't have. Ask an admin to grant access, or "
                         f"connect your own {provider} account."
                     ),
-                    scope="entity",
+                    scope="none",
                 )
-        # 3. Dev / cloud-default env fallback (only when flag is set)
+        # Dev / cloud-default env fallback (only when the caller allows it).
         if allow_env_fallback and _env_token_for(provider):
             return ToolAccessDecision(
                 allowed=True,
@@ -250,10 +299,11 @@ async def resolve_usable_mcp_providers(
 ) -> frozenset[str]:
     """Batch 'which MCP servers can this user use right now'.
 
-    Used by search-time pre-filtering (tool_discovery_v2). Reuses
-    can_use_integration per provider so admin gating / first-party /
-    credential logic can't drift from the dispatch-time check. Failures
-    fail-open per provider (discovery-only surface; execution still gates).
+    Used by Tool Discovery v2 search-time pre-filtering. Account-backed
+    providers share one credential-free, actor-scoped registry snapshot;
+    special first-party/platform/CLI providers still reuse
+    ``can_use_integration`` so their gates cannot drift from dispatch.
+    Failures fail-open for discovery only; execution always revalidates.
 
     ``provider_keys`` is required (no default catalog import here): this
     file is a non-runtime production module and importing
@@ -264,12 +314,42 @@ async def resolve_usable_mcp_providers(
     runtime-owned and exempt from that scan) derives the provider keys
     from its own view of the tool schemas instead.
     """
+    canonical_keys = tuple(dict.fromkeys(
+        canonical
+        for key in provider_keys
+        if (canonical := canonical_provider_key(key))
+    ))
+    account_provider_keys = tuple(
+        key for key in canonical_keys
+        if provider_requires_integration_account_registry(key)
+    )
+    integration_registry: RuntimeIntegrationRegistry | None = None
+    registry_failed = False
+    if account_provider_keys:
+        try:
+            integration_registry = await load_runtime_integration_registry(
+                db,
+                user_id=user_id,
+                entity_id=entity_id,
+                provider_keys=account_provider_keys,
+            )
+        except Exception:
+            # Search-time filtering is advisory. A registry outage must not
+            # hide a potentially usable provider; the execution gate will
+            # reload the exact account and fail closed before provider I/O.
+            registry_failed = True
+
     usable: set[str] = set()
-    for key in provider_keys:
+    for key in canonical_keys:
+        if registry_failed and key in account_provider_keys:
+            usable.add(key)
+            continue
         try:
             decision = await can_use_integration(
                 db, user_id=user_id, entity_id=entity_id,
-                provider=key, allow_env_fallback=False,
+                provider=key,
+                integration_registry=integration_registry,
+                allow_env_fallback=False,
             )
             if decision.allowed:
                 usable.add(key)
@@ -285,6 +365,7 @@ async def can_use_mcp_server(
     entity_id: str,
     server_key: str,
     integration_account_id: str | None = None,
+    integration_registry: RuntimeIntegrationRegistry | None = None,
     allow_env_fallback: bool = False,
 ) -> ToolAccessDecision:
     """Thin alias — MCP server keys equal integration provider keys.
@@ -298,6 +379,7 @@ async def can_use_mcp_server(
         entity_id=entity_id,
         provider=server_key,
         integration_account_id=integration_account_id,
+        integration_registry=integration_registry,
         allow_env_fallback=allow_env_fallback,
     )
 

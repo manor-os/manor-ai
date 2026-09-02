@@ -3,6 +3,7 @@
 路径 C（执行中暂停）此前直接写 chat Message.pending_action，不留记录 —
 无法 join 回 task/step，也无法复用去重。这些测试钉住接线后的行为。
 """
+
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -15,10 +16,11 @@ from packages.core.governance import WorkspacePolicy, get_policy, update_policy
 from packages.core.governance.approvals import (
     ApprovalOrigin,
     ApprovalSubject,
+    PermissionDecision,
     count_open_requests,
     dedup_key_for,
     grant_approval,
-    resolve_approval,
+    resolve_approval as _resolve_approval,
 )
 from packages.core.models.hitl_request import HitlRequest
 from packages.core.models.base import generate_ulid
@@ -26,6 +28,18 @@ from packages.core.models.execution import ExecutionPlan, ExecutionStep
 from packages.core.models.task import Conversation, Message
 from packages.core.models.worker import Worker, WorkLease
 from packages.core.models.workspace import Workspace
+from packages.core.services.runtime_authorization import AuthorizationRule
+
+
+_POLICY_TEST_PERMISSION = PermissionDecision.allow(AuthorizationRule.SYSTEM_WORKER)
+
+
+async def resolve_approval(*args, **kwargs):
+    return await _resolve_approval(
+        *args,
+        permission_decision=_POLICY_TEST_PERMISSION,
+        **kwargs,
+    )
 
 
 def _subject(entity_id):
@@ -42,12 +56,12 @@ def test_lease_origin_dedup_key_includes_lease_and_kind():
     entity_id = generate_ulid()
     lease_id = generate_ulid()
     origin = ApprovalOrigin(
-        kind="lease", lease_id=lease_id, step_id=generate_ulid(),
+        kind="lease",
+        lease_id=lease_id,
+        step_id=generate_ulid(),
         context={"pending_kind": "needs_confirmation"},
     )
-    assert dedup_key_for(_subject(entity_id), origin) == (
-        f"lease:{lease_id}:needs_confirmation"
-    )
+    assert dedup_key_for(_subject(entity_id), origin) == (f"lease:{lease_id}:needs_confirmation")
 
 
 def test_lease_origin_same_lease_different_kind_differs():
@@ -56,11 +70,15 @@ def test_lease_origin_same_lease_different_kind_differs():
     lease_id = generate_ulid()
     step_id = generate_ulid()
     confirm = ApprovalOrigin(
-        kind="lease", lease_id=lease_id, step_id=step_id,
+        kind="lease",
+        lease_id=lease_id,
+        step_id=step_id,
         context={"pending_kind": "needs_confirmation"},
     )
     login = ApprovalOrigin(
-        kind="lease", lease_id=lease_id, step_id=step_id,
+        kind="lease",
+        lease_id=lease_id,
+        step_id=step_id,
         context={"pending_kind": "needs_login"},
     )
     assert dedup_key_for(_subject(entity_id), confirm) != dedup_key_for(_subject(entity_id), login)
@@ -74,7 +92,9 @@ def test_lease_origin_same_lease_same_kind_dedups():
 
     def _origin():
         return ApprovalOrigin(
-            kind="lease", lease_id=lease_id, step_id=step_id,
+            kind="lease",
+            lease_id=lease_id,
+            step_id=step_id,
             context={"pending_kind": "needs_confirmation"},
         )
 
@@ -89,6 +109,41 @@ def test_lease_origin_without_pending_kind_falls_back():
     assert dedup_key_for(_subject(entity_id), origin) == f"lease:{lease_id}:human_input"
 
 
+def test_tool_call_dedup_key_includes_resource_scope():
+    entity_id = generate_ulid()
+    conversation_id = generate_ulid()
+    origin = ApprovalOrigin(
+        kind="tool_call",
+        conversation_id=conversation_id,
+        context={"arguments": {"path": "docs/status.xlsx"}},
+    )
+    exact = dedup_key_for(
+        ApprovalSubject(
+            entity_id=entity_id,
+            action_key="workspace.file.modify",
+            resource_id="docs/status.xlsx",
+            capability_id="file.write",
+            risk_level="medium",
+            kind="action",
+        ),
+        origin,
+    )
+    other = dedup_key_for(
+        ApprovalSubject(
+            entity_id=entity_id,
+            action_key="workspace.file.modify",
+            resource_id="docs/other.xlsx",
+            capability_id="file.write",
+            risk_level="medium",
+            kind="action",
+        ),
+        origin,
+    )
+
+    assert exact != other
+    assert exact.startswith(f"tool:{conversation_id}:workspace.file.modify#resource:docs/status.xlsx:")
+
+
 async def _lease_fixture(db, *, entity_id=None, workspace_id=None):
     """A workspace + running plan + leased step, ready to pause.
 
@@ -100,45 +155,82 @@ async def _lease_fixture(db, *, entity_id=None, workspace_id=None):
     entity_id = entity_id or generate_ulid()
     if workspace_id is None:
         workspace_id = generate_ulid()
-        db.add(Workspace(
-            id=workspace_id, entity_id=entity_id, name="Lease WS", operating_model={},
-        ))
+        db.add(
+            Workspace(
+                id=workspace_id,
+                entity_id=entity_id,
+                name="Lease WS",
+                operating_model={},
+            )
+        )
 
     worker_id = generate_ulid()
-    db.add(Worker(
-        id=worker_id, entity_id=entity_id, kind="internal",
-        display_name="W", trust_level="trusted", status="active",
-        capabilities={"supported_kinds": ["subagent"]}, consecutive_failures=0,
-    ))
+    db.add(
+        Worker(
+            id=worker_id,
+            entity_id=entity_id,
+            kind="internal",
+            display_name="W",
+            trust_level="trusted",
+            status="active",
+            capabilities={"supported_kinds": ["subagent"]},
+            consecutive_failures=0,
+        )
+    )
 
     plan_id = generate_ulid()
     task_id = generate_ulid()
-    db.add(ExecutionPlan(
-        id=plan_id, entity_id=entity_id, workspace_id=workspace_id,
-        task_id=task_id, plan_dag={}, status="running",
-    ))
+    db.add(
+        ExecutionPlan(
+            id=plan_id,
+            entity_id=entity_id,
+            workspace_id=workspace_id,
+            task_id=task_id,
+            plan_dag={},
+            status="running",
+        )
+    )
 
     step_id = generate_ulid()
-    db.add(ExecutionStep(
-        id=step_id, plan_id=plan_id, entity_id=entity_id, workspace_id=workspace_id,
-        step_key="publish_via_chrome", kind="subagent", params={},
-        step_status="running", attempt_count=1, max_attempts=3,
-        risk_level="medium", capability_id="browser.control",
-    ))
+    db.add(
+        ExecutionStep(
+            id=step_id,
+            plan_id=plan_id,
+            entity_id=entity_id,
+            workspace_id=workspace_id,
+            step_key="publish_via_chrome",
+            kind="subagent",
+            params={},
+            step_status="running",
+            attempt_count=1,
+            max_attempts=3,
+            risk_level="medium",
+            capability_id="browser.control",
+        )
+    )
 
     lease_id = generate_ulid()
-    db.add(WorkLease(
-        id=lease_id, step_id=step_id, plan_id=plan_id, entity_id=entity_id,
-        workspace_id=workspace_id, worker_id=worker_id,
-        status=WorkLeaseStatus.ACTIVE.value,
-        # lease_until is NOT NULL on the model — omitting it fails the insert.
-        lease_until=datetime.now(timezone.utc) + timedelta(minutes=5),
-    ))
+    db.add(
+        WorkLease(
+            id=lease_id,
+            step_id=step_id,
+            plan_id=plan_id,
+            entity_id=entity_id,
+            workspace_id=workspace_id,
+            worker_id=worker_id,
+            status=WorkLeaseStatus.ACTIVE.value,
+            # lease_until is NOT NULL on the model — omitting it fails the insert.
+            lease_until=datetime.now(timezone.utc) + timedelta(minutes=5),
+        )
+    )
     await db.flush()
     return {
-        "entity_id": entity_id, "workspace_id": workspace_id,
-        "plan_id": plan_id, "task_id": task_id,
-        "step_id": step_id, "lease_id": lease_id,
+        "entity_id": entity_id,
+        "workspace_id": workspace_id,
+        "plan_id": plan_id,
+        "task_id": task_id,
+        "step_id": step_id,
+        "lease_id": lease_id,
     }
 
 
@@ -146,29 +238,35 @@ async def _lease_fixture(db, *, entity_id=None, workspace_id=None):
 async def test_lease_needs_human_mints_request(db_session):
     fx = await _lease_fixture(db_session)
     await Dispatcher().lease_needs_human(
-        db_session, fx["lease_id"],
+        db_session,
+        fx["lease_id"],
         prompt="Confirm the LinkedIn post before publishing",
         pending_action={"kind": "needs_confirmation"},
     )
     await db_session.flush()
 
-    req = (await db_session.execute(
-        select(HitlRequest).where(HitlRequest.origin_step_id == fx["step_id"])
-    )).scalar_one()
+    req = (
+        await db_session.execute(select(HitlRequest).where(HitlRequest.origin_step_id == fx["step_id"]))
+    ).scalar_one()
     assert req.status == ApprovalStatus.PENDING.value
     assert req.origin_kind == "lease"
     assert req.dedup_key == f"lease:{fx['lease_id']}:needs_confirmation"
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("pending_kind,expected_hitl_type", [
-    ("needs_confirmation", "authorize"),
-    ("needs_login", "input"),
-    ("needs_input", "input"),
-    ("human_input", "input"),
-])
+@pytest.mark.parametrize(
+    "pending_kind,expected_hitl_type",
+    [
+        ("needs_confirmation", "authorize"),
+        ("needs_login", "input"),
+        ("needs_input", "input"),
+        ("human_input", "input"),
+    ],
+)
 async def test_lease_pause_records_what_it_actually_asks_for(
-    db_session, pending_kind, expected_hitl_type,
+    db_session,
+    pending_kind,
+    expected_hitl_type,
 ):
     """路径 C 的暂停必须写下自己是「要信息」还是「要许可」。
 
@@ -179,15 +277,17 @@ async def test_lease_pause_records_what_it_actually_asks_for(
     """
     fx = await _lease_fixture(db_session)
     await Dispatcher().lease_needs_human(
-        db_session, fx["lease_id"], prompt="Please help",
+        db_session,
+        fx["lease_id"],
+        prompt="Please help",
         pending_action={"kind": pending_kind},
     )
     await db_session.flush()
     db_session.expire_all()
 
-    req = (await db_session.execute(
-        select(HitlRequest).where(HitlRequest.origin_step_id == fx["step_id"])
-    )).scalar_one()
+    req = (
+        await db_session.execute(select(HitlRequest).where(HitlRequest.origin_step_id == fx["step_id"]))
+    ).scalar_one()
     assert req.hitl_type == expected_hitl_type
     assert req.is_governance() is (expected_hitl_type == "authorize")
 
@@ -197,7 +297,9 @@ async def test_lease_request_joins_back_to_task_and_plan(db_session):
     """§3.3 验收：每一次暂停都能 join 回具体 task/step。"""
     fx = await _lease_fixture(db_session)
     await Dispatcher().lease_needs_human(
-        db_session, fx["lease_id"], prompt="Need input",
+        db_session,
+        fx["lease_id"],
+        prompt="Need input",
         pending_action={"kind": "needs_input"},
     )
     await db_session.flush()
@@ -205,9 +307,9 @@ async def test_lease_request_joins_back_to_task_and_plan(db_session):
     # and the asserts would only restate in-memory state, not persisted columns.
     db_session.expire_all()
 
-    req = (await db_session.execute(
-        select(HitlRequest).where(HitlRequest.origin_step_id == fx["step_id"])
-    )).scalar_one()
+    req = (
+        await db_session.execute(select(HitlRequest).where(HitlRequest.origin_step_id == fx["step_id"]))
+    ).scalar_one()
     assert req.origin_task_id == fx["task_id"]
     assert req.origin_plan_id == fx["plan_id"]
     assert req.workspace_id == fx["workspace_id"]
@@ -221,21 +323,23 @@ async def test_lease_needs_human_twice_same_reason_reuses_request(db_session):
     for _ in range(2):
         # lease_needs_human parks the lease in needs_human; a second pause on
         # the same lease only happens after it is re-leased, so re-activate it.
-        lease = (await db_session.execute(
-            select(WorkLease).where(WorkLease.id == fx["lease_id"])
-        )).scalar_one()
+        lease = (await db_session.execute(select(WorkLease).where(WorkLease.id == fx["lease_id"]))).scalar_one()
         lease.status = WorkLeaseStatus.ACTIVE.value
         await db_session.flush()
 
         await svc.lease_needs_human(
-            db_session, fx["lease_id"], prompt="Confirm",
+            db_session,
+            fx["lease_id"],
+            prompt="Confirm",
             pending_action={"kind": "needs_confirmation"},
         )
         await db_session.flush()
 
-    rows = (await db_session.execute(
-        select(HitlRequest).where(HitlRequest.origin_step_id == fx["step_id"])
-    )).scalars().all()
+    rows = (
+        (await db_session.execute(select(HitlRequest).where(HitlRequest.origin_step_id == fx["step_id"])))
+        .scalars()
+        .all()
+    )
     assert len(rows) == 1
 
 
@@ -259,15 +363,23 @@ async def test_granted_lease_request_stays_findable_until_consumed(db_session):
 
     fx = await _lease_fixture(db_session)
     await Dispatcher().lease_needs_human(
-        db_session, fx["lease_id"], prompt="Confirm",
+        db_session,
+        fx["lease_id"],
+        prompt="Confirm",
         pending_action={"kind": "needs_confirmation"},
     )
     await db_session.flush()
 
-    req = (await db_session.execute(
-        select(HitlRequest).where(HitlRequest.origin_step_id == fx["step_id"])
-    )).scalar_one()
-    await grant_approval(db_session, req, by_user_id=generate_ulid(), via="chat_card")
+    req = (
+        await db_session.execute(select(HitlRequest).where(HitlRequest.origin_step_id == fx["step_id"]))
+    ).scalar_one()
+    await grant_approval(
+        db_session,
+        req,
+        by_user_id=generate_ulid(),
+        via="chat_card",
+        authority_prechecked=True,
+    )
     await db_session.flush()
 
     # 只 grant：仍然存活 —— 单靠 grant 关不掉这一行。
@@ -298,7 +410,9 @@ async def test_plan_terminal_expires_lease_request(db_session):
 
     fx = await _lease_fixture(db_session)
     await Dispatcher().lease_needs_human(
-        db_session, fx["lease_id"], prompt="Confirm",
+        db_session,
+        fx["lease_id"],
+        prompt="Confirm",
         pending_action={"kind": "needs_confirmation"},
     )
     await db_session.flush()
@@ -307,15 +421,16 @@ async def test_plan_terminal_expires_lease_request(db_session):
     await db_session.flush()
     assert closed == 1
 
-    req = (await db_session.execute(
-        select(HitlRequest).where(HitlRequest.origin_step_id == fx["step_id"])
-    )).scalar_one()
+    req = (
+        await db_session.execute(select(HitlRequest).where(HitlRequest.origin_step_id == fx["step_id"]))
+    ).scalar_one()
     assert req.status == ApprovalStatus.EXPIRED.value
 
 
 @pytest.mark.asyncio
 async def test_fallback_card_without_pending_action_carries_request_id(
-    db_session, monkeypatch,
+    db_session,
+    monkeypatch,
 ):
     """apps/api/routers/workers.py 调用时不带 pending_action —— 走通知器自建的
     fallback 卡片分支。那张卡也必须带 approval_request_id，否则回答时无从关闭，
@@ -336,14 +451,16 @@ async def test_fallback_card_without_pending_action_carries_request_id(
 
     fx = await _lease_fixture(db_session)
     await Dispatcher().lease_needs_human(
-        db_session, fx["lease_id"], prompt="Solve the CAPTCHA",
+        db_session,
+        fx["lease_id"],
+        prompt="Solve the CAPTCHA",
         # 无 pending_action —— 正是 workers.py 路由的调用形态。
     )
     await db_session.flush()
 
-    req = (await db_session.execute(
-        select(HitlRequest).where(HitlRequest.origin_step_id == fx["step_id"])
-    )).scalar_one()
+    req = (
+        await db_session.execute(select(HitlRequest).where(HitlRequest.origin_step_id == fx["step_id"]))
+    ).scalar_one()
 
     assert len(posted) == 1, "needs_human 应当恰好投递一张卡片"
     card = posted[0]["pending_action"]
@@ -376,49 +493,86 @@ async def _seed_lease_card(client, db_session, username: str, *, kind: str):
     that points at it. Returns everything the resolve endpoint needs."""
     headers = await _register(client, username)
     ws = await client.post(
-        "/api/v1/workspaces", headers=headers, json={"name": "Lease Card WS"},
+        "/api/v1/workspaces",
+        headers=headers,
+        json={"name": "Lease Card WS"},
     )
     ws_body = ws.json()
     entity_id, workspace_id = ws_body["entity_id"], ws_body["id"]
 
     plan_id, task_id, step_id = generate_ulid(), generate_ulid(), generate_ulid()
-    db_session.add(ExecutionPlan(
-        id=plan_id, entity_id=entity_id, workspace_id=workspace_id,
-        task_id=task_id, plan_dag={}, status="running",
-    ))
-    db_session.add(ExecutionStep(
-        id=step_id, plan_id=plan_id, entity_id=entity_id, workspace_id=workspace_id,
-        step_key="publish_via_chrome", kind="subagent", params={},
-        step_status="waiting_human", attempt_count=1, max_attempts=3,
-        risk_level="medium", capability_id="browser.control",
-    ))
+    db_session.add(
+        ExecutionPlan(
+            id=plan_id,
+            entity_id=entity_id,
+            workspace_id=workspace_id,
+            task_id=task_id,
+            plan_dag={},
+            status="running",
+        )
+    )
+    db_session.add(
+        ExecutionStep(
+            id=step_id,
+            plan_id=plan_id,
+            entity_id=entity_id,
+            workspace_id=workspace_id,
+            step_key="publish_via_chrome",
+            kind="subagent",
+            params={},
+            step_status="waiting_human",
+            attempt_count=1,
+            max_attempts=3,
+            risk_level="medium",
+            capability_id="browser.control",
+        )
+    )
 
     request_id = generate_ulid()
-    db_session.add(HitlRequest(
-        id=request_id, entity_id=entity_id, workspace_id=workspace_id,
-        capability_id="browser.control", risk_level="medium",
-        origin_kind="lease", origin_step_id=step_id, origin_plan_id=plan_id,
-        origin_task_id=task_id, status=ApprovalStatus.PENDING.value,
-        dedup_key=f"lease:{generate_ulid()}:{kind}",
-        reason="Confirm before publishing",
-    ))
+    db_session.add(
+        HitlRequest(
+            id=request_id,
+            entity_id=entity_id,
+            workspace_id=workspace_id,
+            capability_id="browser.control",
+            risk_level="medium",
+            origin_kind="lease",
+            origin_step_id=step_id,
+            origin_plan_id=plan_id,
+            origin_task_id=task_id,
+            status=ApprovalStatus.PENDING.value,
+            dedup_key=f"lease:{generate_ulid()}:{kind}",
+            reason="Confirm before publishing",
+        )
+    )
 
     conv_id, message_id = generate_ulid(), generate_ulid()
-    db_session.add(Conversation(
-        id=conv_id, entity_id=entity_id, workspace_id=workspace_id,
-        title="Lease HITL", channel="workspace", scope="workspace_main",
-    ))
-    db_session.add(Message(
-        id=message_id, conversation_id=conv_id, role="assistant",
-        content="Confirm before publishing", author_kind="agent",
-        message_kind="hitl_request",
-        pending_action={
-            "kind": kind,
-            "step_id": step_id,
-            "plan_id": plan_id,
-            "approval_request_id": request_id,
-        },
-    ))
+    db_session.add(
+        Conversation(
+            id=conv_id,
+            entity_id=entity_id,
+            workspace_id=workspace_id,
+            title="Lease HITL",
+            channel="workspace",
+            scope="workspace_main",
+        )
+    )
+    db_session.add(
+        Message(
+            id=message_id,
+            conversation_id=conv_id,
+            role="assistant",
+            content="Confirm before publishing",
+            author_kind="agent",
+            message_kind="hitl_request",
+            pending_action={
+                "kind": kind,
+                "step_id": step_id,
+                "plan_id": plan_id,
+                "approval_request_id": request_id,
+            },
+        )
+    )
     await db_session.commit()
     return headers, workspace_id, message_id, request_id
 
@@ -435,9 +589,37 @@ async def _resolve_card(client, headers, workspace_id, message_id, choice: str):
 
 async def _reload_request(db_session, request_id: str) -> HitlRequest:
     db_session.expire_all()
-    return (await db_session.execute(
-        select(HitlRequest).where(HitlRequest.id == request_id)
-    )).scalar_one()
+    return (await db_session.execute(select(HitlRequest).where(HitlRequest.id == request_id))).scalar_one()
+
+
+@pytest.mark.asyncio
+async def test_lease_card_rejects_mismatched_request_origin(client, db_session):
+    headers, workspace_id, message_id, request_id = await _seed_lease_card(
+        client,
+        db_session,
+        "lease_card_mismatched_origin",
+        kind="needs_confirmation",
+    )
+    request = await db_session.get(HitlRequest, request_id)
+    assert request is not None and request.origin_step_id is not None
+    original_step_id = request.origin_step_id
+    request.origin_step_id = generate_ulid()
+    await db_session.commit()
+
+    response = await client.post(
+        f"/api/v1/workspaces/{workspace_id}/chat/messages/{message_id}/resolve",
+        headers=headers,
+        json={"choice": "confirm"},
+    )
+
+    assert response.status_code == 409, response.text
+    db_session.expire_all()
+    request = await db_session.get(HitlRequest, request_id)
+    step = await db_session.get(ExecutionStep, original_step_id)
+    message = await db_session.get(Message, message_id)
+    assert request is not None and request.status == ApprovalStatus.PENDING.value
+    assert step is not None and step.step_status == "waiting_human"
+    assert message is not None and message.resolved_at is None
 
 
 @pytest.mark.asyncio
@@ -448,7 +630,10 @@ async def test_resolving_lease_card_closes_request_end_to_end(client, db_session
     直接调 grant_approval 只能证明 governance 函数好用，证明不了路由会调它。
     """
     headers, ws_id, msg_id, req_id = await _seed_lease_card(
-        client, db_session, "lease_card_close", kind="needs_confirmation",
+        client,
+        db_session,
+        "lease_card_close",
+        kind="needs_confirmation",
     )
     await _resolve_card(client, headers, ws_id, msg_id, "confirm")
 
@@ -463,6 +648,31 @@ async def test_resolving_lease_card_closes_request_end_to_end(client, db_session
 
 
 @pytest.mark.asyncio
+async def test_resolving_an_already_closed_lease_card_is_idempotent(
+    client,
+    db_session,
+):
+    headers, ws_id, msg_id, req_id = await _seed_lease_card(
+        client,
+        db_session,
+        "lease_card_idempotent",
+        kind="needs_confirmation",
+    )
+
+    await _resolve_card(client, headers, ws_id, msg_id, "confirm")
+    duplicate = await client.post(
+        f"/api/v1/workspaces/{ws_id}/chat/messages/{msg_id}/resolve",
+        headers=headers,
+        json={"choice": "confirm"},
+    )
+
+    assert duplicate.status_code == 200, duplicate.text
+    assert (await _reload_request(db_session, req_id)).status == (
+        ApprovalStatus.CONSUMED.value
+    )
+
+
+@pytest.mark.asyncio
 async def test_cancelling_lease_card_denies_request(client, db_session):
     """取消必须 deny，不能 grant。
 
@@ -472,7 +682,10 @@ async def test_cancelling_lease_card_denies_request(client, db_session):
     本用例钉住那份「与下方分支同步的」词表。
     """
     headers, ws_id, msg_id, req_id = await _seed_lease_card(
-        client, db_session, "lease_card_cancel", kind="needs_confirmation",
+        client,
+        db_session,
+        "lease_card_cancel",
+        kind="needs_confirmation",
     )
     await _resolve_card(client, headers, ws_id, msg_id, "cancel")
 
@@ -486,7 +699,10 @@ async def test_cancelling_lease_card_denies_request(client, db_session):
 async def test_skipping_needs_input_card_denies_request(client, db_session):
     """needs_input 的 skip 走 else 分支取消步骤 —— 请求同样应当 denied。"""
     headers, ws_id, msg_id, req_id = await _seed_lease_card(
-        client, db_session, "lease_card_skip", kind="needs_input",
+        client,
+        db_session,
+        "lease_card_skip",
+        kind="needs_input",
     )
     await _resolve_card(client, headers, ws_id, msg_id, "skip")
 
@@ -502,20 +718,30 @@ async def test_signin_choice_leaves_login_request_pending(client, db_session):
     等 continue_after_login（grant）或 skip（deny）。
     """
     headers, ws_id, msg_id, req_id = await _seed_lease_card(
-        client, db_session, "lease_card_signin", kind="needs_login",
+        client,
+        db_session,
+        "lease_card_signin",
+        kind="needs_login",
     )
     await _resolve_card(client, headers, ws_id, msg_id, "sign_in")
 
     req = await _reload_request(db_session, req_id)
+    message = await db_session.get(Message, msg_id)
     assert req.status == ApprovalStatus.PENDING.value
     assert req.decided_at is None
+    assert message is not None
+    assert message.resolved_at is None
+    assert message.resolution is None
 
 
 @pytest.mark.asyncio
 async def test_continue_after_login_grants_request(client, db_session):
     """两段式登录的后半段：cookies 已捕获、步骤重试 → 此时才结案。"""
     headers, ws_id, msg_id, req_id = await _seed_lease_card(
-        client, db_session, "lease_card_after_login", kind="needs_login",
+        client,
+        db_session,
+        "lease_card_after_login",
+        kind="needs_login",
     )
     # 先走前半段，确认它没有提前结案，再走后半段。
     await _resolve_card(client, headers, ws_id, msg_id, "sign_in")
@@ -539,47 +765,81 @@ async def test_lease_needs_human_survives_step_without_workspace(db_session):
     """
     entity_id = generate_ulid()
     worker_id = generate_ulid()
-    db_session.add(Worker(
-        id=worker_id, entity_id=entity_id, kind="internal",
-        display_name="W", trust_level="trusted", status="active",
-        capabilities={"supported_kinds": ["subagent"]}, consecutive_failures=0,
-    ))
+    db_session.add(
+        Worker(
+            id=worker_id,
+            entity_id=entity_id,
+            kind="internal",
+            display_name="W",
+            trust_level="trusted",
+            status="active",
+            capabilities={"supported_kinds": ["subagent"]},
+            consecutive_failures=0,
+        )
+    )
 
     plan_id, step_id, lease_id = generate_ulid(), generate_ulid(), generate_ulid()
-    db_session.add(ExecutionPlan(
-        id=plan_id, entity_id=entity_id, workspace_id=None,
-        task_id=generate_ulid(), plan_dag={}, status="running",
-    ))
-    db_session.add(ExecutionStep(
-        id=step_id, plan_id=plan_id, entity_id=entity_id, workspace_id=None,
-        step_key="headless_step", kind="subagent", params={},
-        step_status="running", attempt_count=1, max_attempts=3,
-        risk_level="medium", capability_id="browser.control",
-    ))
-    db_session.add(WorkLease(
-        id=lease_id, step_id=step_id, plan_id=plan_id, entity_id=entity_id,
-        workspace_id=None, worker_id=worker_id,
-        status=WorkLeaseStatus.ACTIVE.value,
-        lease_until=datetime.now(timezone.utc) + timedelta(minutes=5),
-    ))
+    db_session.add(
+        ExecutionPlan(
+            id=plan_id,
+            entity_id=entity_id,
+            workspace_id=None,
+            task_id=generate_ulid(),
+            plan_dag={},
+            status="running",
+        )
+    )
+    db_session.add(
+        ExecutionStep(
+            id=step_id,
+            plan_id=plan_id,
+            entity_id=entity_id,
+            workspace_id=None,
+            step_key="headless_step",
+            kind="subagent",
+            params={},
+            step_status="running",
+            attempt_count=1,
+            max_attempts=3,
+            risk_level="medium",
+            capability_id="browser.control",
+        )
+    )
+    db_session.add(
+        WorkLease(
+            id=lease_id,
+            step_id=step_id,
+            plan_id=plan_id,
+            entity_id=entity_id,
+            workspace_id=None,
+            worker_id=worker_id,
+            status=WorkLeaseStatus.ACTIVE.value,
+            lease_until=datetime.now(timezone.utc) + timedelta(minutes=5),
+        )
+    )
     await db_session.flush()
 
     # 若预初始化被删，这一行抛 UnboundLocalError。
     lease = await Dispatcher().lease_needs_human(
-        db_session, lease_id, prompt="Solve the CAPTCHA",
+        db_session,
+        lease_id,
+        prompt="Solve the CAPTCHA",
     )
     await db_session.flush()
 
     assert lease.status == WorkLeaseStatus.NEEDS_HUMAN.value
     # 无 workspace ⇒ 无卡片可渲染 ⇒ 不铸请求。
-    rows = (await db_session.execute(
-        select(HitlRequest).where(HitlRequest.origin_step_id == step_id)
-    )).scalars().all()
+    rows = (await db_session.execute(select(HitlRequest).where(HitlRequest.origin_step_id == step_id))).scalars().all()
     assert rows == []
 
 
 async def _lease_card_via_dispatcher(
-    client, db_session, monkeypatch, username: str, *, pending_action=None,
+    client,
+    db_session,
+    monkeypatch,
+    username: str,
+    *,
+    pending_action=None,
 ):
     """跑完整链路：dispatcher → notifier → 卡片 → 落库，返回可被端点消费的消息。
 
@@ -591,11 +851,15 @@ async def _lease_card_via_dispatcher(
 
     headers = await _register(client, username)
     ws = await client.post(
-        "/api/v1/workspaces", headers=headers, json={"name": "Lease Roundtrip WS"},
+        "/api/v1/workspaces",
+        headers=headers,
+        json={"name": "Lease Roundtrip WS"},
     )
     ws_body = ws.json()
     fx = await _lease_fixture(
-        db_session, entity_id=ws_body["entity_id"], workspace_id=ws_body["id"],
+        db_session,
+        entity_id=ws_body["entity_id"],
+        workspace_id=ws_body["id"],
     )
 
     posted: list[dict] = []
@@ -605,36 +869,51 @@ async def _lease_card_via_dispatcher(
 
     monkeypatch.setattr(chat_notify, "_safe_post", _capture)
     await Dispatcher().lease_needs_human(
-        db_session, fx["lease_id"], prompt="Confirm the publish",
+        db_session,
+        fx["lease_id"],
+        prompt="Confirm the publish",
         pending_action=pending_action,
     )
     await db_session.flush()
     assert len(posted) == 1, "needs_human 应当恰好投递一张卡片"
     card = posted[0]["pending_action"]
 
-    req = (await db_session.execute(
-        select(HitlRequest).where(HitlRequest.origin_step_id == fx["step_id"])
-    )).scalar_one()
+    req = (
+        await db_session.execute(select(HitlRequest).where(HitlRequest.origin_step_id == fx["step_id"]))
+    ).scalar_one()
 
     conv_id, message_id = generate_ulid(), generate_ulid()
-    db_session.add(Conversation(
-        id=conv_id, entity_id=ws_body["entity_id"], workspace_id=ws_body["id"],
-        title="Lease HITL", channel="workspace", scope="workspace_main",
-    ))
-    db_session.add(Message(
-        id=message_id, conversation_id=conv_id, role="assistant",
-        content="Confirm the publish", author_kind="agent",
-        message_kind="hitl_request",
-        # 关键：原样使用 notifier 投递的卡片。
-        pending_action=card,
-    ))
+    db_session.add(
+        Conversation(
+            id=conv_id,
+            entity_id=ws_body["entity_id"],
+            workspace_id=ws_body["id"],
+            title="Lease HITL",
+            channel="workspace",
+            scope="workspace_main",
+        )
+    )
+    db_session.add(
+        Message(
+            id=message_id,
+            conversation_id=conv_id,
+            role="assistant",
+            content="Confirm the publish",
+            author_kind="agent",
+            message_kind="hitl_request",
+            # 关键：原样使用 notifier 投递的卡片。
+            pending_action=card,
+        )
+    )
     await db_session.commit()
     return headers, ws_body["id"], message_id, req.id, card
 
 
 @pytest.mark.asyncio
 async def test_lease_card_roundtrip_structured_card_closes_request(
-    client, db_session, monkeypatch,
+    client,
+    db_session,
+    monkeypatch,
 ):
     """结构化卡片（internal.py 那条 exc.pending_action 非 None 的主路径）
     必须带上 request id，并且回答后请求结案。
@@ -643,7 +922,10 @@ async def test_lease_card_roundtrip_structured_card_closes_request(
     Part A 把唯一写入点移到 notifier 之后，这条分支就只剩下这一个测试在守。
     """
     headers, ws_id, msg_id, req_id, card = await _lease_card_via_dispatcher(
-        client, db_session, monkeypatch, "lease_rt_structured",
+        client,
+        db_session,
+        monkeypatch,
+        "lease_rt_structured",
         pending_action={"kind": "needs_confirmation"},
     )
     # 确认走的确实是结构化分支，而不是 fallback（fallback 才有 input_schema）。
@@ -658,7 +940,9 @@ async def test_lease_card_roundtrip_structured_card_closes_request(
 
 @pytest.mark.asyncio
 async def test_lease_card_roundtrip_human_input_card_closes_request(
-    client, db_session, monkeypatch,
+    client,
+    db_session,
+    monkeypatch,
 ):
     """workers.py 那条不带 pending_action 的路径产出 human_input 卡片。
 
@@ -667,7 +951,10 @@ async def test_lease_card_roundtrip_human_input_card_closes_request(
     `_lease_decision = "grant"` 删掉都没人发现。
     """
     headers, ws_id, msg_id, req_id, card = await _lease_card_via_dispatcher(
-        client, db_session, monkeypatch, "lease_rt_human_input",
+        client,
+        db_session,
+        monkeypatch,
+        "lease_rt_human_input",
     )
     assert card["kind"] == "human_input"
     assert "input_schema" in card
@@ -682,7 +969,10 @@ async def test_lease_card_roundtrip_human_input_card_closes_request(
 async def test_skipping_needs_login_card_denies_request(client, db_session):
     """needs_login 的 skip 走 else 分支取消步骤 —— 请求应当 denied。"""
     headers, ws_id, msg_id, req_id = await _seed_lease_card(
-        client, db_session, "lease_card_login_skip", kind="needs_login",
+        client,
+        db_session,
+        "lease_card_login_skip",
+        kind="needs_login",
     )
     await _resolve_card(client, headers, ws_id, msg_id, "skip")
 
@@ -709,16 +999,24 @@ async def test_always_grant_is_honored_by_both_step_and_tool_planes(db_session):
     """
     entity_id = generate_ulid()
     workspace_id = generate_ulid()
-    db_session.add(Workspace(
-        id=workspace_id, entity_id=entity_id, name="Always WS", operating_model={},
-    ))
+    db_session.add(
+        Workspace(
+            id=workspace_id,
+            entity_id=entity_id,
+            name="Always WS",
+            operating_model={},
+        )
+    )
     await db_session.flush()
 
     def _subj():
         return ApprovalSubject(
-            entity_id=entity_id, workspace_id=workspace_id,
-            action_key="social_post.publish", capability_id="external.social",
-            risk_level="high", kind="action",
+            entity_id=entity_id,
+            workspace_id=workspace_id,
+            action_key="social_post.publish",
+            capability_id="external.social",
+            risk_level="high",
+            kind="action",
         )
 
     # 前置：工作区把该动作设为 HITL。这一步是为了让「工具调用」路径的
@@ -726,23 +1024,30 @@ async def test_always_grant_is_honored_by_both_step_and_tool_planes(db_session):
     # （那是 step-origin 专属），只有策略 HITL 规则会拦它。少了这条规则，
     # tool_before 会因为「本来就不需要审批」而假通过。
     await update_policy(
-        db_session, entity_id=entity_id, workspace_id=workspace_id,
+        db_session,
+        entity_id=entity_id,
+        workspace_id=workspace_id,
         policy=WorkspacePolicy(hitl_required_actions=["social_post.publish"]),
-        changed_by=generate_ulid(), change_summary="require approval",
+        changed_by=generate_ulid(),
+        change_summary="require approval",
     )
     await db_session.flush()
 
     # 授予前：两条路径都要求人工介入
     step_before = await resolve_approval(
-        db_session, subject=_subj(),
+        db_session,
+        subject=_subj(),
         origin=ApprovalOrigin(kind="step", step_id=generate_ulid()),
     )
     assert step_before.outcome == "needs_human"
 
     tool_before = await resolve_approval(
-        db_session, subject=_subj(),
+        db_session,
+        subject=_subj(),
         origin=ApprovalOrigin(
-            kind="tool_call", conversation_id=generate_ulid(), args_hash="abc123",
+            kind="tool_call",
+            conversation_id=generate_ulid(),
+            args_hash="abc123",
         ),
     )
     assert tool_before.outcome == "needs_human"
@@ -750,8 +1055,12 @@ async def test_always_grant_is_honored_by_both_step_and_tool_planes(db_session):
 
     # 用户在聊天卡片上点 "Always" —— standing=True 把同意写进 standing 存储
     await grant_approval(
-        db_session, tool_before.request,
-        by_user_id=generate_ulid(), via="always", standing=True,
+        db_session,
+        tool_before.request,
+        by_user_id=generate_ulid(),
+        via="always",
+        standing=True,
+        authority_prechecked=True,
     )
     await db_session.flush()
 
@@ -762,16 +1071,20 @@ async def test_always_grant_is_honored_by_both_step_and_tool_planes(db_session):
     # 授予后：步骤门禁放行。用新的 step_id / 新的 conversation+args，
     # 这样放行只可能来自 standing 存储，不可能是上面那条一次性 grant 记录。
     step_after = await resolve_approval(
-        db_session, subject=_subj(),
+        db_session,
+        subject=_subj(),
         origin=ApprovalOrigin(kind="step", step_id=generate_ulid()),
     )
     assert step_after.outcome == "allow"
 
     # 授予后：聊天工具调用路径同样放行（同一 standing 存储）
     tool_after = await resolve_approval(
-        db_session, subject=_subj(),
+        db_session,
+        subject=_subj(),
         origin=ApprovalOrigin(
-            kind="tool_call", conversation_id=generate_ulid(), args_hash="def456",
+            kind="tool_call",
+            conversation_id=generate_ulid(),
+            args_hash="def456",
         ),
     )
     assert tool_after.outcome == "allow"
@@ -790,26 +1103,37 @@ async def test_always_grant_never_overrides_hard_block(db_session):
     """never_allow 是硬阻断：任何 standing grant 都不得放行。"""
     entity_id = generate_ulid()
     workspace_id = generate_ulid()
-    db_session.add(Workspace(
-        id=workspace_id, entity_id=entity_id, name="Block WS", operating_model={},
-    ))
+    db_session.add(
+        Workspace(
+            id=workspace_id,
+            entity_id=entity_id,
+            name="Block WS",
+            operating_model={},
+        )
+    )
     await db_session.flush()
 
     await update_policy(
-        db_session, entity_id=entity_id, workspace_id=workspace_id,
+        db_session,
+        entity_id=entity_id,
+        workspace_id=workspace_id,
         policy=WorkspacePolicy(
             never_allow_actions=["billing.*"],
             auto_approve_actions=["billing.*"],  # 同时 always：硬阻断仍须获胜
         ),
-        changed_by=generate_ulid(), change_summary="conflicting rules",
+        changed_by=generate_ulid(),
+        change_summary="conflicting rules",
     )
     await db_session.flush()
 
     decision = await resolve_approval(
         db_session,
         subject=ApprovalSubject(
-            entity_id=entity_id, workspace_id=workspace_id,
-            action_key="billing.charge", risk_level="high", kind="action",
+            entity_id=entity_id,
+            workspace_id=workspace_id,
+            action_key="billing.charge",
+            risk_level="high",
+            kind="action",
         ),
         origin=ApprovalOrigin(kind="step", step_id=generate_ulid()),
     )
@@ -841,14 +1165,18 @@ async def test_uncloseable_kind_mints_no_request(db_session, monkeypatch):
 
     fx = await _lease_fixture(db_session)
     await Dispatcher().lease_needs_human(
-        db_session, fx["lease_id"], prompt="Apply this workspace operation draft?",
+        db_session,
+        fx["lease_id"],
+        prompt="Apply this workspace operation draft?",
         pending_action={"kind": "workspace_operation_review", "draft_id": generate_ulid()},
     )
     await db_session.flush()
 
-    rows = (await db_session.execute(
-        select(HitlRequest).where(HitlRequest.origin_step_id == fx["step_id"])
-    )).scalars().all()
+    rows = (
+        (await db_session.execute(select(HitlRequest).where(HitlRequest.origin_step_id == fx["step_id"])))
+        .scalars()
+        .all()
+    )
     assert rows == [], "端点关不掉的 kind 不应留下 HitlRequest 行"
 
     # 卡片仍然发出，且不带 approval_request_id（没有行可指）。
@@ -870,6 +1198,11 @@ def test_mint_and_close_kind_sets_are_the_same_object():
     assert dispatcher_service.LEASE_HITL_CLOSEABLE_KINDS is LEASE_HITL_CLOSEABLE_KINDS
     assert chat_router.LEASE_HITL_CLOSEABLE_KINDS is LEASE_HITL_CLOSEABLE_KINDS
     # 集合内容就是四种 path C kind。
-    assert LEASE_HITL_CLOSEABLE_KINDS == frozenset({
-        "human_input", "needs_input", "needs_confirmation", "needs_login",
-    })
+    assert LEASE_HITL_CLOSEABLE_KINDS == frozenset(
+        {
+            "human_input",
+            "needs_input",
+            "needs_confirmation",
+            "needs_login",
+        }
+    )

@@ -30,8 +30,8 @@ CREATE_GOAL_SCHEMA = {
     "function": {
         "name": "create_goal",
         "description": (
-            "Create a persistent business GOAL — a metric the user commits "
-            "to moving over weeks or months (e.g. '10k Twitter followers by "
+            "Create a persistent business GOAL — an outcome measured by a "
+            "metric over weeks or months (e.g. '10k Twitter followers by "
             "October'). Goals are periodically measured and inform the "
             "Strategist's weekly task proposals. Use only when the user "
             "expresses a measurable long-running objective. For one-off "
@@ -42,6 +42,13 @@ CREATE_GOAL_SCHEMA = {
             "properties": {
                 "title": {"type": "string", "description": "Short label for the goal."},
                 "description": {"type": "string", "description": "Optional long-form context."},
+                "goal_key": {
+                    "type": "string",
+                    "description": (
+                        "Optional stable logical identity. Different goals that share a "
+                        "metric_key must use different goal_key values."
+                    ),
+                },
                 "metric_key": {
                     "type": "string",
                     "description": "Canonical metric, e.g. 'follower_count', 'mrr', 'engagement_rate'.",

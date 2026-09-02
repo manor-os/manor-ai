@@ -34,6 +34,7 @@ class ResourceType:
     WORKSPACE = "workspace"
     CONVERSATION = "conversation"
     INTEGRATION = "integration"
+    OAUTH_ACCOUNT = "oauth_account"
     AGENT = "agent"
     SKILL = "skill"
     WORKFLOW = "workflow"
@@ -63,6 +64,7 @@ class Capability:
     RECLASSIFY = "reclassify"
     DELETE = "delete"
     GRANT_ACCESS = "grant_access"
+    USE = "use"
 
 
 class Visibility:

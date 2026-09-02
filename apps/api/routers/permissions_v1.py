@@ -10,7 +10,7 @@ Sister-RFC: ``docs/PERMISSIONS_DESIGN_ZH.md`` §13.
 """
 from __future__ import annotations
 
-from typing import Optional
+from typing import Literal, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
@@ -25,19 +25,26 @@ from packages.core.models import (
     Classification,
     Visibility,
 )
-from packages.core.models.document import Document
+from packages.core.models.document import Document, DocumentFolder
 from packages.core.models.permission import (
     PendingStatus,
     ResourceGrantPending,
+    ResourceType,
 )
 from packages.core.models.user import User
 from packages.core.permissions import (
     Permission,
-    has_permission,
-    user_has_permission,
+    effective_user_has_permission,
 )
 from packages.core.services.document_access import (
     effective_document_capabilities_for_user,
+    lock_folder_policy_rows,
+    lock_workspace_policy_rows,
+    resolve_document_policy_lock_scope,
+)
+from packages.core.services.resource_grant_policy import (
+    ResourceGrantPolicyError,
+    ResourceGrantPolicyFactory,
 )
 
 router = APIRouter(prefix="/api/v1/permissions", tags=["permissions-v1"])
@@ -69,7 +76,7 @@ class ClientVisibleRequest(BaseModel):
 
 
 class AccessRequestPayload(BaseModel):
-    resource_type: str
+    resource_type: Literal[ResourceType.DOCUMENT]
     resource_id: str
     requested_capabilities: list[str] = Field(default_factory=lambda: [Capability.VIEW])
     reason: Optional[str] = None
@@ -85,24 +92,104 @@ _VALID_VISIBILITIES = {
     Visibility.ENTITY,
     Visibility.PUBLIC,
 }
+_VISIBILITY_RANK = {
+    Visibility.PRIVATE: 0,
+    Visibility.WORKSPACE: 1,
+    Visibility.ENTITY: 2,
+    Visibility.PUBLIC: 3,
+}
+
+
+async def _document_folder_constraints(
+    db: AsyncSession,
+    doc: Document,
+) -> tuple[int, int]:
+    """Return ancestor classification floor and visibility ceiling ranks."""
+    floor = Classification.rank(Classification.PUBLIC)
+    ceiling = _VISIBILITY_RANK[Visibility.PUBLIC]
+    current_id = doc.folder_id
+    seen: set[str] = set()
+    while current_id and current_id not in seen:
+        seen.add(current_id)
+        folder = (await db.execute(
+            select(DocumentFolder).where(
+                DocumentFolder.id == current_id,
+                DocumentFolder.entity_id == doc.entity_id,
+            )
+        )).scalar_one_or_none()
+        if folder is None:
+            break
+        floor = max(
+            floor,
+            Classification.rank(folder.classification or Classification.INTERNAL),
+        )
+        ceiling = min(
+            ceiling,
+            _VISIBILITY_RANK.get(folder.visibility or Visibility.ENTITY, 2),
+        )
+        current_id = folder.parent_id
+    return floor, ceiling
 
 
 async def _load_doc(db: AsyncSession, document_id: str, entity_id: str) -> Document:
-    doc = (
-        await db.execute(
-            select(Document).where(
-                Document.id == document_id,
-                Document.entity_id == entity_id,
+    stmt = select(Document).where(
+        Document.id == document_id,
+        Document.entity_id == entity_id,
+    )
+    for _attempt in range(3):
+        savepoint = await db.begin_nested()
+        try:
+            doc = (await db.execute(stmt)).scalar_one_or_none()
+            if doc is None:
+                raise CodedError(
+                    404,
+                    code="permissions.error.doc.not_found",
+                    message="Document not found",
+                )
+            scope = await resolve_document_policy_lock_scope(db, doc)
+            workspaces = await lock_workspace_policy_rows(
+                db,
+                entity_id=entity_id,
+                workspace_ids=scope.workspace_ids,
+                read=True,
             )
-        )
-    ).scalar_one_or_none()
-    if doc is None:
-        raise CodedError(
-            404,
-            code="permissions.error.doc.not_found",
-            message="Document not found",
-        )
-    return doc
+            if any(workspace.deleted_at is not None for workspace in workspaces):
+                raise CodedError(
+                    404,
+                    code="permissions.error.doc.not_found",
+                    message="Document not found",
+                )
+            await lock_folder_policy_rows(
+                db,
+                entity_id=entity_id,
+                folder_id=doc.folder_id,
+                folder_ids=scope.folder_ids,
+                read=True,
+            )
+            doc = (await db.execute(
+                stmt.with_for_update().execution_options(populate_existing=True)
+            )).scalar_one_or_none()
+            if doc is None:
+                raise CodedError(
+                    404,
+                    code="permissions.error.doc.not_found",
+                    message="Document not found",
+                )
+            if await resolve_document_policy_lock_scope(db, doc) != scope:
+                await savepoint.rollback()
+                continue
+            await savepoint.commit()
+            return doc
+        except Exception:
+            if savepoint.is_active:
+                await savepoint.rollback()
+            raise
+
+    raise CodedError(
+        409,
+        code="permissions.error.doc.changed_during_request",
+        message="Document changed during the request; please retry",
+    )
 
 
 async def _require_document_capability(
@@ -126,11 +213,7 @@ async def _require_document_capability(
 
 
 async def _is_audit_admin(db: AsyncSession, user: User) -> bool:
-    if has_permission(user.role, Permission.ADMIN_AUDIT):
-        return True
-    return await user_has_permission(
-        db, user.id, user.entity_id, Permission.ADMIN_AUDIT
-    )
+    return await effective_user_has_permission(db, user, Permission.ADMIN_AUDIT)
 
 
 async def _audit(
@@ -196,6 +279,9 @@ async def reclassify_document(
     # Refuse silent classification *downgrade* — requires the admin.audit
     # verb to drop confidentiality. (Invariant 13.3.)
     current = getattr(doc, "classification", Classification.INTERNAL)
+    folder_floor, _folder_ceiling = await _document_folder_constraints(db, doc)
+    if Classification.rank(body.classification) < folder_floor:
+        raise HTTPException(409, "Document classification cannot be below its folder")
     if Classification.rank(body.classification) < Classification.rank(current):
         if not await _is_audit_admin(db, user):
             raise HTTPException(
@@ -204,6 +290,8 @@ async def reclassify_document(
             )
 
     doc.classification = body.classification
+    if body.classification in {Classification.CONFIDENTIAL, Classification.RESTRICTED}:
+        doc.client_visible = False
     await _audit(db, doc, user, "reclassify", request)
     await db.commit()
     await db.refresh(doc)
@@ -245,6 +333,10 @@ async def change_document_visibility(
         raise HTTPException(
             409, "restricted documents cannot have public visibility"
         )
+
+    _folder_floor, folder_ceiling = await _document_folder_constraints(db, doc)
+    if _VISIBILITY_RANK[body.visibility] > folder_ceiling:
+        raise HTTPException(409, "Document visibility cannot be broader than its folder")
 
     doc.visibility = body.visibility
     await _audit(db, doc, user, "visibility_change", request)
@@ -305,12 +397,30 @@ async def request_access(
     user *currently* lacks access — overlapping requests are harmless and
     audit-friendly.
     """
+    doc = await _load_doc(db, body.resource_id, user.entity_id)
+    if bool(getattr(doc, "is_trashed", False)) or getattr(
+        doc,
+        "quarantine_status",
+        None,
+    ) in {"quarantined", "rejected"}:
+        raise CodedError(
+            404,
+            code="permissions.error.doc.not_found",
+            message="Document not found",
+        )
+    try:
+        requested_capabilities = ResourceGrantPolicyFactory.create(
+            ResourceType.DOCUMENT
+        ).validate(body.requested_capabilities)
+    except ResourceGrantPolicyError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
     pending = ResourceGrantPending(
         entity_id=user.entity_id,
-        resource_type=body.resource_type,
-        resource_id=body.resource_id,
+        resource_type=ResourceType.DOCUMENT,
+        resource_id=doc.id,
         requester_user_id=user.id,
-        requested_capabilities=body.requested_capabilities,
+        requested_capabilities=requested_capabilities,
         reason=body.reason,
         status=PendingStatus.PENDING,
     )
@@ -320,7 +430,7 @@ async def request_access(
     return {
         "id": pending.id,
         "status": pending.status,
-        "resource_type": pending.resource_type,
+        "resource_type": ResourceType.DOCUMENT,
         "resource_id": pending.resource_id,
     }
 

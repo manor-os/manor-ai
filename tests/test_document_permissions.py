@@ -15,7 +15,11 @@ Covers:
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+import asyncio
+import io
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+import zipfile
 
 import pytest
 from httpx import AsyncClient
@@ -86,10 +90,15 @@ async def _invite_and_accept_member(
     *,
     name: str = "Team Member",
 ) -> tuple[dict, dict]:
+    roles = await client.get("/api/v1/staff/roles", headers=owner_headers)
+    assert roles.status_code == 200, roles.text
+    member_role = next(
+        role for role in roles.json() if role["name"].lower() == "member"
+    )
     invite = await client.post(
         "/api/v1/staff/invite",
         headers=owner_headers,
-        json={"email": email, "name": name},
+        json={"email": email, "name": name, "role_id": member_role["id"]},
     )
     assert invite.status_code == 201, invite.text
     invite_data = invite.json()
@@ -134,6 +143,14 @@ async def _upload(
     )
     assert resp.status_code == 201, resp.text
     return resp.json()
+
+
+def _office_fixture(member: str) -> bytes:
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        archive.writestr("[Content_Types].xml", "<Types/>")
+        archive.writestr(member, "<officeDocument/>")
+    return buffer.getvalue()
 
 
 # ── Grants (internal sharing) ────────────────────────────────────────────
@@ -239,12 +256,29 @@ async def test_document_comments_require_comment_capability(client: AsyncClient)
         "/api/v1/comments",
         headers=member_headers,
         json={
-            "resource_type": "document",
+            "resource_type": "Document",
             "resource_id": doc["id"],
             "content": "needs comment permission",
         },
     )
     assert view_only_create.status_code == 403
+
+    owner_comment = await client.post(
+        "/api/v1/comments",
+        headers=headers,
+        json={
+            "resource_type": "document",
+            "resource_id": doc["id"],
+            "content": "Owner note",
+        },
+    )
+    assert owner_comment.status_code == 201, owner_comment.text
+    view_only_reaction = await client.post(
+        f"/api/v1/comments/{owner_comment.json()['id']}/reactions",
+        headers=member_headers,
+        json={"reaction": "thumbsup"},
+    )
+    assert view_only_reaction.status_code == 403
 
     comment_grant = await client.post(
         f"/api/v1/documents/{doc['id']}/grants",
@@ -257,11 +291,18 @@ async def test_document_comments_require_comment_capability(client: AsyncClient)
     )
     assert comment_grant.status_code == 201, comment_grant.text
 
+    comment_reaction = await client.post(
+        f"/api/v1/comments/{owner_comment.json()['id']}/reactions",
+        headers=member_headers,
+        json={"reaction": "thumbsup"},
+    )
+    assert comment_reaction.status_code == 200, comment_reaction.text
+
     created = await client.post(
         "/api/v1/comments",
         headers=member_headers,
         json={
-            "resource_type": "document",
+            "resource_type": "Documents",
             "resource_id": doc["id"],
             "content": "Looks good to me.",
             "anchor": {
@@ -278,6 +319,7 @@ async def test_document_comments_require_comment_capability(client: AsyncClient)
     assert created.status_code == 201, created.text
     created_body = created.json()
     assert created_body["content"] == "Looks good to me."
+    assert created_body["resource_type"] == "document"
     assert created_body["anchor"]["line"] == 1
     assert created_body["user_display_name"] == "Comment Member"
     assert created_body["user_avatar_url"] == "https://cdn.test/avatar.png"
@@ -299,17 +341,55 @@ async def test_document_comments_require_comment_capability(client: AsyncClient)
         headers=member_headers,
     )
     assert counted.status_code == 200
-    assert counted.json()["count"] == 2
+    assert counted.json()["count"] == 3
 
     listed = await client.get(comments_url, headers=member_headers)
     assert listed.status_code == 200
     listed_body = listed.json()
-    assert listed_body[0]["content"] == "Looks good to me."
-    assert listed_body[0]["anchor"]["quote"] == "hello"
-    assert listed_body[0]["user_display_name"] == "Comment Member"
-    assert listed_body[0]["user_avatar_url"] == "https://cdn.test/avatar.png"
-    assert listed_body[0]["replies"][0]["content"] == "Replying here."
-    assert listed_body[0]["replies"][0]["parent_id"] == created_body["id"]
+    member_comment = next(row for row in listed_body if row["id"] == created_body["id"])
+    assert member_comment["content"] == "Looks good to me."
+    assert member_comment["anchor"]["quote"] == "hello"
+    assert member_comment["user_display_name"] == "Comment Member"
+    assert member_comment["user_avatar_url"] == "https://cdn.test/avatar.png"
+    assert member_comment["replies"][0]["content"] == "Replying here."
+    assert member_comment["replies"][0]["parent_id"] == created_body["id"]
+
+
+@pytest.mark.asyncio
+async def test_document_comment_manager_does_not_match_mutable_creator_label(
+    client: AsyncClient,
+):
+    headers = await _auth(client, "commentaliasowner")
+    owner = (await client.get("/api/v1/auth/me", headers=headers)).json()
+    member = await _create_entity_user(
+        owner["entity_id"],
+        "comment_alias_member",
+        "member",
+        display_name="commentaliasowner",
+    )
+    doc = await _upload(client, headers, name="creator-label.md", visibility="private")
+
+    view_grant = await client.post(
+        f"/api/v1/documents/{doc['id']}/grants",
+        headers=headers,
+        json={
+            "subject_type": "user",
+            "subject_id": member["id"],
+            "capabilities": ["view"],
+        },
+    )
+    assert view_grant.status_code == 201, view_grant.text
+
+    create = await client.post(
+        "/api/v1/comments",
+        headers=member["headers"],
+        json={
+            "resource_type": "document",
+            "resource_id": doc["id"],
+            "content": "A mutable display name must not grant comment access",
+        },
+    )
+    assert create.status_code == 403, create.text
 
 
 @pytest.mark.asyncio
@@ -348,6 +428,285 @@ async def test_grant_idempotent_upsert(client: AsyncClient):
     assert len(rows) == 1
     assert set(rows[0]["capabilities"]) == {"view", "comment", "edit"}
     assert rows[0]["subject_id"] == member["user_id"]
+
+
+@pytest.mark.asyncio
+async def test_delegated_document_grants_are_subset_bounded(client: AsyncClient):
+    headers = await _auth(client, "grantdelegateowner")
+    owner = (await client.get("/api/v1/auth/me", headers=headers)).json()
+    delegator = await _create_entity_user(
+        owner["entity_id"],
+        "grant_delegate_editor",
+    )
+    recipient = await _create_entity_user(
+        owner["entity_id"],
+        "grant_delegate_recipient",
+        role="viewer",
+    )
+    doc = await _upload(client, headers, name="delegated.md", visibility="private")
+
+    delegated = await client.post(
+        f"/api/v1/documents/{doc['id']}/grants",
+        headers=headers,
+        json={
+            "subject_type": "user",
+            "subject_id": delegator["id"],
+            "capabilities": ["view", "edit", "share_internal"],
+        },
+    )
+    assert delegated.status_code == 201, delegated.text
+
+    hidden_acl = await client.get(
+        f"/api/v1/documents/{doc['id']}/grants",
+        headers=delegator["headers"],
+    )
+    assert hidden_acl.status_code == 403
+    allowed = await client.post(
+        f"/api/v1/documents/{doc['id']}/grants",
+        headers=delegator["headers"],
+        json={
+            "subject_type": "user",
+            "subject_id": recipient["id"],
+            "capabilities": ["view"],
+        },
+    )
+    assert allowed.status_code == 201, allowed.text
+    escalated = await client.post(
+        f"/api/v1/documents/{doc['id']}/grants",
+        headers=delegator["headers"],
+        json={
+            "subject_type": "user",
+            "subject_id": recipient["id"],
+            "capabilities": ["view", "delete"],
+        },
+    )
+    assert escalated.status_code == 403
+
+    curator = await client.post(
+        f"/api/v1/documents/{doc['id']}/grants",
+        headers=headers,
+        json={
+            "subject_type": "user",
+            "subject_id": delegator["id"],
+            "capabilities": ["view", "grant_access"],
+        },
+    )
+    assert curator.status_code == 201, curator.text
+    assert (
+        await client.get(
+            f"/api/v1/documents/{doc['id']}/grants",
+            headers=delegator["headers"],
+        )
+    ).status_code == 200
+    external = await client.post(
+        f"/api/v1/documents/{doc['id']}/shares",
+        headers=delegator["headers"],
+        json={"audience_type": "anonymous", "capabilities": ["view"]},
+    )
+    assert external.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_access_request_approval_narrows_and_upserts_one_manual_grant(
+    client: AsyncClient,
+    db_session: AsyncSession,
+):
+    from sqlalchemy import select
+
+    headers = await _auth(client, "accessapprovalowner")
+    owner = (await client.get("/api/v1/auth/me", headers=headers)).json()
+    requester = await _create_entity_user(
+        owner["entity_id"],
+        "access_approval_requester",
+    )
+    doc = await _upload(client, headers, name="approval.md", visibility="private")
+
+    first = await client.post(
+        "/api/v1/permissions/access-requests",
+        headers=requester["headers"],
+        json={
+            "resource_type": "document",
+            "resource_id": doc["id"],
+            "requested_capabilities": ["view"],
+        },
+    )
+    assert first.status_code == 200, first.text
+    expanded = await client.post(
+        f"/api/v1/documents/{doc['id']}/access-requests/"
+        f"{first.json()['id']}/decision",
+        headers=headers,
+        json={"decision": "approve", "approved_capabilities": ["view", "delete"]},
+    )
+    assert expanded.status_code == 400
+    approved = await client.post(
+        f"/api/v1/documents/{doc['id']}/access-requests/"
+        f"{first.json()['id']}/decision",
+        headers=headers,
+        json={"decision": "approve", "approved_capabilities": ["view"]},
+    )
+    assert approved.status_code == 200, approved.text
+
+    second = await client.post(
+        "/api/v1/permissions/access-requests",
+        headers=requester["headers"],
+        json={
+            "resource_type": "document",
+            "resource_id": doc["id"],
+            "requested_capabilities": ["comment"],
+        },
+    )
+    assert second.status_code == 200, second.text
+    approved_second = await client.post(
+        f"/api/v1/documents/{doc['id']}/access-requests/"
+        f"{second.json()['id']}/decision",
+        headers=headers,
+        json={"decision": "approve"},
+    )
+    assert approved_second.status_code == 200, approved_second.text
+
+    db_session.expire_all()
+    active = list((await db_session.execute(
+        select(ResourceGrant).where(
+            ResourceGrant.entity_id == owner["entity_id"],
+            ResourceGrant.resource_type == ResourceType.DOCUMENT,
+            ResourceGrant.resource_id == doc["id"],
+            ResourceGrant.subject_type == SubjectType.USER,
+            ResourceGrant.subject_id == requester["id"],
+            ResourceGrant.status == GrantStatus.ACTIVE,
+        )
+    )).scalars().all())
+    assert len(active) == 1
+    assert set(active[0].capabilities) == {Capability.VIEW, Capability.COMMENT}
+
+    revoked = await client.delete(
+        f"/api/v1/documents/{doc['id']}/grants/{active[0].id}",
+        headers=headers,
+    )
+    assert revoked.status_code == 204, revoked.text
+    listed = await client.get(
+        f"/api/v1/documents/{doc['id']}/grants",
+        headers=headers,
+    )
+    assert listed.status_code == 200
+    assert listed.json() == []
+
+
+@pytest.mark.asyncio
+async def test_access_request_approval_preserves_distinct_expirations(
+    client: AsyncClient,
+    db_session: AsyncSession,
+):
+    from sqlalchemy import select
+
+    headers = await _auth(client, "accessexpiryowner")
+    owner = (await client.get("/api/v1/auth/me", headers=headers)).json()
+    requester = await _create_entity_user(
+        owner["entity_id"],
+        "access_expiry_requester",
+    )
+    doc = await _upload(client, headers, name="expiry.md", visibility="private")
+
+    async def request_and_approve(capability: str, expires_at: str | None):
+        pending = await client.post(
+            "/api/v1/permissions/access-requests",
+            headers=requester["headers"],
+            json={
+                "resource_type": "document",
+                "resource_id": doc["id"],
+                "requested_capabilities": [capability],
+            },
+        )
+        assert pending.status_code == 200, pending.text
+        payload = {"decision": "approve"}
+        if expires_at is not None:
+            payload["expires_at"] = expires_at
+        approved = await client.post(
+            f"/api/v1/documents/{doc['id']}/access-requests/"
+            f"{pending.json()['id']}/decision",
+            headers=headers,
+            json=payload,
+        )
+        assert approved.status_code == 200, approved.text
+
+    expires_at = datetime.now(timezone.utc) + timedelta(days=1)
+    await request_and_approve(Capability.VIEW, expires_at.isoformat())
+    await request_and_approve(Capability.COMMENT, None)
+
+    db_session.expire_all()
+    active = list((await db_session.execute(
+        select(ResourceGrant).where(
+            ResourceGrant.entity_id == owner["entity_id"],
+            ResourceGrant.resource_type == ResourceType.DOCUMENT,
+            ResourceGrant.resource_id == doc["id"],
+            ResourceGrant.subject_id == requester["id"],
+            ResourceGrant.status == GrantStatus.ACTIVE,
+        )
+    )).scalars().all())
+    assert len(active) == 2
+    by_capability = {
+        tuple(grant.capabilities or []): grant.expires_at for grant in active
+    }
+    assert by_capability[(Capability.VIEW,)] is not None
+    assert by_capability[(Capability.COMMENT,)] is None
+
+    expiring_grant = next(
+        grant for grant in active
+        if Capability.VIEW in set(grant.capabilities or [])
+    )
+    revoked = await client.delete(
+        f"/api/v1/documents/{doc['id']}/grants/{expiring_grant.id}",
+        headers=headers,
+    )
+    assert revoked.status_code == 204, revoked.text
+    listed = await client.get(
+        f"/api/v1/documents/{doc['id']}/grants",
+        headers=headers,
+    )
+    assert listed.status_code == 200
+    assert len(listed.json()) == 1
+    assert set(listed.json()[0]["capabilities"]) == {Capability.COMMENT}
+    assert listed.json()[0]["expires_at"] is None
+
+
+@pytest.mark.asyncio
+async def test_access_request_rejects_forged_resource_kinds_and_invalid_targets(
+    client: AsyncClient,
+):
+    headers = await _auth(client, "accessrequestvalidation")
+    doc = await _upload(client, headers, name="request-validation.md")
+
+    forged = await client.post(
+        "/api/v1/permissions/access-requests",
+        headers=headers,
+        json={
+            "resource_type": "share",
+            "resource_id": doc["id"],
+            "requested_capabilities": [Capability.VIEW],
+        },
+    )
+    assert forged.status_code == 422, forged.text
+
+    unknown_capability = await client.post(
+        "/api/v1/permissions/access-requests",
+        headers=headers,
+        json={
+            "resource_type": ResourceType.DOCUMENT,
+            "resource_id": doc["id"],
+            "requested_capabilities": ["become_owner"],
+        },
+    )
+    assert unknown_capability.status_code == 400, unknown_capability.text
+
+    missing = await client.post(
+        "/api/v1/permissions/access-requests",
+        headers=headers,
+        json={
+            "resource_type": ResourceType.DOCUMENT,
+            "resource_id": generate_ulid(),
+            "requested_capabilities": [Capability.VIEW],
+        },
+    )
+    assert missing.status_code == 404, missing.text
 
 
 @pytest.mark.asyncio
@@ -525,11 +884,27 @@ async def test_grant_unknown_capability_rejected(client: AsyncClient):
     assert "totally_made_up" in resp.text
 
 
+@pytest.mark.asyncio
+async def test_document_grant_rejects_unsupported_subject_type(client: AsyncClient):
+    headers = await _auth(client, "grantsubject")
+    doc = await _upload(client, headers)
+    response = await client.post(
+        f"/api/v1/documents/{doc['id']}/grants",
+        headers=headers,
+        json={
+            "subject_type": "workspace_role",
+            "subject_id": "viewer",
+            "capabilities": ["view"],
+        },
+    )
+    assert response.status_code == 400
+
+
 # ── External shares ──────────────────────────────────────────────────────
 
 
 @pytest.mark.asyncio
-async def test_share_create_list_revoke(client: AsyncClient):
+async def test_share_create_list_revoke(client: AsyncClient, monkeypatch):
     headers = await _auth(client, "shareowner")
     doc = await _upload(client, headers, name="public.md")
 
@@ -542,6 +917,7 @@ async def test_share_create_list_revoke(client: AsyncClient):
             "audience_value": "bob@partner.com",
             "capabilities": ["view"],
             "expires_in_days": 7,
+            "require_otp": True,
         },
     )
     assert resp.status_code == 201, resp.text
@@ -558,7 +934,44 @@ async def test_share_create_list_revoke(client: AsyncClient):
     # Token must NOT leak on list
     assert "token" not in rows[0]
 
-    # Public viewer works without auth
+    # Audience-restricted links require a verified email access token.
+    resp = await client.get(f"/api/v1/shared-doc/{raw_token}")
+    assert resp.status_code == 401, resp.text
+
+    delivered: dict[str, str] = {}
+
+    async def capture_code(to: str, code: str) -> bool:
+        delivered[to] = code
+        return True
+
+    monkeypatch.setattr(
+        "packages.core.services.email_service.send_share_verification_email",
+        capture_code,
+    )
+    wrong = await client.post(
+        f"/api/v1/shared-doc/{raw_token}/request-otp",
+        json={"email": "mallory@partner.com"},
+    )
+    assert wrong.status_code == 200
+    assert "mallory@partner.com" not in delivered
+    sent = await client.post(
+        f"/api/v1/shared-doc/{raw_token}/request-otp",
+        json={"email": "bob@partner.com"},
+    )
+    assert sent.status_code == 200, sent.text
+    verified = await client.post(
+        f"/api/v1/shared-doc/{raw_token}/verify-otp",
+        json={"email": "bob@partner.com", "code": delivered["bob@partner.com"]},
+    )
+    assert verified.status_code == 200, verified.text
+    access_token = verified.json()["access_token"]
+    assert access_token
+    set_cookie = verified.headers.get("set-cookie", "").lower()
+    assert "httponly" in set_cookie
+    assert "samesite=strict" in set_cookie
+    assert "path=/api/v1/shared-doc/" in set_cookie
+    # Browser flow uses the scoped HttpOnly cookie, keeping the bearer proof
+    # out of preview/download URLs and intermediary request logs.
     resp = await client.get(f"/api/v1/shared-doc/{raw_token}")
     assert resp.status_code == 200, resp.text
     public = resp.json()
@@ -575,6 +988,343 @@ async def test_share_create_list_revoke(client: AsyncClient):
     # Token rejected after revoke
     resp = await client.get(f"/api/v1/shared-doc/{raw_token}")
     assert resp.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_shared_doc_otp_releases_database_locks_before_email_provider(
+    client: AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    headers = await _auth(client, "otplockrelease")
+    doc = await _upload(client, headers, name="otp-lock-release.md")
+    share = await client.post(
+        f"/api/v1/documents/{doc['id']}/shares",
+        headers=headers,
+        json={
+            "audience_type": "email",
+            "audience_value": "recipient@example.com",
+            "capabilities": ["view"],
+            "require_otp": True,
+        },
+    )
+    assert share.status_code == 201, share.text
+    share_data = share.json()
+
+    provider_started = asyncio.Event()
+    release_provider = asyncio.Event()
+
+    async def delayed_email(_to: str, _code: str) -> bool:
+        provider_started.set()
+        await release_provider.wait()
+        return True
+
+    monkeypatch.setattr(
+        "packages.core.services.email_service.send_share_verification_email",
+        delayed_email,
+    )
+    otp_request = asyncio.create_task(client.post(
+        f"/api/v1/shared-doc/{share_data['token']}/request-otp",
+        json={"email": "recipient@example.com"},
+    ))
+    await asyncio.wait_for(provider_started.wait(), timeout=5)
+    try:
+        revoked = await asyncio.wait_for(
+            client.delete(
+                f"/api/v1/documents/{doc['id']}/shares/{share_data['id']}",
+                headers=headers,
+            ),
+            timeout=5,
+        )
+        assert revoked.status_code == 204, revoked.text
+    finally:
+        release_provider.set()
+
+    sent = await asyncio.wait_for(otp_request, timeout=5)
+    assert sent.status_code == 200, sent.text
+
+
+@pytest.mark.asyncio
+async def test_concurrent_shared_doc_otp_requests_keep_both_challenges(
+    client: AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    headers = await _auth(client, "otpconcurrent")
+    doc = await _upload(client, headers, name="otp-concurrent.md")
+    share = await client.post(
+        f"/api/v1/documents/{doc['id']}/shares",
+        headers=headers,
+        json={
+            "audience_type": "email",
+            "audience_value": "recipient@example.com",
+            "capabilities": ["view"],
+            "require_otp": True,
+        },
+    )
+    assert share.status_code == 201, share.text
+    token = share.json()["token"]
+
+    first_provider_started = asyncio.Event()
+    release_first_provider = asyncio.Event()
+    codes: list[str] = []
+
+    async def reordered_email(_to: str, code: str) -> bool:
+        codes.append(code)
+        if len(codes) == 1:
+            first_provider_started.set()
+            await release_first_provider.wait()
+        return True
+
+    monkeypatch.setattr(
+        "packages.core.services.email_service.send_share_verification_email",
+        reordered_email,
+    )
+    first_request = asyncio.create_task(client.post(
+        f"/api/v1/shared-doc/{token}/request-otp",
+        json={"email": "recipient@example.com"},
+    ))
+    await asyncio.wait_for(first_provider_started.wait(), timeout=5)
+    second_request = await client.post(
+        f"/api/v1/shared-doc/{token}/request-otp",
+        json={"email": "recipient@example.com"},
+    )
+    assert second_request.status_code == 200, second_request.text
+    release_first_provider.set()
+    first_response = await asyncio.wait_for(first_request, timeout=5)
+    assert first_response.status_code == 200, first_response.text
+    assert len(codes) == 2
+
+    verified = await client.post(
+        f"/api/v1/shared-doc/{token}/verify-otp",
+        json={"email": "recipient@example.com", "code": codes[0]},
+    )
+    assert verified.status_code == 200, verified.text
+
+
+@pytest.mark.asyncio
+async def test_failed_shared_doc_otp_delivery_discards_only_undelivered_challenge(
+    client: AsyncClient,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from packages.core.models.permission import Share
+
+    headers = await _auth(client, "otpdeliveryfailure")
+    doc = await _upload(client, headers, name="otp-delivery-failure.md")
+    share = await client.post(
+        f"/api/v1/documents/{doc['id']}/shares",
+        headers=headers,
+        json={
+            "audience_type": "email",
+            "audience_value": "recipient@example.com",
+            "capabilities": ["view"],
+            "require_otp": True,
+        },
+    )
+    assert share.status_code == 201, share.text
+
+    async def fail_delivery(_to: str, _code: str) -> bool:
+        return False
+
+    monkeypatch.setattr(
+        "packages.core.services.email_service.send_share_verification_email",
+        fail_delivery,
+    )
+    response = await client.post(
+        f"/api/v1/shared-doc/{share.json()['token']}/request-otp",
+        json={"email": "recipient@example.com"},
+    )
+    assert response.status_code == 503, response.text
+
+    share_row = await db_session.get(Share, share.json()["id"])
+    assert share_row is not None
+    await db_session.refresh(share_row)
+    assert (share_row.metadata_ or {}).get("otp_challenges") == {}
+
+
+@pytest.mark.asyncio
+async def test_shared_doc_content_releases_database_locks_before_streaming(
+    client: AsyncClient,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from packages.core.config import get_settings
+    from starlette.responses import FileResponse
+
+    settings = get_settings()
+    old_root, old_enabled = settings.MANOR_FS_ROOT, settings.MANOR_FS_ENABLED
+    settings.MANOR_FS_ROOT = str(tmp_path)
+    settings.MANOR_FS_ENABLED = True
+    try:
+        headers = await _auth(client, "contentlockrelease")
+        doc = await _upload(
+            client,
+            headers,
+            name="stream-lock-release.md",
+            body=b"stream after admission",
+        )
+        share = await client.post(
+            f"/api/v1/documents/{doc['id']}/shares",
+            headers=headers,
+            json={"audience_type": "anonymous", "capabilities": ["view"]},
+        )
+        assert share.status_code == 201, share.text
+        share_data = share.json()
+
+        stream_started = asyncio.Event()
+        release_stream = asyncio.Event()
+        original_call = FileResponse.__call__
+
+        async def delayed_stream(response, scope, receive, send):
+            stream_started.set()
+            await release_stream.wait()
+            return await original_call(response, scope, receive, send)
+
+        monkeypatch.setattr(FileResponse, "__call__", delayed_stream)
+        content_request = asyncio.create_task(
+            client.get(f"/api/v1/shared-doc/{share_data['token']}/content")
+        )
+        await asyncio.wait_for(stream_started.wait(), timeout=5)
+        try:
+            revoked = await asyncio.wait_for(
+                client.delete(
+                    f"/api/v1/documents/{doc['id']}/shares/{share_data['id']}",
+                    headers=headers,
+                ),
+                timeout=5,
+            )
+            assert revoked.status_code == 204, revoked.text
+        finally:
+            release_stream.set()
+
+        content = await asyncio.wait_for(content_request, timeout=5)
+        assert content.status_code == 200, content.text
+        assert content.content == b"stream after admission"
+    finally:
+        settings.MANOR_FS_ROOT = old_root
+        settings.MANOR_FS_ENABLED = old_enabled
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("endpoint", ["content", "download"])
+async def test_shared_doc_file_stream_releases_entity_read_boundary_after_snapshot(
+    client: AsyncClient,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    endpoint: str,
+):
+    from packages.core.config import get_settings
+    from packages.core.services.entity_fs import (
+        entity_filesystem_mutation_lock,
+        get_entity_root,
+    )
+    from starlette.responses import FileResponse
+
+    settings = get_settings()
+    old_root, old_enabled = settings.MANOR_FS_ROOT, settings.MANOR_FS_ENABLED
+    settings.MANOR_FS_ROOT = str(tmp_path)
+    settings.MANOR_FS_ENABLED = True
+    try:
+        headers = await _auth(client, f"sharedreadboundary{endpoint}")
+        doc = await _upload(
+            client,
+            headers,
+            name=f"locked-{endpoint}.md",
+            body=b"authorized inode",
+        )
+        share = await client.post(
+            f"/api/v1/documents/{doc['id']}/shares",
+            headers=headers,
+            json={
+                "audience_type": "anonymous",
+                "capabilities": ["view", "download"],
+                "allow_download": True,
+            },
+        )
+        assert share.status_code == 201, share.text
+
+        stream_started = asyncio.Event()
+        release_stream = asyncio.Event()
+        original_call = FileResponse.__call__
+
+        async def delayed_stream(response, scope, receive, send):
+            stream_started.set()
+            await release_stream.wait()
+            return await original_call(response, scope, receive, send)
+
+        monkeypatch.setattr(FileResponse, "__call__", delayed_stream)
+        request_task = asyncio.create_task(client.get(
+            f"/api/v1/shared-doc/{share.json()['token']}/{endpoint}"
+        ))
+        await asyncio.wait_for(stream_started.wait(), timeout=5)
+        try:
+            async with entity_filesystem_mutation_lock(
+                get_entity_root(doc["entity_id"]),
+                timeout_seconds=0.2,
+            ):
+                pass
+        finally:
+            release_stream.set()
+
+        response = await asyncio.wait_for(request_task, timeout=5)
+        assert response.status_code == 200, response.text
+        assert response.content == b"authorized inode"
+    finally:
+        settings.MANOR_FS_ROOT = old_root
+        settings.MANOR_FS_ENABLED = old_enabled
+
+
+@pytest.mark.asyncio
+async def test_document_share_can_never_expire(client: AsyncClient):
+    headers = await _auth(client, "permanentdoc")
+    doc = await _upload(client, headers)
+    created = await client.post(
+        f"/api/v1/documents/{doc['id']}/shares",
+        headers=headers,
+        json={
+            "audience_type": "anonymous",
+            "capabilities": ["view"],
+            "expires_in_days": None,
+        },
+    )
+    assert created.status_code == 201, created.text
+    assert created.json()["expires_at"] is None
+
+    public = await client.get(f"/api/v1/shared-doc/{created.json()['token']}")
+    assert public.status_code == 200, public.text
+    assert public.json()["expires_at"] is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("expires_in_days", [1, 90])
+async def test_document_share_configured_expiry(client: AsyncClient, expires_in_days: int):
+    headers = await _auth(client, f"expiry{expires_in_days}")
+    doc = await _upload(client, headers)
+    created = await client.post(
+        f"/api/v1/documents/{doc['id']}/shares",
+        headers=headers,
+        json={
+            "audience_type": "anonymous",
+            "capabilities": ["view"],
+            "expires_in_days": expires_in_days,
+        },
+    )
+    assert created.status_code == 201, created.text
+    assert created.json()["expires_at"] is not None
+
+
+@pytest.mark.asyncio
+async def test_document_share_default_configured_expiry(client: AsyncClient):
+    headers = await _auth(client, "defaultshareexpiry")
+    doc = await _upload(client, headers)
+    before = datetime.now(timezone.utc)
+    created = await client.post(
+        f"/api/v1/documents/{doc['id']}/shares",
+        headers=headers,
+        json={"audience_type": "anonymous", "capabilities": ["view"]},
+    )
+    assert created.status_code == 201, created.text
+    expires_at = datetime.fromisoformat(created.json()["expires_at"])
+    assert timedelta(days=6, hours=23) < expires_at - before < timedelta(days=7, minutes=1)
 
 
 @pytest.mark.asyncio
@@ -616,6 +1366,718 @@ async def test_share_unknown_audience_value_required(client: AsyncClient):
     assert resp.status_code == 400
 
 
+@pytest.mark.asyncio
+async def test_share_requires_view_capability(client: AsyncClient):
+    headers = await _auth(client, "shareviewcap")
+    doc = await _upload(client, headers)
+    response = await client.post(
+        f"/api/v1/documents/{doc['id']}/shares",
+        headers=headers,
+        json={"audience_type": "anonymous", "capabilities": ["comment"]},
+    )
+    assert response.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_trash_immediately_revokes_external_share(client: AsyncClient):
+    headers = await _auth(client, "sharetrash")
+    doc = await _upload(client, headers)
+    share = await client.post(
+        f"/api/v1/documents/{doc['id']}/shares",
+        headers=headers,
+        json={"audience_type": "anonymous", "capabilities": ["view"]},
+    )
+    token = share.json()["token"]
+    assert (await client.get(f"/api/v1/shared-doc/{token}")).status_code == 200
+    trashed = await client.post(f"/api/v1/documents/{doc['id']}/trash", headers=headers)
+    assert trashed.status_code == 200, trashed.text
+    assert (await client.get(f"/api/v1/shared-doc/{token}")).status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_deleted_workspace_blocks_document_acl_and_public_share_until_restore(
+    client: AsyncClient,
+    db_session: AsyncSession,
+):
+    from packages.core.models.document import Document
+
+    headers = await _auth(client, "deletedworkspacedocshare")
+    workspace = await client.post(
+        "/api/v1/workspaces",
+        headers=headers,
+        json={"name": "Restorable document permissions"},
+    )
+    assert workspace.status_code == 201, workspace.text
+    workspace_data = workspace.json()
+    assert workspace_data["artifact_folder_id"]
+
+    doc = await _upload(client, headers, name="workspace-owned.md")
+    doc_row = await db_session.get(Document, doc["id"])
+    assert doc_row is not None
+    doc_row.folder_id = workspace_data["artifact_folder_id"]
+    await db_session.commit()
+
+    share = await client.post(
+        f"/api/v1/documents/{doc['id']}/shares",
+        headers=headers,
+        json={"audience_type": "anonymous", "capabilities": [Capability.VIEW]},
+    )
+    assert share.status_code == 201, share.text
+    token = share.json()["token"]
+    assert (await client.get(f"/api/v1/shared-doc/{token}")).status_code == 200
+
+    deleted = await client.delete(
+        f"/api/v1/workspaces/{workspace_data['id']}",
+        headers=headers,
+    )
+    assert deleted.status_code == 204, deleted.text
+    assert (await client.get(f"/api/v1/shared-doc/{token}")).status_code == 410
+    assert (
+        await client.get(
+            f"/api/v1/documents/{doc['id']}",
+            headers=headers,
+        )
+    ).status_code == 404
+    listed_while_deleted = await client.get("/api/v1/documents", headers=headers)
+    assert listed_while_deleted.status_code == 200, listed_while_deleted.text
+    assert doc["id"] not in {
+        item["id"] for item in listed_while_deleted.json()["items"]
+    }
+    assert (
+        await client.get(
+            f"/api/v1/documents/{doc['id']}/grants",
+            headers=headers,
+        )
+    ).status_code == 404
+    access_request = await client.post(
+        "/api/v1/permissions/access-requests",
+        headers=headers,
+        json={
+            "resource_type": ResourceType.DOCUMENT,
+            "resource_id": doc["id"],
+            "requested_capabilities": [Capability.VIEW],
+        },
+    )
+    assert access_request.status_code == 404, access_request.text
+
+    restored = await client.post(
+        f"/api/v1/workspaces/{workspace_data['id']}/restore",
+        headers=headers,
+    )
+    assert restored.status_code == 200, restored.text
+    assert (await client.get(f"/api/v1/shared-doc/{token}")).status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_legacy_document_group_routes_require_workspace_manage_access(
+    client: AsyncClient,
+    db_session: AsyncSession,
+):
+    from sqlalchemy import select
+
+    from packages.core.models.document import DocumentGroup, DocumentGroupMember
+
+    owner_headers = await _auth(client, "legacygroupworkspaceowner")
+    workspace = await client.post(
+        "/api/v1/workspaces",
+        headers=owner_headers,
+        json={"name": "Private group workspace"},
+    )
+    assert workspace.status_code == 201, workspace.text
+    workspace_data = workspace.json()
+    group = await client.post(
+        "/api/v1/documents/groups",
+        headers=owner_headers,
+        json={"name": "Private Knowledge", "workspace_id": workspace_data["id"]},
+    )
+    assert group.status_code == 201, group.text
+    stored_group = (await db_session.execute(
+        select(DocumentGroup).where(DocumentGroup.id == group.json()["id"])
+    )).scalar_one()
+    assert stored_group.settings == {
+        "kind": "knowledge_net",
+        "scope": "workspace",
+        "purpose": "",
+        "user_manageable": True,
+    }
+    document = await _upload(
+        client,
+        owner_headers,
+        name="private-group-source.md",
+        visibility="private",
+    )
+    member = await _create_entity_user(
+        workspace_data["entity_id"],
+        "legacy_group_nonmember",
+        "member",
+    )
+
+    listed = await client.get("/api/v1/documents/groups", headers=member["headers"])
+    assert listed.status_code == 200, listed.text
+    assert group.json()["id"] not in {row["id"] for row in listed.json()}
+
+    create = await client.post(
+        "/api/v1/documents/groups",
+        headers=member["headers"],
+        json={"name": "Injected", "workspace_id": workspace_data["id"]},
+    )
+    assert create.status_code == 403, create.text
+    batch = await client.post(
+        "/api/v1/documents/groups/batch-add",
+        headers=member["headers"],
+        json={"document_ids": [document["id"]], "group_id": group.json()["id"]},
+    )
+    assert batch.status_code == 403, batch.text
+    single = await client.post(
+        f"/api/v1/documents/{document['id']}/groups/{group.json()['id']}",
+        headers=member["headers"],
+    )
+    assert single.status_code == 403, single.text
+    assert (await db_session.execute(
+        select(DocumentGroupMember).where(
+            DocumentGroupMember.group_id == group.json()["id"],
+            DocumentGroupMember.document_id == document["id"],
+        )
+    )).scalar_one_or_none() is None
+
+
+@pytest.mark.asyncio
+async def test_bulk_reindex_serializes_with_workspace_delete(
+    client: AsyncClient,
+    db_session: AsyncSession,
+):
+    from packages.core.models.document import Document, VectorStatus
+    from packages.core.services.entity_service import soft_delete_workspace
+
+    headers = await _auth(client, "bulkreindexdeleterace")
+    workspace = await client.post(
+        "/api/v1/workspaces",
+        headers=headers,
+        json={"name": "Bulk reindex delete race"},
+    )
+    assert workspace.status_code == 201, workspace.text
+    workspace_data = workspace.json()
+    workspace_doc = await _upload(
+        client,
+        headers,
+        name="workspace-reindex.md",
+    )
+    global_doc = await _upload(
+        client,
+        headers,
+        name="global-reindex.md",
+    )
+    workspace_row = await db_session.get(Document, workspace_doc["id"])
+    global_row = await db_session.get(Document, global_doc["id"])
+    assert workspace_row is not None
+    assert global_row is not None
+    workspace_row.folder_id = workspace_data["artifact_folder_id"]
+    workspace_row.vector_status = VectorStatus.READY
+    global_row.vector_status = VectorStatus.READY
+    await db_session.commit()
+
+    async with db_module.async_session() as deleting_db:
+        assert await soft_delete_workspace(
+            deleting_db,
+            workspace_data["id"],
+            workspace_data["entity_id"],
+        ) is True
+        reindex_task = asyncio.create_task(client.post(
+            "/api/v1/documents/reindex",
+            headers=headers,
+        ))
+        await asyncio.sleep(0.1)
+        assert reindex_task.done() is False
+        await deleting_db.commit()
+
+    response = await asyncio.wait_for(reindex_task, timeout=5)
+    assert response.status_code == 200, response.text
+    assert response.json()["count"] == 1
+    await db_session.refresh(workspace_row)
+    await db_session.refresh(global_row)
+    assert workspace_row.vector_status == VectorStatus.READY
+    assert global_row.vector_status == VectorStatus.PENDING
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("surface", ["share", "access_request"])
+async def test_document_permission_writes_serialize_with_workspace_delete(
+    client: AsyncClient,
+    db_session: AsyncSession,
+    surface: str,
+):
+    from sqlalchemy import func, select
+
+    from packages.core.models.document import Document
+    from packages.core.models.permission import ResourceGrantPending, Share
+    from packages.core.services.entity_service import soft_delete_workspace
+
+    headers = await _auth(client, f"permissiondeleterace{surface}")
+    workspace = await client.post(
+        "/api/v1/workspaces",
+        headers=headers,
+        json={"name": f"Permission delete race {surface}"},
+    )
+    assert workspace.status_code == 201, workspace.text
+    workspace_data = workspace.json()
+    doc = await _upload(client, headers, name=f"race-{surface}.md")
+    doc_row = await db_session.get(Document, doc["id"])
+    assert doc_row is not None
+    doc_row.folder_id = workspace_data["artifact_folder_id"]
+    await db_session.commit()
+
+    async with db_module.async_session() as deleting_db:
+        deleted = await soft_delete_workspace(
+            deleting_db,
+            workspace_data["id"],
+            workspace_data["entity_id"],
+        )
+        assert deleted is True
+
+        if surface == "share":
+            request_task = asyncio.create_task(client.post(
+                f"/api/v1/documents/{doc['id']}/shares",
+                headers=headers,
+                json={
+                    "audience_type": "anonymous",
+                    "capabilities": [Capability.VIEW],
+                },
+            ))
+        else:
+            request_task = asyncio.create_task(client.post(
+                "/api/v1/permissions/access-requests",
+                headers=headers,
+                json={
+                    "resource_type": ResourceType.DOCUMENT,
+                    "resource_id": doc["id"],
+                    "requested_capabilities": [Capability.VIEW],
+                },
+            ))
+
+        await asyncio.sleep(0.1)
+        assert request_task.done() is False
+        await deleting_db.commit()
+
+    response = await asyncio.wait_for(request_task, timeout=5)
+    assert response.status_code == 404, response.text
+
+    async with db_module.async_session() as verify_db:
+        model = Share if surface == "share" else ResourceGrantPending
+        created = await verify_db.scalar(select(func.count()).select_from(model).where(
+            model.entity_id == workspace_data["entity_id"],
+            model.resource_id == doc["id"],
+        ))
+        assert created == 0
+
+
+@pytest.mark.asyncio
+async def test_document_content_write_rechecks_workspace_delete_inside_fs_boundary(
+    client: AsyncClient,
+    db_session: AsyncSession,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from packages.core.config import get_settings
+    from packages.core.models.document import Document
+    from packages.core.services.entity_service import soft_delete_workspace
+
+    settings = get_settings()
+    monkeypatch.setattr(settings, "MANOR_FS_ROOT", str(tmp_path))
+    monkeypatch.setattr(settings, "MANOR_FS_ENABLED", True)
+    headers = await _auth(client, "documentwritedeleterace")
+    workspace = await client.post(
+        "/api/v1/workspaces",
+        headers=headers,
+        json={"name": "Document write delete race"},
+    )
+    assert workspace.status_code == 201, workspace.text
+    workspace_data = workspace.json()
+    doc = await _upload(client, headers, name="write-delete-race.md")
+    doc_row = await db_session.get(Document, doc["id"])
+    assert doc_row is not None
+    doc_row.folder_id = workspace_data["artifact_folder_id"]
+    await db_session.commit()
+
+    async with db_module.async_session() as deleting_db:
+        assert await soft_delete_workspace(
+            deleting_db,
+            workspace_data["id"],
+            workspace_data["entity_id"],
+        ) is True
+        write_task = asyncio.create_task(client.put(
+            f"/api/v1/documents/{doc['id']}/content",
+            headers=headers,
+            json={"content": "must not be committed"},
+        ))
+        await asyncio.sleep(0.1)
+        assert write_task.done() is False
+        await deleting_db.commit()
+
+    response = await asyncio.wait_for(write_task, timeout=5)
+    assert response.status_code == 404, response.text
+    assert Path(tmp_path, doc["entity_id"], doc["fs_path"]).read_bytes() == b"hello"
+
+
+@pytest.mark.asyncio
+async def test_document_content_write_rechecks_revoked_edit_grant_under_lock(
+    client: AsyncClient,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from sqlalchemy import select
+
+    from packages.core.config import get_settings
+    from packages.core.models.document import Document
+
+    settings = get_settings()
+    monkeypatch.setattr(settings, "MANOR_FS_ROOT", str(tmp_path))
+    monkeypatch.setattr(settings, "MANOR_FS_ENABLED", True)
+    owner_headers = await _auth(client, "documentwriterevokerace")
+    member_headers, member = await _invite_and_accept_member(
+        client,
+        owner_headers,
+        "document.write.revoke@test.com",
+        name="Document Writer",
+    )
+    doc = await _upload(
+        client,
+        owner_headers,
+        name="write-revoke-race.md",
+        visibility="private",
+    )
+    grant_response = await client.post(
+        f"/api/v1/documents/{doc['id']}/grants",
+        headers=owner_headers,
+        json={
+            "subject_type": "user",
+            "subject_id": member["staff_id"],
+            "capabilities": [Capability.VIEW, Capability.EDIT],
+        },
+    )
+    assert grant_response.status_code == 201, grant_response.text
+
+    async with db_module.async_session() as revoking_db:
+        await revoking_db.execute(
+            select(Document).where(Document.id == doc["id"]).with_for_update()
+        )
+        grant = (await revoking_db.execute(
+            select(ResourceGrant)
+            .where(ResourceGrant.id == grant_response.json()["id"])
+            .with_for_update()
+        )).scalar_one()
+        grant.status = GrantStatus.REVOKED
+        write_task = asyncio.create_task(client.put(
+            f"/api/v1/documents/{doc['id']}/content",
+            headers=member_headers,
+            json={"content": "must not be committed"},
+        ))
+        await asyncio.sleep(0.1)
+        assert write_task.done() is False
+        await revoking_db.commit()
+
+    response = await asyncio.wait_for(write_task, timeout=5)
+    # The request can observe the revocation either during its initial
+    # visibility check (404) or during the locked mutation recheck (403).
+    # Both outcomes are fail-closed; the durable invariant is that no content
+    # from the revoked writer reaches storage.
+    assert response.status_code in {403, 404}, response.text
+    assert Path(tmp_path, doc["entity_id"], doc["fs_path"]).read_bytes() == b"hello"
+
+
+@pytest.mark.asyncio
+async def test_public_document_share_serializes_with_workspace_delete(
+    client: AsyncClient,
+    db_session: AsyncSession,
+):
+    from packages.core.models.document import Document
+    from packages.core.services.entity_service import soft_delete_workspace
+
+    headers = await _auth(client, "publicdocdeleterace")
+    workspace = await client.post(
+        "/api/v1/workspaces",
+        headers=headers,
+        json={"name": "Public document delete race"},
+    )
+    assert workspace.status_code == 201, workspace.text
+    workspace_data = workspace.json()
+    doc = await _upload(client, headers, name="public-delete-race.md")
+    doc_row = await db_session.get(Document, doc["id"])
+    assert doc_row is not None
+    doc_row.folder_id = workspace_data["artifact_folder_id"]
+    await db_session.commit()
+
+    share = await client.post(
+        f"/api/v1/documents/{doc['id']}/shares",
+        headers=headers,
+        json={"audience_type": "anonymous", "capabilities": [Capability.VIEW]},
+    )
+    assert share.status_code == 201, share.text
+    token = share.json()["token"]
+
+    async with db_module.async_session() as deleting_db:
+        assert await soft_delete_workspace(
+            deleting_db,
+            workspace_data["id"],
+            workspace_data["entity_id"],
+        ) is True
+        request_task = asyncio.create_task(
+            client.get(f"/api/v1/shared-doc/{token}")
+        )
+        await asyncio.sleep(0.1)
+        assert request_task.done() is False
+        await deleting_db.commit()
+
+    response = await asyncio.wait_for(request_task, timeout=5)
+    assert response.status_code == 410, response.text
+
+
+@pytest.mark.asyncio
+async def test_public_document_share_serializes_with_reclassification(
+    client: AsyncClient,
+):
+    from sqlalchemy import select
+
+    from packages.core.models.document import Document
+
+    headers = await _auth(client, "publicdocclassrace")
+    doc = await _upload(
+        client,
+        headers,
+        name="public-classification-race.md",
+        classification="internal",
+    )
+    share = await client.post(
+        f"/api/v1/documents/{doc['id']}/shares",
+        headers=headers,
+        json={"audience_type": "anonymous", "capabilities": [Capability.VIEW]},
+    )
+    assert share.status_code == 201, share.text
+    token = share.json()["token"]
+
+    async with db_module.async_session() as policy_db:
+        doc_row = (await policy_db.execute(
+            select(Document)
+            .where(Document.id == doc["id"])
+            .with_for_update()
+        )).scalar_one()
+        doc_row.classification = "confidential"
+        await policy_db.flush()
+        request_task = asyncio.create_task(
+            client.get(f"/api/v1/shared-doc/{token}")
+        )
+        await asyncio.sleep(0.1)
+        assert request_task.done() is False
+        await policy_db.commit()
+
+    response = await asyncio.wait_for(request_task, timeout=5)
+    assert response.status_code == 410, response.text
+
+
+@pytest.mark.asyncio
+async def test_public_document_share_retries_when_folder_scope_changes_while_locking(
+    client: AsyncClient,
+):
+    from sqlalchemy import select
+
+    from packages.core.models.document import Document
+
+    headers = await _auth(client, "publicdocmovescope")
+    source_workspace = await client.post(
+        "/api/v1/workspaces",
+        headers=headers,
+        json={"name": "Share move source"},
+    )
+    target_workspace = await client.post(
+        "/api/v1/workspaces",
+        headers=headers,
+        json={"name": "Share move target"},
+    )
+    assert source_workspace.status_code == 201, source_workspace.text
+    assert target_workspace.status_code == 201, target_workspace.text
+    source_folder_id = source_workspace.json()["artifact_folder_id"]
+    target_folder_id = target_workspace.json()["artifact_folder_id"]
+
+    doc = await _upload(client, headers, name="moving-share.md")
+    async with db_module.async_session() as db:
+        doc_row = await db.get(Document, doc["id"])
+        assert doc_row is not None
+        doc_row.folder_id = source_folder_id
+        await db.commit()
+
+    share = await client.post(
+        f"/api/v1/documents/{doc['id']}/shares",
+        headers=headers,
+        json={"audience_type": "anonymous", "capabilities": ["view"]},
+    )
+    assert share.status_code == 201, share.text
+
+    async with db_module.async_session() as moving_db:
+        moving_doc = (await moving_db.execute(
+            select(Document).where(Document.id == doc["id"]).with_for_update()
+        )).scalar_one()
+        moving_doc.folder_id = target_folder_id
+        await moving_db.flush()
+        request_task = asyncio.create_task(
+            client.get(f"/api/v1/shared-doc/{share.json()['token']}")
+        )
+        await asyncio.sleep(0.1)
+        assert request_task.done() is False
+        await moving_db.commit()
+
+    response = await asyncio.wait_for(request_task, timeout=5)
+    assert response.status_code == 200, response.text
+
+
+@pytest.mark.asyncio
+async def test_reclassification_invalidates_older_share_policy(client: AsyncClient):
+    headers = await _auth(client, "sharereclass")
+    doc = await _upload(client, headers, classification="internal")
+    share = await client.post(
+        f"/api/v1/documents/{doc['id']}/shares",
+        headers=headers,
+        json={"audience_type": "anonymous", "capabilities": ["view"]},
+    )
+    token = share.json()["token"]
+    changed = await client.post(
+        f"/api/v1/permissions/documents/{doc['id']}/classify",
+        headers=headers,
+        json={"classification": "confidential"},
+    )
+    assert changed.status_code == 200, changed.text
+    denied = await client.get(f"/api/v1/shared-doc/{token}")
+    assert denied.status_code == 410
+
+
+@pytest.mark.asyncio
+async def test_ancestor_reclassification_invalidates_legacy_child_share(
+    client: AsyncClient,
+    db_session: AsyncSession,
+):
+    from packages.core.models.document import Document, DocumentFolder
+
+    headers = await _auth(client, "shareancestorclass")
+    doc = await _upload(client, headers, classification="internal")
+    share = await client.post(
+        f"/api/v1/documents/{doc['id']}/shares",
+        headers=headers,
+        json={"audience_type": "anonymous", "capabilities": ["view"]},
+    )
+    token = share.json()["token"]
+    row = await db_session.get(Document, doc["id"])
+    assert row is not None
+    folder = DocumentFolder(
+        id=generate_ulid(),
+        entity_id=row.entity_id,
+        name="Legacy Confidential Parent",
+        classification="confidential",
+        visibility="entity",
+        client_visible=False,
+    )
+    db_session.add(folder)
+    row.folder_id = folder.id
+    await db_session.commit()
+
+    denied = await client.get(f"/api/v1/shared-doc/{token}")
+    assert denied.status_code == 410
+
+
+@pytest.mark.asyncio
+async def test_direct_share_uses_effective_ancestor_classification(
+    client: AsyncClient,
+    db_session: AsyncSession,
+):
+    from packages.core.models.document import Document, DocumentFolder
+    from packages.core.models.permission import Share
+
+    headers = await _auth(client, "shareeffectiveinternal")
+    doc = await _upload(client, headers, classification="public")
+    row = await db_session.get(Document, doc["id"])
+    assert row is not None
+    folder = DocumentFolder(
+        id=generate_ulid(),
+        entity_id=row.entity_id,
+        name="Internal Parent",
+        classification="internal",
+        visibility="entity",
+        client_visible=False,
+    )
+    db_session.add(folder)
+    row.folder_id = folder.id
+    await db_session.commit()
+
+    created = await client.post(
+        f"/api/v1/documents/{doc['id']}/shares",
+        headers=headers,
+        json={"audience_type": "anonymous", "capabilities": ["view"]},
+    )
+    assert created.status_code == 201, created.text
+    share = await db_session.get(Share, created.json()["id"])
+    assert share is not None
+    assert share.metadata_["classification_at_creation"] == "internal"
+
+    viewed = await client.get(f"/api/v1/shared-doc/{created.json()['token']}")
+    assert viewed.status_code == 200, viewed.text
+    assert viewed.json()["classification"] == "internal"
+
+
+@pytest.mark.asyncio
+async def test_share_approval_uses_effective_confidential_ancestor(
+    client: AsyncClient,
+    db_session: AsyncSession,
+):
+    from packages.core.models.document import Document, DocumentFolder
+    from packages.core.models.permission import Share
+
+    headers = await _auth(client, "shareeffectiveconfidential")
+    doc = await _upload(client, headers, classification="internal")
+    row = await db_session.get(Document, doc["id"])
+    assert row is not None
+    folder = DocumentFolder(
+        id=generate_ulid(),
+        entity_id=row.entity_id,
+        name="Confidential Parent",
+        classification="confidential",
+        visibility="entity",
+        client_visible=False,
+    )
+    db_session.add(folder)
+    row.folder_id = folder.id
+    await db_session.commit()
+
+    direct = await client.post(
+        f"/api/v1/documents/{doc['id']}/shares",
+        headers=headers,
+        json={"audience_type": "anonymous", "capabilities": ["view"]},
+    )
+    assert direct.status_code == 409, direct.text
+
+    requested = await client.post(
+        f"/api/v1/documents/{doc['id']}/share-approvals",
+        headers=headers,
+        json={
+            "audience_type": "email",
+            "audience_value": "reviewer@example.com",
+            "capabilities": ["view"],
+            "reason": "External review",
+        },
+    )
+    assert requested.status_code == 201, requested.text
+    decided = await client.post(
+        f"/api/v1/documents/{doc['id']}/share-approvals/"
+        f"{requested.json()['id']}/decision",
+        headers=headers,
+        json={"decision": "approve"},
+    )
+    assert decided.status_code == 200, decided.text
+    share = await db_session.get(
+        Share,
+        decided.json()["approval"]["approved_share_id"],
+    )
+    assert share is not None
+    assert share.metadata_["classification_at_creation"] == "confidential"
+    assert share.metadata_["approved_external_share"] is True
+
+
 # ── Share approvals (Confidential workflow) ──────────────────────────────
 
 
@@ -635,7 +2097,7 @@ async def test_share_approval_full_loop(client: AsyncClient):
             "audience_type": "email",
             "audience_value": "client@partner.com",
             "capabilities": ["view"],
-            "expires_in_days": 14,
+            "expires_in_days": None,
             "reason": "Client legal review for Q3 contract",
         },
     )
@@ -668,9 +2130,63 @@ async def test_share_approval_full_loop(client: AsyncClient):
     assert decision["url"]
     assert decision["approval"]["approved_share_id"]
 
-    # Token works
+    # The bearer share token alone is insufficient for an email audience.
     resp = await client.get(f"/api/v1/shared-doc/{decision['token']}")
-    assert resp.status_code == 200
+    assert resp.status_code == 401
+
+    # A consumed approval cannot materialize a second share/token. Production
+    # decisions additionally lock the pending row so concurrent attempts
+    # serialize around this same state transition.
+    repeated = await client.post(
+        f"/api/v1/documents/{doc['id']}/share-approvals/{approval_id}/decision",
+        headers=headers,
+        json={"decision": "approve"},
+    )
+    assert repeated.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_share_approval_concurrent_decisions_materialize_once(
+    client: AsyncClient,
+):
+    headers = await _auth(client, "approvalconcurrent")
+    doc = await _upload(client, headers, classification="confidential")
+    requested = await client.post(
+        f"/api/v1/documents/{doc['id']}/share-approvals",
+        headers=headers,
+        json={
+            "audience_type": "email",
+            "audience_value": "concurrent@example.com",
+            "capabilities": ["view"],
+            "reason": "Concurrent decision regression",
+        },
+    )
+    assert requested.status_code == 201, requested.text
+    decision_url = (
+        f"/api/v1/documents/{doc['id']}/share-approvals/"
+        f"{requested.json()['id']}/decision"
+    )
+
+    first, second = await asyncio.gather(
+        client.post(
+            decision_url,
+            headers=headers,
+            json={"decision": "approve"},
+        ),
+        client.post(
+            decision_url,
+            headers=headers,
+            json={"decision": "approve"},
+        ),
+    )
+
+    assert sorted((first.status_code, second.status_code)) == [200, 400]
+    shares = await client.get(
+        f"/api/v1/documents/{doc['id']}/shares",
+        headers=headers,
+    )
+    assert shares.status_code == 200, shares.text
+    assert len(shares.json()) == 1
 
 
 @pytest.mark.asyncio
@@ -732,8 +2248,7 @@ async def test_access_log_records_share_use(client: AsyncClient):
         f"/api/v1/documents/{doc['id']}/shares",
         headers=headers,
         json={
-            "audience_type": "email",
-            "audience_value": "x@y",
+            "audience_type": "anonymous",
             "capabilities": ["view"],
         },
     )
@@ -748,6 +2263,50 @@ async def test_access_log_records_share_use(client: AsyncClient):
     actions = {r["action"] for r in rows}
     assert "share_create" in actions
     assert "share_use" in actions
+
+
+@pytest.mark.asyncio
+async def test_best_effort_access_log_isolated_by_savepoint():
+    from types import SimpleNamespace
+
+    from apps.api.routers import document_permissions
+
+    class NestedTransaction:
+        def __init__(self, session):
+            self.session = session
+
+        async def __aenter__(self):
+            self.session.savepoint_entered = True
+
+        async def __aexit__(self, exc_type, _exc, _tb):
+            self.session.savepoint_rolled_back = exc_type is RuntimeError
+            return False
+
+    class FailingAuditSession:
+        savepoint_entered = False
+        savepoint_rolled_back = False
+
+        def begin_nested(self):
+            return NestedTransaction(self)
+
+        async def execute(self, *_args, **_kwargs):
+            raise RuntimeError("audit table unavailable")
+
+    session = FailingAuditSession()
+    await document_permissions._write_access_log(
+        session,
+        doc=SimpleNamespace(
+            id="doc-1",
+            entity_id="entity-1",
+            classification="internal",
+        ),
+        actor_type="user",
+        actor_id="user-1",
+        action="read",
+    )
+
+    assert session.savepoint_entered is True
+    assert session.savepoint_rolled_back is True
 
 
 # ── Cross-entity isolation ──────────────────────────────────────────────
@@ -898,6 +2457,153 @@ async def test_shared_doc_download_streams_file_when_allowed(
 
 
 @pytest.mark.asyncio
+async def test_limited_shared_doc_content_requires_a_counted_view_session(
+    client: AsyncClient,
+    db_session: AsyncSession,
+    tmp_path: Path,
+):
+    """Inline previews do not consume a second use or bypass the entry view."""
+    from packages.core.config import get_settings
+    from packages.core.models.permission import Share
+
+    settings = get_settings()
+    old_root, old_enabled = settings.MANOR_FS_ROOT, settings.MANOR_FS_ENABLED
+    settings.MANOR_FS_ROOT = str(tmp_path)
+    settings.MANOR_FS_ENABLED = True
+    try:
+        headers = await _auth(client, "limitedcontent")
+        doc = await _upload(client, headers, name="report.md", body=b"shared content")
+        share = await client.post(
+            f"/api/v1/documents/{doc['id']}/shares",
+            headers=headers,
+            json={
+                "audience_type": "anonymous",
+                "capabilities": ["view"],
+                "allow_download": False,
+            },
+        )
+        assert share.status_code == 201, share.text
+        token = share.json()["token"]
+        share_row = await db_session.get(Share, share.json()["id"])
+        assert share_row is not None
+        share_row.max_uses = 1
+        await db_session.commit()
+
+        blocked = await client.get(f"/api/v1/shared-doc/{token}/content")
+        assert blocked.status_code == 410, blocked.text
+
+        opened = await client.get(f"/api/v1/shared-doc/{token}")
+        assert opened.status_code == 200, opened.text
+        content = await client.get(f"/api/v1/shared-doc/{token}/content")
+        assert content.status_code == 200, content.text
+        assert content.content == b"shared content"
+    finally:
+        settings.MANOR_FS_ROOT = old_root
+        settings.MANOR_FS_ENABLED = old_enabled
+
+
+@pytest.mark.asyncio
+async def test_shared_doc_content_serializes_with_share_revoke(
+    client: AsyncClient,
+    tmp_path: Path,
+):
+    from sqlalchemy import select
+
+    from packages.core.config import get_settings
+    from packages.core.models.permission import Share
+
+    settings = get_settings()
+    old_root, old_enabled = settings.MANOR_FS_ROOT, settings.MANOR_FS_ENABLED
+    settings.MANOR_FS_ROOT = str(tmp_path)
+    settings.MANOR_FS_ENABLED = True
+    try:
+        headers = await _auth(client, "sharedcontentrevokerace")
+        doc = await _upload(
+            client,
+            headers,
+            name="revoked-content.md",
+            body=b"must not escape after revoke",
+        )
+        share = await client.post(
+            f"/api/v1/documents/{doc['id']}/shares",
+            headers=headers,
+            json={"audience_type": "anonymous", "capabilities": ["view"]},
+        )
+        assert share.status_code == 201, share.text
+        token = share.json()["token"]
+
+        async with db_module.async_session() as revoking_db:
+            share_row = (await revoking_db.execute(
+                select(Share)
+                .where(Share.id == share.json()["id"])
+                .with_for_update()
+            )).scalar_one()
+            share_row.status = "revoked"
+            await revoking_db.flush()
+            request_task = asyncio.create_task(
+                client.get(f"/api/v1/shared-doc/{token}/content")
+            )
+            await asyncio.sleep(0.1)
+            assert request_task.done() is False
+            await revoking_db.commit()
+
+        response = await asyncio.wait_for(request_task, timeout=5)
+        assert response.status_code == 404, response.text
+    finally:
+        settings.MANOR_FS_ROOT = old_root
+        settings.MANOR_FS_ENABLED = old_enabled
+
+
+@pytest.mark.asyncio
+async def test_limited_shared_doc_download_uses_the_counted_view_session(
+    client: AsyncClient,
+    db_session: AsyncSession,
+    tmp_path: Path,
+):
+    """A download-enabled limited share remains usable from its public page."""
+    from packages.core.config import get_settings
+    from packages.core.models.permission import Share
+
+    settings = get_settings()
+    old_root, old_enabled = settings.MANOR_FS_ROOT, settings.MANOR_FS_ENABLED
+    settings.MANOR_FS_ROOT = str(tmp_path)
+    settings.MANOR_FS_ENABLED = True
+    try:
+        headers = await _auth(client, "limiteddownload")
+        doc = await _upload(client, headers, name="report.md", body=b"download content")
+        share = await client.post(
+            f"/api/v1/documents/{doc['id']}/shares",
+            headers=headers,
+            json={
+                "audience_type": "anonymous",
+                "capabilities": ["view", "download"],
+                "allow_download": True,
+            },
+        )
+        assert share.status_code == 201, share.text
+        token = share.json()["token"]
+        share_row = await db_session.get(Share, share.json()["id"])
+        assert share_row is not None
+        share_row.max_uses = 1
+        await db_session.commit()
+
+        blocked = await client.get(f"/api/v1/shared-doc/{token}/download")
+        assert blocked.status_code == 410, blocked.text
+
+        opened = await client.get(f"/api/v1/shared-doc/{token}")
+        assert opened.status_code == 200, opened.text
+        download = await client.get(f"/api/v1/shared-doc/{token}/download")
+        assert download.status_code == 200, download.text
+        assert download.content == b"download content"
+
+        await db_session.refresh(share_row)
+        assert share_row.use_count == 1
+    finally:
+        settings.MANOR_FS_ROOT = old_root
+        settings.MANOR_FS_ENABLED = old_enabled
+
+
+@pytest.mark.asyncio
 async def test_shared_doc_download_404_after_revoke(
     client: AsyncClient,
     tmp_path,
@@ -946,6 +2652,109 @@ async def test_shared_doc_download_404_after_revoke(
         after = await client.get(f"/api/v1/shared-doc/{raw_token}/download")
         assert after.status_code == 404
         assert after.json()["detail"]["code"] == "permissions.error.share.not_found_or_revoked"
+    finally:
+        settings.MANOR_FS_ROOT = old_root
+        settings.MANOR_FS_ENABLED = old_enabled
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("name", "preview_path", "renderer_name"),
+    [
+        ("contract.docx", "pages", "render_document_pages"),
+        ("presentation.pptx", "slides", "render_slides"),
+    ],
+)
+async def test_shared_doc_office_preview_reads_are_token_scoped(
+    client: AsyncClient,
+    db_session: AsyncSession,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    name: str,
+    preview_path: str,
+    renderer_name: str,
+):
+    """A limited share unlocks Office preview resources only after its page opens."""
+    from packages.core.config import get_settings
+    from packages.core.models.permission import Share
+    from packages.core.services import slide_renderer
+
+    settings = get_settings()
+    old_root, old_enabled = settings.MANOR_FS_ROOT, settings.MANOR_FS_ENABLED
+    settings.MANOR_FS_ROOT = str(tmp_path)
+    settings.MANOR_FS_ENABLED = True
+    png = b"\x89PNG\r\n\x1a\n" + b"\x00" * 32
+    version = "0123456789abcdef"
+    cache_file = tmp_path / version / "page-0001.png"
+    cache_file.parent.mkdir(parents=True)
+    cache_file.write_bytes(png)
+
+    render_calls = 0
+
+    async def render_preview(*_args, **_kwargs):
+        nonlocal render_calls
+        render_calls += 1
+        return [str(cache_file)]
+
+    async def open_preview(*_args, **_kwargs):
+        return cache_file.open("rb")
+
+    monkeypatch.setattr(slide_renderer, renderer_name, render_preview)
+    monkeypatch.setattr(
+        slide_renderer,
+        "open_cached_document_page" if preview_path == "pages" else "open_cached_slide",
+        open_preview,
+    )
+    try:
+        headers = await _auth(client, f"shared{preview_path}")
+        doc = await _upload(
+            client,
+            headers,
+            name=name,
+            body=_office_fixture(
+                "word/document.xml" if preview_path == "pages" else "ppt/presentation.xml",
+            ),
+        )
+        share = await client.post(
+            f"/api/v1/documents/{doc['id']}/shares",
+            headers=headers,
+            json={
+                "audience_type": "anonymous",
+                "capabilities": ["view"],
+                "allow_download": False,
+            },
+        )
+        assert share.status_code == 201, share.text
+        token = share.json()["token"]
+        share_row = await db_session.get(Share, share.json()["id"])
+        assert share_row is not None
+        share_row.max_uses = 1
+        await db_session.commit()
+
+        blocked = await client.get(f"/api/v1/shared-doc/{token}/preview/{preview_path}")
+        assert blocked.status_code == 410, blocked.text
+        assert render_calls == 0
+
+        opened = await client.get(f"/api/v1/shared-doc/{token}")
+        assert opened.status_code == 200, opened.text
+        assert "manor_share_view=" in opened.headers.get("set-cookie", "")
+
+        preview = await client.get(f"/api/v1/shared-doc/{token}/preview/{preview_path}")
+        assert preview.status_code == 200, preview.text
+        assert render_calls == 1
+        body = preview.json()
+        item = body[preview_path][0]
+        assert item["index"] == 0
+        assert item["url"] == f"/api/v1/shared-doc/{token}/preview/{preview_path}/0?version={version}"
+        assert doc["id"] not in item["url"]
+        assert doc["entity_id"] not in item["url"]
+        assert str(tmp_path) not in item["url"]
+
+        image = await client.get(item["url"])
+        assert image.status_code == 200, image.text
+        assert image.content == png
+        assert image.headers["content-disposition"].startswith("inline")
+        assert image.headers["cache-control"] == "private, no-store"
     finally:
         settings.MANOR_FS_ROOT = old_root
         settings.MANOR_FS_ENABLED = old_enabled

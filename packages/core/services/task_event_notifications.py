@@ -10,7 +10,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from packages.core.models.staff import Staff
 from packages.core.models.task import Task
 from packages.core.models.user import User, UserMembership
+from packages.core.permissions import resolve_effective_user_role_name
 from packages.core.services.notification_service import create_notification
+from packages.core.services.workspace_access import user_can_read_workspace_id
 
 logger = logging.getLogger(__name__)
 
@@ -111,6 +113,30 @@ async def task_event_recipient_users(
             )
         )).scalars().all())
 
+    workspace_id = str(
+        getattr(task, "workspace_id", None)
+        or event_payload.get("workspace_id")
+        or ""
+    )
+    if workspace_id:
+        readable_users: list[User] = []
+        for user in users:
+            role = await resolve_effective_user_role_name(
+                db,
+                user_id=user.id,
+                entity_id=entity_id,
+                legacy_role=user.role if user.entity_id == entity_id else None,
+            )
+            if await user_can_read_workspace_id(
+                db,
+                workspace_id=workspace_id,
+                entity_id=entity_id,
+                user_id=user.id,
+                role=role,
+            ):
+                readable_users.append(user)
+        users = readable_users
+
     return task, users
 
 
@@ -208,6 +234,9 @@ async def notify_task_event(
         "event_type": event_type,
         **event_payload,
     }
+    if task and task.workspace_id:
+        meta.setdefault("workspace_id", task.workspace_id)
+    source_event_key = event_payload.get("idempotency_key") or event_payload.get("event_id")
     delivered = 0
     for user in users:
         try:
@@ -220,6 +249,12 @@ async def notify_task_event(
                 body=task_event_message(event_type, event_payload, task),
                 link=link,
                 meta=meta,
+                workspace_id=task.workspace_id if task else event_payload.get("workspace_id"),
+                idempotency_key=(
+                    f"task-event:{source_event_key}"
+                    if source_event_key
+                    else None
+                ),
             )
             delivered += 1
         except Exception:

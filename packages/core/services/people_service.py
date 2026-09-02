@@ -20,6 +20,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from packages.core.models.base import generate_ulid
 from packages.core.models.people import Client
 from packages.core.models.staff import Staff, STAFF_KIND_EMPLOYEE
+from packages.core.models.user import User, UserMembership
 from packages.core.services.tool_cache_version import bump_tool_cache_version
 
 
@@ -156,8 +157,83 @@ async def create_staff_member(
     member = Staff(id=generate_ulid(), entity_id=entity_id, meta=meta, **fields)
     db.add(member)
     await db.flush()
+    if member.user_id:
+        await _sync_linked_staff_access(db, member)
+        await db.flush()
     await bump_tool_cache_version(entity_id, "staff")
     return member
+
+
+async def _sync_linked_staff_access(db: AsyncSession, member: Staff) -> None:
+    """Keep a linked login, membership, and Staff authority fail-closed."""
+    if not member.user_id:
+        return
+
+    active_staff_ids = list(
+        (
+            await db.execute(
+                select(Staff.id)
+                .where(
+                    Staff.user_id == member.user_id,
+                    Staff.entity_id == member.entity_id,
+                    Staff.status == "active",
+                    Staff.deleted_at.is_(None),
+                )
+                .limit(2)
+            )
+        ).scalars()
+    )
+    access_enabled = len(active_staff_ids) == 1
+    membership = (
+        await db.execute(
+            select(UserMembership).where(
+                UserMembership.user_id == member.user_id,
+                UserMembership.entity_id == member.entity_id,
+            )
+        )
+    ).scalar_one_or_none()
+    if membership is not None:
+        membership.status = "active" if access_enabled else "inactive"
+        if access_enabled:
+            membership.staff_id = active_staff_ids[0]
+
+    user = await db.get(User, member.user_id)
+    if user is None or user.deleted_at is not None:
+        return
+    if access_enabled:
+        if user.entity_id == member.entity_id:
+            user.status = "active"
+        return
+
+    # Tokens are versioned globally, so this immediately revokes every token
+    # that could still carry the removed entity scope.
+    user.token_version = int(user.token_version or 0) + 1
+    if user.entity_id != member.entity_id:
+        return
+
+    next_membership = (
+        await db.execute(
+            select(UserMembership)
+            .where(
+                UserMembership.user_id == user.id,
+                UserMembership.entity_id != member.entity_id,
+                UserMembership.status == "active",
+                UserMembership.deleted_at.is_(None),
+            )
+            .order_by(
+                UserMembership.is_primary.desc(),
+                UserMembership.created_at.asc(),
+            )
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    if next_membership is None:
+        user.status = "inactive"
+        return
+
+    user.entity_id = next_membership.entity_id
+    user.role = next_membership.role
+    user.status = "active"
 
 
 async def update_staff_member(
@@ -166,6 +242,7 @@ async def update_staff_member(
     member = await get_staff_member(db, staff_id, entity_id)
     if not member:
         return None
+    status_was_provided = "status" in fields
 
     meta_updates = _pop_meta_labels(fields)
     if meta_updates:
@@ -178,6 +255,9 @@ async def update_staff_member(
             setattr(member, k, v)
 
     await db.flush()
+    if status_was_provided:
+        await _sync_linked_staff_access(db, member)
+        await db.flush()
     await db.refresh(member)
     await bump_tool_cache_version(entity_id, "staff")
     return member
@@ -190,6 +270,8 @@ async def delete_staff_member(
     if not member:
         return False
     member.deleted_at = datetime.now(timezone.utc)
+    await db.flush()
+    await _sync_linked_staff_access(db, member)
     await db.flush()
     await bump_tool_cache_version(entity_id, "staff")
     return True

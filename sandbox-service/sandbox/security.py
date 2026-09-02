@@ -37,6 +37,117 @@ SAFE_PASSTHROUGH_KEYS: set[str] = {
     "PYTHONUNBUFFERED", "PIP_NO_CACHE_DIR",
 }
 
+# Sandbox execution events cross the untrusted process/runtime boundary. Keep
+# their secret vocabulary and free-text detection here so both the service and
+# the injected bridge enforce the same contract. ``credential_ref`` is
+# intentionally absent: it is the opaque reference that need_credential
+# responses are allowed to carry.
+EVENT_SENSITIVE_KEYS: frozenset[str] = frozenset(
+    {
+        "api_key",
+        "apikey",
+        "x_api_key",
+        "xapikey",
+        "llm_api_key",
+        "_resolved_api_key",
+        "new_api_key",
+        "access_token",
+        "refresh_token",
+        "id_token",
+        "auth_token",
+        "api_token",
+        "bearer_token",
+        "secret_token",
+        "token",
+        "authorization",
+        "proxy_authorization",
+        "auth_header",
+        "client_secret",
+        "oauth_client_secret",
+        "app_secret",
+        "signing_secret",
+        "webhook_secret",
+        "secret_key",
+        "secret",
+        "private_key",
+        "cookie",
+        "cookies",
+        "set_cookie",
+        "session_cookie",
+        "key_hash",
+        "password",
+        "password_hash",
+        "credential",
+        "credentials",
+        "credential_value",
+        "encrypted_credentials",
+        "encrypted_blob",
+        "totp_secret",
+    }
+)
+
+EVENT_SECRET_TEXT_PATTERNS: tuple[str, ...] = (
+    (
+        r"(?is)-----BEGIN (?:RSA |EC |OPENSSH |ENCRYPTED )?PRIVATE KEY-----.*?"
+        r"-----END (?:RSA |EC |OPENSSH |ENCRYPTED )?PRIVATE KEY-----"
+    ),
+    r"(?i)proxy[-_]authorization\s*[:=]\s*(?:(?:bearer|basic|token)\s+)?[^\s,;]+",
+    r"(?i)authorization\s*[:=]\s*(?:(?:bearer|basic|token)\s+)?[^\s,;]+",
+    r"(?i)x[-_]?api[-_]?key\s*[:=]\s*[^\s,;]+",
+    (
+        r'''(?i)['"]?(?:password|client[-_]?secret|access[-_]?token|'''
+        r'''refresh[-_]?token|id[-_]?token|auth[-_]?token|api[-_]?token)'''
+        r'''['"]?\s*[:=]\s*['"]?[^'"\s,}&;]+'''
+    ),
+    r"(?i)(?:set[-_])?cookie\s*[:=]\s*[^\r\n]+",
+    r"(?i)bearer\s+(?:sk-[A-Za-z0-9._-]{6,}|[A-Za-z0-9._~+/=-]{16,})",
+    r'''(?i)['"]?(?:llm_)?api_key['"]?\s*[:=]\s*['"]?[^'"\s,}&]{6,}''',
+    (
+        r"(?i)(?:^|[?&;,\s])(?:api[-_]?key|access[-_]?token|"
+        r"refresh[-_]?token|token|secret)\s*=\s*[^&#\s,;]+"
+    ),
+    r"\bsk-(?:or|ant|proj|live|test)?-?[A-Za-z0-9._-]{8,}\b",
+    r"\bark-[A-Za-z0-9._-]{8,}\b",
+)
+
+_EVENT_SECRET_TEXT_REGEXES = tuple(
+    re.compile(pattern) for pattern in EVENT_SECRET_TEXT_PATTERNS
+)
+
+
+def normalize_event_key(key: object) -> str:
+    """Normalize common JSON key spellings without broad substring matching."""
+
+    value = str(key or "").strip().replace("-", "_")
+    value = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", value)
+    return value.casefold()
+
+
+def contains_sensitive_event_key(value: object) -> bool:
+    """Return true when a nested event payload contains a secret-shaped key."""
+
+    if isinstance(value, dict):
+        return any(
+            normalize_event_key(key) in EVENT_SENSITIVE_KEYS
+            or contains_sensitive_event_key(item)
+            for key, item in value.items()
+        )
+    if isinstance(value, list):
+        return any(contains_sensitive_event_key(item) for item in value)
+    return False
+
+
+def contains_sensitive_event_text(value: object) -> bool:
+    """Detect common plaintext-secret shapes in nested event text values."""
+
+    if isinstance(value, str):
+        return any(pattern.search(value) for pattern in _EVENT_SECRET_TEXT_REGEXES)
+    if isinstance(value, dict):
+        return any(contains_sensitive_event_text(item) for item in value.values())
+    if isinstance(value, list):
+        return any(contains_sensitive_event_text(item) for item in value)
+    return False
+
 # ── Blocked host paths ──
 
 BLOCKED_HOST_PATHS: list[str] = [

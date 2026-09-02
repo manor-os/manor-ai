@@ -1,5 +1,7 @@
 """site_publisher — publish target resolution, snapshot validation, link check."""
+import asyncio
 import os
+from types import SimpleNamespace
 
 import pytest
 
@@ -276,6 +278,130 @@ class TestPublish:
         revs = sorted(p.name for p in site_dir.iterdir())
         assert revs == ["rev2", "rev3", "rev4"]  # keep last 3
         assert r.site.id == r1.site.id  # same source -> same site row
+
+    async def test_concurrent_prepared_publishes_allocate_distinct_revisions(
+        self,
+        db_session,
+        entity_fs,
+    ):
+        from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+        root, eid = entity_fs
+        source = _mk(root, "s/index.html", b"<html>first</html>")
+        target = sp.resolve_publish_target(eid, "s")
+        assert target is not None
+        first = sp.prepare_publication(eid, target)
+        source.write_bytes(b"<html>second</html>")
+        second = sp.prepare_publication(eid, target)
+        session_factory = async_sessionmaker(
+            db_session.bind,
+            class_=AsyncSession,
+            expire_on_commit=False,
+        )
+
+        async def publish_prepared(prepared):
+            async with session_factory() as session:
+                return await sp.publish(
+                    session,
+                    entity_id=eid,
+                    rel_path="s",
+                    name="Concurrent",
+                    prepared=prepared,
+                )
+
+        results = await asyncio.gather(
+            publish_prepared(first),
+            publish_prepared(second),
+        )
+        assert sorted(result.site.revision for result in results) == [1, 2]
+        assert len({result.site.id for result in results}) == 1
+        site_id = results[0].site.id
+        published_contents = {
+            (root / ".sites" / site_id / "rev1" / "index.html").read_bytes(),
+            (root / ".sites" / site_id / "rev2" / "index.html").read_bytes(),
+        }
+        assert published_contents == {b"<html>first</html>", b"<html>second</html>"}
+
+    async def test_concurrent_first_publish_rechecks_management_after_lock(
+        self,
+        db_session,
+        entity_fs,
+        monkeypatch,
+    ):
+        from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+        from packages.core.services import site_access
+        from packages.core.services.site_access import SitePublishAccessDenied
+
+        root, eid = entity_fs
+        _mk(root, "s/index.html", b"<html>site</html>")
+        target = sp.resolve_publish_target(eid, "s")
+        assert target is not None
+        session_factory = async_sessionmaker(
+            db_session.bind,
+            class_=AsyncSession,
+            expire_on_commit=False,
+        )
+        actors = [
+            SimpleNamespace(id="publisher-a", entity_id=eid, role="member"),
+            SimpleNamespace(id="publisher-b", entity_id=eid, role="member"),
+        ]
+
+        async def creator_only(_db, *, user, site):
+            return site.created_by_user_id == user.id
+
+        monkeypatch.setattr(site_access, "user_can_manage_site", creator_only)
+
+        async def publish_as(actor):
+            prepared = sp.prepare_publication(eid, target)
+            async with session_factory() as session:
+                return await sp.publish(
+                    session,
+                    entity_id=eid,
+                    rel_path="s",
+                    name="Concurrent owner",
+                    created_by_user_id=actor.id,
+                    manage_as_user=actor,
+                    prepared=prepared,
+                )
+
+        results = await asyncio.gather(
+            *(publish_as(actor) for actor in actors),
+            return_exceptions=True,
+        )
+        successes = [result for result in results if isinstance(result, sp.PublishResult)]
+        denials = [result for result in results if isinstance(result, SitePublishAccessDenied)]
+        assert len(successes) == 1
+        assert len(denials) == 1
+        assert successes[0].site.created_by_user_id in {actor.id for actor in actors}
+        assert successes[0].site.revision == 1
+
+    async def test_workspace_change_without_new_connections_clears_old_connections(
+        self,
+        db_session,
+        entity_fs,
+    ):
+        root, eid = entity_fs
+        _mk(root, "s/index.html", b"<html>site</html>")
+        first = await sp.publish(
+            db_session,
+            entity_id=eid,
+            rel_path="s",
+            name="Workspace site",
+            workspace_id="workspace-a",
+            connections={"customer_service_channel_config_id": "channel-a"},
+        )
+        assert first.site.connections == {"customer_service_channel_config_id": "channel-a"}
+
+        second = await sp.publish(
+            db_session,
+            entity_id=eid,
+            rel_path="s",
+            name="Workspace site",
+            workspace_id="workspace-b",
+        )
+        assert second.site.workspace_id == "workspace-b"
+        assert second.site.connections == {}
 
     async def test_broken_links_block_publish(self, db_session, entity_fs):
         root, eid = entity_fs

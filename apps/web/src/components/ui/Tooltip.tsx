@@ -5,6 +5,8 @@ interface TooltipProps {
   children: React.ReactNode;
   position?: "top" | "bottom" | "left" | "right";
   className?: string;
+  hideOnClick?: boolean;
+  suppressWhenExpanded?: boolean;
 }
 
 const positionStyles: Record<string, React.CSSProperties> = {
@@ -33,11 +35,25 @@ const arrowStyles: Record<string, React.CSSProperties> = {
   },
 };
 
-export default function Tooltip({ content, children, position = "top", className = "" }: TooltipProps) {
+export default function Tooltip({
+  content,
+  children,
+  position = "top",
+  className = "",
+  hideOnClick = false,
+  suppressWhenExpanded = false,
+}: TooltipProps) {
   const [visible, setVisible] = useState(false);
   const timerRef = useRef<ReturnType<typeof setTimeout>>();
+  const wrapperRef = useRef<HTMLDivElement>(null);
+
+  function expanded() {
+    return suppressWhenExpanded
+      && Boolean(wrapperRef.current?.querySelector('[aria-expanded="true"]'));
+  }
 
   function show() {
+    if (expanded()) return;
     timerRef.current = setTimeout(() => setVisible(true), 300);
   }
 
@@ -47,18 +63,21 @@ export default function Tooltip({ content, children, position = "top", className
   }
 
   function showImmediately() {
+    if (expanded()) return;
     clearTimeout(timerRef.current);
     setVisible(true);
   }
 
   return (
     <div
+      ref={wrapperRef}
       className={className}
       style={{ position: "relative", display: "inline-flex" }}
       onMouseEnter={show}
       onMouseLeave={hide}
       onFocusCapture={showImmediately}
       onBlurCapture={hide}
+      onClickCapture={hideOnClick ? hide : undefined}
     >
       {children}
 

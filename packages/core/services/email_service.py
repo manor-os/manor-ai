@@ -1,8 +1,7 @@
 """Email service — send transactional emails via SMTP with HTML templates.
 
-Templates are ported from the original Manor AI Java backend
-(manor-system/src/main/resources/messageTemplate/) and use the same
-design system: Plus Jakarta Sans, teal #0D9488 accent, dark #0F172A.
+Templates use a deterministic, email-client-safe Manor design system with
+warm neutrals, a muted teal accent, and web-safe font fallbacks.
 
 Configuration (env vars):
   SMTP_HOST        — SMTP server hostname (default: smtp.gmail.com)
@@ -29,10 +28,7 @@ from html import escape
 from pathlib import Path
 from typing import Optional, Union
 
-try:
-    import aiosmtplib
-except ImportError:
-    aiosmtplib = None  # type: ignore[assignment]
+from packages.core.services import smtp_transport
 
 logger = logging.getLogger(__name__)
 
@@ -44,7 +40,9 @@ def _get_smtp_config() -> dict:
     return {
         "hostname": os.getenv("SMTP_HOST", "smtp.gmail.com"),
         "port": int(os.getenv("SMTP_PORT", "587")),
-        "username": os.getenv("SMTP_USER", ""),
+        # SMTP_USERNAME was used by early DOKS runtime files. Keep it as a
+        # fallback while standardizing new configuration on SMTP_USER.
+        "username": os.getenv("SMTP_USER") or os.getenv("SMTP_USERNAME", ""),
         "password": os.getenv("SMTP_PASSWORD", ""),
         "use_starttls": os.getenv("SMTP_STARTTLS", "true").lower() == "true",
         "use_ssl": os.getenv("SMTP_SSL", "false").lower() == "true",
@@ -116,6 +114,7 @@ async def _deliver_email(
     html_body: str,
     text_body: Optional[str],
     config: dict,
+    headers: Optional[dict[str, str]] = None,
 ) -> tuple[bool, Optional[str]]:
     """Deliver to exactly ONE recipient. Returns ``(ok, error)``.
 
@@ -130,32 +129,37 @@ async def _deliver_email(
 
     # Block sending to test/throwaway domains
     domain = to.rsplit("@", 1)[-1].lower() if "@" in to else ""
-    if domain in _BLOCKED_DOMAINS and not os.getenv("PYTEST_CURRENT_TEST"):
+    if (
+        domain in _BLOCKED_DOMAINS or domain.endswith(".local")
+    ) and not os.getenv("PYTEST_CURRENT_TEST"):
         logger.info("Blocked email to test domain %s: %s", to, subject)
         return True, None  # pretend success
-
-    if aiosmtplib is None:
-        logger.warning("aiosmtplib not installed — cannot send email to %s", to)
-        return False, "aiosmtplib not installed"
 
     msg = MIMEMultipart("alternative")
     msg["Subject"] = _encode_header_text(subject)
     msg["From"] = _format_from(config["from_name"], config["from_email"])
     msg["To"] = to
+    for key, value in (headers or {}).items():
+        if "\r" in key or "\n" in key or "\r" in value or "\n" in value:
+            continue
+        if key.lower() in {"subject", "from", "to", "content-type", "mime-version"}:
+            continue
+        msg[key] = value
 
     if text_body:
         msg.attach(MIMEText(text_body, "plain"))
     msg.attach(MIMEText(html_body, "html"))
 
     try:
-        await aiosmtplib.send(
-            msg,
-            hostname=config["hostname"],
+        await smtp_transport.send_message_async(
+            message=msg,
+            host=config["hostname"],
             port=config["port"],
             username=config["username"] or None,
             password=config["password"] or None,
-            start_tls=config["use_starttls"],
-            use_tls=config["use_ssl"],
+            use_starttls=config["use_starttls"],
+            use_ssl=config["use_ssl"],
+            timeout=20,
         )
         logger.info("Email sent to %s: %s", to, subject)
         return True, None
@@ -164,12 +168,26 @@ async def _deliver_email(
         return False, str(e)
 
 
-async def send_email(to: str, subject: str, html_body: str, text_body: str = None) -> bool:
+def is_email_delivery_enabled() -> bool:
+    """Return whether this deployment is configured for real SMTP delivery."""
+    return bool(_get_smtp_config()["enabled"])
+
+
+async def send_email(
+    to: str,
+    subject: str,
+    html_body: str,
+    text_body: str = None,
+    *,
+    headers: Optional[dict[str, str]] = None,
+) -> bool:
     """Send an email to a single recipient. Returns True on success, False on
     failure (never raises). For multiple recipients use ``send_bulk_email``,
     which fans out one clean single-recipient message per address."""
     config = _get_smtp_config()
-    ok, _error = await _deliver_email(to, subject, html_body, text_body, config)
+    ok, _error = await _deliver_email(
+        to, subject, html_body, text_body, config, headers,
+    )
     return ok
 
 
@@ -238,6 +256,13 @@ async def send_verification_email(to: str, code: str) -> bool:
     return await send_email(to, subject, html)
 
 
+async def send_share_verification_email(to: str, code: str) -> bool:
+    """Send the one-time code used to open an audience-restricted share."""
+    subject = "Verify your email to open a Manor share"
+    html = _render("verification", code=code)
+    return await send_email(to, subject, html)
+
+
 async def send_welcome_email(to: str, display_name: str) -> bool:
     """Send a welcome email after successful registration/verification."""
     subject = "Welcome to Manor AI!"
@@ -259,6 +284,72 @@ _SEVERITY_STYLES = {
     "warning":  {"label": "Heads up",      "color": "#B45309", "bg": "#FEF3C7"},
     "critical": {"label": "Action required","color": "#B91C1C", "bg": "#FEE2E2"},
 }
+
+SUPPORTED_ANNOUNCEMENT_EMAIL_LOCALES = frozenset({"en", "zh", "es", "fr", "de"})
+
+_ANNOUNCEMENT_EMAIL_COPY: dict[str, dict[str, str]] = {
+    "en": {
+        "announcement": "Announcement",
+        "warning": "Heads up",
+        "critical": "Action required",
+        "greeting_named": "Hello {name},",
+        "greeting_generic": "Hello,",
+        "view_details": "View details",
+        "tagline": "Empowering Progress, Simplifying Success",
+        "customer_note": "You're receiving this because you're a Manor AI customer.",
+        "rights": "All rights reserved",
+    },
+    "zh": {
+        "announcement": "公告",
+        "warning": "温馨提示",
+        "critical": "需要采取行动",
+        "greeting_named": "{name}，您好：",
+        "greeting_generic": "您好：",
+        "view_details": "查看详情",
+        "tagline": "让进步更简单",
+        "customer_note": "您收到此邮件是因为您是 Manor AI 客户。",
+        "rights": "版权所有",
+    },
+    "es": {
+        "announcement": "Anuncio",
+        "warning": "Aviso",
+        "critical": "Acción requerida",
+        "greeting_named": "Hola {name},",
+        "greeting_generic": "Hola,",
+        "view_details": "Ver detalles",
+        "tagline": "Impulsamos el progreso, simplificamos el éxito",
+        "customer_note": "Recibes este correo porque eres cliente de Manor AI.",
+        "rights": "Todos los derechos reservados",
+    },
+    "fr": {
+        "announcement": "Annonce",
+        "warning": "À noter",
+        "critical": "Action requise",
+        "greeting_named": "Bonjour {name},",
+        "greeting_generic": "Bonjour,",
+        "view_details": "Voir les détails",
+        "tagline": "Faire progresser, simplifier la réussite",
+        "customer_note": "Vous recevez cet e-mail parce que vous êtes client de Manor AI.",
+        "rights": "Tous droits réservés",
+    },
+    "de": {
+        "announcement": "Ankündigung",
+        "warning": "Hinweis",
+        "critical": "Aktion erforderlich",
+        "greeting_named": "Hallo {name},",
+        "greeting_generic": "Hallo,",
+        "view_details": "Details ansehen",
+        "tagline": "Fortschritt ermöglichen, Erfolg vereinfachen",
+        "customer_note": "Sie erhalten diese E-Mail, weil Sie Manor AI-Kunde sind.",
+        "rights": "Alle Rechte vorbehalten",
+    },
+}
+
+
+def normalize_announcement_email_locale(locale: Optional[str]) -> str:
+    """Return a supported base locale, falling back to English."""
+    candidate = (locale or "en").strip().lower().replace("_", "-").split("-", 1)[0]
+    return candidate if candidate in SUPPORTED_ANNOUNCEMENT_EMAIL_LOCALES else "en"
 
 
 def _render_announcement_body_html(body_md: str) -> str:
@@ -439,28 +530,51 @@ def render_announcement_email_html(
     display_name: Optional[str] = None,
     cta_url: Optional[str] = None,
     cta_label: Optional[str] = None,
+    locale: str = "en",
 ) -> str:
     """Render the full announcement email HTML (for preview + send)."""
+    email_locale = normalize_announcement_email_locale(locale)
+    copy = _ANNOUNCEMENT_EMAIL_COPY[email_locale]
     style = _SEVERITY_STYLES.get(severity, _SEVERITY_STYLES["info"])
+    severity_label = copy.get(severity, copy["announcement"])
     body_html = _render_announcement_body_html(body_md)
     cta_block = ""
     if cta_url:
-        label = (cta_label or "View details").strip() or "View details"
+        label = (cta_label or copy["view_details"]).strip() or copy["view_details"]
         cta_block = (
-            f'<section class="cta-section"><div class="section-content">'
-            f'<a href="{html.escape(cta_url, quote=True)}" class="btn-primary" '
-            f'style="color: #ffffff !important;">{html.escape(label)}</a>'
-            f"</div></section>"
+            '<tr><td class="content-pad" align="center" style="padding:28px 40px;'
+            'background-color:#f2f6f5;border-top:1px solid #e8e5df;'
+            'border-bottom:1px solid #e8e5df;text-align:center;">'
+            f'<a href="{html.escape(cta_url, quote=True)}" class="cta-link" '
+            'style="display:inline-block;padding:13px 28px;border-radius:999px;'
+            'background-color:#436b65;color:#ffffff !important;font-family:'
+            'Arial,Helvetica,sans-serif;font-size:14px;font-weight:700;'
+            f'text-decoration:none;">{html.escape(label)}</a>'
+            "</td></tr>"
         )
+    preheader_block = ""
+    unsubscribe_block = ""
+    footer_note = copy["customer_note"]
+    safe_display_name = html.escape((display_name or "").strip())
+    greeting = (
+        copy["greeting_named"].format(name=safe_display_name)
+        if safe_display_name else copy["greeting_generic"]
+    )
     return _render(
         "announcement",
+        email_locale=email_locale,
         title=html.escape(title or ""),
         body_html=body_html,
-        severity_label=style["label"],
+        severity_label=severity_label,
         severity_color=style["color"],
         severity_bg=style["bg"],
-        display_name=html.escape(display_name or "there"),
+        greeting=greeting,
         cta_block=cta_block,
+        preheader_block=preheader_block,
+        footer_title=copy["tagline"],
+        footer_note=footer_note,
+        unsubscribe_block=unsubscribe_block,
+        rights_reserved=copy["rights"],
     )
 
 
@@ -473,14 +587,18 @@ async def send_announcement_email(
     display_name: Optional[str] = None,
     cta_url: Optional[str] = None,
     cta_label: Optional[str] = None,
+    locale: str = "en",
 ) -> bool:
     """Send a platform announcement to one recipient."""
-    subject = f"[Manor AI] {title}".strip()
+    resolved_subject = f"[Manor AI] {title}"
+    resolved_subject = " ".join(resolved_subject.splitlines()).strip()
     html_body = render_announcement_email_html(
         title=title, body_md=body_md, severity=severity,
         display_name=display_name, cta_url=cta_url, cta_label=cta_label,
+        locale=locale,
     )
-    return await send_email(to, subject, html_body)
+    headers = None
+    return await send_email(to, resolved_subject, html_body, headers=headers)
 
 
 async def send_password_reset_email(to: str, reset_token: str, reset_url: str = None) -> bool:

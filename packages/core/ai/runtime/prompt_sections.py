@@ -117,9 +117,9 @@ DEFAULT_RUNTIME_PROMPT_SECTIONS: tuple[RuntimePromptSectionSpec, ...] = (
     ),
     RuntimePromptSectionSpec(
         "artifact_reference_guidance",
-        ("full",),
+        ("full", "minimal"),
         "tools",
-        "A produced file must be cited by the address the tool returned.",
+        "Knowledge files must use canonical clickable viewer links.",
     ),
     RuntimePromptSectionSpec(
         "file_approval_guidance",
@@ -441,11 +441,23 @@ async def available_skills_section(ctx: Any) -> str | None:
             )
         elif getattr(ctx, "agent_id", None):
             from packages.core.services.skill_service import list_skills_for_agent
+            envelope = getattr(ctx, "runtime_envelope", None)
+            envelope_metadata = getattr(envelope, "metadata", None)
+            subscription_id = (
+                envelope_metadata.get("agent_subscription_id")
+                if isinstance(envelope_metadata, dict)
+                else None
+            )
             skills = await list_skills_for_agent(
                 db,
                 entity_id,
                 ctx.agent_id,
                 workspace_id=getattr(ctx, "workspace_id", None),
+                **(
+                    {"agent_subscription_id": subscription_id}
+                    if subscription_id
+                    else {}
+                ),
             )
         else:
             from packages.core.services.skill_service import list_skills
@@ -457,6 +469,10 @@ async def available_skills_section(ctx: Any) -> str | None:
             manual_skill_selected=bool(getattr(ctx, "manual_skill_selected", False)),
             loaded_tool_names=loaded_tool_names,
             available_tool_names=visible_tool_names,
+            # Runtime descriptors use deferred discovery for ordinary Skills.
+            # The DB-backed fallback is the legacy prompt catalog and must
+            # still render its intent-filtered ordinary entries.
+            include_ordinary=not bool(runtime_skill_descriptors),
         )
     except Exception:
         logger.debug("Failed to load skills for prompt", exc_info=True)

@@ -87,16 +87,13 @@ def _memory_increment(key: str, *, limit: int, window: int) -> AuthRateLimitDeci
 
 async def _redis_increment(key: str, *, limit: int, window: int) -> AuthRateLimitDecision | None:
     try:
-        from packages.core.cache import _get_redis
+        from packages.core.cache import _get_redis, redis_increment_with_ttl
 
         client = await _get_redis()
         if client is None:
             return None
         redis_key = f"auth:fail:{key}"
-        count = int(await client.incr(redis_key))
-        if count == 1:
-            await client.expire(redis_key, window)
-        ttl = int(await client.ttl(redis_key))
+        count, ttl = await redis_increment_with_ttl(client, redis_key, window)
         if count > limit:
             return AuthRateLimitDecision(False, ttl if ttl > 0 else window)
         return AuthRateLimitDecision(True)
@@ -107,15 +104,14 @@ async def _redis_increment(key: str, *, limit: int, window: int) -> AuthRateLimi
 
 async def _redis_check(key: str, *, limit: int, window: int) -> AuthRateLimitDecision | None:
     try:
-        from packages.core.cache import _get_redis
+        from packages.core.cache import _get_redis, redis_counter_value_with_ttl
 
         client = await _get_redis()
         if client is None:
             return None
         redis_key = f"auth:fail:{key}"
-        count = int(await client.get(redis_key) or 0)
+        count, ttl = await redis_counter_value_with_ttl(client, redis_key, window)
         if count >= limit:
-            ttl = int(await client.ttl(redis_key))
             return AuthRateLimitDecision(False, ttl if ttl > 0 else window)
         return AuthRateLimitDecision(True)
     except Exception:

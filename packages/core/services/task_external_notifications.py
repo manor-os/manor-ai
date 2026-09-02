@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -17,6 +17,7 @@ from packages.core.models.channel import ChannelConfig
 from packages.core.models.task import Task
 from packages.core.models.user import Entity
 from packages.core.models.workspace import Workspace
+from packages.core.services.channel_credentials import lease_channel_config_credentials
 
 logger = logging.getLogger(__name__)
 
@@ -89,6 +90,9 @@ async def deliver_task_external_notifications(
     entity_id: str,
     event_type: str,
     payload: dict[str, Any] | None = None,
+    *,
+    completed_sinks: dict[str, Any] | None = None,
+    mark_sink_completed: Callable[[str], Awaitable[None]] | None = None,
 ) -> dict[str, int]:
     """Deliver configured post-commit task notifications."""
     if not event_type.startswith("task."):
@@ -102,6 +106,8 @@ async def deliver_task_external_notifications(
             entity_id,
             event_type,
             payload or {},
+            completed_sinks=completed_sinks,
+            mark_sink_completed=mark_sink_completed,
         )
 
 
@@ -110,6 +116,9 @@ async def deliver_task_external_notifications_in_session(
     entity_id: str,
     event_type: str,
     payload: dict[str, Any],
+    *,
+    completed_sinks: dict[str, Any] | None = None,
+    mark_sink_completed: Callable[[str], Awaitable[None]] | None = None,
 ) -> dict[str, int]:
     entity = (await db.execute(
         select(Entity).where(Entity.id == entity_id)
@@ -127,8 +136,17 @@ async def deliver_task_external_notifications_in_session(
         return {"email": 0, "external_chat": 0}
 
     counts = {"email": 0, "external_chat": 0}
+    completed = completed_sinks if isinstance(completed_sinks, dict) else {}
     if task_event_external_channel_enabled(policy, "email", event_type):
-        counts["email"] = await _deliver_email(db, entity_id, event_type, payload, task)
+        counts["email"] = await _deliver_email(
+            db,
+            entity_id,
+            event_type,
+            payload,
+            task,
+            completed_sinks=completed,
+            mark_sink_completed=mark_sink_completed,
+        )
     if task_event_external_channel_enabled(policy, "external_chat", event_type):
         counts["external_chat"] = await _deliver_external_chat(
             db,
@@ -137,6 +155,8 @@ async def deliver_task_external_notifications_in_session(
             payload,
             task,
             _as_dict(policy.get("external_chat")),
+            completed_sinks=completed,
+            mark_sink_completed=mark_sink_completed,
         )
     return counts
 
@@ -167,6 +187,9 @@ async def _deliver_email(
     event_type: str,
     payload: dict[str, Any],
     task: Task | None,
+    *,
+    completed_sinks: dict[str, Any] | None = None,
+    mark_sink_completed: Callable[[str], Awaitable[None]] | None = None,
 ) -> int:
     from packages.core.services.email_service import send_notification_email
     from packages.core.services.task_event_notifications import (
@@ -180,17 +203,33 @@ async def _deliver_email(
     title = task_event_title(event_type)
 
     delivered = 0
+    failures = 0
+    completed = completed_sinks if isinstance(completed_sinks, dict) else {}
     seen: set[str] = set()
     for user in users:
         email = (user.email or "").strip()
         if not email or email.lower() in seen:
             continue
-        seen.add(email.lower())
+        normalized_email = email.lower()
+        seen.add(normalized_email)
+        sink_key = f"task_external.email:{normalized_email}"
+        if completed.get(sink_key) is True:
+            continue
         try:
             if await send_notification_email(email, title, message):
                 delivered += 1
+                if mark_sink_completed is not None:
+                    await mark_sink_completed(sink_key)
+                completed[sink_key] = True
+            else:
+                failures += 1
         except Exception:
+            failures += 1
             logger.debug("task external email failed for user=%s", user.id, exc_info=True)
+    if failures:
+        raise RuntimeError(
+            f"task external email failed for {failures} recipient(s)"
+        )
     return delivered
 
 
@@ -201,6 +240,9 @@ async def _deliver_external_chat(
     payload: dict[str, Any],
     task: Task | None,
     policy: dict[str, Any],
+    *,
+    completed_sinks: dict[str, Any] | None = None,
+    mark_sink_completed: Callable[[str], Awaitable[None]] | None = None,
 ) -> int:
     from packages.core.services.task_event_notifications import (
         task_event_message,
@@ -209,39 +251,56 @@ async def _deliver_external_chat(
 
     channel_types = _as_str_list(policy.get("channel_types")) or ["slack"]
     channel_ids = set(_as_str_list(policy.get("channel_config_ids")))
+    # A task policy must name its intended connection. Falling back to every
+    # active Entity channel would cross the user-owned integration boundary.
+    if not channel_ids:
+        raise RuntimeError(
+            "task external chat target missing: channel_config_ids is required"
+        )
     query = select(ChannelConfig).where(
         ChannelConfig.entity_id == entity_id,
         ChannelConfig.status == "active",
         ChannelConfig.channel_type.in_(channel_types),
+        ChannelConfig.id.in_(channel_ids),
     )
-    if channel_ids:
-        query = query.where(ChannelConfig.id.in_(channel_ids))
-    elif task and task.workspace_id:
-        query = query.where(
-            (ChannelConfig.workspace_id == task.workspace_id)
-            | (ChannelConfig.workspace_id.is_(None))
-        )
 
     configs = list((await db.execute(query.order_by(ChannelConfig.workspace_id.desc().nullslast()))).scalars().all())
     if not configs:
-        return 0
+        raise RuntimeError(
+            "task external chat target missing: no active channel config found"
+        )
 
     title = task_event_title(event_type)
     body = task_event_message(event_type, payload, task)
     text = f"*{title}*\n{body}"
 
     delivered = 0
+    failures = 0
+    completed = completed_sinks if isinstance(completed_sinks, dict) else {}
     for config in configs:
+        sink_key = f"task_external.external_chat:{config.id}"
+        if completed.get(sink_key) is True:
+            continue
         try:
             sent = await _send_channel_message(config, text, policy)
             if sent:
                 delivered += 1
+                if mark_sink_completed is not None:
+                    await mark_sink_completed(sink_key)
+                completed[sink_key] = True
+            else:
+                failures += 1
         except Exception:
+            failures += 1
             logger.debug(
                 "task external chat failed for channel_config=%s",
                 config.id,
                 exc_info=True,
             )
+    if failures:
+        raise RuntimeError(
+            f"task external chat failed for {failures} channel(s)"
+        )
     return delivered
 
 
@@ -250,7 +309,7 @@ async def _send_channel_message(
     text: str,
     policy: dict[str, Any],
 ) -> bool:
-    creds = _channel_credentials(config)
+    creds = await _channel_credentials(config)
     if config.channel_type == "slack":
         webhook_url = (
             str(policy.get("webhook_url") or "").strip()
@@ -277,18 +336,15 @@ async def _send_channel_message(
     return True
 
 
-def _channel_credentials(config: ChannelConfig) -> dict[str, Any]:
+async def _channel_credentials(config: ChannelConfig) -> dict[str, Any]:
     try:
-        from packages.core.credentials import Requester, get_credential_service
-
-        return get_credential_service().lease_channel_config(
+        return await lease_channel_config_credentials(
             config,
-            requester=Requester(kind="system", id="task_external_notification"),
             reason="task_event.external_notification",
         )
     except Exception:
         logger.debug("task external notification credential lease failed", exc_info=True)
-        return dict(config.credentials or {})
+        return {}
 
 
 def _channel_target(

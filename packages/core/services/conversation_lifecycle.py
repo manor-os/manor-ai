@@ -1,13 +1,24 @@
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
-from sqlalchemy import delete, select
+from sqlalchemy import delete, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from packages.core.constants.agents import is_master_agent
+from packages.core.constants.conversation import ConversationSurfaceKind
+from packages.core.models.runtime_run import RuntimeRun, RuntimeRunStatus
 from packages.core.models.base import generate_ulid
 from packages.core.models.task import Conversation, Message
 from packages.core.services.conversation_records import get_conversation
+from packages.core.services.conversation_surfaces import (
+    AiEditTargetIdentity,
+    ConversationSurfaceMetadataFactory,
+)
+from packages.core.services.reusable_resource_locks import (
+    lock_reusable_resource_references,
+)
 
 
 async def ensure_active_workspace(
@@ -65,22 +76,51 @@ async def get_or_create_conversation(
     thread_ref_kind: str | None = None,
     thread_ref_id: str | None = None,
     title: str | None = None,
+    conversation_surface: ConversationSurfaceKind | None = None,
+    ai_edit_target: AiEditTargetIdentity | None = None,
 ) -> Conversation:
     await ensure_active_workspace(
         db,
         entity_id=entity_id,
         workspace_id=workspace_id,
     )
+    if (
+        conversation_surface is ConversationSurfaceKind.AI_EDIT
+        and ai_edit_target is None
+    ):
+        raise ValueError("AI Edit requires a target")
 
     if conversation_id:
+        conversation_query = select(Conversation).where(
+            Conversation.id == conversation_id,
+            Conversation.entity_id == entity_id,
+        )
+        if conversation_surface is ConversationSurfaceKind.AI_EDIT:
+            # Serialize a resumed editor turn with the TTL cleanup sweep and
+            # with any concurrent turn that targets the same editing session.
+            conversation_query = conversation_query.with_for_update()
         result = await db.execute(
-            select(Conversation).where(
-                Conversation.id == conversation_id,
-                Conversation.entity_id == entity_id,
-            )
+            conversation_query
         )
         conv = result.scalar_one_or_none()
         if conv:
+            if (
+                conversation_surface is not None
+                and not ConversationSurfaceMetadataFactory.matches(
+                    conv.meta,
+                    conversation_surface,
+                )
+            ):
+                raise PermissionError("Conversation not found")
+            if (
+                conversation_surface is ConversationSurfaceKind.AI_EDIT
+                and ai_edit_target is not None
+                and not ConversationSurfaceMetadataFactory.matches_ai_edit_target(
+                    conv.meta,
+                    ai_edit_target,
+                )
+            ):
+                raise PermissionError("Conversation not found")
             if not conversation_matches_workspace_request(
                 conv,
                 workspace_id=workspace_id,
@@ -90,13 +130,29 @@ async def get_or_create_conversation(
                 raise PermissionError("Conversation not found")
             if conv.workspace_id is None and conv.user_id != user_id:
                 raise PermissionError("Conversation not found")
+            if conv.workspace_id and conv.thread_ref_kind == "task":
+                from packages.core.services.task_session import (
+                    bind_task_session_conversation,
+                )
+
+                await bind_task_session_conversation(db, conv)
+            if conversation_surface is not None:
+                # Reassigning the canonical metadata also refreshes updated_at,
+                # which is the inactivity clock for temporary AI Edit sessions.
+                conv.meta = ConversationSurfaceMetadataFactory.build(
+                    conversation_surface,
+                    current=conv.meta,
+                    ai_edit_target=ai_edit_target,
+                )
+                if conversation_surface is ConversationSurfaceKind.AI_EDIT:
+                    conv.updated_at = datetime.now(timezone.utc)
             return conv
         raise LookupError("Conversation not found")
 
     if workspace_id and thread_ref_kind and thread_ref_id and not conversation_id:
         from packages.core.workspace_chat.service import spawn_thread
 
-        return await spawn_thread(
+        conv = await spawn_thread(
             db,
             entity_id=entity_id,
             workspace_id=workspace_id,
@@ -104,6 +160,13 @@ async def get_or_create_conversation(
             thread_ref_id=thread_ref_id,
             title=title,
         )
+        if thread_ref_kind == "task":
+            from packages.core.services.task_session import (
+                bind_task_session_conversation,
+            )
+
+            await bind_task_session_conversation(db, conv)
+        return conv
 
     if workspace_id and not conversation_id:
         from packages.core.workspace_chat.service import ensure_main_conversation
@@ -114,6 +177,20 @@ async def get_or_create_conversation(
             workspace_id=workspace_id,
         )
 
+    if agent_id and not is_master_agent(agent_id):
+        await lock_reusable_resource_references(
+            db,
+            entity_id=entity_id,
+            agent_ids=(agent_id,),
+        )
+
+    conversation_metadata = {}
+    if conversation_surface is not None:
+        conversation_metadata = ConversationSurfaceMetadataFactory.build(
+            conversation_surface,
+            ai_edit_target=ai_edit_target,
+        )
+
     conv = Conversation(
         id=conversation_id or generate_ulid(),
         entity_id=entity_id,
@@ -121,6 +198,7 @@ async def get_or_create_conversation(
         agent_id=agent_id,
         workspace_id=workspace_id,
         title=title,
+        meta=conversation_metadata,
     )
     db.add(conv)
     await db.flush()
@@ -147,14 +225,76 @@ async def delete_conversation(
     db: AsyncSession,
     conversation_id: str,
     entity_id: str,
+    *,
+    cancelled_runtime_runs: list[RuntimeRun] | None = None,
 ) -> bool:
-    conv = await get_conversation(db, conversation_id, entity_id)
+    # Serialize deletion with resumed AI Edit turns. Once this lock is held,
+    # no concurrent turn can create a new RuntimeRun after the cancellation
+    # snapshot and leave an orphan execution behind.
+    conv = (await db.execute(
+        select(Conversation).where(
+            Conversation.id == conversation_id,
+            Conversation.entity_id == entity_id,
+        ).with_for_update()
+    )).scalar_one_or_none()
     if not conv:
         return False
+    is_ai_edit = ConversationSurfaceMetadataFactory.matches(
+        conv.meta,
+        ConversationSurfaceKind.AI_EDIT,
+    )
+
+    # Runtime cancellation owns the canonical reservation -> run lock order.
+    # Read identities here without pre-locking RuntimeRun rows so a concurrent
+    # direct cancellation cannot deadlock with conversation deletion.
+    root_run_ids = list((await db.execute(
+        select(RuntimeRun.id).where(
+            RuntimeRun.entity_id == entity_id,
+            RuntimeRun.conversation_id == conversation_id,
+            RuntimeRun.parent_run_id.is_(None),
+            RuntimeRun.status.in_(RuntimeRunStatus.active_root()),
+        ).order_by(RuntimeRun.id.asc())
+    )).scalars().all())
+    if root_run_ids:
+        from packages.core.services.runtime_run_service import request_runtime_run_cancel
+
+        for run_id in root_run_ids:
+            cancelled = await request_runtime_run_cancel(
+                db,
+                run_id=run_id,
+                entity_id=entity_id,
+                reason="conversation_deleted",
+            )
+            if cancelled_runtime_runs is not None:
+                cancelled_runtime_runs.append(cancelled)
+
+    if is_ai_edit:
+        # AI Edit runs can contain the entire temporary editor document. Keep
+        # the durable run/status audit row, but remove document-bearing data as
+        # part of the same deletion transaction as the session and messages.
+        await db.execute(
+            update(RuntimeRun).where(
+                RuntimeRun.entity_id == entity_id,
+                RuntimeRun.conversation_id == conversation_id,
+            ).values(
+                assistant_message_id=None,
+                execution_payload={
+                    "redacted": True,
+                    "reason": "ai_edit_conversation_deleted",
+                },
+                checkpoint=None,
+                result=None,
+                error=None,
+            )
+        )
 
     from packages.core.models.conversation_share import ConversationShare
     from packages.core.models.execution import ExecutionPlan, ExecutionStep
+    from packages.core.models.runtime_learning import RuntimeEvidence
     from packages.core.models.worker import CredentialSublease, WorkLease, WorkerActivityLog
+    from packages.core.services.chat_feedback import (
+        COMPLETION_FEEDBACK_EVIDENCE_TYPES,
+    )
 
     step_rows = (
         await db.execute(
@@ -210,9 +350,64 @@ async def delete_conversation(
             ConversationShare.entity_id == entity_id,
         )
     )
+    # Keep the same parent-to-child lock order as feedback persistence:
+    # Message first, then its cascading feedback rows, then evidence.
     await db.execute(
         delete(Message).where(Message.conversation_id == conversation_id)
+    )
+    # RuntimeEvidence intentionally has no FK to conversations/messages. It is
+    # a projection of the feedback row and must follow the same lifecycle.
+    await db.execute(
+        delete(RuntimeEvidence).where(
+            RuntimeEvidence.conversation_id == conversation_id,
+            RuntimeEvidence.evidence_type.in_(
+                COMPLETION_FEEDBACK_EVIDENCE_TYPES
+            ),
+        )
     )
     await db.delete(conv)
     await db.flush()
     return True
+
+
+AI_EDIT_SESSION_TTL = timedelta(hours=24)
+
+
+async def cleanup_expired_ai_edit_conversations(
+    db: AsyncSession,
+    *,
+    now: datetime | None = None,
+    limit: int = 100,
+    cancelled_runtime_runs: list[RuntimeRun] | None = None,
+) -> int:
+    """Delete bounded, inactive AI Edit sessions through normal lifecycle cleanup."""
+
+    cutoff = (now or datetime.now(timezone.utc)) - AI_EDIT_SESSION_TTL
+    conversations = list((
+        await db.execute(
+            select(Conversation)
+            .where(
+                Conversation.meta[
+                    ConversationSurfaceMetadataFactory.META_KEY
+                ].astext
+                == ConversationSurfaceKind.AI_EDIT.value,
+                func.coalesce(Conversation.updated_at, Conversation.created_at) < cutoff,
+            )
+            .order_by(
+                func.coalesce(Conversation.updated_at, Conversation.created_at),
+                Conversation.id,
+            )
+            .limit(max(1, min(limit, 500)))
+            .with_for_update(skip_locked=True)
+        )
+    ).scalars().all())
+    deleted_count = 0
+    for conversation in conversations:
+        if await delete_conversation(
+            db,
+            conversation.id,
+            conversation.entity_id,
+            cancelled_runtime_runs=cancelled_runtime_runs,
+        ):
+            deleted_count += 1
+    return deleted_count

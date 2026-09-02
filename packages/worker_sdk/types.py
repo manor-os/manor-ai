@@ -1,4 +1,4 @@
-"""Pydantic types mirroring the Manor v1 worker HTTP protocol.
+"""Pydantic types mirroring the Manor v2 worker HTTP protocol.
 
 These intentionally duplicate the schemas in ``apps/api/routers/workers.py``
 rather than importing from there. Reason: the SDK must be installable
@@ -9,6 +9,7 @@ caught by the e2e smoke test which exercises both halves together.
 from __future__ import annotations
 
 from datetime import datetime
+from enum import Enum
 from typing import Any, Literal, Optional
 
 from pydantic import BaseModel, Field
@@ -70,16 +71,45 @@ class Lease(BaseModel):
 
 # ── Result (worker → server) ─────────────────────────────────────────
 
+class TaskOutputValueKind(str, Enum):
+    """How a successful worker result represents a Task output contract."""
+
+    TASK_PAYLOAD = "task_payload"
+    STEP_RESULT_ENVELOPE = "step_result_envelope"
+    STEP_RESULT_FAILURE = "step_result_failure"
+
+
 class LeaseResult(BaseModel):
     """What a handler returns for a successful lease."""
 
-    result: Optional[dict] = None
+    # A declared output contract may legitimately be an array, scalar, or
+    # explicit JSON null. ``Any`` keeps the wire protocol lossless; presence is
+    # tracked by Pydantic's ``model_fields_set`` so omitted ``result`` remains
+    # distinguishable from ``result: null`` at the dispatcher boundary.
+    result: Any = None
     cost: Optional[dict] = None
     """``{llm_tokens_input, llm_tokens_output, api_calls, usd}`` —
     fields are optional; Manor accumulates whatever's present."""
     evidence_refs: Optional[list[str]] = None
     """Object-store keys (S3 / MinIO) for screenshots, raw responses,
     large blobs that don't belong inline in result."""
+    task_output_value_kind: TaskOutputValueKind = TaskOutputValueKind.TASK_PAYLOAD
+    """Explicit representation discriminator; raw handler values are payloads."""
+
+
+class LeaseResultFactory:
+    """Create the worker transport result from one handler return value."""
+
+    @staticmethod
+    def from_handler_output(raw: Any) -> LeaseResult:
+        if raw is None:
+            return LeaseResult()
+        if isinstance(raw, LeaseResult):
+            return raw
+        # A plain dict is a valid task payload even when its business schema
+        # contains keys such as ``result`` or ``cost``. Handlers that need
+        # transport metadata must return LeaseResult explicitly.
+        return LeaseResult(result=raw)
 
 
 class NeedHumanInput(Exception):
@@ -108,10 +138,11 @@ class HeartbeatActiveLease(BaseModel):
 class HeartbeatCompletedLease(BaseModel):
     lease_id: str
     status: Literal["done", "failed"]
-    result: Optional[dict] = None
+    result: Any = None
     error: Optional[dict] = None
     cost: Optional[dict] = None
     evidence_refs: Optional[list[str]] = None
+    task_output_value_kind: TaskOutputValueKind
 
 
 class HeartbeatCapacity(BaseModel):

@@ -1,4 +1,4 @@
-// Manor v1 worker HTTP protocol — TypeScript types.
+// Manor v2 worker HTTP protocol — TypeScript types.
 // Mirrors `packages/worker_sdk/types.py`. Drift caught by smoke test.
 
 export type LeaseKind = "action" | "llm" | "subagent" | "code";
@@ -55,10 +55,54 @@ export interface LeaseCost {
   [k: string]: unknown;
 }
 
+export type TaskOutputValueKind =
+  | "task_payload"
+  | "step_result_envelope"
+  | "step_result_failure";
+
 export interface LeaseResult {
-  result?: Record<string, unknown> | null;
+  /** Native JSON value; the leased output schema owns its shape. */
+  result?: unknown;
   cost?: LeaseCost | null;
   evidence_refs?: string[] | null;
+  task_output_value_kind?: TaskOutputValueKind;
+}
+
+const LEASE_RESULT_ENVELOPE = Symbol("manor.lease-result-envelope");
+
+type ExplicitLeaseResult = LeaseResult & {
+  readonly [LEASE_RESULT_ENVELOPE]: true;
+};
+
+export class LeaseResultFactory {
+  /** Explicitly mark transport metadata; ordinary objects remain task payloads. */
+  static envelope(result: LeaseResult): ExplicitLeaseResult {
+    const envelope = { ...result } as ExplicitLeaseResult;
+    Object.defineProperty(envelope, LEASE_RESULT_ENVELOPE, { value: true });
+    return envelope;
+  }
+
+  static fromHandlerOutput(raw: unknown): LeaseResult {
+    if (raw === undefined || raw === null) return {};
+    if (
+      typeof raw === "object" &&
+      raw !== null &&
+      (raw as Partial<ExplicitLeaseResult>)[LEASE_RESULT_ENVELOPE] === true
+    ) {
+      const envelope = raw as ExplicitLeaseResult;
+      const result: LeaseResult = {};
+      if (Object.prototype.hasOwnProperty.call(envelope, "result")) result.result = envelope.result;
+      if (Object.prototype.hasOwnProperty.call(envelope, "cost")) result.cost = envelope.cost;
+      if (Object.prototype.hasOwnProperty.call(envelope, "evidence_refs")) {
+        result.evidence_refs = envelope.evidence_refs;
+      }
+      if (Object.prototype.hasOwnProperty.call(envelope, "task_output_value_kind")) {
+        result.task_output_value_kind = envelope.task_output_value_kind;
+      }
+      return result;
+    }
+    return { result: raw };
+  }
 }
 
 export interface HeartbeatActiveLease {
@@ -69,10 +113,11 @@ export interface HeartbeatActiveLease {
 export interface HeartbeatCompletedLease {
   lease_id: string;
   status: "done" | "failed";
-  result?: Record<string, unknown> | null;
+  result?: unknown;
   error?: Record<string, unknown> | null;
   cost?: LeaseCost | null;
   evidence_refs?: string[] | null;
+  task_output_value_kind: TaskOutputValueKind;
 }
 
 export interface HeartbeatCapacity {
@@ -131,6 +176,11 @@ export class WorkerClientError extends Error {
     this.name = "WorkerClientError";
     this.statusCode = opts?.statusCode;
     this.body = opts?.body;
+  }
+
+  /** Retrying unchanged credentials/protocol cannot recover these responses. */
+  get requiresOperatorAction(): boolean {
+    return this.statusCode === 401 || this.statusCode === 403 || this.statusCode === 426;
   }
 }
 

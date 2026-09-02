@@ -41,6 +41,23 @@ logger = logging.getLogger(__name__)
 _CURRENT_ENTITY_ID: contextvars.ContextVar[str] = contextvars.ContextVar(
     "code_tool_entity_id", default="",
 )
+_RUNTIME_CODE_SAFE_ACTIONS = frozenset({"dashboard_module_validate"})
+
+
+class CodePathFactory:
+    """Resolve a caller-supplied child path without leaving its coding root."""
+
+    @staticmethod
+    def resolve(cwd: str, path: str) -> str:
+        root = os.path.realpath(cwd)
+        candidate = os.path.realpath(os.path.join(root, str(path or "")))
+        try:
+            inside_root = os.path.commonpath([root, candidate]) == root
+        except ValueError:
+            inside_root = False
+        if not inside_root:
+            raise ValueError("file path must stay inside the coding workspace")
+        return candidate
 
 # ── Action catalog ──────────────────────────────────────────────────────────
 
@@ -620,7 +637,7 @@ async def _handle_lsp_symbols(params: dict, entity_id: str) -> str:
     query = params.get("query", "")
 
     if file_path:
-        full = os.path.join(cwd, file_path)
+        full = CodePathFactory.resolve(cwd, file_path)
         if os.path.isfile(full):
             patterns = r"(def |class |function |const |let |var |type |interface |struct |enum )"
             r = _run_cmd(["rg", "--line-number", "--no-heading", patterns, full], cwd, timeout=10)
@@ -691,7 +708,7 @@ async def _handle_lsp_hover(params: dict, entity_id: str) -> str:
             try:
                 fpath = parts[0].strip()
                 lineno = int(parts[1].strip())
-                full = os.path.join(cwd, fpath)
+                full = CodePathFactory.resolve(cwd, fpath)
                 if os.path.isfile(full):
                     with open(full, "r", encoding="utf-8", errors="replace") as f:
                         all_lines = f.readlines()
@@ -756,7 +773,7 @@ async def _handle_review_security(params: dict, entity_id: str) -> str:
     for label, pattern in security_patterns.items():
         r = _run_cmd(
             ["rg", "--line-number", "--no-heading", "-e", pattern, "--max-count", "10",
-             "--max-filesize", "1M", os.path.join(cwd, path)],
+             "--max-filesize", "1M", CodePathFactory.resolve(cwd, path)],
             cwd, timeout=10,
         )
         if r["ok"] and r["stdout"]:
@@ -780,7 +797,7 @@ async def _handle_review_quality(params: dict, entity_id: str) -> str:
     if "No diagnostics" not in diag and "Cannot auto-detect" not in diag:
         results.append(f"## Lint/Type Issues\n{diag[:5000]}")
 
-    target_path = os.path.join(cwd, path) if path else cwd
+    target_path = CodePathFactory.resolve(cwd, path) if path else cwd
     r = _run_cmd(
         ["rg", "--line-number", "--no-heading", "-e",
          r"^(def |class |function |async function |const \w+ = )",
@@ -1016,11 +1033,11 @@ async def _handle_refactor_rename(params: dict, entity_id: str) -> str:
             "occurrences": len(lines),
             "files": sorted(files),
             "preview": "\n".join(lines[:20]),
-            "hint": "Set dry_run=false to apply the rename, or use write_file for precise control.",
+            "hint": "Set dry_run=false to apply the rename, or use patch_file for precise control.",
         }, ensure_ascii=False)
 
     for fpath in sorted(files):
-        full_path = os.path.join(cwd, fpath)
+        full_path = CodePathFactory.resolve(cwd, fpath)
         if os.path.isfile(full_path):
             try:
                 with open(full_path, "r", encoding="utf-8") as f:
@@ -1051,7 +1068,7 @@ async def _handle_refactor_extract(params: dict, entity_id: str) -> str:
     if not file_path:
         return "file path required"
 
-    full = os.path.join(cwd, file_path)
+    full = CodePathFactory.resolve(cwd, file_path)
     if not os.path.isfile(full):
         return f"File not found: {file_path}"
 
@@ -1100,7 +1117,7 @@ async def _handle_refactor_move(params: dict, entity_id: str) -> str:
     if not source or not destination:
         return "source and destination required"
 
-    source_full = os.path.join(cwd, source)
+    source_full = CodePathFactory.resolve(cwd, source)
     if os.path.isfile(source_full):
         basename = os.path.splitext(os.path.basename(source))[0]
         r = _run_cmd(
@@ -1238,7 +1255,7 @@ async def _handle_notebook_read(params: dict, entity_id: str) -> str:
     if not file_path:
         return "file path required"
 
-    full = os.path.join(cwd, file_path)
+    full = CodePathFactory.resolve(cwd, file_path)
     if not os.path.isfile(full):
         return f"Notebook not found: {file_path}"
 
@@ -1278,7 +1295,7 @@ async def _handle_notebook_edit(params: dict, entity_id: str) -> str:
     if not file_path or cell_index is None:
         return "file and cell_index required"
 
-    full = os.path.join(cwd, file_path)
+    full = CodePathFactory.resolve(cwd, file_path)
     try:
         with open(full, "r", encoding="utf-8") as f:
             nb = json.load(f)
@@ -1305,7 +1322,7 @@ async def _handle_notebook_run(params: dict, entity_id: str) -> str:
     if not file_path:
         return "file path required"
 
-    full = os.path.join(cwd, file_path)
+    full = CodePathFactory.resolve(cwd, file_path)
     if not os.path.isfile(full):
         return f"Notebook not found: {file_path}"
 
@@ -1330,7 +1347,7 @@ async def _handle_notebook_add(params: dict, entity_id: str) -> str:
     if not file_path:
         return "file path required"
 
-    full = os.path.join(cwd, file_path)
+    full = CodePathFactory.resolve(cwd, file_path)
     try:
         with open(full, "r", encoding="utf-8") as f:
             nb = json.load(f)
@@ -1482,6 +1499,24 @@ async def _code_handler(entity_id: str = "", **kwargs: Any) -> str:
 
     if not action:
         return json.dumps({"error": "action is required"})
+
+    runtime_invocation = any(
+        key in kwargs
+        for key in (
+            "_user_id_from_context",
+            "_runtime_envelope_from_context",
+            "_runtime_tool_call_id_from_context",
+        )
+    )
+    if runtime_invocation and action not in _RUNTIME_CODE_SAFE_ACTIONS:
+        return json.dumps({
+            "error": "code_action_requires_sandbox",
+            "action": action,
+            "message": (
+                "Filesystem and subprocess code actions are unavailable on the API host. "
+                "Use an isolated sandbox tool."
+            ),
+        })
 
     manual_skill_slugs = runtime_manual_skill_slugs_from_context(kwargs)
     if (

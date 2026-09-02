@@ -19,6 +19,8 @@ from packages.core.ai.runtime.capability_bindings import (
     runtime_capability_binding_identity,
     validate_runtime_capability_binding,
 )
+from packages.core.constants.goals import GoalStatus
+from packages.core.constants.agents import is_master_agent
 from packages.core.models.base import generate_ulid
 from packages.core.models.task import Conversation, Task
 from packages.core.models.workspace import (
@@ -27,6 +29,15 @@ from packages.core.models.workspace import (
     Workspace,
     WorkspaceOperationDraft,
     WorkspaceWorkBatch,
+)
+from packages.core.services.workspace_autonomy import (
+    WorkspaceAutonomyState,
+    workspace_autonomy_state,
+)
+from packages.core.services.reusable_resource_locks import (
+    lock_reusable_resource_lifecycle,
+    lock_reusable_resource_references,
+    reusable_skill_ids_from_runtime_state,
 )
 
 
@@ -379,19 +390,36 @@ def _remove_by_key(items: Any, key_name: str, key_value: str) -> list[dict[str, 
     ]
 
 
-_GOAL_IDENTITY_KEYS = ("id", "goal_id", "goal_key", "metric_key", "key", "title", "goal")
+_GOAL_IDENTITY_KEYS = ("id", "goal_id", "goal_key", "key", "metric_key", "title", "goal")
 
 
 def _normalise_identity(value: Any) -> str:
     return str(value or "").strip().lower()
 
 
-def _goal_identity_tokens(row: dict[str, Any]) -> set[str]:
-    return {
-        token
-        for token in (_normalise_identity(row.get(key)) for key in _GOAL_IDENTITY_KEYS)
-        if token
-    }
+def _goal_update_matches(goal: dict[str, Any], update: dict[str, Any]) -> bool:
+    """Match one Goal without conflating a shared metric with Goal identity."""
+    update_goal_key = str(update.get("goal_key") or update.get("key") or "").strip()
+    if update_goal_key:
+        return update_goal_key == str(
+            goal.get("goal_key") or goal.get("key") or ""
+        ).strip()
+
+    update_goal_id = str(update.get("goal_id") or update.get("id") or "").strip()
+    if update_goal_id:
+        return update_goal_id == str(
+            goal.get("goal_id") or goal.get("id") or ""
+        ).strip()
+
+    # Legacy/friendly fallbacks are intentionally lower priority. A metric-only
+    # update remains a bulk update for all Goals that measure that metric.
+    update_metric = _normalise_identity(update.get("metric_key"))
+    if update_metric:
+        return update_metric == _normalise_identity(goal.get("metric_key"))
+    update_title = _normalise_identity(update.get("title") or update.get("goal"))
+    return bool(update_title) and update_title == _normalise_identity(
+        goal.get("title") or goal.get("goal")
+    )
 
 
 def _goal_measurement_updates(payload: dict[str, Any]) -> list[dict[str, Any]]:
@@ -473,8 +501,7 @@ def _apply_goal_measurement_updates(
 ) -> list[dict[str, Any]]:
     rows = [dict(row) for row in _as_list(goals) if isinstance(row, dict)]
     for update in _goal_measurement_updates(payload):
-        match_tokens = _goal_identity_tokens(update)
-        if not match_tokens:
+        if not any(_normalise_identity(update.get(key)) for key in _GOAL_IDENTITY_KEYS):
             continue
 
         fields: dict[str, Any] = {}
@@ -504,7 +531,7 @@ def _apply_goal_measurement_updates(
 
         matched = False
         for idx, goal in enumerate(rows):
-            if _goal_identity_tokens(goal) & match_tokens:
+            if _goal_update_matches(goal, update):
                 merged = dict(goal)
                 merged.update(fields)
                 rows[idx] = merged
@@ -656,8 +683,15 @@ def _apply_single_patch(
 
     if op in {"goal.upsert", "goal.add"}:
         goal = _as_dict(payload.get("goal") or payload)
-        key = "goal_key" if goal.get("goal_key") else "key"
-        state["goals"] = _merge_by_key(state.get("goals"), goal, key)
+        state["goals"] = _merge_by_key(
+            state.get("goals"),
+            goal,
+            "goal_key",
+            "key",
+            "goal_id",
+            "id",
+            "metric_key",  # legacy payloads only
+        )
         return _sync_operating_model_from_state(state)
 
     if op in {
@@ -1075,10 +1109,18 @@ async def create_operation_draft(
     if workspace is None:
         return None
     state = await _snapshot_workspace_state(db, workspace)
+    base_skill_ids = reusable_skill_ids_from_runtime_state(state)
     patches: list[dict[str, Any]] = []
     for patch in initial_patches or []:
         state = _apply_single_patch(state, patch)
         patches.append(_json_safe(patch))
+    await lock_reusable_resource_references(
+        db,
+        entity_id=entity_id,
+        skill_ids=(
+            reusable_skill_ids_from_runtime_state(state) - base_skill_ids
+        ),
+    )
     draft = WorkspaceOperationDraft(
         id=generate_ulid(),
         workspace_id=workspace.id,
@@ -1126,10 +1168,18 @@ async def patch_operation_draft(
     if draft.status != "open":
         raise OperationConflictError(f"cannot patch {draft.status} operation draft")
     state = _copy_json(draft.current_state or {})
+    base_skill_ids = reusable_skill_ids_from_runtime_state(state)
     appended = _as_list(draft.patches)
     for patch in patches:
         state = _apply_single_patch(state, patch)
         appended.append(_json_safe(patch))
+    await lock_reusable_resource_references(
+        db,
+        entity_id=entity_id,
+        skill_ids=(
+            reusable_skill_ids_from_runtime_state(state) - base_skill_ids
+        ),
+    )
     draft.current_state = _json_safe(state)
     draft.patches = appended
     draft.validation = await validate_operation_draft(db, draft)
@@ -1160,6 +1210,32 @@ async def validate_operation_draft(
         key = str(service.get("key") or service.get("service_key") or "").strip()
         if not key:
             errors.append({"path": f"services[{idx}].key", "message": "service requires key/service_key"})
+
+    seen_goal_keys: dict[str, int] = {}
+    for idx, goal in enumerate(_as_list(state.get("goals"))):
+        if not isinstance(goal, dict):
+            errors.append({"path": f"goals[{idx}]", "message": "goal must be an object"})
+            continue
+        goal_key = str(
+            goal.get("goal_key")
+            or goal.get("key")
+            or goal.get("metric_key")  # legacy single-goal identity
+            or ""
+        ).strip()
+        if not goal_key:
+            errors.append({
+                "path": f"goals[{idx}].goal_key",
+                "message": "goal requires goal_key (or legacy metric_key)",
+            })
+            continue
+        previous_idx = seen_goal_keys.get(goal_key)
+        if previous_idx is not None:
+            errors.append({
+                "path": f"goals[{idx}].goal_key",
+                "message": f"goal_key duplicates goals[{previous_idx}]",
+            })
+        else:
+            seen_goal_keys[goal_key] = idx
 
     for idx, mapping in enumerate(_as_list(state.get("agent_mappings"))):
         if not isinstance(mapping, dict):
@@ -1356,9 +1432,20 @@ async def _sync_goals_from_operation_state(
         remove_measurement_schedule,
         should_install_measurement_schedule,
     )
-    from packages.core.goals.service import create_goal, update_goal
+    from packages.core.goals.locking import lock_workspace_for_goal_mutation
+    from packages.core.goals.service import (
+        create_goal,
+        sync_workspace_goal_mode,
+        update_goal,
+    )
     from packages.core.models.goal import Goal
     from packages.core.services.workspace_setup_service import _coerce_goal_number
+
+    await lock_workspace_for_goal_mutation(
+        db,
+        workspace_id=workspace.id,
+        entity_id=workspace.entity_id,
+    )
 
     existing_goals = list((await db.execute(
         select(Goal).where(
@@ -1366,13 +1453,13 @@ async def _sync_goals_from_operation_state(
             Goal.workspace_id == workspace.id,
         )
     )).scalars().all())
-    by_metric = {g.metric_key: g for g in existing_goals if g.metric_key}
+    by_goal_key = {g.goal_key: g for g in existing_goals if g.goal_key}
 
     created = 0
     updated = 0
     paused = 0
     scheduled = 0
-    desired_metric_keys: set[str] = set()
+    desired_goal_keys: set[str] = set()
 
     def _merged_measurement_source(existing_source: Any, incoming_source: Any) -> dict | None:
         if not isinstance(incoming_source, dict) or not incoming_source:
@@ -1393,6 +1480,14 @@ async def _sync_goals_from_operation_state(
     for raw in _as_list(raw_goals):
         if not isinstance(raw, dict):
             continue
+        goal_key = str(
+            raw.get("goal_key")
+            or raw.get("key")
+            or raw.get("metric_key")  # legacy operation contract
+            or ""
+        ).strip()
+        if not goal_key:
+            continue
         metric_key = str(
             raw.get("metric_key")
             or raw.get("goal_key")
@@ -1403,9 +1498,9 @@ async def _sync_goals_from_operation_state(
         ).strip()
         if not metric_key:
             continue
-        desired_metric_keys.add(metric_key)
+        desired_goal_keys.add(goal_key)
 
-        existing = by_metric.get(metric_key)
+        existing = by_goal_key.get(goal_key)
         title = str(
             raw.get("title")
             or raw.get("goal")
@@ -1445,9 +1540,16 @@ async def _sync_goals_from_operation_state(
             ).strip() or None
         else:
             measurement_cadence = existing.measurement_cadence if existing else None
-        status = str(raw.get("status") or (existing.status if existing else "active")).strip().lower()
-        if status not in {"active", "achieved", "abandoned", "paused"}:
-            status = "active"
+        status_value = str(
+            raw.get("status") or (existing.status if existing else GoalStatus.ACTIVE.value)
+        ).strip().lower()
+        try:
+            status = GoalStatus(status_value).value
+        except ValueError:
+            status = GoalStatus.ACTIVE.value
+        if status == GoalStatus.ACHIEVED.value and existing is None:
+            # Achievement is runtime evidence, never portable configuration.
+            status = GoalStatus.ACTIVE.value
         deadline = (
             _parse_goal_deadline(raw.get("deadline"))
             if "deadline" in raw
@@ -1463,6 +1565,7 @@ async def _sync_goals_from_operation_state(
                 db,
                 existing.id,
                 workspace.entity_id,
+                sync_contract=False,
                 title=title,
                 description=description,
                 metric_key=metric_key,
@@ -1473,7 +1576,11 @@ async def _sync_goals_from_operation_state(
                 measurement_source=measurement_source,
                 measurement_cadence=measurement_cadence,
                 priority=priority,
-                status=status,
+                **(
+                    {"status": status}
+                    if status != GoalStatus.ACHIEVED.value
+                    else {}
+                ),
             )
             updated += 1 if goal else 0
         else:
@@ -1482,6 +1589,7 @@ async def _sync_goals_from_operation_state(
                 entity_id=workspace.entity_id,
                 workspace_id=workspace.id,
                 title=title,
+                goal_key=goal_key,
                 description=description,
                 metric_key=metric_key,
                 target_value=target_value,
@@ -1491,8 +1599,12 @@ async def _sync_goals_from_operation_state(
                 measurement_cadence=measurement_cadence,
                 priority=priority,
                 install_schedule=False,
+                sync_contract=False,
             )
-            if status != "active":
+            if status not in {
+                GoalStatus.ACTIVE.value,
+                GoalStatus.ACHIEVED.value,
+            }:
                 goal.status = status
             if current_value is not None:
                 goal.current_value = current_value
@@ -1500,7 +1612,12 @@ async def _sync_goals_from_operation_state(
 
         if not goal:
             continue
-        if goal.status == "active" and should_install_measurement_schedule(goal):
+        await db.flush()
+        if (
+            workspace_autonomy_state(workspace) is WorkspaceAutonomyState.RUNNING
+            and goal.status == GoalStatus.ACTIVE.value
+            and should_install_measurement_schedule(goal)
+        ):
             await install_measurement_schedule(db, goal)
             scheduled += 1
         else:
@@ -1508,13 +1625,22 @@ async def _sync_goals_from_operation_state(
 
     if deactivate_missing:
         for goal in existing_goals:
-            if goal.metric_key in desired_metric_keys or goal.status != "active":
+            if (
+                goal.goal_key in desired_goal_keys
+                or goal.status != GoalStatus.ACTIVE.value
+            ):
                 continue
-            goal.status = "paused"
+            goal.status = GoalStatus.PAUSED.value
             await remove_measurement_schedule(db, goal)
             paused += 1
 
     await db.flush()
+    await sync_workspace_goal_mode(
+        db,
+        workspace_id=workspace.id,
+        entity_id=workspace.entity_id,
+        bump_operation_revision=False,
+    )
     return {
         "created": created,
         "updated": updated,
@@ -1777,6 +1903,7 @@ async def _sync_channels_from_operation_state(
         sub = sub_by_service.get(linked_service_key) if linked_service_key else None
         if not sub:
             sub = first_sub
+        resolved_agent_id = sub.agent_id if sub else block.get("agent_id")
 
         config_row = None
         channel_config_id = str(block.get("channel_config_id") or "").strip()
@@ -1824,6 +1951,9 @@ async def _sync_channels_from_operation_state(
                 created_configs += 1
                 created_config_ids.add(config_row.id)
 
+        previous_channel_type = str(
+            getattr(config_row, "channel_type", "") or ""
+        )
         config_payload = _as_dict(getattr(config_row, "config", None))
         config_payload.update(_as_dict(block.get("config")))
         public_token = str(block.get("public_token") or config_payload.get("public_token") or "").strip()
@@ -1861,7 +1991,20 @@ async def _sync_channels_from_operation_state(
             binding_config["public_token"] = public_token
 
         binding = _binding_for_config(config_row.id)
+        if (
+            resolved_agent_id
+            and (binding is None or resolved_agent_id != binding.agent_id)
+            and not is_master_agent(resolved_agent_id)
+        ):
+            await lock_reusable_resource_references(
+                db,
+                entity_id=workspace.entity_id,
+                agent_ids=(resolved_agent_id,),
+            )
         if binding:
+            target_subscription_id = (
+                sub.id if sub else block.get("agent_subscription_id")
+            )
             before_binding = (
                 binding.agent_id,
                 binding.agent_subscription_id,
@@ -1869,8 +2012,30 @@ async def _sync_channels_from_operation_state(
                 binding.name,
                 binding.status,
             )
-            binding.agent_id = sub.agent_id if sub else block.get("agent_id")
-            binding.agent_subscription_id = sub.id if sub else block.get("agent_subscription_id")
+            if (
+                previous_channel_type == "twilio_voice"
+                and (
+                    binding.agent_id != resolved_agent_id
+                    or binding.agent_subscription_id != target_subscription_id
+                    or binding.workspace_id != workspace.id
+                    or binding.type != channel_type
+                    or binding.status != "active"
+                )
+            ):
+                from packages.core.services.voice.call_sessions import (
+                    cancel_unconnected_call_sessions_for_binding,
+                )
+
+                await cancel_unconnected_call_sessions_for_binding(
+                    db,
+                    channel_config_id=config_row.id,
+                    channel_binding_id=binding.id,
+                    reason=(
+                        "Twilio Voice Agent binding changed before the call connected."
+                    ),
+                )
+            binding.agent_id = resolved_agent_id
+            binding.agent_subscription_id = target_subscription_id
             binding.name = block.get("name") or binding.name or config_row.name or channel_type
             binding.type = channel_type
             binding.config = _json_safe(binding_config)
@@ -1891,7 +2056,7 @@ async def _sync_channels_from_operation_state(
                 workspace_id=workspace.id,
                 type=channel_type,
                 name=block.get("name") or config_row.name or channel_type,
-                agent_id=sub.agent_id if sub else block.get("agent_id"),
+                agent_id=resolved_agent_id,
                 agent_subscription_id=sub.id if sub else block.get("agent_subscription_id"),
                 config=_json_safe(binding_config),
                 status="active",
@@ -1932,6 +2097,8 @@ async def apply_operation_draft(
     if draft.status != "open":
         raise OperationConflictError(f"cannot apply {draft.status} operation draft")
 
+    await lock_reusable_resource_lifecycle(db, entity_id=entity_id)
+
     workspace = await _load_workspace(db, workspace_id, entity_id, for_update=True)
     if workspace is None:
         return None
@@ -1963,7 +2130,6 @@ async def apply_operation_draft(
     from packages.core.services.workspace_runtime import sync_workspace_runtime_schedules
     from packages.core.services.workspace_service import record_activity
     from packages.core.services.workspace_setup_service import (
-        _build_governance_policy_from_rules,
         _enrich_operating_rules,
     )
     from packages.core.workspace_chat.context import invalidate
@@ -2250,15 +2416,24 @@ async def _materialize_immediate_tasks(
             agent_id=payload.get("agent_id"),
             agent_type=payload.get("agent_type"),
             creator_id=user_id,
+            owner_service_key=(
+                str(payload["owner_service_key"])
+                if payload.get("owner_service_key")
+                else None
+            ),
+            owner_subscription_id=(
+                str(payload["owner_subscription_id"])
+                if payload.get("owner_subscription_id")
+                else None
+            ),
+            delegate_service_keys=(
+                _unique_list(payload.get("delegate_service_keys"))
+                if isinstance(payload.get("delegate_service_keys"), list)
+                else None
+            ),
             details=details,
             deadline=payload.get("deadline"),
         )
-        if payload.get("owner_service_key"):
-            task.owner_service_key = str(payload["owner_service_key"])
-        if payload.get("owner_subscription_id"):
-            task.owner_subscription_id = str(payload["owner_subscription_id"])
-        if isinstance(payload.get("delegate_service_keys"), list):
-            task.delegate_service_keys = _unique_list(payload.get("delegate_service_keys"))
         tasks_created.append(task)
 
     batch = await create_work_batch(

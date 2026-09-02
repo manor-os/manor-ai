@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { getLocale } from "../lib/i18n";
+import { t } from "../lib/i18n";
 import type { SimulationArtifact } from "./WorkspaceSimulationRuntime";
 import {
   IconArchive,
@@ -67,18 +67,22 @@ export default function SimulationArtifactGallery({
   artifacts: ArtifactWithReceipt[];
 }) {
   const [selected, setSelected] = useState<ArtifactWithReceipt | null>(null);
-  const zh = getLocale().toLowerCase().startsWith("zh");
   if (!artifacts.length) return null;
 
   return (
     <>
-      <section className="simulation-artifact-gallery" aria-label={zh ? "模拟生成产物" : "Simulated generated outputs"}>
+      <section
+        className="simulation-artifact-gallery"
+        aria-label={t("component.simulation_artifact_gallery.section_aria")}
+      >
         <div className="simulation-artifact-gallery__header">
           <div>
-            <strong>{zh ? "Blueprint 生成产物" : "Blueprint outputs"}</strong>
-            <span>{zh ? "可预览，但不会下载、发布或写入外部系统" : "Previewable; never downloaded, published, or written externally"}</span>
+            <strong>{t("component.simulation_artifact_gallery.blueprint_outputs")}</strong>
+            <span>{t("component.simulation_artifact_gallery.preview_only_desc")}</span>
           </div>
-          <StatusBadge type="neutral">Simulation</StatusBadge>
+          <StatusBadge type="neutral">
+            {t("component.simulation_artifact_gallery.workspace_simulation")}
+          </StatusBadge>
         </div>
         <div className="simulation-artifact-gallery__grid">
           {artifacts.map((artifact) => (
@@ -102,7 +106,7 @@ export default function SimulationArtifactGallery({
                 <strong>{artifact.title}</strong>
                 <span>{artifact.filename}</span>
                 <small>
-                  {artifact.stage || "output"}
+                  {artifact.stage || t("component.simulation_artifact_gallery.output_stage")}
                   {durationLabel(artifact.duration_seconds) ? ` · ${durationLabel(artifact.duration_seconds)}` : ""}
                 </small>
               </span>
@@ -114,23 +118,40 @@ export default function SimulationArtifactGallery({
       <Modal
         open={Boolean(selected)}
         onClose={() => setSelected(null)}
-        title={selected?.title || (zh ? "模拟产物" : "Simulated output")}
+        title={selected?.title || t("component.simulation_artifact_gallery.output_title")}
         maxWidth="760px"
-        footer={<Button variant="outline" onClick={() => setSelected(null)}>{zh ? "关闭" : "Close"}</Button>}
+        footer={(
+          <Button variant="outline" onClick={() => setSelected(null)}>
+            {t("component.simulation_artifact_gallery.close")}
+          </Button>
+        )}
       >
         {selected && (
           <div className="simulation-artifact-modal">
             <div className="simulation-artifact-modal__notice">
-              <StatusBadge type="neutral">Simulation</StatusBadge>
-              <span>{zh ? "这是 Blueprint 提供的体验预览，不是正式产物。" : "This is a Blueprint experience preview, not a live artifact."}</span>
+              <StatusBadge type="neutral">
+                {t("component.simulation_artifact_gallery.workspace_simulation")}
+              </StatusBadge>
+              <span>{t("component.simulation_artifact_gallery.preview_notice")}</span>
             </div>
             <div className="simulation-artifact-modal__preview">
               <ArtifactPreview artifact={selected} />
             </div>
             <dl className="simulation-artifact-modal__meta">
-              <div><dt>{zh ? "文件" : "File"}</dt><dd>{selected.filename}</dd></div>
-              <div><dt>{zh ? "类型" : "Type"}</dt><dd>{selected.mime_type}</dd></div>
-              {selected.receipt_id && <div><dt>{zh ? "模拟回执" : "Simulation receipt"}</dt><dd>{selected.receipt_id}</dd></div>}
+              <div>
+                <dt>{t("component.simulation_artifact_gallery.file")}</dt>
+                <dd>{selected.filename}</dd>
+              </div>
+              <div>
+                <dt>{t("component.simulation_artifact_gallery.type")}</dt>
+                <dd>{selected.mime_type}</dd>
+              </div>
+              {selected.receipt_id && (
+                <div>
+                  <dt>{t("component.simulation_artifact_gallery.receipt")}</dt>
+                  <dd>{selected.receipt_id}</dd>
+                </div>
+              )}
             </dl>
             {selected.summary && <p>{selected.summary}</p>}
           </div>

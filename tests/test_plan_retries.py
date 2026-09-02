@@ -1,3 +1,5 @@
+import asyncio
+
 import pytest
 from httpx import AsyncClient
 from sqlalchemy import select
@@ -59,7 +61,32 @@ async def _create_plan(
                 status=status,
                 execution_mode="live",
                 approval_required=False,
-                plan_dag={"steps": []},
+                plan_dag={
+                    "steps": [
+                        {
+                            "key": "failed",
+                            "kind": "llm",
+                            "service_key": "content",
+                            "params": {"prompt": "Retry the failed step."},
+                            "depends_on": [],
+                            "expected_output_schema": {
+                                "type": "object",
+                                "additionalProperties": True,
+                            },
+                        },
+                        {
+                            "key": "done",
+                            "kind": "llm",
+                            "service_key": "content",
+                            "params": {"prompt": "Keep the completed result."},
+                            "depends_on": [],
+                            "expected_output_schema": {
+                                "type": "object",
+                                "additionalProperties": True,
+                            },
+                        },
+                    ]
+                },
                 last_error={"type": "boom"},
             )
         )
@@ -102,7 +129,7 @@ async def _create_plan(
 async def test_plan_steps_include_workspace_chat_agent_display_fields(client: AsyncClient):
     import packages.core.database as dbmod
     from packages.core.models.execution import ExecutionPlan, ExecutionStep
-    from packages.core.models.workspace import Agent, AgentSubscription
+    from packages.core.models.workspace import Agent, AgentSubscription, Workspace
 
     headers, entity_id = await _auth(client, "plan_step_agent_display")
     workspace_id = generate_ulid()
@@ -113,6 +140,14 @@ async def test_plan_steps_include_workspace_chat_agent_display_fields(client: As
     pending_step_id = generate_ulid()
 
     async with dbmod.async_session() as db:
+        db.add(
+            Workspace(
+                id=workspace_id,
+                entity_id=entity_id,
+                name="Plan step display workspace",
+                settings={"access_mode": "members_only"},
+            )
+        )
         db.add(
             Agent(
                 id=agent_id,
@@ -230,6 +265,7 @@ async def test_approval_required_plan_surfaces_waiting_task_state_and_log(client
                     "service_key": "content",
                     "capability_id": "file.write",
                     "params": {"prompt": "Use generate_file to save the report."},
+                    "output_shape": "ArtifactResult",
                     "risk_level": "medium",
                     "requires_approval": True,
                 }
@@ -271,6 +307,140 @@ async def test_approval_required_plan_surfaces_waiting_task_state_and_log(client
 
 
 @pytest.mark.asyncio
+async def test_plan_approval_dispatch_failure_projects_workspace_recovery(
+    client: AsyncClient,
+    monkeypatch,
+):
+    import packages.core.database as dbmod
+    from packages.core.constants.pending_actions import PendingActionKind
+    from packages.core.models.execution import ExecutionPlan
+    from packages.core.models.task import Conversation, Message, Task
+    from packages.core.tasks import ai_tasks
+
+    headers, entity_id = await _auth(client, "plan_approval_dispatch_failure")
+    workspace = await client.post(
+        "/api/v1/workspaces",
+        headers=headers,
+        json={"name": "Plan Dispatch Recovery"},
+    )
+    workspace_id = workspace.json()["id"]
+    task_id, plan_id = generate_ulid(), generate_ulid()
+    async with dbmod.async_session() as db:
+        db.add(Task(
+            id=task_id,
+            entity_id=entity_id,
+            workspace_id=workspace_id,
+            title="Resume only after Plan approval",
+            status="waiting_on_customer",
+            priority=3,
+            task_type="general",
+            details={},
+        ))
+        db.add(ExecutionPlan(
+            id=plan_id,
+            entity_id=entity_id,
+            workspace_id=workspace_id,
+            task_id=task_id,
+            status="pending_approval",
+            execution_mode="live",
+            approval_required=True,
+            plan_dag={"steps": []},
+        ))
+        await db.commit()
+
+    def fail_dispatch(_plan_id: str) -> None:
+        raise RuntimeError("broker unavailable")
+
+    monkeypatch.setattr(ai_tasks.run_plan, "delay", fail_dispatch)
+    response = await client.post(
+        f"/api/v1/plans/{plan_id}/approve",
+        headers=headers,
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["status"] == "needs_attention"
+    async with dbmod.async_session() as db:
+        task = await db.get(Task, task_id)
+        plan = await db.get(ExecutionPlan, plan_id)
+        cards = list((await db.execute(
+            select(Message)
+            .join(Conversation, Message.conversation_id == Conversation.id)
+            .where(
+                Conversation.workspace_id == workspace_id,
+                Message.resolved_at.is_(None),
+            )
+        )).scalars().all())
+        recovery = next(
+            card for card in cards
+            if (card.pending_action or {}).get("kind")
+            == PendingActionKind.TASK_RECOVERY.value
+        )
+        assert task is not None and task.status == "waiting_on_customer"
+        assert task.details["_pending_plan_dispatch"] == {
+            "plan_id": plan_id,
+            "reason": "plan_approval_dispatch_failed",
+        }
+        assert plan is not None and plan.status == "needs_attention"
+        assert plan.last_error["type"] == "PlanContinuationDispatchFailed"
+        assert recovery.pending_action["plan_id"] == plan_id
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("with_task", [False, True])
+async def test_concurrent_plan_approval_dispatches_once(
+    client: AsyncClient,
+    monkeypatch,
+    with_task: bool,
+):
+    import packages.core.database as dbmod
+    from packages.core.models.execution import ExecutionPlan
+    from packages.core.models.task import Task
+    from packages.core.tasks import ai_tasks
+
+    headers, entity_id = await _auth(
+        client,
+        f"plan_approval_concurrent_{'task' if with_task else 'standalone'}",
+    )
+    plan_id = generate_ulid()
+    task_id = generate_ulid() if with_task else None
+    async with dbmod.async_session() as db:
+        if task_id:
+            db.add(Task(
+                id=task_id,
+                entity_id=entity_id,
+                title="Approve this Plan once",
+                status="waiting_on_customer",
+                priority=3,
+                task_type="general",
+                details={},
+            ))
+        db.add(ExecutionPlan(
+            id=plan_id,
+            entity_id=entity_id,
+            task_id=task_id,
+            status="pending_approval",
+            execution_mode="live",
+            approval_required=True,
+            plan_dag={"steps": []},
+        ))
+        await db.commit()
+
+    dispatched: list[str] = []
+    monkeypatch.setattr(
+        ai_tasks.run_plan,
+        "delay",
+        lambda current_plan_id: dispatched.append(current_plan_id),
+    )
+    responses = await asyncio.gather(
+        client.post(f"/api/v1/plans/{plan_id}/approve", headers=headers),
+        client.post(f"/api/v1/plans/{plan_id}/approve", headers=headers),
+    )
+
+    assert sorted(response.status_code for response in responses) == [200, 409]
+    assert dispatched == [plan_id]
+
+
+@pytest.mark.asyncio
 async def test_retry_failed_plan_steps_resets_only_retryable_steps(client: AsyncClient, monkeypatch):
     calls: list[str] = []
     events: list[tuple[str, str, str | None, dict | None]] = []
@@ -279,12 +449,25 @@ async def test_retry_failed_plan_steps_resets_only_retryable_steps(client: Async
     from packages.core.services import event_emitter
 
     monkeypatch.setattr(ai_tasks.run_plan, "delay", lambda plan_id: calls.append(plan_id))
+    async def capture_emit_in_session(
+        _db,
+        entity_id,
+        event_type,
+        *,
+        source=None,
+        payload=None,
+        workspace_id=None,
+        notify=True,
+        deliver_after_commit=False,
+    ):
+        assert deliver_after_commit is True
+        events.append((entity_id, event_type, source, payload))
+        return 0
+
     monkeypatch.setattr(
         event_emitter,
-        "emit",
-        lambda entity_id, event_type, source=None, payload=None: events.append(
-            (entity_id, event_type, source, payload)
-        ),
+        "emit_in_session",
+        capture_emit_in_session,
     )
 
     headers, entity_id = await _auth(client, "plan_retry_all")
@@ -345,6 +528,594 @@ async def test_retry_failed_plan_steps_resets_only_retryable_steps(client: Async
 
 
 @pytest.mark.asyncio
+async def test_retry_failed_plan_replans_artifact_write_constraint_conflict(
+    client: AsyncClient,
+    monkeypatch,
+):
+    import packages.core.database as dbmod
+    from packages.core.models.execution import ExecutionPlan, ExecutionStep
+    from packages.core.models.task import Task
+    from packages.core.tasks import ai_tasks
+
+    headers, entity_id = await _auth(client, "plan_retry_artifact_constraint")
+    plan_id, failed_step_id, _done_step_id, task_id = await _create_plan(
+        entity_id,
+        with_task=True,
+    )
+    assert task_id is not None
+
+    async with dbmod.async_session() as db:
+        task = await db.get(Task, task_id)
+        plan = await db.get(ExecutionPlan, plan_id)
+        step = await db.get(ExecutionStep, failed_step_id)
+        assert task is not None and plan is not None and step is not None
+        task.owner_service_key = "knowledge"
+        task.details = {
+            **dict(task.details or {}),
+            "runtime_context": {
+                "instructions": (
+                    "Keep this inspection read-only. Do not create or write files, "
+                    "including artifact generation."
+                ),
+            },
+        }
+        plan.plan_dag = {
+            "steps": [
+                {
+                    "key": "materialize_closeout_diagnosis",
+                    "kind": "subagent",
+                    "service_key": "knowledge",
+                    "params": {"prompt": "Save the closeout artifact."},
+                    "depends_on": [],
+                    "output_shape": "ArtifactResult",
+                    "expects": ["files"],
+                }
+            ],
+        }
+        step.step_key = "materialize_closeout_diagnosis"
+        step.kind = "subagent"
+        step.service_key = "knowledge"
+        step.error = {
+            "type": "StepResultFailed",
+            "message": "No saved closeout artifact was created because file writes are prohibited.",
+        }
+        await db.commit()
+
+    replanned_tasks: list[str] = []
+    monkeypatch.setattr(
+        ai_tasks.plan_and_run_task,
+        "delay",
+        lambda current_task_id: replanned_tasks.append(current_task_id),
+    )
+    monkeypatch.setattr(
+        ai_tasks.run_plan,
+        "delay",
+        lambda _plan_id: pytest.fail("The impossible persisted step must not be replayed"),
+    )
+
+    response = await client.post(
+        f"/api/v1/plans/{plan_id}/retry-failed-steps",
+        headers=headers,
+        json={},
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["plan"]["status"] == "replanned"
+    assert response.json()["reset_steps"] == 0
+    assert response.json()["dispatched"] is True
+    assert replanned_tasks == [task_id]
+
+    async with dbmod.async_session() as db:
+        task = await db.get(Task, task_id)
+        plan = await db.get(ExecutionPlan, plan_id)
+        step = await db.get(ExecutionStep, failed_step_id)
+        assert task is not None and plan is not None and step is not None
+        assert task.status == "in_progress"
+        assert task.details["_replan_context"]["reason"] == "task_constraint_contract_conflict"
+        assert "saved artifact" in task.details["_replan_context"]["issue"]
+        assert plan.last_error["type"] == "TaskConstraintContractConflict"
+        assert step.step_status == "failed"
+        assert step.attempt_count == 2
+
+
+@pytest.mark.asyncio
+async def test_plan_retry_dispatch_failure_returns_task_to_retryable_state(
+    client: AsyncClient,
+    monkeypatch,
+):
+    from packages.core.tasks import ai_tasks
+
+    headers, entity_id = await _auth(client, "plan_retry_dispatch_failure")
+    plan_id, _failed_step_id, _done_step_id, task_id = await _create_plan(
+        entity_id,
+        with_task=True,
+    )
+    assert task_id
+
+    def fail_dispatch(_plan_id: str) -> None:
+        raise RuntimeError("broker unavailable")
+
+    monkeypatch.setattr(ai_tasks.run_plan, "delay", fail_dispatch)
+    response = await client.post(
+        f"/api/v1/plans/{plan_id}/retry-failed-steps",
+        headers=headers,
+        json={},
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["dispatched"] is False
+    assert response.json()["plan"]["status"] == "needs_attention"
+    assert "human decision" not in response.json()["plan"]["last_error"]["message"].lower()
+    assert "retry" in response.json()["plan"]["last_error"]["message"].lower()
+
+    task = await client.get(f"/api/v1/tasks/{task_id}", headers=headers)
+    assert task.status_code == 200
+    assert task.json()["status"] == "waiting_on_customer"
+    assert task.json()["details"]["_pending_plan_dispatch"]["plan_id"] == plan_id
+
+    logs = await client.get(f"/api/v1/tasks/{task_id}/logs", headers=headers)
+    dispatch_failure = next(
+        log for log in reversed(logs.json())
+        if log["log_type"] == "ai_execution_failed"
+    )
+    assert "human decision" not in dispatch_failure["content"].lower()
+    assert "retry" in dispatch_failure["content"].lower()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("second_retry_surface", ["plan", "step"])
+async def test_standalone_plan_dispatch_failure_can_be_retried_without_resetting_steps(
+    client: AsyncClient,
+    monkeypatch,
+    second_retry_surface: str,
+):
+    import packages.core.database as dbmod
+    from packages.core.models.execution import ExecutionPlan, ExecutionStep
+    from packages.core.tasks import ai_tasks
+
+    headers, entity_id = await _auth(
+        client,
+        f"standalone_plan_dispatch_retry_{second_retry_surface}",
+    )
+    plan_id, failed_step_id, _done_step_id, task_id = await _create_plan(
+        entity_id,
+        status="needs_attention",
+        with_task=False,
+    )
+    assert task_id is None
+
+    async with dbmod.async_session() as db:
+        plan = await db.get(ExecutionPlan, plan_id)
+        step = await db.get(ExecutionStep, failed_step_id)
+        assert plan is not None and step is not None
+        plan.last_error = {
+            "type": "PlanContinuationDispatchFailed",
+            "message": "The Plan runner was not queued.",
+        }
+        step.step_status = "failed"
+        step.error = {
+            "type": "UserRequestedChanges",
+            "message": "Revise the saved review.",
+            "human_decision": {"choice": "request_changes"},
+        }
+        await db.commit()
+
+    dispatched: list[str] = []
+    monkeypatch.setattr(
+        ai_tasks.run_plan,
+        "delay",
+        lambda current_plan_id: dispatched.append(current_plan_id),
+    )
+    response = await client.post(
+        f"/api/v1/plans/{plan_id}/retry-failed-steps",
+        headers=headers,
+        json={},
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["reset_steps"] == 0
+    assert response.json()["dispatched"] is True
+    assert response.json()["plan"]["status"] == "draft"
+    assert response.json()["plan"]["last_error"] is None
+    assert dispatched == [plan_id]
+    second_endpoint = (
+        f"/api/v1/plans/{plan_id}/retry-failed-steps"
+        if second_retry_surface == "plan"
+        else f"/api/v1/plans/steps/{failed_step_id}/retry"
+    )
+    second_response = await client.post(
+        second_endpoint,
+        headers=headers,
+        json={},
+    )
+    assert second_response.status_code == 409, second_response.text
+    assert "active" in second_response.json()["detail"].lower()
+    async with dbmod.async_session() as db:
+        step = await db.get(ExecutionStep, failed_step_id)
+        assert step is not None and step.step_status == "failed"
+        assert step.error["type"] == "UserRequestedChanges"
+        assert step.error["human_decision"]["choice"] == "request_changes"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("retry_surface", ["plan", "step"])
+async def test_pending_plan_cannot_be_retried_while_executor_owns_it(
+    client: AsyncClient,
+    monkeypatch,
+    retry_surface: str,
+):
+    import packages.core.database as dbmod
+    from packages.core.models.execution import ExecutionPlan, ExecutionStep
+    from packages.core.tasks import ai_tasks
+
+    headers, entity_id = await _auth(client, f"pending_plan_retry_{retry_surface}")
+    plan_id, failed_step_id, _done_step_id, _task_id = await _create_plan(
+        entity_id,
+        status="pending",
+    )
+    monkeypatch.setattr(
+        ai_tasks.run_plan,
+        "delay",
+        lambda _plan_id: pytest.fail("An active pending Plan must not be dispatched again"),
+    )
+    endpoint = (
+        f"/api/v1/plans/{plan_id}/retry-failed-steps"
+        if retry_surface == "plan"
+        else f"/api/v1/plans/steps/{failed_step_id}/retry"
+    )
+
+    response = await client.post(endpoint, headers=headers, json={})
+
+    assert response.status_code == 409, response.text
+    assert "active" in response.json()["detail"].lower()
+    async with dbmod.async_session() as db:
+        plan = await db.get(ExecutionPlan, plan_id)
+        step = await db.get(ExecutionStep, failed_step_id)
+        assert plan is not None and plan.status == "pending"
+        assert plan.last_error == {"type": "boom"}
+        assert step is not None and step.step_status == "failed"
+        assert step.error == {"type": "ProviderError"}
+        assert step.result == {"stale": True}
+        assert step.attempt_count == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("retry_surface", ["plan", "step"])
+async def test_open_task_recovery_owns_generic_plan_retry(
+    client: AsyncClient,
+    monkeypatch,
+    retry_surface: str,
+):
+    import packages.core.database as dbmod
+    from packages.core.constants.approvals import ApprovalOriginKind, ApprovalStatus, HitlType
+    from packages.core.governance.approvals import (
+        ApprovalOrigin,
+        ApprovalSubject,
+        mint_approval_request,
+    )
+    from packages.core.models.execution import ExecutionPlan, ExecutionStep
+    from packages.core.models.hitl_request import HitlRequest
+    from packages.core.models.task import Task
+    from packages.core.tasks import ai_tasks
+
+    headers, entity_id = await _auth(client, f"task_recovery_retry_{retry_surface}")
+    plan_id, failed_step_id, _done_step_id, task_id = await _create_plan(
+        entity_id,
+        status="failed",
+        with_task=True,
+    )
+    assert task_id is not None
+
+    async with dbmod.async_session() as db:
+        task = await db.get(Task, task_id)
+        assert task is not None
+        task.status = "waiting_on_customer"
+        request = await mint_approval_request(
+            db,
+            subject=ApprovalSubject(
+                entity_id=entity_id,
+                action_key="task.recover",
+                resource_kind="task",
+                resource_id=task_id,
+            ),
+            origin=ApprovalOrigin(
+                kind=ApprovalOriginKind.TASK.value,
+                task_id=task_id,
+                plan_id=plan_id,
+            ),
+            reason="The task needs operator guidance before retrying.",
+            matched_rule="task.needs_recovery",
+            hitl_type=HitlType.ERROR.value,
+            payload={
+                "what_happened": "The task stopped before it finished.",
+                "why": "The task needs operator guidance before retrying.",
+                "action_to_take": "Retry or cancel the task.",
+                "action_link": f"/tasks/{task_id}",
+            },
+        )
+        request_id = request.id
+        await db.commit()
+
+    monkeypatch.setattr(
+        ai_tasks.run_plan,
+        "delay",
+        lambda _plan_id: pytest.fail("Generic retry must not bypass Task recovery"),
+    )
+    endpoint = (
+        f"/api/v1/plans/{plan_id}/retry-failed-steps"
+        if retry_surface == "plan"
+        else f"/api/v1/plans/steps/{failed_step_id}/retry"
+    )
+
+    response = await client.post(endpoint, headers=headers, json={})
+
+    assert response.status_code == 409, response.text
+    assert "Task recovery" in response.json()["detail"]
+    async with dbmod.async_session() as db:
+        plan = await db.get(ExecutionPlan, plan_id)
+        step = await db.get(ExecutionStep, failed_step_id)
+        task = await db.get(Task, task_id)
+        request = await db.get(HitlRequest, request_id)
+        assert plan is not None and plan.status == "failed"
+        assert plan.last_error == {"type": "boom"}
+        assert step is not None and step.step_status == "failed"
+        assert step.error == {"type": "ProviderError"}
+        assert step.result == {"stale": True}
+        assert task is not None and task.status == "waiting_on_customer"
+        assert request is not None and request.status == ApprovalStatus.PENDING.value
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("retry_surface", ["plan", "step"])
+async def test_task_bound_plan_dispatch_failure_stays_on_task_recovery_path(
+    client: AsyncClient,
+    monkeypatch,
+    retry_surface: str,
+):
+    import packages.core.database as dbmod
+    from packages.core.models.execution import ExecutionPlan, ExecutionStep
+    from packages.core.models.task import Task
+    from packages.core.tasks import ai_tasks
+
+    headers, entity_id = await _auth(
+        client,
+        f"task_plan_dispatch_recovery_{retry_surface}",
+    )
+    plan_id, failed_step_id, _done_step_id, task_id = await _create_plan(
+        entity_id,
+        status="needs_attention",
+        with_task=True,
+    )
+    assert task_id is not None
+
+    async with dbmod.async_session() as db:
+        plan = await db.get(ExecutionPlan, plan_id)
+        step = await db.get(ExecutionStep, failed_step_id)
+        task = await db.get(Task, task_id)
+        assert plan is not None and step is not None and task is not None
+        plan.last_error = {
+            "type": "PlanContinuationDispatchFailed",
+            "message": "The Plan runner was not queued.",
+        }
+        task.status = "waiting_on_customer"
+        task.details = {
+            **dict(task.details or {}),
+            "_pending_plan_dispatch": {
+                "plan_id": plan_id,
+                "reason": "plan_approval_dispatch_failed",
+            },
+        }
+        await db.commit()
+
+    monkeypatch.setattr(
+        ai_tasks.run_plan,
+        "delay",
+        lambda _plan_id: pytest.fail("Task-bound recovery must not dispatch here"),
+    )
+    endpoint = (
+        f"/api/v1/plans/{plan_id}/retry-failed-steps"
+        if retry_surface == "plan"
+        else f"/api/v1/plans/steps/{failed_step_id}/retry"
+    )
+    response = await client.post(endpoint, headers=headers, json={})
+
+    assert response.status_code == 409, response.text
+    assert "Task recovery" in response.json()["detail"]
+    async with dbmod.async_session() as db:
+        plan = await db.get(ExecutionPlan, plan_id)
+        step = await db.get(ExecutionStep, failed_step_id)
+        task = await db.get(Task, task_id)
+        assert plan is not None and plan.status == "needs_attention"
+        assert step is not None and step.step_status == "failed"
+        assert task is not None and task.status == "waiting_on_customer"
+        assert task.details["_pending_plan_dispatch"]["plan_id"] == plan_id
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("retry_surface", ["plan", "step"])
+async def test_generic_plan_retry_cannot_race_task_dispatch_recovery(
+    client: AsyncClient,
+    monkeypatch,
+    retry_surface: str,
+):
+    import packages.core.database as dbmod
+    from packages.core.models.execution import ExecutionPlan, ExecutionStep
+    from packages.core.models.task import Task
+    from packages.core.tasks import ai_tasks
+
+    headers, entity_id = await _auth(
+        client,
+        f"task_dispatch_retry_race_{retry_surface}",
+    )
+    plan_id, failed_step_id, _done_step_id, task_id = await _create_plan(
+        entity_id,
+        status="needs_attention",
+        with_task=True,
+    )
+    assert task_id is not None
+    human_error = {
+        "type": "UserDeniedApproval",
+        "message": "The user rejected this action.",
+        "human_decision": {"choice": "reject"},
+    }
+
+    async with dbmod.async_session() as db:
+        plan = await db.get(ExecutionPlan, plan_id)
+        step = await db.get(ExecutionStep, failed_step_id)
+        task = await db.get(Task, task_id)
+        assert plan is not None and step is not None and task is not None
+        plan.last_error = {
+            "type": "PlanContinuationDispatchFailed",
+            "message": "The Plan runner was not queued.",
+        }
+        step.error = human_error
+        task.status = "waiting_on_customer"
+        task.details = {
+            **dict(task.details or {}),
+            "_pending_plan_dispatch": {
+                "plan_id": plan_id,
+                "reason": "plan_approval_dispatch_failed",
+            },
+        }
+        await db.commit()
+
+    dispatched: list[str] = []
+    monkeypatch.setattr(
+        ai_tasks.run_plan,
+        "delay",
+        lambda current_plan_id: dispatched.append(current_plan_id),
+    )
+    task_retry = await client.post(
+        f"/api/v1/tasks/{task_id}/retry",
+        headers=headers,
+        json={},
+    )
+    assert task_retry.status_code == 200, task_retry.text
+    assert task_retry.json()["mode"] == "plan_dispatch"
+    assert task_retry.json()["reset_steps"] == 0
+
+    endpoint = (
+        f"/api/v1/plans/{plan_id}/retry-failed-steps"
+        if retry_surface == "plan"
+        else f"/api/v1/plans/steps/{failed_step_id}/retry"
+    )
+    competing_retry = await client.post(endpoint, headers=headers, json={})
+
+    assert competing_retry.status_code == 409, competing_retry.text
+    assert "active" in competing_retry.json()["detail"].lower()
+    assert dispatched == [plan_id]
+    async with dbmod.async_session() as db:
+        plan = await db.get(ExecutionPlan, plan_id)
+        step = await db.get(ExecutionStep, failed_step_id)
+        task = await db.get(Task, task_id)
+        assert plan is not None and plan.status == "running"
+        assert plan.last_error is None
+        assert step is not None and step.step_status == "failed"
+        assert step.error == human_error
+        assert task is not None and task.status == "in_progress"
+        assert "_pending_plan_dispatch" not in task.details
+
+
+@pytest.mark.asyncio
+async def test_waiting_step_lock_order_matches_task_bound_plan_mutations(
+    client: AsyncClient,
+):
+    import packages.core.database as dbmod
+    from packages.core.models.execution import ExecutionStep
+    from packages.core.models.task import Task
+    from packages.core.services.step_resume import lock_waiting_step_for_decision
+
+    _headers, entity_id = await _auth(client, "waiting_step_lock_order")
+    plan_id, step_id, _done_step_id, task_id = await _create_plan(
+        entity_id,
+        status="paused",
+        with_task=True,
+    )
+    assert task_id is not None
+
+    async with dbmod.async_session() as db:
+        task = await db.get(Task, task_id)
+        step = await db.get(ExecutionStep, step_id)
+        assert task is not None and step is not None
+        task.status = "waiting_on_customer"
+        step.step_status = "waiting_human"
+        step.error = None
+        await db.commit()
+
+    async with dbmod.async_session() as db:
+        lock_order: list[str] = []
+
+        class RecordingSession:
+            async def execute(self, statement, *args, **kwargs):
+                sql = str(statement)
+                if "FOR UPDATE" in sql:
+                    if "FROM tasks" in sql:
+                        lock_order.append("task")
+                    elif "FROM execution_plans" in sql:
+                        lock_order.append("plan")
+                    elif "FROM execution_steps" in sql:
+                        lock_order.append("step")
+                return await db.execute(statement, *args, **kwargs)
+
+        locked = await lock_waiting_step_for_decision(
+            RecordingSession(),  # type: ignore[arg-type]
+            entity_id=entity_id,
+            task_id=task_id,
+            plan_id=plan_id,
+            step_id=step_id,
+        )
+
+        assert locked is not None and locked.id == step_id
+        assert lock_order == ["task", "plan", "step"]
+
+
+@pytest.mark.asyncio
+async def test_contract_replan_dispatch_failure_returns_task_to_retryable_state(
+    client: AsyncClient,
+    monkeypatch,
+):
+    import packages.core.database as dbmod
+    from apps.api.routers.plans import _dispatch_task_replan
+    from packages.core.models.execution import ExecutionPlan
+    from packages.core.models.task import Task
+    from packages.core.tasks import ai_tasks
+
+    _headers, entity_id = await _auth(client, "contract_replan_dispatch_failure")
+    task_id, plan_id = generate_ulid(), generate_ulid()
+
+    def fail_dispatch(_task_id: str) -> None:
+        raise RuntimeError("broker unavailable")
+
+    monkeypatch.setattr(ai_tasks.plan_and_run_task, "delay", fail_dispatch)
+    async with dbmod.async_session() as db:
+        task = Task(
+            id=task_id,
+            entity_id=entity_id,
+            title="Replan task",
+            status="in_progress",
+            priority=3,
+            task_type="general",
+            details={},
+        )
+        plan = ExecutionPlan(
+            id=plan_id,
+            entity_id=entity_id,
+            task_id=task_id,
+            status="replanned",
+            execution_mode="live",
+            approval_required=False,
+            plan_dag={"steps": []},
+        )
+        db.add_all([task, plan])
+        await db.commit()
+
+        dispatched = await _dispatch_task_replan(db, plan)
+        assert dispatched is False
+        await db.refresh(task)
+        assert task.status == "waiting_on_customer"
+
+
+@pytest.mark.asyncio
 async def test_retry_single_step_rejects_done_step(client: AsyncClient):
     headers, entity_id = await _auth(client, "plan_retry_done")
     _plan_id, _failed_step_id, done_step_id, _task_id = await _create_plan(entity_id)
@@ -357,6 +1128,274 @@ async def test_retry_single_step_rejects_done_step(client: AsyncClient):
 
     assert resp.status_code == 409
     assert "done" in resp.json()["detail"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("retry_surface", ["plan", "step"])
+async def test_replanned_execution_history_cannot_be_retried(
+    client: AsyncClient,
+    monkeypatch,
+    retry_surface: str,
+):
+    import packages.core.database as dbmod
+    from packages.core.models.execution import ExecutionPlan, ExecutionStep
+    from packages.core.tasks import ai_tasks
+
+    dispatched: list[str] = []
+    monkeypatch.setattr(
+        ai_tasks.run_plan,
+        "delay",
+        lambda plan_id: dispatched.append(plan_id),
+    )
+    headers, entity_id = await _auth(
+        client,
+        f"replanned_history_{retry_surface}",
+    )
+    plan_id, failed_step_id, _done_step_id, _task_id = await _create_plan(
+        entity_id,
+        status="replanned",
+    )
+    endpoint = (
+        f"/api/v1/plans/{plan_id}/retry-failed-steps"
+        if retry_surface == "plan"
+        else f"/api/v1/plans/steps/{failed_step_id}/retry"
+    )
+
+    response = await client.post(endpoint, headers=headers, json={})
+
+    assert response.status_code == 409, response.text
+    assert "replanned" in response.json()["detail"].lower()
+    assert dispatched == []
+    async with dbmod.async_session() as db:
+        plan = await db.get(ExecutionPlan, plan_id)
+        failed_step = await db.get(ExecutionStep, failed_step_id)
+        assert plan is not None and plan.status == "replanned"
+        assert plan.last_error == {"type": "boom"}
+        assert failed_step is not None and failed_step.step_status == "failed"
+        assert failed_step.error == {"type": "ProviderError"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("with_task", [False, True])
+@pytest.mark.parametrize("retry_surface", ["plan", "step"])
+async def test_concurrent_plan_retry_dispatches_once(
+    client: AsyncClient,
+    monkeypatch,
+    with_task: bool,
+    retry_surface: str,
+):
+    """Task-bound and taskless Plans each expose one retry winner."""
+    from packages.core.tasks import ai_tasks
+
+    dispatched: list[str] = []
+    monkeypatch.setattr(
+        ai_tasks.run_plan,
+        "delay",
+        lambda plan_id: dispatched.append(plan_id),
+    )
+    headers, entity_id = await _auth(
+        client,
+        (
+            f"plan_retry_concurrent_{retry_surface}_"
+            f"{'task' if with_task else 'standalone'}"
+        ),
+    )
+    plan_id, failed_step_id, _done_step_id, task_id = await _create_plan(
+        entity_id,
+        with_task=with_task,
+    )
+    endpoint = (
+        f"/api/v1/plans/{plan_id}/retry-failed-steps"
+        if retry_surface == "plan"
+        else f"/api/v1/plans/steps/{failed_step_id}/retry"
+    )
+
+    responses = await asyncio.gather(
+        client.post(endpoint, headers=headers, json={}),
+        client.post(endpoint, headers=headers, json={}),
+    )
+
+    assert sorted(response.status_code for response in responses) == [200, 409]
+    assert dispatched == [plan_id]
+    if task_id:
+        current = await client.get(f"/api/v1/tasks/{task_id}", headers=headers)
+        assert current.status_code == 200
+        assert current.json()["details"]["manual_retry_count"] == 5
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("retry_surface", ["plan", "step"])
+async def test_retry_waiting_human_review_requires_explicit_card_decision(
+    client: AsyncClient,
+    monkeypatch,
+    retry_surface: str,
+):
+    import packages.core.database as dbmod
+    from packages.core.models.execution import ExecutionPlan, ExecutionStep
+    from packages.core.tasks import ai_tasks
+
+    dispatched: list[str] = []
+    monkeypatch.setattr(
+        ai_tasks.run_plan,
+        "delay",
+        lambda plan_id: dispatched.append(plan_id),
+    )
+    headers, entity_id = await _auth(
+        client,
+        f"plan_human_retry_{retry_surface}",
+    )
+    plan_id, step_id = generate_ulid(), generate_ulid()
+    async with dbmod.async_session() as db:
+        db.add(ExecutionPlan(
+            id=plan_id,
+            entity_id=entity_id,
+            status="paused",
+            execution_mode="live",
+            approval_required=False,
+            plan_dag={"steps": []},
+        ))
+        db.add(ExecutionStep(
+            id=step_id,
+            plan_id=plan_id,
+            entity_id=entity_id,
+            step_key="review_output",
+            kind="human",
+            params={"prompt": "Review the output."},
+            depends_on=[],
+            step_status="waiting_human",
+            human_input_prompt="Review the output.",
+        ))
+        await db.commit()
+
+    endpoint = (
+        f"/api/v1/plans/{plan_id}/retry-failed-steps"
+        if retry_surface == "plan"
+        else f"/api/v1/plans/steps/{step_id}/retry"
+    )
+    response = await client.post(endpoint, headers=headers, json={})
+
+    assert response.status_code == 409, response.text
+    assert dispatched == []
+    steps = await client.get(f"/api/v1/plans/{plan_id}/steps", headers=headers)
+    review_step = next(row for row in steps.json() if row["id"] == step_id)
+    assert review_step["step_status"] == "waiting_human"
+    assert review_step["human_input_response"] is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("retry_surface", ["plan", "step"])
+async def test_contract_replan_cannot_bypass_waiting_human_decision(
+    client: AsyncClient,
+    monkeypatch,
+    retry_surface: str,
+):
+    import packages.core.database as dbmod
+    from packages.core.models.execution import ExecutionPlan, ExecutionStep
+    from packages.core.models.task import Task
+    from packages.core.tasks import ai_tasks
+
+    replanned: list[str] = []
+    resumed: list[str] = []
+    monkeypatch.setattr(
+        ai_tasks.plan_and_run_task,
+        "delay",
+        lambda task_id: replanned.append(task_id),
+    )
+    monkeypatch.setattr(
+        ai_tasks.run_plan,
+        "delay",
+        lambda plan_id: resumed.append(plan_id),
+    )
+    headers, entity_id = await _auth(
+        client,
+        f"plan_contract_waiting_{retry_surface}",
+    )
+    task_id, plan_id = generate_ulid(), generate_ulid()
+    failed_step_id, review_step_id = generate_ulid(), generate_ulid()
+    stale_artifact_ref = "${{ steps.prepare.result.outputs.files }}"
+    async with dbmod.async_session() as db:
+        db.add(Task(
+            id=task_id,
+            entity_id=entity_id,
+            title="Retry a stale Plan with a pending review",
+            status="waiting_on_customer",
+            priority=3,
+            task_type="general",
+            owner_service_key="content",
+            details={},
+        ))
+        db.add(ExecutionPlan(
+            id=plan_id,
+            entity_id=entity_id,
+            task_id=task_id,
+            status="needs_attention",
+            execution_mode="live",
+            approval_required=False,
+            plan_dag={
+                "steps": [
+                    {
+                        "key": "prepare",
+                        "kind": "subagent",
+                        "service_key": "content",
+                        "output_shape": "ArtifactResult",
+                        "params": {"prompt": "Prepare files."},
+                    },
+                    {
+                        "key": "review",
+                        "kind": "human",
+                        "depends_on": ["prepare"],
+                        "params": {
+                            "prompt": "Review files.",
+                            "review_artifacts": stale_artifact_ref,
+                        },
+                    },
+                ],
+            },
+        ))
+        db.add_all([
+            ExecutionStep(
+                id=failed_step_id,
+                plan_id=plan_id,
+                entity_id=entity_id,
+                step_key="prepare",
+                kind="subagent",
+                params={},
+                depends_on=[],
+                step_status="failed",
+                error={"type": "ProviderError"},
+            ),
+            ExecutionStep(
+                id=review_step_id,
+                plan_id=plan_id,
+                entity_id=entity_id,
+                step_key="review",
+                kind="human",
+                params={"review_artifacts": stale_artifact_ref},
+                depends_on=["prepare"],
+                step_status="waiting_human",
+                human_input_prompt="Review files.",
+            ),
+        ])
+        await db.commit()
+
+    endpoint = (
+        f"/api/v1/plans/{plan_id}/retry-failed-steps"
+        if retry_surface == "plan"
+        else f"/api/v1/plans/steps/{failed_step_id}/retry"
+    )
+    response = await client.post(endpoint, headers=headers, json={})
+
+    assert response.status_code == 409, response.text
+    assert "human decision" in response.json()["detail"].lower()
+    assert replanned == []
+    assert resumed == []
+    async with dbmod.async_session() as db:
+        plan = await db.get(ExecutionPlan, plan_id)
+        failed_step = await db.get(ExecutionStep, failed_step_id)
+        review_step = await db.get(ExecutionStep, review_step_id)
+        assert plan is not None and plan.status == "needs_attention"
+        assert failed_step is not None and failed_step.step_status == "failed"
+        assert review_step is not None and review_step.step_status == "waiting_human"
 
 
 @pytest.mark.asyncio
@@ -409,12 +1448,25 @@ async def test_retry_single_step_resets_skipped_downstream_dependents(client: As
     from packages.core.services import event_emitter
 
     monkeypatch.setattr(ai_tasks.run_plan, "delay", lambda plan_id: calls.append(plan_id))
+    async def capture_emit_in_session(
+        _db,
+        entity_id,
+        event_type,
+        *,
+        source=None,
+        payload=None,
+        workspace_id=None,
+        notify=True,
+        deliver_after_commit=False,
+    ):
+        assert deliver_after_commit is True
+        events.append((entity_id, event_type, source, payload))
+        return 0
+
     monkeypatch.setattr(
         event_emitter,
-        "emit",
-        lambda entity_id, event_type, source=None, payload=None: events.append(
-            (entity_id, event_type, source, payload)
-        ),
+        "emit_in_session",
+        capture_emit_in_session,
     )
 
     import packages.core.database as dbmod
@@ -451,7 +1503,65 @@ async def test_retry_single_step_resets_skipped_downstream_dependents(client: As
                 status="failed",
                 execution_mode="live",
                 approval_required=False,
-                plan_dag={"steps": []},
+                plan_dag={
+                    "steps": [
+                        {
+                            "key": "project_deep_dives_doc",
+                            "kind": "subagent",
+                            "service_key": "content",
+                            "params": {"prompt": "Create the project deep dives document."},
+                            "depends_on": [],
+                            "expected_output_schema": {
+                                "type": "object",
+                                "additionalProperties": True,
+                            },
+                        },
+                        {
+                            "key": "behavioral_stories_doc",
+                            "kind": "subagent",
+                            "service_key": "content",
+                            "params": {"prompt": "Create the behavioral stories document."},
+                            "depends_on": ["project_deep_dives_doc"],
+                            "expected_output_schema": {
+                                "type": "object",
+                                "additionalProperties": True,
+                            },
+                        },
+                        {
+                            "key": "system_design_angles_doc",
+                            "kind": "subagent",
+                            "service_key": "content",
+                            "params": {"prompt": "Create the system design document."},
+                            "depends_on": ["behavioral_stories_doc"],
+                            "expected_output_schema": {
+                                "type": "object",
+                                "additionalProperties": True,
+                            },
+                        },
+                        {
+                            "key": "unrelated_done",
+                            "kind": "subagent",
+                            "service_key": "content",
+                            "params": {"prompt": "Complete the unrelated work."},
+                            "depends_on": [],
+                            "expected_output_schema": {
+                                "type": "object",
+                                "additionalProperties": True,
+                            },
+                        },
+                        {
+                            "key": "unrelated_skipped",
+                            "kind": "subagent",
+                            "service_key": "content",
+                            "params": {"prompt": "Complete the unrelated dependent work."},
+                            "depends_on": ["unrelated_done"],
+                            "expected_output_schema": {
+                                "type": "object",
+                                "additionalProperties": True,
+                            },
+                        },
+                    ]
+                },
             )
         )
         db.add_all(
@@ -563,12 +1673,25 @@ async def test_retry_single_failed_step_dispatches_plan(client: AsyncClient, mon
     from packages.core.services import event_emitter
 
     monkeypatch.setattr(ai_tasks.run_plan, "delay", lambda plan_id: calls.append(plan_id))
+    async def capture_emit_in_session(
+        _db,
+        entity_id,
+        event_type,
+        *,
+        source=None,
+        payload=None,
+        workspace_id=None,
+        notify=True,
+        deliver_after_commit=False,
+    ):
+        assert deliver_after_commit is True
+        events.append((entity_id, event_type, source, payload))
+        return 0
+
     monkeypatch.setattr(
         event_emitter,
-        "emit",
-        lambda entity_id, event_type, source=None, payload=None: events.append(
-            (entity_id, event_type, source, payload)
-        ),
+        "emit_in_session",
+        capture_emit_in_session,
     )
 
     headers, entity_id = await _auth(client, "plan_retry_one")

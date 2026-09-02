@@ -14,7 +14,6 @@ import logging
 
 from fastapi import APIRouter, HTTPException, Query, Request
 from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
 
 from packages.core.database import async_session
 from packages.core.models.channel import ChannelConfig
@@ -33,25 +32,31 @@ router = APIRouter(prefix="/api/v1/channels/telegram", tags=["channels"])
 
 async def _get_adapter_and_config(
     config_id: str,
-) -> tuple[TelegramAdapter, ChannelConfig]:
-    """Load ChannelConfig and build a TelegramAdapter from its credentials."""
+) -> tuple[TelegramAdapter, ChannelConfig, dict]:
+    """Load a Telegram source-linked config and lease its current credentials."""
+    from packages.core.services.channel_credentials import lease_channel_credentials
+
     async with async_session() as db:
         result = await db.execute(
             select(ChannelConfig).where(ChannelConfig.id == config_id)
         )
         cc = result.scalar_one_or_none()
+        if not cc:
+            raise HTTPException(404, "Channel config not found")
+        try:
+            creds = await lease_channel_credentials(
+                db, cc, reason="channel.telegram.inbound_webhook",
+            )
+        except ValueError as exc:
+            raise HTTPException(410, "Telegram credential source is unavailable") from exc
 
-    if not cc:
-        raise HTTPException(404, "Channel config not found")
-
-    creds = cc.credentials or {}
     bot_token = creds.get("bot_token", "")
 
     if not bot_token:
-        raise HTTPException(500, "Telegram channel config is missing required credentials (bot_token)")
+        raise HTTPException(410, "Telegram credential source is missing bot_token")
 
     adapter = TelegramAdapter(bot_token=bot_token)
-    return adapter, cc
+    return adapter, cc, creds
 
 
 def _hash_bot_token(bot_token: str) -> str:
@@ -77,10 +82,10 @@ async def telegram_webhook(
 
     Telegram POSTs JSON updates to the registered webhook URL.
     The URL includes a hash of the bot token for verification.
-    Additionally, the optional X-Telegram-Bot-Api-Secret-Token header
-    is checked if a secret_token was configured.
+    The X-Telegram-Bot-Api-Secret-Token header is required and checked against
+    the server-generated secret held by the source Integration.
     """
-    adapter, cc = await _get_adapter_and_config(config_id)
+    adapter, cc, credentials = await _get_adapter_and_config(config_id)
 
     # Verify the bot token hash matches
     expected_hash = _hash_bot_token(adapter.bot_token)
@@ -91,12 +96,16 @@ async def telegram_webhook(
         )
         raise HTTPException(403, "Invalid bot token hash")
 
-    # Optionally verify the secret token header
-    secret_token = (cc.credentials or {}).get("secret_token", "")
-    if secret_token:
-        header_secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
-        if header_secret != secret_token:
-            raise HTTPException(403, "Invalid secret token")
+    secret_token = credentials.get("secret_token", "")
+    header_secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
+    if not secret_token and cc.telegram_bot_id is None:
+        logger.warning(
+            "Accepting legacy Telegram webhook without secret config=%s; "
+            "re-register the connection to enable secret verification",
+            config_id,
+        )
+    elif not secret_token or header_secret != secret_token:
+        raise HTTPException(403, "Invalid Telegram webhook secret")
 
     # Parse JSON body
     try:

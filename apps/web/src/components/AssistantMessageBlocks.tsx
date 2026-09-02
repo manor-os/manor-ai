@@ -1,20 +1,72 @@
 import ChatMarkdown from "./ChatMarkdown";
+import CollapsibleSentMessage from "./chat/CollapsibleSentMessage";
 import { useEffect, useMemo, useState } from "react";
 import type { CSSProperties } from "react";
 import type {
   AssistantBlock,
   AssistantProcessStep,
+  AssistantResponseSurfaceBlock,
+  ResponseSurfaceSubmissionReceipt,
+  ResponseSurfaceSubmissionResult,
   SubAgentEvent,
   ToolCall,
 } from "../lib/chatStream";
-import { normalizeToolResult } from "../lib/chatStream";
+import { formatPublicToolResult } from "../lib/chatStream";
+import type { WorkspaceLedgerOverview } from "../lib/api";
 import { shouldExpandAssistantProcessBlock } from "../lib/assistantProcessFlow";
-import { stripEditorLiveEditBlocks } from "../lib/editorLiveChat";
+import {
+  projectAssistantText,
+  visibleAssistantText,
+} from "../lib/assistantTextProjection";
 import { t } from "../lib/i18n";
 import { matchSubAgentRuns } from "../lib/subAgentDisplay";
 import { formatUserFacingStructuredText } from "../lib/taskDisplay";
 import { processSurfaceSummary, runtimeToolBadge } from "../lib/toolRuntimeSurface";
+import { normalizeResponseSurfaceBlock } from "../lib/responseSurface";
+import { PendingActionKind } from "../lib/pendingActionKinds";
+import {
+  coalesceWorkspaceLedgerQueryBlocks,
+  isWorkspaceLedgerOverview,
+  isWorkspaceLedgerQueryVisualization,
+  workspaceLedgerOverviewFrameHeights,
+  workspaceLedgerQueryFrameHeights,
+} from "../lib/workspaceLedgerVisualization";
 import AgentLoopStep from "./ui/AgentLoopStep";
+import InteractiveResponseSurface from "./InteractiveResponseSurface";
+import Button from "./ui/Button";
+
+export type AssistantPendingActionKind = "approval" | "input" | null;
+
+type AssistantPendingActionMessage = {
+  hitl_requests?: Array<{ resolved?: boolean; type?: string }> | null;
+  pending_action?: { kind?: string; hitl_type?: unknown } | null;
+  resolved_at?: unknown;
+};
+
+const INPUT_PENDING_ACTION_KINDS = new Set<string>([
+  PendingActionKind.HUMAN_INPUT,
+  PendingActionKind.NEEDS_INPUT,
+  PendingActionKind.NEEDS_LOGIN,
+  PendingActionKind.TASK_RECOVERY,
+  PendingActionKind.RETRY_STRATEGIST_REVIEW,
+  PendingActionKind.WORKFLOW_INPUT,
+  PendingActionKind.WORKFLOW_STARTER_INPUT,
+  PendingActionKind.WORKFLOW_RETRY,
+]);
+
+export function assistantPendingActionKindForMessage(
+  message: AssistantPendingActionMessage,
+): AssistantPendingActionKind {
+  const unresolved = (message.hitl_requests || []).filter((request) => !request.resolved);
+  if (unresolved.some((request) => request.type === "approval")) return "approval";
+  if (unresolved.length > 0) return "input";
+  if (message.resolved_at || !message.pending_action?.kind) return null;
+  const hitlType = String(message.pending_action.hitl_type || "").toLowerCase();
+  if (hitlType === "error" || hitlType === "failure") return null;
+  return INPUT_PENDING_ACTION_KINDS.has(message.pending_action.kind)
+    ? "input"
+    : "approval";
+}
 
 function processStepToToolCall(step: AssistantProcessStep): ToolCall {
   const status =
@@ -26,7 +78,9 @@ function processStepToToolCall(step: AssistantProcessStep): ToolCall {
   return {
     name: step.name || "tool",
     arguments: step.arguments_preview,
-    result: step.result_preview || step.summary || step.display_name,
+    result: formatPublicToolResult(
+      step.result_preview || step.summary || step.display_name,
+    ),
     status,
     duration:
       typeof step.duration_ms === "number"
@@ -46,9 +100,6 @@ function formatDuration(ms?: number) {
   return `${minutes}m ${seconds}s`;
 }
 
-const COLLAPSIBLE_FINAL_MAX_CHARS = 900;
-const COLLAPSIBLE_FINAL_MAX_LINES = 12;
-
 function CollapsibleFinalMarkdown({
   content,
   isUser,
@@ -62,47 +113,15 @@ function CollapsibleFinalMarkdown({
   returnTo?: string;
   enabled: boolean;
 }) {
-  const [expanded, setExpanded] = useState(false);
-  const shouldCollapse =
-    enabled &&
-    !streaming &&
-    (content.length > COLLAPSIBLE_FINAL_MAX_CHARS ||
-      content.split(/\r?\n/).length > COLLAPSIBLE_FINAL_MAX_LINES);
-
-  if (!shouldCollapse) {
-    return (
+  return (
+    <CollapsibleSentMessage text={content} enabled={enabled && !streaming} tone={isUser ? "user" : "assistant"}>
       <ChatMarkdown
         content={content}
         isUser={isUser}
         streaming={streaming}
         returnTo={returnTo}
       />
-    );
-  }
-
-  return (
-    <div className="workspace-markdown-expandable">
-      <div
-        className={`workspace-markdown-clamp${expanded ? "" : " workspace-markdown-clamp--collapsed"}`}
-        style={
-          expanded
-            ? undefined
-            : ({ "--workspace-markdown-clamp-height": "260px" } as CSSProperties)
-        }
-      >
-        <ChatMarkdown content={content} isUser={isUser} returnTo={returnTo} />
-        {!expanded && (
-          <button
-            type="button"
-            className="workspace-markdown-expand-button"
-            onClick={() => setExpanded(true)}
-            aria-label={t("chat.show_more")}
-          >
-            <span aria-hidden="true">...</span>
-          </button>
-        )}
-      </div>
-    </div>
+    </CollapsibleSentMessage>
   );
 }
 
@@ -123,7 +142,7 @@ function processVerb(step: AssistantProcessStep) {
   const name = String(step.name || "").toLowerCase();
   const display = step.display_name || step.name || "tool";
   const args = parsePreviewObject(step.arguments_preview);
-  const result = parsePreviewObject(step.result_preview);
+  const result = parsePreviewObject(formatPublicToolResult(step.result_preview));
   const genericTarget = stepTarget(step, args, display);
   if (name === "manor") {
     const manorParams =
@@ -675,20 +694,31 @@ function RuntimeSurfaceBadge({
 }
 
 function stripInternalProtocolText(value?: string | null) {
-  if (!value) return value || "";
-  return stripEditorLiveEditBlocks(value);
+  return visibleAssistantText(value);
 }
 
 function sanitizeAssistantBlocks(blocks?: AssistantBlock[] | null): AssistantBlock[] {
   if (!Array.isArray(blocks)) return [];
-  return blocks.map((block) => {
+  const sanitized = blocks.flatMap<AssistantBlock>((block) => {
     if (block.type === "text") {
-      return {
+      return [{
         ...block,
         text: stripInternalProtocolText(block.text),
-      };
+      }];
     }
-    return {
+    if (block.type === "visualization") {
+      if (block.kind === "workspace_ledger_overview") {
+        if (!isWorkspaceLedgerOverview(block.data)) return [];
+      } else if (block.kind === "ledger_query_result") {
+        if (!isWorkspaceLedgerQueryVisualization(block.data)) return [];
+      } else return [];
+      return [block];
+    }
+    if (block.type === "surface") {
+      const surface = normalizeResponseSurfaceBlock(block);
+      return surface ? [surface] : [];
+    }
+    return [{
       ...block,
       title: stripInternalProtocolText(block.title),
       note: stripInternalProtocolText(block.note),
@@ -698,10 +728,72 @@ function sanitizeAssistantBlocks(blocks?: AssistantBlock[] | null): AssistantBlo
         summary: stripInternalProtocolText(step.summary),
         assistant_text: stripInternalProtocolText(step.assistant_text),
         arguments_preview: stripInternalProtocolText(step.arguments_preview),
-        result_preview: stripInternalProtocolText(step.result_preview),
+        result_preview: formatPublicToolResult(
+          stripInternalProtocolText(step.result_preview),
+        ),
       })),
-    };
+    }];
   });
+  return coalesceWorkspaceLedgerQueryBlocks(sanitized);
+}
+
+function AssistantLedgerVisualization({
+  block,
+  onConfigure,
+}: {
+  block: Extract<AssistantBlock, { type: "visualization" }>;
+  onConfigure?: (data: WorkspaceLedgerOverview) => void;
+}) {
+  const isOverview = block.kind === "workspace_ledger_overview";
+  const heights = block.kind === "workspace_ledger_overview"
+    ? workspaceLedgerOverviewFrameHeights(block.data)
+    : workspaceLedgerQueryFrameHeights(block.data);
+  const title = isOverview
+    ? t("component.workspace_chat.business_ledger_overview")
+    : t("component.workspace_chat.ledger_query_result");
+  const surface = useMemo<AssistantResponseSurfaceBlock>(() => ({
+    id: block.id,
+    type: "surface",
+    version: 1,
+    title,
+    render: {
+      kind: "template",
+      template_id: isOverview
+        ? "workspace.ledger.overview"
+        : "workspace.ledger.query",
+      template_version: 1,
+      props: block.data as unknown as Record<string, unknown>,
+    },
+    display: {
+      preferred: "inline",
+      inline_height: heights.desktop,
+      focusable: false,
+    },
+    actions: [],
+    fallback_markdown: title,
+  }), [block.data, block.id, heights.desktop, isOverview, title]);
+
+  return (
+    <section className="assistant-ledger-visualization" aria-label={title}>
+      <InteractiveResponseSurface
+        surface={surface}
+        sourceMessageId={block.id}
+        chrome={false}
+        frameClassName="assistant-ledger-visualization__frame"
+        frameStyle={{
+          "--assistant-ledger-height": `${heights.desktop}px`,
+          "--assistant-ledger-mobile-height": `${heights.mobile}px`,
+        } as CSSProperties}
+      />
+      {onConfigure && block.kind === "workspace_ledger_overview" && (
+        <div className="assistant-ledger-visualization__actions">
+          <Button size="sm" onClick={() => onConfigure(block.data)}>
+            {t("component.workspace_chat.configure_ledgers")}
+          </Button>
+        </div>
+      )}
+    </section>
+  );
 }
 
 function AssistantProcessBlock({
@@ -709,7 +801,7 @@ function AssistantProcessBlock({
   openingText,
   progressByStepSeq,
   minimal = false,
-  hasFinalOutput = false,
+  pendingActionKind = null,
   returnTo,
   subAgentRuns = [],
 }: {
@@ -717,7 +809,7 @@ function AssistantProcessBlock({
   openingText: string;
   progressByStepSeq: Map<number, string>;
   minimal?: boolean;
-  hasFinalOutput?: boolean;
+  pendingActionKind?: AssistantPendingActionKind;
   returnTo?: string;
   subAgentRuns?: SubAgentEvent[];
 }) {
@@ -744,13 +836,15 @@ function AssistantProcessBlock({
     subAgentRunByStep.size > 0
       ? ""
       : processSurfaceSummary(steps.map((step) => step.name));
-  const title = hasRunning
-    ? t("component.assistant_message_blocks.processing")
-    : hasError
-      ? hasFinalOutput
-        ? t("component.assistant_message_blocks.process_recovered")
-        : t("component.assistant_message_blocks.process_error")
-      : t("component.assistant_message_blocks.processed");
+  const title = pendingActionKind === "approval"
+    ? t("component.assistant_message_blocks.process_waiting_approval")
+    : pendingActionKind === "input"
+      ? t("component.assistant_message_blocks.process_waiting_input")
+      : hasRunning
+        ? t("component.assistant_message_blocks.processing")
+         : hasError
+           ? t("component.assistant_message_blocks.process_error")
+           : t("component.assistant_message_blocks.processed");
 
   useEffect(() => {
     setExpanded(autoExpand);
@@ -816,7 +910,7 @@ function AssistantProcessBlock({
               );
             }
 
-            const resultText = normalizeToolResult(tool.result);
+            const resultText = formatPublicToolResult(tool.result);
             const argumentsText = step.arguments_preview ? formatUserFacingStructuredText(step.arguments_preview) : "";
             const displayResultText = resultText ? formatUserFacingStructuredText(resultText) : "";
             const progressText = progressByStepSeq.get(Number(step.seq || index + 1)) || "";
@@ -870,6 +964,11 @@ export default function AssistantMessageBlocks({
   collapseLongFinal = false,
   returnTo,
   subAgentRuns = [],
+  onConfigureWorkspaceLedgers,
+  onResponseSurfaceSubmit,
+  responseSurfaceSubmissionReceipts = [],
+  sourceMessageId,
+  pendingActionKind = null,
 }: {
   blocks?: AssistantBlock[] | null;
   content?: string | null;
@@ -878,6 +977,15 @@ export default function AssistantMessageBlocks({
   streaming?: boolean;
   returnTo?: string;
   subAgentRuns?: SubAgentEvent[];
+  onConfigureWorkspaceLedgers?: (data: WorkspaceLedgerOverview) => void;
+  onResponseSurfaceSubmit?: (
+    submission: ResponseSurfaceSubmissionReceipt,
+  ) => void | boolean | ResponseSurfaceSubmissionResult
+    | Promise<void | boolean | ResponseSurfaceSubmissionResult>;
+  responseSurfaceSubmissionReceipts?: ResponseSurfaceSubmissionReceipt[];
+  sourceMessageId: string;
+  /** The persisted HITL/action state still waiting for the user. */
+  pendingActionKind?: AssistantPendingActionKind;
   /** Workspace chat: hide tool/step technical detail (args, results,
    *  thinking) — show only the agent's final text + a quiet step summary. */
   minimal?: boolean;
@@ -889,104 +997,16 @@ export default function AssistantMessageBlocks({
 
   if (!Array.isArray(blocks) || blocks.length === 0) return null;
 
-  const firstProcessIndex = blocks.findIndex((block) => block.type === "process");
-  const stepAssistantTexts = blocks
-    .filter((block): block is Extract<AssistantBlock, { type: "process" }> => block.type === "process")
-    .flatMap((block) => block.steps || [])
-    .map((step) => step.assistant_text?.trim())
-    .filter(Boolean) as string[];
-  const textBlocks = blocks.filter(
-    (block): block is Extract<AssistantBlock, { type: "text" }> => block.type === "text",
-  );
-  const isStepAssistantText = (text: string) => {
-    const trimmed = text.trim();
-    return Boolean(trimmed && stepAssistantTexts.some((stepText) => stepText === trimmed));
-  };
-  const processOpeningText = blocks
-    .filter((block, index) => block.type === "text" && block.phase === "opening" && (firstProcessIndex < 0 || index < firstProcessIndex))
-    .map((block) => ("text" in block ? block.text : ""))
-    .filter(Boolean)
-    .join("");
-  const processProgressText = textBlocks
-    .filter((block) => block.phase === "progress")
-    .map((block) => block.text)
-    .filter((text) => text && !isStepAssistantText(text))
-    .join("\n\n");
-  const progressByStepSeq = new Map<number, string>();
-  textBlocks
-    .filter((block) => block.phase === "progress")
-    .forEach((block) => {
-      const seq = typeof block.after_step_seq === "number" ? block.after_step_seq : 0;
-      const text = block.text || "";
-      if (!seq || !text || isStepAssistantText(text)) return;
-      const existing = progressByStepSeq.get(seq);
-      progressByStepSeq.set(seq, existing ? `${existing}\n\n${text}` : text);
-    });
-  const legacyPostProcessOpeningText = blocks
-    .filter((block, index) => block.type === "text" && block.phase !== "opening" && block.phase !== "progress" && block.phase !== "final" && firstProcessIndex >= 0 && index > firstProcessIndex)
-    .map((block) => ("text" in block ? block.text : ""))
-    .filter((text) => text && !isStepAssistantText(text))
-    .join("");
-  const hasFinalText = textBlocks.some((block) => block.phase === "final" && Boolean(block.text));
-  const finalText = textBlocks
-    .filter((block) => block.phase === "final")
-    .map((block) => block.text)
-    .filter(Boolean)
-    .join("");
-  const authoritativeContent = (content || "").trim();
-  const shouldUseAuthoritativeContent =
-    Boolean(authoritativeContent) &&
-    Boolean(finalText.trim()) &&
-    authoritativeContent.length > finalText.trim().length &&
-    authoritativeContent.endsWith(finalText.trim());
-  const hasRunningProcess = blocks.some(
-    (block) =>
-      block.type === "process" &&
-      (block.status === "running" ||
-        block.status === "pending" ||
-        (block.steps || []).some((step) => step.status === "running" || step.status === "pending")),
-  );
-  const recoveredFinalText = !hasRunningProcess && !shouldUseAuthoritativeContent ? legacyPostProcessOpeningText : "";
-  const contentIsOnlyOpeningText = Boolean(
-    processOpeningText.trim() &&
-    authoritativeContent === processOpeningText.trim(),
-  );
-  const processText = `${processOpeningText}${processProgressText}`.trim();
-  const contentIsOnlyProcessText = Boolean(
-    processText &&
-    (authoritativeContent === processText || processText.endsWith(authoritativeContent)),
-  );
-  const liveFinalText =
-    streaming &&
-    !hasFinalText &&
-    !hasRunningProcess &&
-    Boolean(authoritativeContent) &&
-    !contentIsOnlyOpeningText &&
-    !contentIsOnlyProcessText
-      ? authoritativeContent
-      : "";
-  const fallbackFinalText =
-    !hasFinalText && !hasRunningProcess && !recoveredFinalText && !liveFinalText && !authoritativeContent
-      ? textBlocks
-          .filter((block) => block.phase !== "opening" && block.phase !== "progress")
-          .map((block) => block.text)
-          .filter((text) => text && !isStepAssistantText(text))
-          .filter(Boolean)
-          .join("")
-      : "";
-  const openingText = fallbackFinalText ? "" : processOpeningText;
-  const hasFinalOutput = Boolean(
-    hasFinalText ||
-      recoveredFinalText ||
-      liveFinalText ||
-      fallbackFinalText ||
-      (shouldUseAuthoritativeContent && authoritativeContent),
-  );
-  const shouldSuppressFinalText = (text: string) => {
-    const trimmed = text.trim();
-    if (shouldUseAuthoritativeContent) return true;
-    return Boolean(recoveredFinalText && trimmed && recoveredFinalText.includes(trimmed));
-  };
+  const {
+    progressByStepSeq,
+    authoritativeContent,
+    shouldUseAuthoritativeContent,
+    recoveredFinalText,
+    liveFinalText,
+    fallbackFinalText,
+    openingText,
+    shouldSuppressFinalText,
+  } = projectAssistantText(content, blocks, streaming);
 
   return (
     <>
@@ -1006,6 +1026,27 @@ export default function AssistantMessageBlocks({
             />
           );
         }
+        if (block.type === "visualization") {
+          return (
+            <AssistantLedgerVisualization
+              key={block.id || `${keyPrefix}-visualization-${index}`}
+              block={block}
+              onConfigure={onConfigureWorkspaceLedgers}
+            />
+          );
+        }
+        if (block.type === "surface") {
+          return (
+            <InteractiveResponseSurface
+              key={block.id || `${keyPrefix}-surface-${index}`}
+              surface={block}
+              sourceMessageId={sourceMessageId}
+              submissionReceipts={responseSurfaceSubmissionReceipts}
+              submissionDisabled={streaming || !sourceMessageId}
+              onSubmit={onResponseSurfaceSubmit}
+            />
+          );
+        }
         return (
           <AssistantProcessBlock
             key={block.id || `${keyPrefix}-process-${index}`}
@@ -1013,7 +1054,7 @@ export default function AssistantMessageBlocks({
             openingText={openingText}
             progressByStepSeq={progressByStepSeq}
             minimal={minimal}
-            hasFinalOutput={hasFinalOutput}
+            pendingActionKind={pendingActionKind}
             returnTo={returnTo}
             subAgentRuns={subAgentRuns}
           />

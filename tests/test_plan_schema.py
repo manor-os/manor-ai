@@ -92,6 +92,31 @@ def test_runtime_planner_action_binding_carries_cached_tool_schema():
                     "type": "object",
                     "properties": {"tweet_id": {"type": "string"}},
                 },
+                "account_ids": ["account-default", "account-secondary"],
+                "requires_explicit_account": True,
+                "supports_all_accounts": False,
+                "account_input_schemas": {
+                    "account-default": {
+                        "type": "object",
+                        "properties": {"text": {"type": "string"}},
+                        "required": ["text"],
+                    },
+                    "account-secondary": {
+                        "type": "object",
+                        "properties": {"status": {"type": "string"}},
+                        "required": ["status"],
+                    },
+                },
+                "account_output_schemas": {
+                    "account-default": {
+                        "type": "object",
+                        "properties": {"tweet_id": {"type": "string"}},
+                    },
+                    "account-secondary": {
+                        "type": "object",
+                        "properties": {"post_id": {"type": "string"}},
+                    },
+                },
             },
             {
                 "type": "function",
@@ -120,8 +145,399 @@ def test_runtime_planner_action_binding_carries_cached_tool_schema():
     assert publish["parameters"] == ["text"]
     assert publish["input_schema"]["required"] == ["text"]
     assert publish["output_schema"]["properties"]["tweet_id"]["type"] == "string"
+    assert publish["account_ids"] == ["account-default", "account-secondary"]
+    assert publish["requires_explicit_account"] is True
+    assert publish["supports_all_accounts"] is False
+    assert publish["account_input_schemas"]["account-secondary"]["required"] == [
+        "status"
+    ]
+    assert publish["account_output_schemas"]["account-secondary"]["properties"][
+        "post_id"
+    ]["type"] == "string"
+    assert by_action["publish_tweet"].input_schema_for("account-secondary")[
+        "required"
+    ] == ["status"]
+    assert by_action["publish_tweet"].output_schema_for("account-secondary")[
+        "properties"
+    ]["post_id"]["type"] == "string"
     assert send["description"] == "Send a message."
     assert send["parameters"] == ["to"]
+
+
+def test_runtime_planner_all_account_binding_uses_aggregate_output_schema():
+    from jsonschema import validate
+
+    from packages.core.ai.runtime.planning import RuntimePlannerActionBinding
+
+    binding = RuntimePlannerActionBinding(
+        provider="stripe",
+        action_key="list_customers",
+        output_schema={
+            "type": "object",
+            "required": ["customer_id"],
+            "properties": {"customer_id": {"type": "string"}},
+        },
+        supports_all_accounts=True,
+    )
+
+    schema = binding.output_schema_for(None, selection="all")
+
+    assert schema["x-manor-integration-account-fanout"] is True
+    result_schema = schema["properties"]["results"]["items"]["properties"][
+        "result"
+    ]
+    assert result_schema["anyOf"][0]["required"] == ["customer_id"]
+    validate(
+        {
+            "integration_account_selection": "all",
+            "status": "partial",
+            "total_account_count": 2,
+            "account_count": 2,
+            "failed_count": 1,
+            "result_truncated_count": 0,
+            "omitted_account_count": 0,
+            "results": [
+                {
+                    "integration_account_id": "account-ok",
+                    "ok": True,
+                    "result": {"customer_id": "cus_1"},
+                },
+                {
+                    "integration_account_id": "account-failed",
+                    "ok": False,
+                    "result": {
+                        "error": "account_call_failed",
+                        "reason": "Provider unavailable",
+                    },
+                },
+            ],
+        },
+        schema,
+    )
+
+
+def test_runtime_planner_all_account_binding_augments_strict_vendor_input_schema():
+    from jsonschema import validate
+
+    from packages.core.ai.runtime.planning import RuntimePlannerActionBinding
+
+    binding = RuntimePlannerActionBinding(
+        provider="stripe",
+        action_key="list_customers",
+        input_schema={
+            "type": "object",
+            "properties": {"query": {"type": "string"}},
+            "required": ["query"],
+            "additionalProperties": False,
+        },
+        supports_all_accounts=True,
+    )
+
+    schema = binding.input_schema_for(None, selection="all")
+
+    assert schema["additionalProperties"] is False
+    assert schema["properties"]["integration_account_selection"] == {
+        "type": "string",
+        "const": "all",
+    }
+    validate(
+        {"query": "active customers", "integration_account_selection": "all"},
+        schema,
+    )
+
+
+def test_planner_pins_supported_default_account_and_allows_read_fanout():
+    from packages.core.plans.planner import _Context, _enforce_allowlists
+    from packages.core.plans.schema import Plan
+
+    ctx = _Context(
+        workspace=None,
+        subscriptions=[],
+        agents_by_id={},
+        allowed_service_keys={"payments"},
+        provider_actions={"stripe": ["future_lookup"]},
+        provider_action_specs={
+            "stripe": {
+                "future_lookup": {
+                    "effect": "read",
+                    "account_ids": ["account-default", "account-secondary"],
+                }
+            }
+        },
+    )
+    default_plan = Plan(steps=[PlanStep(
+        key="lookup_default",
+        kind="action",
+        service_key="payments",
+        provider="stripe",
+        action_key="future_lookup",
+    )])
+    all_plan = Plan(steps=[PlanStep(
+        key="lookup_all",
+        kind="action",
+        service_key="payments",
+        provider="stripe",
+        action_key="future_lookup",
+        params={"integration_account_selection": "all"},
+    )])
+
+    _enforce_allowlists(default_plan, ctx)
+    _enforce_allowlists(all_plan, ctx)
+
+    assert default_plan.steps[0].integration_id == "account-default"
+    assert all_plan.steps[0].integration_id is None
+
+
+@pytest.mark.parametrize(
+    ("selection", "message"),
+    [
+        ("exact", "integration_account_id is required"),
+        ("unexpected", "must be 'default', 'exact', or 'all'"),
+    ],
+)
+def test_planner_rejects_invalid_account_selection(
+    selection: str,
+    message: str,
+) -> None:
+    from packages.core.plans.planner import CapabilityError, _Context, _enforce_allowlists
+    from packages.core.plans.schema import Plan
+
+    ctx = _Context(
+        workspace=None,
+        subscriptions=[],
+        agents_by_id={},
+        allowed_service_keys={"payments"},
+        provider_actions={"stripe": ["future_lookup"]},
+        provider_action_specs={
+            "stripe": {
+                "future_lookup": {
+                    "effect": "read",
+                    "account_ids": ["account-default", "account-secondary"],
+                }
+            }
+        },
+    )
+    plan = Plan(steps=[PlanStep(
+        key="lookup_invalid_selection",
+        kind="action",
+        service_key="payments",
+        provider="stripe",
+        action_key="future_lookup",
+        params={"integration_account_selection": selection},
+    )])
+
+    with pytest.raises(CapabilityError, match=message):
+        _enforce_allowlists(plan, ctx)
+
+
+def test_planner_requires_exact_account_for_partial_registry():
+    from packages.core.plans.planner import CapabilityError, _Context, _enforce_allowlists
+    from packages.core.plans.schema import Plan
+
+    ctx = _Context(
+        workspace=None,
+        subscriptions=[],
+        agents_by_id={},
+        allowed_service_keys={"payments"},
+        provider_actions={"stripe": ["future_lookup"]},
+        provider_action_specs={
+            "stripe": {
+                "future_lookup": {
+                    "effect": "read",
+                    "account_ids": ["account-known"],
+                    "requires_explicit_account": True,
+                }
+            }
+        },
+    )
+    plan = Plan(steps=[PlanStep(
+        key="lookup_partial",
+        kind="action",
+        service_key="payments",
+        provider="stripe",
+        action_key="future_lookup",
+    )])
+
+    with pytest.raises(CapabilityError, match="requires an exact integration_id"):
+        _enforce_allowlists(plan, ctx)
+
+
+def test_planner_rejects_all_for_incompatible_account_contracts():
+    from packages.core.plans.planner import CapabilityError, _Context, _enforce_allowlists
+    from packages.core.plans.schema import Plan
+
+    ctx = _Context(
+        workspace=None,
+        subscriptions=[],
+        agents_by_id={},
+        allowed_service_keys={"payments"},
+        provider_actions={"stripe": ["future_lookup"]},
+        provider_action_specs={
+            "stripe": {
+                "future_lookup": {
+                    "effect": "read",
+                    "account_ids": ["account-default", "account-secondary"],
+                    "supports_all_accounts": False,
+                }
+            }
+        },
+    )
+    plan = Plan(steps=[PlanStep(
+        key="lookup_all",
+        kind="action",
+        service_key="payments",
+        provider="stripe",
+        action_key="future_lookup",
+        params={"integration_account_selection": "all"},
+    )])
+
+    with pytest.raises(CapabilityError, match="compatible account contracts"):
+        _enforce_allowlists(plan, ctx)
+
+
+def test_planner_rejects_all_for_partial_account_registry():
+    from packages.core.plans.planner import CapabilityError, _Context, _enforce_allowlists
+    from packages.core.plans.schema import Plan
+
+    ctx = _Context(
+        workspace=None,
+        subscriptions=[],
+        agents_by_id={},
+        allowed_service_keys={"payments"},
+        provider_actions={"stripe": ["future_lookup"]},
+        provider_action_specs={
+            "stripe": {
+                "future_lookup": {
+                    "effect": "read",
+                    "account_ids": ["account-known"],
+                    "requires_explicit_account": True,
+                    "supports_all_accounts": True,
+                }
+            }
+        },
+    )
+    plan = Plan(steps=[PlanStep(
+        key="lookup_all",
+        kind="action",
+        service_key="payments",
+        provider="stripe",
+        action_key="future_lookup",
+        params={"integration_account_selection": "all"},
+    )])
+
+    with pytest.raises(CapabilityError, match="requires an exact integration_id"):
+        _enforce_allowlists(plan, ctx)
+
+
+def test_planner_enforces_authoritative_schema_for_selected_account():
+    from packages.core.plans.planner import _Context, _enforce_allowlists
+    from packages.core.plans.schema import Plan
+
+    secondary_input = {
+        "type": "object",
+        "required": ["record_id"],
+        "properties": {"record_id": {"type": "string"}},
+    }
+    secondary_output = {
+        "type": "object",
+        "required": ["updated"],
+        "properties": {"updated": {"type": "boolean"}},
+    }
+    ctx = _Context(
+        workspace=None,
+        subscriptions=[],
+        agents_by_id={},
+        allowed_service_keys={"records"},
+        provider_actions={"stripe": ["create_record"]},
+        provider_action_specs={
+            "stripe": {
+                "create_record": {
+                    "effect": "write",
+                    "input_schema": {"required": ["title"]},
+                    "output_schema": {"required": ["record_id"]},
+                    "account_ids": ["account-default", "account-secondary"],
+                    "account_input_schemas": {
+                        "account-default": {"required": ["title"]},
+                        "account-secondary": secondary_input,
+                    },
+                    "account_output_schemas": {
+                        "account-default": {"required": ["record_id"]},
+                        "account-secondary": secondary_output,
+                    },
+                }
+            }
+        },
+    )
+    plan = Plan(steps=[PlanStep(
+        key="create_secondary",
+        kind="action",
+        service_key="records",
+        provider="stripe",
+        action_key="create_record",
+        integration_id="account-secondary",
+        params={"record_id": "rec_1"},
+        expected_input_schema={"type": "object"},
+        expected_output_schema={"type": "object"},
+    )])
+
+    _enforce_allowlists(plan, ctx)
+
+    assert plan.steps[0].expected_input_schema == secondary_input
+    assert plan.steps[0].expected_output_schema == secondary_output
+
+
+def test_planner_rejects_invalid_account_and_high_risks_payment_write():
+    from packages.core.plans.planner import CapabilityError, _Context, _enforce_allowlists
+    from packages.core.plans.schema import Plan
+
+    ctx = _Context(
+        workspace=None,
+        subscriptions=[],
+        agents_by_id={},
+        allowed_service_keys={"payments"},
+        provider_actions={"stripe": ["future_charge"]},
+        provider_action_specs={
+            "stripe": {
+                "future_charge": {
+                    "effect": "write",
+                    "account_ids": ["account-default", "account-secondary"],
+                }
+            }
+        },
+    )
+    invalid_plan = Plan(steps=[PlanStep(
+        key="charge_invalid",
+        kind="action",
+        service_key="payments",
+        provider="stripe",
+        action_key="future_charge",
+        integration_id="account-foreign",
+    )])
+    write_plan = Plan(steps=[PlanStep(
+        key="charge_secondary",
+        kind="action",
+        service_key="payments",
+        provider="stripe",
+        action_key="future_charge",
+        integration_id="account-secondary",
+    )])
+    all_plan = Plan(steps=[PlanStep(
+        key="charge_all",
+        kind="action",
+        service_key="payments",
+        provider="stripe",
+        action_key="future_charge",
+        params={"integration_account_selection": "all"},
+    )])
+
+    with pytest.raises(CapabilityError, match="does not expose"):
+        _enforce_allowlists(invalid_plan, ctx)
+    with pytest.raises(CapabilityError, match="restricted to actions declared read-only"):
+        _enforce_allowlists(all_plan, ctx)
+
+    _enforce_allowlists(write_plan, ctx)
+    assert write_plan.steps[0].risk_level == "high"
+    assert write_plan.steps[0].requires_approval is True
 
 
 def test_runtime_planner_chat_turn_wraps_tool_completion(monkeypatch):

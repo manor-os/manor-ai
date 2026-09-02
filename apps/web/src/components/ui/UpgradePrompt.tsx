@@ -19,12 +19,17 @@ interface UpgradePromptProps {
   /** Limit type — drives the title and whether "Buy Credits" is offered. */
   kind?: PlanLimitKind;
   resetsAt?: string | null;
+  returnTo?: string | null;
 }
 
-export default function UpgradePrompt({ open, onClose, message, kind, resetsAt }: UpgradePromptProps) {
+export default function UpgradePrompt({ open, onClose, message, kind, resetsAt, returnTo }: UpgradePromptProps) {
   const navigate = useNavigate();
   const offersCredits = planLimitOffersCredits(kind);
   const resetText = planLimitResetText(kind, resetsAt);
+  const safeReturnTo = returnTo?.startsWith("/blueprints/") ? returnTo : null;
+  const plansPath = safeReturnTo
+    ? `/settings?tab=plans&return_to=${encodeURIComponent(safeReturnTo)}`
+    : "/settings?tab=plans";
 
   return (
     <Modal open={open} onClose={onClose} title={planLimitTitle(kind)} maxWidth="420px"
@@ -42,7 +47,7 @@ export default function UpgradePrompt({ open, onClose, message, kind, resetsAt }
               {t("component.upgrade_prompt.buy_credits")}
             </button>
           )}
-          <button className="btn-manor" onClick={() => { onClose(); navigate("/settings?tab=plans"); }} style={{ fontSize: 13, height: 36, padding: "0 20px" }}>
+          <button className="btn-manor" onClick={() => { onClose(); navigate(plansPath); }} style={{ fontSize: 13, height: 36, padding: "0 20px" }}>
             {t("component.upgrade_prompt.view_plans")}
           </button>
         </div>

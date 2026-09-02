@@ -62,15 +62,23 @@ async def call_tool(
     handler = _HANDLERS.get(name)
     if not handler:
         return _error(f"Unknown tool: {name}")
+    if not isinstance(arguments, dict):
+        return _error("arguments must be an object")
+    arguments = dict(arguments)
 
     spec = _TOOLS.get(name, {})
-    missing = [p for p in spec.get("required", []) if arguments.get(p) in (None, "")]
+    missing = [p for p in spec.get("required", []) if _is_blank(arguments.get(p))]
     if missing:
         return _error(f"Missing required params: {', '.join(missing)}")
+    token = bearer_token.strip() if isinstance(bearer_token, str) else ""
+    if not token:
+        return _error("TikTok access token is missing. Connect TikTok first.")
 
     try:
-        text = await handler(bearer_token, arguments)
+        text = await handler(token, arguments)
         return {"content": [{"type": "text", "text": text}], "isError": False}
+    except _TikTokError as e:
+        return _error(str(e))
     except Exception as e:
         logger.exception("TikTok MCP tool %s failed", name)
         return _error(str(e))
@@ -78,6 +86,14 @@ async def call_tool(
 
 def _error(msg: str) -> Dict[str, Any]:
     return {"content": [{"type": "text", "text": msg}], "isError": True}
+
+
+def _is_blank(value: Any) -> bool:
+    return value is None or (isinstance(value, str) and not value.strip())
+
+
+class _TikTokError(RuntimeError):
+    pass
 
 
 # ── TikTok API client ──────────────────────────────────────────────────────────
@@ -103,11 +119,11 @@ async def _api(
         resp = await client.request(method, url, headers=headers, json=body)
 
     if resp.status_code == 401:
-        return "TikTok authentication failed. Reconnect TikTok on the Integration page."
+        raise _TikTokError("TikTok authentication failed. Reconnect TikTok on the Integration page.")
     if resp.status_code == 403:
-        return f"TikTok forbidden (scope or permissions): {resp.text[:300]}"
+        raise _TikTokError(f"TikTok forbidden (scope or permissions): {resp.text[:300]}")
     if not resp.is_success:
-        return f"TikTok API error ({resp.status_code}): {resp.text[:300]}"
+        raise _TikTokError(f"TikTok API error ({resp.status_code}): {resp.text[:300]}")
 
     if not resp.text:
         return json.dumps({"ok": True})
@@ -115,6 +131,12 @@ async def _api(
         data = resp.json()
     except Exception:
         return resp.text[:_MAX_CHARS]
+    error = data.get("error") if isinstance(data, dict) else None
+    if isinstance(error, dict):
+        code = error.get("code")
+        if code not in (None, 0, "0", "ok", "OK"):
+            message = error.get("message") or "TikTok returned a business error"
+            raise _TikTokError(f"TikTok API error ({code}): {message}")
     out = json.dumps(data, ensure_ascii=False, indent=2, default=str)
     if len(out) > _MAX_CHARS:
         return out[:_MAX_CHARS] + "\n… (truncated)"

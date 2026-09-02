@@ -16,10 +16,63 @@ toggle 30 individual rows.
 """
 from __future__ import annotations
 
+from enum import Enum
 from typing import Literal, TypedDict
 
 Severity = Literal["info", "warn", "critical"]
 Category = Literal["task", "agent", "media", "system", "billing", "calendar"]
+
+
+class NotificationChannel(str, Enum):
+    """Stable channel keys shared by routing and delivery."""
+
+    INAPP = "inapp"
+    EMAIL = "email"
+    TELEGRAM = "telegram"
+    WECHAT = "wechat"
+    WHATSAPP = "whatsapp"
+    SLACK = "slack"
+    DISCORD = "discord"
+    TWILIO_SMS = "twilio_sms"
+    DATABASE = "db"
+    WEBSOCKET = "ws"
+    BROADCAST = "broadcast"
+
+
+class NotificationDispatchStatus(str, Enum):
+    """Visibility lifecycle of the in-app Notification parent."""
+
+    PENDING = "pending"
+    DISPATCHED = "dispatched"
+    CANCELED = "canceled"
+
+
+class NotificationOutboxStatus(str, Enum):
+    """Durable external fan-out lifecycle."""
+
+    PENDING = "pending"
+    PROCESSING = "processing"
+    DELIVERED = "delivered"
+    FAILED = "failed"
+    CANCELED = "canceled"
+
+
+class NotificationDeliveryStatus(str, Enum):
+    """Per-channel actionable delivery lifecycle."""
+
+    PENDING = "pending"
+    SENT = "sent"
+    RESOLVED = "resolved"
+    FAILED = "failed"
+    EXPIRED = "expired"
+
+
+class NotificationCallbackDisposition(str, Enum):
+    """How an actionable callback changes its delivery lifecycle."""
+
+    RESOLVED = "resolved"
+    RETRYABLE = "retryable"
+    TERMINAL_FAILURE = "terminal_failure"
 
 
 class EventDescriptor(TypedDict):
@@ -129,6 +182,20 @@ EVENT_CATALOG: list[EventDescriptor] = [
         "description": "A platform-level health check raised an alert.",
     },
     {
+        "kind": "workspace_setup_required",
+        "category": "system",
+        "severity": "warn",
+        "label": "Workspace connection needs attention",
+        "description": "A required Workspace integration or session disconnected or was added by a Blueprint update.",
+    },
+    {
+        "kind": "automation_paused",
+        "category": "system",
+        "severity": "warn",
+        "label": "Automation paused",
+        "description": "An automation was paused after repeated failures.",
+    },
+    {
         "kind": "system",
         "category": "system",
         "severity": "info",
@@ -147,14 +214,16 @@ EVENTS_BY_KIND: dict[str, EventDescriptor] = {e["kind"]: e for e in EVENT_CATALO
 # everything else corresponds to a ``ChannelAdapter`` registered in
 # ``packages.core.services.channels``.
 SUPPORTED_CHANNELS: list[str] = [
-    "inapp",
-    "email",
-    "telegram",
-    "wechat",
-    "whatsapp",
-    "slack",
-    "discord",
-    "twilio_sms",
+    channel.value
+    for channel in (
+        NotificationChannel.INAPP,
+        NotificationChannel.EMAIL,
+        NotificationChannel.TELEGRAM,
+        NotificationChannel.WECHAT,
+        NotificationChannel.SLACK,
+        NotificationChannel.DISCORD,
+        NotificationChannel.TWILIO_SMS,
+    )
 ]
 
 

@@ -6,18 +6,34 @@ visibility policy.
 """
 from __future__ import annotations
 
+import asyncio
 import os
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
-from sqlalchemy import func as sa_func, select, update as sa_update
+from sqlalchemy import delete as sa_delete, select, update as sa_update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from packages.core.database import async_session
 from packages.core.models.base import generate_ulid
-from packages.core.models.document import Document, DocumentFolder, VectorStatus
+from packages.core.models.document import Document, DocumentFolder, DocumentGroupMember, VectorStatus
+from packages.core.models.permission import (
+    Classification,
+    GrantStatus,
+    PendingStatus,
+    ResourceGrant,
+    ResourceGrantPending,
+    ResourceType,
+    Share,
+    Visibility,
+)
 from packages.core.models.workspace import Workspace
-from packages.core.services.document_service import StorageLimitExceeded, upsert_document_by_fs_path
+from packages.core.services.document_service import (
+    StorageLimitExceeded,
+    upsert_document_by_fs_path_result,
+)
 from packages.core.services.file_type_detection import detect_file_type
 from packages.core.services.knowledge_visibility import (
     is_storage_only_path,
@@ -41,6 +57,18 @@ def _schedule_document_reembed(document_id: str | None) -> None:
         pass
 
 
+async def _invalidate_document_previews(entity_root: str, document_id: str | None) -> None:
+    if not document_id:
+        return
+    from packages.core.services.slide_renderer import invalidate_document_preview_versions
+
+    await asyncio.to_thread(
+        invalidate_document_preview_versions,
+        entity_root,
+        document_id,
+    )
+
+
 _AUTO_CREATE_FOLDER_SOURCES = {
     "manual",
     "upload",
@@ -53,6 +81,11 @@ _AUTO_CREATE_FOLDER_SOURCES = {
 _FINAL_ARTIFACT_SOURCES = {"ai_generated", "sandbox", "bash", "agent", "mcp", "elevenlabs"}
 
 
+def _sql_like_literal(value: str) -> str:
+    """Escape a filesystem path before using it as a SQL LIKE prefix."""
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
 @dataclass(frozen=True)
 class KnowledgeSyncResult:
     """Result of projecting a filesystem path into Knowledge."""
@@ -60,6 +93,12 @@ class KnowledgeSyncResult:
     synced: bool
     document_id: str | None = None
     reason: str | None = None
+    content_changed: bool = False
+    name: str | None = None
+    file_size: int | None = None
+    mime_type: str | None = None
+    fs_path: str | None = None
+    created: bool = False
 
 
 @dataclass(frozen=True)
@@ -72,6 +111,15 @@ class KnowledgeReconcileResult:
     missing_documents: int = 0
     trashed_missing_documents: int = 0
     limited: bool = False
+
+
+@asynccontextmanager
+async def _knowledge_sync_session(db: AsyncSession | None):
+    if db is not None:
+        yield db, False
+        return
+    async with async_session() as owned_db:
+        yield owned_db, True
 
 
 async def sync_file_to_knowledge(
@@ -89,23 +137,55 @@ async def sync_file_to_knowledge(
     conversation_id: str | None = None,
     user_id: str | None = None,
     tool_name: str | None = None,
+    visibility: str | None = None,
+    classification: str | None = None,
+    client_visible: bool | None = None,
+    expected_content_sha256: str | None = None,
+    storage_admission_prevalidated: bool = False,
+    db: AsyncSession | None = None,
+    commit: bool = False,
 ) -> KnowledgeSyncResult:
     """Create/update a Document row for a visible filesystem file.
 
     ``force`` is an intent flag, not a permission override: hidden/system paths
     never sync even when force=True.
     """
-    rel_path = normalize_rel_path(os.path.relpath(abs_path, entity_root))
+    from packages.core.services.entity_fs import (
+        EntityFilesystemError,
+        canonical_entity_root,
+        open_entity_file_snapshot,
+    )
+
+    canonical_root = canonical_entity_root(entity_id)
+    supplied_root = os.path.abspath(entity_root)
+    supplied_path = os.path.abspath(abs_path)
+    if supplied_root != canonical_root or os.path.realpath(supplied_root) != canonical_root:
+        return KnowledgeSyncResult(False, reason="entity_root_mismatch")
+    try:
+        if os.path.commonpath([canonical_root, supplied_path]) != canonical_root:
+            return KnowledgeSyncResult(False, reason="path_escape")
+    except ValueError:
+        return KnowledgeSyncResult(False, reason="path_escape")
+    rel_path = normalize_rel_path(os.path.relpath(supplied_path, canonical_root))
     visible = is_user_visible_path(rel_path)
     should_sync = visible if force is None else bool(force) and visible
     if not should_sync:
         return KnowledgeSyncResult(False, reason="hidden" if not visible else "disabled")
-    if not os.path.isfile(abs_path):
-        return KnowledgeSyncResult(False, reason="not_file")
-
-    stat = os.stat(abs_path)
-    size = stat.st_size
-    detected = detect_file_type(abs_path, declared_name=os.path.basename(rel_path))
+    try:
+        with open_entity_file_snapshot(
+            entity_id,
+            rel_path,
+            expected_resolved_path=supplied_path,
+            expected_content_sha256=expected_content_sha256,
+        ) as snapshot:
+            file_stat = snapshot.stat
+            detected = detect_file_type(
+                snapshot.descriptor_path,
+                declared_name=os.path.basename(rel_path),
+            )
+    except EntityFilesystemError:
+        return KnowledgeSyncResult(False, reason="source_changed")
+    size = file_stat.st_size
     ext = detected.extension
     mime_type = detected.mime_type
     if not workspace_id:
@@ -122,22 +202,35 @@ async def sync_file_to_knowledge(
                 entity_id=entity_id,
                 workspace_id=workspace_id,
                 rel_path=rel_path,
+                db=db,
             )
         else:
             rel_dir = os.path.dirname(rel_path)
             if rel_dir and is_user_visible_folder_path(rel_dir):
                 if source in _AUTO_CREATE_FOLDER_SOURCES:
-                    resolved_folder_id = await ensure_folder_path(entity_id, rel_dir)
+                    resolved_folder_id = await ensure_folder_path(
+                        entity_id,
+                        rel_dir,
+                        db=db,
+                    )
                 else:
-                    resolved_folder_id = await find_folder_path(entity_id, rel_dir)
+                    resolved_folder_id = await find_folder_path(
+                        entity_id,
+                        rel_dir,
+                        db=db,
+                    )
 
     # Reconcile re-projects files already on disk, so it must never be blocked
-    # by the storage quota; every other source counts as adding to the KB.
-    skip_storage_check = source == "filesystem_reconcile"
-    async with async_session() as db:
+    # by the storage quota. A browser upload recovery intent is also one
+    # already-admitted logical attempt: its first request passed the route and
+    # persistence gates before the commit outcome became ambiguous. Only that
+    # caller may set ``storage_admission_prevalidated`` after validating the
+    # same owner, idempotency key, request fingerprint, and source path.
+    skip_storage_check = source == "filesystem_reconcile" or storage_admission_prevalidated
+    async with _knowledge_sync_session(db) as (sync_db, owns_session):
         try:
-            doc = await upsert_document_by_fs_path(
-                db,
+            upsert = await upsert_document_by_fs_path_result(
+                sync_db,
                 entity_id,
                 fs_path=rel_path,
                 name=detected.display_name,
@@ -146,13 +239,31 @@ async def sync_file_to_knowledge(
                 mime_type=mime_type,
                 source=source,
                 created_by=created_by,
+                owner_id=user_id,
                 folder_id=resolved_folder_id,
+                visibility=visibility,
+                classification=classification,
+                client_visible=client_visible,
                 skip_storage_check=skip_storage_check,
+                emit_created_event=False,
             )
+            doc = upsert.document
         except StorageLimitExceeded:
             # Over the plan limit: the file stays on disk but is not added to the
             # knowledge index. Callers (e.g. the generate_file tool) surface this.
             return KnowledgeSyncResult(False, reason="storage_limit")
+        if upsert.created:
+            from packages.core.services.event_emitter import emit_in_session
+
+            await emit_in_session(
+                sync_db,
+                entity_id,
+                "document.uploaded",
+                source="document_service",
+                payload={"document_id": doc.id, "name": doc.name},
+                workspace_id=workspace_id,
+                deliver_after_commit=True,
+            )
         # ── invalidate derived representations on a byte change ──
         # A file's content lives in ONE place (the filesystem). The Document
         # projection carries TWO derived copies — the pgvector embedding and a
@@ -168,7 +279,7 @@ async def sync_file_to_knowledge(
         if isinstance(doc.metadata_, dict):
             prior_integrity = doc.metadata_.get("file_integrity") or {}
         prior_mtime = prior_integrity.get("mtime_ns")
-        new_mtime = getattr(stat, "st_mtime_ns", None)
+        new_mtime = getattr(file_stat, "st_mtime_ns", None)
         content_changed = prior_mtime != new_mtime  # None on first sync ⇒ changed
 
         doc.metadata_ = _with_file_integrity(
@@ -182,7 +293,6 @@ async def sync_file_to_knowledge(
             stale_meta.pop("content_text", None)
             stale_meta.pop("content", None)
             doc.metadata_ = stale_meta
-            _schedule_document_reembed(doc.id)
         if resolved_folder_id is None and is_storage_only_path(rel_path):
             doc.folder_id = None
         if source in _FINAL_ARTIFACT_SOURCES or is_storage_only_path(rel_path):
@@ -200,7 +310,7 @@ async def sync_file_to_knowledge(
             doc.metadata_ = meta
         if workspace_id:
             await _mark_document_workspace_origin(
-                db,
+                sync_db,
                 entity_id=entity_id,
                 document_id=doc.id,
                 workspace_id=workspace_id,
@@ -211,9 +321,24 @@ async def sync_file_to_knowledge(
                 user_id=user_id,
                 tool_name=tool_name,
             )
-        await db.commit()
-        await bump_tool_cache_version(entity_id, "documents")
-        return KnowledgeSyncResult(True, document_id=getattr(doc, "id", None))
+        await sync_db.flush()
+        if content_changed:
+            await _invalidate_document_previews(entity_root, getattr(doc, "id", None))
+        if owns_session or commit:
+            await sync_db.commit()
+            if content_changed:
+                _schedule_document_reembed(doc.id)
+            await bump_tool_cache_version(entity_id, "documents")
+        return KnowledgeSyncResult(
+            True,
+            document_id=getattr(doc, "id", None),
+            content_changed=content_changed,
+            name=getattr(doc, "name", None),
+            file_size=getattr(doc, "file_size", None),
+            mime_type=getattr(doc, "mime_type", None),
+            fs_path=getattr(doc, "fs_path", None),
+            created=upsert.created,
+        )
 
 
 async def reconcile_entity_filesystem(
@@ -417,8 +542,34 @@ async def ensure_folder_path(
     rel_path: str,
     *,
     owner_id: str | None = None,
+    db: AsyncSession | None = None,
 ) -> str | None:
     """Create/find the DocumentFolder chain for a visible relative directory."""
+    if db is not None:
+        return await _ensure_folder_path_in_session(
+            db,
+            entity_id=entity_id,
+            rel_path=rel_path,
+            owner_id=owner_id,
+        )
+    async with async_session() as owned_db:
+        last_id = await _ensure_folder_path_in_session(
+            owned_db,
+            entity_id=entity_id,
+            rel_path=rel_path,
+            owner_id=owner_id,
+        )
+        await owned_db.commit()
+        return last_id
+
+
+async def _ensure_folder_path_in_session(
+    db,
+    *,
+    entity_id: str,
+    rel_path: str,
+    owner_id: str | None = None,
+) -> str | None:
     rel_path = normalize_rel_path(rel_path)
     if not rel_path or not is_user_visible_folder_path(rel_path):
         return None
@@ -429,51 +580,49 @@ async def ensure_folder_path(
 
     parent_id: str | None = None
     last_id: str | None = None
-    async with async_session() as db:
-        for name in parts:
-            folder_id = await _find_folder_id_at_position(
-                db,
-                entity_id=entity_id,
-                parent_id=parent_id,
-                name=name,
+    for name in parts:
+        folder_id = await _find_folder_id_at_position(
+            db,
+            entity_id=entity_id,
+            parent_id=parent_id,
+            name=name,
+        )
+        if not folder_id:
+            folder_id = generate_ulid()
+            result = await db.execute(
+                pg_insert(DocumentFolder)
+                .values(
+                    id=folder_id,
+                    entity_id=entity_id,
+                    name=name,
+                    parent_id=parent_id,
+                    owner_id=owner_id,
+                )
+                .on_conflict_do_nothing()
+                .returning(DocumentFolder.id)
             )
+            folder_id = result.scalar_one_or_none()
             if not folder_id:
-                folder_id = generate_ulid()
-                result = await db.execute(
-                    pg_insert(DocumentFolder)
-                    .values(
-                        id=folder_id,
-                        entity_id=entity_id,
-                        name=name,
-                        parent_id=parent_id,
-                        owner_id=owner_id,
-                    )
-                    .on_conflict_do_nothing()
-                    .returning(DocumentFolder.id)
+                folder_id = await _find_folder_id_at_position(
+                    db,
+                    entity_id=entity_id,
+                    parent_id=parent_id,
+                    name=name,
                 )
-                folder_id = result.scalar_one_or_none()
-                if not folder_id:
-                    folder_id = await _find_folder_id_at_position(
-                        db,
-                        entity_id=entity_id,
-                        parent_id=parent_id,
-                        name=name,
-                    )
-                if not folder_id:
-                    raise RuntimeError(f"Could not create or find Knowledge folder: {rel_path}")
-            parent_id = folder_id
-            last_id = folder_id
-        if owner_id and last_id:
-            await db.execute(
-                sa_update(DocumentFolder)
-                .where(
-                    DocumentFolder.id == last_id,
-                    DocumentFolder.entity_id == entity_id,
-                    DocumentFolder.owner_id.is_(None),
-                )
-                .values(owner_id=owner_id)
+            if not folder_id:
+                raise RuntimeError(f"Could not create or find Knowledge folder: {rel_path}")
+        parent_id = folder_id
+        last_id = folder_id
+    if owner_id and last_id:
+        await db.execute(
+            sa_update(DocumentFolder)
+            .where(
+                DocumentFolder.id == last_id,
+                DocumentFolder.entity_id == entity_id,
+                DocumentFolder.owner_id.is_(None),
             )
-        await db.commit()
+            .values(owner_id=owner_id)
+        )
     return last_id
 
 
@@ -494,58 +643,182 @@ async def _find_folder_id_at_position(
     return result.scalar_one_or_none()
 
 
-async def find_folder_path(entity_id: str, rel_path: str) -> str | None:
+async def find_folder_path(
+    entity_id: str,
+    rel_path: str,
+    *,
+    db: AsyncSession | None = None,
+) -> str | None:
     """Find an existing DocumentFolder chain without creating missing folders."""
+    if db is not None:
+        folder = await _find_folder_path_in_session(
+            db,
+            entity_id=entity_id,
+            rel_path=rel_path,
+        )
+        return folder.id if folder else None
+    async with async_session() as owned_db:
+        folder = await _find_folder_path_in_session(
+            owned_db,
+            entity_id=entity_id,
+            rel_path=rel_path,
+        )
+        return folder.id if folder else None
+
+
+async def _find_folder_path_in_session(
+    db,
+    *,
+    entity_id: str,
+    rel_path: str,
+) -> DocumentFolder | None:
     rel_path = normalize_rel_path(rel_path)
     if not rel_path or not is_user_visible_folder_path(rel_path):
         return None
 
     parent_id: str | None = None
-    found_id: str | None = None
-    async with async_session() as db:
-        for name in _path_parts(rel_path):
-            result = await db.execute(
-                select(DocumentFolder).where(
-                    DocumentFolder.entity_id == entity_id,
-                    DocumentFolder.name == name,
-                    DocumentFolder.parent_id == parent_id,
-                ).limit(1)
-            )
-            folder = result.scalar_one_or_none()
-            if not folder:
-                return None
-            parent_id = folder.id
-            found_id = folder.id
-    return found_id
+    folder: DocumentFolder | None = None
+    for name in _path_parts(rel_path):
+        result = await db.execute(
+            select(DocumentFolder).where(
+                DocumentFolder.entity_id == entity_id,
+                DocumentFolder.name == name,
+                DocumentFolder.parent_id == parent_id,
+            ).limit(1)
+        )
+        folder = result.scalar_one_or_none()
+        if not folder:
+            return None
+        parent_id = folder.id
+    return folder
 
 
-async def trash_path(entity_id: str, rel_path: str) -> bool:
-    """Soft-delete documents matching a visible file or directory path."""
+async def _folder_subtree_ids_in_session(
+    db,
+    *,
+    entity_id: str,
+    root_id: str,
+) -> set[str]:
+    rows = (await db.execute(
+        select(DocumentFolder.id, DocumentFolder.parent_id).where(
+            DocumentFolder.entity_id == entity_id,
+        )
+    )).all()
+    children: dict[str | None, list[str]] = {}
+    for folder_id, parent_id in rows:
+        children.setdefault(parent_id, []).append(folder_id)
+    found: set[str] = set()
+    pending = [root_id]
+    while pending:
+        folder_id = pending.pop()
+        if folder_id in found:
+            continue
+        found.add(folder_id)
+        pending.extend(children.get(folder_id, []))
+    return found
+
+
+async def trash_path(
+    entity_id: str,
+    rel_path: str,
+    *,
+    is_directory: bool | None = None,
+    db: AsyncSession | None = None,
+    commit: bool = False,
+) -> bool:
+    """Retire projections for files removed through a raw filesystem path.
+
+    These callers run after ``rm`` or an equivalent physical delete, so there
+    is no hidden file for the normal Knowledge restore flow to recover. Clear
+    ``fs_path`` and record the former path explicitly; otherwise Restore would
+    reactivate a phantom row that claims a file which no longer exists.
+    """
     rel_path = normalize_rel_path(rel_path)
     if not is_user_visible_path(rel_path):
         return False
 
-    async with async_session() as db:
-        await db.execute(
-            sa_update(Document)
-            .where(Document.entity_id == entity_id, Document.fs_path == rel_path)
-            .values(is_trashed=True, trashed_at=datetime.now(timezone.utc))
-        )
+    async with _knowledge_sync_session(db) as (sync_db, owns_session):
         prefix = rel_path.rstrip("/") + "/"
-        await db.execute(
-            sa_update(Document)
-            .where(
+        documents = list((await sync_db.scalars(
+            select(Document).where(
                 Document.entity_id == entity_id,
-                Document.fs_path.like(prefix + "%"),
+                Document.is_trashed.is_(False),
+                (
+                    (Document.fs_path == rel_path)
+                    | Document.fs_path.like(
+                        _sql_like_literal(prefix) + "%",
+                        escape="\\",
+                    )
+                ),
             )
-            .values(is_trashed=True, trashed_at=datetime.now(timezone.utc))
+        )).all())
+        folder = None
+        if is_directory is not False:
+            folder = await _find_folder_path_in_session(
+                sync_db,
+                entity_id=entity_id,
+                rel_path=rel_path,
+            )
+        folder_ids = (
+            await _folder_subtree_ids_in_session(
+                sync_db,
+                entity_id=entity_id,
+                root_id=folder.id,
+            )
+            if folder is not None
+            else set()
         )
-        await db.commit()
-        await bump_tool_cache_version(entity_id, "documents")
+        if not documents and not folder_ids:
+            return False
+
+        now = datetime.now(timezone.utc)
+        for document in documents:
+            metadata = dict(document.metadata_ or {})
+            metadata["deleted_fs_path"] = document.fs_path
+            metadata["restore_blocked_reason"] = "filesystem_path_deleted"
+            document.metadata_ = metadata
+            document.fs_path = None
+            document.folder_id = None
+            document.is_trashed = True
+            document.trashed_at = now
+            document.trashed_by = "system:filesystem-delete"
+        if folder_ids:
+            await sync_db.execute(
+                sa_update(Document)
+                .where(
+                    Document.entity_id == entity_id,
+                    Document.folder_id.in_(folder_ids),
+                )
+                .values(folder_id=None)
+            )
+            await sync_db.execute(
+                sa_update(Workspace)
+                .where(
+                    Workspace.entity_id == entity_id,
+                    Workspace.artifact_folder_id.in_(folder_ids),
+                )
+                .values(artifact_folder_id=None)
+            )
+            await sync_db.execute(
+                sa_delete(DocumentFolder).where(
+                    DocumentFolder.entity_id == entity_id,
+                    DocumentFolder.id.in_(folder_ids),
+                )
+            )
+        if owns_session or commit:
+            await sync_db.commit()
+            await bump_tool_cache_version(entity_id, "documents")
     return True
 
 
-async def move_path(entity_id: str, old_rel: str, new_rel: str) -> bool:
+async def move_path(
+    entity_id: str,
+    old_rel: str,
+    new_rel: str,
+    *,
+    db: AsyncSession | None = None,
+    commit: bool = False,
+) -> bool:
     """Move/rename the Knowledge projection for a file or directory path."""
     old_rel = normalize_rel_path(old_rel)
     new_rel = normalize_rel_path(new_rel)
@@ -554,47 +827,103 @@ async def move_path(entity_id: str, old_rel: str, new_rel: str) -> bool:
     if not old_visible and not new_visible:
         return False
     if old_visible and not new_visible:
-        return await trash_path(entity_id, old_rel)
+        return await trash_path(
+            entity_id,
+            old_rel,
+            db=db,
+            commit=commit,
+        )
     if not old_visible and new_visible:
         # The destination may become visible, but without the absolute file path
         # here we cannot safely create a fresh Document projection.
         return False
 
-    await move_folder_path(entity_id, old_rel, new_rel)
-    new_dir = os.path.dirname(new_rel)
-    new_folder_id = await ensure_folder_path(entity_id, new_dir) if new_dir else None
-
-    async with async_session() as db:
-        await db.execute(
-            sa_update(Document)
-            .where(Document.entity_id == entity_id, Document.fs_path == old_rel)
-            .values(
-                fs_path=new_rel,
-                name=os.path.basename(new_rel),
-                folder_id=new_folder_id,
+    async with _knowledge_sync_session(db) as (sync_db, owns_session):
+        folder_moved = await _move_folder_path_in_session(
+            sync_db,
+            entity_id=entity_id,
+            old_rel=old_rel,
+            new_rel=new_rel,
+        )
+        new_dir = os.path.dirname(new_rel)
+        new_folder_id = (
+            await _ensure_folder_path_in_session(
+                sync_db,
+                entity_id=entity_id,
+                rel_path=new_dir,
             )
+            if new_dir
+            else None
         )
         old_prefix = old_rel.rstrip("/") + "/"
         new_prefix = new_rel.rstrip("/") + "/"
-        await db.execute(
-            sa_update(Document)
-            .where(
+        source_documents = list((await sync_db.scalars(
+            select(Document).where(
                 Document.entity_id == entity_id,
-                Document.fs_path.like(old_prefix + "%"),
+                Document.is_trashed.is_(False),
+                (
+                    (Document.fs_path == old_rel)
+                    | Document.fs_path.like(
+                        _sql_like_literal(old_prefix) + "%",
+                        escape="\\",
+                    )
+                ),
             )
-            .values(
-                fs_path=sa_func.concat(
-                    new_prefix,
-                    sa_func.substr(Document.fs_path, len(old_prefix) + 1),
-                )
+        )).all())
+        if not source_documents and not folder_moved:
+            return False
+
+        replacements: dict[str, str] = {}
+        for document in source_documents:
+            current_path = str(document.fs_path or "")
+            replacements[document.id] = (
+                new_rel
+                if current_path == old_rel
+                else new_prefix + current_path[len(old_prefix):]
             )
-        )
-        await db.commit()
-        await bump_tool_cache_version(entity_id, "documents")
+
+        source_ids = {document.id for document in source_documents}
+        destination_paths = set(replacements.values())
+        collisions = list((await sync_db.scalars(
+            select(Document).where(
+                Document.entity_id == entity_id,
+                Document.fs_path.in_(sorted(destination_paths)),
+                Document.is_trashed.is_(False),
+                Document.id.not_in(source_ids),
+            )
+        )).all())
+        now = datetime.now(timezone.utc)
+        for collision in collisions:
+            metadata = dict(collision.metadata_ or {})
+            metadata["replaced_fs_path"] = collision.fs_path
+            metadata["restore_blocked_reason"] = "filesystem_path_replaced"
+            collision.metadata_ = metadata
+            collision.fs_path = None
+            collision.is_trashed = True
+            collision.trashed_at = now
+            collision.trashed_by = "system:filesystem-move-replaced"
+        if collisions:
+            await sync_db.flush()
+
+        for document in source_documents:
+            destination = replacements[document.id]
+            document.fs_path = destination
+            document.name = os.path.basename(destination)
+            if str(document.fs_path or "") == new_rel:
+                document.folder_id = new_folder_id
+        if owns_session or commit:
+            await sync_db.commit()
+            await bump_tool_cache_version(entity_id, "documents")
     return True
 
 
-async def copy_file_projection(entity_id: str, old_rel: str, new_rel: str) -> bool:
+async def copy_file_projection(
+    entity_id: str,
+    old_rel: str,
+    new_rel: str,
+    *,
+    operation_id: str | None = None,
+) -> bool:
     """Duplicate a Document row when a visible indexed file is copied."""
     old_rel = normalize_rel_path(old_rel)
     new_rel = normalize_rel_path(new_rel)
@@ -603,12 +932,152 @@ async def copy_file_projection(entity_id: str, old_rel: str, new_rel: str) -> bo
 
     async with async_session() as db:
         result = await db.execute(
-            select(Document).where(Document.entity_id == entity_id, Document.fs_path == old_rel)
+            select(Document).where(
+                Document.entity_id == entity_id,
+                Document.fs_path == old_rel,
+                Document.is_trashed.is_(False),
+            )
         )
         src_doc = result.scalar_one_or_none()
         if not src_doc:
             return False
-        folder_id = await find_folder_path(entity_id, os.path.dirname(new_rel))
+        folder = await _find_folder_path_in_session(
+            db,
+            entity_id=entity_id,
+            rel_path=os.path.dirname(new_rel),
+        )
+        folder_id = folder.id if folder else None
+        existing = await db.scalar(
+            select(Document).where(
+                Document.entity_id == entity_id,
+                Document.fs_path == new_rel,
+                Document.is_trashed.is_(False),
+            )
+        )
+        if existing is not None and operation_id:
+            existing_metadata = dict(existing.metadata_ or {})
+            if (
+                existing_metadata.get("filesystem_copy_operation_id") == operation_id
+                and existing_metadata.get("filesystem_copy_source_document_id") == src_doc.id
+            ):
+                # Retry the same journal entry without replacing identity. Also
+                # re-assert the source's restrictive controls in case an older
+                # generic filesystem repair touched the destination row.
+                existing.visibility = _most_restrictive(
+                    existing.visibility,
+                    src_doc.visibility,
+                    (Visibility.PUBLIC, Visibility.ENTITY, Visibility.WORKSPACE, Visibility.PRIVATE),
+                )
+                existing.classification = _most_restrictive(
+                    existing.classification,
+                    src_doc.classification,
+                    Classification.LEVELS,
+                )
+                existing.client_visible = bool(existing.client_visible and src_doc.client_visible)
+                existing.pii_detected = bool(existing.pii_detected or src_doc.pii_detected)
+                existing.quarantine_status = _most_restrictive(
+                    existing.quarantine_status,
+                    src_doc.quarantine_status,
+                    ("clean", "pending_scan", "quarantined", "rejected"),
+                )
+                if src_doc.owner_id:
+                    existing.owner_id = src_doc.owner_id
+                await db.commit()
+                await bump_tool_cache_version(entity_id, "documents")
+                return True
+        source_group_ids = list((await db.scalars(
+            select(DocumentGroupMember.group_id).where(
+                DocumentGroupMember.document_id == src_doc.id,
+            )
+        )).all())
+        visibility = src_doc.visibility
+        classification = src_doc.classification
+        client_visible = src_doc.client_visible
+        pii_detected = src_doc.pii_detected
+        quarantine_status = src_doc.quarantine_status
+        if existing is not None:
+            visibility = _most_restrictive(
+                existing.visibility,
+                src_doc.visibility,
+                (Visibility.PUBLIC, Visibility.ENTITY, Visibility.WORKSPACE, Visibility.PRIVATE),
+            )
+            classification = _most_restrictive(
+                existing.classification,
+                src_doc.classification,
+                Classification.LEVELS,
+            )
+            client_visible = bool(existing.client_visible and src_doc.client_visible)
+            pii_detected = bool(existing.pii_detected or src_doc.pii_detected)
+            quarantine_status = _most_restrictive(
+                existing.quarantine_status,
+                src_doc.quarantine_status,
+                ("clean", "pending_scan", "quarantined", "rejected"),
+            )
+            now = datetime.now(timezone.utc)
+            replaced_metadata = dict(existing.metadata_ or {})
+            replaced_metadata["replaced_fs_path"] = existing.fs_path
+            replaced_metadata["restore_blocked_reason"] = "filesystem_path_replaced"
+            existing.metadata_ = replaced_metadata
+            existing.fs_path = None
+            existing.folder_id = None
+            existing.is_trashed = True
+            existing.trashed_at = now
+            existing.trashed_by = "system:filesystem-copy-replaced"
+            await db.execute(
+                sa_update(ResourceGrant)
+                .where(
+                    ResourceGrant.entity_id == entity_id,
+                    ResourceGrant.resource_type == ResourceType.DOCUMENT,
+                    ResourceGrant.resource_id == existing.id,
+                    ResourceGrant.status == GrantStatus.ACTIVE,
+                )
+                .values(
+                    status=GrantStatus.REVOKED,
+                    revoked_at=now,
+                    revoked_by="system:filesystem-copy",
+                )
+            )
+            await db.execute(
+                sa_update(ResourceGrantPending)
+                .where(
+                    ResourceGrantPending.entity_id == entity_id,
+                    ResourceGrantPending.resource_type.in_((ResourceType.DOCUMENT, "share")),
+                    ResourceGrantPending.resource_id == existing.id,
+                    ResourceGrantPending.status == PendingStatus.PENDING,
+                )
+                .values(
+                    status=PendingStatus.DENIED,
+                    decided_at=now,
+                    decision_note="Destination content was replaced by a filesystem copy",
+                )
+            )
+            await db.execute(
+                sa_update(Share)
+                .where(
+                    Share.entity_id == entity_id,
+                    Share.resource_type == ResourceType.DOCUMENT,
+                    Share.resource_id == existing.id,
+                    Share.status == "active",
+                )
+                .values(
+                    status="revoked",
+                    revoked_at=now,
+                    revoked_by="system:filesystem-copy",
+                )
+            )
+            await db.execute(
+                sa_delete(DocumentGroupMember).where(
+                    DocumentGroupMember.document_id == existing.id,
+                )
+            )
+            await db.flush()
+        copied_metadata = dict(src_doc.metadata_ or {})
+        if operation_id:
+            copied_metadata.update({
+                "filesystem_copy_operation_id": operation_id,
+                "filesystem_copy_source_document_id": src_doc.id,
+                "filesystem_copy_source_path": old_rel,
+            })
         new_doc = Document(
             id=generate_ulid(),
             entity_id=entity_id,
@@ -620,8 +1089,19 @@ async def copy_file_projection(entity_id: str, old_rel: str, new_rel: str) -> bo
             source=src_doc.source,
             created_by=src_doc.created_by,
             folder_id=folder_id,
+            metadata_=copied_metadata,
+            vector_status=VectorStatus.PENDING,
+            visibility=visibility,
+            classification=classification,
+            owner_id=src_doc.owner_id,
+            client_visible=client_visible,
+            pii_detected=pii_detected,
+            quarantine_status=quarantine_status,
         )
         db.add(new_doc)
+        await db.flush()
+        for group_id in source_group_ids:
+            db.add(DocumentGroupMember(document_id=new_doc.id, group_id=group_id))
         await db.commit()
         await bump_tool_cache_version(entity_id, "documents")
     return True
@@ -629,36 +1109,47 @@ async def copy_file_projection(entity_id: str, old_rel: str, new_rel: str) -> bo
 
 async def move_folder_path(entity_id: str, old_rel: str, new_rel: str) -> bool:
     """Move/rename a DocumentFolder chain to match a filesystem mv."""
+    async with async_session() as db:
+        moved = await _move_folder_path_in_session(
+            db,
+            entity_id=entity_id,
+            old_rel=old_rel,
+            new_rel=new_rel,
+        )
+        if moved:
+            await db.commit()
+        return moved
+
+
+async def _move_folder_path_in_session(
+    db,
+    *,
+    entity_id: str,
+    old_rel: str,
+    new_rel: str,
+) -> bool:
     old_parts = _path_parts(old_rel)
     new_parts = _path_parts(new_rel)
     if not old_parts or not new_parts:
         return False
 
-    async with async_session() as db:
-        chain: list[DocumentFolder] = []
-        parent_id: str | None = None
-        for name in old_parts:
-            row = await db.execute(
-                select(DocumentFolder).where(
-                    DocumentFolder.entity_id == entity_id,
-                    DocumentFolder.name == name,
-                    DocumentFolder.parent_id == parent_id,
-                ).limit(1)
-            )
-            folder = row.scalar_one_or_none()
-            if not folder:
-                return False
-            chain.append(folder)
-            parent_id = folder.id
-
-        leaf = chain[-1]
-        new_parent_parts = new_parts[:-1]
-        new_parent_id = None
-        if new_parent_parts:
-            new_parent_id = await ensure_folder_path(entity_id, "/".join(new_parent_parts))
-        leaf.parent_id = new_parent_id
-        leaf.name = new_parts[-1]
-        await db.commit()
+    leaf = await _find_folder_path_in_session(
+        db,
+        entity_id=entity_id,
+        rel_path=old_rel,
+    )
+    if leaf is None:
+        return False
+    new_parent_parts = new_parts[:-1]
+    new_parent_id = None
+    if new_parent_parts:
+        new_parent_id = await _ensure_folder_path_in_session(
+            db,
+            entity_id=entity_id,
+            rel_path="/".join(new_parent_parts),
+        )
+    leaf.parent_id = new_parent_id
+    leaf.name = new_parts[-1]
     return True
 
 
@@ -667,6 +1158,16 @@ def _path_parts(rel_path: str) -> list[str]:
     if not cleaned:
         return []
     return [p for p in cleaned.split("/") if p and p not in (".", "..")]
+
+
+def _most_restrictive(left: str, right: str, ordered: tuple[str, ...]) -> str:
+    def rank(value: str) -> int:
+        try:
+            return ordered.index(value)
+        except ValueError:
+            return len(ordered)
+
+    return left if rank(left) >= rank(right) else right
 
 
 def _with_file_integrity(metadata: dict | None, **fields: object) -> dict:

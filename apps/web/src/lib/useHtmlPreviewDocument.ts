@@ -1,8 +1,9 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { api } from "./api";
 import {
   extractLocalCssPreviewAssetRefs,
   extractLocalHtmlPreviewAssetRefs,
+  htmlPreviewAssetDataUrl,
   htmlPreviewAssetKind,
   injectHtmlPreviewNavigationGuard,
   resolveHtmlPreviewAssetPath,
@@ -11,6 +12,7 @@ import {
   type HtmlPreviewAssetReplacement,
   type HtmlPreviewFsReadResult,
 } from "./html-preview.mjs";
+import { useIsolatedHtmlPreview } from "./useIsolatedHtmlPreview";
 
 const MAX_STYLESHEET_DEPTH = 8;
 const EMPTY_PREVIEW_DOCUMENT = "<!doctype html><html><head></head><body></body></html>";
@@ -24,7 +26,6 @@ interface HtmlPreviewAssetState {
 }
 
 interface HtmlPreviewLoadContext {
-  objectUrls: string[];
   failedAssetCount: number;
 }
 
@@ -40,23 +41,6 @@ async function readPreviewAsset(
     };
   }
   return api.fs.read(path);
-}
-
-function blobFromFsReadResult(result: HtmlPreviewFsReadResult): Blob {
-  const mimeType = result.mime_type || "application/octet-stream";
-  if (result.encoding === "base64") {
-    const binary = window.atob(result.content);
-    const bytes = new Uint8Array(binary.length);
-    for (let index = 0; index < binary.length; index += 1) bytes[index] = binary.charCodeAt(index);
-    return new Blob([bytes], { type: mimeType });
-  }
-  return new Blob([result.content], { type: mimeType });
-}
-
-function createTrackedObjectUrl(blob: Blob, context: HtmlPreviewLoadContext): string {
-  const url = URL.createObjectURL(blob);
-  context.objectUrls.push(url);
-  return url;
 }
 
 async function rewriteProtectedStylesheet(
@@ -87,13 +71,14 @@ async function rewriteProtectedStylesheet(
           depth + 1,
           textOverrides,
         );
-        replacements[ref] = createTrackedObjectUrl(
-          new Blob([nestedCss], { type: result.mime_type || "text/css" }),
-          context,
-        );
+        replacements[ref] = htmlPreviewAssetDataUrl({
+          content: nestedCss,
+          encoding: "utf-8",
+          mime_type: result.mime_type || "text/css",
+        });
         return;
       }
-      replacements[ref] = createTrackedObjectUrl(blobFromFsReadResult(result), context);
+      replacements[ref] = htmlPreviewAssetDataUrl(result);
     } catch {
       context.failedAssetCount += 1;
     }
@@ -107,7 +92,7 @@ async function loadHtmlPreviewAssets(
   textOverrides: Record<string, string>,
 ): Promise<{ replacements: Record<string, HtmlPreviewAssetReplacement>; context: HtmlPreviewLoadContext }> {
   const replacements: Record<string, HtmlPreviewAssetReplacement> = {};
-  const context: HtmlPreviewLoadContext = { objectUrls: [], failedAssetCount: 0 };
+  const context: HtmlPreviewLoadContext = { failedAssetCount: 0 };
 
   await Promise.all(refs.map(async (ref) => {
     const path = resolveHtmlPreviewAssetPath(fsPath, ref);
@@ -126,7 +111,7 @@ async function loadHtmlPreviewAssets(
         replacements[ref] = { kind, value: result.content };
         return;
       }
-      replacements[ref] = { kind: "url", value: createTrackedObjectUrl(blobFromFsReadResult(result), context) };
+      replacements[ref] = { kind: "url", value: htmlPreviewAssetDataUrl(result) };
     } catch {
       context.failedAssetCount += 1;
     }
@@ -136,9 +121,12 @@ async function loadHtmlPreviewAssets(
 }
 
 export interface HtmlPreviewDocumentResult {
-  srcDoc: string;
+  previewUrl: string | null;
   isResolvingAssets: boolean;
+  isPreparingPreview: boolean;
   failedAssetCount: number;
+  previewError: string | null;
+  retryPreview: () => void;
 }
 
 export function useHtmlPreviewDocument(
@@ -162,28 +150,15 @@ export function useHtmlPreviewDocument(
     replacements: {},
     failedAssetCount: 0,
   });
-  const objectUrlsRef = useRef<string[]>([]);
-
   useEffect(() => {
-    const revokeActiveObjectUrls = () => {
-      objectUrlsRef.current.forEach((url) => URL.revokeObjectURL(url));
-      objectUrlsRef.current = [];
-    };
-
     if (!enabled || !fsPath || !refs.length) {
-      revokeActiveObjectUrls();
       setAssetState({ key: assetKey, replacements: {}, failedAssetCount: 0 });
       return;
     }
 
     let cancelled = false;
     void loadHtmlPreviewAssets(refs, fsPath, textOverrides).then(({ replacements, context }) => {
-      if (cancelled) {
-        context.objectUrls.forEach((url) => URL.revokeObjectURL(url));
-        return;
-      }
-      revokeActiveObjectUrls();
-      objectUrlsRef.current = context.objectUrls;
+      if (cancelled) return;
       setAssetState({ key: assetKey, replacements, failedAssetCount: context.failedAssetCount });
     });
 
@@ -192,24 +167,23 @@ export function useHtmlPreviewDocument(
     };
   }, [assetKey, enabled, fsPath, refKey, textOverrides]);
 
-  useEffect(() => () => {
-    objectUrlsRef.current.forEach((url) => URL.revokeObjectURL(url));
-    objectUrlsRef.current = [];
-  }, []);
-
   const isResolvingAssets = Boolean(enabled && fsPath && refs.length && assetState.key !== assetKey);
   const activeReplacements = assetState.key === assetKey
     ? assetState.replacements
     : EMPTY_PREVIEW_REPLACEMENTS;
-  const srcDoc = useMemo(() => {
+  const previewDocument = useMemo(() => {
     if (!enabled) return content;
     if (isResolvingAssets) return EMPTY_PREVIEW_DOCUMENT;
     return injectHtmlPreviewNavigationGuard(rewriteHtmlPreviewAssetUrls(content, activeReplacements));
   }, [activeReplacements, content, enabled, isResolvingAssets]);
+  const isolatedPreview = useIsolatedHtmlPreview(previewDocument, !isResolvingAssets);
 
   return {
-    srcDoc,
+    previewUrl: isolatedPreview.previewUrl,
     isResolvingAssets,
+    isPreparingPreview: isolatedPreview.isPreparingPreview,
     failedAssetCount: assetState.key === assetKey ? assetState.failedAssetCount : 0,
+    previewError: isolatedPreview.previewError,
+    retryPreview: isolatedPreview.retryPreview,
   };
 }

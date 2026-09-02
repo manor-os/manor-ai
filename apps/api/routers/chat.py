@@ -4,27 +4,41 @@ from __future__ import annotations
 import json
 import os
 import re
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import StrEnum
 from urllib.parse import unquote, urlsplit
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, UploadFile
-from fastapi.responses import PlainTextResponse, Response, StreamingResponse
+from fastapi.responses import PlainTextResponse, StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from packages.core.database import get_db
+from packages.core.constants.agents import is_master_agent
+from packages.core.constants.conversation import ConversationSurfaceKind
 from packages.core.ai.runtime import (
     ChatSurface,
+    EditorCurrentDocumentTooLargeError,
+    render_editor_current_document_user_context,
     runtime_parse_editor_context,
     runtime_run_chat_turn,
     runtime_stream_chat_turn,
 )
 from packages.core.ai.runtime.surfaces import infer_chat_surface
-from packages.core.models.chat_feedback import ChatMessageFeedback
+from packages.core.ai.runtime.output_policy import (
+    runtime_assistant_stream_error_content,
+    runtime_public_assistant_message_content,
+    runtime_public_failure_payload,
+    runtime_public_tool_calls,
+    runtime_public_tool_payload,
+)
 from packages.core.models.task import Conversation, Message
+from packages.core.models.runtime_run import RuntimeRun, RuntimeRunStatus
 from packages.core.models.user import User
+from packages.core.models.workspace import Agent, AgentSubscription
 from packages.core.models.workflow import WorkflowRun
 from packages.core.schemas.chat import (
     ChatMessageResponse,
@@ -40,13 +54,24 @@ from packages.core.services.conversation_lifecycle import (
     get_or_create_conversation,
     rename_conversation,
 )
-from packages.core.services.conversation_messages import add_message
-from packages.core.services.conversation_messages import create_assistant_stream_placeholder
+from packages.core.services.conversation_messages import (
+    ORIGIN_USER_MESSAGE_ID_META_KEY,
+    add_message,
+    assistant_message_origin_meta,
+    create_assistant_stream_placeholder,
+)
+from packages.core.services.conversation_visibility import (
+    is_internal_file_permission_marker,
+)
 from packages.core.services.conversation_records import (
     is_channel_history_conversation,
     list_conversations,
     list_messages,
     list_messages_before,
+)
+from packages.core.services.conversation_surfaces import (
+    AiEditTargetIdentity,
+    ConversationSurfaceMetadataFactory,
 )
 from packages.core.services.conversation_export import (
     export_as_markdown, export_as_json, export_as_text,
@@ -58,8 +83,22 @@ from packages.core.services.chat_approvals import (
 )
 from packages.core.services.chat_manual_skills import (
     ChatManualSkillTurn,
+    ManualSkillReferenceError,
     ManualSkillResolutionError,
     prepare_chat_manual_skill_turn,
+)
+from packages.core.services.chat_feedback import (
+    ChatFeedbackIntegrityErrorKind,
+    ChatFeedbackMutationStatus,
+    ChatFeedbackRating,
+    ChatFeedbackTargetDeletedError,
+    ChatFeedbackTargetKind,
+    ChatFeedbackTargetPolicyFactory,
+    build_chat_feedback_content_preview,
+    classify_chat_feedback_integrity_error,
+    list_chat_message_feedback,
+    persist_chat_message_feedback,
+    resolve_chat_feedback_request_preview,
 )
 from packages.core.services.sse_events import format_sse
 from packages.core.services.runtime_file_context import (
@@ -71,19 +110,28 @@ from packages.core.services.runtime_file_context import (
 from packages.core.services.share_service import (
     create_share, get_shared_conversation, revoke_share, list_shares,
 )
-from packages.core.services.local_worker_targeting import (
-    select_conversation_local_worker_target,
-)
 from packages.core.services.workspace_access import (
     user_can_read_workspace_id,
     user_readable_workspace_ids,
 )
+from apps.api.chat_audio import SpeechRequest, acquire_audio_lease, authenticated_audio_scope, chat_speech_response
 from apps.api.deps import get_current_user, require_plan
+from apps.api.streaming_concurrency import acquire_chat_stream_lease
+from packages.core.services.runtime_run_service import (
+    RuntimeRunNotFoundError,
+    cancel_runtime_run_resources,
+    project_runtime_run_status,
+    request_runtime_run_cancel,
+    create_runtime_run,
+)
+from packages.core.services.response_surfaces import (
+    registered_response_surface_template_action,
+)
+from packages.core.config import get_settings
 
 router = APIRouter(prefix="/api/v1/chat", tags=["chat"])
 
 _LOCAL_FS_URL_RE = re.compile(r"/api/v1/fs/[A-Za-z0-9_-]+/[^\s\"'`)<>]+")
-_FILE_PERMISSION_MARKER_RE = re.compile(r"^\[File permission(?:\s+[^\]]*)?\]$", re.IGNORECASE)
 _RUNTIME_APPROVAL_REJECTED_RE = re.compile(r"^\[Runtime approval rejected\]", re.IGNORECASE)
 _RUNTIME_APPROVAL_REJECTED_REPLY = (
     "The blocked tool call was cancelled and will not access the filesystem. "
@@ -102,28 +150,90 @@ _WORKFLOW_CHAT_META_KEYS = frozenset({
     "workflow_steps",
     "workflow_title",
 })
-# A reload lands mid-turn with no way to tell a finished reply from one that is
-# still being written — the row looks identical either way. Without this the
-# page shows a dead placeholder until the first resume snapshot arrives, and
-# shows it forever when the turn produced no further events.
 _STREAM_STATE_META_KEYS = frozenset({"stream_status"})
 _CHAT_MESSAGE_META_KEYS = (
     _WORKFLOW_CHAT_META_KEYS
     | _STREAM_STATE_META_KEYS
-    | frozenset({"chat_mode", "chat_mode_payload"})
+    | frozenset({
+        "chat_mode",
+        "chat_mode_payload",
+        ORIGIN_USER_MESSAGE_ID_META_KEY,
+        "response_surface_submission",
+        "workspace_recommendation",
+    })
+)
+_RESPONSE_SURFACE_EVENT_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,95}$")
+_RESPONSE_SURFACE_ACTION_RE = re.compile(r"^[a-z][a-z0-9_.-]{0,63}$")
+_RESPONSE_SURFACE_EVENT_UNIQUE_INDEX = (
+    "uq_messages_conversation_response_surface_event"
+)
+_RESPONSE_SURFACE_RECEIPT_MAX_CHARS = 250_000
+_RESPONSE_SURFACE_PARSED_PAYLOAD_MAX_CHARS = 200_000
+_RESPONSE_SURFACE_GENERIC_PAYLOAD_MAX_CHARS = 40_000
+_DEFAULT_CODE_LAB_LANGUAGE_IDS = (
+    "python",
+    "javascript",
+    "typescript",
+    "java",
+    "cpp",
+    "go",
+    "rust",
 )
 
 
+def _parse_chat_conversation_surface(value: str | None) -> ConversationSurfaceKind:
+    normalized = str(value or "").strip()
+    if not normalized:
+        return ConversationSurfaceKind.ORDINARY_CHAT
+    try:
+        surface = ConversationSurfaceKind(normalized)
+    except ValueError as exc:
+        raise HTTPException(422, "Unsupported conversation surface") from exc
+    if surface not in {
+        ConversationSurfaceKind.ORDINARY_CHAT,
+        ConversationSurfaceKind.AI_EDIT,
+    }:
+        raise HTTPException(422, "Unsupported conversation surface")
+    return surface
+
+
+def _parse_ai_edit_target(editor_context: dict | None) -> AiEditTargetIdentity:
+    context = editor_context or {}
+    try:
+        return ConversationSurfaceMetadataFactory.ai_edit_target(
+            str(context.get("target_kind") or ""),
+            str(context.get("target_id") or ""),
+        )
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+
 class ChatMessageFeedbackRequest(BaseModel):
-    rating: str
+    rating: ChatFeedbackRating
     content_preview: str | None = None
     request_preview: str | None = None
 
 
 class ChatMessageFeedbackResponse(BaseModel):
     message_id: str
-    rating: str
+    rating: ChatFeedbackRating
+    mutation_sequence: int
+    mutation_status: ChatFeedbackMutationStatus
     updated_at: str | None = None
+    target_kind: ChatFeedbackTargetKind
+    target_id: str
+    task_id: str | None = None
+    plan_id: str | None = None
+
+
+class ChatMessageFeedbackSnapshotResponse(BaseModel):
+    message_id: str
+    rating: ChatFeedbackRating
+    mutation_sequence: int
+    target_kind: ChatFeedbackTargetKind
+    target_id: str
+    task_id: str | None = None
+    plan_id: str | None = None
 
 
 class ResolveChatActionRequest(BaseModel):
@@ -148,6 +258,564 @@ class GlobalChatFlowEntrypointResponse(BaseModel):
     placeholder: str
     order: int
     inputs: list[dict]
+
+
+def _reject_non_finite_response_surface_json_constant(value: str):
+    raise ValueError(f"Unsupported JSON constant: {value}")
+
+
+def _parse_response_surface_submission(value: str | None) -> dict | None:
+    if value is None:
+        return None
+    if len(value) > _RESPONSE_SURFACE_RECEIPT_MAX_CHARS:
+        raise HTTPException(422, "Response surface submission is too large")
+    try:
+        raw = json.loads(
+            value,
+            parse_constant=_reject_non_finite_response_surface_json_constant,
+        )
+    except (RecursionError, TypeError, ValueError) as exc:
+        raise HTTPException(422, "Invalid response surface submission") from exc
+    if not isinstance(raw, dict) or raw.get("version") != 1:
+        raise HTTPException(422, "Invalid response surface submission")
+    required_strings = {
+        "eventId": 96,
+        "recordedAt": 64,
+        "sourceMessageId": 128,
+        "surfaceId": 96,
+        "title": 120,
+        "action": 64,
+        "actionLabel": 80,
+    }
+    parsed: dict = {"version": 1}
+    for key, maximum in required_strings.items():
+        item = raw.get(key)
+        if not isinstance(item, str) or not item.strip() or len(item) > maximum:
+            raise HTTPException(422, "Invalid response surface submission")
+        parsed[key] = item.strip()
+    if not _RESPONSE_SURFACE_EVENT_ID_RE.fullmatch(parsed["eventId"]):
+        raise HTTPException(422, "Invalid response surface event")
+    if not _RESPONSE_SURFACE_ACTION_RE.fullmatch(parsed["action"]):
+        raise HTTPException(422, "Invalid response surface action")
+    payload = raw.get("payload")
+    if not isinstance(payload, dict):
+        raise HTTPException(422, "Invalid response surface payload")
+    try:
+        if (
+            len(json.dumps(payload, ensure_ascii=False, allow_nan=False))
+            > _RESPONSE_SURFACE_PARSED_PAYLOAD_MAX_CHARS
+        ):
+            raise HTTPException(422, "Response surface payload is too large")
+    except (RecursionError, TypeError, ValueError) as exc:
+        raise HTTPException(422, "Invalid response surface payload") from exc
+    parsed["payload"] = payload
+    return parsed
+
+
+def _canonicalize_response_surface_submission(
+    receipt: dict,
+    surface: dict,
+    action: dict,
+) -> dict:
+    canonical = {
+        "version": 1,
+        "eventId": receipt["eventId"],
+        "recordedAt": datetime.now(timezone.utc).isoformat(),
+        "sourceMessageId": receipt["sourceMessageId"],
+        "surfaceId": surface["id"],
+        "title": str(surface.get("title") or "")[:120],
+        "action": action["id"],
+        "actionLabel": str(action.get("label") or "")[:80],
+        "payload": receipt["payload"],
+    }
+    render = surface.get("render") if isinstance(surface.get("render"), dict) else {}
+    props = render.get("props") if isinstance(render.get("props"), dict) else {}
+    if render.get("kind") == "template":
+        context: dict = {"templateId": render.get("template_id")}
+        instructions = props.get("instructions")
+        if isinstance(instructions, str) and instructions:
+            context["instructions"] = instructions[:4_000]
+        tests = props.get("tests")
+        if isinstance(tests, list):
+            context["checks"] = [
+                item[:2_000]
+                for item in tests[:20]
+                if isinstance(item, str) and item
+            ]
+        canonical["context"] = context
+    return canonical
+
+
+def _validated_response_surface_payload(receipt: dict, surface: dict) -> dict:
+    payload = receipt.get("payload")
+    if not isinstance(payload, dict):
+        raise HTTPException(422, "Invalid response surface payload")
+    render = surface.get("render") if isinstance(surface.get("render"), dict) else {}
+    if render.get("kind") != "template":
+        if (
+            len(json.dumps(payload, ensure_ascii=False))
+            > _RESPONSE_SURFACE_GENERIC_PAYLOAD_MAX_CHARS
+        ):
+            raise HTTPException(422, "Response surface payload is too large")
+        return payload
+    props = render.get("props") if isinstance(render.get("props"), dict) else {}
+    template_id = render.get("template_id")
+    if template_id == "response.choice":
+        choice = payload.get("choice")
+        allowed_choices = {
+            option.get("id")
+            for option in props.get("options", [])
+            if isinstance(option, dict) and isinstance(option.get("id"), str)
+        }
+        if not isinstance(choice, str) or choice not in allowed_choices:
+            raise HTTPException(422, "Invalid response surface choice")
+        return {"choice": choice}
+    if template_id == "learning.code_lab":
+        language = payload.get("language")
+        code = payload.get("code")
+        if not isinstance(language, str) or not isinstance(code, str) or not code:
+            raise HTTPException(422, "Invalid code lab submission")
+        if len(code) > 30_000:
+            raise HTTPException(422, "Code lab submission is too large")
+        language = language.strip().lower()
+        configured_languages = [
+            item.get("id")
+            for item in props.get("languages", [])
+            if isinstance(item, dict) and isinstance(item.get("id"), str)
+        ][:8]
+        allowed_languages = configured_languages or list(_DEFAULT_CODE_LAB_LANGUAGE_IDS)
+        initial_language = str(props.get("language") or "text").strip().lower()
+        if initial_language not in allowed_languages:
+            allowed_languages.insert(0, initial_language)
+        if language not in allowed_languages[:8]:
+            raise HTTPException(422, "Invalid code lab language")
+        return {"language": language, "code": code}
+    if (
+        len(json.dumps(payload, ensure_ascii=False))
+        > _RESPONSE_SURFACE_GENERIC_PAYLOAD_MAX_CHARS
+    ):
+        raise HTTPException(422, "Response surface payload is too large")
+    return payload
+
+
+def _response_surface_submission_message(receipt: dict) -> str:
+    payload = receipt.get("payload") if isinstance(receipt.get("payload"), dict) else {}
+    code = payload.get("code") if isinstance(payload.get("code"), str) else ""
+    if code:
+        language = re.sub(r"[^A-Za-z0-9_+.-]", "", str(payload.get("language") or "text"))[:32]
+        context = receipt.get("context") if isinstance(receipt.get("context"), dict) else {}
+        execution_request = ""
+        if context.get("templateId") == "learning.code_lab" and receipt.get("action") == "run":
+            requirements = [
+                "Execute this submission with the sandbox-backed bash tool using a single non-multiline command. Call search_tools with query select:bash now before execution, even if an earlier turn reported that bash was unavailable. Do not write files to the Workspace. Do not claim any test passed unless the tool output proves it. Evaluate it against the exercise requirements and report concise pass/fail feedback."
+            ]
+            if context.get("instructions"):
+                requirements.append(f"Exercise requirements:\n{context['instructions']}")
+            checks = context.get("checks") if isinstance(context.get("checks"), list) else []
+            if checks:
+                requirements.append("Checks:\n" + "\n".join(f"- {item}" for item in checks))
+            execution_request = "\n\n" + "\n\n".join(requirements)
+        return (
+            f"{receipt['actionLabel']}: {receipt['title']}{execution_request}"
+            f"\n\n```{language}\n{code[:30_000]}\n```"
+        )
+    serialized = json.dumps(payload, ensure_ascii=False, indent=2)[:8_000]
+    suffix = f"\n\n{serialized}" if serialized and serialized != "{}" else ""
+    return f"{receipt['actionLabel']}: {receipt['title']}{suffix}"
+
+
+async def _bind_response_surface_submission(
+    db: AsyncSession,
+    *,
+    conversation_id: str,
+    receipt: dict | None,
+) -> dict | None:
+    if receipt is None:
+        return None
+    source = (await db.execute(
+        select(Message).where(
+            Message.id == receipt["sourceMessageId"],
+            Message.conversation_id == conversation_id,
+            Message.role == "assistant",
+        )
+    )).scalar_one_or_none()
+    if source is None:
+        raise HTTPException(409, "Response surface source message is unavailable")
+    blocks = _message_assistant_blocks(source) or []
+    surface = next((
+        block for block in blocks
+        if isinstance(block, dict)
+        and block.get("type") == "surface"
+        and block.get("id") == receipt["surfaceId"]
+    ), None)
+    if surface is None:
+        raise HTTPException(409, "Response surface is unavailable")
+    actions = surface.get("actions") if isinstance(surface.get("actions"), list) else []
+    persisted_action = next((
+        item for item in actions
+        if isinstance(item, dict)
+        and item.get("id") == receipt["action"]
+        and item.get("intent") == "submit"
+    ), None)
+    render = surface.get("render") if isinstance(surface.get("render"), dict) else {}
+    registered_action = None
+    if render.get("kind") == "template":
+        registered_action = registered_response_surface_template_action(
+            str(render.get("template_id") or ""),
+            actions,
+        )
+    action = (
+        registered_action
+        if registered_action is not None
+        and (
+            receipt["action"] == registered_action["id"]
+            or persisted_action is not None
+        )
+        else persisted_action
+    )
+    if action is None:
+        raise HTTPException(409, "Response surface action is unavailable")
+    canonical_receipt = {
+        **receipt,
+        "payload": _validated_response_surface_payload(receipt, surface),
+    }
+    return _canonicalize_response_surface_submission(canonical_receipt, surface, action)
+
+
+@dataclass(frozen=True)
+class _ResponseSurfaceSubmissionAgent:
+    agent_id: str | None
+    agent_subscription_id: str | None
+
+
+async def _response_surface_submission_agent(
+    db: AsyncSession,
+    *,
+    conversation: Conversation,
+    submission: dict,
+) -> _ResponseSurfaceSubmissionAgent:
+    """Resolve the exact Agent deployment that authored the submitted surface."""
+
+    author_subscription_id = (await db.execute(
+        select(Message.author_subscription_id).where(
+            Message.id == submission["sourceMessageId"],
+            Message.conversation_id == conversation.id,
+            Message.role == "assistant",
+        )
+    )).scalar_one_or_none()
+    fallback_subscription_id = getattr(conversation, "agent_subscription_id", None)
+    expected_agent_id = None
+    if not author_subscription_id and not fallback_subscription_id:
+        if (
+            conversation.workspace_id
+            and conversation.agent_id
+            and not is_master_agent(conversation.agent_id)
+        ):
+            candidate_subscriptions = list((await db.execute(
+                select(AgentSubscription)
+                .join(Agent, Agent.id == AgentSubscription.agent_id)
+                .where(
+                    AgentSubscription.entity_id == conversation.entity_id,
+                    AgentSubscription.workspace_id == conversation.workspace_id,
+                    AgentSubscription.agent_id == conversation.agent_id,
+                    AgentSubscription.status == "active",
+                    Agent.status == "active",
+                    Agent.deleted_at.is_(None),
+                )
+                .limit(2)
+            )).scalars().all())
+            if len(candidate_subscriptions) != 1:
+                raise HTTPException(409, "Response surface Agent is ambiguous")
+            source_subscription = candidate_subscriptions[0]
+            return _ResponseSurfaceSubmissionAgent(
+                agent_id=str(source_subscription.agent_id),
+                agent_subscription_id=str(source_subscription.id),
+            )
+        return _ResponseSurfaceSubmissionAgent(
+            agent_id=conversation.agent_id,
+            agent_subscription_id=None,
+        )
+    if not author_subscription_id:
+        author_subscription_id = fallback_subscription_id
+        expected_agent_id = conversation.agent_id
+
+    subscription_filters = [
+        AgentSubscription.id == author_subscription_id,
+        AgentSubscription.entity_id == conversation.entity_id,
+        AgentSubscription.workspace_id == conversation.workspace_id,
+        AgentSubscription.status == "active",
+        Agent.status == "active",
+        Agent.deleted_at.is_(None),
+    ]
+    if expected_agent_id:
+        subscription_filters.append(AgentSubscription.agent_id == expected_agent_id)
+    source_subscription = (await db.execute(
+        select(AgentSubscription)
+        .join(Agent, Agent.id == AgentSubscription.agent_id)
+        .where(*subscription_filters)
+    )).scalar_one_or_none()
+    if not source_subscription:
+        raise HTTPException(409, "Response surface Agent is unavailable")
+    return _ResponseSurfaceSubmissionAgent(
+        agent_id=str(source_subscription.agent_id),
+        agent_subscription_id=str(source_subscription.id),
+    )
+
+
+def _same_response_surface_submission(stored: object, current: dict) -> bool:
+    """Compare immutable submission intent while ignoring server timestamps."""
+
+    if not isinstance(stored, dict):
+        return False
+    immutable_fields_match = all(stored.get(key) == current.get(key) for key in (
+        "version",
+        "eventId",
+        "sourceMessageId",
+        "surfaceId",
+        "payload",
+    ))
+    if not immutable_fields_match:
+        return False
+
+    def canonical_action(submission: dict) -> object:
+        context = submission.get("context")
+        template_id = (
+            context.get("templateId")
+            if isinstance(context, dict)
+            else None
+        )
+        registered_action = registered_response_surface_template_action(
+            str(template_id or "")
+        )
+        return (
+            registered_action["id"]
+            if registered_action is not None
+            else submission.get("action")
+        )
+
+    return canonical_action(stored) == canonical_action(current)
+
+
+async def _find_response_surface_submission_replay(
+    db: AsyncSession,
+    *,
+    conversation_id: str,
+    user_id: str,
+    submission: dict,
+) -> tuple[Message | None, RuntimeRun | None] | None:
+    """Return the prior assistant/run for an accepted idempotency event."""
+
+    origin = (await db.execute(
+        select(Message).where(
+            Message.conversation_id == conversation_id,
+            Message.role == "user",
+            Message.response_surface_event_id == submission["eventId"],
+        ).limit(1)
+    )).scalar_one_or_none()
+    if origin is None:
+        return None
+    stored_submission = (
+        origin.meta.get("response_surface_submission")
+        if isinstance(origin.meta, dict)
+        else None
+    )
+    if not _same_response_surface_submission(stored_submission, submission):
+        raise HTTPException(409, "Response surface event conflicts with an earlier submission")
+
+    assistant = (await db.execute(
+        select(Message)
+        .where(
+            Message.conversation_id == conversation_id,
+            Message.role == "assistant",
+            Message.meta[ORIGIN_USER_MESSAGE_ID_META_KEY].astext == origin.id,
+        )
+        .order_by(Message.created_at.asc(), Message.id.asc())
+        .limit(1)
+    )).scalar_one_or_none()
+    if assistant is None:
+        return (None, None)
+    runtime_run = (await db.execute(
+        select(RuntimeRun)
+        .where(
+            RuntimeRun.conversation_id == conversation_id,
+            RuntimeRun.assistant_message_id == assistant.id,
+            RuntimeRun.parent_run_id.is_(None),
+            RuntimeRun.user_id == user_id,
+        )
+        .order_by(RuntimeRun.created_at.desc(), RuntimeRun.id.desc())
+        .limit(1)
+    )).scalar_one_or_none()
+    return (assistant, runtime_run)
+
+
+async def _response_surface_submission_replay_stream(
+    conversation_id: str,
+    assistant: Message | None,
+):
+    """Replay an already accepted local result without starting another run."""
+
+    message_id = assistant.id if assistant is not None else None
+    yield format_sse("stream_start", {
+        "conversation_id": conversation_id,
+        "message_id": message_id,
+        "submission_reused": True,
+    })
+    content = _message_public_content(assistant) if assistant is not None else ""
+    if content:
+        yield format_sse("text_delta", {
+            "conversation_id": conversation_id,
+            "message_id": message_id,
+            "content": content,
+        })
+    terminal = {
+        "conversation_id": conversation_id,
+        "message_id": message_id,
+        "usage": assistant.token_usage or {} if assistant is not None else {},
+        "tool_calls": (
+            runtime_public_tool_calls(assistant.tool_calls or [])
+            if assistant is not None
+            else []
+        ),
+        "attachments": assistant.attachments if assistant is not None else None,
+        "assistant_blocks": (
+            _message_assistant_blocks(assistant) if assistant is not None else None
+        ),
+        "persisted": assistant is not None,
+        "rounds": 0,
+        "submission_reused": True,
+    }
+    yield format_sse("stream_end", terminal)
+
+
+async def _response_surface_submission_failure_replay_stream(
+    conversation_id: str,
+    assistant: Message,
+    error_message: str,
+):
+    """Replay a persisted local failure without presenting it as success."""
+
+    public_error_message = runtime_assistant_stream_error_content(error_message)
+    yield format_sse("stream_start", {
+        "conversation_id": conversation_id,
+        "message_id": assistant.id,
+        "submission_reused": True,
+    })
+    yield format_sse("error", {
+        "conversation_id": conversation_id,
+        "message_id": assistant.id,
+        "message": public_error_message,
+        "persisted": True,
+        "submission_reused": True,
+    })
+    yield format_sse("stream_end", {
+        "conversation_id": conversation_id,
+        "message_id": assistant.id,
+        "persisted": True,
+        "submission_reused": True,
+    })
+
+
+def _response_surface_submission_replay_source(
+    conversation_id: str,
+    assistant: Message | None,
+    runtime_run: RuntimeRun | None,
+):
+    if (
+        runtime_run is not None
+        and (
+            runtime_run.status != RuntimeRunStatus.COMPLETED.value
+            or (
+                assistant is not None
+                and _is_stream_placeholder_message(assistant)
+            )
+        )
+    ):
+        return _durable_runtime_event_stream(runtime_run)
+    if assistant is not None and _is_stream_placeholder_message(assistant):
+        raise HTTPException(
+            status_code=409,
+            detail="response_surface_submission_in_progress",
+            headers={"Retry-After": "1"},
+        )
+    if assistant is not None:
+        meta = assistant.meta or {}
+        stream_status = str(meta.get("stream_status") or "").lower()
+        stop_reason = str(meta.get("stop_reason") or "").lower()
+        persisted_error = str(meta.get("error") or "").strip()
+        limit_detail = meta.get("limit_detail")
+        if (
+            meta.get("stream_error") is True
+            or stream_status == "error"
+            or stop_reason in {"error", "credit_exhausted"}
+            or bool(persisted_error)
+        ):
+            error_message = str(
+                meta.get("error_message")
+                or persisted_error
+                or (
+                    limit_detail.get("message")
+                    if isinstance(limit_detail, dict)
+                    else None
+                )
+                or "Response surface submission failed"
+            )
+            return _response_surface_submission_failure_replay_stream(
+                conversation_id,
+                assistant,
+                error_message,
+            )
+        if meta.get("stream_interrupted") is True or stream_status == "interrupted":
+            return _response_surface_submission_failure_replay_stream(
+                conversation_id,
+                assistant,
+                "Response surface submission was interrupted",
+            )
+    return _response_surface_submission_replay_stream(conversation_id, assistant)
+
+
+async def _response_surface_submission_replay_after_integrity_error(
+    db: AsyncSession,
+    lease,
+    *,
+    conversation_id: str,
+    user_id: str,
+    submission: dict,
+):
+    """Resolve a uniqueness-race replay while retaining lease ownership."""
+
+    try:
+        replay = await _find_response_surface_submission_replay(
+            db,
+            conversation_id=conversation_id,
+            user_id=user_id,
+            submission=submission,
+        )
+        if replay is None:
+            return None
+        assistant, runtime_run = replay
+        return _response_surface_submission_replay_source(
+            conversation_id,
+            assistant,
+            runtime_run,
+        )
+    except BaseException:
+        await lease.release()
+        raise
+
+
+def _integrity_error_constraint_name(exc: IntegrityError) -> str | None:
+    current: object | None = exc
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        constraint_name = getattr(current, "constraint_name", None)
+        diag = getattr(current, "diag", None)
+        if constraint_name:
+            return str(constraint_name)
+        if diag is not None and getattr(diag, "constraint_name", None):
+            return str(diag.constraint_name)
+        current = getattr(current, "orig", None) or getattr(current, "__cause__", None)
+    return None
 
 
 def _encode_message_cursor(message: Message | None) -> str | None:
@@ -232,15 +900,19 @@ def _to_chat_message_response(
     workflow_run_accessible: bool | None = None,
 ) -> MessageResponse:
     raw_meta = message.meta if isinstance(message.meta, dict) else {}
-    response_meta = {key: raw_meta[key] for key in _CHAT_MESSAGE_META_KEYS if key in raw_meta}
+    response_meta = runtime_public_tool_payload({
+        key: raw_meta[key]
+        for key in _CHAT_MESSAGE_META_KEYS
+        if key in raw_meta
+    })
     if workflow_run_accessible is False:
         response_meta["workflow_run_accessible"] = False
     return MessageResponse(
         id=message.id,
         conversation_id=message.conversation_id,
         role=message.role,
-        content=message.content,
-        tool_calls=message.tool_calls,
+        content=_message_public_content(message),
+        tool_calls=runtime_public_tool_calls(message.tool_calls),
         assistant_blocks=_message_assistant_blocks(message),
         token_usage=message.token_usage,
         attachments=message.attachments,
@@ -354,6 +1026,39 @@ _SSE_HEADERS = {
     "Connection": "keep-alive",
     "X-Accel-Buffering": "no",
 }
+_CONVERSATION_ID_HEADER = "X-Conversation-ID"
+_RUNTIME_RUN_ID_HEADER = "X-Runtime-Run-ID"
+_RESPONSE_SURFACE_EVENT_ID_HEADER = "X-Response-Surface-Event-ID"
+
+
+async def _chat_streaming_response(
+    db: AsyncSession,
+    lease,
+    source,
+    *,
+    conversation_id: str | None = None,
+    runtime_run_id: str | None = None,
+    response_surface_event_id: str | None = None,
+) -> StreamingResponse:
+    """Release the request transaction before a long-lived SSE response starts."""
+    try:
+        await db.commit()
+        await db.close()
+        headers = dict(_SSE_HEADERS)
+        if conversation_id:
+            headers[_CONVERSATION_ID_HEADER] = conversation_id
+        if runtime_run_id:
+            headers[_RUNTIME_RUN_ID_HEADER] = runtime_run_id
+        if response_surface_event_id:
+            headers[_RESPONSE_SURFACE_EVENT_ID_HEADER] = response_surface_event_id
+        return StreamingResponse(
+            lease.wrap(source),
+            media_type="text/event-stream",
+            headers=headers,
+        )
+    except BaseException:
+        await lease.release()
+        raise
 
 
 def _surface_for_chat_request(
@@ -415,10 +1120,15 @@ def _redact_local_fs_urls(value):
 
 def _message_limit_meta(message) -> dict:
     meta = message.meta or {}
+    raw_error = meta.get("error")
     return {
         "stop_reason": meta.get("stop_reason"),
-        "error": meta.get("error"),
-        "limit_detail": meta.get("limit_detail"),
+        "error": (
+            runtime_assistant_stream_error_content(str(raw_error))
+            if raw_error
+            else None
+        ),
+        "limit_detail": runtime_public_failure_payload(meta.get("limit_detail")),
     }
 
 
@@ -428,21 +1138,35 @@ def _message_hitl_requests(message) -> list[dict] | None:
     return requests if isinstance(requests, list) else None
 
 
+def _message_public_content(message) -> str:
+    return runtime_public_assistant_message_content(
+        message.content,
+        message.meta,
+        message.tool_calls,
+    )
+
+
 def _message_assistant_blocks(message) -> list[dict] | None:
     meta = message.meta or {}
+    if (
+        meta.get("stream_error") is True
+        or meta.get("stream_interrupted") is True
+        or str(meta.get("stream_status") or "").lower() in {"error", "interrupted"}
+        or str(meta.get("stop_reason") or "").lower() in {"error", "credit_exhausted"}
+    ):
+        return None
     blocks = meta.get("assistant_blocks")
-    return blocks if isinstance(blocks, list) else None
+    return (
+        runtime_public_tool_payload(blocks)
+        if isinstance(blocks, list)
+        else None
+    )
 
 
 def _message_workflow_result(message) -> dict | None:
     meta = message.meta or {}
     result = meta.get("workflow_result")
-    return result if isinstance(result, dict) else None
-
-
-def _is_internal_file_permission_marker(content: str | None) -> bool:
-    """Return True for legacy approval-resume markers that should stay hidden."""
-    return bool(isinstance(content, str) and _FILE_PERMISSION_MARKER_RE.match(content.strip()))
+    return runtime_public_tool_payload(result) if isinstance(result, dict) else None
 
 
 def _parse_csv_names(value: str | list[str] | tuple[str, ...] | None) -> list[str]:
@@ -463,16 +1187,30 @@ def _is_stream_placeholder_message(message) -> bool:
 def _visible_chat_messages(messages: list) -> list:
     """Filter chat transcript rows without letting hidden rows consume the UI limit."""
     visible_reversed = []
-    later_completed_assistant_seen = False
+    later_completed_origins: set[str] = set()
+    later_unscoped_completed_assistant_seen = False
     for message in reversed(messages):
         is_placeholder = _is_stream_placeholder_message(message)
-        if message.role == "user" and _is_internal_file_permission_marker(message.content):
+        if message.role == "user" and is_internal_file_permission_marker(message.content):
             continue
-        if is_placeholder and later_completed_assistant_seen:
-            continue
+        meta = message.meta or {}
+        origin_user_message_id = str(
+            meta.get(ORIGIN_USER_MESSAGE_ID_META_KEY) or ""
+        ).strip()
+        if is_placeholder:
+            if origin_user_message_id in later_completed_origins:
+                continue
+            if (
+                not origin_user_message_id
+                and later_unscoped_completed_assistant_seen
+            ):
+                continue
         visible_reversed.append(message)
         if message.role == "assistant" and not is_placeholder:
-            later_completed_assistant_seen = True
+            if origin_user_message_id:
+                later_completed_origins.add(origin_user_message_id)
+            else:
+                later_unscoped_completed_assistant_seen = True
     return list(reversed(visible_reversed))
 
 
@@ -558,6 +1296,179 @@ async def _get_accessible_conversation(
     return conv
 
 
+def _require_user_managed_conversation(conv: Conversation) -> Conversation:
+    """Hide host-owned surface sessions from ordinary chat management APIs."""
+
+    if ConversationSurfaceMetadataFactory.is_host_owned(conv.meta):
+        raise HTTPException(404, "Conversation not found")
+    return conv
+
+
+def _require_deletable_conversation(conv: Conversation) -> Conversation:
+    """Keep host-owned sessions out of generic deletion except AI Edit teardown."""
+
+    if not ConversationSurfaceMetadataFactory.is_deletable_session(conv.meta):
+        raise HTTPException(404, "Conversation not found")
+    return conv
+
+
+async def _get_owned_runtime_run(
+    db: AsyncSession,
+    run_id: str,
+    user: User,
+) -> RuntimeRun:
+    run = (
+        await db.execute(
+            select(RuntimeRun).where(
+                RuntimeRun.id == run_id,
+                RuntimeRun.entity_id == user.entity_id,
+                RuntimeRun.user_id == user.id,
+            )
+        )
+    ).scalar_one_or_none()
+    if run is None:
+        raise HTTPException(404, "Chat run not found")
+    return run
+
+
+@router.get("/runs/{run_id}")
+async def get_chat_runtime_run_status(
+    run_id: str,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    run = await _get_owned_runtime_run(db, run_id, user)
+    return await project_runtime_run_status(
+        db,
+        run,
+        poll_after_seconds=get_settings().SANDBOX_QUEUE_POLL_SECONDS,
+    )
+
+
+@router.post("/runs/{run_id}/cancel")
+async def cancel_chat_runtime_run(
+    run_id: str,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    await _get_owned_runtime_run(db, run_id, user)
+    try:
+        run = await request_runtime_run_cancel(
+            db,
+            run_id=run_id,
+            entity_id=user.entity_id,
+            user_id=user.id,
+        )
+    except RuntimeRunNotFoundError as exc:
+        raise HTTPException(404, "Chat run not found") from exc
+    await db.commit()
+    await cancel_runtime_run_resources(run)
+    return await project_runtime_run_status(
+        db,
+        run,
+        poll_after_seconds=get_settings().SANDBOX_QUEUE_POLL_SECONDS,
+    )
+
+
+async def _durable_runtime_event_stream(
+    run: RuntimeRun,
+    *,
+    after_id: str = "0-0",
+):
+    from packages.core.database import async_session
+    from packages.core.models.runtime_run import RuntimeRunStatus
+    from packages.core.services.runtime_event_stream import (
+        parse_sse_frame,
+        read_runtime_sse_events,
+    )
+
+    yield format_sse(
+        "runtime_run",
+        {
+            "run_id": run.id,
+            "conversation_id": run.conversation_id,
+            "message_id": run.assistant_message_id,
+            "status": run.status,
+            "poll_after_seconds": get_settings().SANDBOX_QUEUE_POLL_SECONDS,
+        },
+    )
+    cursor = after_id or "0-0"
+    terminal_event_seen = False
+    stream_end_seen = False
+    while True:
+        frames = await read_runtime_sse_events(
+            run.id,
+            after_id=cursor,
+        )
+        for event_id, frame in frames:
+            cursor = event_id
+            event_type = parse_sse_frame(frame)[0]
+            stream_end_seen = stream_end_seen or event_type == "stream_end"
+            terminal_event_seen = terminal_event_seen or event_type in {
+                "runtime_status",
+                "stream_end",
+            }
+            yield frame
+        if stream_end_seen:
+            while True:
+                final_frames = await read_runtime_sse_events(
+                    run.id,
+                    after_id=cursor,
+                    block_ms=None,
+                )
+                if not final_frames:
+                    return
+                for event_id, frame in final_frames:
+                    cursor = event_id
+                    yield frame
+        async with async_session() as db:
+            current = await db.get(RuntimeRun, run.id)
+            status = current.status if current is not None else RuntimeRunStatus.FAILED.value
+            reason = current.status_reason if current is not None else "runtime_run_missing"
+        if status in RuntimeRunStatus.terminal():
+            while True:
+                final_frames = await read_runtime_sse_events(
+                    run.id,
+                    after_id=cursor,
+                    block_ms=None,
+                )
+                if not final_frames:
+                    break
+                for event_id, frame in final_frames:
+                    cursor = event_id
+                    terminal_event_seen = terminal_event_seen or parse_sse_frame(frame)[0] in {
+                        "runtime_status",
+                        "stream_end",
+                    }
+                    yield frame
+            if not terminal_event_seen:
+                yield format_sse(
+                    "runtime_status",
+                    {"run_id": run.id, "status": status, "status_reason": reason},
+                )
+            return
+        if not frames:
+            yield format_sse("keepalive", {"run_id": run.id})
+
+
+@router.get("/runs/{run_id}/events")
+async def reconnect_chat_runtime_run_events(
+    run_id: str,
+    request: Request,
+    after_id: str | None = Query(None),
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    run = await _get_owned_runtime_run(db, run_id, user)
+    cursor = after_id or request.headers.get("Last-Event-ID") or "0-0"
+    lease = await acquire_chat_stream_lease(scope="chat-reconnect")
+    return await _chat_streaming_response(
+        db,
+        lease,
+        _durable_runtime_event_stream(run, after_id=cursor),
+    )
+
+
 async def _resolve_chat_workspace_scope(
     db: AsyncSession,
     user: User,
@@ -606,6 +1517,47 @@ async def _resolve_chat_workspace_scope(
     return workspace_id, requested_thread_ref_kind, requested_thread_ref_id
 
 
+async def _resolve_task_session_request_agent(
+    db: AsyncSession,
+    user: User,
+    *,
+    requested_agent_id: str | None,
+    conversation_id: str | None = None,
+    workspace_id: str | None,
+    thread_ref_kind: str | None,
+    thread_ref_id: str | None,
+) -> str | None:
+    """Apply an interactive Task's Host before request-level Agent work."""
+
+    from packages.core.services.task_session import (
+        TaskSessionHostError,
+        task_session_host_for_conversation,
+        task_session_host_for_thread,
+    )
+
+    try:
+        if conversation_id:
+            host = await task_session_host_for_conversation(
+                db,
+                conversation_id=conversation_id,
+                entity_id=user.entity_id,
+                workspace_id=workspace_id,
+            )
+        else:
+            host = await task_session_host_for_thread(
+                db,
+                entity_id=user.entity_id,
+                workspace_id=workspace_id,
+                thread_ref_kind=thread_ref_kind,
+                thread_ref_id=thread_ref_id,
+            )
+    except LookupError as exc:
+        raise HTTPException(404, "Conversation not found") from exc
+    except TaskSessionHostError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    return host.agent_id if host else requested_agent_id
+
+
 def _coerce_bool(value) -> bool:
     if isinstance(value, bool):
         return value
@@ -644,15 +1596,23 @@ async def _prepare_manual_skill_turn(
     agent_id: str | None,
     message: str,
     manual_skill_ids: str | None,
+    manual_skill_refs: str | None = None,
+    user_id: str | None = None,
+    user_role: str | None = None,
 ) -> ChatManualSkillTurn:
     try:
         return await prepare_chat_manual_skill_turn(
             db,
             entity_id=entity_id,
             agent_id=agent_id,
+            user_id=user_id,
+            user_role=user_role,
             message=message,
             manual_skill_ids=manual_skill_ids,
+            manual_skill_refs=manual_skill_refs,
         )
+    except ManualSkillReferenceError as exc:
+        raise HTTPException(400, str(exc)) from exc
     except ManualSkillResolutionError as exc:
         raise HTTPException(404, str(exc)) from exc
 
@@ -684,6 +1644,8 @@ _VIDEO_ASPECT_RATIO_ALIASES = {
     "自适应": "adaptive",
 }
 _VIDEO_ASPECT_RATIO_CHOICES = {"adaptive", "21:9", "16:9", "4:3", "3:4", "1:1", "9:16"}
+
+
 class _VideoGenerationMode(StrEnum):
     AUTO = "auto"
     NATIVE_MOTION = "native_motion"
@@ -702,9 +1664,7 @@ class _VideoSandboxSkill(StrEnum):
 
 
 _LIVE_VIDEO_SANDBOX_STATUSES = frozenset({"ready", "executing"})
-
-
-_VIDEO_GENERATION_MODE_ALIASES: dict[str, _VideoGenerationMode] = {
+_VIDEO_GENERATION_MODE_ALIASES = {
     "auto": _VideoGenerationMode.AUTO,
     "native": _VideoGenerationMode.NATIVE_MOTION,
     "motion": _VideoGenerationMode.NATIVE_MOTION,
@@ -786,7 +1746,9 @@ def _parse_chat_mode_payload(raw: str | dict | None, chat_mode: str | None) -> d
 
     if _normalize_chat_mode(chat_mode) == "video":
         raw_generation_mode = payload.get("generation_mode")
-        generation_mode = str(raw_generation_mode or _VideoGenerationMode.AUTO).strip().lower().replace("-", "_")
+        generation_mode = str(
+            raw_generation_mode or _VideoGenerationMode.AUTO
+        ).strip().lower().replace("-", "_")
         payload["generation_mode"] = _VIDEO_GENERATION_MODE_ALIASES.get(
             generation_mode,
             _VideoGenerationMode.AUTO,
@@ -989,7 +1951,6 @@ async def _live_video_sandbox_matches_skill(
     if not normalized_id:
         return False
     try:
-        from packages.core.config import get_settings
         from packages.core.services.sandbox_sdk import SandboxClient
 
         sandbox_url = get_settings().SANDBOX_SERVICE_URL.strip()
@@ -1085,19 +2046,14 @@ def _chat_mode_direct_tool_calls(
     if not prompt_text or manual_skill_refs:
         return []
 
-    if (
-        mode in {None, "auto"}
-        and video_edit_route_state is not _VideoEditRouteState.INACTIVE
-    ):
-        return [
-            {
-                "name": "invoke_skill",
-                "arguments": {
-                    "skill": _VideoSandboxSkill.EDIT_SKILL.value,
-                    "input": _video_edit_skill_input(prompt_text, {}, attachments),
-                },
-            }
-        ]
+    if mode in {None, "auto"} and video_edit_route_state is not _VideoEditRouteState.INACTIVE:
+        return [{
+            "name": "invoke_skill",
+            "arguments": {
+                "skill": _VideoSandboxSkill.EDIT_SKILL.value,
+                "input": _video_edit_skill_input(prompt_text, {}, attachments),
+            },
+        }]
 
     if mode not in {"image", "video", "audio"}:
         return []
@@ -1112,20 +2068,17 @@ def _chat_mode_direct_tool_calls(
     output_type = str(payload.get("output_type") or "single_clip").strip().lower()
     if output_type not in _DIRECT_VIDEO_OUTPUT_TYPES:
         return []
-    generation_mode = payload["generation_mode"]
-    if generation_mode in {
+    if payload["generation_mode"] in {
         _VideoGenerationMode.AUTO,
         _VideoGenerationMode.NATIVE_MOTION,
     }:
-        return [
-            {
-                "name": "invoke_skill",
-                "arguments": {
-                    "skill": "video-edit",
-                    "input": _video_edit_skill_input(prompt_text, payload, attachments),
-                },
-            }
-        ]
+        return [{
+            "name": "invoke_skill",
+            "arguments": {
+                "skill": _VideoSandboxSkill.EDIT_SKILL.value,
+                "input": _video_edit_skill_input(prompt_text, payload, attachments),
+            },
+        }]
 
     image_urls = [url for url in (attachments.image_urls or []) if str(url or "").strip()]
     video_urls = [url for url in (attachments.video_urls or []) if str(url or "").strip()]
@@ -1202,13 +2155,17 @@ def _stream_llm_message_with_attachments(
     llm_base_message: str,
     attachments: FileAttachments,
     direct_tool_calls: list[dict] | None,
+    editor_context: dict | None = None,
 ) -> str | list:
-    text_part = llm_base_message
+    text_sections = [llm_base_message]
+    current_document_context = render_editor_current_document_user_context(editor_context)
+    if current_document_context:
+        text_sections.append(current_document_context)
     if attachments.text_context:
-        text_part = (
-            f"{llm_base_message}\n\n<attached_files>\n"
-            f"{attachments.text_context}\n</attached_files>"
+        text_sections.append(
+            f"<attached_files>\n{attachments.text_context}\n</attached_files>"
         )
+    text_part = "\n\n".join(text_sections)
 
     if attachments.image_blocks and not _is_direct_media_generation_turn(direct_tool_calls):
         return [
@@ -1216,6 +2173,13 @@ def _stream_llm_message_with_attachments(
             *attachments.image_blocks,
         ]
     return text_part
+
+
+def _parse_editor_context_request(value: str | dict | None) -> dict | None:
+    try:
+        return runtime_parse_editor_context(value)
+    except EditorCurrentDocumentTooLargeError as exc:
+        raise HTTPException(status_code=413, detail=str(exc)) from exc
 
 
 def _chat_mode_payload_summary(payload: dict) -> str:
@@ -1342,24 +2306,7 @@ def _chat_mode_runtime_prompt(chat_mode: str | None, chat_mode_payload: str | di
             + _slides_render_prompt(str(payload.get("render") or "editable"))
         ),
         "sheet": f"{shared}\nMode: Spreadsheet generation. Use generate_file with kind='spreadsheet'.",
-        "website": (
-            f"{shared}\nMode: Website/app generation. Build or edit a real responsive implementation with "
-            "generate_file(kind='code'), preserve supplied source files and visual references, and produce a root "
-            "index.html with browser-ready relative assets. Copy generated media into the bundle with params.assets; "
-            "never leave publishable HTML/CSS/JS dependent on /api/ paths. Every link must have a real destination, "
-            "every fragment target must exist, and every enabled button or form must have real behavior. Repair all "
-            "returned static-site preflight errors until validation.valid is true, then verify the rendered result when "
-            "browser tools are available, including console errors and failed requests. A static prototype must not "
-            "pretend that login, payment, persistence, or server APIs are production-backed. Return the runnable "
-            "artifact rather than stopping at a mockup or prose plan. For behavior that should connect after Manor Site "
-            "publishing, use the declarative Site Bridge contract: mark newsletter/subscription forms with "
-            "data-manor-action='subscription', contact/demo/lead forms with data-manor-action='lead', and meaningful CTA "
-            "elements with a stable data-manor-event value. Put an aria-live element with data-manor-status inside each "
-            "connected form. Do not add Manor API URLs, Workspace IDs, Flow IDs, chat tokens, credentials, password fields, "
-            "payment card fields, or hand-written fetch calls for those connections; publishing injects the same-origin "
-            "runtime, infers the originating Workspace, and automatically creates or reuses the required Webchat and "
-            "Flows after the user confirms publishing."
-        ),
+        "website": f"{shared}\nMode: Website/app generation. Use generate_file with kind='code'.",
         "research": f"{shared}\nMode: Research. Prioritize source-backed research, comparisons, citations, and synthesis.",
         "flows": (
             f"{shared}\nMode: Workspace Flows. First use search_tools to load list_workspace_flows, "
@@ -1388,13 +2335,22 @@ def _runtime_metadata_for_chat_mode(
     chat_mode: str | None,
     chat_mode_prompt: str | None,
     direct_tool_calls: list[dict] | None,
+    intent_routing_metadata: dict | None = None,
     approval_runtime_metadata: dict | None = None,
     origin_user_message_id: str | None = None,
+    voice_session_mode: str | None = None,
 ) -> dict:
     metadata = dict(getattr(file_context_turn, "runtime_metadata", None) or {})
+    if intent_routing_metadata:
+        metadata.update(intent_routing_metadata)
     metadata["chat_mode"] = _normalize_chat_mode(chat_mode) or "auto"
     if origin_user_message_id:
         metadata["origin_user_message_id"] = origin_user_message_id
+    if voice_session_mode == "chat_gateway":
+        # Only an internal WebSocket-created Request can set this state. It
+        # changes delivery style without weakening the ordinary Chat surface,
+        # tool policy, approval boundary, or persistence path.
+        metadata["voice_session_mode"] = voice_session_mode
     if chat_mode_prompt:
         metadata["chat_mode_prompt"] = chat_mode_prompt
     if direct_tool_calls:
@@ -1405,6 +2361,7 @@ def _runtime_metadata_for_chat_mode(
 
 
 # ── SSE Streaming ──
+
 
 @router.get(
     "/flow-entrypoints",
@@ -1485,12 +2442,17 @@ async def stream_global_chat_flow_entrypoint(
             workspace_id=None,
             conversation_id=conversation_id,
             title=title,
+            conversation_surface=ConversationSurfaceKind.ORDINARY_CHAT,
         )
     except (LookupError, PermissionError):
         raise HTTPException(404, "Conversation not found")
     if conversation.workspace_id:
         raise HTTPException(409, "Use Workspace Chat to run a Flow in this conversation")
     if local_worker_id:
+        from packages.core.services.local_worker_targeting import (
+            select_conversation_local_worker_target,
+        )
+
         try:
             await select_conversation_local_worker_target(
                 db,
@@ -1520,6 +2482,7 @@ async def stream_global_chat_flow_entrypoint(
         ],
         meta={"author_user_id": user.id, "chat_mode": "flows"},
     )
+    lease = await acquire_chat_stream_lease(scope="chat")
     try:
         started = await launch_workspace_flow(
             db,
@@ -1536,20 +2499,25 @@ async def stream_global_chat_flow_entrypoint(
             starter_policy="always_review",
         )
     except PermissionError as exc:
+        await lease.release()
         raise HTTPException(403, str(exc)) from exc
     except (LookupError, ValueError) as exc:
+        await lease.release()
         raise HTTPException(409, str(exc)) from exc
-    return StreamingResponse(
+    except BaseException:
+        await lease.release()
+        raise
+    return await _chat_streaming_response(
+        db,
+        lease,
         _workspace_entrypoint_started_stream(started),
-        media_type="text/event-stream",
-        headers=_SSE_HEADERS,
     )
+
 
 @router.post("/stream")
 async def chat_stream(
     message: str = Form(...),
     conversation_id: str | None = Form(None),
-    local_worker_id: str | None = Form(None),
     agent_id: str | None = Form(None),
     workspace_id: str | None = Form(None),
     workspace_context: bool = Form(False),
@@ -1557,11 +2525,14 @@ async def chat_stream(
     thread_ref_id: str | None = Form(None),
     document_ids: str | None = Form(None),
     manual_skill_ids: str | None = Form(None),
+    manual_skill_refs: str | None = Form(None),
     chat_mode: str | None = Form(None),
     chat_mode_payload: str | None = Form(None),
+    response_surface_submission: str | None = Form(None),
     disable_tools: bool = Form(False),
     blocked_tools: str | None = Form(None),
     editor_context: str | None = Form(None),
+    conversation_surface: str | None = Form(None),
     ephemeral: bool = Form(False),
     files: list[UploadFile] = File(default=[]),
     user: User = Depends(get_current_user),
@@ -1573,6 +2544,95 @@ async def chat_stream(
     knowledge-base document IDs (comma-separated). File contents are
     extracted and injected into the LLM context automatically.
     """
+    requested_conversation_surface = _parse_chat_conversation_surface(
+        conversation_surface
+    )
+    parsed_editor_context = _parse_editor_context_request(editor_context)
+    ai_edit_target: AiEditTargetIdentity | None = None
+    if requested_conversation_surface is ConversationSurfaceKind.AI_EDIT:
+        if not parsed_editor_context:
+            raise HTTPException(422, "AI Edit requires editor context")
+        ai_edit_target = _parse_ai_edit_target(parsed_editor_context)
+        if ephemeral:
+            raise HTTPException(409, "AI Edit sessions require persisted context")
+        if workspace_context or workspace_id or thread_ref_kind or thread_ref_id:
+            raise HTTPException(409, "AI Edit sessions cannot use Workspace chat scope")
+    if conversation_id:
+        preflight_conversation = await _get_accessible_conversation(
+            db,
+            user,
+            conversation_id,
+        )
+        if not ConversationSurfaceMetadataFactory.matches(
+            preflight_conversation.meta,
+            requested_conversation_surface,
+        ):
+            raise HTTPException(404, "Conversation not found")
+        if (
+            ai_edit_target is not None
+            and not ConversationSurfaceMetadataFactory.matches_ai_edit_target(
+                preflight_conversation.meta,
+                ai_edit_target,
+            )
+        ):
+            raise HTTPException(404, "Conversation not found")
+    parsed_response_surface_submission = _parse_response_surface_submission(
+        response_surface_submission
+    )
+    if parsed_response_surface_submission is not None and (
+        ephemeral
+        or files
+        or document_ids
+        or manual_skill_ids
+        or manual_skill_refs
+        or chat_mode
+        or chat_mode_payload
+        or disable_tools
+        or blocked_tools
+        or editor_context
+    ):
+        raise HTTPException(409, "Response surface submission cannot include chat controls")
+    response_surface_bound = False
+    response_surface_agent_subscription_id: str | None = None
+    if parsed_response_surface_submission is not None:
+        if not conversation_id:
+            raise HTTPException(422, "Response surface submission requires a conversation")
+        preflight_conversation = await _get_accessible_conversation(
+            db,
+            user,
+            conversation_id,
+        )
+        parsed_response_surface_submission = await _bind_response_surface_submission(
+            db,
+            conversation_id=preflight_conversation.id,
+            receipt=parsed_response_surface_submission,
+        )
+        response_surface_bound = True
+        replay = await _find_response_surface_submission_replay(
+            db,
+            conversation_id=preflight_conversation.id,
+            user_id=user.id,
+            submission=parsed_response_surface_submission,
+        )
+        if replay is not None:
+            assistant, runtime_run = replay
+            source = _response_surface_submission_replay_source(
+                preflight_conversation.id,
+                assistant,
+                runtime_run,
+            )
+            replay_lease = await acquire_chat_stream_lease(scope="chat-replay")
+            return await _chat_streaming_response(
+                db,
+                replay_lease,
+                source,
+                response_surface_event_id=parsed_response_surface_submission["eventId"],
+            )
+    response_surface_event_id = (
+        parsed_response_surface_submission["eventId"]
+        if parsed_response_surface_submission is not None
+        else None
+    )
     pending_approval_turn = await _require_chat_budget_unless_pending_approval(
         db,
         user=user,
@@ -1588,166 +2648,220 @@ async def chat_stream(
         thread_ref_id=thread_ref_id,
         workspace_context=workspace_context,
     )
+    if parsed_response_surface_submission is not None:
+        task_session_agent_id = await _resolve_task_session_request_agent(
+            db,
+            user,
+            requested_agent_id=None,
+            conversation_id=conversation_id,
+            workspace_id=workspace_id,
+            thread_ref_kind=thread_ref_kind,
+            thread_ref_id=thread_ref_id,
+        )
+        if task_session_agent_id:
+            agent_id = task_session_agent_id
+        else:
+            response_surface_agent = await _response_surface_submission_agent(
+                db,
+                conversation=preflight_conversation,
+                submission=parsed_response_surface_submission,
+            )
+            agent_id = response_surface_agent.agent_id
+            response_surface_agent_subscription_id = (
+                response_surface_agent.agent_subscription_id
+            )
+    else:
+        agent_id = await _resolve_task_session_request_agent(
+            db,
+            user,
+            requested_agent_id=agent_id,
+            conversation_id=conversation_id,
+            workspace_id=workspace_id,
+            thread_ref_kind=thread_ref_kind,
+            thread_ref_id=thread_ref_id,
+        )
     video_edit_route_state = await _conversation_video_edit_route_state(
         conversation_id,
         entity_id=user.entity_id,
         user_id=user.id,
     )
-    file_context_turn = await _build_attachments(
-        message, document_ids, files, user.entity_id, db,
-        workspace_id=workspace_id, user_id=user.id,
-    )
-    message = file_context_turn.cleaned_message
-    attachments = file_context_turn.attachments
+    lease = await acquire_chat_stream_lease(scope="chat")
 
-    # Workspace-configured Workflow Starters may claim an ordinary Chat turn
-    # before Manor AI runs. Explicit Chat controls always win, and any uncertain
-    # or failed classification falls through to the existing path below.
-    from packages.core.services.workspace_workflow_router import (
-        auto_routing_allowed,
-        classify_workspace_intent,
-        conversation_message_is_pending_action_reply,
-        get_workspace_chat_entrypoint,
-        list_workspace_chat_entrypoints,
-        start_workspace_chat_entrypoint,
-        workflow_intent_attachment_descriptors,
-    )
-
-    if auto_routing_allowed(
-        workspace_id=workspace_id,
-        message=message,
-        agent_id=agent_id,
-        manual_skill_ids=manual_skill_ids,
-        chat_mode=chat_mode,
-        ephemeral=ephemeral,
-        editor_context=editor_context,
-        thread_ref_kind=thread_ref_kind,
-        thread_ref_id=thread_ref_id,
-        disable_tools=disable_tools,
-        blocked_tools=blocked_tools,
-    ) and (
-        video_edit_route_state is _VideoEditRouteState.INACTIVE
-    ) and not await conversation_message_is_pending_action_reply(
-        db,
-        conversation_id,
-        message,
-    ):
-        entrypoints = await list_workspace_chat_entrypoints(
-            db,
-            entity_id=user.entity_id,
-            workspace_id=workspace_id or "",
-            intent_only=True,
+    try:
+        file_context_turn = await _build_attachments(
+            message, document_ids, files, user.entity_id, db,
+            workspace_id=workspace_id, user_id=user.id,
         )
-        decision = await classify_workspace_intent(
-            entrypoints=entrypoints,
+        message = file_context_turn.cleaned_message
+        attachments = file_context_turn.attachments
+
+        # Workspace-configured Workflow Starters may claim an ordinary Chat
+        # turn before Manor AI runs. Explicit Chat controls always win, and any
+        # uncertain or failed classification falls through to the normal path.
+        from packages.core.services.workspace_workflow_router import (
+            auto_routing_allowed,
+            classify_workspace_intent,
+            conversation_message_is_pending_action_reply,
+            get_workspace_chat_entrypoint,
+            list_workspace_chat_entrypoints,
+            start_workspace_chat_entrypoint,
+            workflow_intent_attachment_descriptors,
+        )
+
+        if parsed_response_surface_submission is None and auto_routing_allowed(
+            workspace_id=workspace_id,
             message=message,
-            attachment_refs=workflow_intent_attachment_descriptors(attachments),
-            entity_id=user.entity_id,
-            user_id=user.id,
-            workspace_id=workspace_id or "",
-        )
-        if decision is not None:
-            resolved = await get_workspace_chat_entrypoint(
+            agent_id=agent_id,
+            manual_skill_ids=manual_skill_ids,
+            manual_skill_refs=manual_skill_refs,
+            chat_mode=chat_mode,
+            ephemeral=ephemeral,
+            editor_context=editor_context,
+            thread_ref_kind=thread_ref_kind,
+            thread_ref_id=thread_ref_id,
+            disable_tools=disable_tools,
+            blocked_tools=blocked_tools,
+        ) and (
+            video_edit_route_state is _VideoEditRouteState.INACTIVE
+        ) and not await conversation_message_is_pending_action_reply(
+            db,
+            conversation_id,
+            message,
+        ):
+            entrypoints = await list_workspace_chat_entrypoints(
                 db,
                 entity_id=user.entity_id,
                 workspace_id=workspace_id or "",
-                binding_id=decision.entrypoint.binding_id,
+                intent_only=True,
+                user=user,
+                require_control=True,
             )
-            if resolved is not None:
-                entrypoint, binding, _workflow = resolved
-                started = await start_workspace_chat_entrypoint(
-                    db,
-                    entrypoint=entrypoint,
-                    binding=binding,
+            decision = None
+            if entrypoints:
+                decision = await classify_workspace_intent(
+                    entrypoints=entrypoints,
+                    message=message,
+                    attachment_refs=workflow_intent_attachment_descriptors(attachments),
                     entity_id=user.entity_id,
                     user_id=user.id,
                     workspace_id=workspace_id or "",
-                    message=message,
-                    attachments=attachments,
-                    conversation_id=conversation_id,
-                    route_source="intent",
-                    confidence=decision.confidence,
-                    reason=decision.reason,
                 )
-                from apps.api.routers.workspace_chat import (
-                    _workspace_entrypoint_started_stream,
+            if decision is not None:
+                resolved = await get_workspace_chat_entrypoint(
+                    db,
+                    entity_id=user.entity_id,
+                    workspace_id=workspace_id or "",
+                    binding_id=decision.entrypoint.binding_id,
                 )
+                if resolved is not None:
+                    entrypoint, binding, _workflow = resolved
+                    started = await start_workspace_chat_entrypoint(
+                        db,
+                        entrypoint=entrypoint,
+                        binding=binding,
+                        entity_id=user.entity_id,
+                        user_id=user.id,
+                        workspace_id=workspace_id or "",
+                        message=message,
+                        attachments=attachments,
+                        conversation_id=conversation_id,
+                        route_source="intent",
+                        confidence=decision.confidence,
+                        reason=decision.reason,
+                    )
+                    from apps.api.routers.workspace_chat import (
+                        _workspace_entrypoint_started_stream,
+                    )
 
-                return StreamingResponse(
-                    _workspace_entrypoint_started_stream(started),
-                    media_type="text/event-stream",
-                    headers=_SSE_HEADERS,
-                )
-    manual_skill_turn = await _prepare_manual_skill_turn(
-        db,
-        entity_id=user.entity_id,
-        agent_id=agent_id,
-        message=message,
-        manual_skill_ids=manual_skill_ids,
-    )
-    manual_skill_refs = manual_skill_turn.manual_skill_refs
-    llm_base_message = manual_skill_turn.llm_base_message
+                    return await _chat_streaming_response(
+                        db,
+                        lease,
+                        _workspace_entrypoint_started_stream(started),
+                    )
 
-    chat_mode_prompt = _chat_mode_runtime_prompt(chat_mode, chat_mode_payload)
-    direct_tool_calls = [] if disable_tools else _chat_mode_direct_tool_calls(
-        chat_mode=chat_mode,
-        chat_mode_payload=chat_mode_payload,
-        prompt=llm_base_message,
-        attachments=attachments,
-        manual_skill_refs=manual_skill_refs,
-        video_edit_route_state=video_edit_route_state,
-    )
-    llm_message = _stream_llm_message_with_attachments(
-        llm_base_message,
-        attachments,
-        direct_tool_calls,
-    )
-
-    if ephemeral:
-        parsed_editor_context = runtime_parse_editor_context(editor_context)
-        turn_surface = _surface_for_chat_request(
+        manual_skill_turn = await _prepare_manual_skill_turn(
+            db,
+            entity_id=user.entity_id,
             agent_id=agent_id,
-            workspace_id=workspace_id,
-            ephemeral=True,
-            editor_context=parsed_editor_context,
+            user_id=user.id,
+            user_role=getattr(user, "role", None),
+            message=message,
+            manual_skill_ids=manual_skill_ids,
+            manual_skill_refs=manual_skill_refs,
         )
-        return StreamingResponse(
-            runtime_stream_chat_turn(
-                llm_message,
-                None,
-                surface=turn_surface,
-                entity_id=user.entity_id,
-                user_id=user.id,
+        manual_skill_refs = manual_skill_turn.manual_skill_refs
+        llm_base_message = manual_skill_turn.llm_base_message
+
+        chat_mode_prompt = _chat_mode_runtime_prompt(chat_mode, chat_mode_payload)
+        direct_tool_calls = [] if disable_tools else _chat_mode_direct_tool_calls(
+            chat_mode=chat_mode,
+            chat_mode_payload=chat_mode_payload,
+            prompt=llm_base_message,
+            attachments=attachments,
+            manual_skill_refs=manual_skill_refs,
+            video_edit_route_state=video_edit_route_state,
+        )
+        llm_message = _stream_llm_message_with_attachments(
+            llm_base_message,
+            attachments,
+            direct_tool_calls,
+            parsed_editor_context,
+        )
+    except BaseException:
+        await lease.release()
+        raise
+
+    try:
+        if ephemeral:
+            turn_surface = _surface_for_chat_request(
                 agent_id=agent_id,
                 workspace_id=workspace_id,
-                manual_skill_refs=manual_skill_refs,
-                disable_tools=disable_tools,
-                blocked_tools=(
-                    set(_parse_csv_names(blocked_tools))
-                    | _chat_mode_blocked_tools(chat_mode, surface=turn_surface)
-                ),
+                ephemeral=True,
                 editor_context=parsed_editor_context,
-                runtime_metadata=_runtime_metadata_for_chat_mode(
-                    file_context_turn,
-                    chat_mode=chat_mode,
-                    chat_mode_prompt=chat_mode_prompt,
-                    direct_tool_calls=direct_tool_calls,
+            )
+            return await _chat_streaming_response(
+                db,
+                lease,
+                runtime_stream_chat_turn(
+                    llm_message,
+                    None,
+                    surface=turn_surface,
+                    entity_id=user.entity_id,
+                    user_id=user.id,
+                    agent_id=agent_id,
+                    workspace_id=workspace_id,
+                    manual_skill_refs=manual_skill_refs,
+                    disable_tools=disable_tools,
+                    blocked_tools=(
+                        set(_parse_csv_names(blocked_tools))
+                        | _chat_mode_blocked_tools(chat_mode, surface=turn_surface)
+                    ),
+                    editor_context=parsed_editor_context,
+                    runtime_metadata=_runtime_metadata_for_chat_mode(
+                        file_context_turn,
+                        chat_mode=chat_mode,
+                        chat_mode_prompt=chat_mode_prompt,
+                        direct_tool_calls=direct_tool_calls,
+                    ),
+                    persist_messages=False,
                 ),
-                persist_messages=False,
-            ),
-            media_type="text/event-stream",
-            headers=_SSE_HEADERS,
-        )
+            )
+    except BaseException:
+        await lease.release()
+        raise
 
-    # Get or create conversation
-    # Auto-title from first message when creating a new conversation
-    saved_user_base = _message_with_chat_mode_marker(
-        manual_skill_turn.saved_user_base,
-        chat_mode,
-        chat_mode_payload,
-    )
-    _auto_title = saved_user_base.split("\n")[0][:100].strip() if not conversation_id else None
+    if ephemeral:
+        raise AssertionError("unreachable")
+
     try:
+        # Get or create conversation
+        # Auto-title from first message when creating a new conversation
+        saved_user_base = _message_with_chat_mode_marker(
+            manual_skill_turn.saved_user_base,
+            chat_mode,
+            chat_mode_payload,
+        )
+        _auto_title = saved_user_base.split("\n")[0][:100].strip() if not conversation_id else None
         conv = await get_or_create_conversation(
             db, user.entity_id, user.id,
             agent_id=agent_id,
@@ -1756,138 +2870,299 @@ async def chat_stream(
             thread_ref_kind=thread_ref_kind,
             thread_ref_id=thread_ref_id,
             title=_auto_title,
+            conversation_surface=requested_conversation_surface,
+            ai_edit_target=ai_edit_target,
         )
-    except (LookupError, PermissionError):
-        raise HTTPException(404, "Conversation not found")
-
-    if local_worker_id:
-        try:
-            await select_conversation_local_worker_target(
+        agent_id = await _resolve_task_session_request_agent(
+            db,
+            user,
+            requested_agent_id=agent_id,
+            conversation_id=conv.id,
+            workspace_id=conv.workspace_id,
+            thread_ref_kind=conv.thread_ref_kind,
+            thread_ref_id=conv.thread_ref_id,
+        )
+        if not response_surface_bound:
+            parsed_response_surface_submission = await _bind_response_surface_submission(
                 db,
                 conversation_id=conv.id,
-                entity_id=user.entity_id,
-                user_id=user.id,
-                worker_id=local_worker_id,
+                receipt=parsed_response_surface_submission,
             )
-        except LookupError as exc:
-            raise HTTPException(404, str(exc)) from exc
-        except RuntimeError as exc:
-            raise HTTPException(409, str(exc)) from exc
+        if parsed_response_surface_submission is not None:
+            canonical_submission_message = _response_surface_submission_message(
+                parsed_response_surface_submission
+            )
+            saved_user_base = canonical_submission_message
+            llm_base_message = canonical_submission_message
+            llm_message = canonical_submission_message
+    except (LookupError, PermissionError) as exc:
+        await lease.release()
+        raise HTTPException(404, "Conversation not found") from exc
+    except ValueError as exc:
+        await lease.release()
+        raise HTTPException(409, str(exc)) from exc
+    except BaseException:
+        await lease.release()
+        raise
 
     if _is_runtime_approval_rejected_message(llm_base_message):
-        assistant_msg = await add_message(db, conv.id, role="assistant", content=_RUNTIME_APPROVAL_REJECTED_REPLY)
-        await db.commit()
-        return StreamingResponse(
-            _runtime_approval_rejected_stream(conv.id, _RUNTIME_APPROVAL_REJECTED_REPLY, assistant_msg.id),
-            media_type="text/event-stream",
-            headers=_SSE_HEADERS,
-        )
+        try:
+            assistant_msg = await add_message(db, conv.id, role="assistant", content=_RUNTIME_APPROVAL_REJECTED_REPLY)
+            await db.commit()
+            return await _chat_streaming_response(
+                db,
+                lease,
+                _runtime_approval_rejected_stream(
+                    conv.id,
+                    _RUNTIME_APPROVAL_REJECTED_REPLY,
+                    assistant_msg.id,
+                ),
+            )
+        except BaseException:
+            await lease.release()
+            raise
 
     approval_saved_text: str | None = None
     approval_runtime_metadata: dict | None = None
+    intent_routing_metadata: dict | None = None
     save_user_message = True
-    replacement, resolved_saved_text, save_user_message, approval_runtime_metadata = await resolve_chat_approval_turn(
-        db,
-        conversation_id=conv.id,
-        entity_id=user.entity_id,
-        user_id=user.id,
-        message=llm_base_message,
-    )
-    if replacement:
-        llm_message = replacement
-        approval_saved_text = resolved_saved_text
-        direct_tool_calls = []
-    elif pending_approval_turn:
-        # The card changed between the preflight lookup and resolution.  Do not
-        # let a stale structured action become an ungated AI prompt.
-        await require_plan("ai_budget_usd")(user=user, db=db)
+    durable_run: RuntimeRun | None = None
+    resolved_conversation_id = str(conv.id)
+    try:
+        replacement, resolved_saved_text, save_user_message, approval_runtime_metadata = await resolve_chat_approval_turn(
+            db,
+            conversation_id=conv.id,
+            entity_id=user.entity_id,
+            user_id=user.id,
+            message=llm_base_message,
+        )
+        if replacement:
+            llm_message = replacement
+            approval_saved_text = resolved_saved_text
+            direct_tool_calls = []
+        elif pending_approval_turn:
+            # The card changed between the preflight lookup and resolution. Do
+            # not let a stale structured action become an ungated AI prompt.
+            await require_plan("ai_budget_usd")(user=user, db=db)
 
-    if replacement and _is_workflow_approval_resolution(approval_runtime_metadata):
-        if save_user_message:
-            await add_message(
+        if replacement and _is_workflow_approval_resolution(approval_runtime_metadata):
+            if save_user_message:
+                await add_message(
+                    db,
+                    conv.id,
+                    role="user",
+                    content=resolved_saved_text or saved_user_base,
+                    attachments=attachments.attachment_refs or None,
+                    meta={"author_user_id": user.id},
+                )
+            assistant_msg = await add_message(
                 db,
                 conv.id,
-                role="user",
-                content=resolved_saved_text or saved_user_base,
-                meta={"author_user_id": user.id},
+                role="assistant",
+                content=replacement,
             )
-        assistant_msg = await add_message(
-            db,
-            conv.id,
-            role="assistant",
-            content=replacement,
+            return await _chat_streaming_response(
+                db,
+                lease,
+                _runtime_approval_rejected_stream(conv.id, replacement, assistant_msg.id),
+            )
+
+        runtime_surface = _surface_for_chat_request(
+            agent_id=agent_id,
+            workspace_id=workspace_id,
+            editor_context=parsed_editor_context,
         )
-        await db.commit()
-        return StreamingResponse(
-            _runtime_approval_rejected_stream(conv.id, replacement, assistant_msg.id),
-            media_type="text/event-stream",
-            headers=_SSE_HEADERS,
+        from packages.core.services.chat_intent_routing import (
+            auto_chat_intent_routing_allowed,
+            classify_chat_intent_routing,
         )
 
-    # Save user message in DB as plain text. The image bytes are only
-    # multimodal for this turn, but the stable /api/v1/fs references must
-    # remain in history so follow-up turns can use them for media tools.
-    origin_user_message = None
-    if save_user_message:
-        saved_text = approval_saved_text or saved_user_base
-        if not approval_saved_text:
-            saved_text = runtime_saved_message_with_file_references(saved_text, attachments)
-        # Stash the posting user so workspace chat can attribute the message
-        # to its real author. Without this, every user message reads back with
-        # no author_user_id and the UI renders all of them as the viewer's own.
-        origin_user_message = await add_message(
-            db, conv.id, role="user", content=saved_text,
-            meta={"author_user_id": user.id},
+        if (
+            parsed_response_surface_submission is None
+            and
+            video_edit_route_state is _VideoEditRouteState.INACTIVE
+            and auto_chat_intent_routing_allowed(
+                surface=runtime_surface,
+                chat_mode=_normalize_chat_mode(chat_mode),
+                agent_id=agent_id,
+                workspace_id=workspace_id,
+                manual_skill_selected=bool(manual_skill_refs),
+                editor_context=parsed_editor_context,
+                ephemeral=False,
+                disable_tools=disable_tools,
+                blocked_tools=bool(_parse_csv_names(blocked_tools)),
+                approval_turn=bool(replacement or pending_approval_turn),
+                has_forced_tool_calls=bool(direct_tool_calls),
+                has_attachments=bool(
+                    attachments.attachment_refs
+                    or attachments.text_context
+                    or attachments.image_blocks
+                ),
+            )
+        ):
+            intent_routing = await classify_chat_intent_routing(
+                db,
+                user=user,
+                message=llm_base_message,
+                conversation_id=conv.id,
+                runtime_metadata={
+                    "chat_mode": _normalize_chat_mode(chat_mode) or "auto",
+                },
+            )
+            intent_routing_metadata = intent_routing.runtime_metadata(
+                request=llm_base_message,
+            )
+            disable_tools = disable_tools or intent_routing.execution_plan.disable_tools
+
+        # Save user message in DB as plain text. The image bytes are only
+        # multimodal for this turn, but the stable /api/v1/fs references must
+        # remain in history so follow-up turns can use them for media tools.
+        origin_user_message = None
+        if save_user_message:
+            saved_text = approval_saved_text or saved_user_base
+            if not approval_saved_text:
+                saved_text = runtime_saved_message_with_file_references(saved_text, attachments)
+            # Stash the posting user so workspace chat can attribute the message
+            # to its real author. Without this, every user message reads back with
+            # no author_user_id and the UI renders all of them as the viewer's own.
+            origin_user_message = await add_message(
+                db, conv.id, role="user", content=saved_text,
+                attachments=attachments.attachment_refs or None,
+                response_surface_event_id=(
+                    parsed_response_surface_submission["eventId"]
+                    if parsed_response_surface_submission is not None
+                    else None
+                ),
+                meta={
+                    "author_user_id": user.id,
+                    **(
+                        {"response_surface_submission": parsed_response_surface_submission}
+                        if parsed_response_surface_submission is not None
+                        else {}
+                    ),
+                },
+            )
+        assistant_placeholder = await create_assistant_stream_placeholder(
+            db,
+            conv.id,
+            entity_id=user.entity_id,
+            workspace_id=workspace_id,
+            agent_id=agent_id,
+            author_subscription_id=response_surface_agent_subscription_id,
+            meta=(
+                assistant_message_origin_meta(
+                    origin_user_message.id if origin_user_message else None
+                )
+                or None
+            ),
         )
-    assistant_placeholder = await create_assistant_stream_placeholder(
-        db,
-        conv.id,
-        entity_id=user.entity_id,
-        workspace_id=workspace_id,
-        agent_id=agent_id,
-    )
-    await db.commit()
+        blocked_tools_for_turn = (
+            set(_parse_csv_names(blocked_tools))
+            | _chat_mode_blocked_tools(chat_mode, surface=runtime_surface)
+        )
+        runtime_metadata_payload = _runtime_metadata_for_chat_mode(
+            file_context_turn,
+            chat_mode=chat_mode,
+            chat_mode_prompt=chat_mode_prompt,
+            direct_tool_calls=direct_tool_calls,
+            intent_routing_metadata=intent_routing_metadata,
+            approval_runtime_metadata=approval_runtime_metadata,
+            origin_user_message_id=(
+                origin_user_message.id if origin_user_message is not None else None
+            ),
+        )
+        if response_surface_agent_subscription_id:
+            runtime_metadata_payload["agent_subscription_id"] = (
+                response_surface_agent_subscription_id
+            )
+        settings = get_settings()
+        if (
+            settings.MANOR_RUNTIME_EXECUTION_MODE == "durable"
+            and settings.SANDBOX_COORDINATION_MODE == "external-runner"
+        ):
+            durable_run = await create_runtime_run(
+                db,
+                conversation_id=conv.id,
+                assistant_message_id=assistant_placeholder.id,
+                entity_id=user.entity_id,
+                user_id=user.id,
+                agent_id=agent_id,
+                workspace_id=workspace_id,
+                execution_payload={
+                    "message": llm_message,
+                    "surface": getattr(runtime_surface, "value", runtime_surface),
+                    "manual_skill_refs": manual_skill_refs,
+                    "disable_tools": disable_tools,
+                    "blocked_tools": sorted(blocked_tools_for_turn),
+                    "editor_context": parsed_editor_context,
+                    "runtime_metadata": runtime_metadata_payload,
+                },
+            )
+        await db.commit()
+    except IntegrityError as exc:
+        await db.rollback()
+        if (
+            parsed_response_surface_submission is not None
+            and _integrity_error_constraint_name(exc)
+            == _RESPONSE_SURFACE_EVENT_UNIQUE_INDEX
+        ):
+            source = await _response_surface_submission_replay_after_integrity_error(
+                db,
+                lease,
+                conversation_id=resolved_conversation_id,
+                user_id=user.id,
+                submission=parsed_response_surface_submission,
+            )
+            if source is not None:
+                return await _chat_streaming_response(
+                    db,
+                    lease,
+                    source,
+                    response_surface_event_id=response_surface_event_id,
+                )
+        await lease.release()
+        raise HTTPException(409, "conversation_run_active") from exc
+    except BaseException:
+        await lease.release()
+        raise
 
     # Stream response — don't pass the request-scoped db session;
     # the generator creates its own short-lived sessions to avoid
     # holding a DB connection for the entire SSE stream duration.
-    parsed_editor_context = runtime_parse_editor_context(editor_context)
-    turn_surface = _surface_for_chat_request(
-        agent_id=agent_id,
-        workspace_id=workspace_id,
-        editor_context=parsed_editor_context,
-    )
-    return StreamingResponse(
-        runtime_stream_chat_turn(
-            llm_message,
-            conv.id,
-            surface=turn_surface,
-            entity_id=user.entity_id,
-            user_id=user.id,
-            agent_id=agent_id,
-            workspace_id=workspace_id,
-            manual_skill_refs=manual_skill_refs,
-            disable_tools=disable_tools,
-            blocked_tools=(
-                set(_parse_csv_names(blocked_tools))
-                | _chat_mode_blocked_tools(chat_mode, surface=turn_surface)
+    try:
+        if durable_run is not None:
+            return await _chat_streaming_response(
+                db,
+                lease,
+                _durable_runtime_event_stream(durable_run),
+                conversation_id=resolved_conversation_id,
+                runtime_run_id=durable_run.id,
+                response_surface_event_id=response_surface_event_id,
+            )
+        return await _chat_streaming_response(
+            db,
+            lease,
+            runtime_stream_chat_turn(
+                llm_message,
+                conv.id,
+                surface=runtime_surface,
+                entity_id=user.entity_id,
+                user_id=user.id,
+                agent_id=agent_id,
+                workspace_id=workspace_id,
+                manual_skill_refs=manual_skill_refs,
+                disable_tools=disable_tools,
+                blocked_tools=blocked_tools_for_turn,
+                editor_context=parsed_editor_context,
+                assistant_message_id=assistant_placeholder.id,
+                runtime_metadata=runtime_metadata_payload,
             ),
-            editor_context=parsed_editor_context,
-            assistant_message_id=assistant_placeholder.id,
-            runtime_metadata=_runtime_metadata_for_chat_mode(
-                file_context_turn,
-                chat_mode=chat_mode,
-                chat_mode_prompt=chat_mode_prompt,
-                direct_tool_calls=direct_tool_calls,
-                approval_runtime_metadata=approval_runtime_metadata,
-                origin_user_message_id=(
-                    origin_user_message.id if origin_user_message is not None else None
-                ),
-            ),
-        ),
-        media_type="text/event-stream",
-        headers=_SSE_HEADERS,
-    )
+            conversation_id=resolved_conversation_id,
+            response_surface_event_id=response_surface_event_id,
+        )
+    except BaseException:
+        await lease.release()
+        raise
 
 
 
@@ -1898,7 +3173,6 @@ async def chat_message(
     request: Request,
     message: str | None = Form(None),
     conversation_id: str | None = Form(None),
-    local_worker_id: str | None = Form(None),
     agent_id: str | None = Form(None),
     workspace_id: str | None = Form(None),
     workspace_context: bool = Form(False),
@@ -1906,6 +3180,7 @@ async def chat_message(
     thread_ref_id: str | None = Form(None),
     document_ids: str | None = Form(None),
     manual_skill_ids: str | None = Form(None),
+    manual_skill_refs: str | None = Form(None),
     chat_mode: str | None = Form(None),
     chat_mode_payload: str | None = Form(None),
     blocked_tools: str | None = Form(None),
@@ -1923,7 +3198,6 @@ async def chat_message(
         body = await request.json()
         message = body.get("message")
         conversation_id = body.get("conversation_id", conversation_id)
-        local_worker_id = body.get("local_worker_id", local_worker_id)
         agent_id = body.get("agent_id", agent_id)
         workspace_id = body.get("workspace_id", workspace_id)
         workspace_context = _coerce_bool(body.get("workspace_context", workspace_context))
@@ -1931,12 +3205,19 @@ async def chat_message(
         thread_ref_id = body.get("thread_ref_id", thread_ref_id)
         document_ids = body.get("document_ids", document_ids)
         manual_skill_ids = body.get("manual_skill_ids", manual_skill_ids)
+        manual_skill_refs_value = body.get("manual_skill_refs", manual_skill_refs)
+        manual_skill_refs = (
+            json.dumps(manual_skill_refs_value)
+            if isinstance(manual_skill_refs_value, list)
+            else manual_skill_refs_value
+        )
         chat_mode = body.get("chat_mode", chat_mode)
         chat_mode_payload = body.get("chat_mode_payload", chat_mode_payload)
         blocked_tools = body.get("blocked_tools", blocked_tools)
         editor_context = body.get("editor_context", editor_context)
     if message is None:
         raise HTTPException(422, "message is required")
+    parsed_editor_context = _parse_editor_context_request(editor_context)
 
     pending_approval_turn = await _require_chat_budget_unless_pending_approval(
         db,
@@ -1954,6 +3235,15 @@ async def chat_message(
         thread_ref_id=thread_ref_id,
         workspace_context=bool(workspace_context),
     )
+    agent_id = await _resolve_task_session_request_agent(
+        db,
+        user,
+        requested_agent_id=agent_id,
+        conversation_id=conversation_id,
+        workspace_id=workspace_id,
+        thread_ref_kind=thread_ref_kind,
+        thread_ref_id=thread_ref_id,
+    )
     video_edit_route_state = await _conversation_video_edit_route_state(
         conversation_id,
         entity_id=user.entity_id,
@@ -1969,8 +3259,11 @@ async def chat_message(
         db,
         entity_id=user.entity_id,
         agent_id=agent_id,
+        user_id=user.id,
+        user_role=getattr(user, "role", None),
         message=message,
         manual_skill_ids=manual_skill_ids,
+        manual_skill_refs=manual_skill_refs,
     )
     manual_skill_refs = manual_skill_turn.manual_skill_refs
     llm_base_message = manual_skill_turn.llm_base_message
@@ -1988,6 +3281,7 @@ async def chat_message(
         llm_base_message,
         attachments,
         direct_tool_calls,
+        parsed_editor_context,
     )
 
     # Get or create conversation
@@ -2007,21 +3301,42 @@ async def chat_message(
             thread_ref_kind=thread_ref_kind,
             thread_ref_id=thread_ref_id,
             title=_auto_title,
+            conversation_surface=ConversationSurfaceKind.ORDINARY_CHAT,
+        )
+        agent_id = await _resolve_task_session_request_agent(
+            db,
+            user,
+            requested_agent_id=agent_id,
+            conversation_id=conv.id,
+            workspace_id=conv.workspace_id,
+            thread_ref_kind=conv.thread_ref_kind,
+            thread_ref_id=conv.thread_ref_id,
         )
     except (LookupError, PermissionError):
         raise HTTPException(404, "Conversation not found")
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
 
-    if local_worker_id:
+    voice_origin_user_message: Message | None = None
+    voice_origin_message_id = (
+        getattr(request.state, "voice_origin_message_id", None)
+        if getattr(request.state, "voice_session_mode", None) == "chat_gateway"
+        else None
+    )
+    if voice_origin_message_id:
+        from packages.core.services.voice.work_queue import (
+            validate_voice_origin_message,
+        )
+
+        candidate = await db.scalar(
+            select(Message).where(Message.id == str(voice_origin_message_id))
+        )
         try:
-            await select_conversation_local_worker_target(
-                db,
+            voice_origin_user_message = validate_voice_origin_message(
+                candidate,
                 conversation_id=conv.id,
-                entity_id=user.entity_id,
-                user_id=user.id,
-                worker_id=local_worker_id,
+                content=llm_base_message,
             )
-        except LookupError as exc:
-            raise HTTPException(404, str(exc)) from exc
         except RuntimeError as exc:
             raise HTTPException(409, str(exc)) from exc
 
@@ -2039,6 +3354,7 @@ async def chat_message(
 
     approval_saved_text: str | None = None
     approval_runtime_metadata: dict | None = None
+    intent_routing_metadata: dict | None = None
     save_user_message = True
     replacement, resolved_saved_text, save_user_message, approval_runtime_metadata = await resolve_chat_approval_turn(
         db,
@@ -2057,12 +3373,13 @@ async def chat_message(
         await require_plan("ai_budget_usd")(user=user, db=db)
 
     if replacement and _is_workflow_approval_resolution(approval_runtime_metadata):
-        if save_user_message:
+        if save_user_message and voice_origin_user_message is None:
             await add_message(
                 db,
                 conv.id,
                 role="user",
                 content=resolved_saved_text or saved_user_base,
+                attachments=attachments.attachment_refs or None,
                 meta={"author_user_id": user.id},
             )
         assistant_msg = await add_message(
@@ -2081,27 +3398,72 @@ async def chat_message(
             rounds=0,
         )
 
+    turn_surface = _surface_for_chat_request(
+        agent_id=agent_id,
+        workspace_id=workspace_id,
+        editor_context=parsed_editor_context,
+    )
+    from packages.core.services.chat_intent_routing import (
+        auto_chat_intent_routing_allowed,
+        classify_chat_intent_routing,
+    )
+
+    if (
+        video_edit_route_state is _VideoEditRouteState.INACTIVE
+        and auto_chat_intent_routing_allowed(
+            surface=turn_surface,
+            chat_mode=_normalize_chat_mode(chat_mode),
+            agent_id=agent_id,
+            workspace_id=workspace_id,
+            manual_skill_selected=bool(manual_skill_refs),
+            editor_context=parsed_editor_context,
+            ephemeral=False,
+            disable_tools=False,
+            blocked_tools=bool(_parse_csv_names(blocked_tools)),
+            approval_turn=bool(replacement or pending_approval_turn),
+            has_forced_tool_calls=bool(direct_tool_calls),
+            has_attachments=bool(
+                attachments.attachment_refs
+                or attachments.text_context
+                or attachments.image_blocks
+            ),
+        )
+    ):
+        intent_routing = await classify_chat_intent_routing(
+            db,
+            user=user,
+            message=llm_base_message,
+            conversation_id=conv.id,
+            runtime_metadata={
+                "chat_mode": _normalize_chat_mode(chat_mode) or "auto",
+                "voice_session_mode": getattr(
+                    request.state,
+                    "voice_session_mode",
+                    None,
+                ),
+            },
+        )
+        intent_routing_metadata = intent_routing.runtime_metadata(
+            request=llm_base_message,
+        )
+
     # Save user message
-    origin_user_message = None
+    origin_user_message = voice_origin_user_message
     if save_user_message:
         saved_text = approval_saved_text or saved_user_base
         if not approval_saved_text:
             saved_text = runtime_saved_message_with_file_references(saved_text, attachments)
         # Attribute the message to its author so workspace chat can tell who
         # sent it (see /chat/stream above for the full rationale).
-        origin_user_message = await add_message(
-            db, conv.id, role="user", content=saved_text,
-            meta={"author_user_id": user.id},
-        )
+        if origin_user_message is None:
+            origin_user_message = await add_message(
+                db, conv.id, role="user", content=saved_text,
+                attachments=attachments.attachment_refs or None,
+                meta={"author_user_id": user.id},
+            )
     await db.commit()
 
     # Run agentic loop
-    parsed_editor_context = runtime_parse_editor_context(editor_context)
-    turn_surface = _surface_for_chat_request(
-        agent_id=agent_id,
-        workspace_id=workspace_id,
-        editor_context=parsed_editor_context,
-    )
     result = await runtime_run_chat_turn(
         llm_message,
         conv.id,
@@ -2122,10 +3484,12 @@ async def chat_message(
             chat_mode=chat_mode,
             chat_mode_prompt=chat_mode_prompt,
             direct_tool_calls=direct_tool_calls,
+            intent_routing_metadata=intent_routing_metadata,
             approval_runtime_metadata=approval_runtime_metadata,
             origin_user_message_id=(
                 origin_user_message.id if origin_user_message is not None else None
             ),
+            voice_session_mode=getattr(request.state, "voice_session_mode", None),
         ),
     )
 
@@ -2193,7 +3557,9 @@ async def _rename_one_conversation(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    await _get_accessible_conversation(db, user, conversation_id)
+    _require_user_managed_conversation(
+        await _get_accessible_conversation(db, user, conversation_id)
+    )
     conv = await rename_conversation(db, conversation_id, user.entity_id, req.title)
     if not conv:
         raise HTTPException(404, "Conversation not found")
@@ -2232,10 +3598,21 @@ async def delete_one_conversation(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    await _get_accessible_conversation(db, user, conversation_id)
-    ok = await delete_conversation(db, conversation_id, user.entity_id)
+    _require_deletable_conversation(
+        await _get_accessible_conversation(db, user, conversation_id)
+    )
+    cancelled_runs: list[RuntimeRun] = []
+    ok = await delete_conversation(
+        db,
+        conversation_id,
+        user.entity_id,
+        cancelled_runtime_runs=cancelled_runs,
+    )
     if not ok:
         raise HTTPException(404, "Conversation not found")
+    await db.commit()
+    for run in cancelled_runs:
+        await cancel_runtime_run_resources(run)
 
 
 # ── Messages ──
@@ -2347,11 +3724,7 @@ async def record_message_feedback(
     db: AsyncSession = Depends(get_db),
 ):
     """Record thumbs feedback for an assistant response."""
-    await _get_accessible_conversation(db, user, conversation_id)
-    rating = (req.rating or "").strip().lower()
-    if rating not in {"up", "down"}:
-        raise HTTPException(422, "rating must be 'up' or 'down'")
-
+    conv = await _get_accessible_conversation(db, user, conversation_id)
     msg = (await db.execute(
         select(Message).where(
             Message.id == message_id,
@@ -2360,45 +3733,80 @@ async def record_message_feedback(
     )).scalar_one_or_none()
     if not msg:
         raise HTTPException(404, "Message not found")
-    if msg.role != "assistant":
-        raise HTTPException(422, "Only assistant messages can be rated")
+    target_decision = ChatFeedbackTargetPolicyFactory.create(
+        ChatFeedbackTargetKind.RESPONSE
+    ).evaluate(
+        msg,
+        workspace_scoped=conv.workspace_id is not None,
+    )
+    if not target_decision.eligible:
+        raise HTTPException(422, target_decision.detail)
 
-    def _preview(value: str | None) -> str | None:
-        text = (value or "").strip()
-        return text[:1000] if text else None
-
-    existing = (await db.execute(
-        select(ChatMessageFeedback).where(
-            ChatMessageFeedback.message_id == message_id,
-            ChatMessageFeedback.user_id == user.id,
-        )
-    )).scalar_one_or_none()
-
-    content_preview = _preview(req.content_preview) or _preview(msg.content)
-    request_preview = _preview(req.request_preview)
-    if existing:
-        existing.rating = rating
-        existing.content_preview = content_preview
-        existing.request_preview = request_preview
-        existing.updated_at = datetime.now(timezone.utc)
-        entry = existing
-    else:
-        entry = ChatMessageFeedback(
+    content_preview = build_chat_feedback_content_preview(
+        requested_preview=req.content_preview,
+        message_content=msg.content,
+        assistant_blocks=_message_assistant_blocks(msg),
+    )
+    request_preview = await resolve_chat_feedback_request_preview(
+        db,
+        message=msg,
+        requested_preview=req.request_preview,
+    )
+    try:
+        result = await persist_chat_message_feedback(
+            db,
             entity_id=user.entity_id,
             user_id=user.id,
             conversation_id=conversation_id,
             message_id=message_id,
-            rating=rating,
+            rating=req.rating,
             content_preview=content_preview,
             request_preview=request_preview,
+            target_kind=ChatFeedbackTargetKind.RESPONSE,
+            target_id=message_id,
         )
-        db.add(entry)
-    await db.commit()
-    await db.refresh(entry)
+    except ChatFeedbackTargetDeletedError as exc:
+        await db.rollback()
+        raise HTTPException(404, "Message not found") from exc
+    except IntegrityError as exc:
+        await db.rollback()
+        if (
+            classify_chat_feedback_integrity_error(exc)
+            == ChatFeedbackIntegrityErrorKind.TARGET_DELETED
+        ):
+            raise HTTPException(404, "Message not found") from exc
+        raise
     return ChatMessageFeedbackResponse(
         message_id=message_id,
-        rating=entry.rating,
-        updated_at=entry.updated_at.isoformat() if entry.updated_at else None,
+        rating=result.rating,
+        mutation_sequence=result.mutation_sequence,
+        mutation_status=result.mutation_status,
+        updated_at=result.updated_at.isoformat(),
+        target_kind=ChatFeedbackTargetKind.RESPONSE,
+        target_id=message_id,
+    )
+
+
+@router.get(
+    "/conversations/{conversation_id}/feedback",
+    response_model=list[ChatMessageFeedbackSnapshotResponse],
+)
+async def get_conversation_feedback(
+    conversation_id: str,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Restore the current user's ratings for an accessible conversation."""
+    conversation = await _get_accessible_conversation(
+        db,
+        user,
+        conversation_id,
+    )
+    return await list_chat_message_feedback(
+        db,
+        user_id=user.id,
+        conversation_id=conversation_id,
+        workspace_id=conversation.workspace_id,
     )
 
 
@@ -2418,7 +3826,6 @@ async def cancel_conversation_file_approvals(
         user_id=user.id,
         hitl_ids=(req.hitl_ids if req else None),
         reason=(req.reason if req and req.reason else "request_stopped"),
-        cancel_turn=True,
     )
     await db.commit()
     return cancelled
@@ -2434,7 +3841,9 @@ async def export_conversation(
     db: AsyncSession = Depends(get_db),
 ):
     """Export a conversation in markdown, json, or text format."""
-    await _get_accessible_conversation(db, user, conversation_id)
+    _require_user_managed_conversation(
+        await _get_accessible_conversation(db, user, conversation_id)
+    )
     if format == "json":
         data = await export_as_json(db, conversation_id, user.entity_id)
         if not data:
@@ -2462,7 +3871,9 @@ async def share_conversation(
     db: AsyncSession = Depends(get_db),
 ):
     """Create a shareable link for a conversation."""
-    await _get_accessible_conversation(db, user, conversation_id)
+    _require_user_managed_conversation(
+        await _get_accessible_conversation(db, user, conversation_id)
+    )
     try:
         share = await create_share(
             db, conversation_id, user.entity_id, user.id,
@@ -2489,7 +3900,9 @@ async def list_conversation_shares(
     db: AsyncSession = Depends(get_db),
 ):
     """List active shares for a conversation."""
-    await _get_accessible_conversation(db, user, conversation_id)
+    _require_user_managed_conversation(
+        await _get_accessible_conversation(db, user, conversation_id)
+    )
     shares = await list_shares(db, user.entity_id, conversation_id=conversation_id)
     return [
         ShareResponse(
@@ -2512,7 +3925,9 @@ async def revoke_conversation_share(
     db: AsyncSession = Depends(get_db),
 ):
     """Revoke a shared link."""
-    await _get_accessible_conversation(db, user, conversation_id)
+    _require_user_managed_conversation(
+        await _get_accessible_conversation(db, user, conversation_id)
+    )
     ok = await revoke_share(
         db, share_id, user.entity_id, conversation_id=conversation_id
     )
@@ -2543,8 +3958,11 @@ async def view_shared_conversation(
         messages=[
             MessageResponse(
                 id=m.id, conversation_id=m.conversation_id,
-                role=m.role, content=_redact_local_fs_urls(m.content),
-                tool_calls=_redact_local_fs_urls(m.tool_calls),
+                role=m.role,
+                content=_redact_local_fs_urls(_message_public_content(m)),
+                tool_calls=_redact_local_fs_urls(
+                    runtime_public_tool_calls(m.tool_calls)
+                ),
                 assistant_blocks=_redact_local_fs_urls(_message_assistant_blocks(m)),
                 token_usage=m.token_usage,
                 attachments=_redact_local_fs_urls(m.attachments),
@@ -2554,7 +3972,7 @@ async def view_shared_conversation(
                 created_at=m.created_at.isoformat() if m.created_at else None,
             )
             for m in messages
-            if not (m.role == "user" and _is_internal_file_permission_marker(m.content))
+            if not (m.role == "user" and is_internal_file_permission_marker(m.content))
         ],
     )
 
@@ -2563,158 +3981,18 @@ async def view_shared_conversation(
 
 @router.post("/tts")
 async def text_to_speech(
-    request: Request,
+    body: SpeechRequest,
     user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
 ):
-    """Convert text to speech audio (MP3). Used by the web voice chat mode."""
-    import os
-    import httpx
-
-    body = await request.json()
-    text = (body.get("text") or "").strip()
-    if not text:
-        raise HTTPException(400, "text is required")
-    voice = body.get("voice", "alloy")
-
-    api_key = os.getenv("OPENAI_API_KEY", "")
-    base_url = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
-    if not api_key:
-        raise HTTPException(503, "TTS not configured")
-
-    async with httpx.AsyncClient(timeout=30) as client:
-        resp = await client.post(
-            f"{base_url.rstrip('/')}/audio/speech",
-            headers={"Authorization": f"Bearer {api_key}"},
-            json={
-                "model": "tts-1",
-                "voice": voice,
-                "input": text[:4096],
-                "response_format": "mp3",
-            },
-        )
-    if not resp.is_success:
-        raise HTTPException(502, f"TTS API error: {resp.status_code}")
-
-    return Response(
-        content=resp.content,
-        media_type="audio/mpeg",
-        headers={"Cache-Control": "public, max-age=3600"},
+    scope = await authenticated_audio_scope(
+        db, user, conversation_id=body.conversation_id, workspace_id=body.workspace_id,
     )
+    lease = await acquire_audio_lease()
+    try:
+        return await chat_speech_response(db, scope, body.text, body.voice)
+    finally:
+        await lease.release()
 
 
 # ── Live Voice Session (OpenAI Realtime API) ──
-
-@router.post("/voice-session")
-async def create_voice_session(
-    request: Request,
-    user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
-):
-    """Create an ephemeral token for OpenAI Realtime API voice chat.
-
-    Returns the ephemeral key, model, and resolved agent instructions so
-    the browser can connect directly to OpenAI via WebRTC.
-    """
-    import os
-    import httpx
-
-    body = await request.json()
-    agent_id = body.get("agent_id")
-    voice = body.get("voice", "alloy")
-    conversation_id = body.get("conversation_id")
-    workspace_id = body.get("workspace_id")
-
-    # Realtime API requires a direct OpenAI key (not OpenRouter)
-    api_key = os.getenv("OPENAI_API_KEY", "")
-    if not api_key:
-        raise HTTPException(
-            503,
-            "Live voice requires an OpenAI API key. "
-            "Set OPENAI_API_KEY in your .env file.",
-        )
-
-    # Resolve agent system prompt so the realtime model has context
-    instructions = "You are a helpful assistant. Be concise and conversational."
-    try:
-        from packages.core.services.voice_runtime import resolve_voice_chat_instructions
-        instructions = await resolve_voice_chat_instructions(
-            db,
-            entity_id=user.entity_id,
-            user_id=user.id,
-            agent_id=agent_id,
-            workspace_id=workspace_id,
-            conversation_id=conversation_id,
-        )
-    except Exception:
-        pass  # Fall back to default instructions
-
-    # Get or create conversation for saving transcript later
-    conv_id = conversation_id
-    if conv_id:
-        await _get_accessible_conversation(db, user, conv_id)
-    else:
-        _auto_title = "Voice conversation"
-        conv = await get_or_create_conversation(
-            db, user.entity_id, user.id,
-            agent_id=agent_id, workspace_id=workspace_id,
-            title=_auto_title,
-        )
-        await db.commit()
-        conv_id = str(conv.id)
-
-    realtime_model = os.getenv("OPENAI_REALTIME_MODEL", "gpt-4o-mini-realtime-preview")
-
-    # Request ephemeral token from OpenAI Realtime API
-    async with httpx.AsyncClient(timeout=15) as client:
-        resp = await client.post(
-            "https://api.openai.com/v1/realtime/sessions",
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "model": realtime_model,
-                "voice": voice,
-                "instructions": instructions[:32000],
-                "modalities": ["text", "audio"],
-                "turn_detection": {"type": "server_vad"},
-                "input_audio_transcription": {"model": "whisper-1"},
-            },
-        )
-
-    if not resp.is_success:
-        raise HTTPException(502, f"Realtime session error: {resp.status_code}")
-
-    data = resp.json()
-    return {
-        "ephemeral_key": data.get("client_secret", {}).get("value"),
-        "expires_at": data.get("client_secret", {}).get("expires_at"),
-        "model": realtime_model,
-        "conversation_id": conv_id,
-        "session_id": data.get("id"),
-    }
-
-
-@router.post("/voice-save")
-async def save_voice_transcript(
-    request: Request,
-    user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
-):
-    """Save voice conversation transcript to the conversation history."""
-    body = await request.json()
-    conversation_id = body.get("conversation_id")
-    turns = body.get("turns", [])  # [{role, content}]
-
-    if not conversation_id or not turns:
-        raise HTTPException(400, "conversation_id and turns are required")
-
-    await _get_accessible_conversation(db, user, conversation_id)
-    for turn in turns:
-        role = turn.get("role", "user")
-        content = (turn.get("content") or "").strip()
-        if content:
-            await add_message(db, conversation_id, role=role, content=content)
-
-    await db.commit()
-    return {"ok": True, "saved": len(turns)}

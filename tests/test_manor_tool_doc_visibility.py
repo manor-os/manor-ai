@@ -20,13 +20,16 @@ import pytest
 
 import packages.core.database as db_module
 from packages.core.ai.tools.manor_tool import _dispatch_action
-from packages.core.models.user import User
+from packages.core.models.user import Entity, User, UserMembership
 from packages.core.services.auth_service import hash_password
 from packages.core.services.document_service import create_document
 
 
 async def _make_user(entity_id: str, name: str, role: str = "member") -> str:
     async with db_module.async_session() as db:
+        if await db.get(Entity, entity_id) is None:
+            db.add(Entity(id=entity_id, name=f"{name} test entity"))
+            await db.flush()
         user = User(
             entity_id=entity_id,
             email=f"{name}@test.com",
@@ -37,6 +40,13 @@ async def _make_user(entity_id: str, name: str, role: str = "member") -> str:
         )
         db.add(user)
         await db.flush()
+        db.add(UserMembership(
+            user_id=user.id,
+            entity_id=entity_id,
+            role=role,
+            status="active",
+            is_primary=True,
+        ))
         uid = user.id
         await db.commit()
     return uid

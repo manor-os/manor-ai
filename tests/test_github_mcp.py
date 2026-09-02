@@ -252,6 +252,19 @@ async def test_get_job_logs_tails_large_output(fake_http):
     assert len(text) <= g._MAX_CHARS + 64
 
 
+@pytest.mark.parametrize("status_code", [401, 404, 500])
+async def test_get_job_logs_failure_is_an_error_envelope(fake_http, status_code):
+    fake_http.response = _FakeResp(status_code, {"message": "logs unavailable"})
+
+    out = await g.call_tool(
+        "get_job_logs",
+        {"repo": "o/r", "job_id": 123},
+        _TOKEN,
+    )
+
+    assert out["isError"] is True
+
+
 # ── Actions: artifacts, status, checks ───────────────────────────────────────
 
 
@@ -290,9 +303,155 @@ async def test_missing_required_param_is_rejected(fake_http):
     assert not fake_http.calls
 
 
+async def test_blank_required_string_is_rejected(fake_http):
+    out = await g.call_tool(
+        "update_comment",
+        {"repo": "o/r", "comment_id": 42, "body": "   "},
+        _TOKEN,
+    )
+    assert out["isError"] is True
+    assert "body" in out["content"][0]["text"]
+    assert not fake_http.calls
+
+
 async def test_unknown_tool_is_rejected(fake_http):
     out = await g.call_tool("nope_not_a_tool", {}, _TOKEN)
     assert out["isError"] is True
+
+
+async def test_missing_token_is_rejected_without_http(fake_http):
+    out = await g.call_tool("get_authenticated_user", {}, "")
+    assert out["isError"] is True
+    assert "token" in out["content"][0]["text"].lower()
+    assert not fake_http.calls
+
+
+async def test_http_403_is_an_error_envelope(fake_http):
+    fake_http.response = _FakeResp(403, {"message": "Resource not accessible"})
+
+    out = await g.call_tool("get_authenticated_user", {}, _TOKEN)
+
+    assert out["isError"] is True
+    assert "403" in out["content"][0]["text"]
+
+
+async def test_create_branch_requires_explicit_source(fake_http):
+    out = await g.call_tool(
+        "create_branch",
+        {"repo": "o/r", "branch": "feature"},
+        _TOKEN,
+    )
+
+    assert out["isError"] is True
+    assert "from_branch or from_sha" in out["content"][0]["text"]
+    assert not fake_http.calls
+
+
+async def test_create_file_rejects_unsupported_encoding(fake_http):
+    out = await g.call_tool(
+        "create_or_update_file",
+        {
+            "repo": "o/r",
+            "path": "README.md",
+            "message": "update",
+            "content": "hello",
+            "content_encoding": "gzip",
+        },
+        _TOKEN,
+    )
+
+    assert out["isError"] is True
+    assert "unsupported content_encoding" in out["content"][0]["text"].lower()
+    assert not fake_http.calls
+
+
+async def test_push_files_rejects_empty_list(fake_http):
+    out = await g.call_tool(
+        "push_files",
+        {"repo": "o/r", "branch": "main", "message": "update", "files": []},
+        _TOKEN,
+    )
+
+    assert out["isError"] is True
+    assert "files list is empty" in out["content"][0]["text"]
+    assert not fake_http.calls
+
+
+async def test_push_files_rejects_unsupported_encoding_before_http(fake_http):
+    out = await g.call_tool(
+        "push_files",
+        {
+            "repo": "o/r",
+            "branch": "main",
+            "message": "update",
+            "files": [{"path": "asset.bin", "content": "abc", "encoding": "gzip"}],
+        },
+        _TOKEN,
+    )
+
+    assert out["isError"] is True
+    assert "unsupported encoding" in out["content"][0]["text"].lower()
+    assert not fake_http.calls
+
+
+async def test_token_whitespace_is_normalized_before_http(fake_http):
+    fake_http.response = _FakeResp(200, {"login": "manor"})
+    await g.call_tool("get_authenticated_user", {}, f"  {_TOKEN}  ")
+    call = _last(fake_http)
+    assert call["headers"]["Authorization"] == f"Bearer {_TOKEN}"
+
+
+async def test_non_string_token_is_rejected_without_http(fake_http):
+    out = await g.call_tool("get_authenticated_user", {}, {"access_token": _TOKEN})
+    assert out["isError"] is True
+    assert "token" in out["content"][0]["text"].lower()
+    assert not fake_http.calls
+
+
+async def test_repo_with_query_string_is_rejected_without_http(fake_http):
+    out = await g.call_tool(
+        "get_issue",
+        {"repo": "o/r?admin=true", "number": 1},
+        _TOKEN,
+    )
+    assert out["isError"] is True
+    assert "repo" in out["content"][0]["text"].lower()
+    assert not fake_http.calls
+
+
+@pytest.mark.parametrize("value", [True, 0, -1, 1.5])
+async def test_issue_number_must_be_a_positive_integer(fake_http, value):
+    out = await g.call_tool(
+        "get_issue",
+        {"repo": "o/r", "number": value},
+        _TOKEN,
+    )
+    assert out["isError"] is True
+    assert "number" in out["content"][0]["text"].lower()
+    assert not fake_http.calls
+
+
+@pytest.mark.parametrize("value", [True, 0, -1, 1.5])
+async def test_per_page_must_be_a_positive_integer(fake_http, value):
+    out = await g.call_tool(
+        "list_issues",
+        {"repo": "o/r", "per_page": value},
+        _TOKEN,
+    )
+    assert out["isError"] is True
+    assert "per_page" in out["content"][0]["text"].lower()
+    assert not fake_http.calls
+
+
+async def test_run_workflow_rejects_non_object_inputs_without_http(fake_http):
+    out = await g.call_tool(
+        "run_workflow",
+        {"repo": "o/r", "workflow_id": "ci.yml", "ref": "main", "inputs": []},
+        _TOKEN,
+    )
+    assert out["isError"] is True
+    assert "inputs" in out["content"][0]["text"].lower()
+    assert not fake_http.calls
 
 
 def test_ok_or_passes_real_errors_through():

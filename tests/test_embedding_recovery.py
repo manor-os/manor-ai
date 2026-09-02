@@ -20,11 +20,8 @@ def test_embedding_task_and_recovery_schedule_cover_long_local_indexes():
     assert process_document_embeddings.time_limit == 7_200
     assert process_document_embeddings.time_limit > process_document_embeddings.soft_time_limit
     assert celery_app.conf.beat_schedule["embedding-sweep-pending"]["schedule"] == 60.0
-    assert TASK_QUEUES["embeddings.sweep_pending"] == CeleryQueue.CONTROL
-    assert (
-        TASK_QUEUES["packages.core.tasks.ai_tasks.process_document_embeddings"]
-        == CeleryQueue.WORK
-    )
+    assert TASK_QUEUES["embeddings.sweep_pending"] == CeleryQueue.HEAVY
+    assert TASK_QUEUES["packages.core.tasks.ai_tasks.process_document_embeddings"] == CeleryQueue.HEAVY
 
 
 @pytest.mark.asyncio
@@ -213,6 +210,19 @@ async def test_recovery_sweep_requeues_stale_rows_and_bounds_retries(db_session)
         vector_status=VectorStatus.PENDING,
         updated_at=stale_at,
     )
+    workspace_deleted = Document(
+        id=generate_ulid(),
+        entity_id=generate_ulid(),
+        name="deleted-workspace.md",
+        vector_status=VectorStatus.PENDING,
+        updated_at=stale_at,
+        metadata_={
+            "indexing": {
+                "step": "blocked",
+                "blocked_reason": "workspace_deleted",
+            }
+        },
+    )
     fresh = Document(
         id=generate_ulid(),
         entity_id=generate_ulid(),
@@ -227,7 +237,7 @@ async def test_recovery_sweep_requeues_stale_rows_and_bounds_retries(db_session)
             }
         },
     )
-    db_session.add_all([stale, exhausted, pending, fresh])
+    db_session.add_all([stale, exhausted, pending, workspace_deleted, fresh])
     await db_session.commit()
 
     result = await recover_stale_embedding_documents(
@@ -242,7 +252,7 @@ async def test_recovery_sweep_requeues_stale_rows_and_bounds_retries(db_session)
     assert set(result["requeued"]) == {stale.id, pending.id}
     assert result["failed"] == [exhausted.id]
 
-    for doc in (stale, exhausted, pending, fresh):
+    for doc in (stale, exhausted, pending, workspace_deleted, fresh):
         await db_session.refresh(doc)
 
     assert stale.vector_status == VectorStatus.PENDING
@@ -251,6 +261,8 @@ async def test_recovery_sweep_requeues_stale_rows_and_bounds_retries(db_session)
     assert "run_id" not in stale.metadata_["indexing"]
     assert pending.vector_status == VectorStatus.PENDING
     assert pending.metadata_["indexing"]["step"] == "queued"
+    assert workspace_deleted.vector_status == VectorStatus.PENDING
+    assert workspace_deleted.metadata_["indexing"]["step"] == "blocked"
     assert exhausted.vector_status == VectorStatus.FAILED
     assert exhausted.metadata_["indexing"]["error_code"] == "stale_heartbeat"
     assert exhausted.metadata_["indexing"]["recovery_attempts"] == 4

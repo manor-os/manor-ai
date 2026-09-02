@@ -42,7 +42,7 @@ from packages.core.config import get_settings
 from packages.core.constants.pending_actions import PendingActionKind
 from packages.core.database import async_session
 from packages.core.services.hitl_options import approval_options
-from packages.core.dispatcher import Dispatcher
+from packages.core.dispatcher import Dispatcher, MISSING_RESULT
 from packages.core.dispatcher.output_coercion import (
     coerce_step_output_for_schema,
     parse_json_from_text_for_schema,
@@ -55,6 +55,7 @@ from packages.core.ai.runtime import (
     runtime_prompt_with_output_schema,
     runtime_tool_call_error,
 )
+from packages.core.ai.llm_client import CreditExhaustedError, LLMRateLimited
 from packages.core.models.base import generate_ulid
 from packages.core.models.document import Integration
 from packages.core.models.execution import ExecutionPlan, ExecutionStep
@@ -74,6 +75,11 @@ from packages.core.workers.submit_result import (
     submit_result_capture,
     submit_result_followup_message,
 )
+from packages.core.contracts.task_output import (
+    OutputContractKind,
+    TaskOutputValueKind,
+    output_contract_for_schema,
+)
 from packages.core.workers.registry import (
     INTERNAL_WORKER_KIND,
     ensure_internal_worker,
@@ -83,9 +89,18 @@ from packages.core.services.step_deadline import (
     resolve_step_deadline,
     step_deadline_error,
 )
+from packages.core.services.task_requester_identity import (
+    TaskRequesterIdentityError,
+    resolve_task_execution_user_id,
+)
 from packages.core.contracts.shapes import coerce_to_shape, get_shape
 from packages.core.services.workspace_layout import WorkspaceArtifactDir
-from packages.core.contracts.envelope import Success, Failure, StepResult
+from packages.core.contracts.envelope import (
+    Failure,
+    StepResult,
+    Success,
+    envelope_indicates_failure,
+)
 from packages.core.contracts.workspace_paths import default_fs_path_into_workspace
 
 logger = logging.getLogger(__name__)
@@ -171,12 +186,15 @@ def enforce_output_shape(
     """Normalize raw onto a canonical shape, apply workspace path defaults,
     validate, and return a typed Success/Failure. No LLM repair here — that
     is layered in ``enforce_with_repair``."""
-    from jsonschema import Draft202012Validator
+    from packages.core.contracts.json_schema import SchemaContractValidatorFactory
 
     data = coerce_to_shape(shape_name, raw)
     data = default_fs_path_into_workspace(data, workspace_base_dir=workspace_base_dir)
     schema = get_shape(shape_name).json_schema()
-    errors = sorted(Draft202012Validator(schema).iter_errors(data), key=lambda e: list(e.path))
+    errors = sorted(
+        SchemaContractValidatorFactory.build(schema).iter_errors(data),
+        key=lambda error: list(error.path),
+    )
     if errors:
         def _fmt(err) -> str:
             path = "".join(f"[{p!r}]" for p in err.path)
@@ -582,6 +600,48 @@ def _merge_artifact_refs(result: Any, refs: list[dict[str, Any]]) -> Any:
         if ref.get("document_id") and not result.get("document_id"):
             result["document_id"] = ref["document_id"]
     return result
+
+
+def _preserve_bare_output_contract(
+    result: Any,
+    schema: Optional[dict],
+    *,
+    original_keys: set[str] | None = None,
+) -> Any:
+    """Keep worker-side enrichment from changing a bare payload's contract.
+
+    ``submit_result`` returns the exact value for a marked PlanStep payload.
+    The legacy enrichment pass still runs afterwards so artifact/tool evidence
+    can complete old envelopes, but those helpers may add envelope-era keys
+    (``files``, ``summary``, ``status``) to a strict custom object.  Preserve
+    keys supplied by the model and permit additions only when the declared
+    payload schema names the field; anything else is left for the validator to
+    reject only when it was part of the submitted value itself.
+
+    Non-object payloads are intentionally returned unchanged.  Wrapping an
+    array/string/null in ``{"value": ...}`` would turn a valid bare contract
+    into a different JSON type before validation.
+    """
+    contract = output_contract_for_schema(schema)
+    if not contract.is_bare_payload or not isinstance(result, dict):
+        return result
+    payload_schema = contract.payload_schema
+    properties = (
+        payload_schema.get("properties")
+        if isinstance(payload_schema, dict)
+        else None
+    )
+    declared_keys = {str(key) for key in properties} if isinstance(properties, dict) else set()
+    # ``original_keys`` is captured before enrichment.  Retain model-supplied
+    # unknown keys so an ``additionalProperties: false`` contract fails loudly
+    # instead of silently laundering malformed model output into success.
+    allowed_new_keys = declared_keys
+    supplied_keys = {str(key) for key in (original_keys or set())}
+    return {
+        key: value
+        for key, value in result.items()
+        if str(key) in supplied_keys or str(key) in allowed_new_keys
+    }
 
 
 _MATERIALIZED_ARTIFACT_SCHEMA_FIELDS = {
@@ -1082,35 +1142,56 @@ async def _execute_claimed_lease(lease_id: str) -> dict:
         task_binding_constraints: list[str] = []
         runtime_metadata: dict[str, Any] = {}
         if plan.task_id:
+            from packages.core.models.task import Task
+
+            task = (await db.execute(
+                select(Task).where(Task.id == plan.task_id)
+            )).scalar_one_or_none()
             try:
-                from packages.core.models.task import Task
-                task_row = (await db.execute(
-                    select(
-                        Task.conversation_id, Task.creator_id, Task.details,
-                    ).where(Task.id == plan.task_id)
-                )).first()
-                if task_row:
-                    conversation_id = task_row[0]
-                    user_id = task_row[1]
-                    task_details = task_row[2]
-                    if isinstance(task_details, dict):
-                        proposal_authorization = task_details.get(
-                            "proposal_external_authorization"
-                        )
-                        if isinstance(proposal_authorization, dict):
-                            runtime_metadata["proposal_external_authorization"] = dict(
-                                proposal_authorization
-                            )
-                    # The user's verbatim task constraints, carried to the
-                    # executing subagent so a prohibition like "no essay" is
-                    # not lost between planning and execution.
-                    from packages.core.plans.task_constraints import (
-                        extract_binding_constraints,
+                if task is None:
+                    raise TaskRequesterIdentityError(
+                        plan.task_id,
+                        "the Task referenced by the execution plan does not exist",
                     )
-                    task_binding_constraints = extract_binding_constraints(task_details)
-            except Exception:
-                conversation_id = None
-                user_id = None
+                conversation_id = task.conversation_id
+                user_id = await resolve_task_execution_user_id(db, task)
+            except TaskRequesterIdentityError as exc:
+                error = {
+                    "type": type(exc).__name__,
+                    "message": str(exc),
+                }
+                await dispatcher.fail_lease(
+                    db,
+                    lease_id,
+                    error=error,
+                    will_retry=False,
+                )
+                await db.commit()
+                from packages.core.plans.wakeup import wake_plan_cycle
+
+                wake_plan_cycle(plan.id)
+                return {
+                    "lease_id": lease_id,
+                    "outcome": "failed",
+                    "error": error,
+                }
+            if task:
+                task_details = task.details
+                if isinstance(task_details, dict):
+                    proposal_authorization = task_details.get(
+                        "proposal_external_authorization"
+                    )
+                    if isinstance(proposal_authorization, dict):
+                        runtime_metadata["proposal_external_authorization"] = dict(
+                            proposal_authorization
+                        )
+                # The user's verbatim task constraints, carried to the
+                # executing subagent so a prohibition like "no essay" is
+                # not lost between planning and execution.
+                from packages.core.plans.task_constraints import (
+                    extract_binding_constraints,
+                )
+                task_binding_constraints = extract_binding_constraints(task_details)
 
         params = dict(step.params or {})
         if step.human_input_response is not None:
@@ -1126,6 +1207,8 @@ async def _execute_claimed_lease(lease_id: str) -> dict:
             "provider": step.provider,
             "action_key": step.action_key,
             "capability_id": step.capability_id,
+            "risk_level": step.risk_level,
+            "requires_approval": bool(step.requires_approval),
             "integration_id": step.integration_id,
             "resolved_subscription_id": step.resolved_subscription_id,
             "resolved_agent_id": step.resolved_agent_id,
@@ -1134,6 +1217,7 @@ async def _execute_claimed_lease(lease_id: str) -> dict:
             "entity_id": step.entity_id,
             "workspace_id": step.workspace_id,
             "user_id": user_id,
+            "plan_id": plan.id,
             "task_id": plan.task_id,
             "conversation_id": conversation_id,
             "task_binding_constraints": task_binding_constraints,
@@ -1195,6 +1279,37 @@ async def _execute_claimed_lease(lease_id: str) -> dict:
         from packages.core.plans.wakeup import wake_plan_cycle
         wake_plan_cycle(snapshot.get("plan_id"))
         return {"lease_id": lease_id, "outcome": "failed", "error": error}
+    except LLMRateLimited as exc:
+        # Cooperative provider backoff is a control-flow signal (it inherits
+        # BaseException), so the generic failure handler below cannot see it.
+        # Persist a retryable lease transition now instead of leaving the
+        # lease active until the expiry sweep notices the stopped heartbeat.
+        error = {
+            "type": type(exc).__name__,
+            "message": str(exc),
+            "retry_after_seconds": exc.retry_after,
+        }
+        async with async_session() as db:
+            await dispatcher.fail_lease(db, lease_id, error=error)
+            await db.commit()
+        from packages.core.plans.wakeup import wake_plan_cycle
+        wake_plan_cycle(snapshot.get("plan_id"))
+        return {"lease_id": lease_id, "outcome": "retry", "error": error}
+    except CreditExhaustedError as exc:
+        # Credits cannot recover inside this attempt. Failing terminally keeps
+        # a long Plan from burning every step retry on the same balance wall.
+        error = {"type": type(exc).__name__, "message": str(exc)}
+        async with async_session() as db:
+            await dispatcher.fail_lease(
+                db,
+                lease_id,
+                error=error,
+                will_retry=False,
+            )
+            await db.commit()
+        from packages.core.plans.wakeup import wake_plan_cycle
+        wake_plan_cycle(snapshot.get("plan_id"))
+        return {"lease_id": lease_id, "outcome": "failed", "error": error}
     except _NeedsHumanInput as exc:
         async with async_session() as db:
             await dispatcher.lease_needs_human(
@@ -1206,6 +1321,43 @@ async def _execute_claimed_lease(lease_id: str) -> dict:
         from packages.core.plans.wakeup import wake_plan_cycle
         wake_plan_cycle(snapshot.get("plan_id"))
         return {"lease_id": lease_id, "outcome": "needs_human"}
+    except _FreshMCPApprovalRequired as exc:
+        # The vendor is authoritative for a newly discovered tool's effect.
+        # If it changed from the Planner's cached read classification to a
+        # write/destructive action, end this lease without calling the vendor
+        # and put the step back through Dispatcher's normal approval gate.
+        error = {
+            "type": type(exc).__name__,
+            "message": str(exc),
+            "provider": exc.provider,
+            "action_key": exc.action_key,
+            "effect": exc.effect,
+        }
+        async with async_session() as db:
+            step = (await db.execute(
+                select(ExecutionStep).where(
+                    ExecutionStep.id == snapshot["step_id"]
+                )
+            )).scalar_one()
+            step.risk_level = "high"
+            step.requires_approval = True
+            await dispatcher.fail_lease(
+                db,
+                lease_id,
+                error=error,
+                will_retry=True,
+            )
+            # No external call ran. Do not consume an execution attempt merely
+            # because live discovery supplied stricter governance metadata.
+            step.attempt_count = max(0, (step.attempt_count or 0) - 1)
+            await db.commit()
+        from packages.core.plans.wakeup import wake_plan_cycle
+        wake_plan_cycle(snapshot.get("plan_id"))
+        return {
+            "lease_id": lease_id,
+            "outcome": "approval_required",
+            "error": error,
+        }
     except Exception as exc:  # noqa: BLE001
         logger.exception("execute_lease %s failed: %s", lease_id, exc)
         async with async_session() as db:
@@ -1222,12 +1374,25 @@ async def _execute_claimed_lease(lease_id: str) -> dict:
 
     # Success path.
     async with async_session() as db:
+        reported_result = (
+            result["result"]
+            if isinstance(result, dict) and "result" in result
+            else MISSING_RESULT
+        )
+        task_output_value_kind = result.get("task_output_value_kind")
+        if (
+            task_output_value_kind is None
+            and output_contract_for_schema(snapshot.get("expected_output_schema")).kind
+            is OutputContractKind.TASK_ENVELOPE
+        ):
+            task_output_value_kind = TaskOutputValueKind.TASK_PAYLOAD
         completed_lease = await dispatcher.complete_lease(
             db, lease_id,
-            result=result.get("result"),
+            result=reported_result,
             cost=result.get("cost"),
             evidence_refs=result.get("evidence_refs"),
             metadata=result.get("metadata"),
+            task_output_value_kind=task_output_value_kind,
         )
         await db.commit()
     from packages.core.plans.wakeup import wake_plan_cycle
@@ -1273,6 +1438,20 @@ class _NeedsHumanInput(Exception):
         super().__init__(prompt or (pending_action or {}).get("title") or "")
         self.prompt = prompt
         self.pending_action = pending_action
+
+
+class _FreshMCPApprovalRequired(RuntimeError):
+    """Live MCP discovery found a stricter effect than the persisted plan."""
+
+    def __init__(self, *, provider: str, action_key: str, effect: str) -> None:
+        self.provider = provider
+        self.action_key = action_key
+        self.effect = effect
+        super().__init__(
+            "Fresh MCP discovery classified this action as "
+            f"{effect}; a high-risk Dispatcher approval is required before "
+            "the external call can run."
+        )
 
 
 async def _execute_by_kind(s: dict) -> dict:
@@ -1336,13 +1515,24 @@ async def _exec_action(s: dict) -> dict:
     if not s["provider"] or not s["action_key"]:
         raise ValueError("action step missing provider / action_key")
 
+    from packages.core.services.official_remote_mcp import (
+        OfficialRemoteMCPProvider,
+    )
+
     try:
-        module = importlib.import_module(f"packages.core.ai.mcp.{s['provider']}")
-    except ImportError as exc:
-        raise ValueError(f"no adapter for provider={s['provider']!r}") from exc
+        remote_provider = OfficialRemoteMCPProvider(s["provider"])
+    except ValueError:
+        remote_provider = None
+
+    module = None
+    if remote_provider is None:
+        try:
+            module = importlib.import_module(f"packages.core.ai.mcp.{s['provider']}")
+        except ImportError as exc:
+            raise ValueError(f"no adapter for provider={s['provider']!r}") from exc
 
     if s["execution_mode"] in ("dry_run", "sandbox"):
-        sim = getattr(module, "simulate_tool", None)
+        sim = getattr(module, "simulate_tool", None) if module is not None else None
         if sim is None:
             envelope = {
                 "content": [{
@@ -1354,6 +1544,8 @@ async def _exec_action(s: dict) -> dict:
         else:
             envelope = await sim(s["action_key"], s["params"])
     else:
+        if remote_provider is not None:
+            return await _exec_official_remote_action(s)
         # Live mode — resolve credentials via Vault.
         from packages.core.credentials import Requester, get_credential_service
 
@@ -1397,9 +1589,153 @@ async def _exec_action(s: dict) -> dict:
     _maybe_raise_needs_human(envelope)
 
     parsed = _extract_text(envelope)
+    # Provider schemas describe the native action payload.  Do not introduce
+    # the legacy ``{"value": ...}`` wrapper here: the dispatcher validates and
+    # persists the exact JSON value for structured contracts.
     return {
-        "result": parsed if isinstance(parsed, dict) else {"value": parsed},
+        "result": parsed,
         "cost": {"api_calls": 1, "usd": 0},
+    }
+
+
+async def _exec_official_remote_action(s: dict) -> dict:
+    """Execute a Planner action through the shared actor/account MCP factory."""
+
+    from packages.core.ai.runtime.dynamic_mcp import (
+        RuntimeDynamicMCPToolBindingFactory,
+        runtime_discover_official_remote_mcp_tools,
+        runtime_dynamic_mcp_tool_handler,
+    )
+
+    discovered = await runtime_discover_official_remote_mcp_tools(
+        provider_keys=frozenset({str(s["provider"])}),
+        entity_id=str(s.get("entity_id") or ""),
+        user_id=str(s.get("user_id") or ""),
+    )
+    binding = next(
+        (
+            tool
+            for tool in discovered.get(str(s["provider"]), ())
+            if tool.action == str(s["action_key"])
+        ),
+        None,
+    )
+    if binding is None:
+        raise ValueError(
+            f"live action {s['provider']}.{s['action_key']} is not exposed "
+            "by any callable connected account"
+        )
+    from packages.core.services.official_remote_mcp import (
+        OfficialRemoteMCPActionPolicyFactory,
+    )
+
+    effect_policy = OfficialRemoteMCPActionPolicyFactory.create(
+        binding.provider,
+        binding.effect,
+    )
+    if (
+        effect_policy.required_approval
+        and str(s.get("risk_level") or "low") != "high"
+    ):
+        raise _FreshMCPApprovalRequired(
+            provider=str(binding.provider),
+            action_key=str(binding.action),
+            effect=str(binding.effect.value),
+        )
+    handler = runtime_dynamic_mcp_tool_handler(
+        RuntimeDynamicMCPToolBindingFactory.from_discovered(
+            binding,
+            expires_at=0.0,
+        )
+    )
+    if handler is None:
+        raise ValueError(
+            f"could not construct remote MCP handler for "
+            f"{s['provider']}.{s['action_key']}"
+        )
+    from packages.core.constants.integrations import (
+        INTEGRATION_ACCOUNT_CONTINUATION_ARGUMENT,
+        INTEGRATION_ACCOUNT_SELECTION_ARGUMENT,
+    )
+    from packages.core.services.integration_account_service import (
+        IntegrationAccountFanoutResultFactory,
+        IntegrationAccountSelectionMode,
+    )
+
+    arguments = dict(s.get("params") or {})
+    if s.get("integration_id"):
+        arguments["integration_account_id"] = str(s["integration_id"])
+    page_calls = 0
+
+    async def _invoke(call_arguments: dict[str, Any]) -> Any:
+        nonlocal page_calls
+        page_calls += 1
+        raw_result = await handler(
+            entity_id=str(s.get("entity_id") or ""),
+            user_id=str(s.get("user_id") or ""),
+            **call_arguments,
+        )
+        try:
+            result: Any = json.loads(raw_result)
+        except (TypeError, ValueError):
+            result = raw_result
+        if isinstance(result, dict) and result.get("error"):
+            reason = result.get("reason") or result.get("detail") or result["error"]
+            raise RuntimeError(f"remote MCP action failed: {reason}")
+        return result
+
+    parsed = await _invoke(arguments)
+    if (
+        isinstance(parsed, dict)
+        and parsed.get(INTEGRATION_ACCOUNT_SELECTION_ARGUMENT)
+        == IntegrationAccountSelectionMode.ALL.value
+    ):
+        aggregate = parsed
+        seen_tokens: set[str] = set()
+        while not IntegrationAccountFanoutResultFactory.output_is_complete(aggregate):
+            token = IntegrationAccountFanoutResultFactory.continuation_account_id(
+                aggregate
+            )
+            if not token:
+                break
+            if token in seen_tokens:
+                raise RuntimeError(
+                    "remote MCP all-account action returned a repeated continuation"
+                )
+            seen_tokens.add(token)
+            if len(seen_tokens) > max(
+                1,
+                int(aggregate.get("total_account_count") or 0),
+            ):
+                raise RuntimeError(
+                    "remote MCP all-account action exceeded its account page bound"
+                )
+            continued_arguments = dict(arguments)
+            continued_arguments[INTEGRATION_ACCOUNT_SELECTION_ARGUMENT] = (
+                IntegrationAccountSelectionMode.ALL.value
+            )
+            continued_arguments[INTEGRATION_ACCOUNT_CONTINUATION_ARGUMENT] = token
+            continued = await _invoke(continued_arguments)
+            if (
+                not isinstance(continued, dict)
+                or continued.get(INTEGRATION_ACCOUNT_SELECTION_ARGUMENT)
+                != IntegrationAccountSelectionMode.ALL.value
+            ):
+                raise RuntimeError(
+                    "remote MCP all-account continuation returned an invalid payload"
+                )
+            aggregate = IntegrationAccountFanoutResultFactory.merge_pages(
+                aggregate,
+                continued,
+            )
+        parsed = aggregate
+        if not IntegrationAccountFanoutResultFactory.output_is_complete(parsed):
+            raise RuntimeError(
+                "remote MCP all-account action remained incomplete after bounded continuation"
+            )
+    return {
+        "result": parsed,
+        "cost": {"api_calls": page_calls, "usd": 0},
     }
 
 
@@ -1509,13 +1845,16 @@ async def _exec_llm(s: dict) -> dict:
         except Exception:
             pass
 
+    output_contract = output_contract_for_schema(s.get("expected_output_schema"))
+    producer_schema = output_contract.payload_schema or s.get("expected_output_schema")
+
     # Evidence is written in `finally` so it survives every exit path —
     # including the provider raising and the lease deadline cancelling us.
     # See docs/EXECUTION_OBSERVABILITY_DESIGN_ZH.md §3 principle 3.
     try:
         completion = await runtime_execute_internal_worker_llm_step(
             prompt=prompt,
-            expected_output_schema=s.get("expected_output_schema"),
+            expected_output_schema=producer_schema,
             system_prompt=s["params"].get("system_prompt") or getattr(ctx, "system_prompt", None),
             entity_id=entity_id,
             user_id=s.get("user_id"),
@@ -1527,12 +1866,22 @@ async def _exec_llm(s: dict) -> dict:
         )
 
         usage = completion.usage or {}
+        provider_error = str(usage.get("error") or "").strip()
+        if provider_error:
+            # chat_completion deliberately returns provider failures in usage
+            # for one-shot calls. Preserve that evidence so retry policy can
+            # distinguish a transient 503/524 from a genuinely empty model
+            # response or a permanent auth/configuration error.
+            raise RuntimeError(
+                "LLM call failed before the model could respond. "
+                f"Error detail: {provider_error}"
+            )
         # An empty completion produced nothing — never coerce it into a
         # `{"text": ""}` "success". Fail so the retry policy gets a turn.
         if not str(completion.content or "").strip():
             raise EmptyModelOutput("model returned no content")
-        return {
-            "result": _coerce_llm_text_result(completion.content, s.get("expected_output_schema")),
+        result = {
+            "result": _coerce_llm_text_result(completion.content, producer_schema),
             "cost": {
                 "llm_tokens_input": usage.get("prompt_tokens"),
                 "llm_tokens_output": usage.get("completion_tokens"),
@@ -1540,6 +1889,9 @@ async def _exec_llm(s: dict) -> dict:
             },
             "metadata": runtime_metadata_from_context(ctx),
         }
+        if output_contract.kind is OutputContractKind.TASK_ENVELOPE:
+            result["task_output_value_kind"] = TaskOutputValueKind.TASK_PAYLOAD
+        return result
     finally:
         await runtime_persist_internal_worker_runtime_events(
             getattr(ctx, "runtime_envelope", None),
@@ -1611,11 +1963,24 @@ async def _exec_subagent(s: dict) -> dict:
     guidance = _human_guidance_note(s["params"])
     if guidance:
         original_prompt = f"{guidance}\n\n{original_prompt}"
-    prompt = runtime_prompt_with_output_schema(original_prompt, s.get("expected_output_schema"))
+    output_contract = output_contract_for_schema(s.get("expected_output_schema"))
+    producer_schema = output_contract.payload_schema or s.get("expected_output_schema")
+    prompt = runtime_prompt_with_output_schema(original_prompt, producer_schema)
     prompt = f"{prompt}{SUBMIT_RESULT_PROMPT_SUFFIX}"
 
     entity_id = s.get("entity_id")
     agent_id = s.get("resolved_agent_id")
+
+    params = s.get("params") if isinstance(s.get("params"), dict) else {}
+    required_skill_refs = [
+        str(ref).strip()
+        for ref in (params.get("skill_refs") or [])
+        if str(ref or "").strip()
+    ]
+    runtime_skill_refs = [
+        {"kind": "slug", "value": ref}
+        for ref in required_skill_refs
+    ]
 
     async with async_session() as db:
         ctx = await build_agent_context(
@@ -1630,10 +1995,10 @@ async def _exec_subagent(s: dict) -> dict:
             active_user_message=prompt,
             model_role="primary",
             runtime_metadata=s.get("runtime_metadata"),
+            skill_refs=runtime_skill_refs,
         )
 
     system_prompt = s["params"].get("system_prompt") or ctx.system_prompt
-    params = s.get("params") if isinstance(s.get("params"), dict) else {}
 
     # ── forced submit_result finalization (StepResult envelope part ②) ──
     # The loop carries a submit_result tool and terminates on its call; the
@@ -1672,6 +2037,16 @@ async def _exec_subagent(s: dict) -> dict:
             requested_max_rounds=params.get("max_rounds"),
             dynamic_tool_handlers={SUBMIT_RESULT_TOOL_NAME: submit_handler},
             terminal_tool_result_policy=SUBMIT_RESULT_TERMINAL_POLICY,
+            forced_tool_calls=[
+                {
+                    "name": "invoke_skill",
+                    "arguments": {
+                        "skill_id": ref,
+                        "input": original_prompt,
+                    },
+                }
+                for ref in required_skill_refs
+            ] or None,
             on_tool_start=on_tool_start,
             on_tool_end=on_tool_end,
         )
@@ -1685,6 +2060,11 @@ async def _exec_subagent(s: dict) -> dict:
         submit_payload = get_submit_payload()
         if submit_payload is None:
             _raise_if_agentic_loop_failed(result)
+        elif output_contract.requires_result:
+            # Keep omission distinct from an explicit JSON null.  The latter
+            # may be valid for a custom ``type: null`` contract; an omitted
+            # result is always a malformed hard submission and must retry.
+            output_contract.require_submission_result(submit_payload)
         pending_action = _pending_action_from_agent_messages(result.messages or [])
         if pending_action:
             raise _NeedsHumanInput(
@@ -1696,13 +2076,22 @@ async def _exec_subagent(s: dict) -> dict:
         if submit_payload is None:
             # The model finished without submitting. One cheap follow-up round —
             # transcript continued, submit_result the ONLY tool — turns the
-            # trailing prose into a deliberate submission.
+            # trailing prose into a deliberate submission. Hard contracts do
+            # not fall back to prose: without the explicit result member there
+            # is no way to distinguish an omitted payload from a valid JSON
+            # ``null`` result.
             submit_payload, fallback_usage = await _force_submit_result_round(
                 s, ctx=ctx, prompt=prompt, system_prompt=system_prompt,
                 prior_messages=result.messages or [],
                 submit_tool=submit_tool, submit_handler=submit_handler,
                 get_submit_payload=get_submit_payload,
             )
+
+        if submit_payload is None and output_contract.requires_result:
+            # Keep the omission gate at the final boundary too: a failed
+            # follow-up must not silently re-enter the legacy text coercion
+            # path and mark an explicit bare-payload contract as complete.
+            output_contract.require_submission_result(None)
 
         artifact_refs = _collect_artifact_refs_from_agent_messages(result.messages or [])
         evidence_refs = _collect_step_evidence(result.messages or [])
@@ -1724,28 +2113,52 @@ async def _exec_subagent(s: dict) -> dict:
             )
         else:
             step_result = _coerce_llm_text_result(result.content, s.get("expected_output_schema"))
-        step_result = _merge_artifact_refs(step_result, artifact_refs)
-        step_result = _infer_prompt_backed_fields(
-            step_result,
-            prompt=original_prompt,
-            schema=s.get("expected_output_schema"),
+        output_contract_original_keys = (
+            {str(key) for key in step_result}
+            if output_contract.is_bare_payload and isinstance(step_result, dict)
+            else None
         )
-        step_result = _merge_tool_backed_fields_for_schema(
-            step_result,
-            result.messages or [],
-            schema=s.get("expected_output_schema"),
-        )
-        if (
-            _schema_requires_materialized_artifact(s.get("expected_output_schema"))
-            and isinstance(step_result, dict)
-            and not any(step_result.get(field) for field in _MATERIALIZED_ARTIFACT_SCHEMA_FIELDS)
-        ):
-            step_result = await _persist_subagent_text_artifact(
-                s,
+        # A bare scalar/array/null is already the exact declared payload. The
+        # legacy enrichment helpers normalize non-dicts to ``{"value": ...}``
+        # and would therefore change its JSON type before validation.
+        if not (output_contract.is_bare_payload and not isinstance(step_result, dict)):
+            step_result = _merge_artifact_refs(step_result, artifact_refs)
+            step_result = _infer_prompt_backed_fields(
+                step_result,
                 prompt=original_prompt,
-                content=result.content,
-                result=step_result,
+                schema=s.get("expected_output_schema"),
             )
+            step_result = _merge_tool_backed_fields_for_schema(
+                step_result,
+                result.messages or [],
+                schema=s.get("expected_output_schema"),
+            )
+            if (
+                _schema_requires_materialized_artifact(s.get("expected_output_schema"))
+                and isinstance(step_result, dict)
+                and not any(step_result.get(field) for field in _MATERIALIZED_ARTIFACT_SCHEMA_FIELDS)
+            ):
+                step_result = await _persist_subagent_text_artifact(
+                    s,
+                    prompt=original_prompt,
+                    content=result.content,
+                    result=step_result,
+                )
+        step_result = _preserve_bare_output_contract(
+            step_result,
+            s.get("expected_output_schema"),
+            original_keys=output_contract_original_keys,
+        )
+        runtime_metadata = runtime_metadata_from_context(ctx)
+        task_output_value_kind = None
+        if output_contract.kind is OutputContractKind.TASK_ENVELOPE:
+            task_output_value_kind = TaskOutputValueKind.TASK_PAYLOAD
+            if submit_payload is not None:
+                task_output_value_kind = (
+                    TaskOutputValueKind.STEP_RESULT_FAILURE
+                    if envelope_indicates_failure(step_result)
+                    else TaskOutputValueKind.STEP_RESULT_ENVELOPE
+                )
         return {
             "result": step_result,
             "evidence_refs": evidence_refs,
@@ -1758,7 +2171,8 @@ async def _exec_subagent(s: dict) -> dict:
                 "tool_call_count": len(result.tool_calls_made or []),
                 "usd": 0,
             },
-            "metadata": runtime_metadata_from_context(ctx),
+            "metadata": runtime_metadata,
+            "task_output_value_kind": task_output_value_kind,
         }
     finally:
         await runtime_persist_internal_worker_runtime_events(

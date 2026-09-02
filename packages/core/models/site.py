@@ -22,6 +22,7 @@ class Site(Base):
     __table_args__ = (
         Index("ix_sites_entity", "entity_id"),
         Index("ix_sites_workspace", "workspace_id"),
+        Index("ix_sites_created_by_user", "created_by_user_id"),
         Index("ix_sites_slug", "slug", unique=True),
         Index("ix_sites_custom_domain", "custom_domain", unique=True),
         Index("uq_sites_entity_source", "entity_id", "source_path", unique=True),
@@ -29,6 +30,9 @@ class Site(Base):
 
     id: Mapped[str] = mapped_column(String(26), primary_key=True, default=generate_ulid)
     entity_id: Mapped[str] = mapped_column(String(26), nullable=False)
+    # Durable management principal.  Source Document ACLs govern publishing
+    # content, but cannot revoke or transfer ownership of an existing site.
+    created_by_user_id: Mapped[Optional[str]] = mapped_column(String(26), nullable=True)
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     # DNS label — max 63 chars
     slug: Mapped[str] = mapped_column(String(63), nullable=False)

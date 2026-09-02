@@ -15,6 +15,7 @@ import LoadingSpinner from "../components/ui/LoadingSpinner";
 import EmptyState from "../components/ui/EmptyState";
 import Button from "../components/ui/Button";
 import AiEditButton from "../components/ui/AiEditButton";
+import AiEditPreviewControls from "../components/ui/AiEditPreviewControls";
 import Input from "../components/ui/Input";
 import Textarea from "../components/ui/Textarea";
 import { CardGridSkeleton } from "../components/ui/Skeleton";
@@ -40,6 +41,7 @@ import {
   IconUpload,
 } from "../components/icons";
 import SmartToolbar from "../components/ui/SmartToolbar";
+import HoverMarqueeText from "../components/ui/HoverMarqueeText";
 import WorkflowImportModal from "../components/workflows/WorkflowImportModal";
 import WorkflowDeployModal from "../components/workflows/WorkflowDeployModal";
 import WorkflowCanvas, { NodeIcon, type CanvasStep } from "../components/workflows/WorkflowCanvas";
@@ -48,7 +50,15 @@ import WorkflowNodeConfigPanel from "../components/workflows/WorkflowNodeConfigP
 import { workflowStepOutputs } from "../lib/workflowBindings";
 import MediaPreview from "../components/workflows/MediaPreview";
 import WorkflowTemplates, { type WorkflowTemplate } from "../components/workflows/WorkflowTemplates";
-import { closeEditorLiveChat, openEditorLiveChat } from "../lib/editorLiveChat";
+import {
+  AiEditPreviewStatus,
+  AiEditTargetKind,
+  closeEditorLiveChat,
+  createAiEditCommitCoordinator,
+  createEditorLiveAdapter,
+  nextEditorLiveChangeCount,
+  openEditorLiveChat,
+} from "../lib/editorLiveChat";
 import { parseWorkflowLiveEdit, serializeWorkflowLiveEdit } from "../lib/workflowLiveEdit";
 import { extractMediaRefs, primaryMediaRef, type MediaRef } from "../lib/workflowMedia";
 import { validateWorkflow, issuesByNode } from "../lib/workflowValidate";
@@ -59,7 +69,7 @@ import { validateWorkflow, issuesByNode } from "../lib/workflowValidate";
 
 interface FlowStep {
   id: string;
-  type: "agent" | "tool" | "condition" | "wait" | "notify" | "transform";
+  type: string;
   name: string;
   status?: "pending" | "running" | "done" | "error";
   config?: Record<string, unknown>;
@@ -70,7 +80,7 @@ interface Flow {
   name: string;
   description: string;
   icon?: string;
-  trigger: "manual" | "event" | "schedule";
+  trigger: "manual" | "event" | "schedule" | "webhook" | "mcp" | "internal";
   trigger_type?: "manual" | "event" | "schedule" | "webhook" | "mcp" | "internal";
   trigger_config?: Record<string, unknown>;
   variables?: Record<string, unknown>;
@@ -82,6 +92,13 @@ interface Flow {
   created_by?: string | null;
   created_at: string;
   updated_at?: string | null;
+}
+
+interface WorkflowAiPreview {
+  baseline: Flow;
+  current: Flow;
+  status: AiEditPreviewStatus;
+  changeCount: number;
 }
 
 interface WorkflowMetadata {
@@ -636,6 +653,9 @@ export default function Flows() {
   const [identityDescription, setIdentityDescription] = useState("");
   const [identityIcon, setIdentityIcon] = useState("flow");
   const [identityNameError, setIdentityNameError] = useState("");
+  const [workflowAiPreview, setWorkflowAiPreview] = useState<WorkflowAiPreview | null>(null);
+  const workflowAiPreviewRef = useRef<WorkflowAiPreview | null>(null);
+  const workflowAiCommitCoordinator = useRef(createAiEditCommitCoordinator()).current;
   const selectedFlowRef = useRef<Flow | null>(null);
   selectedFlowRef.current = selectedFlow;
   const flowContextMenu = useContextMenu();
@@ -670,7 +690,15 @@ export default function Flows() {
     ) return;
     const requested = (flows as Flow[]).find((flow) => flow.id === requestedWorkflowId)
       || (flows as Flow[]).find((flow) => flow.name === requestedWorkflowId);
-    if (requested) setSelectedFlow(requested);
+    if (requested) {
+      if (
+        workflowAiPreviewRef.current
+        && workflowAiPreviewRef.current.current.id !== requested.id
+      ) {
+        closeEditorLiveChat();
+      }
+      setSelectedFlow(requested);
+    }
   }, [flows, requestedWorkflowId, selectedFlow?.id]);
 
   const closeWorkflow = () => {
@@ -898,6 +926,7 @@ export default function Flows() {
   };
 
   const saveWorkflowIdentity = () => {
+    if (workflowAiPreviewRef.current) return;
     const current = identityTarget || selectedFlowRef.current;
     const name = identityName.trim();
     if (!current) return;
@@ -923,6 +952,12 @@ export default function Flows() {
   };
 
   const openFlowEditor = (flow: Flow) => {
+    if (
+      workflowAiPreviewRef.current
+      && workflowAiPreviewRef.current.current.id !== flow.id
+    ) {
+      closeEditorLiveChat();
+    }
     closeDetail();
     setSelectedFlow(flow);
     const next = new URLSearchParams(searchParams);
@@ -984,9 +1019,48 @@ export default function Flows() {
     },
   ];
 
+  const discardWorkflowAiPreview = () => {
+    if (workflowAiCommitCoordinator.isCommitting()) return;
+    const preview = workflowAiPreviewRef.current;
+    if (!preview) return;
+    const baseline = structuredClone(preview.baseline);
+    selectedFlowRef.current = baseline;
+    setSelectedFlow(baseline);
+    workflowAiPreviewRef.current = null;
+    setWorkflowAiPreview(null);
+  };
+
+  const acceptWorkflowAiPreview = async () => {
+    if (workflowAiCommitCoordinator.isCommitting()) return;
+    const preview = workflowAiPreviewRef.current;
+    if (!preview || preview.status !== AiEditPreviewStatus.Ready) return;
+    await workflowAiCommitCoordinator.run(async () => {
+      const update = parseWorkflowLiveEdit(serializeWorkflowLiveEdit(preview.current));
+      try {
+        const saved = await updateMutation.mutateAsync({
+          id: preview.current.id,
+          ...update,
+          validate_steps: true,
+        }) as Flow;
+        selectedFlowRef.current = saved;
+        setSelectedFlow(saved);
+        workflowAiPreviewRef.current = null;
+        setWorkflowAiPreview(null);
+        toast.success(t("page.flows.ai_edit_accepted", { count: saved.steps?.length || 0 }));
+      } catch {
+        // The mutation owns the error toast. Keep the draft so the user can retry.
+      }
+    });
+  };
+
   const openWorkflowAiEdit = () => {
     const current = selectedFlowRef.current;
-    if (!current) return;
+    if (!current || updateMutation.isPending) return;
+    setShowAddStep(false);
+    setAddFromId(null);
+    setConfigStepId(null);
+    setShowIdentityModal(false);
+    setIdentityTarget(null);
     openEditorLiveChat({
       documentName: current.name,
       fileType: "workflow",
@@ -996,23 +1070,67 @@ export default function Flows() {
       emptyDescription: `Describe what to change. I will update ${current.name} directly on the canvas as the answer streams.`,
       placeholder: `Describe how to change ${current.name}...`,
       examples: ["Add an LLM node", "Add a branch", "Fix connections", "Add error handling"],
-      getContent: () => serializeWorkflowLiveEdit(selectedFlowRef.current || current),
-      applyContent: (content) => {
-        const active = selectedFlowRef.current;
-        if (!active || active.id !== current.id) {
-          throw new Error("The workflow is no longer open.");
-        }
-        const update = parseWorkflowLiveEdit(content);
-        updateMutation.mutate(
-          { id: active.id, ...update },
-          {
-            onSuccess: (saved: any) => {
-              selectedFlowRef.current = saved;
-              toast.success(`AI updated · ${saved.steps?.length || 0} node${saved.steps?.length === 1 ? "" : "s"}`);
-            },
-          },
-        );
-      },
+      adapter: createEditorLiveAdapter({
+        target: { kind: AiEditTargetKind.Workflow, id: current.id },
+        read: () => serializeWorkflowLiveEdit(selectedFlowRef.current || current),
+        getTurnPreviewState: () => ({
+          changeCount: workflowAiPreviewRef.current?.changeCount || 0,
+        }),
+        beginTurn: (meta) => {
+          if (meta.signal?.aborted) return false;
+          const preview = workflowAiPreviewRef.current;
+          if (!preview || preview.current.id !== current.id) return true;
+          const pending = { ...preview, status: AiEditPreviewStatus.Animating };
+          workflowAiPreviewRef.current = pending;
+          setWorkflowAiPreview(pending);
+          return true;
+        },
+        preview: (content, meta) => {
+          const active = selectedFlowRef.current;
+          if (!active || active.id !== current.id) {
+            throw new Error("The workflow is no longer open.");
+          }
+          const update = parseWorkflowLiveEdit(content);
+          const previous = workflowAiPreviewRef.current?.current.id === current.id
+            ? workflowAiPreviewRef.current
+            : null;
+          const triggerType = update.trigger_type as Flow["trigger"];
+          const draft: Flow = {
+            ...active,
+            ...update,
+            id: active.id,
+            trigger: triggerType,
+            trigger_type: triggerType,
+            steps: update.steps.map((step) => ({
+              ...step,
+              id: step.id as string,
+              type: step.type as string,
+              name: step.name as string,
+            })),
+          };
+          const preview: WorkflowAiPreview = {
+            baseline: previous?.baseline || structuredClone(active),
+            current: draft,
+            status: AiEditPreviewStatus.Animating,
+            changeCount: nextEditorLiveChangeCount(previous, meta),
+          };
+          workflowAiPreviewRef.current = preview;
+          setWorkflowAiPreview(preview);
+          selectedFlowRef.current = draft;
+          setSelectedFlow(draft);
+          return true;
+        },
+        complete: () => {
+          const preview = workflowAiPreviewRef.current;
+          if (!preview || preview.current.id !== current.id) return false;
+          const ready = { ...preview, status: AiEditPreviewStatus.Ready };
+          workflowAiPreviewRef.current = ready;
+          setWorkflowAiPreview(ready);
+          return true;
+        },
+        rollback: discardWorkflowAiPreview,
+        commitCoordinator: workflowAiCommitCoordinator,
+      }),
     });
   };
 
@@ -1431,6 +1549,7 @@ export default function Flows() {
                   type="button"
                   className="workflow-editor-identity-edit"
                   onClick={() => openWorkflowIdentityEditor()}
+                  disabled={Boolean(workflowAiPreview)}
                   aria-label="Edit workflow name, description, and icon"
                   title="Edit workflow details"
                 >
@@ -1470,11 +1589,13 @@ export default function Flows() {
               <AiEditButton
                 className="workflow-editor-action workflow-editor-action-ai"
                 onClick={openWorkflowAiEdit}
+                disabled={updateMutation.isPending}
               />
               <Button
                 className="workflow-editor-action"
                 variant="outline"
                 onClick={() => openAddStep(steps.length)}
+                disabled={Boolean(workflowAiPreview)}
                 title="Add node"
                 ariaLabel="Add node"
               >
@@ -1485,6 +1606,7 @@ export default function Flows() {
                 variant="outline"
                 title="Deploy workflow"
                 ariaLabel="Deploy workflow"
+                disabled={Boolean(workflowAiPreview)}
                 onClick={() => {
                   if (errorCount > 0) {
                     setShowIssues(true);
@@ -1500,7 +1622,7 @@ export default function Flows() {
                 className="workflow-editor-action"
                 variant="primary"
                 onClick={() => runStep()}
-                disabled={streaming || errorCount > 0}
+                disabled={streaming || errorCount > 0 || Boolean(workflowAiPreview)}
                 title={errorCount > 0 ? "Fix workflow errors before running" : t("page.flows.run")}
                 ariaLabel={streaming ? t("page.flows.starting") : t("page.flows.run")}
               >
@@ -1523,7 +1645,7 @@ export default function Flows() {
                 className="workflow-editor-action"
                 variant="danger"
                 onClick={() => setDeleteTarget(flow.id)}
-                disabled={streaming || deleteMutation.isPending}
+                disabled={streaming || deleteMutation.isPending || Boolean(workflowAiPreview)}
                 loading={deleteMutation.isPending && deleteTarget === flow.id}
                 title={t("page.flows.delete_flow")}
                 ariaLabel={t("page.flows.delete_flow")}
@@ -1533,6 +1655,20 @@ export default function Flows() {
             </div>
           </div>
         </div>
+
+        {workflowAiPreview && (
+          <AiEditPreviewControls
+            className="workflow-ai-edit-controls"
+            status={workflowAiPreview.status}
+            changeCount={workflowAiPreview.changeCount}
+            accepting={updateMutation.isPending || workflowAiCommitCoordinator.isCommitting()}
+            workingLabel={t("page.flows.ai_edit_editing")}
+            workingDescription={t("page.flows.ai_edit_streaming")}
+            readyDescription={t("page.flows.ai_edit_review_preview")}
+            onDiscard={discardWorkflowAiPreview}
+            onAccept={acceptWorkflowAiPreview}
+          />
+        )}
 
         {/* Visual canvas; AI edit uses the same global floating chat as the file editors. */}
         {(() => {
@@ -1624,13 +1760,13 @@ export default function Flows() {
             statusById={statusById}
             previewById={previewById}
             outputById={outputById}
-            onRunNode={runSingleNode}
+            onRunNode={workflowAiPreview ? undefined : runSingleNode}
             issueById={issueById}
-            onStepsChange={(next) =>
+            onStepsChange={workflowAiPreview ? undefined : (next) =>
               flow.id && updateMutation.mutate({ id: flow.id, steps: next })
             }
-            onNodeOpen={(id) => setConfigStepId(id)}
-            onAddFrom={(id) => { setAddFromId(id); setShowAddStep(true); }}
+            onNodeOpen={workflowAiPreview ? undefined : (id) => setConfigStepId(id)}
+            onAddFrom={workflowAiPreview ? undefined : (id) => { setAddFromId(id); setShowAddStep(true); }}
           />
         </div>
         );
@@ -1911,12 +2047,13 @@ export default function Flows() {
             ].filter(Boolean))] as string[],
             outputs: workflowNodeOutputs(s),
           }))}
-          onSave={(updated) =>
+          onSave={(updated) => {
+            if (workflowAiPreviewRef.current) return;
             updateMutation.mutate({
               id: flow.id,
               steps: (flow.steps || []).map((s: any) => (s.id === updated.id ? updated : s)),
-            })
-          }
+            });
+          }}
           onRunResult={recordSingleResult}
           onClose={() => setConfigStepId(null)}
         />
@@ -2003,7 +2140,12 @@ export default function Flows() {
                       {workflowIconGlyph(flow.icon, 18)}
                     </IconTile>
                   }
-                  title={flow.name}
+                  title={
+                    <HoverMarqueeText
+                      className="compact-card-title"
+                      text={flow.name}
+                    />
+                  }
                   subtitle={flow.description || t(TRIGGER_LABELS[flow.trigger] || flow.trigger)}
                   meta={
                     <>

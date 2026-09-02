@@ -23,6 +23,7 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 from xml.etree import ElementTree as ET
+from defusedxml import ElementTree as SafeET
 
 
 SVG_NS = 'http://www.w3.org/2000/svg'
@@ -73,7 +74,7 @@ def _build_replacement_g(
     # namespace through to every primitive (path/circle/...).
     wrapped = f'<svg xmlns="{SVG_NS}">{g_xml}</svg>'
     try:
-        parsed_root = ET.fromstring(wrapped)
+        parsed_root = SafeET.fromstring(wrapped)
     except ET.ParseError:
         return None
 

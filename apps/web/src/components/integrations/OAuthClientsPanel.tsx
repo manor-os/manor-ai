@@ -17,6 +17,7 @@ type OAuthClient = {
   name: string;
   client_id: string | null;
   has_secret: boolean;
+  client_secret_required?: boolean;
   source: "env" | "ui" | "db" | "none";
   scopes: string | null;
   configured: boolean;
@@ -187,7 +188,9 @@ export default function OAuthClientsPanel({
                     })()}
                   </td>
                   <td style={td}>
-                    {c.has_secret
+                    {c.client_secret_required === false
+                      ? <span>—</span>
+                      : c.has_secret
                       ? <Chip size="sm" variant="green">{t("component.oauth_clients_panel.set")}</Chip>
                       : <Chip size="sm" variant="slate">{t("component.oauth_clients_panel.missing")}</Chip>}
                   </td>
@@ -287,7 +290,8 @@ function EditModal({
     onError: (err: Error) => toast.error(t("page.blueprint_detail.save_failed"), err.message),
   });
 
-  const valid = clientId.trim() && clientSecret.trim();
+  const needsSecret = client.client_secret_required !== false;
+  const valid = clientId.trim() && (!needsSecret || clientSecret.trim());
 
   return (
     <Modal open onClose={onClose} title={`${client.name} OAuth`} maxWidth="560px">
@@ -312,8 +316,10 @@ function EditModal({
           </a>
         )}
         <p style={{ fontSize: 12, color: "#78716c", margin: 0, lineHeight: 1.5 }}>
-          {t("component.oauth_clients_panel.create_oauth_apps_in_the_provider_console_first_paypal")}<code style={codeStyle}>{client.client_id_env_var}</code> /
-          <code style={codeStyle}>{client.client_secret_env_var}</code> {t("component.oauth_clients_panel.env_vars_for_this_provider_until_you_reset")}</p>
+          {needsSecret ? <>
+            {t("component.oauth_clients_panel.create_oauth_apps_in_the_provider_console_first_paypal")}<code style={codeStyle}>{client.client_id_env_var}</code> /
+            <code style={codeStyle}>{client.client_secret_env_var}</code> {t("component.oauth_clients_panel.env_vars_for_this_provider_until_you_reset")}
+          </> : t("page.integrations.public_oauth_client_hint")}</p>
         <p style={{ fontSize: 11, color: "#a8a29e", margin: 0, lineHeight: 1.55 }}>
           {t("component.oauth_clients_panel.after_saving_go_to_integrations_connect_for_this_provi")}</p>
         <Field label={t("component.oauth_clients_panel.client_id")} required>
@@ -322,7 +328,7 @@ function EditModal({
             style={input}
           />
         </Field>
-        <Field label={t("component.oauth_clients_panel.client_secret_2")} required hint={
+        {needsSecret && <Field label={t("component.oauth_clients_panel.client_secret_2")} required hint={
           client.has_secret ? "Replacing the existing encrypted secret." : "First-time entry."
         }>
           <input
@@ -330,7 +336,7 @@ function EditModal({
             value={clientSecret} onChange={(e) => setClientSecret(e.target.value)}
             style={input}
           />
-        </Field>
+        </Field>}
         <Field label={t("component.oauth_clients_panel.scopes")} hint="Space-separated; leave blank to use the provider default.">
           <input
             type="text" value={scopes} onChange={(e) => setScopes(e.target.value)}

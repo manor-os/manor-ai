@@ -443,6 +443,140 @@ def test_step_infos_read_canonical_envelope_output_data():
     assert '"visual_beats"' in preview
 
 
+def test_supervisor_contract_gate_rejects_materialized_step_contract_drift():
+    """Review must not compare a result against a different contract than Plan."""
+    from packages.core.contracts.shapes import get_shape
+    from packages.core.contracts.task_output import plan_output_contract_schema
+    from packages.core.plans.executor import _execution_output_contract_issue
+
+    plan = types.SimpleNamespace(
+        id="plan_1",
+        plan_dag={
+            "steps": [{
+                "key": "draft",
+                "kind": "subagent",
+                "service_key": "content",
+                "output_shape": "TextResult",
+                "params": {"prompt": "Draft the final copy."},
+            }],
+        },
+    )
+    step = types.SimpleNamespace(
+        step_key="draft",
+        kind="subagent",
+        step_status="done",
+        expected_output_schema=plan_output_contract_schema(
+            get_shape("ArtifactResult").json_schema()
+        ),
+        result={"files": [{"name": "draft.md", "fs_path": "draft.md"}]},
+    )
+
+    issue = _execution_output_contract_issue(plan, [step])
+
+    assert issue is not None
+    assert "draft" in issue
+    assert "differs from the Plan contract" in issue
+
+
+def test_supervisor_contract_gate_revalidates_the_delivered_step_result():
+    from packages.core.contracts.shapes import get_shape
+    from packages.core.contracts.task_output import plan_output_contract_schema
+    from packages.core.plans.executor import _execution_output_contract_issue
+
+    text_contract = plan_output_contract_schema(get_shape("TextResult").json_schema())
+    plan = types.SimpleNamespace(
+        id="plan_1",
+        plan_dag={
+            "steps": [{
+                "key": "draft",
+                "kind": "subagent",
+                "service_key": "content",
+                "output_shape": "TextResult",
+                "params": {"prompt": "Draft the final copy."},
+            }],
+        },
+    )
+    step = types.SimpleNamespace(
+        step_key="draft",
+        kind="subagent",
+        step_status="done",
+        expected_output_schema=text_contract,
+        result={"summary": "claimed success without the required text"},
+    )
+
+    issue = _execution_output_contract_issue(plan, [step])
+
+    assert issue is not None
+    assert "does not satisfy its output contract" in issue
+
+
+def test_supervisor_contract_gate_allows_provider_hydrated_action_schema():
+    """A provider may add a stronger contract when Plan declared none."""
+    from packages.core.plans.executor import _execution_output_contract_issue
+
+    provider_schema = {
+        "type": "object",
+        "required": ["message_id"],
+        "properties": {"message_id": {"type": "string"}},
+    }
+    plan = types.SimpleNamespace(
+        id="plan_1",
+        plan_dag={
+            "steps": [{
+                "key": "send_email",
+                "kind": "action",
+                "service_key": "communications",
+                "provider": "gmail",
+                "action_key": "email.send",
+                "params": {},
+            }],
+        },
+    )
+    step = types.SimpleNamespace(
+        step_key="send_email",
+        kind="action",
+        step_status="done",
+        expected_output_schema=provider_schema,
+        result={"message_id": "msg_123"},
+    )
+
+    assert _execution_output_contract_issue(plan, [step]) is None
+
+
+def test_supervisor_step_view_uses_the_materialized_payload_contract():
+    from packages.core.contracts.task_output import task_output_envelope_schema
+    from packages.core.plans.executor import _supervisor_step_infos
+
+    payload_schema = {
+        "type": "object",
+        "required": ["leads"],
+        "properties": {"leads": {"type": "array", "minItems": 1}},
+    }
+    plan = types.SimpleNamespace(plan_dag={"steps": [{"key": "deliver"}]})
+    step = types.SimpleNamespace(
+        step_key="deliver",
+        kind="subagent",
+        step_status="done",
+        service_key="research",
+        action_key=None,
+        attempt_count=1,
+        params={},
+        expected_output_schema=task_output_envelope_schema(payload_schema),
+        result={
+            "status": "succeeded",
+            "summary": "one lead",
+            "outputs": {"data": {"leads": [{"name": "A"}]}},
+        },
+        error=None,
+    )
+
+    info = _supervisor_step_infos(plan, [step])[0]
+
+    assert info["output_contract"] == payload_schema
+    assert info["contract_check"] == "passed"
+    assert '"leads"' in info["result"]
+
+
 def test_the_supervisor_call_passes_the_full_view():
     import inspect
 

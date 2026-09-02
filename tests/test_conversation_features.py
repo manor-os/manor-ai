@@ -1,7 +1,84 @@
 """E2E tests: conversation export and sharing."""
 
+from types import SimpleNamespace
+
 import pytest
 from httpx import AsyncClient
+
+from packages.core.ai.runtime.output_policy import runtime_public_tool_calls
+from packages.core.services import conversation_export
+from packages.core.services.conversation_export import _public_export_content
+
+
+def test_conversation_export_redacts_internal_tool_contract_failures() -> None:
+    internal_error = "Tool error (mcp__private__run): missing handler"
+    message = SimpleNamespace(
+        content=internal_error,
+        meta={"stream_status": "error", "error": internal_error},
+        tool_calls=None,
+    )
+
+    public_content = _public_export_content(message)
+    public_calls = runtime_public_tool_calls([{
+        "name": "mcp__private__run",
+        "result": internal_error,
+        "raw_result": internal_error,
+        "status": "error",
+    }])
+
+    assert public_content == "Sorry, the request failed. Please try again."
+    assert "mcp__private__run" not in public_content
+    assert public_calls[0]["result"] == (
+        "This operation is temporarily unavailable. Please try again."
+    )
+    assert public_calls[0]["name"] == "operation"
+    assert "raw_result" not in public_calls[0]
+
+
+@pytest.mark.asyncio
+async def test_markdown_export_redacts_internal_tool_call_names(monkeypatch) -> None:
+    internal_error = (
+        "Tool error (mcp__private__run): "
+        "No matching handler for mcp__private__run"
+    )
+    conversation = SimpleNamespace(title="Private failure")
+    message = SimpleNamespace(
+        role="assistant",
+        content=internal_error,
+        meta={"stream_status": "error", "error": internal_error},
+        tool_calls=[{
+            "name": "mcp__private__run",
+            "result": internal_error,
+            "status": "error",
+        }],
+        created_at=None,
+    )
+
+    async def fake_get_conversation(*_args, **_kwargs):
+        return conversation
+
+    async def fake_list_messages(*_args, **_kwargs):
+        return [message]
+
+    monkeypatch.setattr(
+        conversation_export,
+        "get_conversation",
+        fake_get_conversation,
+    )
+    monkeypatch.setattr(
+        conversation_export,
+        "list_messages",
+        fake_list_messages,
+    )
+
+    exported = await conversation_export.export_as_markdown(
+        object(),
+        "conversation-id",
+        "entity-id",
+    )
+
+    assert "mcp__private__run" not in exported
+    assert "- `operation`" in exported
 
 
 async def _auth(client: AsyncClient, username: str = "convuser") -> dict:

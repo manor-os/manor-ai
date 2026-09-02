@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from copy import deepcopy
 from typing import Any
 
@@ -26,6 +27,7 @@ _NOTIFICATION_LISTENER_KEY = "workflow_chat_projection_listeners"
 _ACTIONABLE_COMPLETED_OUTCOMES = {
     "needs_input",
 }
+logger = logging.getLogger(__name__)
 
 
 async def _push_notification(payload: dict[str, Any]) -> None:
@@ -613,6 +615,7 @@ async def _notify_update(db: AsyncSession, message: Message) -> None:
             payload = {
                 "target": "user",
                 "user_id": conversation.user_id,
+                "entity_id": conversation.entity_id,
                 "event": "conversation_message",
                 "data": {
                     "conversation_id": conversation.id,
@@ -992,11 +995,33 @@ async def project_workflow_run_status(
     *,
     run: Any,
 ) -> None:
+    """Settle authoritative run relations, then project Chat best-effort."""
+    from packages.core.services.scheduler_service import (
+        finalize_scheduled_workflow_run,
+    )
     from packages.core.services.proposal_workflow_runs import (
         sync_proposal_workflow_run_item,
     )
 
+    await finalize_scheduled_workflow_run(db, run)
     await sync_proposal_workflow_run_item(db, run)
+    # Keep scheduler/proposal settlement outside the UI savepoint. A broken
+    # Message row or notification projection must not orphan authoritative
+    # Workflow relationships when the caller commits the run terminal state.
+    await db.flush()
+    try:
+        async with db.begin_nested():
+            await _project_workflow_run_status_chat(db, run=run)
+    except Exception:
+        logger.debug("Workflow Chat run projection skipped", exc_info=True)
+
+
+async def _project_workflow_run_status_chat(
+    db: AsyncSession,
+    *,
+    run: Any,
+) -> None:
+    """Project run status into Chat inside the caller's UI savepoint."""
     context = _entrypoint_context(run)
     if context is None:
         return

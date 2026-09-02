@@ -15,7 +15,7 @@ in Redis (``ops:snapshot``) without further serialization gymnastics.
 from __future__ import annotations
 
 import logging
-import os
+import re
 import time
 from typing import Any
 
@@ -182,7 +182,7 @@ def collect_celery_queues() -> dict[str, int]:
     connection rather than opening a new Redis client.
 
     Probes every queue Manor declares (packages/core/queues.py) so the control
-    plane and the work queue are visible separately — a backlog on ``work``
+    plane and the heavy queue are visible separately — a backlog on ``heavy``
     means "steps are queueing", a backlog on ``celery`` means "the orchestration
     loop is behind", and they call for different responses."""
     try:
@@ -214,8 +214,6 @@ def collect_snapshot() -> dict[str, Any]:
 
 
 # ── Log scanning ───────────────────────────────────────────────────────
-
-import re
 
 # Match common Python / Node / panic patterns. Greedy ``ERROR`` alone
 # would catch "ERROR_CODES" / "no errors" — anchor to a word-ish boundary.

@@ -10,7 +10,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libreoffice-impress libreoffice-writer libreoffice-calc \
     poppler-utils \
     fonts-crosextra-caladea fonts-crosextra-carlito fonts-lato \
-    fonts-liberation fonts-noto-cjk fonts-roboto && \
+    fonts-liberation fonts-noto-core fonts-noto-cjk fonts-roboto && \
     rm -rf /var/lib/apt/lists/* && \
     ARCH=$(dpkg --print-architecture) && \
     curl -sSL "https://github.com/juicedata/juicefs/releases/download/v1.2.3/juicefs-1.2.3-linux-${ARCH}.tar.gz" \
@@ -33,7 +33,8 @@ RUN for attempt in 1 2 3; do \
 COPY alembic.ini .
 COPY .agents/ .agents/
 COPY packages/ packages/
-COPY apps/ apps/
+COPY apps/__init__.py apps/__init__.py
+COPY apps/api/ apps/api/
 COPY scripts/ scripts/
 
 # Entrypoint mounts JuiceFS then runs the main command

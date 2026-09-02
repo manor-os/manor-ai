@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
+import io
 import json
 import logging
 import mimetypes
@@ -298,30 +299,44 @@ _background_tasks: set = set()
 def schedule_video_job(job_id: str) -> None:
     """Schedule a video job for background processing.
 
-    Prefer Celery so provider polling survives API reloads. Falls back to an
-    in-process task only if the broker is unavailable.
+    Prefer Celery so provider polling survives API reloads. A heavy worker must
+    run the child in its current loop: video tasks share the heavy queue, and a
+    Workflow waiting for its own queued child would otherwise deadlock when the
+    worker concurrency is one.
     """
-    try:
-        process_video_job_task.delay(job_id)
-        return
-    except Exception:
-        logger.warning("Celery dispatch failed for video job %s; falling back in-process", job_id, exc_info=True)
-
     async def _run():
         try:
             await process_video_job(job_id)
         except Exception:
             logger.error("Video job %s crashed", job_id, exc_info=True)
 
-    try:
-        loop = asyncio.get_running_loop()
+    def _schedule_in_current_loop() -> bool:
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return False
         task = loop.create_task(_run())
-        # Keep strong reference to prevent GC before completion
         _background_tasks.add(task)
         task.add_done_callback(_background_tasks.discard)
-    except RuntimeError:
-        import threading
-        threading.Thread(target=lambda: asyncio.run(_run()), daemon=True).start()
+        return True
+
+    if (
+        os.getenv("MANOR_SERVICE_ROLE", "").strip().lower() == "worker-heavy"
+        and _schedule_in_current_loop()
+    ):
+        return
+
+    try:
+        process_video_job_task.delay(job_id)
+        return
+    except Exception:
+        logger.warning("Celery dispatch failed for video job %s; falling back in-process", job_id, exc_info=True)
+
+    if _schedule_in_current_loop():
+        return
+
+    import threading
+    threading.Thread(target=lambda: asyncio.run(_run()), daemon=True).start()
 
 
 # ── Internal helpers ─────────────────────────────────────────────────────────
@@ -729,6 +744,7 @@ def _video_adapter_runtime(
         http_client_cls=httpx.AsyncClient,
         media_api_timeout=MEDIA_API_TIMEOUT,
         ensure_public_url=_ensure_public_url,
+        ensure_inline_data_url=_ensure_inline_data_url,
         public_url_kwargs=_public_url_kwargs,
         remember_provider_poll=_remember_provider_poll,
         poll_openrouter_generation=lambda poll_url, headers: _poll_video_generation(
@@ -904,6 +920,7 @@ async def _push_notification(job) -> None:
             "resolution": display_resolution,
             "model": job.model,
         },
+        workspace_id=str((job.params or {}).get("workspace_id") or "").strip() or None,
         channels=["db", "broadcast"],
     )
 
@@ -2002,3 +2019,96 @@ async def _ensure_public_url(
     with open(full_path, "rb") as f:
         b64 = base64.b64encode(f.read()).decode("ascii")
     return f"data:{mime_type};base64,{b64}"
+
+
+async def _ensure_inline_data_url(
+    url: str,
+    entity_id: str,
+    *,
+    max_bytes: int,
+) -> str:
+    """Encode an entity-local media reference for adapters that accept inline data."""
+    from packages.core.services.entity_fs import get_entity_root
+
+    value = str(url or "").strip()
+    if value.startswith("data:"):
+        parsed = _decode_image_data_uri(value)
+        if parsed is None:
+            return value
+        return _inline_image_data_url_with_limit(*parsed, max_bytes=max_bytes)
+
+    entity_root = get_entity_root(entity_id)
+    rel_path = _entity_rel_path_from_reference(value, entity_id, entity_root)
+    if not rel_path and _looks_like_entity_fs_reference(value):
+        raise RuntimeError(_invalid_entity_fs_reference_message(value, entity_id))
+    if not rel_path:
+        return value
+
+    full_path = os.path.join(entity_root, rel_path)
+    if not os.path.isfile(full_path):
+        raise RuntimeError(f"Local media reference does not exist: {rel_path}")
+    size = os.path.getsize(full_path)
+    mime_type = mimetypes.guess_type(full_path)[0] or "application/octet-stream"
+    with open(full_path, "rb") as f:
+        content = f.read()
+    if size <= max_bytes:
+        encoded = base64.b64encode(content).decode("ascii")
+        return f"data:{mime_type};base64,{encoded}"
+    if not mime_type.startswith("image/"):
+        raise video_adapters.InlineMediaReferenceLimitError(
+            f"Local media reference is {size} bytes, exceeding the inline limit of {max_bytes} bytes."
+        )
+    return _inline_image_data_url_with_limit(content, mime_type, max_bytes=max_bytes)
+
+
+def _inline_image_data_url_with_limit(
+    content: bytes,
+    mime_type: str,
+    *,
+    max_bytes: int,
+) -> str:
+    """Keep inline image references below a provider payload limit."""
+    if len(content) <= max_bytes:
+        encoded = base64.b64encode(content).decode("ascii")
+        return f"data:{mime_type};base64,{encoded}"
+
+    try:
+        from PIL import Image, ImageOps
+    except ImportError as exc:  # pragma: no cover - Pillow is a runtime dependency
+        raise RuntimeError("Pillow is required to resize oversized inline image references.") from exc
+
+    with Image.open(io.BytesIO(content)) as source:
+        image = ImageOps.exif_transpose(source)
+        if image.mode in {"RGBA", "LA"}:
+            background = Image.new("RGB", image.size, "white")
+            alpha = image.getchannel("A")
+            background.paste(image.convert("RGB"), mask=alpha)
+            image = background
+        elif image.mode != "RGB":
+            image = image.convert("RGB")
+
+        max_dimension = 1280
+        if max(image.size) > max_dimension:
+            scale = max_dimension / max(image.size)
+            image = image.resize(
+                (max(1, round(image.width * scale)), max(1, round(image.height * scale))),
+                Image.Resampling.LANCZOS,
+            )
+
+        while True:
+            for quality in (88, 78, 68, 58, 48):
+                output = io.BytesIO()
+                image.save(output, format="JPEG", quality=quality, optimize=True)
+                compressed = output.getvalue()
+                if len(compressed) <= max_bytes:
+                    encoded = base64.b64encode(compressed).decode("ascii")
+                    return f"data:image/jpeg;base64,{encoded}"
+            if min(image.size) <= 256:
+                break
+            image = image.resize(
+                (max(256, round(image.width * 0.75)), max(256, round(image.height * 0.75))),
+                Image.Resampling.LANCZOS,
+            )
+    raise video_adapters.InlineMediaReferenceLimitError(
+        f"Local image reference cannot be encoded below the inline limit of {max_bytes} bytes."
+    )

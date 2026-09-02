@@ -15,6 +15,7 @@ HTTP surface
 ────────────
 Health (no auth, no session):
   GET  /health                                → {ok, protocol, sessions: N}
+  GET  /ready                                 → same shape; 503 until restore
 
 Lifecycle (per session):
   POST   /sessions                            → {session_id}
@@ -22,6 +23,7 @@ Lifecycle (per session):
                                                   in the background)
   GET    /sessions                            → [{sid, online, account, ...}]
   GET    /sessions/{sid}/status               → status dict
+  GET    /sessions/{sid}/credentials         → token + base URL (internal)
   GET    /sessions/{sid}/qr.png               → image/png (no auth)
   POST   /sessions/{sid}/messages             → send (text now; media later)
   POST   /sessions/{sid}/config               → register callback URL
@@ -45,9 +47,10 @@ Inbound envelope POSTed to the configured callback (unchanged):
 
 Persistence
 ───────────
-Sessions live in process memory. On runner restart they're gone and
-the user has to scan again. Persisting tokens to Vault is a future
-exercise — keeping the v1 surface narrow.
+The Manor API persists each account's iLink ``bot_token`` and ``base_url``
+in its encrypted Integration credential store. On restart this runner
+fetches active sessions from the API and rebuilds the in-memory long-poll
+tasks. Cursor and peer context remain intentionally ephemeral.
 """
 from __future__ import annotations
 
@@ -80,7 +83,14 @@ logging.basicConfig(level=logging.INFO,
 _DATA_ROOT = Path(os.getenv("WECHAT_RUNNER_DATA", "/data"))
 _SESSIONS_DIR = _DATA_ROOT / "sessions"
 RUNNER_BEARER_TOKEN = os.getenv("RUNNER_BEARER_TOKEN", "")
+# Empty by default keeps the standalone runner useful for local pairing. The
+# compose and Kubernetes manifests set the in-cluster API service explicitly.
+MANOR_API_URL = os.getenv("MANOR_API_URL", "").rstrip("/")
 PUBLIC_QR_BASE = (os.getenv("PUBLIC_QR_BASE") or "").rstrip("/")
+
+# The process is live as soon as FastAPI starts, but it is not ready to serve
+# integration traffic until the persisted sessions have been reconciled.
+_restore_ready = not bool(MANOR_API_URL)
 
 _QRCODE_POLL_INTERVAL = 2.0
 _SESSION_EXPIRED_BACKOFF_SEC = 60 * 60
@@ -97,14 +107,23 @@ class Session:
     (callback URL + per-peer context_token cache).
     """
 
-    def __init__(self, sid: str) -> None:
+    def __init__(
+        self,
+        sid: str,
+        *,
+        bot_token: Optional[str] = None,
+        base_url: Optional[str] = None,
+        account: Optional[Dict[str, Any]] = None,
+        callback_url: Optional[str] = None,
+        callback_bearer: Optional[str] = None,
+    ) -> None:
         self.sid = sid
-        self.client = ILinkClient()
-        self.online: bool = False
-        self.qr_pending: bool = True
-        self.account: Optional[Dict[str, Any]] = None
-        self.callback_url: Optional[str] = None
-        self.callback_bearer: Optional[str] = None
+        self.client = ILinkClient(bot_token=bot_token, base_url=base_url)
+        self.online: bool = bool(bot_token)
+        self.qr_pending: bool = not bool(bot_token)
+        self.account: Optional[Dict[str, Any]] = account
+        self.callback_url: Optional[str] = callback_url
+        self.callback_bearer: Optional[str] = callback_bearer
         self.last_error: Optional[str] = None
         self.cursor: str = ""
         # Per-peer cache of the most recent context_token. Outbound
@@ -385,19 +404,119 @@ def _render_qr_png(content: str, out_path: Path) -> None:
 app = FastAPI(title="Manor WeChat Personal Runner (iLink, multi-session)")
 
 
+async def _restore_sessions() -> int | None:
+    """Restore token-backed sessions from Manor without persisting runner state.
+
+    ``None`` means the API could not be reached and allows the startup retry;
+    a numeric result means the API answered successfully (including no rows).
+    """
+    if not MANOR_API_URL:
+        return 0
+    headers = {"Accept": "application/json"}
+    if RUNNER_BEARER_TOKEN:
+        headers["Authorization"] = f"Bearer {RUNNER_BEARER_TOKEN}"
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            response = await client.get(
+                f"{MANOR_API_URL}/api/v1/integrations/wechat-personal/internal/sessions",
+                headers=headers,
+            )
+        if not response.is_success:
+            logger.warning("Session restore API rejected request with HTTP %d", response.status_code)
+            return None
+        payload = response.json()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Session restore API unavailable: %s", exc)
+        return None
+
+    if not isinstance(payload, list):
+        logger.warning("Session restore API returned an invalid payload")
+        return None
+
+    restored = 0
+    for item in payload:
+        if not isinstance(item, dict):
+            continue
+        sid = str(item.get("session_id") or "").strip()
+        bot_token = str(item.get("bot_token") or "").strip()
+        if not sid or not bot_token:
+            continue
+        base_url = item.get("base_url")
+        if not isinstance(base_url, str):
+            base_url = None
+        existing = _sessions.get(sid)
+        if existing and not existing.closed:
+            continue
+        sess = Session(
+            sid,
+            bot_token=bot_token,
+            base_url=base_url,
+            account=item.get("account") if isinstance(item.get("account"), dict) else None,
+            callback_url=str(item.get("callback_url") or "").strip() or None,
+            callback_bearer=str(item.get("callback_bearer") or "").strip() or None,
+        )
+        _sessions[sid] = sess
+        sess.task = asyncio.create_task(
+            _long_poll_loop(sess), name=f"ilink-restored-{sid}",
+        )
+        restored += 1
+    if restored:
+        logger.info("Restored %d WeChat session(s) from Manor", restored)
+    return restored
+
+
+async def _restore_sessions_with_retry() -> None:
+    global _restore_ready
+    _restore_ready = False
+    delay = 1.0
+    while True:
+        result = await _restore_sessions()
+        if result is not None:
+            _restore_ready = True
+            return
+        logger.warning("Session restore will retry in %.0fs", delay)
+        await asyncio.sleep(delay)
+        delay = min(delay * 2, 30.0)
+
+
+_restore_task: Optional[asyncio.Task] = None
+
+
 @app.on_event("startup")
 async def _startup() -> None:
     _SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
+    global _restore_ready, _restore_task
+    _restore_ready = not bool(MANOR_API_URL)
+    _restore_task = asyncio.create_task(
+        _restore_sessions_with_retry(), name="wechat-session-restore",
+    )
 
 
 @app.on_event("shutdown")
 async def _shutdown() -> None:
+    if _restore_task and not _restore_task.done():
+        _restore_task.cancel()
+        try:
+            await _restore_task
+        except asyncio.CancelledError:
+            pass
     for sess in list(_sessions.values()):
         await sess.shutdown()
 
 
 @app.get("/health")
 async def health() -> Dict[str, Any]:
+    return {
+        "ok": True,
+        "protocol": "ilink",
+        "sessions": sum(1 for s in _sessions.values() if not s.closed),
+    }
+
+
+@app.get("/ready")
+async def ready() -> Dict[str, Any]:
+    if not _restore_ready:
+        raise HTTPException(503, "Session restore pending")
     return {
         "ok": True,
         "protocol": "ilink",
@@ -447,6 +566,23 @@ async def list_sessions() -> List[Dict[str, Any]]:
 @app.get("/sessions/{sid}/status", dependencies=[Depends(require_bearer)])
 async def session_status(sid: str) -> Dict[str, Any]:
     return _require_session(sid).status_dict()
+
+
+@app.get("/sessions/{sid}/credentials", dependencies=[Depends(require_bearer)])
+async def session_credentials(sid: str) -> Dict[str, Any]:
+    """Return the token Manor needs to persist a completed pairing.
+
+    Keep this separate from status: user-facing status and logs must never
+    contain the iLink bot token.
+    """
+    sess = _require_session(sid)
+    if not sess.client.bot_token:
+        raise HTTPException(409, "WeChat session has no bot token yet")
+    return {
+        "session_id": sess.sid,
+        "bot_token": sess.client.bot_token,
+        "base_url": sess.client.base_url,
+    }
 
 
 @app.get("/sessions/{sid}/qr.png")

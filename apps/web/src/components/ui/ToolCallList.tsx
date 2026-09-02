@@ -6,7 +6,7 @@
  */
 import { useEffect, useMemo, useState } from "react";
 import {
-  normalizeToolResult,
+  formatPublicToolResult,
   WRAPPER_TOOLS,
   type SubAgentEvent,
   type ToolCall,
@@ -99,7 +99,7 @@ interface ToolCallListProps {
 }
 
 function parseToolResult(result?: unknown): Record<string, any> | null {
-  const text = normalizeToolResult(result);
+  const text = formatPublicToolResult(result);
   if (!text) return null;
   try {
     const parsed = JSON.parse(text);
@@ -530,7 +530,7 @@ export default function ToolCallList(props: ToolCallListProps) {
           {displayTools.map((tc, j) => {
             const key = `${keyPrefix}-${j}`;
             const subAgentRun = subAgentRunByTool.get(j);
-            const resultText = normalizeToolResult(tc.result);
+            const resultText = formatPublicToolResult(tc.result);
             const displayResultText = resultText ? formatUserFacingStructuredText(resultText) : "";
             const status = tc.status || (resultText ? "success" : "pending");
             const isExpanded = expandedResults[key];
@@ -774,7 +774,7 @@ function ChevronIcon({ expanded }: { expanded?: boolean }) {
 }
 
 function MediaPreview({ tc }: { tc: ToolCall }) {
-  const resultText = normalizeToolResult(tc.result);
+  const resultText = formatPublicToolResult(tc.result);
   if (
     (tc.name === "generate_image" || tc.name === "generate_file") &&
     resultText

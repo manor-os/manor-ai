@@ -31,7 +31,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import httpx
-from sqlalchemy import delete as sa_delete, func, select, update as sa_update
+from sqlalchemy import delete as sa_delete, func, or_, select, update as sa_update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from packages.core.models.user import Entity, OAuthAccount, User
@@ -153,6 +153,48 @@ async def purge_user(db: AsyncSession, user_id: str) -> bool:
         return False
 
     entity_id = user.entity_id
+    from packages.core.models.chat_feedback import ChatMessageFeedback
+    from packages.core.models.channel import TwilioVoiceCallSession
+    from packages.core.models.product_growth import ProductGrowthEvent
+    from packages.core.models.runtime_learning import RuntimeEvidence
+    from packages.core.models.task import Conversation, Message
+    from packages.core.services.chat_feedback import (
+        COMPLETION_FEEDBACK_EVIDENCE_TYPES,
+    )
+
+    feedback_message_ids = select(ChatMessageFeedback.message_id).where(
+        ChatMessageFeedback.user_id == user_id
+    )
+    await db.execute(
+        select(Message.id)
+        .join(Conversation, Conversation.id == Message.conversation_id)
+        .where(
+            Conversation.entity_id == entity_id,
+            Message.id.in_(feedback_message_ids),
+        )
+        .order_by(Message.id)
+        .with_for_update(of=Message)
+    )
+    # Match feedback persistence's Message → feedback → evidence lock order.
+    await db.execute(
+        sa_delete(ChatMessageFeedback).where(ChatMessageFeedback.user_id == user_id)
+    )
+    await db.execute(
+        sa_delete(RuntimeEvidence).where(
+            RuntimeEvidence.user_id == user_id,
+            RuntimeEvidence.evidence_type.in_(
+                COMPLETION_FEEDBACK_EVIDENCE_TYPES
+            ),
+        )
+    )
+    await db.execute(
+        sa_delete(ProductGrowthEvent).where(ProductGrowthEvent.user_id == user_id)
+    )
+    await db.execute(
+        sa_delete(TwilioVoiceCallSession).where(
+            TwilioVoiceCallSession.owner_user_id == user_id
+        )
+    )
     await _anonymize_user_references(db, user_id)
     await db.execute(sa_delete(OAuthAccount).where(OAuthAccount.user_id == user_id))
     await db.delete(user)
@@ -169,10 +211,14 @@ async def purge_user(db: AsyncSession, user_id: str) -> bool:
     if remaining == 0:
         entity = await db.get(Entity, entity_id)
         if entity is not None and entity.deleted_at is not None:
-            from packages.core.models.workspace import Workspace
             # Workspaces get cleared by the workspace purge task; here
             # we just drop the entity row itself + its OAuth integrations.
             from packages.core.models.document import Integration
+            await db.execute(
+                sa_delete(TwilioVoiceCallSession).where(
+                    TwilioVoiceCallSession.entity_id == entity_id
+                )
+            )
             await db.execute(
                 sa_delete(Integration).where(Integration.entity_id == entity_id)
             )
@@ -273,24 +319,46 @@ async def _is_sole_active_admin(db: AsyncSession, user: User) -> bool:
     of their entity. We count peers that are NOT soft-deleted and have
     a privileged role. The user themselves is excluded from the count
     (they're the one being soft-deleted)."""
-    if user.role not in ("owner", "admin"):
+    from packages.core.models.user import UserMembership
+    from packages.core.permissions import (
+        effective_user_role_name,
+        resolve_effective_user_role_name,
+    )
+
+    if await effective_user_role_name(db, user) not in ("owner", "admin"):
         return False
-    count = (await db.execute(
-        select(func.count(User.id)).where(
-            User.entity_id == user.entity_id,
+    peers = list((await db.execute(
+        select(User).where(
             User.id != user.id,
-            User.role.in_(("owner", "admin")),
+            User.status == "active",
             User.deleted_at.is_(None),
+            or_(
+                User.entity_id == user.entity_id,
+                User.id.in_(
+                    select(UserMembership.user_id).where(
+                        UserMembership.entity_id == user.entity_id,
+                        UserMembership.status == "active",
+                        UserMembership.deleted_at.is_(None),
+                    )
+                ),
+            ),
         )
-    )).scalar_one() or 0
-    return count == 0
+    )).scalars().all())
+    for peer in peers:
+        if await resolve_effective_user_role_name(
+            db,
+            user_id=peer.id,
+            entity_id=user.entity_id,
+        ) in ("owner", "admin"):
+            return False
+    return True
 
 
 async def _cascade_delete_entity(
     db: AsyncSession, entity_id: str, now: datetime,
 ) -> None:
     """Soft-delete the entity and every workspace under it."""
-    entity = await db.get(Entity, entity_id)
+    entity = await db.get(Entity, entity_id, populate_existing=True)
     if entity is None or entity.deleted_at is not None:
         return
     entity.deleted_at = now
@@ -397,6 +465,17 @@ async def _anonymize_user_references(
         fk_columns.append((Favorite, "user_id"))
     except ImportError:
         pass
+    try:
+        from packages.core.models.scheduler import ScheduledJob
+        fk_columns.append((ScheduledJob, "user_id"))
+    except ImportError:
+        pass
+    try:
+        from packages.core.models.workspace import WorkspaceActivity
+        fk_columns.append((WorkspaceActivity, "user_id"))
+    except ImportError:
+        pass
+
 
     for model, col in fk_columns:
         col_attr = getattr(model, col, None)

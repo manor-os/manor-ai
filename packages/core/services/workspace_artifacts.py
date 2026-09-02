@@ -91,13 +91,25 @@ def artifact_folder_id_from_storage_path(location: str | None) -> str | None:
     return None
 
 
+def artifact_folder_id_from_entity_storage_path(location: str | None) -> str | None:
+    """Extract a Workspace folder ID only from an entity-root-relative path."""
+    normalized = normalize_rel_path(str(location or ""))
+    parts = [part for part in normalized.split("/") if part]
+    if (
+        len(parts) >= 3
+        and parts[:2] == [WORKSPACE_FOLDER_ROOT, WORKSPACE_STORAGE_SEGMENT]
+    ):
+        return parts[2]
+    return None
+
+
 async def infer_workspace_id_from_storage_path(
     *,
     entity_id: str,
     rel_path: str,
 ) -> str | None:
     """Resolve manually added ID-scoped files back to their workspace."""
-    folder_id = artifact_folder_id_from_storage_path(rel_path)
+    folder_id = artifact_folder_id_from_entity_storage_path(rel_path)
     if not entity_id or not folder_id:
         return None
     from packages.core.database import async_session
@@ -190,29 +202,53 @@ async def ensure_workspace_document_folder(
     entity_id: str,
     workspace_id: str,
     rel_path: str,
+    db: AsyncSession | None = None,
 ) -> str | None:
-    """Project a physical workspace file into its logical folder tree."""
+    """Project a workspace file or document into its logical folder tree."""
     if not entity_id or not workspace_id:
         return None
+    if db is not None:
+        return await _ensure_workspace_document_folder_in_session(
+            db,
+            entity_id=entity_id,
+            workspace_id=workspace_id,
+            rel_path=rel_path,
+        )
     from packages.core.database import async_session
 
     async with async_session() as db:
-        workspace = (await db.execute(
-            select(Workspace).where(
-                Workspace.id == workspace_id,
-                Workspace.entity_id == entity_id,
-                Workspace.deleted_at.is_(None),
-            ).with_for_update().limit(1)
-        )).scalar_one_or_none()
-        if workspace is None:
-            return None
-        root = await ensure_workspace_artifact_folder(db, workspace)
-        parent_id = root.id
-        for name in _artifact_relative_directory_parts(rel_path, root.id):
-            child = await _ensure_folder(db, entity_id=entity_id, name=name, parent_id=parent_id)
-            parent_id = child.id
+        parent_id = await _ensure_workspace_document_folder_in_session(
+            db,
+            entity_id=entity_id,
+            workspace_id=workspace_id,
+            rel_path=rel_path,
+        )
         await db.commit()
         return parent_id
+
+
+async def _ensure_workspace_document_folder_in_session(
+    db: AsyncSession,
+    *,
+    entity_id: str,
+    workspace_id: str,
+    rel_path: str,
+) -> str | None:
+    workspace = (await db.execute(
+        select(Workspace).where(
+            Workspace.id == workspace_id,
+            Workspace.entity_id == entity_id,
+            Workspace.deleted_at.is_(None),
+        ).with_for_update().limit(1)
+    )).scalar_one_or_none()
+    if workspace is None:
+        return None
+    root = await ensure_workspace_artifact_folder(db, workspace)
+    parent_id = root.id
+    for name in _artifact_relative_directory_parts(rel_path, root.id):
+        child = await _ensure_folder(db, entity_id=entity_id, name=name, parent_id=parent_id)
+        parent_id = child.id
+    return parent_id
 
 
 async def ensure_workspace_artifact_directory(
@@ -261,6 +297,53 @@ async def ensure_workspace_artifact_directory(
         )
         return WorkspaceArtifactDirectory(
             folder_id=parent_id,
+            storage_path=storage_path,
+            display_path=display_path,
+        )
+
+
+async def resolve_workspace_artifact_directory(
+    *,
+    entity_id: str,
+    workspace_id: str,
+    directory_path: str,
+) -> WorkspaceArtifactDirectory:
+    """Resolve an existing Workspace artifact path without creating anything.
+
+    Read-only ledger queries use this resolver so an absent ledger does not
+    create a Knowledge folder or mutate the Workspace artifact mapping.
+    """
+    if not entity_id or not workspace_id:
+        raise ValueError("entity_id and workspace_id are required")
+    from packages.core.database import async_session
+
+    async with async_session() as db:
+        workspace = (await db.execute(
+            select(Workspace).where(
+                Workspace.id == workspace_id,
+                Workspace.entity_id == entity_id,
+                Workspace.deleted_at.is_(None),
+            ).limit(1)
+        )).scalar_one_or_none()
+        if workspace is None or not workspace.artifact_folder_id:
+            raise ValueError("Workspace artifact directory is not initialized")
+        folder_id = str(workspace.artifact_folder_id)
+        relative_parts = _artifact_relative_directory_parts(
+            f"{directory_path}/.artifact",
+            folder_id,
+        )
+        storage_path = "/".join(
+            part
+            for part in (workspace_artifact_storage_base(folder_id), *relative_parts)
+            if part
+        )
+        display_path = "/".join(
+            part
+            for part in (workspace_artifact_display_base(workspace.name), *relative_parts)
+            if part
+        )
+        return WorkspaceArtifactDirectory(
+            folder_id=folder_id,
             storage_path=storage_path,
             display_path=display_path,
         )

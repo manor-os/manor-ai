@@ -166,6 +166,32 @@ test("ShareDialog exposes an internal-visibility switcher hook", () => {
   assert.match(shareDialogSource, /permissions\.share\.visibility_readonly_hint/);
 });
 
+test("General access sends the selected external-link expiry", async () => {
+  assert.match(shareDialogSource, /const \[externalExpiryDays, setExternalExpiryDays\] = useState/);
+  assert.match(shareDialogSource, /expires_in_days: externalExpiryDays/);
+  assert.doesNotMatch(shareDialogSource, /expires_in_days:\s*7/);
+  assert.match(shareDialogSource, /function _externalExpiryOptions\(\)/);
+  for (const value of ["1", "7", "30", "90", "never"]) {
+    assert.match(shareDialogSource, new RegExp(`value: "${value}"`));
+  }
+  for (const locale of ["en", "zh", "es"]) {
+    const source = await readFile(
+      new URL(`../src/lib/i18n/${locale}.ts`, import.meta.url),
+      "utf8",
+    );
+    for (const key of [
+      "permissions.share.link_expiry_label",
+      "permissions.share.link_expiry.one_day",
+      "permissions.share.link_expiry.seven_days",
+      "permissions.share.link_expiry.thirty_days",
+      "permissions.share.link_expiry.ninety_days",
+      "permissions.share.link_expiry.never",
+    ]) {
+      assert.ok(source.includes(`"${key}"`), `${locale}.ts missing ${key}`);
+    }
+  }
+});
+
 test("both knowledge containers and FileViewer wire the visibility switcher", async () => {
   const knowledge = await readFile(
     new URL("../src/pages/Knowledge.tsx", import.meta.url),

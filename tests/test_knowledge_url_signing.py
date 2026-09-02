@@ -58,6 +58,17 @@ def test_token_round_trips_for_same_entity():
     assert payload["path"] == "Photos/foo.jpg"
 
 
+def test_actor_bound_signing_preserves_user_claim():
+    [url] = paths_to_signed_urls(
+        ["/Photos/foo.jpg"],
+        entity_id="ent-A",
+        user_id="user-123",
+    )
+    payload = verify_file_access_token(_token_in(url))
+    assert payload is not None
+    assert payload["user_id"] == "user-123"
+
+
 def test_tampered_entity_claim_breaks_hmac():
     """If you re-mint the inner payload to claim entity-B, the HMAC
     computed over the original payload no longer matches — the
@@ -136,7 +147,7 @@ def test_http_urls_pass_through_unchanged():
     assert out[0] == "https://example.com/cat.jpg"
     assert out[1] == "http://cdn.example.org/dog.png"
     # Third one is signed
-    assert out[2].startswith("http://api:8000/api/v1/fs/public/")
+    assert out[2].startswith("http://manor-api:8000/api/v1/fs/public/")
 
 
 def test_local_fs_url_converts_to_signed_knowledge_path():

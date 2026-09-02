@@ -42,7 +42,7 @@ test("EmbeddedChat does not clear or refetch the conversation it is streaming", 
 
 test("FloatingChat session switching leaves a live stream's transcript alone", () => {
   const fn = floatingSource.slice(
-    floatingSource.indexOf("const handleSwitchSession = (convId: string) => {"),
+    floatingSource.indexOf("const handleSwitchSession = async (convId: string) => {"),
     floatingSource.indexOf("/* ---- HITL action handler ---- */"),
   );
   assert.ok(fn.includes("streamState.getSessionKeyForConversation(convId)"));

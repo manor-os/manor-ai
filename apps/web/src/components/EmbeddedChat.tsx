@@ -1,4 +1,6 @@
 import {
+  lazy,
+  Suspense,
   useState,
   useRef,
   useEffect,
@@ -16,6 +18,7 @@ import {
   type BlueprintDetail,
   type BlueprintCoverTemplate,
   type GlobalChatFlowEntrypoint,
+  fetchProtectedFsResponse,
   isLocalFsUrl,
   resolveDisplayMediaUrl,
 } from "../lib/api";
@@ -25,8 +28,11 @@ import {
   type ChatMessage,
   type ChatStreamSnapshot,
   type HITLRequest,
+  type ResponseSurfaceSubmissionReceipt,
+  type ResponseSurfaceSubmissionResult,
   type SubAgentEvent,
   type ToolCall,
+  formatRuntimeQueueStatus,
   isInternalFilePermissionMessage,
   isRedundantApprovalResolutionReceipt,
   isTerminalStreamSnapshot,
@@ -34,37 +40,67 @@ import {
   hasActivePersistedChatStream,
   mergeChatStreamSnapshot,
   mergeResolvedWorkflowMessage,
+  normalizeWorkspaceRecommendation,
   parseToolCalls,
   pendingHITLIds,
   resolveGlobalWorkflowMessageAction,
   streamSnapshotNeedsHistory,
 } from "../lib/chatStream";
+import {
+  collectResponseSurfaceSubmissionFailureMessageIds,
+  collectResponseSurfaceSubmissionReceipts,
+  isResponseSurfaceSubmissionMessage,
+  rollbackResponseSurfaceSubmissionMessages,
+  settleResponseSurfaceSubmissionFailure,
+  responseSurfaceSubmissionMessage,
+  responseSurfaceSubmissionMeta,
+} from "../lib/responseSurface";
 import { chatMessageAnchorId } from "../lib/chatMessageAnchor";
 import { createdChatResourceReferences } from "../lib/chatResourceReferences";
 import { invalidateKnowledgeQueries } from "../lib/knowledgeInvalidation";
-import { sanitizeDocumentHtml } from "../lib/sanitizeDocumentHtml";
+import { sanitizeDocumentHtml, sanitizeManorDocumentRender } from "../lib/sanitizeDocumentHtml";
+import {
+  paginateManorDocument,
+  renderManorDocument,
+  type ManorDocumentRender,
+} from "../lib/manorDocumentEngine";
+import { useIsolatedHtmlPreview } from "../lib/useIsolatedHtmlPreview";
 import { usePreviewFeatureAccess } from "../lib/previewFeatureAccess";
-import { hasLocallyStreamedConversation, useChatStreamStore } from "../stores/chatStream";
+import {
+  ChatStreamCompletionStatus,
+  hasLocallyStreamedConversation,
+  shouldIgnoreLocallyStoppedStreamUpdate,
+  useChatStreamStore,
+} from "../stores/chatStream";
 import { useAuthStore } from "../stores/auth";
 import { useToastStore } from "../stores/toast";
 import type { Agent, Document, UserSummary, Workspace } from "../lib/types";
 import ChatMarkdown from "./ChatMarkdown";
 import WorkflowResultCard from "./WorkflowResultCard";
 import CreatedResourceCard from "./CreatedResourceCard";
-import AssistantMessageBlocks from "./AssistantMessageBlocks";
+import AssistantMessageBlocks, {
+  assistantPendingActionKindForMessage,
+} from "./AssistantMessageBlocks";
 import ChatMessageActions, {
+  chatMessageActionText,
   type ChatMessageFeedbackRating,
   displayContentForAssistantMessage,
   isRetryableAssistantMessage,
 } from "./chat/ChatMessageActions";
+import useChatMessageFeedback from "./chat/useChatMessageFeedback";
 import ChatTimestamp from "./chat/ChatTimestamp";
 import CollapsibleSentMessage from "./chat/CollapsibleSentMessage";
 import ChatScrollRail, {
   type ChatScrollRailMarker,
 } from "./chat/ChatScrollRail";
+import {
+  buildChatScrollRailTurnMarkers,
+  type ChatScrollRailTurnSource,
+} from "./chat/chatScrollRailTurns";
 import ManorAvatar from "./ui/ManorAvatar";
 import AgentActivityOrb, { inferAgentActivity } from "./ui/AgentActivityOrb";
 import ThemeAwareImage from "./ui/ThemeAwareImage";
+import WorkspaceIntroDialog from "./workspaces/WorkspaceIntroDialog";
 import UserAvatar from "./ui/UserAvatar";
 import ChatActionCard, { ApprovalSummary } from "./ui/ChatActionCard";
 import ApprovalActionBar from "./ui/ApprovalActionBar";
@@ -77,7 +113,12 @@ import CreditLimitNotice from "./ui/CreditLimitNotice";
 import Button from "./ui/Button";
 import EmptyState from "./ui/EmptyState";
 import LoadingSpinner from "./ui/LoadingSpinner";
+import IsolatedHtmlPreviewFrame from "./ui/IsolatedHtmlPreviewFrame";
 import Modal from "./ui/Modal";
+import ResizablePaneGroup from "./ui/ResizablePaneGroup";
+import WorkspaceDraftConfigurationPanel from "./WorkspaceDraftConfigurationPanel";
+import WorkspaceRecommendationCard from "./WorkspaceRecommendationCard";
+import useWorkspaceRecommendationActions from "./useWorkspaceRecommendationActions";
 import {
   buildTemplateRemixPrompt,
   uploadTemplateRemixSource,
@@ -114,10 +155,13 @@ import {
   type ChatModePayload,
 } from "./ChatModeBriefPanel";
 import {
+  CHAT_MESSAGE_REFERENCE_CARD_LIMIT,
+  type ChatMessageDisplayProjectionOptions,
   type ChatMessageDisplayReference,
   ChatMessageMetaChips,
   ChatMessageReferenceStrip,
   parseUserMessageDisplay,
+  renderedChatMessageMarkdownForFileDedupe,
   resolveChatMessageReferenceDocument,
 } from "./ChatMessageDisplay";
 import {
@@ -126,15 +170,36 @@ import {
   type PendingChatRetry,
 } from "../lib/chatRetry";
 import {
+  manualSkillReferences,
+  resolveManualSkillReferenceIds,
+} from "../lib/manualSkillRefs";
+import {
+  extractPlatformFileReferences,
+  explicitDiagramIdentityOverridesGenericJson,
+  filterGeneratedFileRecordsAlreadyLinkedInMarkdown,
+  filterGeneratedFileRecordsAlreadyRepresented,
+  fileReferenceKind,
+  generatedFileFsPath,
+  generatedFileOpenReference,
+} from "../lib/fileReferences";
+import {
+  assertDiagramPreviewFileSize,
+  diagramPreviewTextFromFsRead,
+  readDiagramPreviewText,
+} from "../lib/diagram/previewLimits";
+import {
   INSERT_CHAT_COMPOSER_EVENT,
   type InsertChatComposerDetail,
 } from "../lib/selectionActions";
+
+const LazyDiagramArtifactViewer = lazy(() => import("./diagram/DiagramArtifactViewer"));
 
 function maybeLocalCodingRunNoticeForTools(_tools: ToolCall[]): string | null {
   return null;
 }
 import {
   IconCheckCircle,
+  IconChevronLeft,
   IconChevronRight,
   IconDownload,
   IconFlow,
@@ -148,12 +213,13 @@ import { useChatAutoFollow } from "../lib/useChatAutoFollow";
 import { isCodeLikeFile } from "../lib/codeFiles";
 import { parseDelimitedText } from "../lib/delimitedText";
 import {
-  spreadsheetChartsFromFile,
+  spreadsheetCellVisualStyle,
   spreadsheetMergeAt,
-  spreadsheetSheetsFromWorkbook,
+  spreadsheetSheetsFromFile,
   type SpreadsheetSheetModel,
 } from "../lib/spreadsheetOoxml";
 import SpreadsheetChartPreview from "./SpreadsheetChartPreview";
+import SpreadsheetImageLayer from "./SpreadsheetImageLayer";
 import {
   pickRandomSoloBusinessIdeas,
   soloBusinessIdeaExecutionKey,
@@ -206,6 +272,7 @@ interface EmbeddedChatProps {
   agentId?: string; // DM agent ID — ensures tools/prompt are resolved correctly
   onConversationResolved?: (conversationId: string) => void;
   onNewConversation?: () => void;
+  showWorkspaceIntro?: boolean;
 }
 
 type ExecutionStatus =
@@ -229,6 +296,12 @@ type ArtifactFileCategory =
   | "xlsx"
   | "diagram"
   | "unsupported";
+type ArtifactDocumentPage = {
+  index: number;
+  url: string;
+  width: number | null;
+  height: number | null;
+};
 type WorkspaceCapability =
   | "workspace"
   | "slides"
@@ -301,7 +374,7 @@ type IdeaQuickActionRequest = {
 /*
  * The empty chat pre-focuses the "new idea" rail card purely for looks. That
  * focus must never be mistaken for the user asking for the idea skill: the
- * server treats any client-supplied manual skill id as an explicit selection
+ * server treats any client-supplied manual Skill reference as an explicit selection
  * and force-invokes it in round 1, before the model gets to reason. So the
  * composer records WHO chose the mode, and only a deliberate gesture ("user")
  * is allowed to attach a built-in skill to the send.
@@ -316,11 +389,21 @@ const IDEA_BUILT_IN_SKILLS: Record<IdeaQuickAction["id"], ManualSkillItem> = {
     id: "solo-business-idea-finder",
     name: "solo-business-idea-finder",
     slug: "solo-business-idea-finder",
+    reference: {
+      kind: "slug",
+      value: "solo-business-idea-finder",
+      source: "builtin",
+    },
   },
   "validate-idea": {
     id: "solo-business-idea-review",
     name: "solo-business-idea-review",
     slug: "solo-business-idea-review",
+    reference: {
+      kind: "slug",
+      value: "solo-business-idea-review",
+      source: "builtin",
+    },
   },
 };
 
@@ -3168,9 +3251,14 @@ function artifactFromMessageReference(
   refItem: ChatMessageDisplayReference,
   doc?: Document | null,
 ): OutputArtifact {
-  const documentId = doc?.id || refItem.id || undefined;
+  const documentId = doc?.id || refItem.document_id || undefined;
   const title = doc?.name || refItem.name;
-  const directUrl = refItem.openUrl || refItem.url || refItem.fsPath;
+  const directUrl = generatedFileOpenReference({
+    document_id: documentId,
+    open_url: refItem.openUrl,
+    result_url: refItem.url || refItem.previewUrl,
+    fs_path: refItem.fsPath,
+  }) || undefined;
   return {
     id: `chat-reference-${documentId || refItem.key}`,
     kind: referenceArtifactKind(refItem, doc),
@@ -3242,7 +3330,7 @@ function buildMessageInlineParts(
           kind: "attachment",
           token,
           attachment,
-          key: `attachment-${attachment.id || attachment.name}-${index}-${count}`,
+          key: `attachment-${attachment.document_id || attachment.name}-${index}-${count}`,
         },
       });
       start = content.indexOf(token, start + token.length);
@@ -3313,7 +3401,7 @@ function UserMessageContent({
                         name={part.mention.name}
                         avatarUrl={part.mention.avatarUrl}
                         type={part.mention.type}
-                        seed={part.mention.id}
+                        seed={part.mention.avatarSeed || part.mention.id}
                         size={18}
                       />
                     </span>
@@ -5419,12 +5507,20 @@ function WorkspaceWelcome({
   );
 }
 
+function isDiagramArtifactReference(value?: unknown) {
+  const path = String(value || "").split(/[?#]/)[0].trim().toLowerCase();
+  return (
+    path.endsWith(".diagram.json") ||
+    /\.(mmd|mermaid|drawio|diagram)$/.test(path)
+  );
+}
+
 function inferArtifactKindFromPath(path: string): OutputArtifact["kind"] {
   const lowerPath = path.toLowerCase();
   if (lowerPath.match(/\.(ppt|pptx)$/)) return "presentation";
   if (lowerPath.match(/\.(pdf)$/)) return "pdf";
   if (lowerPath.match(/\.(xlsx|xls|csv)$/)) return "spreadsheet";
-  if (lowerPath.match(/\.(mmd|mermaid|drawio|diagram)$/)) return "diagram";
+  if (isDiagramArtifactReference(lowerPath)) return "diagram";
   if (lowerPath.match(/\.(png|jpg|jpeg|webp|gif|svg)$/)) return "image";
   if (lowerPath.match(/\.(mp4|mov|webm|m4v)$/)) return "video";
   if (lowerPath.match(/\.(mp3|wav|m4a|aac|ogg|flac)$/)) return "audio";
@@ -5603,14 +5699,29 @@ function looksLikeCodeDraftContent(content: string) {
 function detectArtifactFileCategory(
   doc: Pick<Document, "name" | "mime_type" | "file_type">,
 ): ArtifactFileCategory {
-  const ext = (doc.name || "").split(".").pop()?.toLowerCase() || "";
-  const mime = doc.mime_type || doc.file_type || "";
+  const fileType = String(doc.file_type || "")
+    .trim()
+    .toLowerCase()
+    .replace(/^\./, "");
+  const persistedKind = fileType ? fileReferenceKind("", undefined, fileType) : "file";
+  const ext = persistedKind !== "file" ? fileType : (
+    (doc.name || "").split(".").pop()?.toLowerCase() || ""
+  );
+  const mime = persistedKind !== "file" ? "" : doc.mime_type || "";
 
+  if (fileReferenceKind(doc.name || "", doc.mime_type, doc.file_type) === "diagram") {
+    return "diagram";
+  }
   if (["md", "markdown"].includes(ext)) return "markdown";
   if (["html", "htm"].includes(ext) || mime === "text/html") return "html";
   if (["json"].includes(ext) || mime === "application/json") return "json";
   if (["csv"].includes(ext) || mime === "text/csv") return "csv";
   if (["mmd", "mermaid", "drawio", "diagram"].includes(ext)) return "diagram";
+  if (persistedKind === "page") return "html";
+  if (persistedKind === "image") return "image";
+  if (persistedKind === "video") return "video";
+  if (persistedKind === "audio") return "audio";
+  if (persistedKind === "pdf") return "pdf";
   if (
     ["png", "jpg", "jpeg", "gif", "svg", "webp", "bmp", "ico"].includes(ext) ||
     mime.startsWith("image/")
@@ -5638,6 +5749,7 @@ function detectArtifactFileCategory(
     mime === "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
   )
     return "xlsx";
+  if (persistedKind === "code") return "code";
   if (isCodeLikeFile(doc))
     return "code";
   if (
@@ -5797,16 +5909,11 @@ function extractFileArtifactsFromText(
   content: string,
   idPrefix: string,
 ): OutputArtifact[] {
-  const matches = Array.from(
-    content.matchAll(
-      /([A-Za-z0-9_\-./\s\u4e00-\u9fff]+?\.(?:pptx?|pdf|docx?|xlsx?|csv|md|txt|rtf|html?|css|tsx?|jsx|py|sql|json|ya?ml|png|jpe?g|webp|gif|svg|mmd|mermaid|drawio|diagram|mp4|mov|webm|m4v|mp3|wav|m4a|aac|ogg|flac))/gi,
-    ),
-  );
+  const matches = extractPlatformFileReferences(content);
   const seen = new Set<string>();
   return matches.flatMap((match, index) => {
-    const raw = match[1].trim().replace(/^[`'"]|[`'"，。!！?？]+$/g, "");
+    const raw = match.trim();
     const name = fileNameFromPath(raw);
-    if (!isPlatformFilesystemUrl(raw)) return [];
     if (!name || seen.has(name)) return [];
     seen.add(name);
     return [
@@ -5849,7 +5956,12 @@ function normalizeArtifactPath(value?: string) {
   return String(value).trim().replace(/\\/g, "/").toLowerCase();
 }
 
-function artifactDedupKey(artifact: OutputArtifact) {
+export function artifactDedupKey(artifact: OutputArtifact) {
+  if (artifact.kind === "workspace" && artifact.data?.draft_id) {
+    return `workspace|draft:${String(artifact.data.draft_id)}`;
+  }
+  const documentId = String(artifact.data?.document_id || "").trim();
+  if (documentId) return `${artifact.kind}|document:${documentId}`;
   const href = normalizeArtifactPath(artifact.href);
   const body = normalizeArtifactPath(artifact.body);
   const meta = normalizeArtifactPath(artifact.meta);
@@ -5872,7 +5984,13 @@ function dedupeArtifacts(artifacts: OutputArtifact[]): OutputArtifact[] {
       const existingIndex = result.findIndex(
         (item) => artifactDedupKey(item) === key,
       );
-      if (
+      if (existingIndex >= 0 && artifact.kind === "workspace") {
+        result[existingIndex] = {
+          ...result[existingIndex],
+          ...artifact,
+          id: result[existingIndex].id,
+        };
+      } else if (
         existingIndex >= 0 &&
         !hasFriendlyArtifactTitle(result[existingIndex]) &&
         hasFriendlyArtifactTitle(artifact)
@@ -5932,10 +6050,7 @@ function hasFilesystemArtifactProof(artifact: OutputArtifact) {
   const data = artifact.data || {};
   if (
     artifact.href?.startsWith("/viewer/") ||
-    data.document_id ||
-    data.documentId ||
-    data.doc_id ||
-    (data.document && typeof data.document === "object" && data.document.id)
+    data.document_id
   ) {
     return true;
   }
@@ -6149,6 +6264,15 @@ function isApprovalBoilerplateContent(msg: ChatMessage) {
   return approvalPromptSignals(content);
 }
 
+export function assistantMessageRendersInlineFileSurfaces(
+  message: ChatMessage | undefined,
+  streaming: boolean,
+): boolean {
+  if (message?.role !== "assistant") return false;
+  if (message.stop_reason === "credit_exhausted") return false;
+  return streaming || !isApprovalBoilerplateContent(message);
+}
+
 function inferApprovalAction(content: unknown) {
   const lower = (toDisplayText(content) || "").toLowerCase();
   if (/删除|移除|delete|remove|trash/.test(lower)) return "delete";
@@ -6244,8 +6368,14 @@ function recordRequestsChatArtifact(record: any): boolean {
   return role === "final";
 }
 
+function parseArtifactToolResult(tool: ToolCall): any {
+  const preview = parseToolResultJson(tool.result);
+  if (preview && typeof preview === "object") return preview;
+  return parseToolResultJson(tool.rawResult ?? tool.result);
+}
+
 function toolResultRequestsChatArtifact(tool: ToolCall): boolean {
-  const parsed = parseToolResultJson(tool.result);
+  const parsed = parseArtifactToolResult(tool);
   return recordRequestsChatArtifact(parsed);
 }
 
@@ -6263,13 +6393,14 @@ function looksLikeLocalCodingAnswer(content: unknown) {
 
 function isWorkspaceDraftToolResult(tool: ToolCall) {
   const normalizedName = (tool.name || "").toLowerCase();
-  if (normalizedName !== "start_workspace_draft" && normalizedName !== "manor")
+  if (!["start_workspace_draft", "continue_workspace_draft", "manor"].includes(normalizedName))
     return false;
-  const parsed = parseToolResultJson(tool.result);
+  const parsed = parseArtifactToolResult(tool);
   return Boolean(
     parsed?.draft_id &&
-    typeof parsed?.deep_link === "string" &&
-    parsed.deep_link.includes("/workspaces/new?draft="),
+    (parsed?.artifact_kind === "workspace_draft" ||
+      (typeof parsed?.deep_link === "string" &&
+        parsed.deep_link.includes("/workspaces/new?draft="))),
   );
 }
 
@@ -6289,7 +6420,7 @@ function normalizeArtifactKind(kind?: unknown): OutputArtifact["kind"] | null {
   if (["xls", "xlsx", "csv", "spreadsheet", "sheet"].includes(value))
     return "spreadsheet";
   if (["pdf"].includes(value)) return "pdf";
-  if (["diagram", "mermaid", "mmd", "drawio"].includes(value))
+  if (["diagram", "diagram.json", "mermaid", "mmd", "drawio"].includes(value))
     return "diagram";
   if (["code", "source"].includes(value)) return "code";
   if (["html", "page", "website", "url"].includes(value)) return "page";
@@ -6308,11 +6439,38 @@ function artifactKindFromRecord(
   record: Record<string, any>,
   reference?: string,
 ): OutputArtifact["kind"] {
+  const diagramReferences = [
+    record.name,
+    record.filename,
+    record.fs_path,
+    record.file_path,
+    record.path,
+    record.output_path,
+    record.saved_to,
+    reference,
+  ];
+  const explicit = normalizeArtifactKind(
+    record.kind || record.type || record.category,
+  );
+  const persistedFileType = String(record.file_type || record.fileType || "").trim();
+  if (explicitDiagramIdentityOverridesGenericJson(persistedFileType, explicit)) {
+    return "diagram";
+  }
+  if (persistedFileType) {
+    const persistedFileKind = fileReferenceKind(
+      diagramReferences.find((value) => String(value || "").trim()) || "",
+      record.mime_type || record.mime,
+      persistedFileType,
+    );
+    if (persistedFileKind !== "file") {
+      if (persistedFileKind === "archive") return "file";
+      return persistedFileKind;
+    }
+  }
   if (record.html || record.component || record.preview_url || record.route)
     return "page";
-  const explicit = normalizeArtifactKind(
-    record.kind || record.type || record.category || record.file_type,
-  );
+  if (explicit && explicit !== "file") return explicit;
+  if (diagramReferences.some(isDiagramArtifactReference)) return "diagram";
   if (explicit) return explicit;
   const mime = String(record.mime_type || record.mime || "").toLowerCase();
   if (mime.startsWith("image/")) return "image";
@@ -6372,6 +6530,8 @@ function artifactFromRecord(
   if (!isTerminalArtifactRecord(merged)) return null;
 
   const href =
+    merged.open_url ||
+    merged.viewer_url ||
     merged.download_url ||
     merged.file_url ||
     merged.document_url ||
@@ -6392,18 +6552,17 @@ function artifactFromRecord(
     merged.primary ||
     undefined;
   const reference = String(path || href || merged.name || "").trim();
-  const documentId =
-    merged.document_id ||
-    (normalizeArtifactKind(merged.kind || merged.type) === "document"
-      ? merged.id
-      : undefined);
+  const documentId = String(merged.document_id || "").trim();
 
   if (!reference && !documentId) return null;
 
   const kind = artifactKindFromRecord(merged, reference);
-  const openHref = href || (documentId
-    ? `/viewer/${encodeURIComponent(String(documentId))}`
-    : undefined);
+  const openHref = generatedFileOpenReference({
+    ...merged,
+    document_id: documentId,
+    open_url: href,
+    fs_path: path,
+  }) || undefined;
   const title =
     merged.title ||
     merged.name ||
@@ -6491,7 +6650,7 @@ function ImageGenerationStatusCard() {
 }
 
 function parseToolResult(tool: ToolCall, id: string): OutputArtifact | null {
-  const rawResult: unknown = tool.result;
+  const rawResult: unknown = tool.rawResult ?? tool.result;
   const textResult = toDisplayText(rawResult) || "";
   if (!textResult || tool.status === "pending") return null;
   if (tool.status === "error") return null;
@@ -6500,20 +6659,18 @@ function parseToolResult(tool: ToolCall, id: string): OutputArtifact | null {
 
   const normalizedName = (tool.name || "").toLowerCase();
 
-  if (
-    parsed?.draft_id &&
-    typeof parsed?.deep_link === "string" &&
-    parsed.deep_link.includes("/workspaces/new?draft=")
-  ) {
+  if (parsed?.draft_id && (
+    parsed?.artifact_kind === "workspace_draft" ||
+    (typeof parsed?.deep_link === "string" && parsed.deep_link.includes("/workspaces/new?draft="))
+  )) {
     return {
       id,
       kind: "workspace",
-      title: parsed.title || "Workspace draft started",
+      title: parsed.title || "Workspace configuration",
       status: "done",
-      href: parsed.deep_link,
       body:
         parsed.assistant_reply ||
-        "Continue setting up this workspace in the guided draft flow.",
+        "Keep chatting to refine this Workspace.",
       data: parsed,
     };
   }
@@ -6681,7 +6838,7 @@ function parseToolResultArtifacts(
 ): OutputArtifact[] {
   if (tool.status === "pending" || tool.status === "error") return [];
 
-  const parsed = parseToolResultJson(tool.result);
+  const parsed = parseArtifactToolResult(tool);
   if (isSandboxSavedFileTool(tool) && !recordRequestsChatArtifact(parsed)) {
     return [];
   }
@@ -6850,16 +7007,26 @@ export function deriveMessageArtifacts(
   });
 
   msg.attachments?.forEach((attachment, attachmentIndex) => {
-    const documentId = String(attachment.id || "").trim();
+    const documentId = String(attachment.document_id || "").trim();
     const previewUrl = String(attachment.previewUrl || "").trim();
     const openUrl = String(attachment.openUrl || "").trim();
     const fsPath = String(attachment.fsPath || "").trim();
-    const reference = openUrl || previewUrl || fsPath || (documentId ? `/viewer/${encodeURIComponent(documentId)}` : "");
+    const reference = generatedFileOpenReference({
+      document_id: documentId,
+      open_url: openUrl,
+      result_url: previewUrl,
+      fs_path: fsPath,
+    });
     const name = String(attachment.name || "").trim();
     if (!name || !reference) return;
     artifacts.push({
       id: `message-attachment-${attachmentIndex}-${documentId || name}`,
-      kind: inferArtifactKindFromPath(name),
+      kind: artifactKindFromRecord({
+        name,
+        file_type: attachment.fileType,
+        type: attachment.type,
+        mime_type: attachment.mimeType,
+      }, name),
       title: friendlyGeneratedAssetTitle(name),
       status: "done",
       href: reference,
@@ -6910,6 +7077,83 @@ export function deriveMessageArtifacts(
     }
   }
   return primaryArtifacts(artifacts);
+}
+
+export function filterMessageArtifactsAlreadyRepresented(
+  message: ChatMessage | undefined,
+  artifacts: OutputArtifact[],
+  inlineFileSurfacesVisible = true,
+  projection: ChatMessageDisplayProjectionOptions = {},
+): OutputArtifact[] {
+  if (
+    message?.role !== "assistant"
+    || artifacts.length === 0
+    || !inlineFileSurfacesVisible
+  ) return artifacts;
+  const parsedDisplay = parseUserMessageDisplay(message, projection);
+  const renderedContent =
+    projection.renderedContent === undefined
+      ? parsedDisplay.cleanContent
+      : projection.renderedContent;
+  const markdown = renderedChatMessageMarkdownForFileDedupe(
+    message,
+    renderedContent,
+    Boolean(projection.streaming),
+  );
+  const recordByArtifact = new Map<OutputArtifact, Record<string, unknown>>();
+  artifacts.forEach((artifact) => {
+    if (!FILE_BACKED_ARTIFACT_KINDS.has(artifact.kind)) return;
+    const data = artifact.data || {};
+    recordByArtifact.set(artifact, {
+      ...data,
+      name: data.name || artifact.title,
+      artifact_url: artifact.href || data.artifact_url,
+      output_path: artifact.body || data.output_path,
+      output_url: artifact.meta || data.output_url,
+    });
+  });
+  const recordsNotLinkedInMarkdown =
+    filterGeneratedFileRecordsAlreadyLinkedInMarkdown(
+      markdown,
+      Array.from(recordByArtifact.values()),
+    );
+  const representedReferences = parsedDisplay.references
+    .slice(0, CHAT_MESSAGE_REFERENCE_CARD_LIMIT)
+    .map((reference) => ({
+      ...reference,
+      open_url: reference.openUrl,
+      result_url: reference.url || reference.previewUrl,
+      fs_path: reference.fsPath,
+    }));
+  const visibleRecords = new Set(
+    filterGeneratedFileRecordsAlreadyRepresented(
+      recordsNotLinkedInMarkdown,
+      representedReferences,
+    ),
+  );
+  return artifacts.filter((artifact) => {
+    const record = recordByArtifact.get(artifact);
+    return !record || visibleRecords.has(record);
+  });
+}
+
+export function keepLatestWorkspaceDraftArtifacts(
+  artifactGroups: OutputArtifact[][],
+): OutputArtifact[][] {
+  const latestMessageByDraft = new Map<string, number>();
+  artifactGroups.forEach((artifacts, messageIndex) => {
+    artifacts.forEach((artifact) => {
+      if (artifact.kind !== "workspace" || !artifact.data?.draft_id) return;
+      latestMessageByDraft.set(artifactDedupKey(artifact), messageIndex);
+    });
+  });
+
+  return artifactGroups.map((artifacts, messageIndex) =>
+    artifacts.filter((artifact) => {
+      if (artifact.kind !== "workspace" || !artifact.data?.draft_id) return true;
+      return latestMessageByDraft.get(artifactDedupKey(artifact)) === messageIndex;
+    }),
+  );
 }
 
 function ExecutionStatusDot({ status }: { status: ExecutionStatus }) {
@@ -7094,40 +7338,16 @@ function ArtifactThumb({ artifact }: { artifact: OutputArtifact }) {
 }
 
 function artifactDocumentId(artifact: OutputArtifact): string {
-  const data = artifact.data || {};
-  const nestedDocument =
-    data.document && typeof data.document === "object" ? data.document : null;
-  const dataLooksDocumentBacked = Boolean(
-    data.fs_path ||
-      data.file_path ||
-      data.file_type ||
-      data.mime_type ||
-      data.source,
-  );
-  const viewerDocumentId = [artifact.href, artifact.body, artifact.meta]
-    .map(documentIdFromViewerReference)
-    .find(Boolean);
-  const candidate =
-    data.document_id ||
-    nestedDocument?.id ||
-    (data.id && dataLooksDocumentBacked ? data.id : "") ||
-    viewerDocumentId;
-  return String(candidate || "").trim();
-}
-
-function documentIdFromViewerReference(value?: string): string {
-  const match = String(value || "").match(/(?:^|\/)viewer\/([^/?#]+)/i);
-  if (!match?.[1]) return "";
-  try {
-    return decodeURIComponent(match[1]);
-  } catch {
-    return match[1];
-  }
+  return String(artifact.data?.document_id || "").trim();
 }
 
 function artifactDownloadName(artifact: OutputArtifact, doc?: Document | null) {
+  const data = artifact.data || {};
   return (
     doc?.name ||
+    fileNameFromPath(
+      data.fs_path || data.file_path || data.path || data.saved_to || "",
+    ) ||
     fileNameFromPath(artifact.body) ||
     fileNameFromPath(artifact.meta) ||
     fileNameFromPath(artifact.href) ||
@@ -7201,26 +7421,13 @@ const artifactDocumentCache = new Map<
 >();
 const artifactDocumentInflight = new Map<string, Promise<Document | null>>();
 
-function artifactDocumentCacheKey(artifact: OutputArtifact) {
-  const documentId = artifactDocumentId(artifact);
-  if (documentId) return `id:${documentId}`;
-  return [
-    "lookup",
-    artifact.kind,
-    artifact.title,
-    artifact.body,
-    artifact.meta,
-    artifact.href,
-  ]
-    .filter(Boolean)
-    .join(":")
-    .toLowerCase();
-}
-
 async function findDocumentForArtifact(
   artifact: OutputArtifact,
 ): Promise<Document | null> {
-  const cacheKey = artifactDocumentCacheKey(artifact);
+  const documentId = artifactDocumentId(artifact);
+  if (!documentId) return null;
+
+  const cacheKey = `id:${documentId}`;
   const now = Date.now();
   const cached = artifactDocumentCache.get(cacheKey);
   if (cached && cached.expiresAt > now) return cached.document;
@@ -7229,77 +7436,7 @@ async function findDocumentForArtifact(
   const inflight = artifactDocumentInflight.get(cacheKey);
   if (inflight) return inflight;
 
-  const lookup = (async () => {
-    const explicitDocumentId = artifactDocumentId(artifact);
-    if (explicitDocumentId) {
-      try {
-        return await api.documents.get(explicitDocumentId);
-      } catch {
-        // Fall back to name/path search for older tool results.
-      }
-    }
-
-    const data = artifact.data || {};
-    const nestedDocument =
-      data.document && typeof data.document === "object"
-        ? (data.document as Record<string, any>)
-        : {};
-    const searchTerms = [
-      artifact.title,
-      fileNameFromPath(artifact.body),
-      fileNameFromPath(artifact.meta),
-      fileNameFromPath(artifact.href),
-      data.name,
-      data.filename,
-      data.title,
-      data.fs_path,
-      data.file_path,
-      data.path,
-      data.output_path,
-      data.saved_to,
-      data.primary,
-      data.download_url,
-      data.file_url,
-      data.image_url,
-      data.video_url,
-      data.audio_url,
-      data.preview_url,
-      nestedDocument.name,
-      nestedDocument.fs_path,
-      nestedDocument.file_path,
-      artifact.body,
-      artifact.meta,
-      artifact.href,
-    ]
-      .map((term) => String(term || "").trim())
-      .filter(Boolean);
-
-    const seen = new Set<string>();
-    for (const term of searchTerms) {
-      const normalizedTerm =
-        fileNameFromPath(term).toLowerCase() || term.toLowerCase();
-      if (!normalizedTerm || seen.has(normalizedTerm)) continue;
-      seen.add(normalizedTerm);
-
-      const docs = await api.documents.list({
-        search: normalizedTerm,
-        limit: 10,
-      });
-      const exact = docs.items.find(
-        (doc) => doc.name.toLowerCase() === normalizedTerm,
-      );
-      const contains = docs.items.find((doc) => {
-        const docName = doc.name.toLowerCase();
-        return (
-          normalizedTerm.includes(docName) || docName.includes(normalizedTerm)
-        );
-      });
-      if (exact || contains || docs.items[0])
-        return exact || contains || docs.items[0];
-    }
-
-    return null;
-  })();
+  const lookup = api.documents.get(documentId).catch(() => null);
 
   artifactDocumentInflight.set(cacheKey, lookup);
   try {
@@ -7309,7 +7446,6 @@ async function findDocumentForArtifact(
       expiresAt: Date.now() + ARTIFACT_DOCUMENT_CACHE_TTL_MS,
     };
     artifactDocumentCache.set(cacheKey, entry);
-    if (document) artifactDocumentCache.set(`id:${document.id}`, entry);
     if (artifactDocumentCache.size > 200) {
       const expiredAt = Date.now();
       for (const [key, value] of artifactDocumentCache) {
@@ -7338,9 +7474,7 @@ async function downloadArtifact(artifact: OutputArtifact) {
     artifact.href ||
     (isLocalFsUrl(artifact.body) ? artifact.body : "") ||
     (isLocalFsUrl(artifact.meta) ? artifact.meta : "");
-  if (!directUrl) return;
-
-  if (isLocalFsUrl(directUrl)) {
+  if (directUrl && isLocalFsUrl(directUrl)) {
     const resolved = await resolveDisplayMediaUrl(directUrl);
     triggerBrowserDownload(
       resolved.url,
@@ -7350,7 +7484,288 @@ async function downloadArtifact(artifact: OutputArtifact) {
     return;
   }
 
+  const fsPath =
+    generatedFileFsPath(artifact.data) ||
+    generatedFileFsPath({ fs_path: artifact.href }) ||
+    generatedFileFsPath({ fs_path: artifact.body }) ||
+    generatedFileFsPath({ fs_path: artifact.meta });
+  if (fsPath) {
+    const entityId = useAuthStore.getState().user?.entity_id;
+    if (!entityId) throw new Error("Artifact download requires an active entity");
+    const encodedPath = fsPath
+      .split("/")
+      .map((segment) => encodeURIComponent(segment))
+      .join("/");
+    const response = await fetchProtectedFsResponse(
+      `/api/v1/fs/${encodeURIComponent(entityId)}/${encodedPath}`,
+    );
+    const blob = await response.blob();
+    const url = URL.createObjectURL(blob);
+    triggerBrowserDownload(url, artifactDownloadName(artifact), () =>
+      URL.revokeObjectURL(url),
+    );
+    return;
+  }
+
+  if (!directUrl) throw new Error("Artifact download source is unavailable");
   triggerBrowserDownload(directUrl, artifactDownloadName(artifact));
+}
+
+function withArtifactPreviewTimeout<T>(
+  promise: Promise<T>,
+  ms: number,
+  message: string,
+): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error(message)), ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => {
+    if (timer) clearTimeout(timer);
+  });
+}
+
+function PresentationArtifactCanvas({
+  url,
+  title,
+}: {
+  url: string;
+  title: string;
+}) {
+  const stageRef = useRef<HTMLDivElement | null>(null);
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const viewerRef = useRef<any>(null);
+  const resizeTimerRef = useRef<number | null>(null);
+  const renderGenerationRef = useRef(0);
+  const renderQueueRef = useRef<Promise<unknown>>(Promise.resolve());
+  const slideAspectRef = useRef(16 / 9);
+  const activeSlideRef = useRef(0);
+  const [slideCount, setSlideCount] = useState(0);
+  const [activeSlide, setActiveSlide] = useState(0);
+  const [loading, setLoading] = useState(true);
+  const [rendering, setRendering] = useState(false);
+  const [error, setError] = useState("");
+
+  const prepareCanvas = useCallback((aspect = slideAspectRef.current) => {
+    const canvas = canvasRef.current;
+    const stage = stageRef.current;
+    if (!canvas || !stage) return null;
+    const stageWidth = Math.max(1, stage.clientWidth);
+    const stageHeight = Math.max(1, stage.clientHeight);
+    const width = Math.max(
+      1,
+      Math.floor(Math.min(stageWidth, stageHeight * aspect)),
+    );
+    const height = Math.max(1, Math.round(width / aspect));
+    const pixelRatio = window.devicePixelRatio || 1;
+    canvas.style.width = `${width}px`;
+    canvas.style.height = `${height}px`;
+    canvas.width = Math.round(width * pixelRatio);
+    canvas.height = Math.round(height * pixelRatio);
+    return canvas;
+  }, []);
+
+  const renderSlide = useCallback(
+    async (slideIndex: number, announce = true) => {
+      const viewer = viewerRef.current;
+      if (!viewer) return;
+      if (announce && resizeTimerRef.current !== null) {
+        window.clearTimeout(resizeTimerRef.current);
+        resizeTimerRef.current = null;
+      }
+      activeSlideRef.current = slideIndex;
+      const generation = ++renderGenerationRef.current;
+      if (announce) setRendering(true);
+      const task = renderQueueRef.current.then(async () => {
+        if (
+          generation !== renderGenerationRef.current ||
+          viewerRef.current !== viewer
+        ) {
+          return false;
+        }
+        const canvas = prepareCanvas();
+        if (!canvas) return false;
+        await withArtifactPreviewTimeout(
+          viewer.renderSlide(slideIndex, canvas, { quality: "high" }),
+          20000,
+          "Presentation preview timed out",
+        );
+        return true;
+      });
+      renderQueueRef.current = task.catch(() => undefined);
+      try {
+        const rendered = await task;
+        if (
+          rendered &&
+          generation === renderGenerationRef.current &&
+          viewerRef.current === viewer
+        ) {
+          setActiveSlide(slideIndex);
+        }
+      } catch (previewError: any) {
+        if (
+          generation === renderGenerationRef.current &&
+          viewerRef.current === viewer
+        ) {
+          setError(
+            previewError?.message ||
+              t("component.embedded_chat.presentation_content_is_not_available_yet"),
+          );
+        }
+      } finally {
+        if (generation === renderGenerationRef.current) setRendering(false);
+      }
+    },
+    [prepareCanvas],
+  );
+
+  useEffect(() => {
+    let cancelled = false;
+    const fetchAbortController = new AbortController();
+
+    (async () => {
+      setLoading(true);
+      setError("");
+      setSlideCount(0);
+      setActiveSlide(0);
+      setRendering(false);
+      activeSlideRef.current = 0;
+      try {
+        const response = await fetch(url, {
+          signal: fetchAbortController.signal,
+        });
+        if (!response.ok) throw new Error("Presentation fetch failed");
+        const buffer = await response.arrayBuffer();
+        if (cancelled || !canvasRef.current) return;
+        const { PPTXViewer } = await import("pptxviewjs");
+        if (cancelled || !canvasRef.current) return;
+        const viewer = new PPTXViewer({
+          canvas: canvasRef.current,
+          backgroundColor: "#ffffff",
+          slideSizeMode: "fit",
+        });
+        viewerRef.current = viewer;
+        try {
+          await withArtifactPreviewTimeout(
+            viewer.loadFile(buffer),
+            20000,
+            "Presentation preview timed out",
+          );
+        } catch (previewError) {
+          if (viewerRef.current === viewer) {
+            viewerRef.current = null;
+            viewer.destroy();
+          }
+          throw previewError;
+        }
+        if (cancelled || viewerRef.current !== viewer) return;
+        const viewerInternals = viewer as any;
+        const slideSize =
+          viewerInternals?.processor?.getSlideDimensions?.() ||
+          viewerInternals?.presentation?.slideSize;
+        const rawAspect =
+          slideSize?.cx && slideSize?.cy
+            ? slideSize.cx / slideSize.cy
+            : 16 / 9;
+        slideAspectRef.current = Number.isFinite(rawAspect)
+          ? Math.min(4, Math.max(0.25, rawAspect))
+          : 16 / 9;
+        const total = viewer.getSlideCount();
+        setSlideCount(total);
+        if (total > 0) await renderSlide(0, false);
+      } catch (previewError: any) {
+        if (!cancelled) {
+          setError(
+            previewError?.message ||
+              t("component.embedded_chat.presentation_content_is_not_available_yet"),
+          );
+        }
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+      fetchAbortController.abort();
+      renderGenerationRef.current += 1;
+      if (resizeTimerRef.current !== null) {
+        window.clearTimeout(resizeTimerRef.current);
+        resizeTimerRef.current = null;
+      }
+      const viewer = viewerRef.current;
+      viewerRef.current = null;
+      viewer?.destroy();
+    };
+  }, [renderSlide, url]);
+
+  useEffect(() => {
+    const stage = stageRef.current;
+    if (!stage || loading) return undefined;
+    const observer = new ResizeObserver(() => {
+      if (!viewerRef.current) return;
+      if (resizeTimerRef.current !== null) {
+        window.clearTimeout(resizeTimerRef.current);
+      }
+      resizeTimerRef.current = window.setTimeout(() => {
+        resizeTimerRef.current = null;
+        void renderSlide(activeSlideRef.current, false);
+      }, 80);
+    });
+    observer.observe(stage);
+    return () => observer.disconnect();
+  }, [loading, renderSlide]);
+
+  if (error) {
+    return (
+      <div className="chat-output-file-missing">
+        <p>{t("component.embedded_chat.presentation_content_is_not_available_yet")}</p>
+        <span>{title}</span>
+      </div>
+    );
+  }
+
+  return (
+    <div className="chat-output-ppt-viewer chat-output-ppt-viewer--canvas">
+      <div ref={stageRef} className="chat-output-ppt-stage">
+        <canvas
+          ref={canvasRef}
+          role="img"
+          aria-label={`${title} — ${t("page.file_viewer.slide")} ${activeSlide + 1}`}
+        />
+        {loading && (
+          <div className="chat-output-ppt-canvas-loading">
+            <span className="chat-tool-spinner" />
+          </div>
+        )}
+      </div>
+      {slideCount > 1 && (
+        <div className="chat-output-ppt-navigation">
+          <button
+            type="button"
+            onClick={() => void renderSlide(Math.max(0, activeSlide - 1))}
+            disabled={activeSlide === 0 || rendering}
+            aria-label={t("page.doc_editor.previous_slide")}
+          >
+            <IconChevronLeft size={16} />
+          </button>
+          <span aria-live="polite">
+            {t("page.file_viewer.slide")} {activeSlide + 1} {t("page.file_viewer.of")} {slideCount}
+          </span>
+          <button
+            type="button"
+            onClick={() =>
+              void renderSlide(Math.min(slideCount - 1, activeSlide + 1))
+            }
+            disabled={activeSlide === slideCount - 1 || rendering}
+            aria-label={t("page.doc_editor.next_slide")}
+          >
+            <IconChevronRight size={16} />
+          </button>
+        </div>
+      )}
+    </div>
+  );
 }
 
 function PresentationArtifactViewer({
@@ -7358,43 +7773,84 @@ function PresentationArtifactViewer({
 }: {
   artifact: OutputArtifact;
 }) {
-  const [docId, setDocId] = useState<string | null>(null);
   const [slideUrls, setSlideUrls] = useState<string[]>([]);
+  const [canvasUrl, setCanvasUrl] = useState<string | null>(null);
   const [activeSlide, setActiveSlide] = useState(0);
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
     let cancelled = false;
-    const objectUrls: string[] = [];
+    const previewAbortController = new AbortController();
+    let objectUrls: string[] = [];
+    const trackObjectUrl = (url: string) => {
+      if (cancelled) URL.revokeObjectURL(url);
+      else objectUrls.push(url);
+      return url;
+    };
+    const revokeTrackedObjectUrls = (urls: string[]) => {
+      urls.forEach((url) => {
+        const index = objectUrls.indexOf(url);
+        if (index < 0) return;
+        objectUrls.splice(index, 1);
+        URL.revokeObjectURL(url);
+      });
+    };
 
     async function loadPresentation() {
       setLoading(true);
       setSlideUrls([]);
+      setCanvasUrl(null);
       setActiveSlide(0);
       try {
         const doc = await findDocumentForArtifact(artifact);
         if (!doc || cancelled) return;
-        setDocId(doc.id);
 
         try {
-          const slideData = await api.documents.getSlides(doc.id);
+          const slideData = await withArtifactPreviewTimeout(
+            api.documents.getSlides(doc.id),
+            8000,
+            "Presentation preview timed out",
+          );
           const token = getAuthToken();
           const headers: Record<string, string> = {};
           if (token) headers.Authorization = `Bearer ${token}`;
-          const urls = await Promise.all(
+          const slideResults = await Promise.allSettled(
             (slideData.slides || []).map(async (slide) => {
-              const res = await fetch(`/api/v1${slide.url}`, { headers });
+              const res = await withArtifactPreviewTimeout(
+                fetch(`/api/v1${slide.url}`, {
+                  headers,
+                  signal: previewAbortController.signal,
+                }),
+                8000,
+                "Presentation preview timed out",
+              );
               if (!res.ok) throw new Error("Slide fetch failed");
               const blob = await res.blob();
-              const url = URL.createObjectURL(blob);
-              objectUrls.push(url);
-              return url;
+              return trackObjectUrl(URL.createObjectURL(blob));
             }),
           );
+          const urls = slideResults.flatMap((result) =>
+            result.status === "fulfilled" ? [result.value] : [],
+          );
+          const failedSlide = slideResults.find(
+            (result) => result.status === "rejected",
+          );
+          if (failedSlide?.status === "rejected") {
+            revokeTrackedObjectUrls(urls);
+            throw failedSlide.reason;
+          }
+          if (urls.length === 0) throw new Error("No rendered slides");
           if (!cancelled) setSlideUrls(urls);
         } catch {
-          // FileViewer fallback below still shows the real document.
+          previewAbortController.abort();
+          revokeTrackedObjectUrls([...objectUrls]);
+          if (cancelled) return;
+          const url = trackObjectUrl(await api.documents.preview(doc.id));
+          if (cancelled) return;
+          setCanvasUrl(url);
         }
+      } catch {
+        if (!cancelled) setCanvasUrl(null);
       } finally {
         if (!cancelled) setLoading(false);
       }
@@ -7403,9 +7859,18 @@ function PresentationArtifactViewer({
     loadPresentation();
     return () => {
       cancelled = true;
+      previewAbortController.abort();
       objectUrls.forEach((url) => URL.revokeObjectURL(url));
+      objectUrls = [];
     };
-  }, [artifact.title, artifact.body]);
+  }, [
+    artifact.body,
+    artifact.data,
+    artifact.href,
+    artifact.id,
+    artifact.meta,
+    artifact.title,
+  ]);
 
   if (loading) {
     return (
@@ -7442,12 +7907,8 @@ function PresentationArtifactViewer({
     );
   }
 
-  if (docId) {
-    return (
-      <div className="chat-output-file-frame">
-        <iframe title={artifact.title} src={`/viewer/${docId}`} />
-      </div>
-    );
+  if (canvasUrl) {
+    return <PresentationArtifactCanvas url={canvasUrl} title={artifact.title} />;
   }
 
   return (
@@ -7458,40 +7919,353 @@ function PresentationArtifactViewer({
   );
 }
 
+function formatJsonArtifactContent(content: string) {
+  try {
+    return JSON.stringify(JSON.parse(content), null, 2);
+  } catch {
+    return content;
+  }
+}
+
+const DOCX_PAGE_FETCH_CONCURRENCY = 3;
+
+async function loadDocxFallbackRender(
+  documentId: string,
+  signal?: AbortSignal,
+): Promise<ManorDocumentRender> {
+  const response = await api.documents.previewResponse(documentId, { signal });
+  const blob = await response.blob();
+  const buf = await blob.arrayBuffer();
+  const rendered = await renderManorDocument(buf);
+  const sanitizeOptions = {
+    allowDocxEditorAttributes: true,
+    allowDocxLayoutStyles: true,
+  };
+  return sanitizeManorDocumentRender(rendered, sanitizeOptions);
+}
+
+function DocxFallbackArtifactViewer({
+  artifact,
+  render,
+}: {
+  artifact: OutputArtifact;
+  render: ManorDocumentRender;
+}) {
+  const rootRef = useRef<HTMLDivElement | null>(null);
+
+  useLayoutEffect(() => {
+    const root = rootRef.current;
+    if (!root) return;
+    root.innerHTML = render.html;
+    paginateManorDocument(root, render);
+  }, [render]);
+
+  return (
+    <div
+      className="chat-output-docx-pages chat-output-docx-pages--native"
+      aria-label={artifact.title}
+    >
+      <div
+        ref={rootRef}
+        className="docx-viewer-page manor-docx-native manor-docx-readonly"
+        style={{
+          "--docx-page-width": `${render.layout.pageWidthPx}px`,
+          "--docx-page-height": `${render.layout.pageHeightPx}px`,
+          "--docx-margin-top": `${render.layout.marginTopPx}px`,
+          "--docx-margin-right": `${render.layout.marginRightPx}px`,
+          "--docx-margin-bottom": `${render.layout.marginBottomPx}px`,
+          "--docx-margin-left": `${render.layout.marginLeftPx}px`,
+          "--docx-header-distance": `${render.layout.headerDistancePx}px`,
+          "--docx-footer-distance": `${render.layout.footerDistancePx}px`,
+        } as CSSProperties}
+      />
+    </div>
+  );
+}
+
+function DocumentPageArtifactViewer({
+  artifact,
+  documentId,
+  pages,
+}: {
+  artifact: OutputArtifact;
+  documentId: string;
+  pages: ArtifactDocumentPage[];
+}) {
+  const rootRef = useRef<HTMLDivElement | null>(null);
+  const [pageUrls, setPageUrls] = useState<Record<number, string>>({});
+  const [fallbackRender, setFallbackRender] = useState<ManorDocumentRender | null>(null);
+  const [fallbackLoading, setFallbackLoading] = useState(false);
+  const [fallbackError, setFallbackError] = useState("");
+
+  useEffect(() => {
+    const root = rootRef.current;
+    if (!root) return;
+
+    let cancelled = false;
+    let fallbackStarted = false;
+    let activeFetches = 0;
+    const pageController = new AbortController();
+    const fallbackController = new AbortController();
+    const queued = new Set<number>();
+    const loaded = new Set<number>();
+    const queue: number[] = [];
+    const objectUrls = new Set<string>();
+    const pagesByIndex = new Map(pages.map((page) => [page.index, page]));
+    let observer: IntersectionObserver | null = null;
+
+    setPageUrls({});
+    setFallbackRender(null);
+    setFallbackLoading(false);
+    setFallbackError("");
+
+    const revokePageUrls = () => {
+      objectUrls.forEach((url) => URL.revokeObjectURL(url));
+      objectUrls.clear();
+    };
+
+    const startFallback = async (reason: unknown) => {
+      if (cancelled || fallbackStarted) return;
+      fallbackStarted = true;
+      observer?.disconnect();
+      pageController.abort();
+      revokePageUrls();
+      setPageUrls({});
+      setFallbackLoading(true);
+      try {
+        const render = await loadDocxFallbackRender(
+          documentId,
+          fallbackController.signal,
+        );
+        if (!cancelled) setFallbackRender(render);
+      } catch (error: any) {
+        if (!cancelled) {
+          setFallbackError(
+            error?.message || (reason instanceof Error ? reason.message : "File preview failed"),
+          );
+        }
+      } finally {
+        if (!cancelled) setFallbackLoading(false);
+      }
+    };
+
+    const pump = () => {
+      if (cancelled || fallbackStarted) return;
+      while (activeFetches < DOCX_PAGE_FETCH_CONCURRENCY && queue.length > 0) {
+        const pageIndex = queue.shift();
+        if (pageIndex === undefined) break;
+        queued.delete(pageIndex);
+        if (loaded.has(pageIndex)) continue;
+        const page = pagesByIndex.get(pageIndex);
+        if (!page) continue;
+        activeFetches += 1;
+        void (async () => {
+          try {
+            const token = getAuthToken();
+            const headers: Record<string, string> = {};
+            if (token) headers.Authorization = `Bearer ${token}`;
+            const response = await withArtifactPreviewTimeout(
+              fetch(`/api/v1${page.url}`, {
+                headers,
+                signal: pageController.signal,
+              }),
+              15_000,
+              "Word preview timed out",
+            );
+            if (!response.ok) throw new Error("Word page fetch failed");
+            const imageUrl = URL.createObjectURL(await response.blob());
+            if (cancelled || fallbackStarted) {
+              URL.revokeObjectURL(imageUrl);
+              return;
+            }
+            objectUrls.add(imageUrl);
+            loaded.add(pageIndex);
+            setPageUrls((current) => ({ ...current, [pageIndex]: imageUrl }));
+          } catch (error: any) {
+            if (error?.name !== "AbortError") void startFallback(error);
+          } finally {
+            activeFetches -= 1;
+            pump();
+          }
+        })();
+      }
+    };
+
+    const enqueue = (pageIndex: number) => {
+      if (
+        cancelled
+        || fallbackStarted
+        || loaded.has(pageIndex)
+        || queued.has(pageIndex)
+      ) return;
+      queued.add(pageIndex);
+      queue.push(pageIndex);
+      pump();
+    };
+
+    const pageElements = Array.from(
+      root.querySelectorAll<HTMLElement>("[data-docx-page-index]"),
+    );
+    if (typeof IntersectionObserver === "undefined") {
+      pages.forEach((page) => enqueue(page.index));
+    } else {
+      observer = new IntersectionObserver(
+        (entries) => {
+          entries.forEach((entry) => {
+            if (!entry.isIntersecting) return;
+            const pageIndex = Number(
+              (entry.target as HTMLElement).dataset.docxPageIndex,
+            );
+            if (Number.isInteger(pageIndex)) enqueue(pageIndex);
+          });
+        },
+        { root, rootMargin: "900px 0px" },
+      );
+      pageElements.forEach((element) => observer?.observe(element));
+    }
+
+    return () => {
+      cancelled = true;
+      observer?.disconnect();
+      pageController.abort();
+      fallbackController.abort();
+      revokePageUrls();
+    };
+  }, [documentId, pages]);
+
+  if (fallbackLoading) {
+    return (
+      <div className="chat-output-file-loading">
+        <span className="chat-tool-spinner" />
+        <p>{t("component.embedded_chat.loading_file_preview")}</p>
+      </div>
+    );
+  }
+
+  if (fallbackError) {
+    return (
+      <div className="chat-output-file-missing">
+        <p>{t("component.embedded_chat.file_preview_failed")}</p>
+        <span>{fallbackError}</span>
+      </div>
+    );
+  }
+
+  if (fallbackRender) {
+    return <DocxFallbackArtifactViewer artifact={artifact} render={fallbackRender} />;
+  }
+
+  return (
+    <div
+      ref={rootRef}
+      className="chat-output-docx-pages"
+      aria-label={artifact.title}
+    >
+      {pages.map((page) => {
+        const imageUrl = pageUrls[page.index];
+        return (
+          <figure
+            aria-busy={!imageUrl}
+            className="chat-output-docx-page"
+            data-docx-page-index={page.index}
+            key={`${page.index}:${page.url}`}
+            style={{
+              aspectRatio: page.width && page.height
+                ? `${page.width} / ${page.height}`
+                : "8.5 / 11",
+            }}
+          >
+            {imageUrl ? (
+              <img
+                src={imageUrl}
+                alt={`${artifact.title} — page ${page.index + 1}`}
+                draggable={false}
+              />
+            ) : (
+              <div className="chat-output-docx-page-loading" aria-hidden="true">
+                <span className="chat-tool-spinner" />
+              </div>
+            )}
+          </figure>
+        );
+      })}
+    </div>
+  );
+}
+
 function FileArtifactViewer({ artifact }: { artifact: OutputArtifact }) {
   const [category, setCategory] = useState<ArtifactFileCategory | null>(null);
   const [objectUrl, setObjectUrl] = useState<string | null>(null);
   const [content, setContent] = useState("");
-  const [docxHtml, setDocxHtml] = useState("");
+  const [docxRender, setDocxRender] = useState<ManorDocumentRender | null>(null);
+  const [docxPages, setDocxPages] = useState<ArtifactDocumentPage[]>([]);
+  const [docxDocumentId, setDocxDocumentId] = useState("");
   const [sheets, setSheets] = useState<SpreadsheetSheetModel[]>([]);
   const [activeSheet, setActiveSheet] = useState(0);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const directUrl = artifact.href || artifact.body || "";
+  const htmlPreview = useIsolatedHtmlPreview(
+    content,
+    category === "html" && Boolean(content),
+  );
 
   useEffect(() => {
     let cancelled = false;
     let createdObjectUrl: string | null = null;
+    const abortController = new AbortController();
+    const docxPageAbortController = new AbortController();
 
     async function loadFile() {
       setLoading(true);
       setCategory(null);
       setObjectUrl(null);
       setContent("");
-      setDocxHtml("");
+      setDocxRender(null);
+      setDocxPages([]);
+      setDocxDocumentId("");
       setSheets([]);
       setActiveSheet(0);
       setError("");
       try {
         const doc = await findDocumentForArtifact(artifact);
         if (!doc) {
-          const fallbackCategory = inferArtifactKindFromPath(
-            directUrl || artifact.title,
-          );
+          const fallbackCategory = artifact.kind === "diagram"
+            ? "diagram"
+            : inferArtifactKindFromPath(directUrl || artifact.title);
+          if (fallbackCategory === "diagram") {
+            let diagramSourceLoaded = false;
+            const fsPath = generatedFileFsPath(artifact.data)
+              || generatedFileFsPath({ fs_path: directUrl });
+            if (isLocalFsUrl(directUrl)) {
+              const response = await fetchProtectedFsResponse(directUrl, {
+                signal: abortController.signal,
+              });
+              const rawContent = await readDiagramPreviewText(response);
+              diagramSourceLoaded = true;
+              if (!cancelled) setContent(rawContent);
+            } else if (fsPath) {
+              const info = await api.fs.info(fsPath);
+              assertDiagramPreviewFileSize(info?.size);
+              const result = await api.fs.read(fsPath);
+              const rawContent = diagramPreviewTextFromFsRead(result);
+              diagramSourceLoaded = true;
+              if (!cancelled) setContent(rawContent);
+            }
+            if (!diagramSourceLoaded) {
+              throw new Error("Artifact preview source is unavailable");
+            }
+            if (!cancelled) setCategory("diagram");
+            return;
+          }
           if (isLocalFsUrl(directUrl)) {
             const resolved = await resolveDisplayMediaUrl(directUrl);
+            if (cancelled) {
+              resolved.revoke();
+              return;
+            }
             createdObjectUrl = resolved.url;
-            if (!cancelled) setObjectUrl(resolved.url);
+            setObjectUrl(resolved.url);
           }
           if (!cancelled)
             setCategory(
@@ -7501,9 +8275,20 @@ function FileArtifactViewer({ artifact }: { artifact: OutputArtifact }) {
             );
           return;
         }
+        if (cancelled) return;
 
         const nextCategory = detectArtifactFileCategory(doc);
         if (!cancelled) setCategory(nextCategory);
+
+        if (nextCategory === "diagram") {
+          assertDiagramPreviewFileSize(doc.file_size);
+          const response = await api.documents.previewResponse(doc.id, {
+            signal: abortController.signal,
+          });
+          const rawContent = await readDiagramPreviewText(response);
+          if (!cancelled) setContent(rawContent);
+          return;
+        }
 
         if (
           [
@@ -7513,7 +8298,6 @@ function FileArtifactViewer({ artifact }: { artifact: OutputArtifact }) {
             "html",
             "csv",
             "json",
-            "diagram",
           ].includes(nextCategory)
         ) {
           const res = await api.documents.getContent(doc.id);
@@ -7531,21 +8315,13 @@ function FileArtifactViewer({ artifact }: { artifact: OutputArtifact }) {
             nextCategory,
           )
         ) {
-          createdObjectUrl = await api.documents.download(doc.id);
-          if (!cancelled) setObjectUrl(createdObjectUrl);
-
-          if (nextCategory === "docx") {
-            const res = await fetch(createdObjectUrl);
-            const buf = await res.arrayBuffer();
-            const mammoth = await import("mammoth");
-            const result = await mammoth.convertToHtml({ arrayBuffer: buf });
-            if (!cancelled) setDocxHtml(sanitizeDocumentHtml(result.value));
-          }
-
           if (nextCategory === "xlsx") {
-            const res = await fetch(createdObjectUrl);
-            const buf = await res.arrayBuffer();
+            const blob = await api.documents.previewBlob(doc.id);
+            if (cancelled) return;
+            const buf = await blob.arrayBuffer();
+            if (cancelled) return;
             const XLSX = await import("xlsx");
+            if (cancelled) return;
             const wb = XLSX.read(buf, {
               type: "array",
               cellFormula: true,
@@ -7553,14 +8329,52 @@ function FileArtifactViewer({ artifact }: { artifact: OutputArtifact }) {
               cellStyles: true,
               cellText: true,
             });
-            const chartsBySheet = await spreadsheetChartsFromFile(buf, XLSX, wb);
-            const parsedSheets = spreadsheetSheetsFromWorkbook(XLSX, wb)
-              .map((sheet) => ({ ...sheet, charts: chartsBySheet.get(sheet.name) || [] }))
+            const parsed = await spreadsheetSheetsFromFile(XLSX, wb, buf);
+            if (cancelled) return;
+            const parsedSheets = parsed
               .filter((sheet) => !sheet.hidden && sheet.name !== "_manor_charts");
-            if (!cancelled) setSheets(parsedSheets);
+            setSheets(parsedSheets);
+            return;
           }
+
+          if (nextCategory === "docx") {
+            try {
+              const pageData = await api.documents.getPages(
+                doc.id,
+                docxPageAbortController.signal,
+              );
+              const pages = pageData.pages || [];
+              if (pages.length === 0) throw new Error("No rendered Word pages");
+              if (!cancelled) {
+                setDocxDocumentId(doc.id);
+                setDocxPages(pages);
+              }
+              return;
+            } catch {
+              if (cancelled) return;
+            }
+
+            const render = await loadDocxFallbackRender(
+              doc.id,
+              abortController.signal,
+            );
+            if (!cancelled) setDocxRender(render);
+            return;
+          }
+
+          const downloadedUrl = await api.documents.preview(doc.id);
+          if (cancelled) {
+            if (downloadedUrl.startsWith("blob:")) URL.revokeObjectURL(downloadedUrl);
+            return;
+          }
+          createdObjectUrl = downloadedUrl;
+          setObjectUrl(downloadedUrl);
         }
       } catch (err: any) {
+        if (createdObjectUrl?.startsWith("blob:")) {
+          URL.revokeObjectURL(createdObjectUrl);
+          createdObjectUrl = null;
+        }
         if (!cancelled) setError(err?.message || "File preview failed");
       } finally {
         if (!cancelled) setLoading(false);
@@ -7570,9 +8384,19 @@ function FileArtifactViewer({ artifact }: { artifact: OutputArtifact }) {
     loadFile();
     return () => {
       cancelled = true;
+      abortController.abort();
+      docxPageAbortController.abort();
       if (createdObjectUrl) URL.revokeObjectURL(createdObjectUrl);
     };
-  }, [artifact.title, artifact.body, artifact.meta, artifact.href]);
+  }, [
+    artifact.body,
+    artifact.data,
+    artifact.href,
+    artifact.id,
+    artifact.kind,
+    artifact.meta,
+    artifact.title,
+  ]);
 
   if (loading) {
     return (
@@ -7648,10 +8472,9 @@ function FileArtifactViewer({ artifact }: { artifact: OutputArtifact }) {
   if (category === "html" && content) {
     return (
       <div className="chat-output-render-frame chat-output-render-frame--raw">
-        <iframe
+        <IsolatedHtmlPreviewFrame
           title={artifact.title}
-          srcDoc={content}
-          sandbox="allow-scripts allow-same-origin"
+          preview={htmlPreview}
         />
       </div>
     );
@@ -7669,16 +8492,36 @@ function FileArtifactViewer({ artifact }: { artifact: OutputArtifact }) {
     );
   }
 
+  if (category === "diagram") {
+    return (
+      <Suspense
+        fallback={(
+          <div className="chat-output-file-loading">
+            <span className="chat-tool-spinner" />
+            <p>{t("component.embedded_chat.loading_file_preview")}</p>
+          </div>
+        )}
+      >
+        <LazyDiagramArtifactViewer
+          content={content}
+          title={artifact.title}
+          fileType={artifact.data?.file_type || artifact.data?.document?.file_type}
+        />
+      </Suspense>
+    );
+  }
+
   if (
     (category === "text" ||
       category === "code" ||
-      category === "json" ||
-      category === "diagram") &&
+      category === "json") &&
     content
   ) {
     return (
       <pre className="chat-output-code-block chat-output-code-block--light">
-        <code>{content}</code>
+        <code>
+          {category === "json" ? formatJsonArtifactContent(content) : content}
+        </code>
       </pre>
     );
   }
@@ -7706,13 +8549,18 @@ function FileArtifactViewer({ artifact }: { artifact: OutputArtifact }) {
     );
   }
 
-  if (category === "docx" && docxHtml) {
+  if (category === "docx" && docxDocumentId && docxPages.length > 0) {
     return (
-      <div
-        className="chat-output-docx"
-        dangerouslySetInnerHTML={{ __html: docxHtml }}
+      <DocumentPageArtifactViewer
+        artifact={artifact}
+        documentId={docxDocumentId}
+        pages={docxPages}
       />
     );
+  }
+
+  if (category === "docx" && docxRender) {
+    return <DocxFallbackArtifactViewer artifact={artifact} render={docxRender} />;
   }
 
   if (category === "xlsx" && sheets.length > 0) {
@@ -7734,6 +8582,7 @@ function FileArtifactViewer({ artifact }: { artifact: OutputArtifact }) {
           </div>
         )}
         <div className="chat-output-table-frame">
+          <div style={{ position: "relative", width: "max-content", minWidth: "100%" }}>
           <table style={{ width: "max-content", minWidth: "100%", tableLayout: "fixed" }}>
             <colgroup>
               <col style={{ width: 44 }} />
@@ -7766,14 +8615,10 @@ function FileArtifactViewer({ artifact }: { artifact: OutputArtifact }) {
                         colSpan={merge.columnSpan}
                         title={typeof raw === "string" && raw.startsWith("=") ? raw : undefined}
                         style={{
+                          ...(sheet.showGridlines === false ? { borderTop: "1px solid transparent", borderBottom: "1px solid transparent", borderLeft: "1px solid transparent", borderRight: "1px solid transparent" } : {}),
+                          ...spreadsheetCellVisualStyle(style),
                           color: style.color || "var(--text-default)",
                           background: style.fill || "var(--surface-panel)",
-                          fontWeight: style.bold ? 700 : 400,
-                          fontStyle: style.italic ? "italic" : "normal",
-                          fontFamily: style.fontFamily,
-                          fontSize: style.fontSize,
-                          textAlign: style.align,
-                          whiteSpace: "pre-wrap",
                           overflowWrap: "anywhere",
                         }}
                       >
@@ -7785,6 +8630,14 @@ function FileArtifactViewer({ artifact }: { artifact: OutputArtifact }) {
               ))}
             </tbody>
           </table>
+          <SpreadsheetImageLayer
+            images={sheet.images}
+            columnWidths={sheet.columnWidths}
+            rowHeights={sheet.rowHeights}
+            rowHeaderWidth={44}
+            columnHeaderHeight={35}
+          />
+          </div>
         </div>
         {sheet.charts.length > 0 && (
           <div style={{ marginTop: 12 }}>
@@ -7834,8 +8687,12 @@ function ArtifactEditAction({
     let cancelled = false;
     setDoc(null);
     (async () => {
-      const nextDoc = await findDocumentForArtifact(artifact);
-      if (!cancelled) setDoc(nextDoc);
+      try {
+        const nextDoc = await findDocumentForArtifact(artifact);
+        if (!cancelled) setDoc(nextDoc);
+      } catch {
+        if (!cancelled) setDoc(null);
+      }
     })();
     return () => {
       cancelled = true;
@@ -7873,7 +8730,13 @@ function ArtifactEditAction({
   );
 }
 
-export function ArtifactViewer({ artifact }: { artifact: OutputArtifact }) {
+export function ArtifactViewer({
+  artifact,
+  updating = false,
+}: {
+  artifact: OutputArtifact;
+  updating?: boolean;
+}) {
   const [viewMode, setViewMode] = useState<"preview" | "code">("preview");
   const task = artifact.kind === "task" ? artifact.data || {} : null;
   const htmlSource = artifact.kind === "page" ? artifact.body || "" : "";
@@ -7893,10 +8756,27 @@ export function ArtifactViewer({ artifact }: { artifact: OutputArtifact }) {
         looksLikeFileReference(artifact.body) ||
         looksLikeFileReference(artifact.meta))) ||
     (artifact.kind === "code" &&
-      (looksLikeFileReference(artifact.body) ||
+      (Boolean(artifactDocumentId(artifact)) ||
+        looksLikeFileReference(artifact.body) ||
         looksLikeFileReference(artifact.meta)));
   const canToggleCode =
     artifact.kind === "page" && Boolean(htmlSource) && !isFileBackedArtifact;
+  const htmlPreview = useIsolatedHtmlPreview(htmlSource, canToggleCode);
+
+  if (artifact.kind === "workspace" && artifact.data?.draft_id) {
+    return (
+      <WorkspaceDraftConfigurationPanel
+        draftId={String(artifact.data.draft_id)}
+        updating={updating}
+        refreshKey={JSON.stringify({
+          status: artifact.data.status,
+          ready: artifact.data.ready,
+          missing: artifact.data.missing,
+          fields: artifact.data.fields,
+        })}
+      />
+    );
+  }
 
   return (
     <div
@@ -7942,10 +8822,9 @@ export function ArtifactViewer({ artifact }: { artifact: OutputArtifact }) {
             {artifact.href ? (
               <iframe title={artifact.title} src={artifact.href} />
             ) : (
-              <iframe
+              <IsolatedHtmlPreviewFrame
                 title={artifact.title}
-                srcDoc={htmlSource}
-                sandbox="allow-scripts allow-same-origin"
+                preview={htmlPreview}
               />
             )}
           </div>
@@ -8028,12 +8907,14 @@ export function ArtifactViewer({ artifact }: { artifact: OutputArtifact }) {
   );
 }
 
-function OutputPanel({
+export function OutputPanel({
   artifact,
+  updating,
   onStop,
   returnTo,
 }: {
   artifact?: OutputArtifact | null;
+  updating: boolean;
   onStop: () => void;
   returnTo: string;
 }) {
@@ -8068,7 +8949,7 @@ function OutputPanel({
             {t("component.embedded_chat.open_an_artifact_card_from_the_conversation_to_preview")}</span>
         </div>
       ) : (
-        <ArtifactViewer artifact={artifact} />
+        <ArtifactViewer artifact={artifact} updating={updating} />
       )}
     </aside>
   );
@@ -8081,6 +8962,7 @@ export function ArtifactSummaryCards({
   artifacts: OutputArtifact[];
   onOpen: (artifact: OutputArtifact) => void;
 }) {
+  const toast = useToastStore();
   const [expanded, setExpanded] = useState(false);
   const [downloadingId, setDownloadingId] = useState<string | null>(null);
   if (artifacts.length === 0) return null;
@@ -8101,6 +8983,11 @@ export function ArtifactSummaryCards({
               setDownloadingId(artifact.id);
               try {
                 await downloadArtifact(artifact);
+              } catch (error) {
+                toast.error(
+                  t("component.embedded_chat.artifact_download_failed"),
+                  error instanceof Error ? error.message : undefined,
+                );
               } finally {
                 setDownloadingId((current) =>
                   current === artifact.id ? null : current,
@@ -8179,10 +9066,12 @@ export default function EmbeddedChat({
   agentId,
   onConversationResolved,
   onNewConversation,
+  showWorkspaceIntro = false,
 }: EmbeddedChatProps) {
   const queryClient = useQueryClient();
   const toast = useToastStore();
   const location = useLocation();
+  const navigate = useNavigate();
   const currentUser = useAuthStore((s) => s.user);
   const currentUserName =
     currentUser?.display_name ||
@@ -8295,6 +9184,17 @@ export default function EmbeddedChat({
   );
   const streaming = Boolean(currentSession?.streaming);
   const messages = currentSession?.messages || [];
+  const responseSurfaceSubmissionReceipts = useMemo(
+    () => collectResponseSurfaceSubmissionReceipts(messages),
+    [messages],
+  );
+  const responseSurfaceSubmissionFailureMessageIds = useMemo(
+    () => collectResponseSurfaceSubmissionFailureMessageIds(
+      messages,
+      responseSurfaceSubmissionReceipts,
+    ),
+    [messages, responseSurfaceSubmissionReceipts],
+  );
   /*
    * A run this tab only watches. Deliberately NOT the store's `streaming`,
    * which means "this tab owns an SSE connection and an AbortController": that
@@ -8317,9 +9217,19 @@ export default function EmbeddedChat({
       : undefined,
   );
   const streamingConvId = currentSession?.convId;
-  const [messageFeedback, setMessageFeedback] = useState<
-    Record<string, ChatMessageFeedbackRating>
-  >({});
+  const runtimeQueueStatus = currentSession?.runtimeQueue
+    ? formatRuntimeQueueStatus(currentSession.runtimeQueue)
+    : null;
+  const {
+    hydrateConversation: hydrateMessageFeedback,
+    submit: submitMessageFeedback,
+    values: messageFeedback,
+  } = useChatMessageFeedback(currentUser?.id);
+  useEffect(() => {
+    const conversationId = currentConvId || streamingConvId;
+    if (!conversationId) return;
+    void hydrateMessageFeedback(conversationId).catch(() => {});
+  }, [currentConvId, hydrateMessageFeedback, streamingConvId]);
   const [messageHistoryState, setMessageHistoryState] = useState<
     Record<string, { hasMore: boolean; nextCursor: string | null }>
   >({});
@@ -8330,6 +9240,7 @@ export default function EmbeddedChat({
   const startStream = useChatStreamStore((s) => s.startStream);
   const stopStream = useChatStreamStore((s) => s.stopStream);
   const streamingRef = useRef(false);
+  const sendPreflightInFlightRef = useRef(false);
   useEffect(() => {
     streamingRef.current = streaming;
   }, [streaming]);
@@ -8368,11 +9279,18 @@ export default function EmbeddedChat({
   );
   const visibleWorkflowMessageEntries = useMemo(
     () => messages.flatMap((message, index) => (
-      message.id && hostOwnedWorkflowMessageIds.has(message.id)
+      isResponseSurfaceSubmissionMessage(message, responseSurfaceSubmissionReceipts)
+        || Boolean(message.id && responseSurfaceSubmissionFailureMessageIds.has(message.id))
+        || (message.id && hostOwnedWorkflowMessageIds.has(message.id))
         ? []
         : [{ message, index }]
     )),
-    [hostOwnedWorkflowMessageIds, messages],
+    [
+      hostOwnedWorkflowMessageIds,
+      messages,
+      responseSurfaceSubmissionFailureMessageIds,
+      responseSurfaceSubmissionReceipts,
+    ],
   );
   const visibleWorkflowMessages = useMemo(
     () => visibleWorkflowMessageEntries.map(({ message }) => message),
@@ -8423,16 +9341,44 @@ export default function EmbeddedChat({
     () => deriveOutputState(messages, assistantWorking),
     [messages, assistantWorking],
   );
-  const messageArtifacts = useMemo(
-    () =>
+  const activeOutputArtifact = useMemo(() => {
+    if (!selectedArtifact) return outputState.artifacts[0];
+    const selectedKey = artifactDedupKey(selectedArtifact);
+    return (
+      outputState.artifacts.find(
+        (artifact) => artifactDedupKey(artifact) === selectedKey,
+      ) || selectedArtifact
+    );
+  }, [outputState.artifacts, selectedArtifact]);
+  const messageArtifacts = useMemo(() => {
+    const artifactGroups = keepLatestWorkspaceDraftArtifacts(
       messages.map((message, index) =>
         deriveMessageArtifacts(
           message,
           assistantWorking && index === messages.length - 1,
         ),
       ),
-    [messages, assistantWorking],
-  );
+    );
+    return artifactGroups.map((artifacts, index) => {
+      const message = messages[index];
+      const streaming = assistantWorking && index === messages.length - 1;
+      const localCodingNotice =
+        message?.role === "assistant"
+          ? maybeLocalCodingRunNoticeForTools(
+              visibleToolCallsForApprovalMessage(message),
+            )
+          : null;
+      return filterMessageArtifactsAlreadyRepresented(
+        message,
+        artifacts,
+        assistantMessageRendersInlineFileSurfaces(message, streaming),
+        {
+          renderedContent: localCodingNotice ?? undefined,
+          streaming,
+        },
+      );
+    });
+  }, [messages, assistantWorking]);
 
   const mentionOptions = useMemo<MentionOption[]>(() => {
     const agentMap = new Map<string, AgentInfo>();
@@ -8676,8 +9622,8 @@ export default function EmbeddedChat({
   }, [location.hash, messages.length]);
 
   const chatScrollRailMarkers = useMemo<ChatScrollRailMarker[]>(
-    () =>
-      messages.map((msg, index) => {
+    () => {
+      const sources = messages.map<ChatScrollRailTurnSource>((msg, index) => {
         const fallbackTitle =
           msg.role === "user" ? currentUserName || "You" : title || "Manor AI";
         const rawContent =
@@ -8705,14 +9651,19 @@ export default function EmbeddedChat({
           (fileLabel.includes(".") ? fileLabel.split(".").pop() : "") ||
           "file";
         return {
-          id: msg.id || `${msg.role}-${msg.timestamp || index}`,
+          id: chatMessageAnchorId(msg.id, index),
+          sourceIndex: index,
+          role: msg.role,
           tone: msg.role === "user" ? "user" : "assistant",
           title: preview.title,
           excerpt: preview.excerpt,
+          text: rawContent,
           fileKind: String(fileKindSource).slice(0, 4).toUpperCase(),
           fileLabel,
         };
-      }),
+      });
+      return buildChatScrollRailTurnMarkers(sources);
+    },
     [currentUserName, messageArtifacts, messages, title],
   );
 
@@ -8799,10 +9750,14 @@ export default function EmbeddedChat({
          * view back while the URL still points at the new one.
          */
         onlyIfStillCurrent?: boolean;
+        messageId?: string;
       } = {},
     ) => {
       const staleForCurrentView = () =>
         options.onlyIfStillCurrent && currentSessionKeyRef.current !== convId;
+      if (shouldIgnoreLocallyStoppedStreamUpdate(convId, options.messageId)) {
+        return;
+      }
       if (!options.backgroundRefresh) setConversationLoading(true);
       try {
         const page = await api.chat.getMessagesPage(convId, {
@@ -8816,6 +9771,7 @@ export default function EmbeddedChat({
         );
         if (targetTransportStreaming && !options.allowSettledStreamRefresh) return;
         if (staleForCurrentView()) return;
+        if (shouldIgnoreLocallyStoppedStreamUpdate(convId, options.messageId)) return;
         const mappedMessages = mapMessages(page.items || []);
         setSessionMessages(convId, mappedMessages);
         setMessageHistoryState((prev) => ({
@@ -8936,6 +9892,17 @@ export default function EmbeddedChat({
       const liveKey = streamState.getSessionKeyForConversation(currentConvId);
       if (liveKey && streamState.sessions[liveKey]?.streaming) return;
       if (hasLocallyStreamedConversation(currentConvId)) return;
+      if (
+        shouldIgnoreLocallyStoppedStreamUpdate(
+          currentConvId,
+          snapshot.message_id,
+          snapshot.status,
+        )
+      ) {
+        setFollowedRunActive(false);
+        followedRunPollsRef.current = 0;
+        return;
+      }
 
       const seqKey = snapshot.message_id || currentConvId;
       const seq = typeof snapshot.seq === "number" ? snapshot.seq : 0;
@@ -8980,6 +9947,10 @@ export default function EmbeddedChat({
   useEffect(() => {
     if (!currentConvId || !remoteRunInFlight) return;
     const timer = window.setTimeout(() => {
+      if (shouldIgnoreLocallyStoppedStreamUpdate(currentConvId)) {
+        setFollowedRunActive(false);
+        return;
+      }
       if (followedRunPollsRef.current >= FOLLOWED_RUN_MAX_POLLS) {
         // A row can claim "streaming" forever if its API process was
         // hard-killed (the sweeper only runs at startup). Give up on the
@@ -9034,9 +10005,15 @@ export default function EmbeddedChat({
         detail?.conversation_id === currentConvId &&
         !streamingRef.current
       ) {
+        const messageId =
+          typeof detail?.message_id === "string" ? detail.message_id : undefined;
+        if (shouldIgnoreLocallyStoppedStreamUpdate(currentConvId, messageId)) {
+          return;
+        }
         loadConversationMessages(detail.conversation_id, {
           fallbackToAgent: Boolean(agentId),
           backgroundRefresh: true,
+          messageId,
         }).catch(() => {});
       }
     };
@@ -9103,6 +10080,7 @@ export default function EmbeddedChat({
   useEffect(() => {
     if (isNewManorConversationId(conversationId)) {
       const sessionKey = createDraftSession();
+      currentSessionKeyRef.current = sessionKey;
       setCurrentConvId(undefined);
       setDraftSessionKey(sessionKey);
       setSelectedAgent(null);
@@ -9124,6 +10102,7 @@ export default function EmbeddedChat({
       isVirtualAgentConversationId(conversationId)
         ? undefined
         : conversationId;
+    currentSessionKeyRef.current = cid;
     /*
      * A live session owns its transcript. This effect also fires on the
      * conversation we are streaming right now: the first `stream_start` frame
@@ -9149,7 +10128,10 @@ export default function EmbeddedChat({
         setConversationLoading(false);
         return;
       }
-      loadConversationMessages(cid, { fallbackToAgent: Boolean(agentId) });
+      loadConversationMessages(cid, {
+        fallbackToAgent: Boolean(agentId),
+        onlyIfStillCurrent: true,
+      });
       return;
     }
     if (isVirtualAgentConversationId(conversationId) && agentId) {
@@ -9177,10 +10159,12 @@ export default function EmbeddedChat({
     if (conversationId !== "manor-ai") return;
     if (resumedRef.current || currentConvId) return;
     if (streamingRef.current) return;
+    let cancelled = false;
     resumedRef.current = true;
     setConversationLoading(true);
     api.chat.listConversations()
       .then((convs) => {
+        if (cancelled) return undefined;
         const latest = (convs || []).find(
           (conv: any) => !conv.agent_id && !conv.workspace_id,
         );
@@ -9188,10 +10172,19 @@ export default function EmbeddedChat({
           setConversationLoading(false);
           return undefined;
         }
+        currentSessionKeyRef.current = latest.id;
         setCurrentConvId(latest.id);
-        return loadConversationMessages(latest.id, { fallbackToAgent: false });
+        return loadConversationMessages(latest.id, {
+          fallbackToAgent: false,
+          onlyIfStillCurrent: true,
+        });
       })
-      .catch(() => setConversationLoading(false));
+      .catch(() => {
+        if (!cancelled) setConversationLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
   }, [conversationId, currentConvId, loadConversationMessages]);
 
   /* Auto-scroll: land at the latest message immediately, then avoid smooth-scroll churn while streaming. */
@@ -9242,28 +10235,62 @@ export default function EmbeddedChat({
       manualSkills: ManualSkillItem[] = [],
       options: {
         forceAutoMode?: boolean;
+        forceOwnerChat?: boolean;
         workflow?: WorkflowInvokeItem | null;
         sendContext?: ChatComposerSendContext;
+        responseSurfaceSubmission?: ResponseSurfaceSubmissionReceipt;
       } = {},
     ) => {
+      if (sendPreflightInFlightRef.current) return false;
+      sendPreflightInFlightRef.current = true;
+      const releaseSendPreflight = () => {
+        sendPreflightInFlightRef.current = false;
+      };
+      const isResponseSurfaceSubmission = Boolean(options.responseSurfaceSubmission);
+
       /*
        * A built-in skill rides along only when the person deliberately armed an
        * idea mode on an empty chat. Anything else — the cosmetic default focus,
        * or a follow-up in a conversation that already has messages — sends no
-       * skill, because manual_skill_ids is a force-invoke instruction to the
+       * skill, because manual_skill_refs is a force-invoke instruction to the
        * server, not a hint.
        */
       const armedIdeaSkill =
-        messages.length === 0 && ideaComposer?.origin === "user"
+        !isResponseSurfaceSubmission && messages.length === 0 && ideaComposer?.origin === "user"
           ? IDEA_BUILT_IN_SKILLS[ideaComposer.mode]
           : undefined;
-      const selectedWorkflow = options.workflow || null;
+      const selectedWorkflow = isResponseSurfaceSubmission ? null : options.workflow || null;
       const effectiveManualSkills =
-        !selectedWorkflow && manualSkills.length > 0
+        !isResponseSurfaceSubmission && !selectedWorkflow && manualSkills.length > 0
           ? manualSkills
           : !selectedWorkflow && armedIdeaSkill
             ? [armedIdeaSkill]
             : [];
+      const requestedManualSkillRefs =
+        effectiveManualSkills.length > 0
+          ? manualSkillReferences(effectiveManualSkills)
+          : undefined;
+      let manualSkillRefs = requestedManualSkillRefs;
+      if (requestedManualSkillRefs?.some((reference) => reference.kind === "slug")) {
+        try {
+          const availableSkills = await queryClient.fetchQuery({
+            queryKey: ["skills", "chat-manual-skill-resolution", "platform"],
+            queryFn: () => api.skills.list({ include_platform: true }),
+            staleTime: 60_000,
+          });
+          manualSkillRefs = resolveManualSkillReferenceIds(
+            requestedManualSkillRefs,
+            availableSkills,
+          );
+        } catch (error) {
+          releaseSendPreflight();
+          toast.error(
+            t("lib.api.chat_failed"),
+            error instanceof Error ? error.message : undefined,
+          );
+          return false;
+        }
+      }
       const text = stripWorkflowInvokeToken(
         stripManualSkillTokens(rawText, manualSkills),
         selectedWorkflow,
@@ -9273,8 +10300,10 @@ export default function EmbeddedChat({
         attachments.length === 0 &&
         effectiveManualSkills.length === 0 &&
         !selectedWorkflow
-      )
-        return;
+      ) {
+        releaseSendPreflight();
+        return false;
+      }
       let sessionKey = currentSessionKeyRef.current;
       if (!sessionKey) {
         sessionKey = createDraftSession();
@@ -9285,7 +10314,8 @@ export default function EmbeddedChat({
         existingSession?.streaming ||
         hasActivePersistedChatStream(existingSession?.messages || [])
       ) {
-        return;
+        releaseSendPreflight();
+        return false;
       }
 
       // Sending is an explicit jump back to the newest message.
@@ -9314,10 +10344,12 @@ export default function EmbeddedChat({
         (selectedWorkflow
           ? workflowInvokeMessage(selectedWorkflow)
           : "Use the manually selected skill with the current conversation context.");
-      setInput("");
-      setSelectedMentions([]);
-      setMentionedAgent(null);
-      setIdeaComposer(null);
+      if (!isResponseSurfaceSubmission) {
+        setInput("");
+        setSelectedMentions([]);
+        setMentionedAgent(null);
+        setIdeaComposer(null);
+      }
 
       const displayContent = [
         text,
@@ -9331,31 +10363,44 @@ export default function EmbeddedChat({
       const documentIds = attachments
         .filter((a) => a.type === "knowledge" && a.id)
         .map((a) => a.id!);
-      const turnChatMode = selectedWorkflow
+      const turnChatMode = options.responseSurfaceSubmission
+        ? undefined
+        : selectedWorkflow
         ? "flows"
         : options.forceAutoMode
           ? undefined
           : requestChatMode;
       const turnChatModePayload =
         !turnChatMode || selectedWorkflow ? undefined : chatModePayload;
+      const turnAgentId = isResponseSurfaceSubmission
+        ? agentId
+        : options.forceOwnerChat
+          ? undefined
+          : resolvedAgentId;
       const retryRequest: ChatRetryRequest | undefined = selectedWorkflow ? undefined : {
         message: streamText || text,
         conversationId: currentConvId,
         documentIds: documentIds.length > 0 ? documentIds : undefined,
-        agentId: resolvedAgentId,
+        agentId: turnAgentId,
         localWorkerId: options.sendContext?.localWorkerId,
         chatMode: turnChatMode,
         chatModePayload: turnChatModePayload,
-        manualSkillIds:
-          effectiveManualSkills.length > 0
-            ? effectiveManualSkills.map((skill) => skill.id)
-            : undefined,
+        manualSkillRefs,
+        responseSurfaceSubmission: options.responseSurfaceSubmission,
       };
       if (retryRequest) savePendingChatRetry(retryRequest);
 
-      const attachmentSnapshots = await Promise.all(
-        attachments.map(createChatMessageAttachmentSnapshot),
-      );
+      let attachmentSnapshots: Awaited<
+        ReturnType<typeof createChatMessageAttachmentSnapshot>
+      >[];
+      try {
+        attachmentSnapshots = await Promise.all(
+          attachments.map(createChatMessageAttachmentSnapshot),
+        );
+      } catch (error) {
+        releaseSendPreflight();
+        throw error;
+      }
 
       const msgsBeforeSend = [
         ...messages,
@@ -9378,6 +10423,9 @@ export default function EmbeddedChat({
               : undefined,
           chatMode: turnChatMode,
           chatModePayload: turnChatModePayload,
+          meta: options.responseSurfaceSubmission
+            ? responseSurfaceSubmissionMeta(options.responseSurfaceSubmission)
+            : undefined,
         },
         {
           role: "assistant" as const,
@@ -9387,9 +10435,16 @@ export default function EmbeddedChat({
         },
       ];
 
+      let sendSucceeded = true;
+      let responseSurfaceResult: ResponseSurfaceSubmissionResult = {
+        status: "succeeded",
+        serverAccepted: false,
+        terminalObserved: false,
+      };
       const completedSessionKey = await startStream(
-        () =>
-          selectedWorkflow
+        () => {
+          releaseSendPreflight();
+          return selectedWorkflow
             ? api.chat.streamFlowEntrypoint(
                 selectedWorkflow.bindingId,
                 text || workflowInvokeMessage(selectedWorkflow),
@@ -9404,15 +10459,14 @@ export default function EmbeddedChat({
             : api.chat.stream(streamText, currentConvId, {
                 files: localFiles.length > 0 ? localFiles : undefined,
                 documentIds: documentIds.length > 0 ? documentIds : undefined,
-                agentId: resolvedAgentId,
+                agentId: turnAgentId,
                 localWorkerId: options.sendContext?.localWorkerId,
                 chatMode: turnChatMode,
                 chatModePayload: turnChatModePayload,
-                manualSkillIds:
-                  effectiveManualSkills.length > 0
-                    ? effectiveManualSkills.map((skill) => skill.id)
-                    : undefined,
-              }),
+                manualSkillRefs,
+                responseSurfaceSubmission: options.responseSurfaceSubmission,
+              });
+        },
         currentConvId,
         msgsBeforeSend,
         (newConvId) => {
@@ -9424,7 +10478,22 @@ export default function EmbeddedChat({
           }
         },
         sessionKey,
+        (status, details) => {
+          sendSucceeded = status === ChatStreamCompletionStatus.Succeeded;
+          responseSurfaceResult = {
+            status: status === ChatStreamCompletionStatus.Succeeded
+              ? "succeeded"
+              : status === ChatStreamCompletionStatus.Cancelled
+                ? "cancelled"
+                : "failed",
+            serverAccepted: details.serverAccepted,
+            terminalObserved: details.terminalObserved,
+          };
+        },
       );
+      if (!sendSucceeded) {
+        return options.responseSurfaceSubmission ? responseSurfaceResult : false;
+      }
       const streamState = useChatStreamStore.getState();
       const activeKey = currentSessionKeyRef.current;
       const resolvedActiveKey = activeKey
@@ -9443,8 +10512,11 @@ export default function EmbeddedChat({
         });
       }
       clearPendingChatRetry();
-      if (requestChatMode) resetChatModeAfterTurn();
+      if (turnChatMode) resetChatModeAfterTurn();
       queryClient.invalidateQueries({ queryKey: ["conversations"] });
+      return options.responseSurfaceSubmission
+        ? responseSurfaceResult
+        : true;
     },
     [
       selectedMentions,
@@ -9462,8 +10534,67 @@ export default function EmbeddedChat({
       agentId,
       isAgentConversation,
       onConversationResolved,
+      toast,
     ],
   );
+
+  const handleResponseSurfaceSubmit = useCallback(
+    async (receipt: ResponseSurfaceSubmissionReceipt) => {
+      const rollback = () => {
+        setMessages((current) => (
+          rollbackResponseSurfaceSubmissionMessages(current, receipt.eventId)
+        ));
+      };
+      try {
+        const accepted = await handleSend(
+          responseSurfaceSubmissionMessage(receipt),
+          [],
+          [],
+          { responseSurfaceSubmission: receipt },
+        );
+        if (typeof accepted === "object") {
+          if (!accepted.serverAccepted) {
+            rollback();
+          } else if (accepted.status !== "succeeded" && accepted.terminalObserved) {
+            setMessages((current) => settleResponseSurfaceSubmissionFailure(
+              current,
+              receipt.eventId,
+              accepted.status === "cancelled" ? "interrupted" : "failed",
+            ));
+          }
+        } else if (accepted === false) rollback();
+        return accepted;
+      } catch (error) {
+        rollback();
+        throw error;
+      }
+    },
+    [handleSend, setMessages],
+  );
+
+  const createWorkspaceFromRecommendation = useCallback(
+    async (prompt: string) => {
+      await handleSend(prompt, [], [], {
+        forceAutoMode: true,
+        forceOwnerChat: true,
+      });
+    },
+    [handleSend],
+  );
+  const {
+    dismissedWorkspaceRecommendations,
+    dismissWorkspaceRecommendation,
+    handleWorkspaceRecommendationAdd,
+    handleWorkspaceRecommendationCreate,
+    handleWorkspaceRecommendationOpen,
+    handleWorkspaceRecommendationOptOut,
+    workspaceRecommendationBusyKey,
+    workspaceRecommendationPreferenceBusy,
+    workspaceRecommendationPreferencesReady,
+    workspaceRecommendationsSuppressed,
+  } = useWorkspaceRecommendationActions({
+    createWorkspace: createWorkspaceFromRecommendation,
+  });
 
   const handleIdeaQuickAction = useCallback(
     (request: IdeaQuickActionRequest) => {
@@ -9504,7 +10635,7 @@ export default function EmbeddedChat({
         () => undefined,
       );
     }
-    stopStream(currentSessionKeyRef.current);
+    void stopStream(currentSessionKeyRef.current);
   }, [currentConvId, streamingConvId, messages, stopStream, queryClient]);
 
   /* ---- HITL actions ---- */
@@ -9614,6 +10745,9 @@ export default function EmbeddedChat({
           manualSkills: fallbackUserMessage?.manualSkills,
           chatMode: fallbackUserMessage?.chatMode,
           chatModePayload: fallbackUserMessage?.chatModePayload,
+          meta: retryRequest.responseSurfaceSubmission
+            ? responseSurfaceSubmissionMeta(retryRequest.responseSurfaceSubmission)
+            : fallbackUserMessage?.meta,
         },
         {
           role: "assistant",
@@ -9634,7 +10768,9 @@ export default function EmbeddedChat({
               workspaceId: retryRequest.workspaceId,
               chatMode: retryRequest.chatMode,
               chatModePayload: retryRequest.chatModePayload,
+              manualSkillRefs: retryRequest.manualSkillRefs,
               manualSkillIds: retryRequest.manualSkillIds,
+              responseSurfaceSubmission: retryRequest.responseSurfaceSubmission,
             },
           ),
         retryRequest.conversationId || currentConvId,
@@ -9683,34 +10819,26 @@ export default function EmbeddedChat({
       if (message.role !== "assistant" || !message.id || !conversationId) return;
 
       const key = feedbackKeyForMessage(message, index);
-      const previous = messageFeedback[key] || null;
-      setMessageFeedback((prev) => ({ ...prev, [key]: rating }));
-
       const fallbackRequestPreview = messages
         .slice(0, index)
         .reverse()
         .find(hasVisibleUserContent);
 
       try {
-        await api.chat.feedback(conversationId, message.id, {
-          rating,
-          content_preview: contentPreview,
-          request_preview: (toDisplayText(fallbackRequestPreview?.content) || "").slice(0, 1000),
-        });
-      } catch {
-        setMessageFeedback((prev) => {
-          const next = { ...prev };
-          if (previous) next[key] = previous;
-          else delete next[key];
-          return next;
-        });
-      }
+        await submitMessageFeedback(key, rating, (queuedRating) =>
+          api.chat.feedback(conversationId, message.id!, {
+            rating: queuedRating,
+            content_preview: contentPreview,
+            request_preview: (toDisplayText(fallbackRequestPreview?.content) || "").slice(0, 1000),
+          }),
+        );
+      } catch {}
     },
     [
       currentConvId,
       feedbackKeyForMessage,
-      messageFeedback,
       messages,
+      submitMessageFeedback,
       streamingConvId,
     ],
   );
@@ -9789,16 +10917,21 @@ export default function EmbeddedChat({
             )}
           </div>
         </div>
-        {onNewConversation && (
-          <Button
-            variant="ghost"
-            className="embedded-chat-new-session"
-            onClick={onNewConversation}
-            title={t("component.session_switcher.new_chat_2")}
-            ariaLabel={t("component.session_switcher.new_chat_2")}
-          >
-            <IconPlus size={22} />
-          </Button>
+        {(showWorkspaceIntro || onNewConversation) && (
+          <div className="embedded-chat-header-actions">
+            {showWorkspaceIntro && <WorkspaceIntroDialog />}
+            {onNewConversation && (
+              <Button
+                variant="ghost"
+                className="embedded-chat-new-session"
+                onClick={onNewConversation}
+                title={t("component.session_switcher.new_chat_2")}
+                ariaLabel={t("component.session_switcher.new_chat_2")}
+              >
+                <IconPlus size={22} />
+              </Button>
+            )}
+          </div>
         )}
       </div>
 
@@ -9856,7 +10989,16 @@ export default function EmbeddedChat({
       <div
         className={`embedded-chat-workbench ${outputOpen ? "embedded-chat-workbench--output-open" : ""}`}
       >
-        <div className="embedded-chat-column">
+        <ResizablePaneGroup
+          panes={[
+            {
+              id: "chat",
+              label: title,
+              initialSize: 2,
+              minSize: outputOpen ? 360 : undefined,
+              className: "embedded-chat-pane embedded-chat-pane--chat",
+              children: (
+                <div className="embedded-chat-column">
           {/* ---- Chat Body ---- */}
           <div className="embedded-chat-body-wrap">
             <div
@@ -9918,12 +11060,28 @@ export default function EmbeddedChat({
                   ? displayContentForAssistantMessage(msg, rawBubbleContent)
                   : rawBubbleContent;
               const isLatestStreaming = assistantWorking && i === messages.length - 1;
+              const renderedBubbleDisplay = parseUserMessageDisplay(
+                { ...msg, content: bubbleContent },
+                { streaming: isLatestStreaming },
+              );
+              const renderedBubbleContent = renderedBubbleDisplay.cleanContent;
+              const messageDisplay = localCodingNotice
+                ? parseUserMessageDisplay(msg, {
+                    renderedContent: renderedBubbleContent,
+                    streaming: isLatestStreaming,
+                  })
+                : renderedBubbleDisplay;
               const suppressApprovalBubble =
                 isApprovalBoilerplateContent(msg) && !isLatestStreaming;
               const showCreditLimitNotice =
                 msg.role === "assistant" &&
                 msg.stop_reason === "credit_exhausted";
-              const actionCopyText = msg.role === "user" ? content : rawBubbleContent;
+              const renderAssistantBubble =
+                msg.role !== "assistant" ||
+                assistantMessageRendersInlineFileSurfaces(msg, isLatestStreaming);
+              const actionCopyText = msg.role === "user"
+                ? content
+                : chatMessageActionText(msg, rawBubbleContent);
               const showMessageActions = Boolean(
                 !suppressApprovalBubble &&
                   !showCreditLimitNotice &&
@@ -9940,6 +11098,12 @@ export default function EmbeddedChat({
               const createdResources = msg.role === "assistant"
                 ? createdChatResourceReferences(msg.tool_calls)
                 : [];
+              const workspaceRecommendation = msg.role === "assistant"
+                ? normalizeWorkspaceRecommendation(
+                    msg.meta?.workspace_recommendation,
+                  )
+                : null;
+              const workspaceRecommendationKey = `${msg.id || currentConvId || "draft"}:${i}`;
               const messageReturnTo = `${location.pathname}${location.search}#${messageAnchorId}`;
               // Only backend HITL cards have an id that can be safely resolved.
               const showInlineApproval = false;
@@ -9986,6 +11150,22 @@ export default function EmbeddedChat({
                     {!hasAssistantBlocks && visibleTools.length > 0 && (
                       <ToolCallList tools={visibleTools} keyPrefix={i} />
                     )}
+
+                    {isLatestStreaming &&
+                      msg.role === "assistant" &&
+                      runtimeQueueStatus && (
+                        <div
+                          className="chat-runtime-queue-status"
+                          role="status"
+                          aria-live="polite"
+                        >
+                          <span
+                            className="chat-runtime-queue-status-dot"
+                            aria-hidden="true"
+                          />
+                          <span>{runtimeQueueStatus}</span>
+                        </div>
+                      )}
 
                     {msg.role === "assistant" &&
                       hasPendingImageGeneration(msg) && (
@@ -10177,15 +11357,18 @@ export default function EmbeddedChat({
                     {/* Message Bubble */}
                     {hasAssistantBlocks &&
                       !canRetryFromContent &&
-                      !suppressApprovalBubble &&
-                      !showCreditLimitNotice && (
+                      renderAssistantBubble && (
                       <div className="chat-bubble chat-bubble--bot">
                         <AssistantMessageBlocks
                           blocks={msg.assistant_blocks}
-                          content={bubbleContent}
+                          content={renderedBubbleContent}
                           keyPrefix={i}
                           streaming={assistantWorking && i === messages.length - 1}
                           returnTo={messageReturnTo}
+                          onResponseSurfaceSubmit={handleResponseSurfaceSubmit}
+                          sourceMessageId={msg.id || ""}
+                          pendingActionKind={assistantPendingActionKindForMessage(msg)}
+                          responseSurfaceSubmissionReceipts={responseSurfaceSubmissionReceipts}
                         />
                         {createdResources.map((resource) => (
                           <CreatedResourceCard
@@ -10201,7 +11384,7 @@ export default function EmbeddedChat({
                           />
                         )}
                         <ChatMessageReferenceStrip
-                          references={parseUserMessageDisplay(msg).references}
+                          references={messageDisplay.references}
                           inlineFileCards
                           returnTo={messageReturnTo}
                         />
@@ -10215,8 +11398,7 @@ export default function EmbeddedChat({
                         // Attachment-only turns still need their bubble: the
                         // file card is the message's only visible trace.
                         (msg.attachments?.length ?? 0) > 0) &&
-                      !suppressApprovalBubble &&
-                      !showCreditLimitNotice && (
+                      renderAssistantBubble && (
                         <div
                           className={`chat-bubble ${msg.role === "user" ? "chat-bubble--user" : "chat-bubble--bot"}`}
                         >
@@ -10230,7 +11412,7 @@ export default function EmbeddedChat({
                           ) : (
                             <>
                               <ChatMarkdown
-                                content={bubbleContent}
+                                content={renderedBubbleContent}
                                 isUser={false}
                                 streaming={
                                   assistantWorking &&
@@ -10253,7 +11435,7 @@ export default function EmbeddedChat({
                                 />
                               )}
                               <ChatMessageReferenceStrip
-                                references={parseUserMessageDisplay(msg).references}
+                                references={messageDisplay.references}
                                 inlineFileCards
                                 returnTo={messageReturnTo}
                               />
@@ -10261,7 +11443,8 @@ export default function EmbeddedChat({
                           )}
                           {assistantWorking &&
                             i === messages.length - 1 &&
-                            msg.role === "assistant" && (
+                            msg.role === "assistant" &&
+                            !runtimeQueueStatus && (
                               <span className="chat-streaming-cursor" />
                             )}
                         </div>
@@ -10274,13 +11457,42 @@ export default function EmbeddedChat({
                       !hasAssistantBlocks &&
                       assistantWorking &&
                       i === messages.length - 1 &&
-                      msg.role === "assistant" && (
+                      msg.role === "assistant" &&
+                      !runtimeQueueStatus && (
                         <div className="chat-bubble chat-bubble--bot chat-bubble--activity">
                           <AgentActivityOrb
                             activity={inferAgentActivity(msg)}
                             className="agent-activity-orb--message"
                           />
                         </div>
+                      )}
+
+                    {workspaceRecommendation &&
+                      workspaceRecommendationPreferencesReady &&
+                      !workspaceRecommendationsSuppressed &&
+                      !dismissedWorkspaceRecommendations.has(workspaceRecommendationKey) && (
+                        <WorkspaceRecommendationCard
+                          recommendation={workspaceRecommendation}
+                          loading={workspaceRecommendationBusyKey === workspaceRecommendationKey}
+                          preferenceLoading={workspaceRecommendationPreferenceBusy}
+                          disabled={assistantWorking || workspaceRecommendationPreferenceBusy}
+                          onCreate={() => void handleWorkspaceRecommendationCreate(
+                            workspaceRecommendation,
+                            workspaceRecommendationKey,
+                          )}
+                          onOpen={() => handleWorkspaceRecommendationOpen(
+                            workspaceRecommendation,
+                            workspaceRecommendationKey,
+                          )}
+                          onAdd={() => void handleWorkspaceRecommendationAdd(
+                            workspaceRecommendation,
+                            workspaceRecommendationKey,
+                          )}
+                          onContinue={() => dismissWorkspaceRecommendation(
+                            workspaceRecommendationKey,
+                          )}
+                          onDontSuggestAgain={() => void handleWorkspaceRecommendationOptOut()}
+                        />
                       )}
 
                     {msg.role === "assistant" && (
@@ -10306,6 +11518,8 @@ export default function EmbeddedChat({
                             <ChatMessageActions
                               align="right"
                               copyText={actionCopyText}
+                              speechText={msg.role === "assistant" ? actionCopyText : undefined}
+                              voiceScope={{ conversationId: msg.conversation_id || currentConvId || streamingConvId }}
                               copyLabel={t(
                                 msg.role === "user"
                                   ? "component.chat_message_actions.copy_request"
@@ -10381,6 +11595,13 @@ export default function EmbeddedChat({
           />
 
           <ChatInputFooter
+            voiceScope={{ conversationId: currentConvId || streamingConvId, agentId: resolvedAgentId }}
+            onVoiceConversation={(id) => {
+              setCurrentConvId(id);
+              setDraftSessionKey(undefined);
+              void loadConversationMessages(id, { backgroundRefresh: true, onlyIfStillCurrent: true });
+              void queryClient.invalidateQueries({ queryKey: ["conversations"] });
+            }}
             value={input}
             onChange={handleComposerChange}
             streaming={assistantWorking}
@@ -10435,15 +11656,32 @@ export default function EmbeddedChat({
             seedAttachments={composerSeed?.attachments}
             seedAttachmentsKey={composerSeed?.key}
           />
-        </div>
-
-        {outputOpen && (
-          <OutputPanel
-            artifact={selectedArtifact || outputState.artifacts[0]}
-            onStop={closeOutputPanel}
-            returnTo={selectedArtifactReturnTo}
-          />
-        )}
+                </div>
+              ),
+            },
+            ...(outputOpen
+              ? [
+                  {
+                    id: "output",
+                    label: t("component.embedded_chat.output_panel"),
+                    initialSize: 1,
+                    minSize: 360,
+                    className: "embedded-chat-pane embedded-chat-pane--output",
+                    children: (
+                      <OutputPanel
+                        artifact={activeOutputArtifact}
+                        updating={assistantWorking}
+                        onStop={closeOutputPanel}
+                        returnTo={selectedArtifactReturnTo}
+                      />
+                    ),
+                  },
+                ]
+              : []),
+          ]}
+          storageKey="embedded-chat-output-panes"
+          className="embedded-chat-output-panes"
+        />
       </div>
     </div>
   );

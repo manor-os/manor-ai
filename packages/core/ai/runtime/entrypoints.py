@@ -26,12 +26,15 @@ def runtime_channel_context_from_value(
 def runtime_manual_skill_ids_from_refs(
     skill_refs: Iterable[Mapping[str, Any]] | None,
 ) -> tuple[str, ...]:
+    """Return stable database IDs for manually selected Skills."""
+
     seen: set[str] = set()
     ids: list[str] = []
     for ref in skill_refs or ():
-        value = str(ref.get("id") or ref.get("slug") or ref.get("name") or "").strip()
-        if value and value not in seen:
-            seen.add(value)
+        value = str(ref.get("id") or "").strip()
+        normalized = value.lower()
+        if value and normalized not in seen:
+            seen.add(normalized)
             ids.append(value)
     return tuple(ids)
 

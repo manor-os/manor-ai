@@ -23,6 +23,7 @@ import InfoPopover from "../components/ui/InfoPopover";
 import Modal from "../components/ui/Modal";
 import Select from "../components/ui/Select";
 import AiEditButton from "../components/ui/AiEditButton";
+import AiEditPreviewControls, { AiEditPreviewInteractionShield } from "../components/ui/AiEditPreviewControls";
 import { PageHeaderSubtitle, PageHeaderTitle } from "../components/ui/PageHeader";
 import {
   IconArrowLeft,
@@ -58,7 +59,19 @@ import {
   IconUpload,
 } from "../components/icons";
 import { useToastStore } from "../stores/toast";
-import { openEditorLiveChat } from "../lib/editorLiveChat";
+import {
+  AiEditPreviewStatus,
+  AiEditTargetKind,
+  aiEditInteractionLockProps,
+  cancelActiveEditorInteractions,
+  createAiEditCommitCoordinator,
+  createEditorLiveAdapter,
+  nextEditorLiveChangeCount,
+  openEditorLiveChat,
+  updateEditorLiveChat,
+  type EditorLiveApplyMeta,
+  type EditorLiveChatDetail,
+} from "../lib/editorLiveChat";
 import { getPlayableMediaDuration, requestMediaDurationProbe } from "../lib/mediaDuration";
 import { captionAnchorTransform, containedMediaSize, fittedMediaSize } from "../lib/videoEditorGeometry";
 import {
@@ -487,6 +500,20 @@ type AiEditNotice = {
   detail: string;
   highlights: NonNullable<Selection>[];
   focus: AiEditFocus | null;
+};
+
+type VideoAiPreview = {
+  baseline: EditorTrackState;
+  current: EditorTrackState;
+  baselineMediaSize: { width: number; height: number };
+  baselineTrackStates: Record<TimelineTrackId, TimelineTrackState>;
+  baselineWorkArea: WorkAreaState;
+  baselineSelection: Selection;
+  baselinePlayhead: number;
+  undoStack: EditorTrackState[];
+  redoStack: EditorTrackState[];
+  status: AiEditPreviewStatus;
+  changeCount: number;
 };
 
 type TimelineTool = "select" | "razor";
@@ -2117,33 +2144,17 @@ function timelineItemsFromRecipePayload(payload: unknown): Record<string, unknow
 }
 
 function recipeReferencesDocument(recipe: VideoEditRecipe, doc: Document): boolean {
-  const docPath = normalizeRecipePath(doc.fs_path);
-  const docBaseName = recipePathBaseName(doc.name);
   const source = recipe.source_document;
   if (source?.id === doc.id) return true;
-  if (docPath && normalizeRecipePath(source?.fs_path) === docPath) return true;
-  if (docBaseName && recipePathBaseName(source?.name) === docBaseName) return true;
-
-  const aiComposition = (recipe as unknown as { ai_composition?: Record<string, unknown> }).ai_composition;
-  if (docPath && normalizeRecipePath(aiComposition?.final_video_path) === docPath) return true;
-  if (docPath && normalizeRecipePath(aiComposition?.clean_picture_master) === docPath) return true;
 
   const clips = Array.isArray(recipe.timeline?.clips) ? recipe.timeline.clips : [];
-  const clipMatches = clips.some((clip) => {
-    const candidate = clip as Partial<ClipSegment>;
-    if (candidate.assetDocumentId === doc.id) return true;
-    return Boolean(docBaseName && recipePathBaseName(candidate.assetName) === docBaseName);
-  });
+  const clipMatches = clips.some(
+    (clip) => (clip as Partial<ClipSegment>).assetDocumentId === doc.id,
+  );
   if (clipMatches) return true;
 
   const rawItems = timelineItemsFromRecipePayload((recipe as unknown as { source_timeline?: unknown }).source_timeline);
-  return rawItems.some((item) => {
-    const candidateId = item.document_id ?? item.doc_id ?? item.asset_document_id ?? item.assetDocumentId;
-    if (candidateId === doc.id) return true;
-    const candidatePath = item.path ?? item.file ?? item.video_path ?? item.media_path ?? item.output_path ?? item.fs_path;
-    if (docPath && normalizeRecipePath(candidatePath) === docPath) return true;
-    return Boolean(docBaseName && recipePathBaseName(candidatePath) === docBaseName);
-  });
+  return rawItems.some((item) => item.document_id === doc.id);
 }
 
 function recipeSearchFolderIds(folderId: string | null | undefined, folders: DocumentFolderInfo[]): string[] {
@@ -3758,6 +3769,8 @@ export default function VideoEditor() {
   const lastHistoryStateRef = useRef<EditorTrackState | null>(null);
   const latestTrackStateRef = useRef<EditorTrackState | null>(null);
   const editorLiveContentRef = useRef("");
+  const videoAiPreviewRef = useRef<VideoAiPreview | null>(null);
+  const videoAiCommitCoordinator = useRef(createAiEditCommitCoordinator()).current;
   const historyTransactionRef = useRef<EditorHistoryTransaction | null>(null);
   const restoringHistoryRef = useRef(false);
 
@@ -3831,6 +3844,7 @@ export default function VideoEditor() {
   const [sourceDocOverride, setSourceDocOverride] = useState<Document | null>(null);
   const [pendingRouteRecipe, setPendingRouteRecipe] = useState<VideoEditRecipe | null>(null);
   const [aiEditNotice, setAiEditNotice] = useState<AiEditNotice | null>(null);
+  const [videoAiPreview, setVideoAiPreview] = useState<VideoAiPreview | null>(null);
   const [scanningProjectRecipe, setScanningProjectRecipe] = useState(false);
 
   useEffect(() => {
@@ -8300,7 +8314,10 @@ export default function VideoEditor() {
     return uploaded;
   }, [buildRecipe, doc, findRecipeDocumentByName, uploadRecipeDocument]);
 
-  const saveRecipe = useCallback(async (): Promise<Document | null> => {
+  const saveRecipe = useCallback(async (
+    options: { acceptAiPreview?: boolean } = {},
+  ): Promise<Document | null> => {
+    if (videoAiPreviewRef.current && !options.acceptAiPreview) return null;
     if (!doc) return null;
     setSaving(true);
     try {
@@ -8322,6 +8339,133 @@ export default function VideoEditor() {
       setSaving(false);
     }
   }, [buildRecipe, doc, queryClient, recipeDoc, recipeQuery.data, toast, uploadRecipeDocument]);
+
+  const applyVideoAiPreview = useCallback((next: string, meta: EditorLiveApplyMeta) => {
+    if (meta.signal?.aborted) return false;
+    try {
+      cancelActiveEditorInteractions();
+      const recipe = JSON.parse(next) as VideoEditRecipe;
+      const previousPreview = videoAiPreviewRef.current;
+      const before = cloneEditorTrackState(latestTrackStateRef.current ?? currentTrackState);
+      const normalized = normalizeVideoEditRecipe(recipe, sourceDuration);
+      const notice = buildAiEditNotice(before, normalized.state);
+      const preview: VideoAiPreview = {
+        baseline: previousPreview?.baseline ?? before,
+        current: cloneEditorTrackState(normalized.state),
+        baselineMediaSize: previousPreview?.baselineMediaSize ?? { ...mediaSize },
+        baselineTrackStates: previousPreview?.baselineTrackStates ?? structuredClone(trackStates),
+        baselineWorkArea: previousPreview?.baselineWorkArea ?? { ...workArea },
+        baselineSelection: previousPreview?.baselineSelection ?? selection,
+        baselinePlayhead: previousPreview?.baselinePlayhead ?? playhead,
+        undoStack: previousPreview?.undoStack ?? undoStackRef.current.map(cloneEditorTrackState),
+        redoStack: previousPreview?.redoStack ?? redoStackRef.current.map(cloneEditorTrackState),
+        status: AiEditPreviewStatus.Animating,
+        changeCount: nextEditorLiveChangeCount(previousPreview, meta),
+      };
+      videoAiPreviewRef.current = preview;
+      setVideoAiPreview(preview);
+      applyNormalizedRecipe(normalized, recipeDoc ?? recipeQuery.data ?? doc ?? null, false, notice.focus);
+      setAiEditNotice(notice);
+      return true;
+    } catch (error) {
+      toast.error(veText("toast.load_recipe_failed"), error instanceof Error ? error.message : undefined);
+      return false;
+    }
+  }, [applyNormalizedRecipe, currentTrackState, doc, mediaSize, playhead, recipeDoc, recipeQuery.data, selection, sourceDuration, toast, trackStates, workArea]);
+
+  const completeVideoAiPreview = useCallback((_content: string, meta: EditorLiveApplyMeta) => {
+    if (meta.signal?.aborted) return false;
+    const preview = videoAiPreviewRef.current;
+    if (!preview) return false;
+    const ready = { ...preview, status: AiEditPreviewStatus.Ready };
+    videoAiPreviewRef.current = ready;
+    setVideoAiPreview(ready);
+    return true;
+  }, []);
+
+  const beginVideoAiTurn = useCallback((meta: EditorLiveApplyMeta) => {
+    if (meta.signal?.aborted) return false;
+    const preview = videoAiPreviewRef.current;
+    if (!preview) return true;
+    const pending = { ...preview, status: AiEditPreviewStatus.Animating };
+    videoAiPreviewRef.current = pending;
+    setVideoAiPreview(pending);
+    return true;
+  }, []);
+
+  const rollbackVideoAiPreview = useCallback(() => {
+    if (videoAiCommitCoordinator.isCommitting()) return;
+    const preview = videoAiPreviewRef.current;
+    if (!preview) return;
+    restoreTrackState(preview.baseline);
+    setMediaSize(preview.baselineMediaSize);
+    setTrackStates(preview.baselineTrackStates);
+    setWorkArea(preview.baselineWorkArea);
+    setSelection(preview.baselineSelection);
+    setPlayhead(preview.baselinePlayhead);
+    undoStackRef.current = preview.undoStack.map(cloneEditorTrackState);
+    redoStackRef.current = preview.redoStack.map(cloneEditorTrackState);
+    lastHistoryStateRef.current = cloneEditorTrackState(preview.baseline);
+    latestTrackStateRef.current = cloneEditorTrackState(preview.baseline);
+    videoAiPreviewRef.current = null;
+    setVideoAiPreview(null);
+    setAiEditNotice(null);
+    setHistoryVersion((version) => version + 1);
+  }, [restoreTrackState, videoAiCommitCoordinator]);
+
+  const acceptVideoAiPreview = useCallback(async () => {
+    if (videoAiCommitCoordinator.isCommitting()) return;
+    const preview = videoAiPreviewRef.current;
+    if (!preview || preview.status !== AiEditPreviewStatus.Ready) return;
+    await videoAiCommitCoordinator.run(async () => {
+      const saved = await saveRecipe({ acceptAiPreview: true });
+      if (!saved) return;
+      undoStackRef.current = [...preview.undoStack.map(cloneEditorTrackState), cloneEditorTrackState(preview.baseline)].slice(-80);
+      redoStackRef.current = [];
+      lastHistoryStateRef.current = cloneEditorTrackState(preview.current);
+      latestTrackStateRef.current = cloneEditorTrackState(preview.current);
+      videoAiPreviewRef.current = null;
+      setVideoAiPreview(null);
+      setHistoryVersion((version) => version + 1);
+    });
+  }, [saveRecipe, videoAiCommitCoordinator]);
+
+  const videoEditorAiEditDetail = useMemo<EditorLiveChatDetail | null>(() => {
+    if (!doc) return null;
+    return {
+      documentId: doc.id,
+      documentName: doc.name,
+      fileType: doc.file_type || "video",
+      mimeType: doc.mime_type,
+      editorType: "Video",
+      instruction: veText("ai.instruction", { name: doc.name }),
+      sessionLabel: veText("ai.session_label", { name: doc.name }),
+      emptyDescription: veText("ai.empty_description"),
+      placeholder: veText("ai.placeholder"),
+      examples: [
+        veText("ai.example.camera_move"),
+        veText("ai.example.title_card"),
+        veText("ai.example.bezier"),
+        veText("ai.example.polish"),
+      ],
+      adapter: createEditorLiveAdapter({
+        target: { kind: AiEditTargetKind.Video, id: doc.id },
+        read: () => editorLiveContentRef.current,
+        getTurnPreviewState: () => ({
+          changeCount: videoAiPreviewRef.current?.changeCount || 0,
+        }),
+        beginTurn: beginVideoAiTurn,
+        preview: applyVideoAiPreview,
+        complete: completeVideoAiPreview,
+        rollback: rollbackVideoAiPreview,
+        commitCoordinator: videoAiCommitCoordinator,
+      }),
+    };
+  }, [applyVideoAiPreview, beginVideoAiTurn, completeVideoAiPreview, doc, rollbackVideoAiPreview, videoAiCommitCoordinator]);
+
+  useEffect(() => {
+    if (videoEditorAiEditDetail) updateEditorLiveChat(videoEditorAiEditDetail);
+  }, [videoEditorAiEditDetail]);
 
   const drawExportFrame = useCallback((
     ctx: CanvasRenderingContext2D,
@@ -8841,6 +8985,7 @@ export default function VideoEditor() {
   }, [doc, drawExportFrame, graphicImageAssetIds, graphicLayers, mediaSize.height, mediaSize.width, playhead, toast]);
 
   const exportPreview = useCallback(async () => {
+    if (videoAiPreviewRef.current) return;
     if (!doc || !downloadUrl || timelineDuration <= 0 || exportRangeDuration <= 0) return;
     if (!("MediaRecorder" in window)) {
       toast.error(veText("toast.browser_export_unsupported"));
@@ -9200,6 +9345,11 @@ export default function VideoEditor() {
   useEffect(() => {
     const handleKeyDown = (event: KeyboardEvent) => {
       if (isTextEditingTarget(event.target)) return;
+      if (event.target instanceof Element && event.target.closest(".ai-edit-preview-controls")) return;
+      if (videoAiPreviewRef.current) {
+        event.preventDefault();
+        return;
+      }
       const key = event.key.toLowerCase();
       const usesModifier = event.metaKey || event.ctrlKey;
       const hasModifier = usesModifier || event.altKey;
@@ -9926,7 +10076,21 @@ export default function VideoEditor() {
   return (
     <div className="ve-shell">
       <style>{VIDEO_EDITOR_STYLES}</style>
-      <header className="ve-topbar">
+      {videoAiPreview && (
+        <AiEditPreviewControls
+          className="ve-ai-edit-controls"
+          status={videoAiPreview.status}
+          changeCount={videoAiPreview.changeCount}
+          accepting={saving}
+          onAccept={acceptVideoAiPreview}
+          onDiscard={rollbackVideoAiPreview}
+        />
+      )}
+      {videoAiPreview && <AiEditPreviewInteractionShield />}
+      <header
+        className="ve-topbar"
+        {...aiEditInteractionLockProps(Boolean(videoAiPreview))}
+      >
         <div className="ve-topbar-left">
           <button className="ve-icon-button" type="button" title={veText("back")} onClick={() => navigate(backTarget)}>
             <IconArrowLeft size={18} />
@@ -9945,38 +10109,9 @@ export default function VideoEditor() {
         </div>
         <div className="ve-topbar-actions">
           <AiEditButton
-            onClick={() =>
-              openEditorLiveChat({
-                documentId: doc.id,
-                documentName: doc.name,
-                fileType: doc.file_type || "video",
-                mimeType: doc.mime_type,
-                editorType: "Video",
-                instruction: veText("ai.instruction", { name: doc.name }),
-                sessionLabel: veText("ai.session_label", { name: doc.name }),
-                emptyDescription: veText("ai.empty_description"),
-                placeholder: veText("ai.placeholder"),
-                examples: [
-                  veText("ai.example.camera_move"),
-                  veText("ai.example.title_card"),
-                  veText("ai.example.bezier"),
-                  veText("ai.example.polish"),
-                ],
-                getContent: () => editorLiveContentRef.current,
-                applyContent: (next) => {
-                  try {
-                    const recipe = JSON.parse(next) as VideoEditRecipe;
-                    const before = cloneEditorTrackState(latestTrackStateRef.current ?? currentTrackState);
-                    const normalized = normalizeVideoEditRecipe(recipe, sourceDuration);
-                    const notice = buildAiEditNotice(before, normalized.state);
-                    applyNormalizedRecipe(normalized, recipeDoc ?? recipeQuery.data ?? doc, false, notice.focus);
-                    setAiEditNotice(notice);
-                  } catch (error) {
-                    toast.error(veText("toast.load_recipe_failed"), error instanceof Error ? error.message : undefined);
-                  }
-                },
-              })
-            }
+            onClick={() => {
+              if (videoEditorAiEditDetail) openEditorLiveChat(videoEditorAiEditDetail);
+            }}
           />
           {lastExportDoc && (
             <Link className="ve-link-button ve-open-export" to={`/viewer/${lastExportDoc.id}`} state={location.state} title={veText("open_export")}>
@@ -10018,7 +10153,7 @@ export default function VideoEditor() {
             </button>
           )}
           <div className="ve-save-actions">
-            <button className="ve-button ve-save-plan" type="button" title={veText("shortcut.save_recipe")} onClick={saveRecipe} disabled={saving || timelineDuration <= 0}>
+            <button className="ve-button ve-save-plan" type="button" title={veText("shortcut.save_recipe")} onClick={() => { void saveRecipe(); }} disabled={saving || timelineDuration <= 0}>
               <IconEdit size={15} />
               <span className="ve-action-label">{saving ? veText("saving") : veText("save_recipe")}</span>
             </button>
@@ -10030,7 +10165,10 @@ export default function VideoEditor() {
         </div>
       </header>
 
-      <div className={`ve-workspace ${mediaPanelOpen ? "" : "is-media-panel-closed"} ${inspectorPanelOpen ? "" : "is-inspector-panel-closed"}`}>
+      <div
+        className={`ve-workspace ${mediaPanelOpen ? "" : "is-media-panel-closed"} ${inspectorPanelOpen ? "" : "is-inspector-panel-closed"}`}
+        {...aiEditInteractionLockProps(Boolean(videoAiPreview))}
+      >
         {mediaPanelOpen && <aside className="ve-panel ve-media-panel">
           <div className="ve-panel-header">
             <div className="ve-section-title">
@@ -12826,6 +12964,7 @@ const VIDEO_EDITOR_STYLES = `
   --ve-muted-surface: var(--surface-muted);
   --ve-teal: var(--accent);
   box-sizing: border-box;
+  position: relative;
   container-name: video-editor;
   container-type: inline-size;
   height: 100%;

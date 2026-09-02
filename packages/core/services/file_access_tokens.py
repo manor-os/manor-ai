@@ -32,6 +32,7 @@ def create_file_access_token(
     entity_id: str,
     rel_path: str,
     expires_in_seconds: int = 900,
+    user_id: str | None = None,
 ) -> str:
     """Create an opaque token for a single entity FS file."""
     payload: dict[str, Any] = {
@@ -39,11 +40,13 @@ def create_file_access_token(
         "path": normalize_rel_path(rel_path),
         "exp": int(time.time()) + max(60, int(expires_in_seconds)),
     }
+    if user_id:
+        payload["user_id"] = str(user_id)
     payload_b64 = _b64_encode(json.dumps(payload, separators=(",", ":")).encode("utf-8"))
     return f"{payload_b64}.{_sign(payload_b64)}"
 
 
-def verify_file_access_token(token: str) -> dict[str, str] | None:
+def verify_file_access_token(token: str) -> dict[str, Any] | None:
     """Verify a file token and return entity/path, or None when invalid."""
     try:
         payload_b64, sig = token.split(".", 1)
@@ -61,4 +64,8 @@ def verify_file_access_token(token: str) -> dict[str, str] | None:
     rel_path = normalize_rel_path(str(payload.get("path") or ""))
     if not entity_id or not rel_path or rel_path == ".." or rel_path.startswith("../"):
         return None
-    return {"entity_id": entity_id, "path": rel_path}
+    verified: dict[str, Any] = {"entity_id": entity_id, "path": rel_path}
+    user_id = str(payload.get("user_id") or "").strip()
+    if user_id:
+        verified["user_id"] = user_id
+    return verified

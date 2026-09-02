@@ -4,7 +4,18 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Optional
 
-from sqlalchemy import BigInteger, DateTime, Index, Integer, Numeric, String, Text, func, text
+from sqlalchemy import (
+    BigInteger,
+    CheckConstraint,
+    DateTime,
+    Index,
+    Integer,
+    Numeric,
+    String,
+    Text,
+    func,
+    text,
+)
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -108,11 +119,14 @@ class PaymentLog(Base, TimestampMixin):
     """Stripe payment records — tracks every charge and refund."""
     __tablename__ = "payment_logs"
     __table_args__ = (
+        CheckConstraint(
+            "stripe_payment_intent_id IS NULL "
+            "OR stripe_payment_intent_id ~ '^pi_[A-Za-z0-9_]+$'",
+            name="ck_payment_logs_stripe_pi_nonblank",
+        ),
         Index("ix_payment_logs_entity", "entity_id"),
-        Index("ix_payment_logs_stripe_pi", "stripe_payment_intent_id"),
         Index(
-            "ux_payment_logs_entity_stripe_pi",
-            "entity_id",
+            "ux_payment_logs_stripe_pi_global",
             "stripe_payment_intent_id",
             unique=True,
             postgresql_where=text("stripe_payment_intent_id IS NOT NULL"),
@@ -141,7 +155,7 @@ class PaymentLog(Base, TimestampMixin):
     stripe_customer_id: Mapped[Optional[str]] = mapped_column(String(255))
     description: Mapped[Optional[str]] = mapped_column(Text)
     status: Mapped[str] = mapped_column(String(30), nullable=False, server_default="pending")
-    # status: pending, succeeded, failed, refunded
+    # status: pending, succeeded, failed, disputed, refunded
     event_type: Mapped[Optional[str]] = mapped_column(String(100))
     error_message: Mapped[Optional[str]] = mapped_column(Text)
     credit_awarded: Mapped[int] = mapped_column(Integer, server_default="0")

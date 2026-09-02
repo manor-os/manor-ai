@@ -5,7 +5,7 @@ type ThemeAwareImageProps = Omit<ImgHTMLAttributes<HTMLImageElement>, "src"> & {
   darkSrc?: string | null;
 };
 
-type ResolvedDocumentTheme = "white" | "dark";
+export type ResolvedDocumentTheme = "white" | "dark";
 
 const themeListeners = new Set<() => void>();
 let themeObserver: MutationObserver | null = null;
@@ -40,6 +40,14 @@ function subscribeToDocumentTheme(listener: () => void) {
   };
 }
 
+export function useResolvedDocumentTheme(): ResolvedDocumentTheme {
+  return useSyncExternalStore(
+    subscribeToDocumentTheme,
+    currentDocumentTheme,
+    () => "white",
+  );
+}
+
 /** Return the paired dark cover only for Manor's generated blueprint assets. */
 export function generatedBlueprintDarkCoverUrl(src: string): string | null {
   const match = src.match(/^(.*\/assets\/blueprints\/generated\/)([^/?#]+)\.webp([?#].*)?$/);
@@ -49,11 +57,7 @@ export function generatedBlueprintDarkCoverUrl(src: string): string | null {
 
 /** Render a single image request and follow Manor's resolved data-theme value. */
 export default function ThemeAwareImage({ src, darkSrc, ...props }: ThemeAwareImageProps) {
-  const theme = useSyncExternalStore(
-    subscribeToDocumentTheme,
-    currentDocumentTheme,
-    () => "white",
-  );
+  const theme = useResolvedDocumentTheme();
 
   return <img {...props} src={theme === "dark" && darkSrc ? darkSrc : src} />;
 }

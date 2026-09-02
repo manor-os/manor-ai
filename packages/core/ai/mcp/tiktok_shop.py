@@ -36,6 +36,7 @@ logger = logging.getLogger(__name__)
 _API = "https://open-api.tiktokglobalshop.com"
 _MAX_CHARS = 12_000
 _TIMEOUT = 30.0
+_MAX_PAGE_SIZE = 100
 
 
 # ── MCP Protocol ─────────────────────────────────────────────────────────────
@@ -52,9 +53,12 @@ async def call_tool(
     handler = _HANDLERS.get(name)
     if not handler:
         return _error(f"Unknown tool: {name}")
+    if not isinstance(arguments, dict):
+        return _error("arguments must be an object")
+    arguments = dict(arguments)
 
     spec = _TOOLS.get(name, {})
-    missing = [p for p in spec.get("required", []) if arguments.get(p) in (None, "")]
+    missing = [p for p in spec.get("required", []) if _is_blank(arguments.get(p))]
     if missing:
         return _error(f"Missing required params: {', '.join(missing)}")
 
@@ -62,12 +66,20 @@ async def call_tool(
         cfg = json.loads(bearer_token) if bearer_token else {}
     except Exception:
         return _error("TikTok Shop credentials malformed (expected JSON).")
-    if not (cfg.get("app_key") and cfg.get("app_secret") and cfg.get("access_token")):
+    if not isinstance(cfg, dict):
+        return _error("TikTok Shop credentials malformed (expected JSON object).")
+    for field in ("app_key", "app_secret", "access_token"):
+        if cfg.get(field) is not None and not isinstance(cfg[field], str):
+            return _error(f"TikTok Shop {field} must be a string.")
+    if any(_is_blank(cfg.get(field)) for field in ("app_key", "app_secret", "access_token")):
         return _error("TikTok Shop needs app_key, app_secret and access_token.")
+    cfg = {**cfg, **{field: str(cfg[field]).strip() for field in ("app_key", "app_secret", "access_token")}}
 
     try:
         text = await handler(cfg, arguments)
         return {"content": [{"type": "text", "text": text}], "isError": False}
+    except _TikTokShopError as e:
+        return _error(str(e))
     except Exception as e:
         logger.exception("TikTok Shop MCP tool %s failed", name)
         return _error(str(e))
@@ -75,6 +87,14 @@ async def call_tool(
 
 def _error(msg: str) -> Dict[str, Any]:
     return {"content": [{"type": "text", "text": msg}], "isError": True}
+
+
+def _is_blank(value: Any) -> bool:
+    return value is None or (isinstance(value, str) and not value.strip())
+
+
+class _TikTokShopError(RuntimeError):
+    pass
 
 
 # ── Signed API client ──────────────────────────────────────────────────────────
@@ -102,8 +122,8 @@ async def _api(
     }
     if shop_scoped:
         cipher = (query or {}).get("shop_cipher") or cfg.get("shop_cipher")
-        if not cipher:
-            return "This call needs a shop_cipher (pass it, or set one in credentials)."
+        if _is_blank(cipher):
+            raise _TikTokShopError("This call needs a shop_cipher (pass it, or set one in credentials).")
         q["shop_cipher"] = cipher
     for k, v in (query or {}).items():
         if v is not None and v != "" and k != "shop_cipher":
@@ -124,9 +144,9 @@ async def _api(
         )
 
     if resp.status_code == 401:
-        return "TikTok Shop authentication failed. Reconnect the shop (token/app key)."
+        raise _TikTokShopError("TikTok Shop authentication failed. Reconnect the shop (token/app key).")
     if not resp.is_success:
-        return f"TikTok Shop API error ({resp.status_code}): {resp.text[:300]}"
+        raise _TikTokShopError(f"TikTok Shop API error ({resp.status_code}): {resp.text[:300]}")
 
     if not resp.text:
         return json.dumps({"ok": True})
@@ -134,8 +154,28 @@ async def _api(
         data = resp.json()
     except Exception:
         return resp.text[:_MAX_CHARS]
+    if isinstance(data, dict):
+        code = data.get("code")
+        if code not in (None, 0, "0"):
+            message = data.get("message") or "TikTok Shop returned a business error"
+            raise _TikTokShopError(f"TikTok Shop API error ({code}): {message}")
     out = json.dumps(data, ensure_ascii=False, indent=2, default=str)
     return out[:_MAX_CHARS] + "\n… (truncated)" if len(out) > _MAX_CHARS else out
+
+
+def _page_size(args: Dict[str, Any]) -> int:
+    raw = args.get("page_size", 20)
+    if isinstance(raw, bool):
+        raise _TikTokShopError("page_size must be an integer between 1 and 100.")
+    try:
+        page_size = int(raw)
+    except (TypeError, ValueError):
+        raise _TikTokShopError("page_size must be an integer between 1 and 100.") from None
+    if isinstance(raw, float) and raw != page_size:
+        raise _TikTokShopError("page_size must be an integer between 1 and 100.")
+    if page_size < 1 or page_size > _MAX_PAGE_SIZE:
+        raise _TikTokShopError("page_size must be an integer between 1 and 100.")
+    return page_size
 
 
 # ── Shops ─────────────────────────────────────────────────────────────────────
@@ -156,7 +196,7 @@ async def _search_orders(cfg, args) -> str:
     if args.get("create_time_lt"):
         body["create_time_lt"] = int(args["create_time_lt"])
     query = {
-        "page_size": int(args.get("page_size", 20)),
+        "page_size": _page_size(args),
         "shop_cipher": args.get("shop_cipher"),
     }
     if args.get("page_token"):
@@ -180,7 +220,7 @@ async def _search_products(cfg, args) -> str:
     if args.get("status"):
         body["status"] = args["status"]
     query = {
-        "page_size": int(args.get("page_size", 20)),
+        "page_size": _page_size(args),
         "shop_cipher": args.get("shop_cipher"),
     }
     if args.get("page_token"):

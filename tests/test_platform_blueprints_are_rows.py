@@ -12,10 +12,12 @@ rather than by being the one shape you match on a slug.
 """
 from __future__ import annotations
 
+import asyncio
 import copy
 
 import pytest
 from sqlalchemy import select
+from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from packages.core.blueprints.seed import (
     PLATFORM_BLUEPRINT_ID_PREFIX,
@@ -25,6 +27,7 @@ from packages.core.blueprints.seed import (
 from packages.core.blueprints.payload import detect_version
 from packages.core.blueprints.solo_company import get_solo_company_blueprints
 from packages.core.models.blueprint import WorkspaceBlueprint
+from packages.core.models.workspace import Workspace
 
 SLUG = "solo-faceless-stickman-studio-v1"
 
@@ -48,6 +51,61 @@ async def test_every_config_becomes_a_published_row(db_session):
     assert rows[SLUG].status == "published"
     assert rows[SLUG].entity_id is None, "the platform owns it"
     assert rows[SLUG].payload_version == detect_version(rows[SLUG].payload)
+    assert rows[SLUG].author_handle == "manor"
+    assert rows[SLUG].author_display_name == "Manor AI"
+
+
+@pytest.mark.asyncio
+async def test_raw_payload_inherits_official_identity_only_for_exact_content(
+    db_session,
+):
+    from apps.api.routers.blueprints import (
+        _published_platform_blueprint_matching_payload,
+    )
+
+    await seed_platform_blueprints(db_session)
+    payload = copy.deepcopy(next(
+        item for item in get_solo_company_blueprints()
+        if item["manifest"]["slug"] == SLUG
+    ))
+
+    matched = await _published_platform_blueprint_matching_payload(
+        db_session, payload,
+    )
+    assert matched is not None
+    assert matched.id == platform_blueprint_id(SLUG)
+
+    payload["embedded"]["skills"][0]["system_prompt"] = "caller supplied rewrite"
+    assert await _published_platform_blueprint_matching_payload(
+        db_session, payload,
+    ) is None
+
+
+@pytest.mark.asyncio
+async def test_seeding_projects_showcase_metadata_onto_the_marketplace_row(
+    db_session,
+    monkeypatch,
+):
+    payloads = [copy.deepcopy(payload) for payload in get_solo_company_blueprints()]
+    target = next(payload for payload in payloads if payload["manifest"]["slug"] == SLUG)
+    target["manifest"]["cover_image_url"] = "/assets/blueprints/stickman/cover.png"
+    target["manifest"]["showcase_assets"] = [{
+        "id": "stickman-cover",
+        "kind": "image",
+        "url": "/assets/blueprints/stickman/cover.png",
+        "alt_text": "Stickman Blueprint preview",
+    }]
+    monkeypatch.setattr(
+        "packages.core.blueprints.seed.get_solo_company_blueprints",
+        lambda: payloads,
+    )
+
+    await seed_platform_blueprints(db_session)
+
+    row = await db_session.get(WorkspaceBlueprint, platform_blueprint_id(SLUG))
+    assert row is not None
+    assert row.cover_image_url == "/assets/blueprints/stickman/cover.png"
+    assert row.showcase_assets == target["manifest"]["showcase_assets"]
 
 
 @pytest.mark.asyncio
@@ -94,6 +152,67 @@ async def test_seeding_adopts_a_legacy_platform_row_without_aborting(db_session)
     assert legacy.payload["embedded"]["skills"][0]["system_prompt"] != "legacy stub"
     assert legacy.title != "Legacy platform listing"
     assert await db_session.get(WorkspaceBlueprint, platform_blueprint_id(SLUG)) is None
+
+    from apps.api.routers.blueprints import _find_blueprint_row
+
+    resolved = await _find_blueprint_row(db_session, platform_blueprint_id(SLUG))
+    assert resolved is legacy
+
+    workspace = Workspace(
+        entity_id="01TESTENTITY0000000000000P",
+        name="Legacy slug-only install",
+        settings={"_blueprint": {"blueprint_slug": SLUG}},
+    )
+    db_session.add(workspace)
+    await db_session.flush()
+
+    from apps.api.routers.workspaces import _blueprint_payloads_for
+
+    payloads = await _blueprint_payloads_for(db_session, [workspace])
+    assert payloads[workspace.id] == (
+        legacy.payload,
+        legacy.content_version,
+        legacy.id,
+    )
+
+
+@pytest.mark.asyncio
+async def test_install_count_increment_is_atomic_across_sessions(db_session):
+    from apps.api.routers.blueprints import _increment_blueprint_install_count
+    from packages.core.models.base import generate_ulid
+
+    blueprint = WorkspaceBlueprint(
+        entity_id=generate_ulid(),
+        slug=f"concurrent-installs-{generate_ulid().lower()}",
+        title="Concurrent install counter",
+        payload={"manifest": {"blueprint_version": "1.1"}},
+        payload_version="1.1",
+        status="published",
+        install_count=0,
+    )
+    db_session.add(blueprint)
+    await db_session.commit()
+
+    session_factory = async_sessionmaker(
+        db_session.bind,
+        expire_on_commit=False,
+    )
+
+    async def increment_once() -> None:
+        async with session_factory() as session:
+            await _increment_blueprint_install_count(session, blueprint.id)
+            await session.commit()
+
+    increments = 8
+    await asyncio.gather(*(increment_once() for _ in range(increments)))
+    async with session_factory() as verification_session:
+        install_count = (await verification_session.execute(
+            select(WorkspaceBlueprint.install_count).where(
+                WorkspaceBlueprint.id == blueprint.id,
+            )
+        )).scalar_one()
+
+    assert install_count == increments
 
 
 @pytest.mark.asyncio
@@ -180,7 +299,7 @@ def test_nothing_resolves_a_payload_from_the_config_directory():
 
     body = inspect.getsource(workspaces._blueprint_payloads_for)
     assert "get_solo_company_blueprint" not in body
-    assert "WorkspaceBlueprint" in body
+    assert "resolve_blueprint_rows" in body
 
 
 def test_marketplace_listing_does_not_append_the_configs_to_the_rows():
@@ -195,6 +314,19 @@ def test_marketplace_listing_does_not_append_the_configs_to_the_rows():
     body = inspect.getsource(blueprints.list_blueprints)
     assert "get_solo_company_blueprints" not in body
     assert "return summaries" in body
+
+
+def test_marketplace_detail_and_install_use_the_canonical_row():
+    import inspect
+
+    from apps.api.routers import blueprints
+
+    detail_body = inspect.getsource(blueprints.get_blueprint)
+    install_body = inspect.getsource(blueprints.install)
+    assert "_builtin_detail" not in detail_body
+    assert "_load_blueprint" in detail_body
+    assert "_builtin_payload_for_id" not in install_body
+    assert "_load_blueprint" in install_body
 
 
 def test_the_seeder_runs_at_startup():

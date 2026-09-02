@@ -4,7 +4,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Optional
 
-from sqlalchemy import Boolean, DateTime, Float, Index, Integer, SmallInteger, String, Text, func
+from sqlalchemy import Boolean, DateTime, Float, Index, Integer, SmallInteger, String, Text, func, text
 from sqlalchemy.dialects.postgresql import ARRAY, JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -53,6 +53,9 @@ class Task(Base, TimestampMixin):
     deadline: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     started_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    # Dedicated lifecycle clock. ``updated_at`` also changes for title,
+    # assignee, and other edits, so it cannot identify a new status occurrence.
+    status_changed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
 
     # Automation fields
     sla_policy_id: Mapped[Optional[str]] = mapped_column(String(26))
@@ -218,6 +221,13 @@ class Message(Base):
     __tablename__ = "messages"
     __table_args__ = (
         Index("ix_messages_conv", "conversation_id", "created_at"),
+        Index(
+            "uq_messages_conversation_response_surface_event",
+            "conversation_id",
+            "response_surface_event_id",
+            unique=True,
+            postgresql_where=text("response_surface_event_id IS NOT NULL"),
+        ),
     )
 
     id: Mapped[str] = mapped_column(String(26), primary_key=True, default=generate_ulid)
@@ -228,6 +238,7 @@ class Message(Base):
     attachments: Mapped[Optional[dict]] = mapped_column(JSONB)
     token_usage: Mapped[Optional[dict]] = mapped_column(JSONB)
     meta: Mapped[dict] = mapped_column("metadata", JSONB, server_default="{}")
+    response_surface_event_id: Mapped[Optional[str]] = mapped_column(String(96))
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )

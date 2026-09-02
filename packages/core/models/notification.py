@@ -4,9 +4,15 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Optional
 
-from sqlalchemy import DateTime, ForeignKey, Index, String, func
+from sqlalchemy import DateTime, ForeignKey, Index, Integer, String, Text, func
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
+
+from packages.core.constants.notification_types import (
+    NotificationDeliveryStatus,
+    NotificationDispatchStatus,
+    NotificationOutboxStatus,
+)
 
 from .base import Base, generate_ulid
 
@@ -15,6 +21,12 @@ class Notification(Base):
     __tablename__ = "notifications"
     __table_args__ = (
         Index("ix_notifications_user", "user_id", "created_at"),
+        Index("ix_notifications_workspace", "workspace_id", "created_at"),
+        Index(
+            "uq_notifications_recipient_idempotency",
+            "entity_id", "user_id", "idempotency_key",
+            unique=True,
+        ),
         Index(
             "ix_notifications_due",
             "dispatch_status", "deliver_at",
@@ -24,6 +36,8 @@ class Notification(Base):
     id: Mapped[str] = mapped_column(String(26), primary_key=True, default=generate_ulid)
     entity_id: Mapped[str] = mapped_column(String(26), nullable=False)
     user_id: Mapped[str] = mapped_column(String(26), nullable=False)
+    workspace_id: Mapped[Optional[str]] = mapped_column(String(26))
+    idempotency_key: Mapped[Optional[str]] = mapped_column(String(255))
     type: Mapped[str] = mapped_column(String(50), nullable=False)
     title: Mapped[Optional[str]] = mapped_column(String(500))
     content: Mapped[Optional[str]] = mapped_column(String)
@@ -39,15 +53,71 @@ class Notification(Base):
     # sweeper picks it up.
     #
     # ``dispatch_status`` lifecycle:
-    #   - ``dispatched`` (default) — immediate notify(); the row is live
-    #     on the bell, external channels already shipped
+    #   - ``dispatched`` (default) — the row is live on the bell; external
+    #     channel status is owned by NotificationOutboxEvent
     #   - ``pending``                — future delivery; in-app row is
     #     hidden from the bell list and the sweeper will pick it up
     #   - ``canceled``               — producer revoked before delivery
-    #   - ``failed``                 — sweeper hit a permanent error
     deliver_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     dispatch_status: Mapped[str] = mapped_column(
-        String(20), nullable=False, default="dispatched", server_default="dispatched",
+        String(20),
+        nullable=False,
+        default=NotificationDispatchStatus.DISPATCHED.value,
+        server_default=NotificationDispatchStatus.DISPATCHED.value,
+    )
+
+
+class NotificationOutboxEvent(Base):
+    """Durable external fan-out intent for one logical notification.
+
+    The parent ``Notification`` is the in-app source of truth. This row is
+    claimed with a lease and may be retried at least once without creating a
+    second parent notification.
+    """
+
+    __tablename__ = "notification_outbox_events"
+    __table_args__ = (
+        Index(
+            "uq_notification_outbox_notification",
+            "notification_id",
+            unique=True,
+        ),
+        Index(
+            "ix_notification_outbox_due",
+            "status", "available_at",
+        ),
+        Index(
+            "ix_notification_outbox_lease",
+            "status", "locked_until",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(26), primary_key=True, default=generate_ulid)
+    notification_id: Mapped[str] = mapped_column(
+        String(26),
+        ForeignKey("notifications.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    payload: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict, server_default="{}")
+    status: Mapped[str] = mapped_column(
+        String(20),
+        nullable=False,
+        default=NotificationOutboxStatus.PENDING.value,
+        server_default=NotificationOutboxStatus.PENDING.value,
+    )
+    attempt_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0",
+    )
+    available_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    locked_until: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    claim_token: Mapped[Optional[str]] = mapped_column(String(26))
+    delivered_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    last_error: Mapped[Optional[str]] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False,
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False,
     )
 
 
@@ -119,7 +189,11 @@ class NotificationDelivery(Base):
     callback_kind: Mapped[Optional[str]] = mapped_column(String(64))
     callback_payload: Mapped[Optional[dict]] = mapped_column(JSONB)
 
-    status: Mapped[str] = mapped_column(String(20), nullable=False, default="pending")
+    status: Mapped[str] = mapped_column(
+        String(20),
+        nullable=False,
+        default=NotificationDeliveryStatus.PENDING.value,
+    )
     resolved_action_key: Mapped[Optional[str]] = mapped_column(String(64))
     resolved_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     error_message: Mapped[Optional[str]] = mapped_column(String)

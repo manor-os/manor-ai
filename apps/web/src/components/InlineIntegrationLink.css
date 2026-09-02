@@ -1,0 +1,13 @@
+.inline-integration-link {
+  min-height: 28px;
+  color: inherit;
+  text-decoration: none;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .inline-integration-link,
+  .inline-integration-link:hover {
+    transition: none;
+    transform: none;
+  }
+}

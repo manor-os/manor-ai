@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head><meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" /><title>Message collapse regression</title></head>
+  <body>
+    <div id="root"></div>
+    <script type="module">
+      import React, { useState } from "react";
+      import { createRoot } from "react-dom/client";
+      import { MemoryRouter } from "react-router-dom";
+      import CollapsibleSentMessage from "/src/components/chat/CollapsibleSentMessage.tsx";
+      import ChatMarkdown from "/src/components/ChatMarkdown.tsx";
+      import AssistantMessageBlocks from "/src/components/AssistantMessageBlocks.tsx";
+      import "/src/index.css";
+
+      const h = React.createElement;
+      const longText = Array.from({ length: 18 }, (_, i) => `第 ${i + 1} 笔记录：这是一条用于验证长消息显示的测试内容。`).join("\n\n");
+      const shortText = "已完成，文件已经保存，可以直接查看。";
+      function Final({ id, text, streaming = false }) {
+        return h(AssistantMessageBlocks, {
+          blocks: [{ id, type: "text", phase: "final", text }],
+          content: text, keyPrefix: id, sourceMessageId: id,
+          minimal: true, collapseLongFinal: true, streaming,
+        });
+      }
+      function Example({ id, title, user = false, children }) {
+        return h("section", { id, style: { marginBottom: 24, minWidth: 0 } },
+          h("h2", { style: { marginBottom: 8, color: "var(--text-muted)", fontSize: 13 } }, title),
+          h("div", { className: `chat-bubble chat-bubble--${user ? "user" : "bot"}`, style: { width: "100%", maxWidth: "100%" } }, children),
+        );
+      }
+      function App() {
+        const [streaming, setStreaming] = useState(true);
+        const [changingText, setChangingText] = useState(longText);
+        const [addedRows, setAddedRows] = useState(false);
+        return h(MemoryRouter, {},
+          h("main", { style: { maxWidth: 800, margin: "24px auto", padding: 16 } },
+            h("h1", { style: { fontSize: 20, marginBottom: 20 } }, "Workspace 消息折叠测试"),
+            h(Example, { id: "short-ai", title: "AI 短回复：应完整显示" }, h(Final, { id: "short-final", text: shortText })),
+            h(Example, { id: "long-source", title: "Markdown 原文很长，但显示只有一行：不应折叠" },
+              h(Final, { id: "source-final", text: `[查看文档](https://example.com/${"long-path-".repeat(120)})` })),
+            h(Example, { id: "long-ai", title: "AI 长回复：与用户消息同一规则" }, h(Final, { id: "long-final", text: longText })),
+            h(Example, { id: "long-user", title: "用户长消息", user: true },
+              h(CollapsibleSentMessage, { text: longText }, h(ChatMarkdown, { content: longText, isUser: true }))),
+            h(Example, { id: "responsive", title: "宽屏能完整显示、窄屏自动判断换行高度" },
+              h(Final, { id: "responsive-final", text: "这是一段用于验证响应式显示的内容，宽屏只需要几行，而窄屏会自动换行。".repeat(6) })),
+            h("button", { className: "btn-ghost", onClick: () => setStreaming(!streaming) }, streaming ? "完成输出" : "重新开始输出"),
+            h(Example, { id: "streaming", title: "输出中保持完整，完成后才折叠" }, h(Final, { id: "stream-final", text: longText, streaming })),
+            h("button", { className: "btn-ghost", onClick: () => setChangingText(changingText === longText ? shortText : longText) }, "切换长短内容"),
+            h(Example, { id: "changing", title: "同一组件内容变化后重新判断" }, h(Final, { id: "changing-final", text: changingText })),
+            h("button", { className: "btn-ghost", onClick: () => setAddedRows(!addedRows) }, "切换异步内容"),
+            h(Example, { id: "async", title: "原文不变，子内容高度变化后重新判断" },
+              h(CollapsibleSentMessage, { text: "stable", tone: "assistant" },
+                h("div", {}, ...(addedRows ? Array.from({ length: 18 }, (_, i) => h("p", { key: i, style: { marginBottom: 8 } }, `异步行 ${i + 1}`)) : [h("p", { key: "short" }, shortText)])))),
+          ),
+        );
+      }
+      createRoot(document.getElementById("root")).render(h(App));
+    </script>
+  </body>
+</html>

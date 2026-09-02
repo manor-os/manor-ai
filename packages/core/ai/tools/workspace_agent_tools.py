@@ -1,15 +1,19 @@
 """Workspace Agent tools for Manor AI in workspace chat.
 
-These tools are the durable operation layer behind natural-language workspace
-chat. They let the master agent turn user messages into workspace-scoped tasks,
-task runtime requirements, persistent guardrails, and strategist reviews without
-going through the broad ``manor`` composite gateway.
+These handlers are the durable operation layer behind natural-language
+Workspace chat. Internal masters reach them through
+``manor(action="workspace")``; narrow historical names remain as compatibility
+or external least-privilege entries.
 """
 from __future__ import annotations
 
 import json
 from typing import Any
 
+from packages.core.ai.runtime.composite_tools import WorkspaceToolAction
+from packages.core.ai.runtime.workspace_composite_actions import (
+    runtime_visualize_workspace_ledgers_action,
+)
 from packages.core.ai.runtime import (
     runtime_get_goal_status_action,
     runtime_update_goal_value_action,
@@ -23,10 +27,31 @@ from packages.core.ai.runtime import (
     runtime_workspace_operation_action,
     runtime_workspace_remove_knowledge_document_action,
     runtime_workspace_request_strategist_review_action,
+    runtime_workspace_resolve_hitl_action,
     runtime_workspace_update_task_runtime_action,
     runtime_workspace_update_knowledge_policy_action,
 )
-from packages.core.constants.pending_actions import PendingActionKind
+from packages.core.ai.runtime.tool_context import RUNTIME_TOOL_CONTEXT_KEYS
+
+
+_WORKSPACE_PROTECTED_CONTEXT_KEYS = frozenset(
+    {
+        "entity_id",
+        "user_id",
+        "workspace_id",
+        "conversation_id",
+        "actor_agent_id",
+    }
+    | set(RUNTIME_TOOL_CONTEXT_KEYS)
+)
+
+
+def _workspace_action_params(params: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: value
+        for key, value in params.items()
+        if key not in _WORKSPACE_PROTECTED_CONTEXT_KEYS
+    }
 
 
 WORKSPACE_AGENT_SCHEMA = {
@@ -39,22 +64,7 @@ WORKSPACE_AGENT_SCHEMA = {
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": [
-                        "search",
-                        "create_task",
-                        "update_task_runtime",
-                        "list_knowledge",
-                        "create_knowledge_folder",
-                        "add_knowledge_documents",
-                        "remove_knowledge_document",
-                        "update_knowledge_policy",
-                        "add_rule",
-                        "delegate_service",
-                        "get_goal_status",
-                        "update_goal_value",
-                        "operation",
-                        "request_strategist_review",
-                    ],
+                    "enum": list(WorkspaceToolAction.values()),
                 },
                 "params": {
                     "type": "object",
@@ -253,7 +263,21 @@ WORKSPACE_CREATE_TASK_SCHEMA = {
                     "type": "integer",
                     "description": "Priority: 5=critical, 4=high, 3=medium, 2=low, 1=minimal.",
                 },
-                "task_type": {"type": "string", "description": "Task type slug, default general."},
+                "task_type": {
+                    "type": "string",
+                    "description": (
+                        "Task type slug. Use interactive when the work itself is an "
+                        "adaptive conversation, such as teaching, coaching, practice, "
+                        "or a mock interview; otherwise default to general."
+                    ),
+                },
+                "session_config": {
+                    "type": "object",
+                    "description": (
+                        "Optional interactive-session contract, such as objective, "
+                        "opening, phases, rubric, completion criteria, or source context."
+                    ),
+                },
                 "assignee_id": {"type": "string", "description": "Optional user/staff assignee id."},
                 "agent_id": {"type": "string", "description": "Optional agent id to associate with the task."},
                 "agent_type": {"type": "string", "description": "Optional agent type/service key hint."},
@@ -459,7 +483,9 @@ WORKSPACE_REQUEST_STRATEGIST_REVIEW_SCHEMA = {
             "or reassess workspace goals/rules/knowledge after new context. Do not "
             "use merely because the user appended task-local roles or review stages; "
             "persist those with workspace_update_task_runtime unless the user explicitly "
-            "asks to replan or create follow-up tasks now.\n\n"
+            "asks to replan or create follow-up tasks now. A paused or otherwise inactive "
+            "workspace cannot start a review; report that block truthfully and ask the user "
+            "to start the workspace before retrying.\n\n"
             "TWO-STEP CONTRACT: if proposals from an earlier review are still "
             "awaiting the user's decision, this returns "
             "{\"needs_decision\": true, \"conflict\": {...}} and does NOT start a "
@@ -653,29 +679,6 @@ def _dumps(payload: dict[str, Any]) -> str:
     return json.dumps(payload, ensure_ascii=False, default=str)
 
 
-def _pending_hitl_id(pending_action: dict[str, Any]) -> str:
-    operation = pending_action.get("operation") if isinstance(pending_action.get("operation"), dict) else {}
-    return str(
-        pending_action.get("draft_id")
-        or pending_action.get("approval_token")
-        or pending_action.get("review_id")
-        or pending_action.get("step_id")
-        or operation.get("draft_id")
-        or ""
-    ).strip()
-
-
-def _normalise_hitl_action(action: Any) -> str:
-    raw = str(action or "").strip().lower()
-    approvals = {"approve", "approved", "yes", "accept", "confirm", "confirmed", "ok"}
-    rejections = {"reject", "rejected", "no", "deny", "decline", "cancel", "cancelled", "canceled", "stop"}
-    if raw in approvals:
-        return "approve"
-    if raw in rejections:
-        return "reject"
-    return raw
-
-
 async def _workspace_agent_handler(
     entity_id: str = "",
     user_id: str = "",
@@ -683,45 +686,79 @@ async def _workspace_agent_handler(
     conversation_id: str = "",
     **kwargs: Any,
 ) -> str:
-    action = str(kwargs.get("action") or "").strip()
+    raw_action = str(kwargs.get("action") or "").strip()
     raw_params = kwargs.get("params") or {}
     params = raw_params if isinstance(raw_params, dict) else {}
-    if not action:
+    if not raw_action:
         return _dumps({"error": "action is required"})
 
-    if action == "search":
+    try:
+        action = WorkspaceToolAction(raw_action)
+    except ValueError:
+        return _dumps({"error": f"unsupported workspace_agent action: {raw_action}"})
+
+    if action is WorkspaceToolAction.SEARCH:
         from packages.core.ai.runtime import runtime_workspace_search
 
         return await runtime_workspace_search(
             entity_id=entity_id,
             workspace_id=workspace_id,
-            **params,
+            **_workspace_action_params(params),
         )
 
     handlers = {
-        "create_task": _workspace_create_task_handler,
-        "update_task_runtime": _workspace_update_task_runtime_handler,
-        "list_knowledge": _workspace_list_knowledge_handler,
-        "create_knowledge_folder": _workspace_create_knowledge_folder_handler,
-        "add_knowledge_documents": _workspace_add_knowledge_documents_handler,
-        "remove_knowledge_document": _workspace_remove_knowledge_document_handler,
-        "update_knowledge_policy": _workspace_update_knowledge_policy_handler,
-        "add_rule": _workspace_add_rule_handler,
-        "get_goal_status": _workspace_get_goal_status_handler,
-        "update_goal_value": _workspace_update_goal_value_handler,
-        "operation": _workspace_operation_handler,
-        "request_strategist_review": _workspace_request_strategist_review_handler,
-        "delegate_service": _workspace_delegate_service_handler,
+        WorkspaceToolAction.CREATE_TASK: _workspace_create_task_handler,
+        WorkspaceToolAction.UPDATE_TASK_RUNTIME: _workspace_update_task_runtime_handler,
+        WorkspaceToolAction.LIST_KNOWLEDGE: _workspace_list_knowledge_handler,
+        WorkspaceToolAction.CREATE_KNOWLEDGE_FOLDER: _workspace_create_knowledge_folder_handler,
+        WorkspaceToolAction.ADD_KNOWLEDGE_DOCUMENTS: _workspace_add_knowledge_documents_handler,
+        WorkspaceToolAction.REMOVE_KNOWLEDGE_DOCUMENT: _workspace_remove_knowledge_document_handler,
+        WorkspaceToolAction.UPDATE_KNOWLEDGE_POLICY: _workspace_update_knowledge_policy_handler,
+        WorkspaceToolAction.ADD_RULE: _workspace_add_rule_handler,
+        WorkspaceToolAction.GET_GOAL_STATUS: _workspace_get_goal_status_handler,
+        WorkspaceToolAction.UPDATE_GOAL_VALUE: _workspace_update_goal_value_handler,
+        WorkspaceToolAction.OPERATION: _workspace_operation_handler,
+        WorkspaceToolAction.REQUEST_STRATEGIST_REVIEW: _workspace_request_strategist_review_handler,
+        WorkspaceToolAction.DELEGATE_SERVICE: _workspace_delegate_service_handler,
+        WorkspaceToolAction.RESOLVE_HITL: _workspace_resolve_hitl_handler,
+        WorkspaceToolAction.ANSWER_TASK_BLOCKER: _answer_task_blocker_handler,
+        WorkspaceToolAction.VISUALIZE_LEDGERS: _workspace_visualize_ledgers_handler,
     }
     handler = handlers.get(action)
     if not handler:
-        return _dumps({"error": f"unsupported workspace_agent action: {action}"})
+        return _dumps({"error": f"unsupported workspace_agent action: {raw_action}"})
 
     # Stamp the active agent persona so task logs/comments it writes are
     # attributed to that agent in the activity UI (not a generic
     # "workspace-agent"). The id is injected by the runtime tool harness.
+    action_params = _workspace_action_params(params)
+    context_kwargs = {
+        key: value
+        for key, value in kwargs.items()
+        if key in RUNTIME_TOOL_CONTEXT_KEYS
+    }
+    runtime_task_id = str(context_kwargs.get("task_id") or "").strip()
+    requested_task_id = str(params.get("task_id") or "").strip()
+    if (
+        action is WorkspaceToolAction.UPDATE_TASK_RUNTIME
+        and runtime_task_id
+        and requested_task_id
+        and requested_task_id != runtime_task_id
+    ):
+        return _dumps({"error": "task_id conflicts with active runtime task"})
+    if (
+        action is WorkspaceToolAction.UPDATE_TASK_RUNTIME
+        and not runtime_task_id
+        and requested_task_id
+    ):
+        # A global Workspace chat may target a task explicitly. A task-scoped
+        # Runtime requires an exact match with its injected target above.
+        action_params["task_id"] = requested_task_id
     actor_kwargs: dict[str, Any] = {}
-    if action in ("create_task", "update_task_runtime"):
+    if action in {
+        WorkspaceToolAction.CREATE_TASK,
+        WorkspaceToolAction.UPDATE_TASK_RUNTIME,
+    }:
         actor_agent_id = str(kwargs.get("_agent_id_from_context") or "").strip()
         if actor_agent_id:
             actor_kwargs["actor_agent_id"] = actor_agent_id
@@ -731,8 +768,9 @@ async def _workspace_agent_handler(
         user_id=user_id,
         workspace_id=workspace_id,
         conversation_id=conversation_id,
+        **context_kwargs,
         **actor_kwargs,
-        **params,
+        **action_params,
     )
 
 
@@ -872,121 +910,30 @@ async def _workspace_resolve_hitl_handler(
     conversation_id: str = "",
     **kwargs: Any,
 ) -> str:
-    message_id = str(kwargs.get("message_id") or "").strip()
-    hitl_id = str(kwargs.get("hitl_id") or "").strip()
-    action = _normalise_hitl_action(kwargs.get("action"))
-    note = str(kwargs.get("note") or "").strip()
-    if not conversation_id or not workspace_id or not entity_id:
-        return _dumps({"error": "workspace_resolve_hitl requires workspace conversation context"})
-    if not user_id:
-        return _dumps({"error": "workspace_resolve_hitl requires a user_id"})
-    if action not in {"approve", "reject"}:
-        return _dumps({
-            "error": "unsupported_hitl_action",
-            "message": "This tool currently supports approve/reject workspace operation reviews.",
-            "action": action,
-        })
+    return await runtime_workspace_resolve_hitl_action(
+        entity_id=entity_id,
+        workspace_id=workspace_id,
+        conversation_id=conversation_id,
+        user_id=user_id or None,
+        params=kwargs,
+    )
 
-    from sqlalchemy import select
-    from packages.core.database import async_session
-    from packages.core.models.task import Message
-    from packages.core.services.workspace_operation_service import resolve_workspace_operation_review
-    from packages.core.workspace_chat import service as workspace_chat_service
 
-    async with async_session() as db:
-        rows = list((await db.execute(
-            select(Message)
-            .where(
-                Message.conversation_id == conversation_id,
-                Message.pending_action.isnot(None),
-                Message.resolved_at.is_(None),
-            )
-            .order_by(Message.created_at.desc())
-            .limit(25)
-        )).scalars().all())
-        candidates = [
-            row for row in rows
-            if isinstance(row.pending_action, dict)
-            and row.pending_action.get("kind") == PendingActionKind.WORKSPACE_OPERATION_REVIEW
-        ]
-        if not candidates:
-            return _dumps({"resolved": False, "reason": "no_open_workspace_operation_review"})
-
-        primary = next((row for row in candidates if row.id == message_id), None)
-        if primary is None and hitl_id:
-            primary = next(
-                (
-                    row for row in candidates
-                    if _pending_hitl_id(row.pending_action or {}) == hitl_id
-                ),
-                None,
-            )
-        if primary is None:
-            return _dumps({
-                "resolved": False,
-                "reason": "target_not_found",
-                "available": [
-                    {
-                        "message_id": row.id,
-                        "hitl_id": _pending_hitl_id(row.pending_action or {}),
-                    }
-                    for row in candidates[:10]
-                ],
-            })
-
-        primary_hitl_id = _pending_hitl_id(primary.pending_action or {})
-        targets = [
-            row for row in candidates
-            if primary_hitl_id and _pending_hitl_id(row.pending_action or {}) == primary_hitl_id
-        ] or [primary]
-
-        result = await resolve_workspace_operation_review(
-            db,
-            conversation_id=conversation_id,
-            entity_id=entity_id,
-            user_id=user_id,
-            workspace_id=workspace_id,
-            hitl_id=primary_hitl_id,
-            action=action,
-        )
-        if result is None:
-            await db.rollback()
-            return _dumps({"resolved": False, "reason": "workspace_operation_review_rejected_by_service"})
-
-        resolution = {"choice": str(result.get("action") or action)}
-        if note:
-            resolution["note"] = note
-        resolved_message_ids: list[str] = []
-        for target in targets:
-            resolved = await workspace_chat_service.resolve_pending_action(
-                db,
-                message_id=target.id,
-                user_id=user_id,
-                resolution=resolution,
-            )
-            if resolved is not None:
-                resolved_message_ids.append(target.id)
-
-        db.add(Message(
-            conversation_id=conversation_id,
-            role="system",
-            content=str(result.get("message") or "Workspace operation review resolved."),
-            author_kind="system",
-            message_kind="system",
-            refs=[
-                {"type": "message", "id": primary.id},
-                {"type": "workspace_operation_draft", "id": result.get("draft_id")},
-            ],
-        ))
-        await db.commit()
-        return _dumps({
-            "resolved": True,
-            "kind": PendingActionKind.WORKSPACE_OPERATION_REVIEW.value,
-            "action": resolution["choice"],
-            "draft_id": result.get("draft_id") or primary_hitl_id,
-            "message_ids": resolved_message_ids,
-            "message": result.get("llm_message") or result.get("message"),
-        })
+async def _workspace_visualize_ledgers_handler(
+    entity_id: str = "",
+    user_id: str = "",
+    workspace_id: str = "",
+    conversation_id: str = "",
+    **kwargs: Any,
+) -> str:
+    return await runtime_visualize_workspace_ledgers_action(
+        entity_id=entity_id,
+        tool_kwargs={
+            "workspace_id": workspace_id,
+            "conversation_id": conversation_id,
+            **kwargs,
+        },
+    )
 
 
 async def _workspace_add_rule_handler(

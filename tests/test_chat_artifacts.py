@@ -1,4 +1,7 @@
 import json
+from types import SimpleNamespace
+
+import pytest
 
 from packages.core.services.chat_artifacts import chat_attachments_from_tool_results
 
@@ -38,7 +41,7 @@ def test_chat_attachments_from_generated_media_tool_results():
                     "created": True,
                     "kind": "pdf",
                     "document": {
-                        "id": "doc_pdf",
+                        "document_id": "doc_pdf",
                         "name": "brief.pdf",
                         "fs_path": "documents/brief.pdf",
                         "file_type": "pdf",
@@ -52,7 +55,7 @@ def test_chat_attachments_from_generated_media_tool_results():
     assert chat_attachments_from_tool_results(tool_results) == [
         {
             "name": "hero.png",
-            "id": "doc_img",
+            "document_id": "doc_img",
             "type": "knowledge",
             "open_url": "/viewer/doc_img",
             "markdown_link": "[hero.png](/viewer/doc_img)",
@@ -63,7 +66,7 @@ def test_chat_attachments_from_generated_media_tool_results():
         },
         {
             "name": "intro.mp4",
-            "id": "doc_vid",
+            "document_id": "doc_vid",
             "type": "knowledge",
             "open_url": "/viewer/doc_vid",
             "markdown_link": "[intro.mp4](/viewer/doc_vid)",
@@ -74,7 +77,7 @@ def test_chat_attachments_from_generated_media_tool_results():
         },
         {
             "name": "brief.pdf",
-            "id": "doc_pdf",
+            "document_id": "doc_pdf",
             "type": "knowledge",
             "open_url": "/viewer/doc_pdf",
             "markdown_link": "[brief.pdf](/viewer/doc_pdf)",
@@ -85,6 +88,37 @@ def test_chat_attachments_from_generated_media_tool_results():
         },
     ]
 
+
+def test_runtime_document_payload_keeps_exact_id_through_chat_artifacts():
+    from packages.core.ai.runtime.document_actions import runtime_document_to_dict
+
+    document = runtime_document_to_dict(
+        SimpleNamespace(
+            id="doc_exact",
+            name="report.md",
+            file_type="md",
+            file_size=42,
+        )
+    )
+
+    attachments = chat_attachments_from_tool_results([
+        {
+            "name": "generate_document_file",
+            "raw_result": json.dumps({"created": True, "document": document}),
+        }
+    ])
+
+    assert attachments == [
+        {
+            "name": "report.md",
+            "document_id": "doc_exact",
+            "type": "knowledge",
+            "open_url": "/viewer/doc_exact",
+            "markdown_link": "[report.md](/viewer/doc_exact)",
+            "fileType": "md",
+            "mimeType": "text/markdown",
+        }
+    ]
 
 def test_chat_attachments_from_generated_code_bundle_files():
     tool_results = [
@@ -112,7 +146,7 @@ def test_chat_attachments_from_generated_code_bundle_files():
     assert chat_attachments_from_tool_results(tool_results) == [
         {
             "name": "index.html",
-            "id": "doc_html",
+            "document_id": "doc_html",
             "type": "knowledge",
             "open_url": "/viewer/doc_html",
             "markdown_link": "[index.html](/viewer/doc_html)",
@@ -123,7 +157,7 @@ def test_chat_attachments_from_generated_code_bundle_files():
         },
         {
             "name": "styles.css",
-            "id": "doc_css",
+            "document_id": "doc_css",
             "type": "knowledge",
             "open_url": "/viewer/doc_css",
             "markdown_link": "[styles.css](/viewer/doc_css)",
@@ -194,7 +228,7 @@ def test_sandbox_save_result_can_opt_into_final_chat_attachment():
     assert chat_attachments_from_tool_results(tool_results) == [
         {
             "name": "final-report.pdf",
-            "id": "doc_pdf",
+            "document_id": "doc_pdf",
             "type": "knowledge",
             "open_url": "/viewer/doc_pdf",
             "markdown_link": "[final-report.pdf](/viewer/doc_pdf)",
@@ -204,6 +238,58 @@ def test_sandbox_save_result_can_opt_into_final_chat_attachment():
             "previewUrl": "/api/v1/fs/ent/reports/final-report.pdf",
         }
     ]
+
+
+def test_composite_sandbox_save_result_is_not_chat_attachment_by_default():
+    tool_results = [
+        {
+            "name": "sandbox",
+            "arguments": {
+                "action": "save_result",
+                "params": {"sandbox_id": "sb_123", "path": "file.txt"},
+            },
+            "raw_result": {
+                "saved": True,
+                "saved_to_knowledge": True,
+                "document_id": "doc_txt",
+                "name": "file.txt",
+                "fs_path": "file.txt",
+                "result_url": "/api/v1/fs/ent/file.txt",
+                "mime_type": "text/plain",
+            },
+        }
+    ]
+
+    assert chat_attachments_from_tool_results(tool_results) == []
+
+
+def test_composite_sandbox_save_result_can_opt_into_final_chat_attachment():
+    tool_results = [
+        {
+            "name": "sandbox",
+            "arguments": {
+                "action": "save_result",
+                "params": {"sandbox_id": "sb_123", "path": "final-report.pdf"},
+            },
+            "raw_result": {
+                "saved": True,
+                "saved_to_knowledge": True,
+                "display_as_artifact": True,
+                "artifact_role": "final",
+                "document_id": "doc_pdf",
+                "name": "final-report.pdf",
+                "fs_path": "reports/final-report.pdf",
+                "result_url": "/api/v1/fs/ent/reports/final-report.pdf",
+                "mime_type": "application/pdf",
+            },
+        }
+    ]
+
+    attachments = chat_attachments_from_tool_results(tool_results)
+
+    assert len(attachments) == 1
+    assert attachments[0]["document_id"] == "doc_pdf"
+    assert attachments[0]["open_url"] == "/viewer/doc_pdf"
 
 
 def test_chat_attachments_open_document_id_without_filesystem_reference():
@@ -225,7 +311,7 @@ def test_chat_attachments_open_document_id_without_filesystem_reference():
     assert chat_attachments_from_tool_results(tool_results) == [
         {
             "name": "draft.pdf",
-            "id": "doc_pdf",
+            "document_id": "doc_pdf",
             "type": "knowledge",
             "open_url": "/viewer/doc_pdf",
             "markdown_link": "[draft.pdf](/viewer/doc_pdf)",
@@ -233,6 +319,42 @@ def test_chat_attachments_open_document_id_without_filesystem_reference():
             "mimeType": "application/pdf",
         }
     ]
+
+
+def test_chat_attachments_do_not_infer_document_ids_from_alias_fields():
+    tool_results = []
+    for key in ("documentId", "doc_id", "id"):
+        tool_results.append({
+            "name": "generate_file",
+            "raw_result": {
+                "created": True,
+                "kind": "pdf",
+                "name": f"{key}.pdf",
+                key: f"doc_{key}",
+                "mime_type": "application/pdf",
+            },
+        })
+
+    assert chat_attachments_from_tool_results(tool_results) == []
+
+
+@pytest.mark.asyncio
+async def test_conversation_history_resolves_only_canonical_document_id():
+    from packages.core.services.conversation_history import (
+        _resolve_message_attachment_refs,
+    )
+
+    class NoDocumentLookup:
+        async def execute(self, _statement):
+            raise AssertionError("legacy attachment id must not trigger a Document lookup")
+
+    refs = await _resolve_message_attachment_refs(
+        NoDocumentLookup(),
+        SimpleNamespace(entity_id="entity"),
+        SimpleNamespace(attachments=[{"id": "doc_alias", "name": "legacy.pdf"}]),
+    )
+
+    assert refs == [{"id": "doc_alias", "name": "legacy.pdf"}]
 
 
 def test_chat_attachments_open_external_url_without_filesystem_reference():

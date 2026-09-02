@@ -1,0 +1,12 @@
+{
+  "id": "mcp_webhook",
+  "name": "mcp_webhook",
+  "type": "runtime_guidance",
+  "description": "Send JSON events to a connected HTTP webhook with explicit authorization, timeout, and idempotency controls.",
+  "category": "connectors",
+  "output_format": "guidance",
+  "tags": ["webhook", "http", "events", "connectors", "runtime-guidance", "builtin", "mcp"],
+  "tools": [
+    "mcp__webhook__send"
+  ]
+}

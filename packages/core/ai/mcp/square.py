@@ -12,14 +12,14 @@ Tools follow ``mcp__square__{tool_name}``. Read + write across locations,
 catalog (items), orders, customers and inventory.
 
 Money is in the smallest currency unit (e.g. cents). Mutations send a
-generated idempotency key as required by Square.
+caller-supplied idempotency key so retries cannot create duplicate objects.
 """
 from __future__ import annotations
 
 import json
 import logging
-import uuid
 from typing import Any, Dict, List, Optional
+from urllib.parse import quote
 
 import httpx
 
@@ -28,6 +28,7 @@ logger = logging.getLogger(__name__)
 _VERSION = "2025-01-23"  # Square-Version header
 _MAX_CHARS = 12_000
 _TIMEOUT = 30.0
+_MAX_LIMIT = 100
 
 
 def _base(env: str) -> str:
@@ -52,9 +53,12 @@ async def call_tool(
     handler = _HANDLERS.get(name)
     if not handler:
         return _error(f"Unknown tool: {name}")
+    if not isinstance(arguments, dict):
+        return _error("arguments must be an object")
+    arguments = dict(arguments)
 
     spec = _TOOLS.get(name, {})
-    missing = [p for p in spec.get("required", []) if arguments.get(p) in (None, "")]
+    missing = [p for p in spec.get("required", []) if _is_blank(arguments.get(p))]
     if missing:
         return _error(f"Missing required params: {', '.join(missing)}")
 
@@ -62,14 +66,27 @@ async def call_tool(
         cfg = json.loads(bearer_token) if bearer_token else {}
     except Exception:
         return _error("Square credentials malformed (expected JSON).")
+    if not isinstance(cfg, dict):
+        return _error("Square credentials malformed (expected JSON object).")
     token = cfg.get("access_token") or cfg.get("token")
-    if not token:
+    if _is_blank(token):
         return _error("Square needs an access_token.")
-    base = _base(cfg.get("environment", "production"))
+    if not isinstance(token, str):
+        return _error("Square access_token must be a string.")
+    environment_value = cfg.get("environment", "production")
+    if not isinstance(environment_value, str):
+        return _error("Square environment must be a string.")
+    token = token.strip()
+    environment = environment_value.strip().lower()
+    if environment not in {"sandbox", "production"}:
+        return _error("Square environment must be 'sandbox' or 'production'.")
+    base = _base(environment)
 
     try:
         text = await handler(base, token, cfg, arguments)
         return {"content": [{"type": "text", "text": text}], "isError": False}
+    except _SquareError as e:
+        return _error(str(e))
     except Exception as e:
         logger.exception("Square MCP tool %s failed", name)
         return _error(str(e))
@@ -79,9 +96,42 @@ def _error(msg: str) -> Dict[str, Any]:
     return {"content": [{"type": "text", "text": msg}], "isError": True}
 
 
+def _is_blank(value: Any) -> bool:
+    return value is None or (isinstance(value, str) and not value.strip())
+
+
 class _SquareError(RuntimeError):
     """Raised on non-2xx so call_tool surfaces it as isError, not as a
     success payload the model would mistake for a normal result."""
+
+
+def _bounded_limit(value: Any) -> int:
+    if isinstance(value, bool):
+        raise _SquareError("limit must be an integer between 1 and 100.")
+    try:
+        limit = int(value)
+    except (TypeError, ValueError):
+        raise _SquareError("limit must be an integer between 1 and 100.") from None
+    if isinstance(value, float) and value != limit:
+        raise _SquareError("limit must be an integer between 1 and 100.")
+    if limit < 1 or limit > _MAX_LIMIT:
+        raise _SquareError("limit must be an integer between 1 and 100.")
+    return limit
+
+
+def _idempotency_key(
+    args: Dict[str, Any],
+    *,
+    max_length: int | None = None,
+) -> str:
+    value = args.get("idempotency_key")
+    if not isinstance(value, str) or not value.strip():
+        raise _SquareError("idempotency_key must be a non-empty string.")
+    if max_length is not None and len(value) > max_length:
+        raise _SquareError(
+            f"idempotency_key must be a string of 1-{max_length} characters."
+        )
+    return value
 
 
 # ── REST client ───────────────────────────────────────────────────────────────
@@ -117,10 +167,6 @@ async def _api(
     return out[:_MAX_CHARS] + "\n… (truncated)" if len(out) > _MAX_CHARS else out
 
 
-def _idem() -> str:
-    return str(uuid.uuid4())
-
-
 # ── Read ────────────────────────────────────────────────────────────────────
 
 async def _list_locations(base, token, cfg, args) -> str:
@@ -128,7 +174,7 @@ async def _list_locations(base, token, cfg, args) -> str:
 
 
 async def _search_catalog_items(base, token, cfg, args) -> str:
-    body: Dict[str, Any] = {"limit": int(args.get("limit", 20))}
+    body: Dict[str, Any] = {"limit": _bounded_limit(args.get("limit", 20))}
     if args.get("query"):
         body["text_filter"] = args["query"]
     return await _api(base, token, "POST", "catalog/search-catalog-items", body)
@@ -143,8 +189,10 @@ async def _search_orders(base, token, cfg, args) -> str:
     if isinstance(location_ids, str):
         location_ids = [s.strip() for s in location_ids.split(",") if s.strip()]
     if not location_ids:
-        return "Provide location_ids (or set a default location_id in credentials)."
-    body: Dict[str, Any] = {"location_ids": location_ids, "limit": int(args.get("limit", 20))}
+        raise _SquareError(
+            "Provide location_ids (or set a default location_id in credentials)."
+        )
+    body: Dict[str, Any] = {"location_ids": location_ids, "limit": _bounded_limit(args.get("limit", 20))}
     if args.get("state"):
         body["query"] = {"filter": {"state_filter": {"states": [args["state"]]}}}
     return await _api(base, token, "POST", "orders/search", body)
@@ -192,12 +240,17 @@ async def _create_catalog_item(base, token, cfg, args) -> str:
         },
     }
     return await _api(base, token, "POST", "catalog/object", {
-        "idempotency_key": _idem(), "object": obj,
+        "idempotency_key": _idempotency_key(args, max_length=128), "object": obj,
     })
 
 
+async def _delete_catalog_object(base, token, cfg, args) -> str:
+    object_id = quote(str(args["object_id"]), safe="")
+    return await _api(base, token, "DELETE", f"catalog/object/{object_id}")
+
+
 async def _create_customer(base, token, cfg, args) -> str:
-    body: Dict[str, Any] = {"idempotency_key": _idem()}
+    body: Dict[str, Any] = {"idempotency_key": _idempotency_key(args)}
     for k in ("given_name", "family_name", "email_address", "phone_number", "company_name"):
         if args.get(k) is not None:
             body[k] = args[k]
@@ -215,7 +268,7 @@ async def _update_customer(base, token, cfg, args) -> str:
 async def _adjust_inventory(base, token, cfg, args) -> str:
     location_id = args.get("location_id") or cfg.get("location_id")
     if not location_id:
-        return "Provide location_id (or set a default in credentials)."
+        raise _SquareError("Provide location_id (or set a default in credentials).")
     change = {
         "type": "ADJUSTMENT",
         "adjustment": {
@@ -227,7 +280,8 @@ async def _adjust_inventory(base, token, cfg, args) -> str:
         },
     }
     return await _api(base, token, "POST", "inventory/changes/batch-create", {
-        "idempotency_key": _idem(), "changes": [change],
+        "idempotency_key": _idempotency_key(args, max_length=128),
+        "changes": [change],
     })
 
 
@@ -295,8 +349,18 @@ _TOOLS: Dict[str, Dict[str, Any]] = {
             "currency": _prop("ISO currency (default: USD)"),
             "description": _prop("Item description"),
             "variation_name": _prop("Variation name (default: Regular)"),
+            "idempotency_key": _prop(
+                "Caller-generated retry key (1-128 characters)",
+                minLength=1,
+                maxLength=128,
+            ),
         },
-        "required": ["name", "price_amount"],
+        "required": ["name", "price_amount", "idempotency_key"],
+    },
+    "delete_catalog_object": {
+        "description": "Delete a catalog object (use to clean up staging fixtures)",
+        "properties": {"object_id": _prop("Catalog object id")},
+        "required": ["object_id"],
     },
     "create_customer": {
         "description": "Create a customer",
@@ -306,8 +370,12 @@ _TOOLS: Dict[str, Dict[str, Any]] = {
             "email_address": _prop("Email"),
             "phone_number": _prop("Phone"),
             "company_name": _prop("Company"),
+            "idempotency_key": _prop(
+                "Caller-generated retry key",
+                minLength=1,
+            ),
         },
-        "required": [],
+        "required": ["idempotency_key"],
     },
     "update_customer": {
         "description": "Update a customer's fields",
@@ -329,8 +397,13 @@ _TOOLS: Dict[str, Dict[str, Any]] = {
             "location_id": _prop("Location id (defaults to credential location)"),
             "from_state": _prop("From state (default: NONE)"),
             "to_state": _prop("To state (default: IN_STOCK)"),
+            "idempotency_key": _prop(
+                "Caller-generated retry key (1-128 characters)",
+                minLength=1,
+                maxLength=128,
+            ),
         },
-        "required": ["catalog_object_id", "quantity"],
+        "required": ["catalog_object_id", "quantity", "idempotency_key"],
     },
 }
 
@@ -345,6 +418,7 @@ _HANDLERS = {
     "get_customer": _get_customer,
     "get_inventory": _get_inventory,
     "create_catalog_item": _create_catalog_item,
+    "delete_catalog_object": _delete_catalog_object,
     "create_customer": _create_customer,
     "update_customer": _update_customer,
     "adjust_inventory": _adjust_inventory,

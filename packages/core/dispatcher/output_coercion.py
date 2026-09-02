@@ -17,9 +17,13 @@ from typing import Any
 
 from packages.core.contracts.envelope import (
     build_step_result_envelope,
-    is_step_result_envelope_schema,
 )
-from packages.core.contracts.task_output import is_plan_output_contract_schema
+from packages.core.contracts.task_output import (
+    OutputContractKind,
+    TaskOutputValueKind,
+    output_contract_for_schema,
+)
+from packages.core.contracts.shapes import coerce_to_shape
 
 
 _TEXT_KEYS = (
@@ -55,7 +59,13 @@ _PATH_RE = re.compile(
 _URL_RE = re.compile(r"https?://[^\s)\]>\"']+", re.IGNORECASE)
 
 
-def coerce_step_output_for_schema(schema: dict | None, result: Any) -> Any:
+def coerce_step_output_for_schema(
+    schema: dict | None,
+    result: Any,
+    *,
+    step_kind: str | None = None,
+    task_output_value_kind: TaskOutputValueKind | str | None = None,
+) -> Any:
     """Return a schema-friendlier output without hiding real failures.
 
     The function only fills fields when the raw result contains concrete
@@ -66,15 +76,37 @@ def coerce_step_output_for_schema(schema: dict | None, result: Any) -> Any:
     # envelope constructor.  The generic envelope always validates; a
     # task-output envelope may still fail its nested outputs.data contract,
     # which is intentional and handled by the dispatcher retry path.
-    if is_step_result_envelope_schema(schema):
+    contract = output_contract_for_schema(schema)
+    if contract.kind is OutputContractKind.TASK_ENVELOPE:
+        return _coerce_task_output_envelope(
+            contract,
+            result,
+            declared_kind=task_output_value_kind,
+        )
+    if contract.kind is OutputContractKind.LEGACY_ENVELOPE:
         return build_step_result_envelope(result)
     if not isinstance(schema, dict) or result is None:
         return result
-    if is_plan_output_contract_schema(schema):
+    # Provider/action schemas are native payload contracts even when an older
+    # persisted row lacks the provenance marker.  Do not apply the legacy LLM
+    # repair heuristics here: they can unwrap a legitimate ``text`` field or
+    # silently filter unknown keys under ``additionalProperties: false``.
+    # Callers that do not know the producer kind retain the historical
+    # best-effort behavior for compatibility with legacy LLM/subagent rows.
+    if (
+        step_kind is not None
+        and contract.kind is OutputContractKind.UNMARKED_SCHEMA
+        and contract.preserves_native_payload_for(step_kind)
+    ):
+        return result
+    if contract.is_bare_payload:
         # A new plan declared this exact payload before execution. Permit only
-        # syntax unwrapping (for example a fenced JSON object); do not invent
-        # missing contract fields from summaries, URLs, aliases, or prose.
-        return _parse_wrapped_json(result, schema=schema)
+        # syntax unwrapping (for example a fenced JSON object). Canonical
+        # shapes additionally run their owned alias normalizer; custom schemas
+        # never receive heuristic fields.
+        parsed = _parse_wrapped_json(result, schema=contract.payload_schema or schema)
+        shape_name = contract.canonical_shape_name
+        return coerce_to_shape(shape_name, parsed) if shape_name else parsed
 
     schema_type = _schema_type(schema)
     coerced = _parse_wrapped_json(result, schema=schema)
@@ -113,6 +145,47 @@ def coerce_step_output_for_schema(schema: dict | None, result: Any) -> Any:
     _infer_batch_summary(output, props, required)
 
     return _filter_additional_properties(schema, output)
+
+
+def _coerce_task_output_envelope(
+    contract: Any,
+    result: Any,
+    *,
+    declared_kind: TaskOutputValueKind | str | None = None,
+) -> dict:
+    """Put a raw terminal-agent payload under ``outputs.data``.
+
+    ``Task.expected_output`` is an envelope contract, but the single-call LLM
+    worker (and a few external adapters) naturally return the payload itself.
+    Treating that value as a generic StepResult loses arbitrary payload keys
+    such as ``leads`` or ``files``.  Submit-result already builds the envelope
+    explicitly; this path makes the dispatcher equivalent for non-tool
+    workers while preserving an already-formed envelope.
+    """
+    value_kind = contract.require_task_output_value_kind(
+        result,
+        declared_kind=declared_kind,
+    )
+    payload = result
+    if isinstance(result, dict):
+        # A failed Task step has no deliverable payload to wrap. Preserve its
+        # control envelope so the dispatcher can apply retry/HITL semantics
+        # instead of validating the failure object as if it were Task data.
+        if value_kind is TaskOutputValueKind.STEP_RESULT_FAILURE:
+            return result
+        # A result carrying the canonical envelope's data member is already
+        # materialized. Do not nest it a second time.
+        if value_kind is TaskOutputValueKind.STEP_RESULT_ENVELOPE:
+            return result
+        payload = _parse_wrapped_json(result, schema=contract.payload_schema)
+    elif isinstance(result, str):
+        payload = _parse_wrapped_json(result, schema=contract.payload_schema)
+
+    return {
+        "status": "succeeded",
+        "summary": "structured task output submitted",
+        "outputs": {"data": payload},
+    }
 
 
 def _schema_type(schema: dict) -> str | None:
@@ -1013,7 +1086,7 @@ def _file_ref_scalar_value(ref: dict[str, str]) -> str | None:
 def _file_ref_from_dict(item: dict[str, Any]) -> dict[str, str] | None:
     path = _first_string(item, _FILE_PATH_KEYS)
     url = _first_string(item, _FILE_URL_KEYS)
-    document_id = _first_string(item, ("document_id", "id"))
+    document_id = _first_string(item, ("document_id",))
     value = path or url or document_id
     if not value:
         return None

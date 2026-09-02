@@ -1,35 +1,466 @@
+import { stripEditorLiveEditBlocks } from "./assistant-visible-text.mjs";
+
+export { stripEditorLiveEditBlocks } from "./assistant-visible-text.mjs";
+
 export const EDITOR_LIVE_CHAT_EVENT = "manor:open-editor-live-chat";
 export const EDITOR_LIVE_CHAT_CLOSE_EVENT = "manor:close-editor-live-chat";
+export const EDITOR_LIVE_CHAT_UPDATE_EVENT = "manor:update-editor-live-chat";
+
+export enum AiEditTargetKind {
+  Document = "document",
+  Diagram = "diagram",
+  Project = "project",
+  Workflow = "workflow",
+  Audio = "audio",
+  Image = "image",
+  Video = "video",
+}
+
+const AI_EDIT_TARGET_KINDS = new Set<AiEditTargetKind>(
+  Object.values(AiEditTargetKind),
+);
+
+export enum AiEditApplyPhase {
+  Preview = "preview",
+  Complete = "complete",
+}
+
+export enum AiEditPatchStreamEventKind {
+  Delta = "delta",
+  Commit = "commit",
+}
+
+export enum AiEditPreviewStatus {
+  Animating = "animating",
+  Ready = "ready",
+}
+
+export enum AiEditSessionCleanupStatus {
+  Idle = "idle",
+  Closing = "closing",
+  Failed = "failed",
+}
+
+export const EDITOR_LIVE_STREAMING_PREVIEW_MAX_CHARS = 100_000;
+
+/** End pointer/focus mutations before an AI preview snapshots editor state. */
+export function cancelActiveEditorInteractions(): void {
+  if (typeof window === "undefined") return;
+  if (typeof PointerEvent === "function") {
+    window.dispatchEvent(new PointerEvent("pointercancel"));
+  }
+  if (typeof document !== "undefined" && document.activeElement instanceof HTMLElement) {
+    document.activeElement.blur();
+  }
+}
+
+/** React 18 typings omit native `inert`; spread this shared lock contract. */
+export function aiEditInteractionLockProps(
+  locked: boolean,
+): Record<string, string | boolean> {
+  return locked ? { inert: "", "aria-disabled": true } : {};
+}
+
+export type AiEditTarget = {
+  kind: AiEditTargetKind;
+  /** Stable resource identity. Labels and routes must never be used as identity. */
+  id: string;
+};
 
 export type EditorLiveApplyMeta = {
   complete: boolean;
+  phase: AiEditApplyPhase;
   source: "assistant-stream";
+  /** Stable for one assistant response inside a longer AI Edit session. */
+  turnId?: string;
+  /** Reviewable operation count that existed before this assistant response. */
+  turnBasePatchCount?: number;
+  streamEvent?: AiEditPatchStreamEventKind;
   mode?: "patch";
   diff?: string;
   patch?: string;
   patchCount?: number;
   sourceLabel?: string;
+  signal?: AbortSignal;
 };
 
-export type EditorLiveChatDetail = {
+export function nextEditorLiveChangeCount(
+  previous: { changeCount?: number } | null | undefined,
+  meta?: EditorLiveApplyMeta,
+) {
+  const previousCount = previous?.changeCount || 0;
+  if (typeof meta?.patchCount !== "number") return previousCount + 1;
+  return Math.max(
+    previousCount,
+    Math.max(0, meta.turnBasePatchCount || 0) + Math.max(0, meta.patchCount),
+  );
+}
+
+export function hasReviewableEditorLivePreview(
+  state: Readonly<{ changeCount: number }> | null | undefined,
+) {
+  return Math.max(0, state?.changeCount || 0) > 0;
+}
+
+export function shouldStreamEditorLiveDeltaPreview(contentLength: number) {
+  return Number.isFinite(contentLength)
+    && contentLength >= 0
+    && contentLength <= EDITOR_LIVE_STREAMING_PREVIEW_MAX_CHARS;
+}
+
+export function mergeEditorLivePreviewDiff(
+  previousDiff: string | undefined,
+  meta: EditorLiveApplyMeta,
+) {
+  if (!meta.diff) return previousDiff;
+  if (
+    (meta.turnBasePatchCount || 0) > 0
+    && previousDiff
+    && previousDiff !== meta.diff
+  ) return `${previousDiff}\n\n${meta.diff}`;
+  return meta.diff;
+}
+
+export type AiEditCommitCoordinator = Readonly<{
+  run: <T>(operation: () => Promise<T>) => Promise<T>;
+  isCommitting: () => boolean;
+  waitForCommit: () => Promise<void>;
+}>;
+
+export type AiEditConversationDeleteCoordinator = Readonly<{
+  run: (
+    owner: AiEditConversationOwnerScope,
+    conversationId: string,
+    operation: () => Promise<boolean>,
+  ) => Promise<boolean>;
+}>;
+
+export type AiEditConversationOwnerScope = Readonly<{
+  userId: string;
+  entityId: string;
+}>;
+
+export function aiEditConversationOwnerKey(owner: AiEditConversationOwnerScope) {
+  return JSON.stringify([owner.userId, owner.entityId]);
+}
+
+export function isSameAiEditConversationOwner(
+  left: AiEditConversationOwnerScope | null | undefined,
+  right: AiEditConversationOwnerScope | null | undefined,
+) {
+  return Boolean(
+    left
+    && right
+    && left.userId === right.userId
+    && left.entityId === right.entityId,
+  );
+}
+
+/** One delete flight owns a temporary AI Edit conversation at a time. */
+export function createAiEditConversationDeleteCoordinator(): AiEditConversationDeleteCoordinator {
+  const inFlight = new Map<string, Promise<boolean>>();
+  const completed = new Set<string>();
+  const completedOrder: string[] = [];
+  const completedLimit = 256;
+
+  const rememberCompleted = (deletionKey: string) => {
+    if (completed.has(deletionKey)) return;
+    completed.add(deletionKey);
+    completedOrder.push(deletionKey);
+    if (completedOrder.length <= completedLimit) return;
+    const oldest = completedOrder.shift();
+    if (oldest) completed.delete(oldest);
+  };
+
+  return Object.freeze({
+    run: (owner, conversationId, operation) => {
+      const deletionKey = JSON.stringify([owner.userId, owner.entityId, conversationId]);
+      // Conversation ids are immutable. Once this page has observed a
+      // successful idempotent teardown, a later close surface or queue flush
+      // must not issue another DELETE for the same host-owned session.
+      if (completed.has(deletionKey)) return Promise.resolve(true);
+      const existing = inFlight.get(deletionKey);
+      if (existing) return existing;
+      const tracked = Promise.resolve()
+        .then(operation)
+        .then((deleted) => {
+          if (deleted) rememberCompleted(deletionKey);
+          return deleted;
+        })
+        .finally(() => {
+          if (inFlight.get(deletionKey) === tracked) {
+            inFlight.delete(deletionKey);
+          }
+        });
+      inFlight.set(deletionKey, tracked);
+      return tracked;
+    },
+  });
+}
+
+export type AiEditSessionCleanupCoordinator = Readonly<{
+  run: (operation: () => Promise<boolean>) => Promise<boolean>;
+  current: () => Promise<boolean> | null;
+}>;
+
+/** Every close surface joins the same rollback transaction. */
+export function createAiEditSessionCleanupCoordinator(): AiEditSessionCleanupCoordinator {
+  let inFlight: Promise<boolean> | null = null;
+
+  return Object.freeze({
+    run: (operation) => {
+      if (inFlight) return inFlight;
+      const tracked = Promise.resolve()
+        .then(operation)
+        .finally(() => {
+          if (inFlight === tracked) inFlight = null;
+        });
+      inFlight = tracked;
+      return tracked;
+    },
+    current: () => inFlight,
+  });
+}
+
+/** One shared commit lock for an editor surface and its Chat adapter. */
+export function createAiEditCommitCoordinator(): AiEditCommitCoordinator {
+  let pending: Promise<void> | null = null;
+
+  return Object.freeze({
+    run: async <T>(operation: () => Promise<T>) => {
+      if (pending) throw new Error("AI Edit is already accepting a preview.");
+      const operationPromise = Promise.resolve().then(operation);
+      const tracked = operationPromise.then(() => undefined, () => undefined);
+      pending = tracked;
+      try {
+        return await operationPromise;
+      } finally {
+        if (pending === tracked) pending = null;
+      }
+    },
+    isCommitting: () => pending !== null,
+    waitForCommit: async () => {
+      await pending;
+    },
+  });
+}
+
+export type EditorLiveAdapter = Readonly<{
+  target: AiEditTarget;
+  read: () => string;
+  getTurnPreviewState: () => Readonly<{ changeCount: number }>;
+  /** Lock any existing reviewable preview before the next model turn starts. */
+  beginTurn: (
+    meta: EditorLiveApplyMeta,
+  ) => boolean | void | Promise<boolean | void>;
+  preview: (
+    content: string,
+    meta: EditorLiveApplyMeta,
+  ) => boolean | void | Promise<boolean | void>;
+  complete: (
+    content: string,
+    meta: EditorLiveApplyMeta,
+  ) => boolean | void | Promise<boolean | void>;
+  /** Restore the content captured at the start of one turn without discarding the session. */
+  restore: (
+    content: string,
+    meta: EditorLiveApplyMeta,
+  ) => boolean | void | Promise<boolean | void>;
+  rollback: () => void | Promise<void>;
+  isCommitting: () => boolean;
+  waitForCommit: () => Promise<void>;
+}>;
+
+export type EditorLiveAdapterConfig = {
+  target: AiEditTarget;
+  read: () => string;
+  getTurnPreviewState: EditorLiveAdapter["getTurnPreviewState"];
+  beginTurn: EditorLiveAdapter["beginTurn"];
+  preview: EditorLiveAdapter["preview"];
+  complete: EditorLiveAdapter["complete"];
+  restore?: EditorLiveAdapter["restore"];
+  rollback: EditorLiveAdapter["rollback"];
+  commitCoordinator?: AiEditCommitCoordinator;
+};
+
+/**
+ * One construction path for every AI Edit surface. A surface is only a valid
+ * AI Edit target when it implements the complete preview transaction:
+ * preview -> complete -> accept in the surface, or rollback on discard/close.
+ */
+export function createEditorLiveAdapter(
+  config: EditorLiveAdapterConfig,
+): EditorLiveAdapter {
+  if (!AI_EDIT_TARGET_KINDS.has(config.target.kind)) {
+    throw new Error("AI Edit requires a supported target kind.");
+  }
+  const id = config.target.id.trim();
+  if (!id) throw new Error("AI Edit requires a stable target id.");
+  if (
+    typeof config.beginTurn !== "function"
+    || typeof config.complete !== "function"
+    || typeof config.rollback !== "function"
+  ) {
+    throw new Error("AI Edit requires begin, complete, and rollback lifecycle hooks.");
+  }
+  if (typeof config.getTurnPreviewState !== "function") {
+    throw new Error("AI Edit requires a turn preview state hook.");
+  }
+  const commitCoordinator = config.commitCoordinator || createAiEditCommitCoordinator();
+  return Object.freeze({
+    target: Object.freeze({ ...config.target, id }),
+    read: config.read,
+    getTurnPreviewState: () => {
+      const changeCount = config.getTurnPreviewState().changeCount;
+      if (!Number.isFinite(changeCount)) {
+        throw new Error("AI Edit turn preview state requires a finite change count.");
+      }
+      return { changeCount: Math.max(0, Math.floor(changeCount)) };
+    },
+    beginTurn: async (meta) => {
+      await commitCoordinator.waitForCommit();
+      if (meta.signal?.aborted) return false;
+      return config.beginTurn(meta);
+    },
+    preview: async (content, meta) => {
+      await commitCoordinator.waitForCommit();
+      if (meta.signal?.aborted) return false;
+      const previewed = await config.preview(content, meta);
+      return meta.signal?.aborted ? false : previewed;
+    },
+    complete: async (content, meta) => {
+      await commitCoordinator.waitForCommit();
+      if (meta.signal?.aborted) return false;
+      const completed = await config.complete(content, meta);
+      return meta.signal?.aborted ? false : completed;
+    },
+    restore: async (content, meta) => {
+      await commitCoordinator.waitForCommit();
+      if (meta.signal?.aborted) return false;
+      if (config.restore) return config.restore(content, meta);
+      const previewed = await config.preview(content, {
+        ...meta,
+        complete: false,
+        phase: AiEditApplyPhase.Preview,
+      });
+      if (previewed === false || meta.signal?.aborted) return false;
+      return config.complete(content, {
+        ...meta,
+        complete: true,
+        phase: AiEditApplyPhase.Complete,
+      });
+    },
+    rollback: async () => {
+      await commitCoordinator.waitForCommit();
+      await config.rollback();
+    },
+    isCommitting: commitCoordinator.isCommitting,
+    waitForCommit: commitCoordinator.waitForCommit,
+  });
+}
+
+export type EditorLiveTurnMetadata = Pick<
+  EditorLiveChatMetadata,
+  "documentName" | "fileType" | "mimeType" | "editorType" | "sourcePath"
+>;
+
+export type EditorNativeFilePatchResult = {
+  patched: true;
+  path: string;
+  document_id?: string | null;
+  source_sha256?: string | null;
+  knowledge_synced?: boolean;
+  [key: string]: unknown;
+};
+
+/** Extract only a completed, successful native patch_file result from an SSE frame. */
+export function nativeFilePatchResultFromSseFrame(
+  parsed: unknown,
+): EditorNativeFilePatchResult | null {
+  if (!parsed || typeof parsed !== "object") return null;
+  const frame = parsed as {
+    tool_call?: { name?: string; result?: unknown; status?: string };
+  };
+  const tool = frame.tool_call;
+  if (!tool) return null;
+  const status = String(tool.status || "").trim().toLowerCase();
+  if (!["success", "completed", "ok"].includes(status)) return null;
+  if ((tool.name || "").toLowerCase() !== "patch_file") return null;
+  let result = tool.result;
+  if (typeof result === "string") {
+    try {
+      result = JSON.parse(result.trim());
+    } catch {
+      return null;
+    }
+  }
+  if (!result || typeof result !== "object") return null;
+  const record = result as Record<string, unknown>;
+  if (record.error || record.patched !== true || typeof record.path !== "string" || !record.path) {
+    return null;
+  }
+  return record as EditorNativeFilePatchResult;
+}
+
+export type EditorLiveChatMetadata = {
   documentId?: string | null;
   documentName?: string | null;
   fileType?: string | null;
   mimeType?: string | null;
   editorType?: string | null;
   sourcePath?: string | null;
+  /** Browser route that owns this session. This must not be overloaded with
+   * sourcePath, which can be a Knowledge filesystem path for native tools. */
+  routePath?: string | null;
   instruction?: string | null;
   sessionLabel?: string | null;
   emptyDescription?: string | null;
   placeholder?: string | null;
   examples?: string[];
-  getContent?: () => string;
-  applyContent?: (content: string, meta: EditorLiveApplyMeta) => void;
-  localEditContent?: (userRequest: string, currentContent: string) => string | null;
   getAttachmentFiles?: () => File[] | Promise<File[]>;
   supportsImageGeneration?: boolean;
-  applyGeneratedImage?: (imageUrl: string, meta: EditorLiveApplyMeta) => void | Promise<void>;
+  applyGeneratedImage?: (
+    imageUrl: string,
+    meta: EditorLiveApplyMeta,
+  ) => boolean | void | Promise<boolean | void>;
+  supportsNativeFilePatch?: boolean;
+  /** Reload persisted editor bytes after an approval-gated patch_file succeeds. */
+  applyNativeFilePatch?: (
+    result: EditorNativeFilePatchResult,
+    meta: EditorLiveApplyMeta,
+  ) => boolean | void | Promise<boolean | void>;
+  /** Resolved after read() locks the target for the current streamed turn. */
+  getTurnMetadata?: () => EditorLiveTurnMetadata;
+  previewStatus?: AiEditPreviewStatus | null;
+  previewChangeCount?: number;
+  previewAccepting?: boolean;
+  acceptPreview?: () => void | Promise<void>;
+  discardPreview?: () => void | Promise<void>;
 };
+
+export type EditorLiveChatDetail = EditorLiveChatMetadata & {
+  adapter: EditorLiveAdapter;
+};
+
+/**
+ * Attach the saved source only when the editor cannot already provide the
+ * current bytes for the turn. This avoids sending a stale Knowledge snapshot
+ * beside newer in-memory content.
+ */
+export function shouldAttachEditorLiveSourceDocument(
+  detail: EditorLiveChatDetail,
+) {
+  if (!detail.documentId || !detail.documentName || detail.getAttachmentFiles) return false;
+  if (
+    detail.adapter.target.kind === AiEditTargetKind.Audio
+    || detail.adapter.target.kind === AiEditTargetKind.Video
+  ) return true;
+  const fileType = String(detail.fileType || "").trim().toLowerCase();
+  const mimeType = String(detail.mimeType || "").split(";", 1)[0].trim().toLowerCase();
+  return fileType === "pdf"
+    || mimeType === "application/pdf"
+    || detail.documentName.toLowerCase().endsWith(".pdf");
+}
 
 export type EditorLivePatchOperation =
   | {
@@ -59,12 +490,12 @@ export type EditorLivePatchResult = {
   failed: Array<{ index: number; reason: string }>;
 };
 
-function documentReference(detail: EditorLiveChatDetail) {
+function documentReference(detail: EditorLiveChatMetadata) {
   if (detail.documentName && detail.documentId) return `#${detail.documentName}`;
   return detail.documentName || "the current document";
 }
 
-export function buildEditorLiveEditPrompt(detail: EditorLiveChatDetail = {}) {
+export function buildEditorLiveEditPrompt(detail: EditorLiveChatMetadata = {}) {
   const docRef = documentReference(detail);
   const firstLine =
     detail.instruction?.trim() || `Tell me what to change in ${docRef}.`;
@@ -73,7 +504,7 @@ export function buildEditorLiveEditPrompt(detail: EditorLiveChatDetail = {}) {
 }
 
 export function buildEditorLiveEditRequest(
-  detail: EditorLiveChatDetail,
+  detail: EditorLiveChatMetadata,
   userRequest: string,
   currentContent: string,
 ) {
@@ -82,218 +513,52 @@ export function buildEditorLiveEditRequest(
   return userRequest.trim();
 }
 
-function isHtmlLike(detail: EditorLiveChatDetail, currentContent: string) {
-  const name = (detail.documentName || "").toLowerCase();
-  const type = `${detail.fileType || ""} ${detail.mimeType || ""} ${detail.editorType || ""}`.toLowerCase();
-  return (
-    name.endsWith(".html") ||
-    name.endsWith(".htm") ||
-    type.includes("html") ||
-    /<(!doctype\s+html|html|head|body)\b/i.test(currentContent)
-  );
-}
-
-function isCssLike(detail: EditorLiveChatDetail) {
-  const name = (detail.documentName || "").toLowerCase();
-  const type = `${detail.fileType || ""} ${detail.mimeType || ""} ${detail.editorType || ""}`.toLowerCase();
-  return name.endsWith(".css") || type.includes("css");
-}
-
-function asksForVisualCss(userRequest: string) {
-  return /css|style|design|beautiful|modern|polish|visual|ui|ux|美感|美化|好看|漂亮|设计|样式|视觉|界面|页面/i.test(
-    userRequest,
-  );
-}
-
-const BASIC_HTML_POLISH_CSS = `
-  :root {
-    color-scheme: light;
-    --page-bg: #f5f7fb;
-    --surface: #ffffff;
-    --ink: #232020;
-    --muted: #607089;
-    --accent: #0f8f84;
-    --accent-strong: #0b6f67;
-    --line: rgba(15, 30, 50, 0.12);
-    font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+class EditorLivePatchValidationError extends Error {
+  constructor(readonly index: number, message: string) {
+    super(message);
   }
-
-  * {
-    box-sizing: border-box;
-  }
-
-  body {
-    margin: 0;
-    min-height: 100vh;
-    background:
-      radial-gradient(circle at 20% 10%, rgba(15, 143, 132, 0.14), transparent 30%),
-      linear-gradient(135deg, #f8fbff 0%, var(--page-bg) 100%);
-    color: var(--ink);
-    line-height: 1.6;
-  }
-
-  main, .container, .page, .content {
-    width: min(1120px, calc(100% - 40px));
-    margin: 0 auto;
-  }
-
-  header, section, article, .card {
-    background: rgba(255, 255, 255, 0.86);
-    border: 1px solid var(--line);
-    border-radius: 18px;
-    box-shadow: 0 18px 50px rgba(35, 32, 32, 0.08);
-  }
-
-  header {
-    margin: 32px auto 24px;
-    padding: clamp(28px, 5vw, 72px);
-  }
-
-  section, article, .card {
-    margin: 20px 0;
-    padding: clamp(20px, 3vw, 36px);
-  }
-
-  h1, h2, h3 {
-    margin: 0 0 14px;
-    line-height: 1.15;
-    letter-spacing: 0;
-  }
-
-  h1 {
-    font-size: clamp(2.3rem, 5vw, 4.8rem);
-  }
-
-  p {
-    color: var(--muted);
-    max-width: 68ch;
-  }
-
-  a, button, .button {
-    color: #fff;
-    background: var(--accent);
-    border: 0;
-    border-radius: 10px;
-    padding: 10px 16px;
-    text-decoration: none;
-    font-weight: 700;
-    transition: transform 160ms ease, background 160ms ease;
-  }
-
-  a:hover, button:hover, .button:hover {
-    background: var(--accent-strong);
-    transform: translateY(-1px);
-  }
-`;
-
-function styleBlock() {
-  return `<style id="manor-ai-polish">${BASIC_HTML_POLISH_CSS}</style>`;
-}
-
-function appendCssFallback(currentContent: string) {
-  const css = `${BASIC_HTML_POLISH_CSS}\n`;
-  return currentContent.trimEnd() + `\n\n/* Manor AI visual polish */\n${css}`;
-}
-
-function quotedSegments(value: string) {
-  const segments: string[] = [];
-  const re = /"([^"]{1,200})"|'([^']{1,200})'|`([^`]{1,200})`|“([^”]{1,200})”|‘([^’]{1,200})’/g;
-  let match: RegExpExecArray | null;
-  while ((match = re.exec(value))) {
-    const segment = (match[1] || match[2] || match[3] || match[4] || match[5] || "").trim();
-    if (segment) segments.push(segment);
-  }
-  return segments;
-}
-
-function isJsonLikeContent(value: string) {
-  try {
-    const parsed = JSON.parse(value);
-    return parsed !== null && typeof parsed === "object";
-  } catch {
-    return false;
-  }
-}
-
-function applyQuotedTextFallback(userRequest: string, currentContent: string) {
-  const lower = userRequest.toLowerCase();
-  const quoted = quotedSegments(userRequest);
-  const replaceIntent = /(replace|change|rename|update|改成|替换|改为|换成)/.test(lower);
-  const deleteIntent = /(delete|remove|drop|删掉|删除|移除|去掉)/.test(lower);
-  const appendIntent = /(append|add to end|bottom|末尾|最后|追加)/.test(lower);
-  const prependIntent = /(prepend|add to top|top|beginning|开头|顶部|最前)/.test(lower);
-  const addIntent = /(add|insert|write|添加|加入|插入|写入)/.test(lower);
-  const all = /(all|every|全部|所有|每个)/.test(lower);
-  const jsonLike = isJsonLikeContent(currentContent);
-
-  if (replaceIntent && quoted.length >= 2 && currentContent.includes(quoted[0]!)) {
-    return all
-      ? currentContent.split(quoted[0]!).join(quoted[1]!)
-      : currentContent.replace(quoted[0]!, quoted[1]!);
-  }
-
-  if (deleteIntent && quoted.length >= 1 && currentContent.includes(quoted[0]!)) {
-    return all
-      ? currentContent.split(quoted[0]!).join("")
-      : currentContent.replace(quoted[0]!, "");
-  }
-
-  if (!jsonLike && (appendIntent || (addIntent && /end|bottom|末尾|最后/.test(lower))) && quoted.length >= 1) {
-    const separator = currentContent.endsWith("\n") || !currentContent ? "" : "\n";
-    return `${currentContent}${separator}${quoted[0]}\n`;
-  }
-
-  if (!jsonLike && (prependIntent || (addIntent && /top|beginning|开头|顶部|最前/.test(lower))) && quoted.length >= 1) {
-    const separator = quoted[0]!.endsWith("\n") ? "" : "\n";
-    return `${quoted[0]}${separator}${currentContent}`;
-  }
-
-  return null;
-}
-
-function applyHtmlStyleFallback(currentContent: string) {
-  const block = styleBlock();
-  if (/<style\b[^>]*id=["']manor-ai-polish["'][^>]*>/i.test(currentContent)) {
-    return currentContent.replace(
-      /<style\b[^>]*id=["']manor-ai-polish["'][^>]*>[\s\S]*?<\/style>/i,
-      block,
-    );
-  }
-  if (/<\/head>/i.test(currentContent)) {
-    return currentContent.replace(/<\/head>/i, `${block}\n</head>`);
-  }
-  if (/<head[^>]*>/i.test(currentContent)) {
-    return currentContent.replace(/<head[^>]*>/i, (match) => `${match}\n${block}`);
-  }
-  return `${block}\n${currentContent}`;
-}
-
-export function buildEditorLiveEditFallbackContent(
-  detail: EditorLiveChatDetail,
-  userRequest: string,
-  currentContent: string,
-) {
-  const custom = detail.localEditContent?.(userRequest, currentContent);
-  if (typeof custom === "string" && custom !== currentContent) return custom;
-
-  const quotedFallback = applyQuotedTextFallback(userRequest, currentContent);
-  if (typeof quotedFallback === "string" && quotedFallback !== currentContent) {
-    return quotedFallback;
-  }
-
-  if (!asksForVisualCss(userRequest)) return null;
-  if (isHtmlLike(detail, currentContent)) return applyHtmlStyleFallback(currentContent);
-  if (isCssLike(detail)) return appendCssFallback(currentContent);
-  return null;
 }
 
 function parsePatchOperations(patchJson: string): EditorLivePatchOperation[] {
   const parsed = JSON.parse(patchJson);
   const operations = Array.isArray(parsed) ? parsed : [parsed];
-  return operations.filter(
-    (operation): operation is EditorLivePatchOperation =>
-      operation && typeof operation === "object" && typeof operation.op === "string",
-  );
+  return operations.map((raw, index) => {
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+      throw new EditorLivePatchValidationError(index, "Patch operation must be an object.");
+    }
+    const operation = raw as Record<string, unknown>;
+    if (typeof operation.op !== "string") {
+      throw new EditorLivePatchValidationError(index, "Patch operation is missing op.");
+    }
+    if (
+      operation.op === "append"
+      || operation.op === "prepend"
+    ) {
+      if (typeof operation.text !== "string") {
+        throw new EditorLivePatchValidationError(index, `${operation.op} operation is missing text.`);
+      }
+      return operation as EditorLivePatchOperation;
+    }
+    if (!["replace", "delete", "insert_before", "insert_after"].includes(operation.op)) {
+      throw new EditorLivePatchValidationError(index, `Unsupported patch operation: ${operation.op}`);
+    }
+    if (typeof operation.find !== "string" || !operation.find) {
+      throw new EditorLivePatchValidationError(index, "Patch operation is missing exact find text.");
+    }
+    if ("all" in operation && typeof operation.all !== "boolean") {
+      throw new EditorLivePatchValidationError(index, "Patch operation all must be a boolean.");
+    }
+    if (operation.op === "replace" && typeof operation.replace !== "string") {
+      throw new EditorLivePatchValidationError(index, "Replace operation is missing replacement text.");
+    }
+    if (
+      (operation.op === "insert_before" || operation.op === "insert_after")
+      && typeof operation.text !== "string"
+    ) {
+      throw new EditorLivePatchValidationError(index, "Insert operation is missing text.");
+    }
+    return operation as EditorLivePatchOperation;
+  });
 }
 
 function firstFailure(index: number, reason: string) {
@@ -308,10 +573,11 @@ export function applyEditorLivePatch(
   try {
     operations = parsePatchOperations(patchJson);
   } catch (err) {
+    const index = err instanceof EditorLivePatchValidationError ? err.index : 0;
     return {
       content: currentContent,
       applied: 0,
-      failed: firstFailure(0, `Invalid patch JSON: ${(err as Error).message}`),
+      failed: firstFailure(index, `Invalid patch: ${(err as Error).message}`),
     };
   }
 
@@ -439,46 +705,911 @@ export function extractEditorLivePatchPayloads(text: string) {
   return payloads;
 }
 
-const HIDDEN_EDITOR_LIVE_TAG_PREFIXES = [
+const EDITOR_LIVE_PATCH_OPEN = "<manor-live-patch";
+const EDITOR_LIVE_PATCH_CLOSE = "</manor-live-patch>";
+
+const EDITOR_LIVE_HIDDEN_TAG_PREFIXES = [
   "<manor-live-patch",
   "</manor-live-patch",
   "<manor-live-edit",
   "</manor-live-edit",
-  // Old model output is hidden for display safety, but is never parsed or applied.
   "<manor live patch",
   "</manor live patch",
   "<manor live edit",
   "</manor live edit",
 ] as const;
 
-function stripTrailingEditorLiveTagFragment(text: string) {
-  const tagStart = text.lastIndexOf("<");
-  if (tagStart < 0) return text;
-  const fragment = text.slice(tagStart).toLowerCase();
-  if (!fragment || fragment.includes(">")) return text;
-  if (!fragment.startsWith("<manor") && !fragment.startsWith("</manor")) return text;
-  return HIDDEN_EDITOR_LIVE_TAG_PREFIXES.some(
-    (prefix) => prefix.startsWith(fragment) || fragment.startsWith(prefix),
-  )
-    ? text.slice(0, tagStart)
-    : text;
+const EDITOR_LIVE_HIDDEN_CLOSE_TAG_PREFIXES = [
+  "</manor-live-patch",
+  "</manor-live-edit",
+  "</manor live patch",
+  "</manor live edit",
+] as const;
+
+const EDITOR_LIVE_HIDDEN_OPEN_TAG_RE =
+  /^<manor(?:-|\s+)live(?:-|\s+)(?:patch|edit)(?:\s[^>]*)?>$/i;
+const EDITOR_LIVE_HIDDEN_CLOSE_TAG_RE =
+  /^<\/manor(?:-|\s+)live(?:-|\s+)(?:patch|edit)(?:\s[^>]*)?>$/i;
+
+enum EditorLiveVisibleProjectionState {
+  Visible = "visible",
+  Hidden = "hidden",
 }
 
-export function stripEditorLiveEditBlocks(text: string) {
-  const withoutProtocolBlocks = text
-    .replace(
-      /<manor(?:-|\s+)live(?:-|\s+)(?:patch|edit)(?:\s[^>]*)?>[\s\S]*?<\/manor(?:-|\s+)live(?:-|\s+)(?:patch|edit)\s*>/gi,
-      "",
-    )
-    .replace(
-      /<manor(?:-|\s+)live(?:-|\s+)(?:patch|edit)(?:\s[^>]*)?>[\s\S]*$/i,
-      "",
-    )
-    .replace(
-      /<\/?manor(?:-|\s+)live(?:-|\s+)(?:patch|edit)(?:\s[^>]*)?>/gi,
-      "",
-    );
-  return stripTrailingEditorLiveTagFragment(withoutProtocolBlocks).trim();
+export type EditorLiveVisibleTextProjector = Readonly<{
+  push: (chunk: string) => string;
+  flush: () => string;
+  reset: () => void;
+}>;
+
+export type EditorLiveChatSseProjector = Readonly<{
+  projectLine: (rawLine: string) => string;
+  flush: () => string;
+}>;
+
+function isPotentialEditorLiveTagFragment(
+  fragment: string,
+  state: EditorLiveVisibleProjectionState,
+) {
+  if (!fragment.startsWith("<") || fragment.includes(">")) return false;
+  const normalized = fragment.toLowerCase().replace(/\s+/g, " ");
+  const prefixes = state === EditorLiveVisibleProjectionState.Hidden
+    ? EDITOR_LIVE_HIDDEN_CLOSE_TAG_PREFIXES
+    : EDITOR_LIVE_HIDDEN_TAG_PREFIXES;
+  return prefixes.some(
+    (prefix) => prefix.startsWith(normalized)
+      || (
+        normalized.startsWith(prefix)
+        && (normalized.length === prefix.length || normalized[prefix.length] === " ")
+      ),
+  );
+}
+
+/**
+ * Project one model response into the text Chat may type for the user.
+ *
+ * The editor branch still consumes the complete protocol. This projector is a
+ * bounded incremental state machine: fragmented tags never leak, hidden patch
+ * JSON never enters the Chat typewriter queue, and each input character is
+ * inspected once instead of repeatedly rescanning the complete response.
+ */
+export function createEditorLiveVisibleTextProjector(): EditorLiveVisibleTextProjector {
+  let state = EditorLiveVisibleProjectionState.Visible;
+  let tagCandidate = "";
+  let hasVisibleText = false;
+  let pendingWhitespace = "";
+
+  const appendVisible = (value: string) => {
+    let projected = "";
+    for (const char of value) {
+      if (/\s/.test(char)) {
+        if (hasVisibleText) pendingWhitespace += char;
+        continue;
+      }
+      projected += pendingWhitespace + char;
+      pendingWhitespace = "";
+      hasVisibleText = true;
+    }
+    return projected;
+  };
+
+  const push = (chunk: string) => {
+    let projected = "";
+    for (const char of chunk) {
+      if (!tagCandidate) {
+        if (char === "<") {
+          tagCandidate = char;
+        } else if (state === EditorLiveVisibleProjectionState.Visible) {
+          projected += appendVisible(char);
+        }
+        continue;
+      }
+
+      tagCandidate += char;
+      if (char === ">") {
+        if (state === EditorLiveVisibleProjectionState.Visible) {
+          if (EDITOR_LIVE_HIDDEN_OPEN_TAG_RE.test(tagCandidate)) {
+            state = EditorLiveVisibleProjectionState.Hidden;
+          } else if (!EDITOR_LIVE_HIDDEN_CLOSE_TAG_RE.test(tagCandidate)) {
+            projected += appendVisible(tagCandidate);
+          }
+        } else if (EDITOR_LIVE_HIDDEN_CLOSE_TAG_RE.test(tagCandidate)) {
+          state = EditorLiveVisibleProjectionState.Visible;
+        }
+        tagCandidate = "";
+        continue;
+      }
+
+      if (!isPotentialEditorLiveTagFragment(tagCandidate, state)) {
+        if (state === EditorLiveVisibleProjectionState.Visible) {
+          const visibleCandidate = char === "<" ? tagCandidate.slice(0, -1) : tagCandidate;
+          projected += appendVisible(visibleCandidate);
+        }
+        tagCandidate = char === "<" ? "<" : "";
+      }
+    }
+    return projected;
+  };
+
+  return Object.freeze({
+    push,
+    flush: () => {
+      let projected = "";
+      if (state === EditorLiveVisibleProjectionState.Visible && tagCandidate) {
+        const normalized = tagCandidate.toLowerCase();
+        const isHiddenProtocolFragment = (
+          normalized.startsWith("<manor") || normalized.startsWith("</manor")
+        ) && isPotentialEditorLiveTagFragment(
+          tagCandidate,
+          EditorLiveVisibleProjectionState.Visible,
+        );
+        if (!isHiddenProtocolFragment) projected = appendVisible(tagCandidate);
+      }
+      tagCandidate = "";
+      pendingWhitespace = "";
+      return projected;
+    },
+    reset: () => {
+      state = EditorLiveVisibleProjectionState.Visible;
+      tagCandidate = "";
+      hasVisibleText = false;
+      pendingWhitespace = "";
+    },
+  });
+}
+
+/**
+ * Build the Chat-side SSE projection for an AI Edit turn. The source stream is
+ * left intact for the editor tee; only user-visible text fields are projected.
+ */
+export function createEditorLiveChatSseProjector(): EditorLiveChatSseProjector {
+  const visibleText = createEditorLiveVisibleTextProjector();
+  let currentEvent = "";
+  let projectionFlushed = false;
+
+  const flush = () => {
+    if (projectionFlushed) return "";
+    projectionFlushed = true;
+    const textDelta = visibleText.flush();
+    if (!textDelta) return "";
+    return `event: text_delta\ndata: ${JSON.stringify({ text_delta: textDelta })}\n\n`;
+  };
+
+  const projectLine = (rawLine: string) => {
+    const line = rawLine.endsWith("\r") ? rawLine.slice(0, -1) : rawLine;
+    if (line.startsWith("event: ")) {
+      const nextEvent = line.slice(7).trim();
+      const pendingText = nextEvent === "stream_end" ? flush() : "";
+      if (nextEvent === "text_reset" || nextEvent === "summary_start") {
+        visibleText.reset();
+        projectionFlushed = false;
+      }
+      currentEvent = nextEvent;
+      return `${pendingText}${rawLine}`;
+    }
+    if (!line.startsWith("data: ")) return rawLine;
+
+    const rawData = line.slice(6).trim();
+    if (rawData === "[DONE]") return `${flush()}${rawLine}`;
+    if (
+      !rawData
+      || currentEvent === "error"
+      || currentEvent === "text_reset"
+      || currentEvent === "summary_start"
+    ) {
+      return rawLine;
+    }
+
+    try {
+      const parsed = JSON.parse(rawData);
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return rawLine;
+      const textKey = (["text_delta", "token", "content"] as const).find(
+        (key) => parsed[key] != null,
+      );
+      if (!textKey) return rawLine;
+      const token = parsed[textKey];
+      if (
+        typeof token !== "string"
+        && typeof token !== "number"
+        && typeof token !== "boolean"
+      ) return rawLine;
+      parsed[textKey] = visibleText.push(String(token));
+      return `data: ${JSON.stringify(parsed)}`;
+    } catch {
+      return rawLine;
+    }
+  };
+
+  return Object.freeze({ projectLine, flush });
+}
+
+export function containsEditorLivePatchProtocol(text: string) {
+  const lower = text.toLowerCase();
+  let searchFrom = 0;
+  while (searchFrom < lower.length) {
+    const start = lower.indexOf("<", searchFrom);
+    if (start < 0) return false;
+    const suffix = lower.slice(start);
+    if (
+      suffix.startsWith(EDITOR_LIVE_PATCH_OPEN)
+      || suffix.startsWith(EDITOR_LIVE_PATCH_CLOSE)
+      || EDITOR_LIVE_PATCH_OPEN.startsWith(suffix)
+      || EDITOR_LIVE_PATCH_CLOSE.startsWith(suffix)
+    ) return true;
+    searchFrom = start + 1;
+  }
+  return false;
+}
+
+/**
+ * Return the number of canonical operations only after every patch tag has a
+ * complete, syntactically valid JSON object or array-of-objects payload.
+ * Streaming callers use this at EOF before making a temporary preview
+ * reviewable; `null` means the final protocol must be rolled back.
+ */
+export function countCompleteEditorLivePatchOperations(text: string) {
+  const lower = text.toLowerCase();
+  let openTag = false;
+  let completeTagCount = 0;
+  let searchFrom = 0;
+  while (searchFrom < lower.length) {
+    const start = lower.indexOf("<", searchFrom);
+    if (start < 0) break;
+    const suffix = lower.slice(start);
+
+    if (suffix.startsWith(EDITOR_LIVE_PATCH_CLOSE)) {
+      if (!openTag) return null;
+      openTag = false;
+      completeTagCount += 1;
+      searchFrom = start + EDITOR_LIVE_PATCH_CLOSE.length;
+      continue;
+    }
+
+    if (suffix.startsWith(EDITOR_LIVE_PATCH_OPEN)) {
+      const characterAfterName = lower[start + EDITOR_LIVE_PATCH_OPEN.length];
+      if (characterAfterName === undefined) return null;
+      if (characterAfterName !== ">" && !/\s/.test(characterAfterName || "")) {
+        return null;
+      }
+      const tagEnd = lower.indexOf(">", start + EDITOR_LIVE_PATCH_OPEN.length);
+      if (tagEnd < 0) return null;
+      if (openTag) return null;
+      openTag = true;
+      searchFrom = tagEnd + 1;
+      continue;
+    }
+
+    if (
+      EDITOR_LIVE_PATCH_OPEN.startsWith(suffix)
+      || EDITOR_LIVE_PATCH_CLOSE.startsWith(suffix)
+    ) return null;
+
+    searchFrom = start + 1;
+  }
+  if (openTag || completeTagCount === 0) return null;
+
+  const payloads = extractEditorLivePatchPayloads(text);
+  if (payloads.length !== completeTagCount) return null;
+
+  let operationCount = 0;
+  for (const payload of payloads) {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(payload);
+    } catch {
+      return null;
+    }
+    const operations = Array.isArray(parsed) ? parsed : [parsed];
+    if (
+      operations.some(
+        (operation) =>
+          !operation
+          || typeof operation !== "object"
+          || Array.isArray(operation),
+      )
+    ) return null;
+    operationCount += operations.length;
+  }
+  return operationCount;
+}
+
+function completeJsonObjectEnd(payload: string, objectStart: number) {
+  let objectDepth = 0;
+  let inString = false;
+  let escaped = false;
+  for (let index = objectStart; index < payload.length; index += 1) {
+    const char = payload[index]!;
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (char === "\\") escaped = true;
+      else if (char === '"') inString = false;
+      continue;
+    }
+    if (char === '"') {
+      inString = true;
+      continue;
+    }
+    if (char === "{") {
+      objectDepth += 1;
+      continue;
+    }
+    if (char !== "}" || objectDepth === 0) continue;
+    objectDepth -= 1;
+    if (objectDepth === 0) return index;
+  }
+  return -1;
+}
+
+function extractCompletePatchOperations(payload: string) {
+  const operations: string[] = [];
+  const firstValue = payload.search(/\S/);
+  if (firstValue < 0) return operations;
+  const arrayPayload = payload[firstValue] === "[";
+  if (!arrayPayload && payload[firstValue] !== "{") return operations;
+
+  let cursor = firstValue + (arrayPayload ? 1 : 0);
+  while (cursor < payload.length) {
+    while (/\s/.test(payload[cursor] || "")) cursor += 1;
+    if (cursor >= payload.length || (arrayPayload && payload[cursor] === "]")) break;
+    if (payload[cursor] !== "{") break;
+
+    const objectEnd = completeJsonObjectEnd(payload, cursor);
+    if (objectEnd < 0) break;
+    operations.push(payload.slice(cursor, objectEnd + 1));
+    if (!arrayPayload) break;
+
+    cursor = objectEnd + 1;
+    while (/\s/.test(payload[cursor] || "")) cursor += 1;
+    if (cursor >= payload.length || payload[cursor] === "]") break;
+    if (payload[cursor] !== ",") break;
+    cursor += 1;
+  }
+  return operations;
+}
+
+function withoutTrailingHighSurrogate(value: string) {
+  if (!value) return value;
+  const last = value.charCodeAt(value.length - 1);
+  return last >= 0xd800 && last <= 0xdbff ? value.slice(0, -1) : value;
+}
+
+type PartialPatchField = Readonly<{
+  value: string;
+  complete: boolean;
+}>;
+
+function buildPartialPatchOperation(
+  stringFields: Readonly<Record<string, PartialPatchField>>,
+  booleanFields: Readonly<Record<string, boolean>>,
+) {
+  const op = stringFields.op?.complete ? stringFields.op.value : "";
+  const all = booleanFields.all;
+  if (op === "append" || op === "prepend") {
+    if (!("text" in stringFields)) return null;
+    return JSON.stringify({ op, text: stringFields.text!.value });
+  }
+  const find = stringFields.find?.complete ? stringFields.find.value : "";
+  if (!find) return null;
+  if (op === "replace") {
+    if (!("replace" in stringFields)) return null;
+    return JSON.stringify({
+      op,
+      find,
+      replace: stringFields.replace!.value,
+      ...(all === undefined ? {} : { all }),
+    });
+  }
+  if (op === "insert_before" || op === "insert_after") {
+    if (!("text" in stringFields)) return null;
+    return JSON.stringify({ op, find, text: stringFields.text!.value });
+  }
+  return null;
+}
+
+enum StreamingPatchObjectState {
+  ExpectKey = "expect_key",
+  Key = "key",
+  AfterKey = "after_key",
+  ExpectValue = "expect_value",
+  StringValue = "string_value",
+  BooleanValue = "boolean_value",
+  AfterValue = "after_value",
+  Complete = "complete",
+  Invalid = "invalid",
+}
+
+type StreamingPatchObject = Readonly<{
+  push: (char: string) => void;
+  isComplete: () => boolean;
+  isInvalid: () => boolean;
+  payload: () => string;
+  partialPatch: () => string | null;
+}>;
+
+/** Parse one flat patch object once as its characters arrive. */
+function createStreamingPatchObject(): StreamingPatchObject {
+  const raw = ["{"];
+  const stringFields = Object.create(null) as Record<string, PartialPatchField>;
+  const booleanFields = Object.create(null) as Record<string, boolean>;
+  const simpleEscapes: Readonly<Record<string, string>> = Object.freeze({
+    '"': '"',
+    "\\": "\\",
+    "/": "/",
+    b: "\b",
+    f: "\f",
+    n: "\n",
+    r: "\r",
+    t: "\t",
+  });
+  let state = StreamingPatchObjectState.ExpectKey;
+  let currentKey = "";
+  let stringValue = "";
+  let escaped = false;
+  let unicodeDigits: string | null = null;
+  let booleanToken = "";
+
+  const updateStreamingField = () => {
+    if (state !== StreamingPatchObjectState.StringValue) return;
+    stringFields[currentKey] = {
+      value: withoutTrailingHighSurrogate(stringValue),
+      complete: false,
+    };
+  };
+
+  const appendStringValue = (value: string) => {
+    stringValue += value;
+    updateStreamingField();
+  };
+
+  const pushStringCharacter = (char: string) => {
+    if (unicodeDigits !== null) {
+      if (!/[0-9a-f]/i.test(char)) {
+        state = StreamingPatchObjectState.Invalid;
+        return;
+      }
+      unicodeDigits += char;
+      if (unicodeDigits.length === 4) {
+        appendStringValue(String.fromCharCode(Number.parseInt(unicodeDigits, 16)));
+        unicodeDigits = null;
+        escaped = false;
+      }
+      return;
+    }
+    if (escaped) {
+      if (char === "u") {
+        unicodeDigits = "";
+        return;
+      }
+      const decoded = simpleEscapes[char];
+      if (decoded === undefined) {
+        state = StreamingPatchObjectState.Invalid;
+        return;
+      }
+      appendStringValue(decoded);
+      escaped = false;
+      return;
+    }
+    if (char === "\\") {
+      escaped = true;
+      return;
+    }
+    if (char === '"') {
+      if (state === StreamingPatchObjectState.Key) {
+        currentKey = stringValue;
+        state = StreamingPatchObjectState.AfterKey;
+      } else {
+        stringFields[currentKey] = { value: stringValue, complete: true };
+        state = StreamingPatchObjectState.AfterValue;
+      }
+      stringValue = "";
+      return;
+    }
+    if (char.charCodeAt(0) < 0x20) {
+      state = StreamingPatchObjectState.Invalid;
+      return;
+    }
+    appendStringValue(char);
+  };
+
+  return Object.freeze({
+    push: (char: string) => {
+      if (
+        state === StreamingPatchObjectState.Complete
+        || state === StreamingPatchObjectState.Invalid
+      ) return;
+      raw.push(char);
+      if (
+        state === StreamingPatchObjectState.Key
+        || state === StreamingPatchObjectState.StringValue
+      ) {
+        pushStringCharacter(char);
+        return;
+      }
+      if (/\s/.test(char)) return;
+      if (state === StreamingPatchObjectState.ExpectKey) {
+        if (char === '"') {
+          stringValue = "";
+          escaped = false;
+          unicodeDigits = null;
+          state = StreamingPatchObjectState.Key;
+        } else if (char === "}") {
+          state = StreamingPatchObjectState.Complete;
+        } else {
+          state = StreamingPatchObjectState.Invalid;
+        }
+        return;
+      }
+      if (state === StreamingPatchObjectState.AfterKey) {
+        state = char === ":"
+          ? StreamingPatchObjectState.ExpectValue
+          : StreamingPatchObjectState.Invalid;
+        return;
+      }
+      if (state === StreamingPatchObjectState.ExpectValue) {
+        if (char === '"') {
+          stringValue = "";
+          escaped = false;
+          unicodeDigits = null;
+          stringFields[currentKey] = { value: "", complete: false };
+          state = StreamingPatchObjectState.StringValue;
+        } else if (char === "t" || char === "f") {
+          booleanToken = char;
+          state = StreamingPatchObjectState.BooleanValue;
+        } else {
+          state = StreamingPatchObjectState.Invalid;
+        }
+        return;
+      }
+      if (state === StreamingPatchObjectState.BooleanValue) {
+        const expected = booleanToken[0] === "t" ? "true" : "false";
+        booleanToken += char;
+        if (!expected.startsWith(booleanToken)) {
+          state = StreamingPatchObjectState.Invalid;
+        } else if (booleanToken === expected) {
+          booleanFields[currentKey] = expected === "true";
+          state = StreamingPatchObjectState.AfterValue;
+        }
+        return;
+      }
+      if (state === StreamingPatchObjectState.AfterValue) {
+        if (char === ",") state = StreamingPatchObjectState.ExpectKey;
+        else if (char === "}") state = StreamingPatchObjectState.Complete;
+        else state = StreamingPatchObjectState.Invalid;
+      }
+    },
+    isComplete: () => state === StreamingPatchObjectState.Complete,
+    isInvalid: () => state === StreamingPatchObjectState.Invalid,
+    payload: () => raw.join(""),
+    partialPatch: () => buildPartialPatchOperation(stringFields, booleanFields),
+  });
+}
+
+/**
+ * Extract every complete JSON operation, including operations whose enclosing
+ * array or manor-live-patch tag is still streaming. Text outside the canonical
+ * protocol tag is never executable.
+ */
+export function extractEditorLivePatchOperationPayloads(text: string) {
+  const operations: string[] = [];
+  const openTag = /<manor-live-patch(?:\s[^>]*)?>/gi;
+  const lowerText = text.toLowerCase();
+  const closeTag = "</manor-live-patch>";
+  let match: RegExpExecArray | null;
+  while ((match = openTag.exec(text))) {
+    const payloadStart = openTag.lastIndex;
+    const closeIndex = lowerText.indexOf(closeTag, payloadStart);
+    const payload = text.slice(payloadStart, closeIndex < 0 ? text.length : closeIndex);
+    operations.push(...extractCompletePatchOperations(payload));
+    if (closeIndex < 0) break;
+    openTag.lastIndex = closeIndex + closeTag.length;
+  }
+  return operations;
+}
+
+/** Only a fully closed and valid protocol may be replayed after stream recovery. */
+export function extractRecoverableEditorLivePatchOperationPayloads(text: string) {
+  const completeOperationCount = countCompleteEditorLivePatchOperations(text);
+  if (completeOperationCount === null) return null;
+  const operations = extractEditorLivePatchOperationPayloads(text);
+  return operations.length === completeOperationCount ? operations : null;
+}
+
+export type EditorLivePatchStreamEvent = Readonly<{
+  kind: AiEditPatchStreamEventKind;
+  operationIndex: number;
+  patch: string;
+}>;
+
+/** A validated Commit promotes, but does not repaint, its already-visible Delta. */
+export function isEditorLivePatchCommitAlreadyPreviewed(
+  commitOperationIndex: number,
+  lastDeltaOperationIndex: number | null,
+  committedContent: string,
+  lastPreviewContent: string,
+) {
+  return commitOperationIndex === lastDeltaOperationIndex
+    && committedContent === lastPreviewContent;
+}
+
+export type EditorLivePatchStream = Readonly<{
+  push: (chunk: string) => EditorLivePatchStreamEvent[];
+  operationCount: () => number;
+  reset: () => void;
+}>;
+
+enum StreamingPatchPayloadState {
+  Outside = "outside",
+  Value = "value",
+  Separator = "separator",
+  Done = "done",
+  Invalid = "invalid",
+}
+
+/** One cursor-owning parser binds temporary deltas and validated commits to one response. */
+export function createEditorLivePatchStream(): EditorLivePatchStream {
+  let buffer = "";
+  let payloadState = StreamingPatchPayloadState.Outside;
+  let payloadContainer: "unknown" | "array" | "single" = "unknown";
+  let currentObject: StreamingPatchObject | null = null;
+  let emittedOperationCount = 0;
+  let lastDeltaKey = "";
+
+  const resetPayload = () => {
+    payloadState = StreamingPatchPayloadState.Value;
+    payloadContainer = "unknown";
+    currentObject = null;
+    lastDeltaKey = "";
+  };
+
+  const reset = () => {
+    buffer = "";
+    payloadState = StreamingPatchPayloadState.Outside;
+    payloadContainer = "unknown";
+    currentObject = null;
+    emittedOperationCount = 0;
+    lastDeltaKey = "";
+  };
+
+  return Object.freeze({
+    push: (chunk: string) => {
+      if (chunk) buffer += chunk;
+      const lower = buffer.toLowerCase();
+      const events: EditorLivePatchStreamEvent[] = [];
+      let cursor = 0;
+
+      while (cursor < buffer.length) {
+        if (payloadState === StreamingPatchPayloadState.Outside) {
+          const tagStart = lower.indexOf("<", cursor);
+          if (tagStart < 0) {
+            cursor = buffer.length;
+            break;
+          }
+          const suffix = lower.slice(tagStart);
+          if (EDITOR_LIVE_PATCH_OPEN.startsWith(suffix)) {
+            cursor = tagStart;
+            break;
+          }
+          if (!suffix.startsWith(EDITOR_LIVE_PATCH_OPEN)) {
+            cursor = tagStart + 1;
+            continue;
+          }
+          const characterAfterName = lower[tagStart + EDITOR_LIVE_PATCH_OPEN.length];
+          if (characterAfterName === undefined) {
+            cursor = tagStart;
+            break;
+          }
+          if (characterAfterName !== ">" && !/\s/.test(characterAfterName)) {
+            cursor = tagStart + 1;
+            continue;
+          }
+          const tagEnd = lower.indexOf(">", tagStart + EDITOR_LIVE_PATCH_OPEN.length);
+          if (tagEnd < 0) {
+            cursor = tagStart;
+            break;
+          }
+          cursor = tagEnd + 1;
+          resetPayload();
+          continue;
+        }
+
+        if (currentObject) {
+          currentObject.push(buffer[cursor]!);
+          cursor += 1;
+          if (currentObject.isInvalid()) {
+            currentObject = null;
+            payloadState = StreamingPatchPayloadState.Invalid;
+            continue;
+          }
+          if (currentObject.isComplete()) {
+            events.push({
+              kind: AiEditPatchStreamEventKind.Commit,
+              operationIndex: emittedOperationCount,
+              patch: currentObject.payload(),
+            });
+            emittedOperationCount += 1;
+            currentObject = null;
+            payloadState = payloadContainer === "array"
+              ? StreamingPatchPayloadState.Separator
+              : StreamingPatchPayloadState.Done;
+          }
+          continue;
+        }
+
+        const suffix = lower.slice(cursor);
+        if (
+          suffix.length < EDITOR_LIVE_PATCH_CLOSE.length
+          && EDITOR_LIVE_PATCH_CLOSE.startsWith(suffix)
+        ) break;
+        if (suffix.startsWith(EDITOR_LIVE_PATCH_CLOSE)) {
+          cursor += EDITOR_LIVE_PATCH_CLOSE.length;
+          payloadState = StreamingPatchPayloadState.Outside;
+          payloadContainer = "unknown";
+          lastDeltaKey = "";
+          continue;
+        }
+
+        const char = buffer[cursor]!;
+        if (/\s/.test(char)) {
+          cursor += 1;
+          continue;
+        }
+        if (payloadState === StreamingPatchPayloadState.Invalid) {
+          cursor += 1;
+          continue;
+        }
+        if (payloadContainer === "unknown") {
+          if (char === "[") {
+            payloadContainer = "array";
+            cursor += 1;
+          } else if (char === "{") {
+            payloadContainer = "single";
+            currentObject = createStreamingPatchObject();
+            cursor += 1;
+          } else {
+            payloadState = StreamingPatchPayloadState.Invalid;
+            cursor += 1;
+          }
+          continue;
+        }
+        if (payloadState === StreamingPatchPayloadState.Value) {
+          if (char === "{") {
+            currentObject = createStreamingPatchObject();
+          } else if (payloadContainer === "array" && char === "]") {
+            payloadState = StreamingPatchPayloadState.Done;
+          } else {
+            payloadState = StreamingPatchPayloadState.Invalid;
+          }
+          cursor += 1;
+          continue;
+        }
+        if (payloadState === StreamingPatchPayloadState.Separator) {
+          if (char === ",") payloadState = StreamingPatchPayloadState.Value;
+          else if (char === "]") payloadState = StreamingPatchPayloadState.Done;
+          else payloadState = StreamingPatchPayloadState.Invalid;
+          cursor += 1;
+          continue;
+        }
+        payloadState = StreamingPatchPayloadState.Invalid;
+        cursor += 1;
+      }
+
+      buffer = buffer.slice(cursor);
+      const partialPatch = currentObject?.partialPatch() || null;
+      const deltaKey = partialPatch
+        ? `${emittedOperationCount}:${partialPatch}`
+        : "";
+      if (partialPatch && deltaKey !== lastDeltaKey) {
+        events.push({
+          kind: AiEditPatchStreamEventKind.Delta,
+          operationIndex: emittedOperationCount,
+          patch: partialPatch,
+        });
+      }
+      lastDeltaKey = deltaKey;
+      return events;
+    },
+    operationCount: () => emittedOperationCount,
+    reset,
+  });
+}
+
+export type EditorLivePatchDeltaQueue = Readonly<{
+  enqueue: (event: EditorLivePatchStreamEvent) => void;
+  flush: () => Promise<void>;
+  reset: () => Promise<void>;
+  cancel: () => Promise<void>;
+}>;
+
+type EditorLiveFrameScheduler = (callback: (time: number) => void) => number;
+type EditorLiveFrameCanceller = (handle: number) => void;
+
+/** Coalesce model-token deltas to one latest preview per browser paint. */
+export function createEditorLivePatchDeltaQueue(
+  apply: (event: EditorLivePatchStreamEvent) => void | Promise<void>,
+  scheduleFrame: EditorLiveFrameScheduler = (callback) => window.requestAnimationFrame(callback),
+  cancelFrame: EditorLiveFrameCanceller = (handle) => window.cancelAnimationFrame(handle),
+): EditorLivePatchDeltaQueue {
+  let pending: EditorLivePatchStreamEvent | null = null;
+  let frameHandle: number | null = null;
+  let applying: Promise<void> | null = null;
+  let flushing = false;
+  let cancelled = false;
+
+  const applyEvent = (event: EditorLivePatchStreamEvent) => {
+    const task = Promise.resolve()
+      .then(() => apply(event))
+      .then(() => undefined, () => undefined);
+    applying = task;
+    void task.finally(() => {
+      if (applying === task) applying = null;
+      if (!flushing && !cancelled && pending && frameHandle === null) schedulePending();
+    });
+    return task;
+  };
+
+  const schedulePending = () => {
+    if (cancelled || flushing || applying || !pending || frameHandle !== null) return;
+    frameHandle = scheduleFrame(() => {
+      frameHandle = null;
+      const event = pending;
+      pending = null;
+      if (event && !cancelled) applyEvent(event);
+    });
+  };
+
+  return Object.freeze({
+    enqueue: (event) => {
+      if (cancelled) return;
+      pending = event;
+      schedulePending();
+    },
+    flush: async () => {
+      if (cancelled) return;
+      flushing = true;
+      if (frameHandle !== null) {
+        cancelFrame(frameHandle);
+        frameHandle = null;
+      }
+      if (applying) await applying;
+      while (pending && !cancelled) {
+        const event = pending;
+        pending = null;
+        await applyEvent(event);
+      }
+      flushing = false;
+      schedulePending();
+    },
+    reset: async () => {
+      if (cancelled) return;
+      flushing = true;
+      pending = null;
+      if (frameHandle !== null) {
+        cancelFrame(frameHandle);
+        frameHandle = null;
+      }
+      if (applying) await applying;
+      flushing = false;
+    },
+    cancel: async () => {
+      cancelled = true;
+      pending = null;
+      if (frameHandle !== null) {
+        cancelFrame(frameHandle);
+        frameHandle = null;
+      }
+      if (applying) await applying;
+    },
+  });
+}
+
+/** Reopening AI Edit for the same target should preserve its conversation. */
+export function isSameEditorLiveTarget(
+  current: EditorLiveChatDetail | null | undefined,
+  next: EditorLiveChatDetail | null | undefined,
+) {
+  if (!current || !next) return false;
+  return current.adapter.target.kind === next.adapter.target.kind
+    && current.adapter.target.id === next.adapter.target.id;
 }
 
 export function openEditorLiveChat(detail: EditorLiveChatDetail) {
@@ -486,10 +1617,25 @@ export function openEditorLiveChat(detail: EditorLiveChatDetail) {
   const liveEditDetail: EditorLiveChatDetail = {
     ...detail,
     sourcePath: detail.sourcePath || window.location.pathname,
+    routePath: detail.routePath || window.location.pathname,
   };
   window.dispatchEvent(
     new CustomEvent<EditorLiveChatDetail>(EDITOR_LIVE_CHAT_EVENT, {
       detail: liveEditDetail,
+    }),
+  );
+}
+
+/** Refresh callbacks for an already-open target without reopening or focusing Chat. */
+export function updateEditorLiveChat(detail: EditorLiveChatDetail) {
+  if (typeof window === "undefined") return;
+  window.dispatchEvent(
+    new CustomEvent<EditorLiveChatDetail>(EDITOR_LIVE_CHAT_UPDATE_EVENT, {
+      detail: {
+        ...detail,
+        sourcePath: detail.sourcePath || window.location.pathname,
+        routePath: detail.routePath || window.location.pathname,
+      },
     }),
   );
 }

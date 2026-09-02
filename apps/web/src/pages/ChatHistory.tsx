@@ -3,7 +3,16 @@ import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { api } from "../lib/api";
 import { relativeTime } from "../lib/format";
 import { t } from "../lib/i18n";
-import { isInternalFilePermissionMessage, parseToolCalls } from "../lib/chatStream";
+import {
+  isInternalFilePermissionMessage,
+  parseToolCalls,
+  type ChatMessage,
+} from "../lib/chatStream";
+import {
+  collectResponseSurfaceSubmissionFailureMessageIds,
+  collectResponseSurfaceSubmissionReceipts,
+  isResponseSurfaceSubmissionMessage,
+} from "../lib/responseSurface";
 import { useAuthStore } from "../stores/auth";
 import { useWorkspaceFilter } from "../stores/workspace";
 import SmartToolbar from "../components/ui/SmartToolbar";
@@ -16,6 +25,7 @@ import PageHeader from "../components/ui/PageHeader";
 import { ChatMessagesSkeleton, SkeletonLine, SkeletonCircle } from "../components/ui/Skeleton";
 import ChatMarkdown from "../components/ChatMarkdown";
 import CollapsibleSentMessage from "../components/chat/CollapsibleSentMessage";
+import { isRetryableAssistantMessage } from "../components/chat/ChatMessageActions";
 import AssistantMessageBlocks from "../components/AssistantMessageBlocks";
 import CreditLimitNotice from "../components/ui/CreditLimitNotice";
 import ToolCallList from "../components/ui/ToolCallList";
@@ -88,6 +98,7 @@ function customerNameFromConversation(conversation: any) {
 /* ── Message detail panel (right side) ──────────────────────────── */
 
 interface DetailMessage {
+  id: string;
   role: string;
   content: string;
   tool_calls?: any[];
@@ -95,6 +106,7 @@ interface DetailMessage {
   stop_reason?: string | null;
   limit_detail?: any;
   timestamp?: string;
+  meta?: Record<string, unknown> | null;
 }
 
 function MessagePanel({
@@ -133,6 +145,7 @@ function MessagePanel({
         msgs
           .filter((m) => !(m.role === "user" && isInternalFilePermissionMessage(m.content)))
           .map((m) => ({
+            id: m.id,
             role: m.role,
             content: m.content || "",
             tool_calls: parseToolCalls(m.tool_calls),
@@ -140,6 +153,7 @@ function MessagePanel({
             stop_reason: m.stop_reason,
             limit_detail: m.limit_detail,
             timestamp: m.created_at,
+            meta: m.meta,
           })),
       );
       setLoading(false);
@@ -158,6 +172,28 @@ function MessagePanel({
     if (!ts) return "";
     try { return new Date(ts).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }); } catch { return ""; }
   };
+  const responseSurfaceSubmissionReceipts = useMemo(
+    () => collectResponseSurfaceSubmissionReceipts(messages),
+    [messages],
+  );
+  const responseSurfaceSubmissionFailureMessageIds = useMemo(
+    () => collectResponseSurfaceSubmissionFailureMessageIds(
+      messages,
+      responseSurfaceSubmissionReceipts,
+    ),
+    [messages, responseSurfaceSubmissionReceipts],
+  );
+  const visibleMessages = useMemo(
+    () => messages.filter((message) => (
+      !isResponseSurfaceSubmissionMessage(message, responseSurfaceSubmissionReceipts)
+      && !responseSurfaceSubmissionFailureMessageIds.has(message.id)
+    )),
+    [
+      messages,
+      responseSurfaceSubmissionFailureMessageIds,
+      responseSurfaceSubmissionReceipts,
+    ],
+  );
 
   return (
     <div className="chat-history-panel flex flex-col h-full">
@@ -242,21 +278,30 @@ function MessagePanel({
           <div className="h-full p-5" aria-busy="true" aria-live="polite">
             <ChatMessagesSkeleton rows={5} />
           </div>
-        ) : messages.length === 0 ? (
+        ) : visibleMessages.length === 0 ? (
           <div className="flex items-center justify-center h-full">
             <p className="chat-history-empty-copy text-sm">{t("page.chat_history.no_messages_in_conversation")}</p>
           </div>
         ) : (
           <div className="flex flex-col gap-5">
-            {messages.map((msg, i) => {
+            {visibleMessages.map((msg, i) => {
               const isUser = msg.role === "user";
+              const retryableAssistant = !isUser && isRetryableAssistantMessage({
+                role: "assistant",
+                content: msg.content,
+                stop_reason: msg.stop_reason || undefined,
+                stream_error: msg.meta?.stream_status === "error",
+              } satisfies ChatMessage, msg.content);
               const hasAssistantBlocks =
-                !isUser && Array.isArray(msg.assistant_blocks) && msg.assistant_blocks.length > 0;
+                !isUser &&
+                !retryableAssistant &&
+                Array.isArray(msg.assistant_blocks) &&
+                msg.assistant_blocks.length > 0;
               const showCreditLimitNotice =
                 !isUser && msg.stop_reason === "credit_exhausted";
               return (
                 <div
-                  key={i}
+                  key={msg.id}
                   className={`flex gap-3 ${isUser ? "" : "flex-row-reverse"}`}
                 >
                   {/* Avatar */}
@@ -295,6 +340,8 @@ function MessagePanel({
                           blocks={msg.assistant_blocks as any}
                           content={msg.content}
                           keyPrefix={`history-${i}`}
+                          sourceMessageId={msg.id}
+                          responseSurfaceSubmissionReceipts={responseSurfaceSubmissionReceipts}
                         />
                       </div>
                     )}

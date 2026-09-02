@@ -1,4 +1,5 @@
-import { useState, useEffect, useMemo, useRef } from "react";
+import { useState, useEffect, useMemo, useRef, type MouseEvent as ReactMouseEvent } from "react";
+import { createPortal } from "react-dom";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { Link, useParams, useNavigate, useLocation } from "react-router-dom";
 import { api, type ProvenanceStep } from "../lib/api";
@@ -14,8 +15,9 @@ import Select from "../components/ui/Select";
 import DateTimePicker from "../components/ui/DateTimePicker";
 import UserAvatar from "../components/ui/UserAvatar";
 import InlineTips from "../components/ui/InlineTips";
-import Modal from "../components/ui/Modal";
+import Modal, { trapDialogTabKey } from "../components/ui/Modal";
 import Button from "../components/ui/Button";
+import CompactCard from "../components/ui/CompactCard";
 import PageHeader from "../components/ui/PageHeader";
 import ChatMarkdown from "../components/ChatMarkdown";
 import InlineFileReferenceCard from "../components/InlineFileReferenceCard";
@@ -26,7 +28,12 @@ import PriorityPill from "../components/ui/PriorityPill";
 import { STATUS_CONFIG } from "../components/ui/StatusPill";
 import { PRIORITY_CONFIG } from "../components/ui/PriorityPill";
 import { CATEGORIES } from "../lib/taskCategories";
-import { isApprovalTaskType } from "../lib/taskTypes";
+import { isApprovalTaskType, isInteractiveTaskType } from "../lib/taskTypes";
+import {
+  canResumeLegacyAgentInput,
+  hasPendingPlanDecision,
+  resumablePlanInputStep,
+} from "../lib/taskHitl";
 import CategoryChip from "../components/ui/CategoryChip";
 import TaskPropertiesPanel from "../components/task/TaskPropertiesPanel";
 import TaskLogItem from "../components/task/TaskLogItem";
@@ -49,7 +56,7 @@ import {
   IconCalendar, IconSend, IconFlag, IconCategory,
   IconCancel, IconTimeline, IconComment, IconCircleDot, IconUpload,
   IconDownload, IconDocument, IconManorLogo, IconList, IconTrash,
-  IconChevronLeft, IconChevronRight,
+  IconChevronLeft, IconChevronRight, IconChat, IconClose,
 } from "../components/icons";
 
 /* ── Constants ──
@@ -80,6 +87,12 @@ const TASK_DETAIL_POLL_INTERVAL_MS = 60_000;
 const LIVE_TASK_STATUSES = new Set(["pending", "in_progress"]);
 const LIVE_PLAN_STATUSES = new Set(["pending_approval", "running", "paused", "needs_attention"]);
 const LIVE_STEP_STATUSES = new Set(["pending", "running", "waiting_human"]);
+const RECOVERY_EVENT_TYPES = new Set([
+  "ai_hitl_requested",
+  "step_needs_human",
+  "ai_execution_failed",
+  "ai_needs_replan",
+]);
 
 function getTaskReturnTo(state: unknown): string | null {
   if (!state || typeof state !== "object") return null;
@@ -89,8 +102,6 @@ function getTaskReturnTo(state: unknown): string | null {
     ? value
     : null;
 }
-const HITL_RESUMABLE_PLAN_STATUSES = new Set(["running", "paused", "needs_attention"]);
-
 type TaskCommentPayload = {
   text?: string;
   attachments?: AttachedItem[];
@@ -108,15 +119,6 @@ function hasLivePlanStatus(value: unknown): boolean {
 function hasLiveStepStatus(value: unknown): boolean {
   const steps = Array.isArray(value) ? value : [];
   return steps.some((step: any) => LIVE_STEP_STATUSES.has(String(step?.step_status || step?.status || "")));
-}
-
-function canResumeStructuredHumanInput(task: Task | null | undefined, plan: any | null, steps: any[]): boolean {
-  if (!task) return false;
-  const planCanResume = HITL_RESUMABLE_PLAN_STATUSES.has(String(plan?.status || ""))
-    && (Array.isArray(steps) ? steps : []).some((step: any) => String(step?.step_status || step?.status || "") === "waiting_human");
-  if (planCanResume) return true;
-  const hasLegacyHitlAgent = Boolean(task.agent_id || isMasterAgent(task.agent_id, task.agent_type));
-  return task.status === "waiting_on_customer" && hasLegacyHitlAgent;
 }
 
 function outputFileIdentity(file: any): string {
@@ -1010,6 +1012,14 @@ export default function TaskDetail() {
   const [slaAdminOpen, setSlaAdminOpen] = useState(false);
   const [showMoreProperties, setShowMoreProperties] = useState(false);
   const [runtimeRulePrompt, setRuntimeRulePrompt] = useState("");
+  const [taskSessionFullscreen, setTaskSessionFullscreen] = useState(false);
+  const taskSessionLauncherRef = useRef<HTMLButtonElement | null>(null);
+  const taskSessionCloseRef = useRef<HTMLButtonElement>(null);
+  const taskSessionDialogRef = useRef<HTMLDivElement>(null);
+  const openTaskSession = (event: ReactMouseEvent<HTMLButtonElement>) => {
+    taskSessionLauncherRef.current = event.currentTarget;
+    setTaskSessionFullscreen(true);
+  };
 
   const { data: task, isLoading, error } = useQuery({
     queryKey: ["task", taskId],
@@ -1018,14 +1028,18 @@ export default function TaskDetail() {
     refetchInterval: (query) => hasLiveTaskStatus(query.state.data) ? TASK_DETAIL_POLL_INTERVAL_MS : false,
   });
   const { data: taskConstants } = useQuery({ queryKey: ["task-constants"], queryFn: () => api.tasks.constants() });
-  const { data: taskPlans = [], isLoading: plansLoading } = useQuery({
+  const {
+    data: taskPlans = [],
+    isLoading: plansLoading,
+    isSuccess: plansResolved,
+  } = useQuery({
     queryKey: ["task-plans", taskId],
     queryFn: () => api.plans.list({ task_id: taskId!, limit: 5 }),
     enabled: !!taskId,
     refetchInterval: (query) => hasLiveTaskStatus(task) || hasLivePlanStatus(query.state.data) ? TASK_DETAIL_POLL_INTERVAL_MS : false,
   });
   const latestPlan = taskPlans[0] || null;
-  const { data: planSteps = [] } = useQuery({
+  const { data: planSteps = [], isSuccess: planStepsResolved } = useQuery({
     queryKey: ["plan-steps", latestPlan?.id],
     queryFn: () => api.plans.steps(latestPlan!.id),
     enabled: !!latestPlan?.id,
@@ -1041,6 +1055,11 @@ export default function TaskDetail() {
     staleTime: 60_000,
   });
   const { data: agents = [] } = useQuery({ queryKey: ["agents"], queryFn: () => api.agents.list() });
+  const { data: workspaceAssignableAgents } = useQuery({
+    queryKey: ["workspace-assignable-agents", task?.workspace_id],
+    queryFn: () => api.workspaces.agents.assignable(task!.workspace_id!),
+    enabled: !!task?.workspace_id,
+  });
   const { data: logs = [] } = useQuery({
     queryKey: ["task-logs", taskId],
     queryFn: () => api.tasks.logs(taskId!),
@@ -1055,6 +1074,58 @@ export default function TaskDetail() {
     queryFn: () => api.users.directory(),
   });
   const { data: staffList = [] } = useQuery({ queryKey: ["entity-staff-for-assignee"], queryFn: () => api.staff.list() });
+
+  const workspaceAgentIds = task?.workspace_id
+    ? workspaceAssignableAgents?.agent_ids || []
+    : undefined;
+  const taskWorkspace = task?.workspace_id
+    ? (workspaces as any[]).find((workspace) => workspace.id === task.workspace_id)
+    : null;
+  const taskSessionCanRender = Boolean(
+    task
+    && !error
+    && isInteractiveTaskType(task.task_type)
+    && task.workspace_id
+    && taskWorkspace,
+  );
+
+  useEffect(() => {
+    if (!taskSessionFullscreen) return;
+    if (!taskSessionCanRender) {
+      setTaskSessionFullscreen(false);
+      window.requestAnimationFrame(() => taskSessionLauncherRef.current?.focus());
+      return;
+    }
+
+    const previousBodyOverflow = document.body.style.overflow;
+    const appRoot = document.getElementById("root");
+    const appRootWasInert = appRoot?.hasAttribute("inert") || false;
+    document.body.style.overflow = "hidden";
+    appRoot?.setAttribute("inert", "");
+
+    const focusFrame = window.requestAnimationFrame(() => {
+      taskSessionCloseRef.current?.focus();
+    });
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.defaultPrevented) return;
+      if (event.key === "Tab" && taskSessionDialogRef.current) {
+        trapDialogTabKey(event, taskSessionDialogRef.current);
+        return;
+      }
+      if (event.key !== "Escape") return;
+      event.preventDefault();
+      setTaskSessionFullscreen(false);
+      window.requestAnimationFrame(() => taskSessionLauncherRef.current?.focus());
+    };
+    window.addEventListener("keydown", handleKeyDown);
+
+    return () => {
+      window.cancelAnimationFrame(focusFrame);
+      window.removeEventListener("keydown", handleKeyDown);
+      document.body.style.overflow = previousBodyOverflow;
+      if (!appRootWasInert) appRoot?.removeAttribute("inert");
+    };
+  }, [taskSessionCanRender, taskSessionFullscreen]);
 
   const commentMentionOptions = useMemo<MentionOption[]>(() => {
     const agentOptions = (agents as Agent[]).map((agent) => ({
@@ -1156,6 +1227,10 @@ export default function TaskDetail() {
       queryClient.setQueryData(["task", taskId], result.task);
       queryClient.invalidateQueries({ queryKey: ["task", taskId] });
       queryClient.invalidateQueries({ queryKey: ["task-logs", taskId] });
+      queryClient.invalidateQueries({ queryKey: ["task-plans", taskId] });
+      if (result.plan_id) {
+        queryClient.invalidateQueries({ queryKey: ["plan-steps", result.plan_id] });
+      }
       queryClient.invalidateQueries({ queryKey: ["taskBoard"] });
       queryClient.invalidateQueries({ queryKey: ["tasks"] });
       toast.success(
@@ -1169,11 +1244,15 @@ export default function TaskDetail() {
   });
 
   const hitlMutation = useMutation({
-    mutationFn: ({ response, fields }: { response: string; fields?: Record<string, string> }) => api.tasks.respondHITL(taskId!, { response, fields }),
+    mutationFn: ({ stepId, response, fields }: { stepId?: string; response: string; fields?: Record<string, string> }) => api.tasks.respondHITL(taskId!, { step_id: stepId, response, fields }),
     onSuccess: (result) => {
       queryClient.setQueryData(["task", taskId], result.task);
       queryClient.invalidateQueries({ queryKey: ["task", taskId] });
       queryClient.invalidateQueries({ queryKey: ["task-logs", taskId] });
+      queryClient.invalidateQueries({ queryKey: ["task-plans", taskId] });
+      if (result.plan_id) {
+        queryClient.invalidateQueries({ queryKey: ["plan-steps", result.plan_id] });
+      }
       queryClient.invalidateQueries({ queryKey: ["taskBoard"] });
       queryClient.invalidateQueries({ queryKey: ["tasks"] });
       window.dispatchEvent(new CustomEvent("manor:workspace-actions-refresh", { detail: { workspaceId: result.task.workspace_id } }));
@@ -1461,16 +1540,35 @@ export default function TaskDetail() {
 
   const pcfg = PRIORITY_CONFIG[task.priority] || PRIORITY_CONFIG[3];
   const scfg = STATUS_CONFIG[task.status] || STATUS_CONFIG.pending;
+  const terminalStatusLabel = t((STATUS_CONFIG[task.status] || STATUS_CONFIG.pending).labelKey);
   const isMaster = isMasterAgent(task.agent_id, task.agent_type);
   const isAI = !!task.agent_id || isMaster;
   const ownerServiceLabel = humanizeServiceKey(task.owner_service_key);
   const isRuntimeOwner = Boolean(ownerServiceLabel && !task.agent_id && !task.assignee_id);
+  const humanAssigneeLabel = friendlyPersonName(task.assignee_name
+    || (task.assignee_id === currentUser?.id ? (currentUser?.display_name || currentUser?.email) : task.assignee_id), "");
+  const humanAssigneeAvatarUrl = task.assignee_avatar
+    || (task.assignee_id === currentUser?.id ? currentUser?.avatar_url : null);
   const assigneeLabel = friendlyPersonName(task.agent_name || task.assignee_name || (isMaster ? MANOR_AGENT_NAME
     : task.agent_id ? t("page.tasks.ai_agent")
     : task.assignee_id === currentUser?.id ? (currentUser?.display_name || currentUser?.email)
     : ownerServiceLabel || task.assignee_id), "");
   const assigneeAvatarUrl = task.agent_avatar || task.assignee_avatar
     || (task.assignee_id === currentUser?.id ? currentUser?.avatar_url : null);
+  const sessionHostAvailable = task.session_host_available === true
+    && Boolean(task.session_host_name);
+  const sessionHostName = sessionHostAvailable
+    ? friendlyPersonName(task.session_host_name || "", "")
+    : t("page.task_detail.session_host_unavailable");
+  const sessionHostRoleLabel = sessionHostAvailable && task.session_host_role_label
+    ? formatUserFacingLabel(task.session_host_role_label)
+    : "";
+  const sessionHostLabel = [sessionHostName, sessionHostRoleLabel]
+    .filter(Boolean)
+    .join(" · ");
+  const sessionHostAvatarUrl = sessionHostAvailable
+    ? task.session_host_avatar
+    : null;
   const isAutomatedOwner = isAI || isRuntimeOwner;
   const assigneeType: "manor" | "agent" | "user" | "none" = isMaster ? "manor" : isAutomatedOwner ? "agent" : assigneeLabel ? "user" : "none";
   const isTerminal = ["completed", "cancelled", "failed"].includes(task.status);
@@ -1518,10 +1616,21 @@ export default function TaskDetail() {
     && taskOutputAgentResponse !== taskOutputErrorMessage
   );
   const isApprovalTask = isApprovalTaskType(task.task_type);
-  const approvalDecision = taskDetails.approval_decision || task.actual_output?.approval;
-  const taskWorkspace = task.workspace_id
-    ? (workspaces as any[]).find((w) => w.id === task.workspace_id)
+  const isInteractiveTask = isInteractiveTaskType(task.task_type);
+  const interactiveSession = taskDetails.session
+    && typeof taskDetails.session === "object"
+    && !Array.isArray(taskDetails.session)
+    ? taskDetails.session as Record<string, unknown>
     : null;
+  const interactiveSessionObjective = typeof interactiveSession?.objective === "string"
+    ? interactiveSession.objective.trim()
+    : "";
+  const interactiveSessionPhases = Array.isArray(interactiveSession?.phases)
+    ? interactiveSession.phases
+        .filter((phase): phase is string => typeof phase === "string" && Boolean(phase.trim()))
+        .map((phase) => phase.trim())
+    : [];
+  const approvalDecision = taskDetails.approval_decision || task.actual_output?.approval;
   const taskWorkspaceName = taskWorkspace?.name || (task.workspace_id ? task.workspace_id.slice(0, 8) : t("nav.workspaces"));
   const commitRuntimeContext = (patch: Record<string, any>) => {
     updateMutation.mutate({
@@ -1571,7 +1680,15 @@ export default function TaskDetail() {
     commitRuntimeContext(patch);
     setRuntimeRulePrompt("");
   };
-  const canResumePendingInput = canResumeStructuredHumanInput(task, latestPlan, planSteps as any[]);
+  const pendingPlanInputStep = resumablePlanInputStep(latestPlan, planSteps as any[]);
+  const canResumePendingInput = Boolean(pendingPlanInputStep)
+    || canResumeLegacyAgentInput(task, latestPlan, plansResolved);
+  const hasPendingTypedDecision = hasPendingPlanDecision(
+    planSteps,
+    pendingPlanInputStep?.id,
+  );
+  const planDecisionStateResolved = plansResolved
+    && (!latestPlan || planStepsResolved);
   const submitHumanInputReply = (response: string, fields?: Record<string, string>) => {
     const cleanResponse = response.trim();
     const cleanFields = Object.fromEntries(
@@ -1580,7 +1697,11 @@ export default function TaskDetail() {
         .filter(([, value]) => value),
     );
     if (canResumePendingInput) {
-      hitlMutation.mutate({ response: cleanResponse, fields: cleanFields });
+      hitlMutation.mutate({
+        stepId: pendingPlanInputStep?.id,
+        response: cleanResponse,
+        fields: cleanFields,
+      });
       return;
     }
     const fieldLines = Object.entries(cleanFields).map(([key, value]) => `${formatUserFacingLabel(key)}: ${value}`);
@@ -1589,8 +1710,15 @@ export default function TaskDetail() {
   };
   const pendingInputRequest = latestActionableInputRequest(logs as any[], taskOutput, task.status);
   const actionableInputRequest = canResumePendingInput ? pendingInputRequest : null;
-  const pendingInputPrompt = inputRequestPrompt(actionableInputRequest);
-  const showTaskRecoveryPanel = !actionableInputRequest;
+  const pendingInputPrompt = String(pendingPlanInputStep?.human_input_prompt || "")
+    || inputRequestPrompt(actionableInputRequest);
+  const hasTaskRecoveryOrigin = Boolean(latestPlan)
+    || canResumePendingInput
+    || (logs as any[]).some((log: any) => RECOVERY_EVENT_TYPES.has(log?.log_type));
+  const showTaskRecoveryPanel = planDecisionStateResolved
+    && hasTaskRecoveryOrigin
+    && !actionableInputRequest
+    && (!hasPendingTypedDecision || canResumePendingInput);
   const submitActionReply = () => {
     submitHumanInputReply(hitlReply);
   };
@@ -1598,6 +1726,22 @@ export default function TaskDetail() {
     log?.log_type === "workspace_agent_response" || log?.log_type === "workspace_agent_error"
   ).length;
   const hasWorkspaceAgentActivity = workspaceAgentActivityCount > 0;
+  const taskScopedWorkspaceChat = task.workspace_id && taskWorkspace ? (
+    <WorkspaceChat
+      key={`${task.workspace_id}:${task.id}:workspace-agent-thread`}
+      workspaceId={task.workspace_id}
+      workspace={taskWorkspace}
+      workspaceName={isInteractiveTask ? task.title : `Task: ${task.title}`}
+      threadRef={{ kind: "task", id: task.id }}
+      taskSession={isInteractiveTask ? {
+        hostName: sessionHostLabel,
+        hostAvatarUrl: sessionHostAvatarUrl,
+        hostAvailable: sessionHostAvailable,
+        objective: interactiveSessionObjective || undefined,
+        phases: interactiveSessionPhases,
+      } : undefined}
+    />
+  ) : null;
   return (
     <div className="task-detail-page" style={{ height: "100%", overflowY: "auto", padding: 0 }}>
       <PageHeader
@@ -1665,8 +1809,40 @@ export default function TaskDetail() {
                 {t("page.task_detail.escalated_l")}{task.escalation_level}
               </span>
             )}
-            {(isMaster || task.agent_id || assigneeLabel) && (
-              <span style={{ display: "inline-flex", alignItems: "center", gap: 5, padding: "2px 10px 2px 2px", borderRadius: 20, fontSize: 11, fontWeight: 600, color: isAutomatedOwner ? "#436b65" : "#57534e", background: isAutomatedOwner ? "#f2f6f5" : "#f6f5f3" }}>
+            {isInteractiveTask ? (
+              <>
+                <span className="task-detail-assignment-chip">
+                  <span className="task-detail-assignment-role">
+                    {t("page.task_detail.session_host_label")}
+                  </span>
+                  <UserAvatar
+                    type={sessionHostAvailable
+                      ? isMasterAgent(task.session_host_agent_id) ? "manor" : "agent"
+                      : "none"}
+                    name={sessionHostLabel}
+                    avatarUrl={sessionHostAvatarUrl}
+                    seed={task.session_host_agent_id || undefined}
+                    size={18}
+                  />
+                  <span>{sessionHostLabel}</span>
+                </span>
+                {task.assignee_id && humanAssigneeLabel && (
+                  <span className="task-detail-assignment-chip">
+                    <span className="task-detail-assignment-role">
+                      {t("component.embedded_chat.assignee")}
+                    </span>
+                    <UserAvatar
+                      type="user"
+                      name={humanAssigneeLabel}
+                      avatarUrl={humanAssigneeAvatarUrl}
+                      size={18}
+                    />
+                    <span>{humanAssigneeLabel}</span>
+                  </span>
+                )}
+              </>
+            ) : (isMaster || task.agent_id || assigneeLabel) && (
+              <span className="task-detail-assignment-chip">
                 <UserAvatar
                   type={assigneeType}
                   name={assigneeLabel}
@@ -1674,13 +1850,27 @@ export default function TaskDetail() {
                   seed={assigneeType === "agent" ? task.agent_id || undefined : undefined}
                   size={18}
                 />
-                {assigneeLabel || t("page.task_detail.ai_agent")}
+                <span>{assigneeLabel || t("page.task_detail.ai_agent")}</span>
               </span>
             )}
           </div>
         )}
         actions={(
           <div className="task-detail-hero-actions">
+            {isInteractiveTask && taskScopedWorkspaceChat && (
+              <button
+                type="button"
+                className="btn-manor task-session-open-button"
+                disabled={!sessionHostAvailable}
+                title={sessionHostAvailable
+                  ? t("page.task_detail.session_open")
+                  : t("page.task_detail.session_host_unavailable_copy")}
+                onClick={openTaskSession}
+              >
+                <IconChat size={15} />
+                {t("page.task_detail.session_open")}
+              </button>
+            )}
             <TaskSiblingSwitcher
               task={task}
               tasks={siblingTasks}
@@ -1721,6 +1911,8 @@ export default function TaskDetail() {
               <TaskPropertiesPanel
                 task={task as any}
                 agents={agents as any[]}
+                workspaceAgentIds={workspaceAgentIds}
+                workspaceAgentSubscriptions={workspaceAssignableAgents?.subscriptions || []}
                 users={(users as any[]) || []}
                 staff={(staffList as any[]) || []}
                 currentUser={currentUser as any}
@@ -1789,9 +1981,11 @@ export default function TaskDetail() {
               logs={logs}
               comment={newComment}
               detailReason={formatUserFacingStructuredText(taskOutputErrorMessage)}
+              inputStepId={pendingPlanInputStep?.id}
+              inputPrompt={String(pendingPlanInputStep?.human_input_prompt || "")}
               isPending={retryMutation.isPending || hitlMutation.isPending || actionReplyCommentMutation.isPending}
               onRetry={(note) => retryMutation.mutate(note)}
-              onRespond={submitHumanInputReply}
+              onRespond={canResumePendingInput ? submitHumanInputReply : undefined}
             />
           )}
 
@@ -2213,6 +2407,7 @@ export default function TaskDetail() {
 
           <TaskExecutionTimeline
             plan={latestPlan}
+            taskStatus={task?.status}
             steps={planSteps}
             isLoading={plansLoading}
             isPending={approvePlanMutation.isPending || retryPlanMutation.isPending || retryStepMutation.isPending}
@@ -2344,7 +2539,34 @@ export default function TaskDetail() {
             );
           })()}
 
-          {task.workspace_id && taskWorkspace && (
+          {taskScopedWorkspaceChat && (isInteractiveTask ? (
+            <section
+              className="task-detail-task-session"
+              aria-label={t("page.task_detail.interactive_session")}
+            >
+              <CompactCard
+                className="task-session-launch-card"
+                icon={(
+                  <UserAvatar
+                    type={sessionHostAvailable
+                      ? isMasterAgent(task.session_host_agent_id) ? "manor" : "agent"
+                      : "none"}
+                    name={sessionHostLabel}
+                    avatarUrl={sessionHostAvatarUrl}
+                    size={36}
+                  />
+                )}
+                title={t("page.task_detail.interactive_session")}
+                subtitle={interactiveSessionObjective
+                  || t("page.task_detail.interactive_session_description")}
+                meta={(
+                  <span className="task-session-launch-host">
+                    {t("page.task_detail.session_hosted_by", { agent: sessionHostLabel })}
+                  </span>
+                )}
+              />
+            </section>
+          ) : (
             <details
               className="glass-card task-detail-section-card task-detail-agent-thread-card"
               open={hasWorkspaceAgentActivity ? true : undefined}
@@ -2364,7 +2586,9 @@ export default function TaskDetail() {
                 <div style={{ display: "flex", alignItems: "center", gap: 10, minWidth: 0 }}>
                   <IconAgent size={13} style={{ color: "#78716c", flexShrink: 0 }} />
                   <div style={{ minWidth: 0 }}>
-                    <span className="manor-label" style={{ margin: 0, color: "#57534e" }}>{t("page.task_detail.workspace_agent_thread")}</span>
+                    <span className="manor-label" style={{ margin: 0, color: "#57534e" }}>
+                      {t("page.task_detail.workspace_agent_thread")}
+                    </span>
                     <div style={{
                       fontSize: 11,
                       color: "#a8a29e",
@@ -2400,16 +2624,11 @@ export default function TaskDetail() {
                   {t("page.task_detail.task_scoped_chat_messages_here_carry_this_task_s")}
                 </p>
                 <div style={{ height: hasWorkspaceAgentActivity ? 460 : 380, minHeight: 360, borderRadius: 14, overflow: "hidden", border: "1px solid rgba(28,25,23,0.06)", background: "#fff" }}>
-                  <WorkspaceChat
-                    key={`${task.workspace_id}:${task.id}:workspace-agent-thread`}
-                    workspaceId={task.workspace_id}
-                    workspaceName={`Task: ${task.title}`}
-                    threadRef={{ kind: "task", id: task.id }}
-                  />
+                  {taskScopedWorkspaceChat}
                 </div>
               </div>
             </details>
-          )}
+          ))}
 
           {/* ── Comments (human + status changes + AI agent voice) ──
               Comments now includes the agent-side moments users care
@@ -2573,7 +2792,7 @@ export default function TaskDetail() {
                   return [
                     { label: t("page.dashboard.created"), value: task.created_at ? formatDateFull(task.created_at) : null },
                     { label: t("page.tasks.started"), value: task.started_at ? formatDateFull(task.started_at) : null },
-                    { label: t("status.completed"), value: task.completed_at ? formatDateFull(task.completed_at) : null },
+                    { label: terminalStatusLabel, value: task.completed_at ? formatDateFull(task.completed_at) : null },
                     { label: t("page.task_detail.created_by"), value: creatorDisplayName },
                     { label: t("page.workspace_detail.service"), value: ownerServiceLabel },
                     { label: t("page.custom_fields.type"), value: task.task_type ? formatUserFacingLabel(task.task_type) : null, capitalize: true },
@@ -2703,6 +2922,45 @@ export default function TaskDetail() {
 
         </div>
       </div>
+
+      {taskSessionFullscreen && taskScopedWorkspaceChat && typeof document !== "undefined" && createPortal(
+        <div
+          ref={taskSessionDialogRef}
+          className="task-session-fullscreen"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="task-session-fullscreen-title"
+          tabIndex={-1}
+        >
+          <header className="task-session-fullscreen-header">
+            <button
+              ref={taskSessionCloseRef}
+              type="button"
+              className="btn-manor-ghost task-session-fullscreen-exit"
+              aria-label={t("page.task_detail.session_exit")}
+              title={t("page.task_detail.session_exit")}
+              onClick={() => {
+                setTaskSessionFullscreen(false);
+                window.requestAnimationFrame(() => taskSessionLauncherRef.current?.focus());
+              }}
+            >
+              <IconClose size={16} />
+              <span>{t("page.task_detail.session_exit")}</span>
+            </button>
+            <div className="task-session-fullscreen-identity">
+              <span>{t("page.task_detail.interactive_session")}</span>
+              <h2 id="task-session-fullscreen-title">{task.title}</h2>
+            </div>
+            <div className="task-session-fullscreen-status">
+              <StatusPill status={task.status} />
+            </div>
+          </header>
+          <div className="task-session-fullscreen-chat">
+            {taskScopedWorkspaceChat}
+          </div>
+        </div>,
+        document.body,
+      )}
 
       <ConfirmDialog
         open={showDeleteConfirm}

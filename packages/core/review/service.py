@@ -28,13 +28,19 @@ transaction via ``ledger.service.record_event``.
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional, Sequence
 
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from packages.core.constants.review import (
+    DEFAULT_REVIEW_LEASE_SECONDS,
+    LEGACY_REVIEW_RECOVERY_GRACE_SECONDS,
+    ReviewRunStatus,
+    ReviewSkipReason,
+)
 from packages.core.ledger import event_types as et
 from packages.core.ledger.service import record_event
 from packages.core.models.governance import GovernancePolicy
@@ -58,6 +64,30 @@ class ReviewAlreadyRunning(Exception):
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _aware(value: datetime) -> datetime:
+    return value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
+
+
+def review_lease_is_expired(
+    review: ReviewRun,
+    *,
+    now: datetime | None = None,
+) -> bool:
+    """Return whether a running review may be safely recovered.
+
+    Rows created before durable review leases have no lease fields. They get a
+    grace period longer than the Strategist task's hard time limit, so a live
+    old-version worker is not mistaken for an abandoned execution during a
+    rolling deployment.
+    """
+    current_time = now or _utcnow()
+    if review.lease_expires_at is not None:
+        return _aware(review.lease_expires_at) <= current_time
+    return _aware(review.created_at) <= current_time - timedelta(
+        seconds=LEGACY_REVIEW_RECOVERY_GRACE_SECONDS
+    )
 
 
 async def _record_review_event(
@@ -88,7 +118,7 @@ async def latest_succeeded_review(
             select(ReviewRun)
             .where(
                 ReviewRun.workspace_id == workspace_id,
-                ReviewRun.status == "succeeded",
+                ReviewRun.status == ReviewRunStatus.SUCCEEDED,
             )
             .order_by(ReviewRun.id.desc())
             .limit(1)
@@ -102,6 +132,9 @@ async def begin_review(
     entity_id: str,
     workspace_id: str,
     trigger: "ReviewTrigger | ReviewTriggerKind | str",
+    delivery_id: str | None = None,
+    lease_owner: str | None = None,
+    lease_seconds: int = DEFAULT_REVIEW_LEASE_SECONDS,
 ) -> ReviewRun:
     """Claim the workspace's single review slot and freeze the snapshot.
 
@@ -153,13 +186,18 @@ async def begin_review(
         workspace_id=workspace_id,
         trigger_kind=trigger_kind,
         trigger_detail=trigger.detail or None,
-        status="running",
+        status=ReviewRunStatus.RUNNING,
         watermark_start=watermark_start,
         watermark_end=watermark_end,
         window_start=window_start,
         window_end=window_end,
         workspace_revision=workspace_revision,
         policy_revision=policy_revision,
+        delivery_id=delivery_id,
+        lease_owner=lease_owner,
+        lease_expires_at=(
+            now + timedelta(seconds=lease_seconds) if lease_owner else None
+        ),
         created_at=now,
     )
 
@@ -178,29 +216,61 @@ async def begin_review(
 
     await _record_review_event(
         db, review, et.REVIEW_STARTED,
-        status="running",
+        status=ReviewRunStatus.RUNNING,
         occurred_at=now,
         payload={"trigger_kind": trigger_kind, "trigger_detail": trigger.detail},
     )
     return review
 
 
+async def renew_review_lease(
+    db: AsyncSession,
+    *,
+    review_id: str,
+    lease_owner: str,
+    now: datetime | None = None,
+    lease_seconds: int = DEFAULT_REVIEW_LEASE_SECONDS,
+) -> bool:
+    """Renew a live lease without allowing an expired owner to revive."""
+    current_time = now or _utcnow()
+    review = (
+        await db.execute(
+            select(ReviewRun).where(ReviewRun.id == review_id).with_for_update()
+        )
+    ).scalar_one_or_none()
+    if (
+        review is None
+        or review.status != ReviewRunStatus.RUNNING
+        or review.lease_owner != lease_owner
+        or review.lease_expires_at is None
+        or _aware(review.lease_expires_at) <= current_time
+    ):
+        return False
+    review.lease_expires_at = current_time + timedelta(seconds=lease_seconds)
+    return True
+
+
 async def mark_review_skipped(
-    db: AsyncSession, review: ReviewRun, *, reason: str
+    db: AsyncSession,
+    review: ReviewRun,
+    *,
+    reason: ReviewSkipReason | str,
 ) -> ReviewRun:
     """Suppressed review (裁定 C): keep the row, do NOT advance the watermark.
 
     ``watermark_end`` is forced back to ``watermark_start`` so the row itself
     documents "this review consumed nothing".
     """
-    review.status = "skipped"
-    review.skip_reason = (reason or "")[:64] or None
+    review.status = ReviewRunStatus.SKIPPED
+    review.skip_reason = str(reason or "")[:64] or None
     review.watermark_end = review.watermark_start
     review.completed_at = _utcnow()
+    review.lease_owner = None
+    review.lease_expires_at = None
     await db.flush()
     await _record_review_event(
         db, review, et.REVIEW_SKIPPED,
-        status="skipped",
+        status=ReviewRunStatus.SKIPPED,
         occurred_at=review.completed_at,
         payload={"skip_reason": review.skip_reason},
     )
@@ -211,14 +281,16 @@ async def complete_review(
     db: AsyncSession, review: ReviewRun, *, briefing: Optional[dict] = None
 ) -> ReviewRun:
     """Success — the only transition that advances the watermark."""
-    review.status = "succeeded"
+    review.status = ReviewRunStatus.SUCCEEDED
     if briefing is not None:
         review.briefing = briefing
     review.completed_at = _utcnow()
+    review.lease_owner = None
+    review.lease_expires_at = None
     await db.flush()
     await _record_review_event(
         db, review, et.REVIEW_SUCCEEDED,
-        status="succeeded",
+        status=ReviewRunStatus.SUCCEEDED,
         occurred_at=review.completed_at,
     )
     return review
@@ -233,13 +305,15 @@ async def fail_review(
     ``begin_review`` chains only off the latest *succeeded* review, this row
     is ignored and the same window is re-consumed by the next review.
     """
-    review.status = "failed"
+    review.status = ReviewRunStatus.FAILED
     review.error = (error or "")[:MAX_ERROR_CHARS]
     review.completed_at = _utcnow()
+    review.lease_owner = None
+    review.lease_expires_at = None
     await db.flush()
     await _record_review_event(
         db, review, et.REVIEW_FAILED,
-        status="failed",
+        status=ReviewRunStatus.FAILED,
         occurred_at=review.completed_at,
         payload={"error": review.error[:500]},
     )

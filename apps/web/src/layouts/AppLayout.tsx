@@ -615,25 +615,6 @@ const IconMemory = () => (
   </svg>
 );
 
-const IconReport = () => (
-  <svg
-    width="16"
-    height="16"
-    viewBox="0 0 24 24"
-    fill="none"
-    stroke="currentColor"
-    strokeWidth={1.8}
-    strokeLinecap="round"
-    strokeLinejoin="round"
-  >
-    <path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z" />
-    <polyline points="14 2 14 8 20 8" />
-    <line x1="16" y1="13" x2="8" y2="13" />
-    <line x1="16" y1="17" x2="8" y2="17" />
-    <polyline points="10 9 9 9 8 9" />
-  </svg>
-);
-
 /* ─── Section definitions ─── */
 
 interface NavItem {
@@ -733,16 +714,13 @@ const baseConfigurationItems: NavItem[] = [
   },
 ];
 
-const flowsConfigurationItem = (
-  enabled: boolean,
-  comingSoon: boolean,
-): NavItem => ({
+const flowsConfigurationItem = (enabled: boolean): NavItem => ({
   path: "/flows",
   label: "Workflows",
   i18nKey: "nav.flows",
   icon: <IconWorkflow />,
   disabled: !enabled,
-  badge: comingSoon ? "Soon" : undefined,
+  badge: enabled ? undefined : "Soon",
 });
 
 
@@ -1709,6 +1687,7 @@ export default function AppLayout() {
   const [configureOpen, setConfigureOpen] = useState(false);
   const [helpOpen, setHelpOpen] = useState(false);
   const [supportOpen, setSupportOpen] = useState(false);
+  const supportRestoreFocusRef = useRef<HTMLButtonElement>(null);
   const [searchQuery, setSearchQuery] = useState("");
 
   /* ── Chat Mode state ── */
@@ -1716,6 +1695,7 @@ export default function AppLayout() {
   const [activeConvType, setActiveConvType] = useState<
     "manor" | "operation" | "dm"
   >("manor");
+  const [unavailableWorkspaceId, setUnavailableWorkspaceId] = useState<string | null>(null);
   const [activeDmAgentId, setActiveDmAgentId] = useState<string | null>(null);
   const [chatWorkspaces, setChatWorkspaces] = useState<Workspace[]>([]);
   const activeWorkspaceId = useWorkspaceFilter((s) => s.activeWorkspaceId);
@@ -1780,10 +1760,7 @@ export default function AppLayout() {
   }, []);
   const deploymentMode = useConfigStore((s) => s.deployment_mode);
   const configLoaded = useConfigStore((s) => s.loaded);
-  const {
-    enabled: flowsAvailable,
-    released: flowsReleased,
-  } = usePreviewFeatureAccess("flows");
+  const { enabled: flowsAvailable } = usePreviewFeatureAccess("flows");
   const supportTicketsEnabled = useConfigStore(
     (s) => s.support_tickets_enabled,
   );
@@ -1791,13 +1768,12 @@ export default function AppLayout() {
     useSupportUnreadCount(supportTicketsEnabled).data?.count || 0;
   const configurationItems = useMemo(() => {
     const items = [...baseConfigurationItems];
-    // Flows follows Skills. Account preview access turns the disabled "Soon"
-    // entry into the real destination without changing the global release.
-    items.push(flowsConfigurationItem(flowsAvailable, !flowsReleased));
+    // Flows follows Skills and mirrors Apps: only unavailable accounts see
+    // the disabled "Soon" state.
+    items.push(flowsConfigurationItem(flowsAvailable));
     return items;
   }, [
     flowsAvailable,
-    flowsReleased,
   ]);
   const {
     data: workspaceList = EMPTY_WORKSPACES,
@@ -1907,14 +1883,16 @@ export default function AppLayout() {
       !workspaceListReady
       || mode !== "chat"
       || activeConvType !== "operation"
-      || workspaceList.some((workspace) => workspace.id === activeConvId)
     ) {
       return;
     }
-    setActiveConvId("manor-ai");
-    setActiveConvType("manor");
-    setActiveDmAgentId(null);
-    setConvSearchQuery("");
+    if (workspaceList.some((workspace) => workspace.id === activeConvId)) {
+      setUnavailableWorkspaceId((current) =>
+        current === activeConvId ? null : current,
+      );
+      return;
+    }
+    setUnavailableWorkspaceId(activeConvId);
     if (location.pathname === "/chat" && location.search) {
       navigate("/chat", { replace: true });
     }
@@ -2182,8 +2160,15 @@ export default function AppLayout() {
   const onTaskUpdate = useCallback(
     (data: Record<string, any>) => {
       const taskId = data.task_id || data.id;
-      queryClient.invalidateQueries({ queryKey: ["task", taskId] });
-      queryClient.invalidateQueries({ queryKey: ["task-logs", taskId] });
+      const planId = data.plan_id;
+      if (taskId) {
+        queryClient.invalidateQueries({ queryKey: ["task", taskId] });
+        queryClient.invalidateQueries({ queryKey: ["task-logs", taskId] });
+        queryClient.invalidateQueries({ queryKey: ["task-plans", taskId] });
+      }
+      if (planId) {
+        queryClient.invalidateQueries({ queryKey: ["plan-steps", planId] });
+      }
       queryClient.invalidateQueries({ queryKey: ["taskBoard"] });
       queryClient.invalidateQueries({ queryKey: ["tasks"] });
       refreshWorkspaces();
@@ -2345,7 +2330,6 @@ export default function AppLayout() {
     }
     return location.pathname.startsWith(path);
   };
-
   /* Close mobile sidebar on route change */
   useEffect(() => {
     setMobileOpen(false);
@@ -3397,6 +3381,7 @@ export default function AppLayout() {
                             setActiveConvId(ws.id);
                             setActiveConvType("operation");
                             setActiveDmAgentId(null);
+                            navigate(`/chat?workspace=${encodeURIComponent(ws.id)}`);
                           };
                           return (
                             <div
@@ -4006,6 +3991,7 @@ export default function AppLayout() {
                 {!sidebarCollapsed && (
                   <div style={{ position: "relative", order: 4 }}>
                   <button
+                    ref={supportRestoreFocusRef}
                     type="button"
                     onClick={() => {
                       setMoreOpen(!moreOpen);
@@ -4128,13 +4114,7 @@ export default function AppLayout() {
                             <path d="M9.09 9a3 3 0 015.83 1c0 2-3 3-3 3" />
                             <line x1="12" y1="17" x2="12.01" y2="17" />
                           </svg>
-                          <span>
-                            {locale === "zh"
-                              ? "帮助"
-                              : locale === "es"
-                                ? "Ayuda"
-                                : "Help"}
-                          </span>
+                          <span>{t("nav.support")}</span>
                         </button>
                         <Link
                           to="/settings"
@@ -4215,6 +4195,8 @@ export default function AppLayout() {
                               setMoreOpen(false);
                               setSupportOpen(true);
                             }}
+                            aria-haspopup="dialog"
+                            aria-controls="floating-support-panel"
                             style={{
                               display: "flex",
                               alignItems: "center",
@@ -4284,7 +4266,7 @@ export default function AppLayout() {
                                 </span>
                               )}
                             </span>
-                            <span>Support</span>
+                            <span>{t("nav.support")}</span>
                           </button>
                         )}
                         <div
@@ -4343,7 +4325,7 @@ export default function AppLayout() {
                               }}
                             >
                               <img
-                                src={`https://flagcdn.com/w20/${({ en: "us", zh: "cn", es: "es", de: "de", ja: "jp" } as const)[l.code]}.png`}
+                                src={`https://flagcdn.com/w20/${({ en: "us", zh: "cn", es: "es", fr: "fr", de: "de" } as const)[l.code]}.png`}
                                 width="18"
                                 height="13"
                                 alt=""
@@ -4494,6 +4476,29 @@ export default function AppLayout() {
                   const activeWorkspace = workspaceList.find(
                     (w) => w.id === activeConvId,
                   );
+                  if (unavailableWorkspaceId === activeConvId) {
+                    return (
+                      <div className="flex flex-1 items-center justify-center p-6" role="alert">
+                        <div className="text-center">
+                          <h2 className="m-0 text-lg font-semibold text-stone-800">
+                            {t("page.workspace_detail.not_found")}
+                          </h2>
+                          <p className="mb-4 mt-2 text-sm text-stone-500">
+                            {t("page.workspace_detail.not_found_desc")}
+                          </p>
+                          <Button
+                            variant="outline"
+                            onClick={() => {
+                              setUnavailableWorkspaceId(null);
+                              navigate("/workspaces");
+                            }}
+                          >
+                            {t("page.workspace_detail.back_to_workspaces")}
+                          </Button>
+                        </div>
+                      </div>
+                    );
+                  }
                   if (!activeWorkspace) {
                     return (
                       <div className="flex-1 min-h-0 p-4" aria-busy="true">
@@ -4537,6 +4542,7 @@ export default function AppLayout() {
                           ? startNewManorSession
                           : undefined
                       }
+                      showWorkspaceIntro={activeConvType === "manor"}
                     />
                   );
                 })()
@@ -4636,6 +4642,7 @@ export default function AppLayout() {
           <SupportPanel
             open={supportOpen}
             onClose={() => setSupportOpen(false)}
+            restoreFocusRef={supportRestoreFocusRef}
           />
         )}
       </div>

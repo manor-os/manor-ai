@@ -28,11 +28,13 @@ Read / search:
 Write / send (high-impact — see Guardrails):
 - `send_message` — required: `to`, `subject`, `body`; optional `cc`, `bcc`, `reply_to_message_id`.
 - `reply_to_message` — required: `message_id`, `body` (replies in-thread).
-- `create_draft` → `send_draft` — stage then send; preferred when the user should review first.
+- `list_drafts` / `get_draft`, `create_draft` / `update_draft` / `delete_draft`, then `send_draft` — inspect and stage mail before sending; preferred when the user should review first.
 
 Triage:
 - `mark_read` / `mark_unread`, `archive_message`, `trash_message` (reversible ~30d via `untrash_message`), `mark_spam`.
+- `trash_thread` — move a whole conversation to Trash after confirming the thread.
 - `batch_modify` — add/remove labels across up to 1000 `message_ids` in one call; use for bulk triage instead of looping single calls.
+- `create_label` / `delete_label`, `add_label` / `remove_label` — manage custom labels and apply them to messages.
 
 ## Common Recipes
 

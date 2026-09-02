@@ -11,6 +11,7 @@ from __future__ import annotations
 from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from packages.core.constants.review import ConsolidationReportStatus
 from packages.core.consolidators.base import SnapshotContext, evidence_ids
 from packages.core.consolidators.contract import (
     ConsolidationReportModel,
@@ -172,7 +173,7 @@ class AutomationPortfolioConsolidator:
         }
         return ConsolidationReportModel(
             domain=self.domain,
-            status="complete",
+            status=ConsolidationReportStatus.COMPLETE,
             summary=(
                 f"{len(jobs)} enabled automation(s), {len(bindings)} workflow "
                 f"binding(s); {len(run_events)} run event(s) in window"

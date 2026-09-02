@@ -134,3 +134,51 @@ async def test_scheduled_task_runtime_forwards_agent_performance_overrides():
     assert seen[0]["max_tokens"] == 6144
     assert seen[1]["temperature"] == 0.2
     assert seen[1]["max_tokens"] == 4096
+
+
+@pytest.mark.asyncio
+async def test_scheduled_task_forces_skill_before_first_model_response(monkeypatch):
+    from packages.core.ai.runtime import task_agent
+
+    calls = []
+
+    class UnexpectedEngine:
+        async def chat(self, *_args, **_kwargs):
+            raise AssertionError("forced Skill must run before an LLM response")
+
+    async def execute_tool(name, args, **kwargs):
+        calls.append((name, args, kwargs))
+        return '{"content":"bundle result","tools_used":["sandbox_exec"]}'
+
+    monkeypatch.setattr(task_agent, "runtime_execute_tool", execute_tool)
+
+    messages = [ChatMessage(role="user", content="prepare report")]
+    result = await runtime_execute_task_agent_turn(
+        engine=UnexpectedEngine(),
+        messages=messages,
+        tools=[],
+        loaded_tool_names=set(),
+        system_prompt="agent system",
+        runtime_envelope=None,
+        entity_id="entity-1",
+        agent_id="agent-1",
+        workspace_id="workspace-1",
+        forced_tool_calls=[{
+            "name": "invoke_skill",
+            "arguments": {
+                "skill_id": "skill-1",
+                "input": "prepare report",
+            },
+        }],
+    )
+
+    assert result.had_tool_calls is True
+    assert result.tool_names == ["invoke_skill"]
+    assert calls[0][0:2] == (
+        "invoke_skill",
+        {"skill_id": "skill-1", "input": "prepare report"},
+    )
+    assert messages[-2].role == "assistant"
+    assert messages[-2].tool_calls[0]["name"] == "invoke_skill"
+    assert messages[-1].role == "tool"
+    assert "bundle result" in messages[-1].content

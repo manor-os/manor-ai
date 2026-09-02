@@ -12,6 +12,7 @@ Quick start:
 
 from .client import SandboxClient
 from .exceptions import (
+    SandboxCapacityError,
     SandboxConnectionError,
     SandboxError,
     SandboxNotFoundError,
@@ -19,9 +20,13 @@ from .exceptions import (
     SandboxSecurityError,
 )
 from .models import (
+    CancelExecutionResult,
     ContainerConfig,
     CreateSandboxResult,
     ExecResult,
+    ExecutionEventResult,
+    ExecutionResponseResult,
+    ExecutionStatusResult,
     FileReadBase64Result,
     FileReadResult,
     FileWriteResult,
@@ -40,12 +45,17 @@ __all__ = [
     "SandboxError",
     "SandboxNotFoundError",
     "SandboxSecurityError",
+    "SandboxCapacityError",
     "SandboxRuntimeError",
     "SandboxConnectionError",
     # Models
     "ContainerConfig",
+    "CancelExecutionResult",
     "CreateSandboxResult",
     "ExecResult",
+    "ExecutionEventResult",
+    "ExecutionResponseResult",
+    "ExecutionStatusResult",
     "FileReadResult",
     "FileReadBase64Result",
     "FileWriteResult",

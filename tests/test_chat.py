@@ -1,18 +1,115 @@
 """E2E tests: chat SSE streaming, conversations, messages."""
 
+import asyncio
 import json
 import pytest
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from httpx import AsyncClient
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import delete as sa_delete, select, text
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+import apps.api.routers.chat as chat_router
 from apps.api.routers.chat import _resolve_chat_workspace_scope, _visible_chat_messages
 from packages.core.models.base import generate_ulid
+from packages.core.models.document import Document, VectorStatus
+from packages.core.models.chat_feedback import ChatMessageFeedback
+from packages.core.models.task import Conversation, Message
 from packages.core.models.user import User
 from packages.core.services.auth_service import create_access_token, hash_password
+from packages.core.services.chat_feedback import (
+    ChatFeedbackIntegrityErrorKind,
+    ChatFeedbackRating,
+    ChatFeedbackTargetDeletedError,
+    ChatFeedbackTargetKind,
+    build_chat_feedback_content_preview,
+    classify_chat_feedback_integrity_error,
+    persist_chat_message_feedback,
+)
+from packages.core.services.conversation_lifecycle import delete_conversation
 from packages.core.services.hitl_requests import user_visible_hitl_action_text
 
 pytestmark = pytest.mark.oss_regression
+
+
+def test_chat_feedback_preview_matches_multi_final_copy_semantics() -> None:
+    blocks = [
+        {"type": "text", "phase": "final", "text": "First paragraph"},
+        {"type": "text", "phase": "final", "text": "Second paragraph"},
+    ]
+
+    assert build_chat_feedback_content_preview(
+        requested_preview="Client preview",
+        message_content="",
+        assistant_blocks=blocks,
+    ) == "First paragraph\n\nSecond paragraph"
+    assert build_chat_feedback_content_preview(
+        requested_preview=None,
+        message_content="Context\n\nFirst paragraphSecond paragraph",
+        assistant_blocks=blocks,
+    ) == "Context\n\nFirst paragraphSecond paragraph"
+
+
+def test_chat_feedback_preview_excludes_hidden_assistant_protocol() -> None:
+    hidden = (
+        '<manor-live-edit>{"operation":"replace",'
+        '"content":"SECRET_INTERNAL_PATCH"}</manor-live-edit>\n'
+        "<manor-final-response>Final answer</manor-final-response>"
+    )
+
+    assert build_chat_feedback_content_preview(
+        requested_preview="Client preview",
+        message_content=hidden,
+        assistant_blocks=[
+            {"type": "text", "phase": "final", "text": hidden},
+        ],
+    ) == "Final answer"
+
+    nested_marker = (
+        '<manor-live-edit>{"operation":"replace",'
+        '"content":"<manor-final-response>SECRET_INTERNAL_PATCH"}'
+        "</manor-live-edit>\nVisible answer"
+    )
+    assert build_chat_feedback_content_preview(
+        requested_preview=None,
+        message_content=nested_marker,
+        assistant_blocks=[
+            {"type": "text", "phase": "final", "text": nested_marker},
+        ],
+    ) == "Visible answer"
+
+
+def test_chat_feedback_integrity_errors_only_classify_lifecycle_foreign_keys() -> None:
+    class DatabaseFailure(Exception):
+        def __init__(self, *, constraint_name: str, sqlstate: str) -> None:
+            super().__init__(constraint_name)
+            self.constraint_name = constraint_name
+            self.sqlstate = sqlstate
+
+    deleted_target = IntegrityError(
+        "insert",
+        {},
+        DatabaseFailure(
+            constraint_name="fk_chat_feedback_message",
+            sqlstate="23503",
+        ),
+    )
+    unrelated_constraint = IntegrityError(
+        "insert",
+        {},
+        DatabaseFailure(
+            constraint_name="uq_chat_feedback_message_user",
+            sqlstate="23505",
+        ),
+    )
+
+    assert classify_chat_feedback_integrity_error(
+        deleted_target
+    ) == ChatFeedbackIntegrityErrorKind.TARGET_DELETED
+    assert classify_chat_feedback_integrity_error(
+        unrelated_constraint
+    ) == ChatFeedbackIntegrityErrorKind.UNEXPECTED
 
 
 async def _auth(client: AsyncClient, username: str = "chatuser") -> dict:
@@ -25,6 +122,831 @@ async def _auth(client: AsyncClient, username: str = "chatuser") -> dict:
         },
     )
     return {"Authorization": f"Bearer {resp.json()['access_token']}"}
+
+
+@pytest.mark.asyncio
+async def test_chat_feedback_assigns_server_revisions_to_concurrent_mutations(
+    client: AsyncClient,
+    db_session: AsyncSession,
+):
+    headers = await _auth(client, "chat_feedback_concurrent")
+    me = (await client.get("/api/v1/auth/me", headers=headers)).json()
+    conversation_id = generate_ulid()
+    message_id = generate_ulid()
+    db_session.add(
+        Conversation(
+            id=conversation_id,
+            entity_id=me["entity_id"],
+            user_id=me["id"],
+            channel="web",
+            scope="channel",
+        )
+    )
+    db_session.add(
+        Message(
+            id=message_id,
+            conversation_id=conversation_id,
+            role="assistant",
+            content="Rate this response",
+            author_kind="agent",
+            message_kind="text",
+        )
+    )
+    await db_session.commit()
+
+    endpoint = (
+        f"/api/v1/chat/conversations/{conversation_id}/messages/{message_id}/feedback"
+    )
+    first, second = await asyncio.gather(
+        client.post(
+            endpoint,
+            headers=headers,
+            json={"rating": "up"},
+        ),
+        client.post(
+            endpoint,
+            headers=headers,
+            json={"rating": "down"},
+        ),
+    )
+
+    assert first.status_code == 200, first.text
+    assert second.status_code == 200, second.text
+    responses = [first.json(), second.json()]
+    assert {item["mutation_status"] for item in responses} == {"accepted"}
+    assert sorted(item["mutation_sequence"] for item in responses) == [1, 2]
+    ordered = sorted(responses, key=lambda item: item["mutation_sequence"])
+    assert datetime.fromisoformat(ordered[0]["updated_at"]) <= datetime.fromisoformat(
+        ordered[1]["updated_at"]
+    )
+    newest = ordered[-1]
+
+    await db_session.rollback()
+    stored = (
+        await db_session.execute(
+            select(ChatMessageFeedback).where(
+                ChatMessageFeedback.message_id == message_id,
+                ChatMessageFeedback.user_id == me["id"],
+            )
+        )
+    ).scalar_one()
+    assert stored.rating == newest["rating"]
+    assert stored.mutation_sequence == 2
+
+
+@pytest.mark.asyncio
+async def test_chat_feedback_advances_the_server_revision(
+    client: AsyncClient,
+    db_session: AsyncSession,
+):
+    headers = await _auth(client, "chat_feedback_server_revision")
+    me = (await client.get("/api/v1/auth/me", headers=headers)).json()
+    conversation_id = generate_ulid()
+    message_id = generate_ulid()
+    db_session.add(
+        Conversation(
+            id=conversation_id,
+            entity_id=me["entity_id"],
+            user_id=me["id"],
+            channel="web",
+            scope="channel",
+        )
+    )
+    db_session.add(
+        Message(
+            id=message_id,
+            conversation_id=conversation_id,
+            role="assistant",
+            content="Rate this response",
+            author_kind="agent",
+            message_kind="text",
+        )
+    )
+    await db_session.commit()
+
+    endpoint = (
+        f"/api/v1/chat/conversations/{conversation_id}/messages/{message_id}/feedback"
+    )
+    first = await client.post(
+        endpoint,
+        headers=headers,
+        json={"rating": "down"},
+    )
+    second = await client.post(endpoint, headers=headers, json={"rating": "up"})
+
+    assert first.status_code == 200, first.text
+    assert first.json()["mutation_status"] == "accepted"
+    assert first.json()["mutation_sequence"] == 1
+    assert second.status_code == 200, second.text
+    assert second.json()["message_id"] == message_id
+    assert second.json()["rating"] == "up"
+    assert second.json()["mutation_sequence"] == 2
+    assert second.json()["mutation_status"] == "accepted"
+
+    await db_session.rollback()
+    stored = (
+        await db_session.execute(
+            select(ChatMessageFeedback).where(
+                ChatMessageFeedback.message_id == message_id,
+                ChatMessageFeedback.user_id == me["id"],
+            )
+        )
+    ).scalar_one()
+    assert stored.rating == "up"
+    assert stored.mutation_sequence == 2
+
+
+@pytest.mark.asyncio
+async def test_chat_feedback_schema_rejects_a_legacy_worker_row(
+    client: AsyncClient,
+    db_session: AsyncSession,
+):
+    headers = await _auth(client, "chat_feedback_legacy_worker")
+    me = (await client.get("/api/v1/auth/me", headers=headers)).json()
+    conversation_id = generate_ulid()
+    message_id = generate_ulid()
+    db_session.add(
+        Conversation(
+            id=conversation_id,
+            entity_id=me["entity_id"],
+            user_id=me["id"],
+            channel="web",
+            scope="channel",
+        )
+    )
+    db_session.add(
+        Message(
+            id=message_id,
+            conversation_id=conversation_id,
+            role="assistant",
+            content="Legacy worker response",
+            author_kind="agent",
+            message_kind="text",
+        )
+    )
+    await db_session.commit()
+
+    with pytest.raises(IntegrityError):
+        await db_session.execute(
+            text("""
+                INSERT INTO chat_message_feedback (
+                    id, entity_id, user_id, conversation_id, message_id, rating
+                ) VALUES (
+                    :id, :entity_id, :user_id, :conversation_id, :message_id,
+                    :rating
+                )
+            """),
+            {
+                "id": generate_ulid(),
+                "entity_id": me["entity_id"],
+                "user_id": me["id"],
+                "conversation_id": conversation_id,
+                "message_id": message_id,
+                "rating": "down",
+            },
+        )
+    await db_session.rollback()
+
+    saved = await client.post(
+        f"/api/v1/chat/conversations/{conversation_id}/messages/{message_id}/feedback",
+        headers=headers,
+        json={"rating": "up"},
+    )
+    assert saved.status_code == 200, saved.text
+    assert saved.json()["mutation_sequence"] == 1
+
+    await db_session.rollback()
+    stored = (
+        await db_session.execute(
+            select(ChatMessageFeedback).where(
+                ChatMessageFeedback.message_id == message_id,
+                ChatMessageFeedback.user_id == me["id"],
+            )
+        )
+    ).scalar_one()
+    assert stored.rating == "up"
+    assert stored.target_kind == "response"
+    assert stored.target_id == message_id
+
+
+@pytest.mark.asyncio
+async def test_chat_feedback_list_restores_only_the_current_users_ratings(
+    client: AsyncClient,
+    db_session: AsyncSession,
+):
+    headers = await _auth(client, "chat_feedback_hydration")
+    me = (await client.get("/api/v1/auth/me", headers=headers)).json()
+    other_headers = await _auth(client, "chat_feedback_hydration_other")
+    other = (await client.get("/api/v1/auth/me", headers=other_headers)).json()
+    conversation_id = generate_ulid()
+    message_id = generate_ulid()
+    db_session.add(
+        Conversation(
+            id=conversation_id,
+            entity_id=me["entity_id"],
+            user_id=me["id"],
+            channel="web",
+            scope="channel",
+        )
+    )
+    db_session.add(
+        Message(
+            id=message_id,
+            conversation_id=conversation_id,
+            role="assistant",
+            content="Rate this response",
+            author_kind="agent",
+            message_kind="text",
+        )
+    )
+    await db_session.commit()
+
+    endpoint = (
+        f"/api/v1/chat/conversations/{conversation_id}/messages/{message_id}/feedback"
+    )
+    saved = await client.post(endpoint, headers=headers, json={"rating": "down"})
+    assert saved.status_code == 200, saved.text
+    db_session.add(
+        ChatMessageFeedback(
+            entity_id=me["entity_id"],
+            user_id=other["id"],
+            conversation_id=conversation_id,
+            message_id=message_id,
+            target_kind="response",
+            target_id=message_id,
+            rating="up",
+            mutation_sequence=7,
+        )
+    )
+    await db_session.commit()
+
+    restored = await client.get(
+        f"/api/v1/chat/conversations/{conversation_id}/feedback",
+        headers=headers,
+    )
+    assert restored.status_code == 200, restored.text
+    assert restored.json() == [
+        {
+            "message_id": message_id,
+            "rating": "down",
+            "mutation_sequence": 1,
+            "target_kind": "response",
+            "target_id": message_id,
+            "task_id": None,
+            "plan_id": None,
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_chat_feedback_uses_final_assistant_block_as_the_content_preview(
+    client: AsyncClient,
+    db_session: AsyncSession,
+):
+    headers = await _auth(client, "chat_feedback_structured_preview")
+    me = (await client.get("/api/v1/auth/me", headers=headers)).json()
+    conversation_id = generate_ulid()
+    message_id = generate_ulid()
+    db_session.add(
+        Conversation(
+            id=conversation_id,
+            entity_id=me["entity_id"],
+            user_id=me["id"],
+            channel="web",
+            scope="channel",
+        )
+    )
+    db_session.add(
+        Message(
+            id=message_id,
+            conversation_id=conversation_id,
+            role="assistant",
+            content="Working",
+            author_kind="agent",
+            message_kind="text",
+            meta={
+                "assistant_blocks": [
+                    {"type": "text", "phase": "analysis", "text": "Working"},
+                    {"type": "text", "phase": "final", "text": "Final answer"},
+                ]
+            },
+        )
+    )
+    await db_session.commit()
+
+    saved = await client.post(
+        f"/api/v1/chat/conversations/{conversation_id}/messages/{message_id}/feedback",
+        headers=headers,
+        json={"rating": "up", "content_preview": "Client-forged preview"},
+    )
+    assert saved.status_code == 200, saved.text
+
+    await db_session.rollback()
+    stored = (
+        await db_session.execute(
+            select(ChatMessageFeedback).where(
+                ChatMessageFeedback.message_id == message_id,
+                ChatMessageFeedback.user_id == me["id"],
+            )
+        )
+    ).scalar_one()
+    assert stored.content_preview == "Final answer"
+
+
+@pytest.mark.asyncio
+async def test_chat_feedback_derives_request_preview_from_the_same_conversation(
+    client: AsyncClient,
+    db_session: AsyncSession,
+):
+    headers = await _auth(client, "chat_feedback_request_preview")
+    me = (await client.get("/api/v1/auth/me", headers=headers)).json()
+    conversation_id = generate_ulid()
+    other_conversation_id = generate_ulid()
+    request_id = generate_ulid()
+    message_id = generate_ulid()
+    now = datetime.now(timezone.utc)
+    db_session.add_all(
+        [
+            Conversation(
+                id=conversation_id,
+                entity_id=me["entity_id"],
+                user_id=me["id"],
+                channel="web",
+                scope="channel",
+            ),
+            Conversation(
+                id=other_conversation_id,
+                entity_id=me["entity_id"],
+                user_id=me["id"],
+                channel="web",
+                scope="channel",
+            ),
+            Message(
+                id=request_id,
+                conversation_id=conversation_id,
+                role="user",
+                content="Authoritative request",
+                author_kind="user",
+                message_kind="text",
+                created_at=now,
+            ),
+            Message(
+                id=generate_ulid(),
+                conversation_id=conversation_id,
+                role="assistant",
+                content="Legacy assistant with a backfilled user author kind",
+                author_kind="user",
+                message_kind="text",
+                created_at=now + timedelta(milliseconds=500),
+            ),
+            Message(
+                id=generate_ulid(),
+                conversation_id=conversation_id,
+                role="user",
+                content="[File permission read]",
+                author_kind="user",
+                message_kind="text",
+                created_at=now + timedelta(seconds=1),
+            ),
+            Message(
+                id=generate_ulid(),
+                conversation_id=other_conversation_id,
+                role="user",
+                content="Request from another conversation",
+                author_kind="user",
+                message_kind="text",
+                created_at=now + timedelta(seconds=1, milliseconds=500),
+            ),
+            Message(
+                id=message_id,
+                conversation_id=conversation_id,
+                role="assistant",
+                content="Answer",
+                author_kind="agent",
+                message_kind="text",
+                created_at=now + timedelta(seconds=2),
+            ),
+        ]
+    )
+    await db_session.commit()
+
+    saved = await client.post(
+        f"/api/v1/chat/conversations/{conversation_id}/messages/{message_id}/feedback",
+        headers=headers,
+        json={
+            "rating": "up",
+            "request_preview": "Client-forged request",
+        },
+    )
+    assert saved.status_code == 200, saved.text
+
+    await db_session.rollback()
+    stored = (
+        await db_session.execute(
+            select(ChatMessageFeedback).where(
+                ChatMessageFeedback.message_id == message_id,
+                ChatMessageFeedback.user_id == me["id"],
+            )
+        )
+    ).scalar_one()
+    assert stored.request_preview == "Authoritative request"
+
+
+@pytest.mark.asyncio
+async def test_chat_feedback_prefers_the_causal_request_over_a_newer_user_message(
+    client: AsyncClient,
+    db_session: AsyncSession,
+):
+    headers = await _auth(client, "chat_feedback_causal_request")
+    me = (await client.get("/api/v1/auth/me", headers=headers)).json()
+    conversation_id = generate_ulid()
+    origin_request_id = generate_ulid()
+    answer_id = generate_ulid()
+    now = datetime.now(timezone.utc)
+    db_session.add_all(
+        [
+            Conversation(
+                id=conversation_id,
+                entity_id=me["entity_id"],
+                user_id=me["id"],
+                channel="web",
+                scope="channel",
+            ),
+            Message(
+                id=origin_request_id,
+                conversation_id=conversation_id,
+                role="user",
+                content="Request that caused this answer",
+                author_kind="user",
+                message_kind="text",
+                created_at=now,
+            ),
+            Message(
+                id=generate_ulid(),
+                conversation_id=conversation_id,
+                role="user",
+                content="Newer unrelated request",
+                author_kind="user",
+                message_kind="text",
+                created_at=now + timedelta(seconds=1),
+            ),
+            Message(
+                id=answer_id,
+                conversation_id=conversation_id,
+                role="assistant",
+                content="Answer to the first request",
+                author_kind="agent",
+                message_kind="text",
+                meta={"origin_user_message_id": origin_request_id},
+                created_at=now + timedelta(seconds=2),
+            ),
+        ]
+    )
+    await db_session.commit()
+
+    saved = await client.post(
+        f"/api/v1/chat/conversations/{conversation_id}/messages/{answer_id}/feedback",
+        headers=headers,
+        json={"rating": "up"},
+    )
+    assert saved.status_code == 200, saved.text
+
+    await db_session.rollback()
+    stored = (
+        await db_session.execute(
+            select(ChatMessageFeedback).where(
+                ChatMessageFeedback.message_id == answer_id,
+                ChatMessageFeedback.user_id == me["id"],
+            )
+        )
+    ).scalar_one()
+    assert stored.request_preview == "Request that caused this answer"
+
+
+@pytest.mark.asyncio
+async def test_generic_chat_feedback_rejects_non_response_targets(
+    client: AsyncClient,
+    db_session: AsyncSession,
+):
+    headers = await _auth(client, "chat_feedback_target_policy")
+    me = (await client.get("/api/v1/auth/me", headers=headers)).json()
+    conversation_id = generate_ulid()
+    task_completion_id = generate_ulid()
+    system_message_id = generate_ulid()
+    db_session.add_all(
+        [
+            Conversation(
+                id=conversation_id,
+                entity_id=me["entity_id"],
+                user_id=me["id"],
+                channel="web",
+                scope="channel",
+            ),
+            Message(
+                id=task_completion_id,
+                conversation_id=conversation_id,
+                role="assistant",
+                content="✅ **Task complete — Prepare report**",
+                author_kind="agent",
+                message_kind="agent_update",
+                refs=[{"type": "task", "id": generate_ulid()}],
+                meta={"feedback_target_kind": "task_completion"},
+            ),
+            Message(
+                id=system_message_id,
+                conversation_id=conversation_id,
+                role="assistant",
+                content="Internal lifecycle update",
+                author_kind="system",
+                message_kind="system",
+            ),
+        ]
+    )
+    await db_session.commit()
+
+    for message_id in (task_completion_id, system_message_id):
+        rejected = await client.post(
+            f"/api/v1/chat/conversations/{conversation_id}/messages/{message_id}/feedback",
+            headers=headers,
+            json={"rating": "up"},
+        )
+        assert rejected.status_code == 422, rejected.text
+
+    await db_session.rollback()
+    stored = (
+        await db_session.execute(
+            select(ChatMessageFeedback).where(
+                ChatMessageFeedback.message_id.in_(
+                    [task_completion_id, system_message_id]
+                )
+            )
+        )
+    ).scalars().all()
+    assert stored == []
+
+
+@pytest.mark.asyncio
+async def test_deleting_a_conversation_deletes_its_chat_feedback(
+    client: AsyncClient,
+    db_session: AsyncSession,
+):
+    headers = await _auth(client, "chat_feedback_delete_conversation")
+    me = (await client.get("/api/v1/auth/me", headers=headers)).json()
+    conversation_id = generate_ulid()
+    message_id = generate_ulid()
+    db_session.add(
+        Conversation(
+            id=conversation_id,
+            entity_id=me["entity_id"],
+            user_id=me["id"],
+            channel="web",
+            scope="channel",
+        )
+    )
+    db_session.add(
+        Message(
+            id=message_id,
+            conversation_id=conversation_id,
+            role="assistant",
+            content="Private preview",
+            author_kind="agent",
+            message_kind="text",
+        )
+    )
+    await db_session.commit()
+    saved = await client.post(
+        f"/api/v1/chat/conversations/{conversation_id}/messages/{message_id}/feedback",
+        headers=headers,
+        json={"rating": "up"},
+    )
+    assert saved.status_code == 200, saved.text
+
+    deleted = await client.delete(
+        f"/api/v1/chat/conversations/{conversation_id}",
+        headers=headers,
+    )
+    assert deleted.status_code == 204, deleted.text
+
+    await db_session.rollback()
+    feedback = (
+        await db_session.execute(
+            select(ChatMessageFeedback).where(
+                ChatMessageFeedback.conversation_id == conversation_id
+            )
+        )
+    ).scalar_one_or_none()
+    assert feedback is None
+
+
+@pytest.mark.asyncio
+async def test_chat_feedback_maps_a_deleted_target_race_to_not_found(
+    client: AsyncClient,
+    db_session: AsyncSession,
+    monkeypatch,
+):
+    headers = await _auth(client, "chat_feedback_deleted_race")
+    me = (await client.get("/api/v1/auth/me", headers=headers)).json()
+    conversation_id = generate_ulid()
+    message_id = generate_ulid()
+    db_session.add_all(
+        [
+            Conversation(
+                id=conversation_id,
+                entity_id=me["entity_id"],
+                user_id=me["id"],
+                channel="web",
+                scope="channel",
+            ),
+            Message(
+                id=message_id,
+                conversation_id=conversation_id,
+                role="assistant",
+                content="Delete before the persistence lock",
+                author_kind="agent",
+                message_kind="text",
+            ),
+        ]
+    )
+    await db_session.commit()
+
+    async def deleted_target(*_args, **_kwargs):
+        raise ChatFeedbackTargetDeletedError(message_id)
+
+    monkeypatch.setattr(
+        chat_router,
+        "persist_chat_message_feedback",
+        deleted_target,
+    )
+    response = await client.post(
+        f"/api/v1/chat/conversations/{conversation_id}/messages/{message_id}/feedback",
+        headers=headers,
+        json={"rating": "up"},
+    )
+
+    assert response.status_code == 404
+    assert response.json()["detail"] == "Message not found"
+
+
+@pytest.mark.asyncio
+async def test_feedback_update_and_conversation_delete_use_message_first_lock_order(
+    client: AsyncClient,
+    db_session: AsyncSession,
+):
+    headers = await _auth(client, "chat_feedback_delete_lock_order")
+    me = (await client.get("/api/v1/auth/me", headers=headers)).json()
+    conversation_id = generate_ulid()
+    message_id = generate_ulid()
+    db_session.add_all(
+        [
+            Conversation(
+                id=conversation_id,
+                entity_id=me["entity_id"],
+                user_id=me["id"],
+                channel="web",
+                scope="channel",
+            ),
+            Message(
+                id=message_id,
+                conversation_id=conversation_id,
+                role="assistant",
+                content="Serialize feedback with deletion",
+                author_kind="agent",
+                message_kind="text",
+            ),
+        ]
+    )
+    await db_session.commit()
+    saved = await client.post(
+        f"/api/v1/chat/conversations/{conversation_id}/messages/{message_id}/feedback",
+        headers=headers,
+        json={"rating": "up"},
+    )
+    assert saved.status_code == 200, saved.text
+
+    await db_session.rollback()
+    session_factory = async_sessionmaker(
+        db_session.bind,
+        class_=AsyncSession,
+        expire_on_commit=False,
+    )
+    async with (
+        session_factory() as feedback_db,
+        session_factory() as delete_db,
+    ):
+        await feedback_db.execute(
+            select(Message.id).where(Message.id == message_id).with_for_update()
+        )
+
+        async def delete_and_commit() -> bool:
+            deleted = await delete_conversation(
+                delete_db,
+                conversation_id,
+                me["entity_id"],
+            )
+            await delete_db.commit()
+            return deleted
+
+        delete_task = asyncio.create_task(delete_and_commit())
+        try:
+            await asyncio.sleep(0.1)
+            assert not delete_task.done()
+
+            updated = await asyncio.wait_for(
+                persist_chat_message_feedback(
+                    feedback_db,
+                    entity_id=me["entity_id"],
+                    user_id=me["id"],
+                    conversation_id=conversation_id,
+                    message_id=message_id,
+                    rating=ChatFeedbackRating.DOWN,
+                    content_preview="Serialize feedback with deletion",
+                    request_preview=None,
+                    target_kind=ChatFeedbackTargetKind.RESPONSE,
+                    target_id=message_id,
+                ),
+                timeout=5,
+            )
+            assert updated.mutation_sequence == 2
+            assert await asyncio.wait_for(delete_task, timeout=5) is True
+        finally:
+            if not delete_task.done():
+                delete_task.cancel()
+                await asyncio.gather(delete_task, return_exceptions=True)
+
+    await db_session.rollback()
+    assert await db_session.get(Conversation, conversation_id) is None
+    feedback = (
+        await db_session.execute(
+            select(ChatMessageFeedback).where(
+                ChatMessageFeedback.conversation_id == conversation_id
+            )
+        )
+    ).scalar_one_or_none()
+    assert feedback is None
+
+
+@pytest.mark.asyncio
+async def test_deleting_a_message_cascades_its_chat_feedback(
+    client: AsyncClient,
+    db_session: AsyncSession,
+):
+    headers = await _auth(client, "chat_feedback_delete_message")
+    me = (await client.get("/api/v1/auth/me", headers=headers)).json()
+    conversation_id = generate_ulid()
+    message_id = generate_ulid()
+    db_session.add_all(
+        [
+            Conversation(
+                id=conversation_id,
+                entity_id=me["entity_id"],
+                user_id=me["id"],
+                channel="web",
+                scope="channel",
+            ),
+            Message(
+                id=message_id,
+                conversation_id=conversation_id,
+                role="assistant",
+                content="Private preview",
+                author_kind="agent",
+                message_kind="text",
+            ),
+        ]
+    )
+    await db_session.commit()
+    saved = await client.post(
+        f"/api/v1/chat/conversations/{conversation_id}/messages/{message_id}/feedback",
+        headers=headers,
+        json={"rating": "up"},
+    )
+    assert saved.status_code == 200, saved.text
+
+    await db_session.execute(sa_delete(Message).where(Message.id == message_id))
+    await db_session.commit()
+
+    feedback = (
+        await db_session.execute(
+            select(ChatMessageFeedback).where(
+                ChatMessageFeedback.message_id == message_id
+            )
+        )
+    ).scalar_one_or_none()
+    assert feedback is None
+
+
+@pytest.mark.asyncio
+async def test_chat_feedback_rejects_values_outside_the_rating_enum(
+    client: AsyncClient,
+):
+    headers = await _auth(client, "chat_feedback_rating_enum")
+    response = await client.post(
+        "/api/v1/chat/conversations/does-not-matter/messages/does-not-matter/feedback",
+        headers=headers,
+        json={"rating": "maybe"},
+    )
+
+    assert response.status_code == 422
+    assert response.json()["detail"][0]["loc"] == ["body", "rating"]
 
 
 @pytest.mark.asyncio
@@ -62,6 +984,131 @@ async def test_chat_stream_sse(client: AsyncClient):
     # stream_end should contain conversation_id
     end_event = [e for e in events if e["event"] == "stream_end"][0]
     assert "conversation_id" in end_event["data"]
+
+
+@pytest.mark.asyncio
+async def test_chat_stream_projects_workspace_recommendation_after_unrelated_active_draft(
+    client: AsyncClient,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from apps.api.routers import chat as chat_router
+    from packages.core.ai.runtime.auto_route_classifier import (
+        AutoRouteDecision,
+        AutoRouteMode,
+    )
+    from packages.core.ai.runtime.general_chat_intent import (
+        GeneralChatIntentDecision,
+    )
+    from packages.core.ai.runtime.workspace_creation_authorization import (
+        WorkspaceCreationAuthorizationDecision,
+    )
+    from packages.core.models.workspace_draft import WorkspaceDraft
+    from packages.core.services import chat_intent_routing
+    from packages.core.services.sse_events import format_sse
+
+    headers = await _auth(client, "chat_recommendation_projection")
+    me = (await client.get("/api/v1/auth/me", headers=headers)).json()
+    conversation_id = generate_ulid()
+    draft_id = generate_ulid()
+    db_session.add(
+        Conversation(
+            id=conversation_id,
+            entity_id=me["entity_id"],
+            user_id=me["id"],
+            channel="web",
+            scope="channel",
+        )
+    )
+    db_session.add(
+        WorkspaceDraft(
+            id=draft_id,
+            entity_id=me["entity_id"],
+            user_id=me["id"],
+            status="active",
+            fields={},
+            messages=[],
+            missing=[],
+        )
+    )
+    db_session.add(
+        Message(
+            id=generate_ulid(),
+            conversation_id=conversation_id,
+            role="assistant",
+            content="Property marketing Workspace draft",
+            tool_calls=[{"artifact_kind": "workspace_draft", "draft_id": draft_id}],
+        )
+    )
+    await db_session.commit()
+
+    async def fake_auto_route(**_kwargs):
+        return AutoRouteDecision(AutoRouteMode.DIRECT_CHAT, 0.98)
+
+    async def fake_creation_authorization(**_kwargs):
+        return WorkspaceCreationAuthorizationDecision.not_authorized(0.99)
+
+    async def fake_candidates(*_args, **_kwargs):
+        return []
+
+    async def fake_general_intent(*, candidates, recent_context_text, **_kwargs):
+        assert "Property marketing Workspace draft" in recent_context_text
+        assert "independent request that may need a separate Workspace" in recent_context_text
+        return GeneralChatIntentDecision.from_payload(
+            {
+                "kind": "workspace_recommendation",
+                "confidence": 0.95,
+                "reason": "Recruiting needs its own recurring operating system.",
+                "action": "create_new",
+                "workspace_id": None,
+            },
+            candidates=candidates,
+        )
+
+    monkeypatch.setattr(chat_intent_routing, "classify_auto_route", fake_auto_route)
+    monkeypatch.setattr(
+        chat_intent_routing,
+        "classify_workspace_creation_authorization",
+        fake_creation_authorization,
+    )
+    monkeypatch.setattr(
+        chat_intent_routing,
+        "list_workspace_intent_candidates",
+        fake_candidates,
+    )
+    monkeypatch.setattr(
+        chat_intent_routing,
+        "classify_general_chat_intent",
+        fake_general_intent,
+    )
+
+    captured: dict[str, object] = {}
+
+    async def fake_stream(*_args, runtime_metadata=None, **_kwargs):
+        captured["runtime_metadata"] = runtime_metadata
+        yield format_sse("stream_start", {"conversation_id": conversation_id})
+        yield format_sse("text_delta", {"content": "Recruiting response"})
+        yield format_sse(
+            "stream_end",
+            {"conversation_id": conversation_id, "persisted": False},
+        )
+
+    monkeypatch.setattr(chat_router, "runtime_stream_chat_turn", fake_stream)
+
+    response = await client.post(
+        "/api/v1/chat/stream",
+        headers=headers,
+        data={
+            "message": "我想长期管理招聘流程",
+            "conversation_id": conversation_id,
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    metadata = captured["runtime_metadata"]
+    assert isinstance(metadata, dict)
+    assert metadata["workspace_recommendation"]["action"] == "create_new"
+    assert metadata["workspace_recommendation"]["request"] == "我想长期管理招聘流程"
 
 
 @pytest.mark.asyncio
@@ -106,6 +1153,75 @@ async def test_chat_creates_conversation(client: AsyncClient):
     assert len(assistant_msgs) == 1
     assert assistant_msgs[0]["id"] == stream_message_id
     assert "still working" not in (assistant_msgs[-1]["content"] or "")
+
+
+@pytest.mark.asyncio
+async def test_chat_stream_persists_knowledge_attachment_refs(
+    client: AsyncClient,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from packages.core.services import file_context
+
+    async def _empty_extract(*_args, **_kwargs):
+        return ""
+
+    monkeypatch.setattr(file_context, "extract_text", _empty_extract)
+    headers = await _auth(client, "chat_attachment_refs")
+    me = (await client.get("/api/v1/auth/me", headers=headers)).json()
+    doc_id = "doc_chat_attachment_ref"
+    db_session.add(
+        Document(
+            id=doc_id,
+            entity_id=me["entity_id"],
+            name="completion-reviews/daily-review-template.md",
+            fs_path="completion-reviews/daily-review-template.md",
+            file_type="md",
+            mime_type="text/markdown",
+            source="upload",
+            vector_status=VectorStatus.READY,
+        )
+    )
+    await db_session.commit()
+
+    stream_resp = await client.post(
+        "/api/v1/chat/stream",
+        headers=headers,
+        data={
+            "message": "使用Chrome，将这个文件上传到youtube草稿箱",
+            "document_ids": doc_id,
+        },
+    )
+
+    assert stream_resp.status_code == 200
+    conversation_id = None
+    event_type = ""
+    for line in stream_resp.text.split("\n"):
+        if line.startswith("event:"):
+            event_type = line[len("event:") :].strip()
+        elif line.startswith("data:"):
+            data = json.loads(line[len("data:") :].strip())
+            if event_type == "stream_end":
+                conversation_id = data.get("conversation_id")
+    assert conversation_id
+
+    msg_resp = await client.get(
+        f"/api/v1/chat/conversations/{conversation_id}/messages",
+        headers=headers,
+    )
+    assert msg_resp.status_code == 200
+    user_msg = next(m for m in msg_resp.json() if m["role"] == "user")
+    assert user_msg["attachments"] == [
+        {
+            "kind": "knowledge_document",
+            "name": "completion-reviews/daily-review-template.md",
+            "mime": "text/markdown",
+            "path": "completion-reviews/daily-review-template.md",
+            "url": f"/api/v1/fs/{me['entity_id']}/completion-reviews/daily-review-template.md",
+            "document_id": doc_id,
+            "text": True,
+        }
+    ]
 
 
 def test_global_chat_message_response_preserves_workflow_action_fields() -> None:
@@ -355,6 +1471,58 @@ def test_visible_chat_messages_hides_stale_stream_placeholder():
     visible = _visible_chat_messages(rows)
 
     assert [m.content for m in visible] == ["hello", "done"]
+
+
+def test_visible_chat_messages_keeps_pending_placeholder_from_another_turn():
+    rows = [
+        SimpleNamespace(role="user", content="first", meta={}),
+        SimpleNamespace(
+            role="assistant",
+            content="Still working",
+            meta={
+                "stream_status": "running",
+                "origin_user_message_id": "user-1",
+            },
+        ),
+        SimpleNamespace(role="user", content="second", meta={}),
+        SimpleNamespace(
+            role="assistant",
+            content="Second answer",
+            meta={"origin_user_message_id": "user-2"},
+        ),
+    ]
+
+    visible = _visible_chat_messages(rows)
+
+    assert [message.content for message in visible] == [
+        "first",
+        "Still working",
+        "second",
+        "Second answer",
+    ]
+
+
+def test_visible_chat_messages_hides_placeholder_superseded_for_same_turn():
+    rows = [
+        SimpleNamespace(role="user", content="hello", meta={}),
+        SimpleNamespace(
+            role="assistant",
+            content="Still working",
+            meta={
+                "stream_status": "running",
+                "origin_user_message_id": "user-1",
+            },
+        ),
+        SimpleNamespace(
+            role="assistant",
+            content="Done",
+            meta={"origin_user_message_id": "user-1"},
+        ),
+    ]
+
+    visible = _visible_chat_messages(rows)
+
+    assert [message.content for message in visible] == ["hello", "Done"]
 
 
 @pytest.mark.asyncio

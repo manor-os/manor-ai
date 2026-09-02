@@ -28,6 +28,7 @@ import {
   APPROVAL_CHOICE_REJECT,
   DEFAULT_APPROVAL_OPTIONS,
   oneTimeApprovalOptions,
+  reviewApprovalOptions,
 } from "../../lib/approvalOptions";
 import { PendingActionKind } from "../../lib/pendingActionKinds";
 import { formatUserFacingLabel, formatUserFacingText } from "../../lib/taskDisplay";
@@ -885,12 +886,13 @@ export function ApprovalCard({ options, onResolve, disabled, blockApprove }: {
   // the user's to give for any capability they are shown a card for; only
   // `never_allow` is a hard block, and it never produces a card at all.
   const opts = options && options.length ? options : DEFAULT_APPROVAL_OPTIONS;
-  const [showRevisionRequest, setShowRevisionRequest] = useState(false);
   const [revisionRequest, setRevisionRequest] = useState("");
+  const [revisionChoice, setRevisionChoice] = useState<string | null>(null);
+  const showRevisionRequest = revisionChoice !== null;
   const submitRevision = () => {
     const value = revisionRequest.trim();
-    if (!value || disabled) return;
-    onResolve("revise", undefined, { review: { revision_request: value } });
+    if (!value || !revisionChoice || disabled) return;
+    onResolve(revisionChoice, value, { review: { revision_request: value } });
   };
   return (
     <>
@@ -911,14 +913,21 @@ export function ApprovalCard({ options, onResolve, disabled, blockApprove }: {
               key={opt}
               className={className}
               onClick={() => {
-                if (normalizeChoice(opt) === "revise") {
-                  setShowRevisionRequest((current) => !current);
+                const normalized = normalizeChoice(opt);
+                if (normalized === "revise" || normalized === "request_changes") {
+                  setRevisionChoice((current) => (
+                    current === normalized ? null : normalized
+                  ));
                   return;
                 }
                 onResolve(opt);
               }}
               disabled={disabled || (blockApprove && isApprove)}
-              aria-expanded={normalizeChoice(opt) === "revise" ? showRevisionRequest : undefined}
+              aria-expanded={
+                ["revise", "request_changes"].includes(normalizeChoice(opt))
+                  ? showRevisionRequest
+                  : undefined
+              }
             >
               {approvalLabel(opt)}
             </button>
@@ -1869,7 +1878,7 @@ export function ResolvedBadge({ resolution, by }: { resolution: Resolution; by?:
   const isFeedback = choice === "feedback";
   const isRespond = choice === "respond" || normalized === "provide_answers";
   const isReject = tone === "reject";
-  const isRevise = normalized === "revise";
+  const isRevise = normalized === "revise" || normalized === "request_changes";
 
   const label = isRetry ? t("component.chat_action_card.retry_requested")
     : isCancelled ? t("component.status.cancelled")
@@ -2126,7 +2135,11 @@ export default function ChatActionCard({ action, resolved, resolution, onResolve
             <CardOriginLink taskId={action.task_id} />
           </div>
         )}
-        <ApprovalCard options={action.options} onResolve={(choice) => resolveOnce(choice)} disabled={locked} />
+        <ApprovalCard
+          options={reviewApprovalOptions(action.options)}
+          onResolve={resolveOnce}
+          disabled={locked}
+        />
       </>
     );
   }
@@ -2149,8 +2162,12 @@ export default function ChatActionCard({ action, resolved, resolution, onResolve
         />
       )}
       <ApprovalCard
-        options={action.options}
-        onResolve={(choice) => resolveOnce(choice)}
+        options={
+          action.hitl_type === "review"
+            ? reviewApprovalOptions(action.options)
+            : action.options
+        }
+        onResolve={resolveOnce}
         disabled={locked}
       />
     </>

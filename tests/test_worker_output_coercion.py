@@ -3,6 +3,10 @@ from types import SimpleNamespace
 
 import pytest
 
+from packages.core.contracts.task_output import (
+    TaskOutputValueKind,
+    task_output_envelope_schema,
+)
 from packages.core.workers import internal
 from packages.core.workers.internal import (
     EmptyModelOutput,
@@ -40,6 +44,32 @@ async def test_exec_llm_non_empty_completion_still_returns_result(monkeypatch):
 
     out = await internal._exec_llm({"params": {"prompt": "draft the report"}})
     assert out["result"] == {"text": "a real answer"}
+
+
+async def test_exec_llm_uses_task_payload_schema_and_declares_payload_kind(monkeypatch):
+    expected_payload = {"type": "object"}
+    expected_envelope = task_output_envelope_schema(expected_payload)
+    business_value = {
+        "status": "succeeded",
+        "summary": "provider receipt",
+        "outputs": {"data": {"provider_id": "job-42"}},
+    }
+    calls: list[dict] = []
+
+    async def _fake_llm(**kwargs):
+        calls.append(kwargs)
+        return SimpleNamespace(content=json.dumps(business_value), usage={})
+
+    monkeypatch.setattr(internal, "runtime_execute_internal_worker_llm_step", _fake_llm)
+
+    out = await internal._exec_llm({
+        "params": {"prompt": "return the provider receipt"},
+        "expected_output_schema": expected_envelope,
+    })
+
+    assert calls[0]["expected_output_schema"] == expected_payload
+    assert out["result"] == business_value
+    assert out["task_output_value_kind"] is TaskOutputValueKind.TASK_PAYLOAD
 
 
 def test_coerce_fenced_json_array_for_array_schema():
@@ -160,7 +190,7 @@ def test_tool_backed_tweet_publish_fields_are_merged_from_tool_result():
     assert result["tweet_url"] == "https://x.com/i/web/status/1999000000000000002"
 
 
-def test_tool_backed_linkedin_publish_fields_are_merged_from_tool_result():
+def test_tool_backed_linkedin_publish_fields_are_merged_from_nested_mcp_result():
     schema = {
         "type": "object",
         "required": ["post_url", "post_text", "published_at", "status"],
@@ -247,7 +277,7 @@ def test_llm_text_result_prefers_schema_matching_json_candidate():
     assert _coerce_llm_text_result(content, schema) == {"scripts": scripts}
 
 
-def test_tool_backed_linkedin_publish_fields_are_merged_from_tool_result():
+def test_tool_backed_linkedin_publish_fields_are_merged_from_direct_tool_result():
     # Regression: LinkedIn publish payloads were invisible to the tool-backed
     # merge (only tweets were recognized), so publish_linkedin_post steps failed
     # output validation (X Growth tasks …X5W1 / …QB8C, 2026-05).

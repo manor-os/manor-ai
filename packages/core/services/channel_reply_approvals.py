@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+from packages.core.constants.channels import ExternalMessageActionKey
 from packages.core.constants.pending_actions import PendingActionKind
 from packages.core.database import async_session
 from packages.core.services.hitl_options import approval_options
@@ -16,13 +17,18 @@ async def maybe_hold_external_reply_for_approval(
     workspace_id: str | None,
     channel_type: str,
     channel_config_id: str,
+    channel_binding_id: str,
+    channel_contact_id: str,
     conversation_id: str,
+    agent_id: str | None,
     agent_subscription_id: str | None,
+    route_snapshot: dict[str, object],
     sender_id: str,
     sender_name: str | None,
     chat_id: str,
     reply_text: str,
     customer_message: str | None = None,
+    thread_ts: str | None = None,
 ) -> dict[str, Any] | None:
     """Pause a channel text reply when workspace governance requires review."""
     if not workspace_id or not reply_text.strip():
@@ -37,7 +43,8 @@ async def maybe_hold_external_reply_for_approval(
             db,
             workspace_id=workspace_id,
             kind="action",
-            action_key="external_message.send",
+            action_key=ExternalMessageActionKey.SEND.value,
+            resource_id=channel_config_id,
             risk_level="high",
         )
         if decision.allowed:
@@ -61,6 +68,7 @@ async def maybe_hold_external_reply_for_approval(
                     "sender_id": sender_id,
                     "sender_name": sender_name,
                     "chat_id": chat_id,
+                    "thread_ts": thread_ts,
                 },
                 refs=[
                     {"type": "conversation", "id": conversation_id},
@@ -76,7 +84,7 @@ async def maybe_hold_external_reply_for_approval(
                 "Approval needed before sending an external message.\n\n"
                 f"Channel: `{channel_type}`\n"
                 f"Recipient: `{sender_name or sender_id}`\n"
-                f"Rule: `{decision.matched_rule or 'external_message.send'}`\n\n"
+                f"Rule: `{decision.matched_rule or ExternalMessageActionKey.SEND.value}`\n\n"
                 f"Draft reply:\n{preview}"
             )
             msg = await chat_service.post_message(
@@ -90,13 +98,19 @@ async def maybe_hold_external_reply_for_approval(
                     "kind": PendingActionKind.EXTERNAL_MESSAGE_APPROVAL.value,
                     "channel_type": channel_type,
                     "channel_config_id": channel_config_id,
+                    "channel_binding_id": channel_binding_id,
+                    "channel_contact_id": channel_contact_id,
                     "channel_conversation_id": conversation_id,
+                    "agent_id": agent_id,
                     "agent_subscription_id": agent_subscription_id,
+                    "route_snapshot": dict(route_snapshot),
+                    "workspace_id": workspace_id,
                     "chat_id": chat_id,
+                    "thread_ts": thread_ts,
                     "sender_id": sender_id,
                     "sender_name": sender_name,
                     "reply_text": reply_text,
-                    "action_key": "external_message.send",
+                    "action_key": ExternalMessageActionKey.SEND.value,
                     "matched_rule": decision.matched_rule,
                     "options": approval_options(),
                 },

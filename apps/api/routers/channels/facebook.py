@@ -10,9 +10,9 @@ developers.facebook.com.
 
 Verification:
   * GET handshake compares ``hub.verify_token`` against the
-    ChannelConfig.credentials.verify_token (or env fallback).
-  * POST body HMAC-SHA256 verified against ``app_secret`` in
-    ChannelConfig.credentials (or ``FACEBOOK_APP_SECRET`` env).
+    source Integration's verify token (or env fallback).
+  * POST body HMAC-SHA256 is verified against the source Integration's
+    app secret (or ``FACEBOOK_APP_SECRET`` env).
 """
 from __future__ import annotations
 
@@ -25,6 +25,7 @@ from sqlalchemy import select
 
 from packages.core.database import async_session
 from packages.core.models.channel import ChannelConfig
+from packages.core.services.channel_credentials import lease_channel_credentials
 from packages.core.services.channels import get_adapter
 from packages.core.services.channel_service import handle_inbound_message
 from packages.core.tasks.channel_tasks import dispatch_inbound_task
@@ -54,10 +55,16 @@ async def facebook_verify(
         cc = (await db.execute(
             select(ChannelConfig).where(ChannelConfig.id == config_id)
         )).scalar_one_or_none()
+        if not cc:
+            raise HTTPException(404, f"ChannelConfig {config_id!r} not found")
+        try:
+            credentials = await lease_channel_credentials(
+                db, cc, reason="channel.facebook.verify_webhook",
+            )
+        except ValueError as exc:
+            raise HTTPException(410, "Facebook channel credential source is unavailable") from exc
 
-    expected = ""
-    if cc and cc.credentials:
-        expected = cc.credentials.get("verify_token") or ""
+    expected = credentials.get("verify_token") or ""
     if not expected:
         expected = os.environ.get("FACEBOOK_WEBHOOK_VERIFY_TOKEN", "")
 
@@ -93,13 +100,6 @@ async def facebook_callback(
         )).scalar_one_or_none()
     if not cc:
         raise HTTPException(404, f"ChannelConfig {config_id!r} not found")
-
-    # Backstop: env-level app_secret if the row didn't have one (dev
-    # mode / first boot).
-    if cc.credentials and not cc.credentials.get("app_secret"):
-        env_secret = os.environ.get("FACEBOOK_APP_SECRET", "")
-        if env_secret:
-            cc.credentials = {**cc.credentials, "app_secret": env_secret}
 
     if not await adapter.verify_inbound(cc, headers=headers, query=query, body=body):
         logger.warning("Facebook signature mismatch for cc=%s", config_id)

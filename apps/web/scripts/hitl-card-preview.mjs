@@ -32,7 +32,7 @@ async function bundleToFile(contents, toFile) {
     write: false,
     logLevel: "silent",
     define: { "process.env.NODE_ENV": '"production"' },
-    loader: { ".css": "empty", ".png": "empty", ".svg": "text" },
+    loader: { ".css": "empty", ".png": "empty", ".webp": "empty", ".svg": "text" },
   });
   await writeFile(toFile, built.outputFiles[0].text);
   return import(toFile.href ?? toFile);

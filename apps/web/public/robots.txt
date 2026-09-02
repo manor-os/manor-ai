@@ -1,6 +1,6 @@
-# Manor's web application is an authenticated, user-specific SPA.
-# Let crawlers fetch app pages so the noindex directives in HTML/headers
-# can be seen; public product content lives on manorai.xyz.
+# Manor's application remains private and noindex by default. Only the
+# server-rendered, platform-reviewed Workspace Marketplace is public.
 User-agent: *
-Allow: /
-Sitemap: https://manorai.xyz/sitemap.xml
+Allow: /marketplace/
+Disallow: /
+Sitemap: https://app.manorai.xyz/marketplace/sitemap.xml

@@ -1,6 +1,8 @@
 """Sites router — host-routed public serving, tls-check, publish + domain management."""
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
 import pytest
 import pytest_asyncio
 from httpx import AsyncClient
@@ -9,9 +11,17 @@ from sqlalchemy import select
 from packages.core.models import Site, SiteEvent
 from packages.core.models.channel import ChannelConfig
 from packages.core.models.document import Channel, Document
+from packages.core.models.permission import (
+    Capability,
+    Classification,
+    ResourceGrant,
+    ResourceType,
+    SubjectType,
+)
 from packages.core.models.user import User
+from packages.core.services.auth_service import create_access_token, hash_password
 from packages.core.models.workflow import WorkflowBinding, WorkflowDefinition, WorkflowRun
-from packages.core.models.workspace import Agent, AgentSubscription, Workspace
+from packages.core.models.workspace import Agent, AgentSubscription, Workspace, WorkspaceStaff
 
 SITES_DOMAIN = "sites.test.local"
 
@@ -85,6 +95,22 @@ async def _login_headers(client: AsyncClient, username: str) -> dict:
     return {"Authorization": f"Bearer {response.json()['access_token']}"}
 
 
+async def _create_entity_member(db_session, entity_id: str, username: str) -> tuple[User, dict]:
+    member = User(
+        entity_id=entity_id,
+        email=f"{username}@test.com",
+        display_name=username,
+        password_hash=hash_password("pass123"),
+        role="member",
+        status="active",
+    )
+    db_session.add(member)
+    await db_session.flush()
+    await db_session.commit()
+    token = create_access_token(member.id, entity_id, member.role)
+    return member, {"Authorization": f"Bearer {token}"}
+
+
 @pytest_asyncio.fixture
 async def published(client, sites_env):
     """Register a user, write a bundle, publish it. Returns (headers, site dict)."""
@@ -105,6 +131,507 @@ async def test_publish_reports_url_and_revision(published):
     assert site["revision"] == 1
     assert site["url"] == f"https://{site['slug']}.{SITES_DOMAIN}"
     assert site["excluded"] == []
+
+
+@pytest.mark.asyncio
+async def test_publish_rejects_confidential_and_restricted_documents(
+    client, sites_env, db_session,
+):
+    headers, entity_id = await _auth(client, "siteclassification")
+    owner = await db_session.scalar(select(User).where(User.entity_id == entity_id))
+    assert owner is not None
+    source = sites_env / entity_id / "classified.html"
+    source.parent.mkdir(parents=True, exist_ok=True)
+    source.write_text("<html>classified</html>", encoding="utf-8")
+    document = Document(
+        entity_id=entity_id,
+        name="classified.html",
+        fs_path="classified.html",
+        file_type="html",
+        mime_type="text/html",
+        source="upload",
+        created_by=owner.id,
+        owner_id=owner.id,
+        classification=Classification.RESTRICTED,
+    )
+    db_session.add(document)
+    await db_session.commit()
+
+    restricted = await client.post(
+        "/api/v1/sites/publish",
+        headers=headers,
+        json={"path": document.fs_path, "name": "Classified"},
+    )
+    assert restricted.status_code == 403, restricted.text
+    assert "Restricted" in restricted.json()["detail"]
+
+    document.classification = Classification.CONFIDENTIAL
+    await db_session.commit()
+    confidential = await client.post(
+        "/api/v1/sites/publish",
+        headers=headers,
+        json={"path": document.fs_path, "name": "Classified"},
+    )
+    assert confidential.status_code == 403, confidential.text
+    assert "approval flow" in confidential.json()["detail"]
+
+    document.classification = Classification.INTERNAL
+    await db_session.commit()
+    allowed = await client.post(
+        "/api/v1/sites/publish",
+        headers=headers,
+        json={"path": document.fs_path, "name": "Classified"},
+    )
+    assert allowed.status_code == 200, allowed.text
+
+
+@pytest.mark.asyncio
+async def test_publish_rejects_a_snapshot_changed_after_confirmation(
+    client, sites_env, db_session,
+):
+    headers, entity_id = await _auth(client, "siteconfirmationhash")
+    owner = await db_session.scalar(select(User).where(User.entity_id == entity_id))
+    assert owner is not None
+    source = sites_env / entity_id / "confirmed.html"
+    source.parent.mkdir(parents=True, exist_ok=True)
+    source.write_text("<html>before</html>", encoding="utf-8")
+    document = Document(
+        entity_id=entity_id,
+        name="confirmed.html",
+        fs_path="confirmed.html",
+        file_type="html",
+        mime_type="text/html",
+        source="upload",
+        created_by=owner.id,
+        owner_id=owner.id,
+    )
+    db_session.add(document)
+    await db_session.commit()
+
+    preview = await client.get(
+        "/api/v1/sites/for-path",
+        headers=headers,
+        params={"path": document.fs_path},
+    )
+    assert preview.status_code == 200, preview.text
+    confirmed_hash = preview.json()["publish_snapshot_hash"]
+    assert confirmed_hash
+
+    source.write_text("<html>after</html>", encoding="utf-8")
+    stale_publish = await client.post(
+        "/api/v1/sites/publish",
+        headers=headers,
+        json={
+            "path": document.fs_path,
+            "name": "Confirmed",
+            "expected_snapshot_hash": confirmed_hash,
+        },
+    )
+    assert stale_publish.status_code == 409, stale_publish.text
+
+    refreshed = await client.get(
+        "/api/v1/sites/for-path",
+        headers=headers,
+        params={"path": document.fs_path},
+    )
+    refreshed_hash = refreshed.json()["publish_snapshot_hash"]
+    assert refreshed_hash and refreshed_hash != confirmed_hash
+    published = await client.post(
+        "/api/v1/sites/publish",
+        headers=headers,
+        json={
+            "path": document.fs_path,
+            "name": "Confirmed",
+            "expected_snapshot_hash": refreshed_hash,
+        },
+    )
+    assert published.status_code == 200, published.text
+
+
+@pytest.mark.asyncio
+async def test_publish_requires_edit_and_external_share_access_to_the_source_documents(
+    client, sites_env, db_session,
+):
+    owner_headers, entity_id = await _auth(client, "siteaclowner")
+    _write_bundle(sites_env, entity_id, folder="protected-site")
+    owner = await db_session.scalar(select(User).where(User.entity_id == entity_id))
+    assert owner is not None
+    entry = Document(
+        entity_id=entity_id,
+        name="index.html",
+        fs_path="protected-site/index.html",
+        file_type="html",
+        mime_type="text/html",
+        source="upload",
+        created_by=owner.id,
+        owner_id=owner.id,
+        visibility="entity",
+    )
+    db_session.add(entry)
+    await db_session.flush()
+    member, member_headers = await _create_entity_member(
+        db_session,
+        entity_id,
+        "siteaclmember",
+    )
+
+    denied = await client.post(
+        "/api/v1/sites/publish",
+        headers=member_headers,
+        json={"path": "protected-site", "name": "Protected site"},
+    )
+    assert denied.status_code == 403, denied.text
+
+    entry_grant = ResourceGrant(
+        entity_id=entity_id,
+        resource_type=ResourceType.DOCUMENT,
+        resource_id=entry.id,
+        subject_type=SubjectType.USER,
+        subject_id=member.id,
+        capabilities=[Capability.EDIT],
+        granted_by=owner.id,
+        granted_at=datetime.now(timezone.utc),
+        status="active",
+    )
+    db_session.add(entry_grant)
+    await db_session.commit()
+
+    edit_only = await client.post(
+        "/api/v1/sites/publish",
+        headers=member_headers,
+        json={"path": "protected-site", "name": "Protected site"},
+    )
+    assert edit_only.status_code == 403, edit_only.text
+    assert "indexed" in edit_only.json()["detail"]
+
+    about = Document(
+        entity_id=entity_id,
+        name="about.html",
+        fs_path="protected-site/about.html",
+        file_type="html",
+        mime_type="text/html",
+        source="upload",
+        created_by=owner.id,
+        owner_id=owner.id,
+        visibility="entity",
+    )
+    stylesheet = Document(
+        entity_id=entity_id,
+        name="style.css",
+        fs_path="protected-site/css/style.css",
+        file_type="css",
+        mime_type="text/css",
+        source="upload",
+        created_by=owner.id,
+        owner_id=owner.id,
+        visibility="entity",
+    )
+    db_session.add_all([about, stylesheet])
+    await db_session.flush()
+    for document in (about, stylesheet):
+        db_session.add(ResourceGrant(
+            entity_id=entity_id,
+            resource_type=ResourceType.DOCUMENT,
+            resource_id=document.id,
+            subject_type=SubjectType.USER,
+            subject_id=member.id,
+            capabilities=[Capability.EDIT, Capability.SHARE_EXTERNAL],
+            granted_by=owner.id,
+            granted_at=datetime.now(timezone.utc),
+            status="active",
+        ))
+    await db_session.commit()
+
+    external_share_denied = await client.post(
+        "/api/v1/sites/publish",
+        headers=member_headers,
+        json={"path": "protected-site", "name": "Protected site"},
+    )
+    assert external_share_denied.status_code == 403, external_share_denied.text
+    assert "External share access" in external_share_denied.json()["detail"]
+
+    entry_grant.capabilities = [Capability.EDIT, Capability.SHARE_EXTERNAL]
+    await db_session.commit()
+
+    allowed = await client.post(
+        "/api/v1/sites/publish",
+        headers=member_headers,
+        json={"path": "protected-site", "name": "Protected site"},
+    )
+    assert allowed.status_code == 200, allowed.text
+    assert allowed.json()["revision"] == 1
+    durable_site = await db_session.get(Site, allowed.json()["id"])
+    assert durable_site is not None
+    assert durable_site.created_by_user_id == member.id
+
+    editor_analytics = await client.get(
+        f"/api/v1/sites/{allowed.json()['id']}/analytics",
+        headers=member_headers,
+    )
+    assert editor_analytics.status_code == 200, editor_analytics.text
+
+    taken_offline = await client.post(
+        f"/api/v1/sites/{allowed.json()['id']}/status",
+        headers=member_headers,
+        json={"status": "offline"},
+    )
+    assert taken_offline.status_code == 200, taken_offline.text
+    entry_grant.capabilities = [Capability.EDIT]
+    await db_session.commit()
+    denied_reactivation = await client.post(
+        f"/api/v1/sites/{allowed.json()['id']}/status",
+        headers=member_headers,
+        json={"status": "active"},
+    )
+    assert denied_reactivation.status_code == 403, denied_reactivation.text
+    assert "External share access" in denied_reactivation.json()["detail"]
+    entry_grant.capabilities = [Capability.EDIT, Capability.SHARE_EXTERNAL]
+    await db_session.commit()
+    entry_path = sites_env / entity_id / "protected-site" / "index.html"
+    entry_path.write_text(
+        "<!doctype html><body>fresh authorized snapshot</body>",
+        encoding="utf-8",
+    )
+    reactivated = await client.post(
+        f"/api/v1/sites/{allowed.json()['id']}/status",
+        headers=member_headers,
+        json={"status": "active"},
+    )
+    assert reactivated.status_code == 200, reactivated.text
+    assert reactivated.json()["status"] == "active"
+    assert reactivated.json()["revision"] == 2
+    served = await client.get(
+        "/api/v1/site-host/",
+        headers={"host": f"{allowed.json()['slug']}.{SITES_DOMAIN}"},
+    )
+    assert served.status_code == 200, served.text
+    assert "fresh authorized snapshot" in served.text
+
+    # A source collaborator may publish their own site, but edit/share grants
+    # on this source do not transfer management of the existing site.
+    second_editor, second_editor_headers = await _create_entity_member(
+        db_session,
+        entity_id,
+        "siteaclsecondeditor",
+    )
+    for document in (entry, about, stylesheet):
+        db_session.add(ResourceGrant(
+            entity_id=entity_id,
+            resource_type=ResourceType.DOCUMENT,
+            resource_id=document.id,
+            subject_type=SubjectType.USER,
+            subject_id=second_editor.id,
+            capabilities=[Capability.EDIT, Capability.SHARE_EXTERNAL],
+            granted_by=owner.id,
+            granted_at=datetime.now(timezone.utc),
+            status="active",
+        ))
+    await db_session.commit()
+    denied_editor_management = await client.post(
+        f"/api/v1/sites/{allowed.json()['id']}/status",
+        headers=second_editor_headers,
+        json={"status": "offline"},
+    )
+    assert denied_editor_management.status_code == 403, denied_editor_management.text
+    denied_editor_republish = await client.post(
+        "/api/v1/sites/publish",
+        headers=second_editor_headers,
+        json={"path": "protected-site", "name": "Hijacked site"},
+    )
+    assert denied_editor_republish.status_code == 403, denied_editor_republish.text
+
+    # Durable management survives the source entry projection being moved to
+    # Trash.  Re-activation still separately requires a publishable source.
+    entry.is_trashed = True
+    entry.fs_path = None
+    await db_session.commit()
+    creator_analytics = await client.get(
+        f"/api/v1/sites/{allowed.json()['id']}/analytics",
+        headers=member_headers,
+    )
+    assert creator_analytics.status_code == 200, creator_analytics.text
+    creator_offline = await client.post(
+        f"/api/v1/sites/{allowed.json()['id']}/status",
+        headers=member_headers,
+        json={"status": "offline"},
+    )
+    assert creator_offline.status_code == 200, creator_offline.text
+
+    _, ungranted_headers = await _create_entity_member(
+        db_session,
+        entity_id,
+        "siteaclungranted",
+    )
+    denied_connections = await client.get(
+        f"/api/v1/sites/{allowed.json()['id']}/connections",
+        headers=ungranted_headers,
+    )
+    assert denied_connections.status_code in {403, 404}, denied_connections.text
+    denied_status = await client.post(
+        f"/api/v1/sites/{allowed.json()['id']}/status",
+        headers=ungranted_headers,
+        json={"status": "offline"},
+    )
+    assert denied_status.status_code in {403, 404}, denied_status.text
+
+    hidden_preview = await client.get(
+        "/api/v1/sites/for-path",
+        headers=ungranted_headers,
+        params={"path": "protected-site"},
+    )
+    assert hidden_preview.status_code == 200, hidden_preview.text
+    assert hidden_preview.json()["publishable"] is False
+    assert hidden_preview.json()["site"] is None
+    assert hidden_preview.json()["auto_connection_plan"] is None
+
+    owner_view = await client.get(
+        "/api/v1/sites/for-path",
+        headers=owner_headers,
+        params={"path": "protected-site"},
+    )
+    assert owner_view.status_code == 200
+    assert owner_view.json()["site"]["id"] == allowed.json()["id"]
+
+
+@pytest.mark.asyncio
+async def test_publish_requires_edit_access_to_every_document_in_the_public_snapshot(
+    client, sites_env, db_session,
+):
+    _, entity_id = await _auth(client, "sitesnapshotowner")
+    _write_bundle(sites_env, entity_id, folder="snapshot-site")
+    root = sites_env / entity_id / "snapshot-site"
+    (root / "private-notes.md").write_text("not public", encoding="utf-8")
+    owner = await db_session.scalar(select(User).where(User.entity_id == entity_id))
+    assert owner is not None
+    now = datetime.now(timezone.utc)
+    entry = Document(
+        entity_id=entity_id,
+        name="index.html",
+        fs_path="snapshot-site/index.html",
+        file_type="html",
+        mime_type="text/html",
+        source="upload",
+        created_by=owner.id,
+        owner_id=owner.id,
+        visibility="entity",
+    )
+    protected_page = Document(
+        entity_id=entity_id,
+        name="about.html",
+        fs_path="snapshot-site/about.html",
+        file_type="html",
+        mime_type="text/html",
+        source="upload",
+        created_by=owner.id,
+        owner_id=owner.id,
+        visibility="private",
+    )
+    stylesheet = Document(
+        entity_id=entity_id,
+        name="style.css",
+        fs_path="snapshot-site/css/style.css",
+        file_type="css",
+        mime_type="text/css",
+        source="upload",
+        created_by=owner.id,
+        owner_id=owner.id,
+        visibility="entity",
+    )
+    excluded_notes = Document(
+        entity_id=entity_id,
+        name="private-notes.md",
+        fs_path="snapshot-site/private-notes.md",
+        file_type="markdown",
+        mime_type="text/markdown",
+        source="upload",
+        created_by=owner.id,
+        owner_id=owner.id,
+        visibility="entity",
+    )
+    db_session.add_all([entry, protected_page, stylesheet, excluded_notes])
+    await db_session.flush()
+    member, member_headers = await _create_entity_member(
+        db_session,
+        entity_id,
+        "sitesnapshotmember",
+    )
+    db_session.add(ResourceGrant(
+        entity_id=entity_id,
+        resource_type=ResourceType.DOCUMENT,
+        resource_id=entry.id,
+        subject_type=SubjectType.USER,
+        subject_id=member.id,
+        capabilities=[Capability.EDIT, Capability.SHARE_EXTERNAL],
+        granted_by=owner.id,
+        granted_at=now,
+        status="active",
+    ))
+    await db_session.commit()
+
+    denied = await client.post(
+        "/api/v1/sites/publish",
+        headers=member_headers,
+        json={"path": "snapshot-site", "name": "Snapshot site"},
+    )
+    assert denied.status_code == 403, denied.text
+
+    for document in (protected_page, stylesheet):
+        db_session.add(ResourceGrant(
+            entity_id=entity_id,
+            resource_type=ResourceType.DOCUMENT,
+            resource_id=document.id,
+            subject_type=SubjectType.USER,
+            subject_id=member.id,
+            capabilities=[Capability.EDIT, Capability.SHARE_EXTERNAL],
+            granted_by=owner.id,
+            granted_at=now,
+            status="active",
+        ))
+    await db_session.commit()
+
+    published = await client.post(
+        "/api/v1/sites/publish",
+        headers=member_headers,
+        json={"path": "snapshot-site", "name": "Snapshot site"},
+    )
+    assert published.status_code == 200, published.text
+    assert published.json()["excluded"] == [
+        {"path": "private-notes.md", "sensitive": False},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_publish_promotes_the_exact_snapshot_that_passed_access_check(
+    client, sites_env, monkeypatch,
+):
+    from apps.api.routers import sites
+
+    headers, entity_id = await _auth(client, "sitestagingowner")
+    source = sites_env / entity_id / "race.html"
+    source.parent.mkdir(parents=True, exist_ok=True)
+    source.write_text("<!doctype html><body>authorized snapshot</body>", encoding="utf-8")
+    original_check = sites._require_target_publish_access
+
+    async def mutate_source_after_access_check(*args, **kwargs):
+        await original_check(*args, **kwargs)
+        source.write_text("<!doctype html><body>changed after access check</body>", encoding="utf-8")
+
+    monkeypatch.setattr(sites, "_require_target_publish_access", mutate_source_after_access_check)
+
+    published = await client.post(
+        "/api/v1/sites/publish",
+        headers=headers,
+        json={"path": "race.html", "name": "Immutable snapshot"},
+    )
+    assert published.status_code == 200, published.text
+
+    served = await client.get(
+        "/api/v1/site-host/",
+        headers={"host": f"{published.json()['slug']}.{SITES_DOMAIN}"},
+    )
+    assert served.status_code == 200, served.text
+    assert "authorized snapshot" in served.text
+    assert "changed after access check" not in served.text
 
 
 @pytest.mark.asyncio
@@ -321,6 +848,150 @@ async def test_site_connections_route_webchat_and_lead_form_to_workspace(
 
 
 @pytest.mark.asyncio
+async def test_workspace_document_editor_publishes_without_auto_connect_privileges(
+    client, sites_env, db_session,
+):
+    _, entity_id = await _auth(client, "siteworkspaceowner")
+    owner = await db_session.scalar(select(User).where(User.entity_id == entity_id))
+    assert owner is not None
+    workspace = Workspace(
+        entity_id=entity_id,
+        name="Restricted Website Operations",
+        status="active",
+    )
+    db_session.add(workspace)
+    await db_session.flush()
+    _write_connected_bundle(sites_env, entity_id, folder="restricted-workspace-site")
+    entry = Document(
+        entity_id=entity_id,
+        name="index.html",
+        fs_path="restricted-workspace-site/index.html",
+        file_type="html",
+        mime_type="text/html",
+        source="ai_generated",
+        metadata_={"origin": {"workspace_id": workspace.id}},
+        created_by=owner.id,
+        owner_id=owner.id,
+        visibility="workspace",
+    )
+    db_session.add(entry)
+    await db_session.flush()
+    editor, editor_headers = await _create_entity_member(
+        db_session,
+        entity_id,
+        "siteworkspaceeditor",
+    )
+    db_session.add(ResourceGrant(
+        entity_id=entity_id,
+        resource_type=ResourceType.DOCUMENT,
+        resource_id=entry.id,
+        subject_type=SubjectType.USER,
+        subject_id=editor.id,
+        capabilities=[Capability.EDIT, Capability.SHARE_EXTERNAL],
+        granted_by=owner.id,
+        granted_at=datetime.now(timezone.utc),
+        status="active",
+    ))
+    await db_session.commit()
+
+    preview = await client.get(
+        "/api/v1/sites/for-path",
+        headers=editor_headers,
+        params={"path": entry.fs_path},
+    )
+    assert preview.status_code == 200, preview.text
+    plan = preview.json()["auto_connection_plan"]
+    assert plan["eligible"] is True
+    assert plan["can_auto_connect"] is False
+    assert plan["workspace_id"] is None
+    assert plan["workspace_name"] is None
+    assert plan["actions"] == {
+        "customer_service": "not_available",
+        "lead_flow": "not_detected",
+        "subscription_flow": "not_detected",
+        "analytics": "enable",
+    }
+    assert plan["reason"] == "workspace_manage_required"
+
+    forbidden_auto_connect = await client.post(
+        "/api/v1/sites/publish",
+        headers=editor_headers,
+        json={
+            "path": entry.fs_path,
+            "name": "Restricted Workspace site",
+            "auto_connect": True,
+        },
+    )
+    assert forbidden_auto_connect.status_code == 403, forbidden_auto_connect.text
+
+    published = await client.post(
+        "/api/v1/sites/publish",
+        headers=editor_headers,
+        json={
+            "path": entry.fs_path,
+            "name": "Restricted Workspace site",
+            "auto_connect": False,
+        },
+    )
+    assert published.status_code == 200, published.text
+    site = published.json()
+    assert site["auto_connected"] is False
+    assert site["workspace_id"] == workspace.id
+
+    forbidden_connection = await client.put(
+        f"/api/v1/sites/{site['id']}/connections",
+        headers=editor_headers,
+        json={
+            "workspace_id": workspace.id,
+            "customer_service_channel_config_id": None,
+            "subscription_workflow_binding_id": None,
+            "lead_workflow_binding_id": None,
+            "analytics_enabled": True,
+        },
+    )
+    assert forbidden_connection.status_code == 403, forbidden_connection.text
+
+    forbidden_disconnect = await client.put(
+        f"/api/v1/sites/{site['id']}/connections",
+        headers=editor_headers,
+        json={
+            "workspace_id": None,
+            "customer_service_channel_config_id": None,
+            "subscription_workflow_binding_id": None,
+            "lead_workflow_binding_id": None,
+            "analytics_enabled": False,
+        },
+    )
+    assert forbidden_disconnect.status_code == 403, forbidden_disconnect.text
+    unchanged_connections = await client.get(
+        f"/api/v1/sites/{site['id']}/connections",
+        headers=editor_headers,
+    )
+    assert unchanged_connections.status_code == 200, unchanged_connections.text
+    assert unchanged_connections.json()["workspace_id"] == workspace.id
+    assert unchanged_connections.json()["analytics_enabled"] is True
+
+    workspace_owner, workspace_owner_headers = await _create_entity_member(
+        db_session,
+        entity_id,
+        "siteworkspaceoperator",
+    )
+    db_session.add(WorkspaceStaff(
+        workspace_id=workspace.id,
+        user_id=workspace_owner.id,
+        role="owner",
+        added_by=owner.id,
+        status="active",
+    ))
+    await db_session.commit()
+    owner_analytics = await client.get(
+        f"/api/v1/sites/{site['id']}/analytics",
+        headers=workspace_owner_headers,
+    )
+    assert owner_analytics.status_code == 200, owner_analytics.text
+
+
+@pytest.mark.asyncio
 async def test_workspace_site_publish_auto_connects_and_reuses_managed_resources(
     client, sites_env, db_session, monkeypatch,
 ):
@@ -360,6 +1031,7 @@ async def test_workspace_site_publish_auto_connects_and_reuses_managed_resources
     assert preview.status_code == 200, preview.text
     plan = preview.json()["auto_connection_plan"]
     assert plan["eligible"] is True
+    assert plan["can_auto_connect"] is True
     assert plan["workspace_id"] == workspace_id
     assert plan["workspace_name"] == "Website Operations"
     assert plan["features"] == {
@@ -378,7 +1050,7 @@ async def test_workspace_site_publish_auto_connects_and_reuses_managed_resources
 
     published = await client.post(
         "/api/v1/sites/publish",
-        headers=await _login_headers(client, "autositeowner"),
+        headers=headers,
         json={
             "path": "workspace-site/index.html",
             "name": "Workspace website",
@@ -482,7 +1154,7 @@ async def test_workspace_site_publish_auto_connects_and_reuses_managed_resources
 
     republished = await client.post(
         "/api/v1/sites/publish",
-        headers=await _login_headers(client, "autositeowner"),
+        headers=headers,
         json={
             "path": "workspace-site",
             "name": "Workspace website",
@@ -575,6 +1247,7 @@ async def test_for_path_and_unpublishable(client, published, sites_env):
         "site": None,
         "hosting_configured": True,
         "auto_connection_plan": None,
+        "publish_snapshot_hash": None,
     }
 
 

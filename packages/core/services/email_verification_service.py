@@ -1,7 +1,9 @@
 """Email verification — generate code, verify, resend. Uses Redis so codes survive API restarts."""
+import hashlib
 import json
 import logging
 import secrets
+import time
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -42,68 +44,129 @@ def _redis():
 
 
 def _key(email: str) -> str:
-    return f"manor:verify:{email}"
+    return f"manor:verify:{email.strip().lower()}"
 
 
-async def create_verification(email: str, user_id: str) -> str:
-    """Create a verification code for an email. Stored in Redis."""
+def _password_fingerprint(password_hash: str) -> str:
+    """Fence a verifier to one stored password without copying the hash."""
+    return hashlib.sha256(password_hash.encode("utf-8")).hexdigest()
+
+
+def _delete_verifier(r, email: str) -> None:
+    if r:
+        r.delete(_key(email))
+    else:
+        _fallback.pop(email.strip().lower(), None)
+
+
+async def create_verification(email: str, user_id: str, *, password_hash: str) -> str:
+    """Create a short-lived verifier bound to the current password version."""
     code = _generate_code()
     r = _redis()
-    data = json.dumps({"code": code, "user_id": user_id, "attempts": 0})
+    now = time.time()
+    data = {
+        "code": code,
+        "user_id": user_id,
+        "attempts": 0,
+        "password_fingerprint": _password_fingerprint(password_hash),
+        "expires_at": now + _CODE_TTL,
+    }
     if r:
-        r.setex(_key(email), _CODE_TTL, data)
+        r.setex(_key(email), _CODE_TTL, json.dumps(data))
     else:
-        _fallback[email] = {"code": code, "user_id": user_id, "attempts": 0}
+        for stored_email, previous in list(_fallback.items()):
+            expires_at = previous.get("expires_at")
+            if not isinstance(expires_at, (int, float)) or expires_at <= now:
+                _fallback.pop(stored_email, None)
+        _fallback[email.strip().lower()] = data
 
     logger.info("Email verification code issued", extra={"verification_user_id": user_id})
     return code
 
 
 async def verify_email(db: AsyncSession, email: str, code: str) -> bool:
-    """Verify the email code. Activates user on success."""
+    """Activate only the pending account/password that issued this verifier."""
     r = _redis()
     if r:
         raw = r.get(_key(email))
         if not raw:
             return False
-        data = json.loads(raw)
+        try:
+            data = json.loads(raw)
+        except (TypeError, ValueError):
+            _delete_verifier(r, email)
+            return False
     else:
-        data = _fallback.get(email)
+        data = _fallback.get(email.strip().lower())
         if not data:
             return False
 
-    data["attempts"] = data.get("attempts", 0) + 1
-    if data["attempts"] > _MAX_ATTEMPTS:
-        if r:
-            r.delete(_key(email))
-        else:
-            _fallback.pop(email, None)
+    now = time.time()
+    if not isinstance(data, dict):
+        _delete_verifier(r, email)
+        return False
+    stored_code = data.get("code")
+    user_id = data.get("user_id")
+    fingerprint = data.get("password_fingerprint")
+    expires_at = data.get("expires_at")
+    attempts = data.get("attempts", 0)
+    if (
+        not isinstance(stored_code, str)
+        or not isinstance(user_id, str)
+        or not isinstance(fingerprint, str)
+        or not isinstance(expires_at, (int, float))
+        or not isinstance(attempts, int)
+        or expires_at <= now
+    ):
+        _delete_verifier(r, email)
         return False
 
-    if data["code"] != code:
+    data["attempts"] = attempts + 1
+    if data["attempts"] > _MAX_ATTEMPTS:
+        _delete_verifier(r, email)
+        return False
+
+    if not isinstance(code, str) or not secrets.compare_digest(stored_code, code):
         # Save updated attempt count
         if r:
             ttl = r.ttl(_key(email))
-            r.setex(_key(email), max(ttl, 60), json.dumps(data))
+            if ttl > 0:
+                r.setex(_key(email), ttl, json.dumps(data))
+            else:
+                r.delete(_key(email))
         return False
 
-    # Code matches — activate user
-    result = await db.execute(select(User).where(User.id == data["user_id"]))
+    # Serialize activation with pending-registration password updates and reload
+    # identity-map snapshots that predate another request acquiring this lock.
+    result = await db.execute(
+        select(User).where(User.id == user_id)
+        .with_for_update().execution_options(populate_existing=True)
+    )
     user = result.scalar_one_or_none()
-    if user:
-        user.status = "active"
-        await db.flush()
+    if (
+        user is None
+        or user.email.strip().lower() != email.strip().lower()
+        or user.deleted_at is not None
+        or user.status != "pending"
+        or expires_at <= time.time()
+        or not secrets.compare_digest(
+            fingerprint,
+            _password_fingerprint(user.password_hash),
+        )
+    ):
+        return False
+    user.status = "active"
+    await db.flush()
 
-    if r:
-        r.delete(_key(email))
-    else:
-        _fallback.pop(email, None)
+    # Keep the short-lived record until commit/expiry. The pending->active row
+    # transition is the one-time fence, so a failed commit may safely retry but
+    # a committed verifier can never activate the account again.
     return True
 
 
-async def resend_verification(email: str, user_id: str) -> str | None:
+async def resend_verification(email: str, user_id: str, *, password_hash: str) -> str | None:
     """Resend verification code."""
-    return await create_verification(email, user_id)
+    return await create_verification(email, user_id, password_hash=password_hash)
 
 
 # In-memory fallback if Redis is down

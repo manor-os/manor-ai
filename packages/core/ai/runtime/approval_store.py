@@ -3,7 +3,6 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any, Iterable
 
-
 RUNTIME_APPROVALS_KEY = "runtime_approvals"
 
 __all__ = [
@@ -12,23 +11,34 @@ __all__ = [
     "mark_runtime_hitl_request_resolved",
     "mark_runtime_hitl_requests_resolved",
     "runtime_approval_now_iso",
-    "runtime_approval_workspace_context",
     "runtime_approvals",
     "set_runtime_approvals",
+    "runtime_approval_workspace_context",
 ]
 
 
 def runtime_approval_now_iso() -> str:
+    """Return a timestamp for legacy metadata compatibility callers."""
+
     return datetime.now(timezone.utc).isoformat()
 
 
 def runtime_approvals(conv: Any) -> dict[str, dict[str, Any]]:
+    """Read the retired conversation-meta shape for compatibility only.
+
+    The runtime approval resolver no longer consults this blob; active
+    approvals live in ``HitlRequest`` rows. Keeping this small adapter avoids
+    breaking old integrations and test fixtures that still inspect metadata.
+    """
+
     meta = getattr(conv, "meta", None) or {}
     approvals = meta.get(RUNTIME_APPROVALS_KEY) or {}
     return dict(approvals) if isinstance(approvals, dict) else {}
 
 
 def set_runtime_approvals(conv: Any, approvals: dict[str, dict[str, Any]]) -> None:
+    """Write the retired metadata shape for compatibility-only callers."""
+
     meta = dict(getattr(conv, "meta", None) or {})
     meta[RUNTIME_APPROVALS_KEY] = approvals
     conv.meta = meta

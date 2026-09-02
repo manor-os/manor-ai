@@ -23,6 +23,7 @@ import ssl
 import pytest
 
 from packages.core.services import integration_health as ih
+from packages.core.services import smtp_transport
 
 
 # Captured before the fixture monkeypatches imaplib.IMAP4 away.
@@ -223,3 +224,48 @@ async def test_non_auth_failure_gets_no_password_hint(fake_servers):
 @pytest.mark.asyncio
 async def test_registry_maps_email_to_combined_check():
     assert ih._TESTS["email"] is ih.test_email_login
+
+
+@pytest.mark.asyncio
+async def test_email_health_uses_shared_mail_transports(monkeypatch: pytest.MonkeyPatch):
+    events: list[tuple[str, str, int, bool]] = []
+
+    class FakeIMAP:
+        def login(self, username, password):
+            events.append(("imap-login", username, 0, False))
+
+        def logout(self):
+            pass
+
+    class FakeSMTP:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def ehlo(self):
+            pass
+
+        def starttls(self):
+            pass
+
+        def login(self, username, password):
+            events.append(("smtp-login", username, 0, False))
+
+    def open_imap(host: str, port: int, *, use_ssl: bool, timeout: float):
+        events.append(("imap-open", host, port, use_ssl))
+        return FakeIMAP()
+
+    def open_smtp(host: str, port: int, *, use_ssl: bool, timeout: float):
+        events.append(("smtp-open", host, port, use_ssl))
+        return FakeSMTP()
+
+    monkeypatch.setattr(smtp_transport, "open_imap_client", open_imap)
+    monkeypatch.setattr(smtp_transport, "open_smtp_client", open_smtp)
+
+    result = await ih.test_email_login(dict(BASE_CREDS))
+
+    assert result["ok"] is True
+    assert ("imap-open", "imap.example.com", 993, True) in events
+    assert ("smtp-open", "smtp.example.com", 587, False) in events

@@ -27,7 +27,7 @@ TEST_DATABASE_URL = os.getenv(
 
 
 @pytest_asyncio.fixture
-async def db_session():
+async def db_session(_test_database_guard):
     # Plain pooled engine — NOT NullPool. Confirmed by hand (30/30 clean vs.
     # intermittent sqlalchemy.orm.exc.StaleDataError on an unrelated later
     # commit within the SAME AsyncSession) that pairing NullPool with a

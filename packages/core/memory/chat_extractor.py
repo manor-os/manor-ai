@@ -94,7 +94,7 @@ async def extract_chat_insights(
         since=bookmark, limit=MAX_MESSAGES_PER_PASS,
     )
     if not messages:
-        _write_bookmark(workspace, now)
+        await _write_bookmark(db, workspace, now)
         await db.flush()
         return {"workspace_id": workspace_id, "messages": 0, "extracted": 0}
 
@@ -122,7 +122,7 @@ async def extract_chat_insights(
     # (not ``now``) so we don't accidentally skip a message that arrived
     # mid-pass.
     last_ts = max(m.created_at for m in messages)
-    _write_bookmark(workspace, last_ts)
+    await _write_bookmark(db, workspace, last_ts)
     await db.flush()
 
     if written or skipped_invalid:
@@ -280,10 +280,25 @@ def _read_bookmark(workspace: Workspace, *, default: datetime) -> datetime:
     )
 
 
-def _write_bookmark(workspace: Workspace, ts: datetime) -> None:
-    settings = dict(workspace.settings or {})
+async def _write_bookmark(
+    db: AsyncSession,
+    workspace: Workspace,
+    ts: datetime,
+) -> None:
+    from packages.core.services.workspace_access import (
+        lock_workspace_access_boundary,
+    )
+
+    locked_workspace = await lock_workspace_access_boundary(
+        db,
+        workspace_id=workspace.id,
+        entity_id=workspace.entity_id,
+    )
+    if locked_workspace is None:
+        return
+    settings = dict(locked_workspace.settings or {})
     settings[LAST_EXTRACT_KEY] = ts.isoformat()
-    workspace.settings = settings
+    locked_workspace.settings = settings
 
 
 async def _fetch_operator_messages(

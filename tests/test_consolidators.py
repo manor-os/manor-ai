@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 
 import pytest
 from pydantic import ValidationError
@@ -41,7 +42,7 @@ from packages.core.models.review_run import ReviewRun
 from packages.core.models.scheduler import ScheduledJob
 from packages.core.models.task import Task
 from packages.core.models.workspace import Workspace
-from packages.core.review import begin_review, complete_review, events_in_window
+from packages.core.review import begin_review, events_in_window
 
 ENTITY_ID = "01CONSENTITY00000000000000"
 
@@ -397,6 +398,50 @@ async def test_pace_degraded_observation_fires(db_session):
     degraded = [o for o in report.observations if o.type == "pace_degraded"]
     assert len(degraded) == 1
     assert degraded[0].evidence_refs == [pace_event.id]
+
+
+async def test_goal_digest_preserves_exact_decimal_movement(db_session):
+    workspace = await _workspace(db_session)
+    goal = Goal(
+        entity_id=ENTITY_ID,
+        workspace_id=workspace.id,
+        title="Large exact metric",
+        metric_key="large_exact_metric",
+        target_value=Decimal("9007199254740993.0000"),
+        current_value=Decimal("9007199254740992.0002"),
+        status="active",
+    )
+    db_session.add(goal)
+    await db_session.flush()
+    await _emit(
+        db_session,
+        workspace.id,
+        event_type=et.EXECUTION_COMPLETED,
+    )
+    await _emit(
+        db_session,
+        workspace.id,
+        event_type=et.GOAL_MEASURED,
+        source_kind="goal",
+        source_id=goal.id,
+        payload={"value": "9007199254740992.0001"},
+    )
+    await _emit(
+        db_session,
+        workspace.id,
+        event_type=et.GOAL_MEASURED,
+        source_kind="goal",
+        source_id=goal.id,
+        payload={"value": "9007199254740992.0002"},
+    )
+
+    review = await _begin(db_session, workspace.id)
+    report = await REGISTRY["goal"].run(db_session, await _ctx(db_session, review))
+
+    [digest] = report.metrics["goals"]
+    assert digest["current"] == "9007199254740992.0002"
+    assert digest["window_delta"] == 0.0001
+    assert not [item for item in report.observations if item.type == "goal_stalled"]
 
 
 async def test_approval_bottleneck_observation_fires(db_session):

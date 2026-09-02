@@ -11,6 +11,7 @@
     "mcp__email__get_message",
     "mcp__email__list_attachments",
     "mcp__email__download_attachment",
+    "mcp__email__save_attachment_to_workspace",
     "mcp__email__list_threads",
     "mcp__email__get_thread",
     "mcp__email__send_email",

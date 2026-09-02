@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import Any, Literal
 
 
@@ -18,6 +19,26 @@ RuntimeEventType = Literal[
     "subagent_denied",
     "error",
 ]
+
+
+class RuntimeToolResultStatus(str, Enum):
+    """Closed completion vocabulary for persisted Runtime tool evidence."""
+
+    COMPLETED = "completed"
+    FAILED = "failed"
+
+    @classmethod
+    def parse(cls, value: Any) -> "RuntimeToolResultStatus | None":
+        normalized = str(value or "").strip().lower()
+        if normalized in {"completed", "complete", "succeeded", "success", "ok"}:
+            return cls.COMPLETED
+        if normalized in {"failed", "failure", "error", "cancelled", "canceled"}:
+            return cls.FAILED
+        return None
+
+    @property
+    def is_successful_completion(self) -> bool:
+        return self is RuntimeToolResultStatus.COMPLETED
 
 
 @dataclass(frozen=True)

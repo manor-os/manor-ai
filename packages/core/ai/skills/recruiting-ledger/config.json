@@ -1,0 +1,33 @@
+{
+  "id": "recruiting-ledger",
+  "name": "recruiting-ledger",
+  "display_name": "Recruiting Ledger",
+  "type": "runtime_guidance",
+  "execution_mode": "instructions_only",
+  "description": "Use the active internal Workspace Recruiting Ledger as the durable source for candidate, employee, and contractor lifecycle state and events.",
+  "category": "workspace-ledger",
+  "output_format": "guidance",
+  "tags": [
+    "recruiting-ledger",
+    "recruiting",
+    "hr",
+    "workspace-ledger",
+    "runtime-guidance",
+    "builtin"
+  ],
+  "tools": [
+    "read_recruiting_ledger",
+    "record_recruiting_ledger",
+    "query_ledger",
+    "visualize_workspace_ledgers"
+  ],
+  "ledger_contracts": [
+    "manor.recruiting_ledger/v1"
+  ],
+  "capability_companion": {
+    "tool_names": [
+      "read_recruiting_ledger",
+      "record_recruiting_ledger"
+    ]
+  }
+}

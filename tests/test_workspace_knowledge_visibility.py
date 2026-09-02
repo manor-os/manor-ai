@@ -12,7 +12,8 @@ from __future__ import annotations
 import pytest
 
 import packages.core.database as db_module
-from packages.core.models.user import User
+from packages.core.models.base import generate_ulid
+from packages.core.models.user import Entity, User, UserMembership
 from packages.core.models.workspace import Workspace
 from packages.core.services.auth_service import hash_password
 from packages.core.services.document_service import (
@@ -25,12 +26,26 @@ from packages.core.workspace_chat.context import workspace_search
 
 async def _make_user(entity_id: str, name: str, role: str) -> str:
     async with db_module.async_session() as db:
+        if await db.get(Entity, entity_id) is None:
+            db.add(Entity(id=entity_id, name=f"{name} test entity"))
+            await db.flush()
         u = User(
-            entity_id=entity_id, email=f"{name}@test.com", display_name=name,
+            entity_id=entity_id,
+            email=f"{name}-{entity_id.lower()}@test.com",
+            display_name=name,
             password_hash=hash_password("pass123"), role=role, status="active",
         )
         db.add(u)
         await db.flush()
+        db.add(
+            UserMembership(
+                user_id=u.id,
+                entity_id=entity_id,
+                role=role,
+                status="active",
+                is_primary=True,
+            )
+        )
         uid = u.id
         await db.commit()
     return uid
@@ -38,7 +53,7 @@ async def _make_user(entity_id: str, name: str, role: str) -> str:
 
 @pytest.mark.asyncio
 async def test_workspace_knowledge_search_hides_private_docs_from_member():
-    entity_id = "ent_ws_know_vis"
+    entity_id = generate_ulid()
     owner_id = await _make_user(entity_id, "wsk_owner", "owner")
     member_id = await _make_user(entity_id, "wsk_member", "member")
 
@@ -86,5 +101,7 @@ async def test_workspace_knowledge_search_hides_private_docs_from_member():
     # As MEMBER: private doc name must not appear; shared doc does.
     assert "board-comp.md" not in out_member, f"private doc leaked to member:\n{out_member}"
     assert "handbook.md" in out_member, out_member
+    assert "Ops Net** (1 docs)" in out_member, out_member
     # Owner sees both.
     assert "board-comp.md" in out_owner and "handbook.md" in out_owner, out_owner
+    assert "Ops Net** (2 docs)" in out_owner, out_owner

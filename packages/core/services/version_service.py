@@ -10,12 +10,16 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from packages.core.models.base import generate_ulid
 from packages.core.models.document import Document
-from packages.core.services.tool_cache_version import bump_tool_cache_version
 from packages.core.models.document_version import DocumentVersion
-from packages.core.services.document_service import get_document
+from packages.core.services.document_service import get_document, get_document_for_update
+from packages.core.services.comment_service import delete_resource_comments
 
 
 _TRASH_META_KEY = "original_fs_path_before_trash"
+
+
+class DocumentRestoreConflict(ValueError):
+    """Raised when a trashed projection cannot be restored safely."""
 
 
 def _entity_root(entity_id: str) -> str | None:
@@ -41,7 +45,13 @@ def _dedupe_dest(path: str) -> str:
         return path
     directory = os.path.dirname(path)
     stem, ext = os.path.splitext(os.path.basename(path))
-    return os.path.join(directory, f"{stem}_{int(time.time())}{ext}")
+    timestamp = int(time.time())
+    candidate = os.path.join(directory, f"{stem}_{timestamp}{ext}")
+    sequence = 2
+    while os.path.exists(candidate):
+        candidate = os.path.join(directory, f"{stem}_{timestamp}_{sequence}{ext}")
+        sequence += 1
+    return candidate
 
 
 def _move_file_to_hidden_trash(doc: Document, entity_id: str) -> None:
@@ -150,7 +160,10 @@ async def get_version(db: AsyncSession, version_id: str) -> DocumentVersion | No
 # ── Trash ──
 
 async def trash_document(
-    db: AsyncSession, document_id: str, entity_id: str, trashed_by: str | None = None,
+    db: AsyncSession,
+    document_id: str,
+    entity_id: str,
+    trashed_by: str | None = None,
 ) -> bool:
     """Move document to trash (soft delete)."""
     doc = await get_document(db, document_id, entity_id)
@@ -161,30 +174,44 @@ async def trash_document(
     doc.trashed_at = datetime.now(timezone.utc)
     doc.trashed_by = trashed_by
     await db.flush()
-    await bump_tool_cache_version(entity_id, "documents")
     return True
 
 
 async def restore_document(
-    db: AsyncSession, document_id: str, entity_id: str,
+    db: AsyncSession,
+    document_id: str,
+    entity_id: str,
 ) -> bool:
     """Restore document from trash."""
-    # Query including trashed docs (get_document filters them out)
-    result = await db.execute(
-        select(Document).where(
-            Document.id == document_id,
-            Document.entity_id == entity_id,
-        )
+    doc = await get_document_for_update(
+        db,
+        document_id,
+        entity_id,
+        include_trashed=True,
     )
-    doc = result.scalar_one_or_none()
-    if not doc or not doc.is_trashed:
+    if not doc:
         return False
+    restore_blocked_reason = dict(doc.metadata_ or {}).get("restore_blocked_reason")
+    if restore_blocked_reason:
+        raise DocumentRestoreConflict("This trashed document has no independently recoverable file")
+    original_fs_path = dict(doc.metadata_ or {}).get(_TRASH_META_KEY)
+    active_fs_path = original_fs_path or doc.fs_path
+    if active_fs_path:
+        active_document_id = await db.scalar(
+            select(Document.id).where(
+                Document.entity_id == entity_id,
+                Document.fs_path == active_fs_path,
+                Document.is_trashed.is_(False),
+                Document.id != doc.id,
+            )
+        )
+        if active_document_id is not None:
+            raise DocumentRestoreConflict("A current document already uses this filesystem path")
     _restore_file_from_hidden_trash(doc, entity_id)
     doc.is_trashed = False
     doc.trashed_at = None
     doc.trashed_by = None
     await db.flush()
-    await bump_tool_cache_version(entity_id, "documents")
     return True
 
 
@@ -200,39 +227,99 @@ async def list_trash(db: AsyncSession, entity_id: str) -> list[Document]:
 
 
 async def empty_trash(db: AsyncSession, entity_id: str) -> int:
-    """Permanently delete all trashed documents and their files. Returns count deleted."""
-    import os
-    from packages.core.config import get_settings
+    """Permanently delete trashed rows, then clean their files."""
+    candidate_ids = list((await db.execute(
+        select(Document.id).where(
+            Document.entity_id == entity_id,
+            Document.is_trashed.is_(True),
+        ).order_by(Document.id)
+    )).scalars())
+    document_ids = []
+    for document_id in candidate_ids:
+        document = await get_document_for_update(
+            db,
+            document_id,
+            entity_id,
+            include_trashed=True,
+        )
+        if document is not None:
+            document_ids.append(document.id)
+    if not document_ids:
+        return 0
 
     # Collect fs_paths before deleting records so we can clean up files
     trashed = await db.execute(
-        select(Document.fs_path).where(
+        select(Document.id, Document.fs_path)
+        .where(
             Document.entity_id == entity_id,
-            Document.is_trashed == True,  # noqa: E712
+            Document.id.in_(document_ids),
         )
+        .order_by(Document.id)
+        .with_for_update()
     )
-    fs_paths = [row[0] for row in trashed if row[0]]
+    trashed_rows = list(trashed)
+    fs_paths = [row[1] for row in trashed_rows if row[1]]
+    active_fs_paths: list[str] = []
+    if fs_paths:
+        active_paths = await db.execute(
+            select(Document.fs_path).where(
+                Document.entity_id == entity_id,
+                Document.is_trashed.is_(False),
+                Document.fs_path.is_not(None),
+            )
+        )
+        active_fs_paths = [row[0] for row in active_paths if row[0]]
 
+    entity_root = _entity_root(entity_id)
+    source_cleanup_bases: set[str] = set()
+    if entity_root:
+        protected_files = {
+            full
+            for fp in active_fs_paths
+            if (full := _safe_full_path(entity_root, fp)) is not None
+        }
+        source_cleanup_bases = {
+            fp
+            for fp in fs_paths
+            if (
+                (full := _safe_full_path(entity_root, fp)) is not None
+                and full not in protected_files
+            )
+        }
+    else:
+        source_cleanup_bases = set(fs_paths) - set(active_fs_paths)
+
+    await delete_resource_comments(db, entity_id, "document", document_ids)
     result = await db.execute(
         delete(Document).where(
             Document.entity_id == entity_id,
-            Document.is_trashed == True,  # noqa: E712
+            Document.id.in_(document_ids),
         )
     )
-    await db.flush()
-    if result.rowcount:
-        await bump_tool_cache_version(entity_id, "documents")
+    from packages.core.services.workspace_artifact_purge import (
+        ARTIFACT_CLEANUP_KIND_FILE,
+        document_derived_file_cleanup_bases,
+        document_derived_tree_cleanup_bases,
+        enqueue_artifact_cleanup_jobs,
+    )
 
-    # Delete files from disk
-    settings = get_settings()
-    if settings.MANOR_FS_ENABLED and fs_paths:
-        entity_root = os.path.join(settings.MANOR_FS_ROOT, entity_id)
-        for fp in fs_paths:
-            full = os.path.join(entity_root, fp)
-            try:
-                if os.path.isfile(full):
-                    os.remove(full)
-            except OSError:
-                pass  # best-effort cleanup
+    cleanup_bases = document_derived_tree_cleanup_bases(document_ids)
+    file_cleanup_bases = (
+        source_cleanup_bases
+        | document_derived_file_cleanup_bases(document_ids)
+    )
+    await enqueue_artifact_cleanup_jobs(db, entity_id, cleanup_bases)
+    await enqueue_artifact_cleanup_jobs(
+        db,
+        entity_id,
+        file_cleanup_bases,
+        target_kind=ARTIFACT_CLEANUP_KIND_FILE,
+    )
+    await db.flush()
+
+    # The file cleanup is irreversible.  Make the database deletion durable
+    # first so a failed commit can never leave live trash rows pointing at
+    # files that were already removed.
+    await db.commit()
 
     return result.rowcount

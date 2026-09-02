@@ -14,6 +14,8 @@
     "mcp__google_calendar__delete_event",
     "mcp__google_calendar__list_calendars",
     "mcp__google_calendar__freebusy_query",
+    "mcp__google_calendar__list_event_instances",
+    "mcp__google_calendar__list_event_attendees",
     "mcp__google_calendar__respond_to_invite",
     "mcp__google_calendar__quick_add_event",
     "mcp__google_calendar__move_event"

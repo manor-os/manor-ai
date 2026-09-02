@@ -22,6 +22,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from packages.core.briefing import inbox as inbox_mod
 from packages.core.briefing.prompt import generate_briefing_via_llm
 from packages.core.briefing.schema import Briefing
+from packages.core.constants.goals import GoalStatus
 from packages.core.models.base import generate_ulid
 from packages.core.models.workspace import Workspace
 from packages.core.workspaces import is_sandbox_workspace
@@ -199,7 +200,7 @@ async def _gather_goals_snapshot(
             select(Goal).where(
                 Goal.entity_id == entity_id,
                 Goal.workspace_id == workspace_id,
-                Goal.status == "active",
+                Goal.status == GoalStatus.ACTIVE.value,
             ).order_by(Goal.priority.desc())
         )).scalars().all())
         return [

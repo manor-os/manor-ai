@@ -10,6 +10,7 @@ function readSource(path) {
 const authShell = readSource("../src/components/auth/AuthShell.tsx");
 const login = readSource("../src/pages/Login.tsx");
 const oauthCallback = readSource("../src/pages/OAuthCallback.tsx");
+const authNavigation = readSource("../src/lib/authNavigation.ts");
 const api = readSource("../src/lib/api.ts");
 const forgotPassword = readSource("../src/pages/ForgotPassword.tsx");
 const resetPassword = readSource("../src/pages/ResetPassword.tsx");
@@ -40,3 +41,4 @@ test("Google sign-in preserves the user's remember-me choice", () => {
   assert.match(oauthCallback, /sessionStorage\.removeItem\("oauth_remember_me"\)/);
   assert.match(api, /remember_me: Boolean\(opts\.rememberMe\)/);
 });
+

@@ -9,6 +9,8 @@
   "tools": [
     "mcp__ms_excel__list_worksheets",
     "mcp__ms_excel__add_worksheet",
+    "mcp__ms_excel__delete_worksheet",
+    "mcp__ms_excel__rename_worksheet",
     "mcp__ms_excel__read_range",
     "mcp__ms_excel__read_used_range",
     "mcp__ms_excel__write_range",
@@ -19,6 +21,7 @@
     "mcp__ms_excel__add_table_rows",
     "mcp__ms_excel__create_table",
     "mcp__ms_excel__calculate",
-    "mcp__ms_excel__list_named_items"
+    "mcp__ms_excel__list_named_items",
+    "mcp__ms_excel__get_named_item_range"
   ]
 }

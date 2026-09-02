@@ -7,7 +7,10 @@ from pydantic import BaseModel
 from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from packages.core.ai.runtime import runtime_invoke_skill
+from packages.core.ai.runtime import (
+    runtime_assistant_stream_error_content,
+    runtime_invoke_skill,
+)
 from packages.core.database import get_db
 from packages.core.models.permission import Capability, ResourceType, Visibility
 from packages.core.models.scheduler import ScheduledJob
@@ -34,6 +37,7 @@ from packages.core.services.skill_generator import (
 from packages.core.services.sse_events import format_sse
 from packages.core.services.github_skill_installer import install_from_github
 from apps.api.deps import get_current_user
+from apps.api.streaming_concurrency import acquire_chat_stream_lease
 
 router = APIRouter(prefix="/api/v1/skills", tags=["skills"])
 
@@ -639,6 +643,7 @@ async def generate_skill_endpoint(
             entity_id=user.entity_id,
             db=db,
             category=body.category,
+            owner_user_id=user.id,
         )
     except ValueError as exc:
         raise HTTPException(422, str(exc))
@@ -666,6 +671,7 @@ async def generate_skill_stream_endpoint(
                 entity_id=user.entity_id,
                 db=db,
                 category=body.category,
+                owner_user_id=user.id,
             ):
                 if kind == "step":
                     yield format_sse("step", {"label": payload})
@@ -678,8 +684,9 @@ async def generate_skill_stream_endpoint(
         except Exception as exc:  # noqa: BLE001 — surface any failure to the client
             yield format_sse("error", {"message": str(exc)})
 
+    lease = await acquire_chat_stream_lease(scope="skill-generate")
     return StreamingResponse(
-        event_stream(),
+        lease.wrap(event_stream()),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
@@ -1016,7 +1023,10 @@ async def invoke_skill_endpoint(
         db, skill_id, user.entity_id, input_payload, user_id=user.id,
     )
     if result.get("error"):
-        raise HTTPException(404, result["error"])
+        raise HTTPException(
+            404,
+            runtime_assistant_stream_error_content(str(result["error"])),
+        )
     return result
 
 

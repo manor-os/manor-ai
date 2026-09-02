@@ -15,6 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from packages.core.models.base import generate_ulid
 from packages.core.models.scheduler import ScheduledJob
 from packages.core.models.workspace import Workspace
+from packages.core.services.scheduler_service import ScheduledJobMutationFactory
 
 logger = logging.getLogger(__name__)
 
@@ -60,25 +61,24 @@ async def install_strategist_schedule(
 
     if existing:
         updates = {
+            "entity_id": workspace.entity_id,
+            "workspace_id": workspace.id,
+            "name": f"Strategist review: {workspace.name}",
+            "job_type": (
+                "interval" if schedule_kind in {"every", "interval"} else "cron"
+            ),
             "schedule_kind": schedule_kind,
             "cron_expr": fields.get("cron_expr"),
             "every_seconds": fields.get("every_seconds"),
             "execution_type": "strategist_review",
             "execution_target": {"workspace_id": workspace.id},
             "enabled": True,
+            "consecutive_errors": 0,
         }
-        changed = {k: v for k, v in updates.items() if getattr(existing, k) != v}
-        existing.entity_id = workspace.entity_id
-        existing.workspace_id = workspace.id
-        existing.consecutive_errors = 0
-        for key, value in changed.items():
-            setattr(existing, key, value)
-        if changed:
-            # M11: config actually changed — bump the revision + audit.
-            from packages.core.revisions import bump_revision
-            await bump_revision(db, existing, patch=changed)
-        await db.flush()
-        return existing
+        result = await ScheduledJobMutationFactory.apply(db, existing, updates)
+        if result is None:
+            raise ValueError(f"scheduled job {job_id} no longer exists")
+        return result.job
 
     job = ScheduledJob(
         id=generate_ulid(),
@@ -94,8 +94,9 @@ async def install_strategist_schedule(
         execution_target={"workspace_id": workspace.id},
         enabled=True,
     )
-    db.add(job)
-    await db.flush()
+    from packages.core.services.product_growth import persist_scheduled_job
+
+    await persist_scheduled_job(db, job)
     return job
 
 

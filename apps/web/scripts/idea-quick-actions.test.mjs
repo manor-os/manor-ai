@@ -16,6 +16,7 @@ const [
   messageDisplaySource,
   cssSource,
   apiSource,
+  manualSkillRefsSource,
   enSource,
   zhSource,
   esSource,
@@ -34,6 +35,7 @@ const [
     read("src/components/ChatMessageDisplay.tsx"),
     read("src/index.css"),
     read("src/lib/api.ts"),
+    read("src/lib/manualSkillRefs.ts"),
     read("src/lib/i18n/en.ts"),
     read("src/lib/i18n/zh.ts"),
     read("src/lib/i18n/es.ts"),
@@ -103,7 +105,7 @@ test("chat home centers two idea actions inside the capability rail", () => {
 });
 
 /*
- * manual_skill_ids is not a hint: the server treats it as an explicit user
+ * manual_skill_refs is not a hint: the server treats it as an explicit user
  * selection and force-invokes the skill in round 1 before the model produces a
  * token (packages/core/ai/runtime/skill_forcing.py). A composer default that
  * quietly fills it makes every unrelated message run the idea skill. These
@@ -121,6 +123,16 @@ test("a send attaches a built-in skill only on an explicit user gesture", () => 
   assert.ok(builtInSkillsSource, "IDEA_BUILT_IN_SKILLS should be findable");
 
   const builtInSkills = new Function(`return (${builtInSkillsSource});`)();
+  assert.deepEqual(builtInSkills["new-idea"].reference, {
+    kind: "slug",
+    value: "solo-business-idea-finder",
+    source: "builtin",
+  });
+  assert.deepEqual(builtInSkills["validate-idea"].reference, {
+    kind: "slug",
+    value: "solo-business-idea-review",
+    source: "builtin",
+  });
   // `options` joined the block when workflow sends landed; the lifted code
   // reads options.workflow, so it has to be supplied like any other binding.
   const attachedSkills = new Function(
@@ -129,12 +141,18 @@ test("a send attaches a built-in skill only on an explicit user gesture", () => 
     "manualSkills",
     "IDEA_BUILT_IN_SKILLS",
     "options",
+    "isResponseSurfaceSubmission",
     `${attachBlockSource}\nreturn effectiveManualSkills;`,
   );
   const idsFor = (messages, ideaComposer, manualSkills = [], options = {}) =>
-    attachedSkills(messages, ideaComposer, manualSkills, builtInSkills, options).map(
-      (skill) => skill.id,
-    );
+    attachedSkills(
+      messages,
+      ideaComposer,
+      manualSkills,
+      builtInSkills,
+      options,
+      Boolean(options.responseSurfaceSubmission),
+    ).map((skill) => skill.id);
 
   const someHistory = [{ role: "user" }, { role: "assistant" }];
   const defaultFocus = { mode: "new-idea", origin: "default" };
@@ -148,6 +166,14 @@ test("a send attaches a built-in skill only on an explicit user gesture", () => 
   // A workflow send owns the turn: it must not also carry the idea skill.
   assert.deepEqual(
     idsFor([], { mode: "new-idea", origin: "user" }, [], { workflow: "wf_1" }),
+    [],
+  );
+  // Interactive response cards are their own turn and must not consume the
+  // currently armed idea skill from the untouched composer.
+  assert.deepEqual(
+    idsFor([], { mode: "new-idea", origin: "user" }, [], {
+      responseSurfaceSubmission: { eventId: "evt_1" },
+    }),
     [],
   );
   // The cosmetic empty-state focus is not a request for the skill either.
@@ -165,6 +191,16 @@ test("a send attaches a built-in skill only on an explicit user gesture", () => 
     idsFor(someHistory, defaultFocus, [{ id: "solo-business-idea-finder" }]),
     ["solo-business-idea-finder"],
   );
+});
+
+test("built-in skill slugs resolve to database IDs and are dual-written for old APIs", () => {
+  assert.ok(chatSource.includes('api.skills.list({ include_platform: true })'));
+  assert.ok(chatSource.includes("resolveManualSkillReferenceIds("));
+  assert.ok(manualSkillRefsSource.includes('reference.source === "builtin"'));
+  assert.ok(manualSkillRefsSource.includes("skill.entity_id == null"));
+  assert.ok(apiSource.includes("...legacyManualSkillIds(opts?.manualSkillRefs)"));
+  assert.ok(apiSource.includes('form.append("manual_skill_ids", compatibleManualSkillIds.join(","))'));
+  assert.ok(apiSource.includes('form.append("manual_skill_refs", JSON.stringify(opts.manualSkillRefs))'));
 });
 
 test("idea modes draw clickable candidates from an extensible library", () => {
@@ -525,8 +561,13 @@ test("idea quick actions bind built-in skills without exposing implementation pr
     chatSource.includes("void handleSend(request.message, [], [request.skill]"),
   );
   assert.ok(
-    apiSource.includes('form.append("manual_skill_ids", opts.manualSkillIds.join(","))'),
+    apiSource.includes('form.append("manual_skill_refs", JSON.stringify(opts.manualSkillRefs))'),
   );
+  assert.ok(
+    apiSource.includes('form.append("manual_skill_ids", compatibleManualSkillIds.join(","))'),
+  );
+  assert.ok(chatSource.includes('kind: "slug"'));
+  assert.ok(chatSource.includes('source: "builtin"'));
   assert.ok(messageDisplaySource.includes("PRODUCT_CAPABILITY_SKILL_IDS"));
   assert.ok(messageDisplaySource.includes('"solo-business-idea-finder"'));
   assert.ok(messageDisplaySource.includes('"solo-business-idea-review"'));

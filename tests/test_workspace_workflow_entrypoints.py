@@ -98,6 +98,57 @@ def test_normalize_chat_entrypoint_exposes_only_safe_config() -> None:
     assert entrypoint.projection["approval_review"] == "inline"
 
 
+def test_legacy_workspace_attachment_projects_as_chat_entrypoint() -> None:
+    from packages.core.services.workspace_workflow_router import normalize_chat_entrypoint
+
+    binding = _Binding(
+        id="legacy-binding",
+        workflow_id="workflow-legacy-binding",
+        workspace_id="workspace-a",
+        config={"workspace_attached": True},
+    )
+    workflow = _Workflow(
+        id=binding.workflow_id,
+        name="Legacy attached workflow",
+        variables={"request": ""},
+        steps=[{
+            "id": "trigger",
+            "type": "trigger",
+            "config": {"run_inputs": [{"key": "request", "type": "string"}]},
+        }],
+    )
+
+    entrypoint = normalize_chat_entrypoint(binding, workflow)
+
+    assert entrypoint is not None
+    assert entrypoint.title == "Legacy attached workflow"
+
+
+@pytest.mark.parametrize(
+    ("workspace_id", "config"),
+    [
+        ("workspace-a", {"workspace_attached": True, "chat_entrypoint": {"enabled": False}}),
+        (None, {"workspace_attached": True}),
+        ("workspace-a", {"workspace_attached": "true"}),
+    ],
+)
+def test_chat_entrypoint_legacy_projection_is_strictly_scoped(
+    workspace_id: str | None,
+    config: dict,
+) -> None:
+    from packages.core.services.workspace_workflow_router import normalize_chat_entrypoint
+
+    binding = _Binding(
+        id="legacy-boundary",
+        workflow_id="workflow-legacy-boundary",
+        workspace_id=workspace_id,
+        config=config,
+    )
+    workflow = _Workflow(id=binding.workflow_id, name="Legacy boundary workflow")
+
+    assert normalize_chat_entrypoint(binding, workflow) is None
+
+
 def test_workflow_service_key_preflight_covers_the_full_graph() -> None:
     from packages.core.services.workflow_service import workflow_service_keys
 
@@ -130,6 +181,23 @@ def test_workflow_service_key_preflight_covers_the_full_graph() -> None:
             "config": {"service_key": "ignored", "agent_id": "agent-1"},
         },
     ]) == {"video.planning"}
+
+
+def test_workspace_chat_preflight_error_is_exposed_as_conflict() -> None:
+    from fastapi import HTTPException
+
+    from apps.api.routers.workspace_chat import _workspace_entrypoint_http_error
+
+    error = _workspace_entrypoint_http_error(
+        ValueError(
+            "Workflow preflight missing active Workspace services: "
+            "product_video.planning"
+        )
+    )
+
+    assert isinstance(error, HTTPException)
+    assert error.status_code == 409
+    assert "product_video.planning" in str(error.detail)
 
 
 @pytest.mark.asyncio
@@ -714,6 +782,10 @@ async def test_workspace_flow_launcher_reuses_origin_and_maps_entrypoint_inputs(
         "packages.core.services.workspace_flow_launcher.prepare_workspace_workflow_inputs",
         prepare_inputs,
     )
+    monkeypatch.setattr(
+        "packages.core.services.workspace_access.user_can_write_workspace_artifacts",
+        AsyncMock(return_value=True),
+    )
 
     launched = await launch_workspace_flow(
         db,
@@ -757,6 +829,168 @@ async def test_workspace_flow_launcher_reuses_origin_and_maps_entrypoint_inputs(
     prepare_inputs.assert_awaited_once()
     db.commit.assert_awaited_once()
     assert db.execute.await_args_list[0].args[0]._for_update_arg is not None
+
+
+@pytest.mark.asyncio
+async def test_workspace_flow_launcher_reuses_existing_launch_key(monkeypatch) -> None:
+    from packages.core.services.workspace_flow_launcher import launch_workspace_flow
+
+    entrypoint = _entrypoint("binding-idempotent-launch")
+    assert entrypoint is not None
+    binding = SimpleNamespace(
+        id=entrypoint.binding_id,
+        workflow_id=entrypoint.workflow_id,
+        workspace_id=entrypoint.workspace_id,
+        entity_id="entity-a",
+        enabled=True,
+        status="active",
+    )
+    conversation = SimpleNamespace(
+        id="conversation-a",
+        entity_id="entity-a",
+        user_id="user-a",
+        workspace_id=None,
+    )
+    origin_message = SimpleNamespace(id="message-user-a", conversation_id=conversation.id)
+    activity_message = SimpleNamespace(id="activity-existing")
+    existing_run = SimpleNamespace(
+        id="run-existing",
+        trigger_data={"_workflow_chat_origin": {"activity_message_id": activity_message.id}},
+    )
+
+    class _ScalarResult:
+        def __init__(self, value=None):
+            self.value = value
+
+        def scalar_one_or_none(self):
+            return self.value
+
+    db = SimpleNamespace(
+        execute=AsyncMock(side_effect=[_ScalarResult(), _ScalarResult(existing_run)]),
+        get=AsyncMock(side_effect=[
+            conversation,
+            origin_message,
+            SimpleNamespace(id="user-a", entity_id="entity-a", role="owner"),
+            SimpleNamespace(id="workspace-a", entity_id="entity-a", deleted_at=None),
+            activity_message,
+        ]),
+        commit=AsyncMock(),
+    )
+    monkeypatch.setattr(
+        "packages.core.services.workspace_access.user_can_write_workspace_artifacts",
+        AsyncMock(return_value=True),
+    )
+
+    launched = await launch_workspace_flow(
+        db,
+        source="global_chat",
+        entrypoint=entrypoint,
+        binding=binding,
+        entity_id="entity-a",
+        user_id="user-a",
+        workspace_id="workspace-a",
+        conversation_id=conversation.id,
+        origin_message_id=origin_message.id,
+        source_brief="Create a Manor product video.",
+        input_values={"request": "Create a Manor product video."},
+        starter_policy="only_missing",
+    )
+
+    assert launched.run is existing_run
+    assert launched.activity_message is activity_message
+    assert launched.starter_message is None
+    assert launched.created is False
+    assert db.execute.await_count == 2
+    db.commit.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_workspace_chat_entrypoint_persists_attachment_refs(monkeypatch) -> None:
+    from packages.core.services.file_context import FileAttachments
+    from packages.core.services.workspace_workflow_router import (
+        start_workspace_chat_entrypoint,
+    )
+
+    entrypoint = _entrypoint("binding-persisted-attachments")
+    assert entrypoint is not None
+    binding = SimpleNamespace(
+        id=entrypoint.binding_id,
+        workflow_id=entrypoint.workflow_id,
+        workspace_id=entrypoint.workspace_id,
+        entity_id="entity-a",
+        enabled=True,
+        status="active",
+    )
+    conversation = SimpleNamespace(
+        id="conversation-a",
+        entity_id="entity-a",
+        user_id="user-a",
+        workspace_id="workspace-a",
+    )
+    user_message = SimpleNamespace(
+        id="message-user-a",
+        conversation_id=conversation.id,
+    )
+    user = SimpleNamespace(id="user-a", entity_id="entity-a", role="owner")
+    workspace = SimpleNamespace(
+        id="workspace-a",
+        entity_id="entity-a",
+        deleted_at=None,
+    )
+    attachments = FileAttachments()
+    attachments.attachment_refs.append(
+        {
+            "kind": "knowledge_document",
+            "name": "reference.pdf",
+            "document_id": "doc-reference",
+            "path": "docs/reference.pdf",
+            "url": "/api/v1/fs/entity-a/docs/reference.pdf",
+        }
+    )
+    db = SimpleNamespace(
+        get=AsyncMock(side_effect=[conversation, user_message, user, workspace]),
+        commit=AsyncMock(),
+    )
+    add_message = AsyncMock(side_effect=[SimpleNamespace(id="saved-user-message")])
+    launch = AsyncMock(
+        return_value=SimpleNamespace(
+            run=SimpleNamespace(id="run-a"),
+            conversation=conversation,
+            user_message=user_message,
+            activity_message=SimpleNamespace(id="activity-a"),
+        )
+    )
+    monkeypatch.setattr(
+        "packages.core.services.conversation_messages.add_message",
+        add_message,
+    )
+    monkeypatch.setattr(
+        "packages.core.services.workspace_flow_launcher.launch_workspace_flow",
+        launch,
+    )
+    monkeypatch.setattr(
+        "packages.core.services.conversation_lifecycle.get_or_create_conversation",
+        AsyncMock(return_value=conversation),
+    )
+
+    started = await start_workspace_chat_entrypoint(
+        db,
+        entrypoint=entrypoint,
+        binding=binding,
+        entity_id="entity-a",
+        user_id="user-a",
+        workspace_id="workspace-a",
+        message="Use the attached reference.",
+        attachments=attachments,
+        conversation_id=conversation.id,
+        route_source="explicit",
+    )
+
+    assert started.user_message.id == "saved-user-message"
+    assert add_message.await_count == 1
+    assert add_message.await_args.kwargs["attachments"] == attachments.attachment_refs
+    assert launch.await_args.kwargs["attachments"] is attachments
+    assert launch.await_args.kwargs["origin_message_id"] == "saved-user-message"
 
 
 @pytest.mark.asyncio
@@ -1170,6 +1404,97 @@ def test_workflow_json_input_preserves_and_enforces_its_declared_schema() -> Non
     assert "request.video_type" in errors
 
 
+def test_workflow_input_rejects_an_unsupported_schema_dialect() -> None:
+    from packages.core.services.workspace_workflow_router import (
+        normalize_chat_entrypoint,
+        validate_workspace_workflow_inputs,
+    )
+
+    binding = _Binding(
+        id="binding-legacy-schema",
+        workflow_id="workflow-legacy-schema",
+        workspace_id="workspace-a",
+        config={"chat_entrypoint": {"enabled": True}},
+    )
+    workflow = _Workflow(
+        id=binding.workflow_id,
+        name="Legacy schema input",
+        variables={"request": {}},
+        steps=[
+            {
+                "id": "start",
+                "type": "trigger",
+                "config": {
+                    "run_inputs": [
+                        {
+                            "key": "request",
+                            "type": "json",
+                            "required": True,
+                            "schema": {
+                                "$schema": "http://json-schema.org/draft-07/schema#",
+                                "type": "object",
+                            },
+                        }
+                    ]
+                },
+            }
+        ],
+    )
+    entrypoint = normalize_chat_entrypoint(binding, workflow)
+
+    assert entrypoint is not None
+    with pytest.raises(ValueError) as exc_info:
+        validate_workspace_workflow_inputs(entrypoint, {"request": {}})
+
+    assert json.loads(str(exc_info.value))["request"] == (
+        "This Workflow input has an invalid schema."
+    )
+
+
+def test_workflow_input_rejects_non_object_schema_instead_of_ignoring_it() -> None:
+    from packages.core.services.workspace_workflow_router import (
+        normalize_chat_entrypoint,
+        validate_workspace_workflow_inputs,
+    )
+
+    binding = _Binding(
+        id="binding-false-schema",
+        workflow_id="workflow-false-schema",
+        workspace_id="workspace-a",
+        config={"chat_entrypoint": {"enabled": True}},
+    )
+    workflow = _Workflow(
+        id=binding.workflow_id,
+        name="Reject every input",
+        variables={"request": {}},
+        steps=[
+            {
+                "id": "start",
+                "type": "trigger",
+                "config": {
+                    "run_inputs": [
+                        {
+                            "key": "request",
+                            "type": "json",
+                            "required": True,
+                            "schema": False,
+                        }
+                    ]
+                },
+            }
+        ],
+    )
+    entrypoint = normalize_chat_entrypoint(binding, workflow)
+
+    assert entrypoint is not None
+    with pytest.raises(ValueError) as exc_info:
+        validate_workspace_workflow_inputs(entrypoint, {"request": {}})
+
+    assert json.loads(str(exc_info.value))["request"] == (
+        "This Workflow input has an invalid schema."
+    )
+
+
 def test_workflow_projection_settings_follow_binding_config() -> None:
     from packages.core.services.workflow_chat_projection import (
         _entrypoint_context,
@@ -1440,7 +1765,7 @@ async def test_completed_revision_projects_terminal_summary_without_retry(
     monkeypatch.setattr(projection, "_notify_update", noop)
     monkeypatch.setattr(projection, "_project_final_output", noop)
 
-    await projection.project_workflow_run_status(object(), run=run)
+    await projection._project_workflow_run_status_chat(object(), run=run)
 
     assert activity.meta["workflow_status"] == "completed"
     assert activity.meta["workflow_business_outcome"] == "revision_required"
@@ -1497,7 +1822,7 @@ async def test_cancelled_workflow_projection_clears_retry_action(monkeypatch) ->
     monkeypatch.setattr(projection, "_notify_update", noop)
     monkeypatch.setattr(projection, "_project_final_output", noop)
 
-    await projection.project_workflow_run_status(object(), run=run)
+    await projection._project_workflow_run_status_chat(object(), run=run)
 
     assert activity.meta["workflow_status"] == "cancelled"
     assert activity.content == "Create product video was cancelled."
@@ -1651,6 +1976,7 @@ def test_pending_action_reply_detection_does_not_block_new_work() -> None:
         ({}, True),
         ({"agent_id": "agent-1"}, False),
         ({"manual_skill_ids": "skill-1"}, False),
+        ({"manual_skill_refs": '[{"kind":"id","value":"skill-1"}]'}, False),
         ({"chat_mode": "video"}, False),
         ({"message": "@Demo Producer create this video."}, False),
         ({"ephemeral": True}, False),
@@ -1808,8 +2134,18 @@ async def test_agent_workflow_listing_prefers_current_workspace_binding(
             {"id": "end", "type": "end", "name": "Done", "config": {}, "next": []},
         ],
     })).json()
+    workspace_a = (await client.post(
+        "/api/v1/workspaces",
+        headers=headers,
+        json={"name": "Entrypoint scope A"},
+    )).json()
+    workspace_b = (await client.post(
+        "/api/v1/workspaces",
+        headers=headers,
+        json={"name": "Entrypoint scope B"},
+    )).json()
     bindings = []
-    for workspace_id in (None, "workspace-a", "workspace-b"):
+    for workspace_id in (None, workspace_a["id"], workspace_b["id"]):
         response = await client.post("/api/v1/workflows/bindings", headers=headers, json={
             "workflow_id": workflow["id"],
             "workspace_id": workspace_id,
@@ -1824,7 +2160,7 @@ async def test_agent_workflow_listing_prefers_current_workspace_binding(
     monkeypatch.setattr(workflow_tools, "async_session", db_module.async_session)
     workspace_result = json.loads(await workflow_tools._list_workflows(
         entity_id=registration["entity_id"],
-        workspace_id="workspace-a",
+        workspace_id=workspace_a["id"],
     ))
     entity_result = json.loads(await workflow_tools._list_workflows(
         entity_id=registration["entity_id"],
@@ -1854,9 +2190,14 @@ async def test_agent_chat_can_call_an_unambiguous_workspace_published_workflow(
             {"id": "end", "type": "end", "name": "Done", "config": {}, "next": []},
         ],
     })).json()
+    workspace = (await client.post(
+        "/api/v1/workspaces",
+        headers=headers,
+        json={"name": "Unambiguous workflow workspace"},
+    )).json()
     binding = (await client.post("/api/v1/workflows/bindings", headers=headers, json={
         "workflow_id": workflow["id"],
-        "workspace_id": "workspace-only",
+        "workspace_id": workspace["id"],
         "trigger_type": "mcp",
     })).json()
 
@@ -1873,7 +2214,7 @@ async def test_agent_chat_can_call_an_unambiguous_workspace_published_workflow(
         "description": "",
         "inputs": ["request"],
         "binding_id": binding["id"],
-        "workspace_id": "workspace-only",
+        "workspace_id": workspace["id"],
     }]
 
     run = json.loads(await workflow_tools._run_workflow(
@@ -1883,7 +2224,7 @@ async def test_agent_chat_can_call_an_unambiguous_workspace_published_workflow(
         inputs={"request": "Use the Workspace context"},
     ))
     assert run["ok"] is True
-    assert run["run"]["workspace_id"] == "workspace-only"
+    assert run["run"]["workspace_id"] == workspace["id"]
 
 
 async def _seed_workspace_entrypoint(
@@ -1931,6 +2272,153 @@ async def _seed_workspace_entrypoint(
         },
     })).json()
     return registration, headers, workspace, binding
+
+
+@pytest.mark.asyncio
+async def test_workspace_retry_preflights_snapshot_services_before_creating_run(
+    client: AsyncClient,
+    db_session,
+) -> None:
+    from copy import deepcopy
+
+    from sqlalchemy import func, select
+
+    from packages.core.models.base import generate_ulid
+    from packages.core.models.workflow import WorkflowBinding, WorkflowDefinition, WorkflowRun
+    from packages.core.models.workspace import AgentSubscription
+    from packages.core.services.workflow_service import (
+        retry_workflow_run,
+        start_workflow_from_binding,
+    )
+
+    required_service = "product_video.planning"
+    steps = [
+        {"id": "trigger", "type": "trigger", "config": {}, "next": ["plan"]},
+        {
+            "id": "plan",
+            "type": "transform",
+            "config": {"service_key": required_service, "set": {"planned": True}},
+            "next": ["end"],
+        },
+        {"id": "end", "type": "end", "config": {}, "next": []},
+    ]
+    registration, _headers, workspace, binding = await _seed_workspace_entrypoint(
+        client,
+        "retry_snapshot_preflight",
+        steps=steps,
+    )
+    subscription = AgentSubscription(
+        entity_id=registration["entity_id"],
+        workspace_id=workspace["id"],
+        agent_id=generate_ulid(),
+        service_key=required_service,
+        status="active",
+    )
+    db_session.add(subscription)
+    await db_session.commit()
+
+    stored_binding = await db_session.get(WorkflowBinding, binding["id"])
+    assert stored_binding is not None
+    prior = await start_workflow_from_binding(
+        db_session,
+        binding=stored_binding,
+        started_by=registration["user_id"],
+    )
+    prior.status = "failed"
+    prior.current_step_id = "plan"
+    await db_session.flush()
+
+    stored_workflow = await db_session.get(WorkflowDefinition, binding["workflow_id"])
+    assert stored_workflow is not None
+    current_steps = deepcopy(stored_workflow.steps)
+    current_steps[1]["config"]["service_key"] = "current.definition.service"
+    stored_workflow.steps = current_steps
+    await db_session.delete(subscription)
+    await db_session.commit()
+
+    family_count = await db_session.scalar(
+        select(func.count()).select_from(WorkflowRun).where(
+            WorkflowRun.workflow_id == prior.workflow_id,
+            WorkflowRun.workspace_id == workspace["id"],
+        )
+    )
+    with pytest.raises(ValueError, match=required_service):
+        await retry_workflow_run(
+            db_session,
+            run_id=prior.id,
+            entity_id=registration["entity_id"],
+            started_by=registration["user_id"],
+            from_step_id="plan",
+        )
+    assert await db_session.scalar(
+        select(func.count()).select_from(WorkflowRun).where(
+            WorkflowRun.workflow_id == prior.workflow_id,
+            WorkflowRun.workspace_id == workspace["id"],
+        )
+    ) == family_count
+
+
+@pytest.mark.asyncio
+async def test_workspace_retry_api_rejects_paused_workspace_before_creating_run(
+    client: AsyncClient,
+    db_session,
+) -> None:
+    from sqlalchemy import func, select
+
+    from packages.core.models.workflow import WorkflowBinding, WorkflowRun
+    from packages.core.services.workflow_service import start_workflow_from_binding
+
+    steps = [
+        {"id": "trigger", "type": "trigger", "config": {}, "next": ["plan"]},
+        {
+            "id": "plan",
+            "type": "transform",
+            "config": {"set": {"planned": True}},
+            "next": ["end"],
+        },
+        {"id": "end", "type": "end", "config": {}, "next": []},
+    ]
+    registration, headers, workspace, binding = await _seed_workspace_entrypoint(
+        client,
+        "retry_paused_workspace",
+        steps=steps,
+    )
+    stored_binding = await db_session.get(WorkflowBinding, binding["id"])
+    assert stored_binding is not None
+    prior = await start_workflow_from_binding(
+        db_session,
+        binding=stored_binding,
+        started_by=registration["user_id"],
+    )
+    prior.status = "failed"
+    prior.current_step_id = "plan"
+    await db_session.commit()
+
+    pause = await client.post(
+        f"/api/v1/workspaces/{workspace['id']}/pause",
+        headers=headers,
+    )
+    assert pause.status_code == 200, pause.text
+    family_count = await db_session.scalar(
+        select(func.count()).select_from(WorkflowRun).where(
+            WorkflowRun.workflow_id == prior.workflow_id,
+            WorkflowRun.workspace_id == workspace["id"],
+        )
+    )
+
+    response = await client.post(
+        f"/api/v1/workflows/runs/{prior.id}/retry",
+        headers=headers,
+        json={"from_step_id": "plan", "execute": False},
+    )
+
+    assert response.status_code == 409, response.text
+    assert await db_session.scalar(
+        select(func.count()).select_from(WorkflowRun).where(
+            WorkflowRun.workflow_id == prior.workflow_id,
+            WorkflowRun.workspace_id == workspace["id"],
+        )
+    ) == family_count
 
 
 @pytest.mark.asyncio
@@ -2187,6 +2675,50 @@ async def test_workspace_chat_lists_configured_entrypoints(client: AsyncClient) 
 
 
 @pytest.mark.asyncio
+async def test_task_scoped_workspace_entrypoint_preserves_task_thread(
+    client: AsyncClient,
+    db_session,
+) -> None:
+    from sqlalchemy import select
+    from packages.core.models.task import Conversation, Task
+
+    registration, headers, workspace, binding = await _seed_workspace_entrypoint(
+        client,
+        "task-thread-entrypoint",
+    )
+    task_id = "01KZZ9A11G9VQSG4M7Z5TNP4AV"
+    db_session.add(Task(
+        id=task_id,
+        entity_id=registration["entity_id"],
+        workspace_id=workspace["id"],
+        title="Run the workflow in this Task",
+        details={},
+    ))
+    await db_session.commit()
+
+    response = await client.post(
+        f"/api/v1/workspaces/{workspace['id']}/chat/entrypoints/{binding['id']}/stream",
+        headers=headers,
+        data={
+            "message": "Run this workflow in the task thread.",
+            "thread_ref_kind": "task",
+            "thread_ref_id": task_id,
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    rows = list((await db_session.execute(
+        select(Conversation).where(
+            Conversation.entity_id == registration["entity_id"],
+            Conversation.workspace_id == workspace["id"],
+            Conversation.thread_ref_kind == "task",
+            Conversation.thread_ref_id == task_id,
+        )
+    )).scalars())
+    assert len(rows) == 1
+
+
+@pytest.mark.asyncio
 async def test_explicit_entrypoint_rejects_binding_from_another_workspace(
     client: AsyncClient,
 ) -> None:
@@ -2307,6 +2839,132 @@ async def test_workspace_viewer_cannot_resolve_operator_workflow_action(
     unchanged_action = next(item for item in unchanged_messages if item["id"] == action.id)
     assert unchanged_run["status"] == "paused"
     assert unchanged_action["resolved_at"] is None
+
+
+@pytest.mark.asyncio
+async def test_workspace_viewer_cannot_list_or_start_chat_flow(
+    client: AsyncClient,
+    db_session,
+) -> None:
+    from datetime import UTC, datetime
+
+    from packages.core.models.workspace import WorkspaceStaff
+    from tests.test_document_permissions import _create_entity_user
+
+    registration, owner_headers, workspace, binding = await _seed_workspace_entrypoint(
+        client,
+        "viewer-launch",
+    )
+    viewer = await _create_entity_user(
+        registration["entity_id"],
+        "entrypoint_viewer_launch",
+        role="member",
+    )
+    db_session.add(WorkspaceStaff(
+        workspace_id=workspace["id"],
+        user_id=viewer["id"],
+        role="viewer",
+        added_by=registration["user_id"],
+        added_at=datetime.now(UTC),
+        status="active",
+    ))
+    await db_session.commit()
+
+    visible = await client.get(
+        f"/api/v1/workspaces/{workspace['id']}/chat/entrypoints",
+        headers=viewer["headers"],
+    )
+    assert visible.status_code == 200, visible.text
+    assert visible.json() == []
+
+    denied = await client.post(
+        f"/api/v1/workspaces/{workspace['id']}/chat/entrypoints/{binding['id']}/stream",
+        headers=viewer["headers"],
+        data={"message": "Run this Flow."},
+    )
+    assert denied.status_code == 403, denied.text
+
+    runs = await client.get(
+        f"/api/v1/workflows/runs?workspace_id={workspace['id']}",
+        headers=owner_headers,
+    )
+    assert runs.status_code == 200, runs.text
+    assert runs.json() == []
+    messages = await client.get(
+        f"/api/v1/workspaces/{workspace['id']}/chat/messages",
+        headers=owner_headers,
+    )
+    assert messages.status_code == 200, messages.text
+    assert messages.json() == []
+
+
+@pytest.mark.asyncio
+async def test_workspace_viewer_chat_turn_skips_flow_intent_routing(
+    client: AsyncClient,
+    db_session,
+    monkeypatch,
+) -> None:
+    from datetime import UTC, datetime
+
+    from packages.core.models.workspace import WorkspaceStaff
+    from tests.test_document_permissions import _create_entity_user
+
+    classifier_called = False
+    fallback_called = False
+
+    async def fake_classifier(*args, **kwargs):
+        nonlocal classifier_called
+        classifier_called = True
+        raise AssertionError("viewer must not reach Flow intent classification")
+
+    async def fake_chat_stream(*args, **kwargs):
+        nonlocal fallback_called
+        fallback_called = True
+        yield "event: stream_end\\ndata: {}\\n\\n"
+
+    monkeypatch.setattr(
+        "packages.core.services.workspace_workflow_router.classify_workspace_intent",
+        fake_classifier,
+    )
+    monkeypatch.setattr("apps.api.routers.chat.runtime_stream_chat_turn", fake_chat_stream)
+    registration, owner_headers, workspace, _binding = await _seed_workspace_entrypoint(
+        client,
+        "viewer-auto-route",
+    )
+    viewer = await _create_entity_user(
+        registration["entity_id"],
+        "entrypoint_viewer_auto_route",
+        role="member",
+    )
+    db_session.add(WorkspaceStaff(
+        workspace_id=workspace["id"],
+        user_id=viewer["id"],
+        role="viewer",
+        added_by=registration["user_id"],
+        added_at=datetime.now(UTC),
+        status="active",
+    ))
+    await db_session.commit()
+
+    response = await client.post(
+        "/api/v1/chat/stream",
+        headers=viewer["headers"],
+        data={
+            "message": "Create the full deliverable now.",
+            "workspace_context": "true",
+            "workspace_id": workspace["id"],
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    assert classifier_called is False
+    assert fallback_called is True
+    runs = await client.get(
+        f"/api/v1/workflows/runs?workspace_id={workspace['id']}",
+        headers=owner_headers,
+    )
+    assert runs.status_code == 200, runs.text
+    assert runs.json() == []
 
 
 @pytest.mark.asyncio

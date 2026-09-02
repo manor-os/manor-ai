@@ -15,7 +15,7 @@ import { api } from "../../lib/api";
 import { t } from "../../lib/i18n";
 import Button from "../../components/ui/Button";
 import LoadingSpinner from "../../components/ui/LoadingSpinner";
-import { IconCheck, IconClose, IconPlus } from "../../components/icons";
+import { IconCheck, IconClose, IconPlus, IconRefresh } from "../../components/icons";
 import { formatCategory, getSkillDescription } from "./skillTypes";
 import { SkillFileTree, type SkillTreeFile } from "./SkillFileTree";
 import { SkillFileContent } from "./SkillFileContent";
@@ -82,12 +82,14 @@ export function SkillDetailsModal({
   onImport,
   importing,
   subscribed,
+  updateAvailable,
 }: {
   skill: any | null;
   onClose: () => void;
   onImport?: () => void;
   importing?: boolean;
   subscribed?: boolean;
+  updateAvailable?: boolean;
 }) {
   const [selectedBySkill, setSelectedBySkill] = useState<
     Record<string, string>
@@ -499,7 +501,17 @@ export function SkillDetailsModal({
           <Button variant="outline" size="sm" onClick={onClose}>
             {t("page.flows.close")}
           </Button>
-          {onImport && (subscribed ? (
+          {onImport && (subscribed ? (updateAvailable ? (
+            <Button
+              variant="primary"
+              size="sm"
+              onClick={onImport}
+              loading={importing}
+            >
+              <IconRefresh size={12} />
+              {t("action.update")}
+            </Button>
+          ) : (
             <Button
               variant="outline"
               size="sm"
@@ -512,7 +524,7 @@ export function SkillDetailsModal({
               <IconCheck size={12} />
               {t("page.skills.subscribed")}
             </Button>
-          ) : (
+          )) : (
             <Button
               variant="primary"
               size="sm"

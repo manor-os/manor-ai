@@ -5,37 +5,58 @@ Scopes used:
   - w_member_social:        create/delete posts, comments, reactions, media
   - openid + profile:       get person URN (required for authoring posts)
   - email:                  get user email
-  - r_organization_admin:   list orgs the user can administer
-  - r_organization_social:  read posts/insights for those orgs
-  - w_organization_social:  publish on behalf of an org page
+  - r_organization_admin / r_organization_social / w_organization_social:
+    optional organization-page operations after Community Management API approval
 
-The org-* scopes require LinkedIn's "Community Management API" partner
-program approval. They will be ignored at OAuth-consent time until the
-LinkedIn app has been allow-listed.
+The default OAuth grant intentionally requests only member-level scopes. The
+org-* scopes require LinkedIn's "Community Management API" partner approval
+and are only usable when an approved app grants them separately.
 
 Auth: Bearer token = LinkedIn OAuth access_token (from entity integration config).
 """
 from __future__ import annotations
 
 import asyncio
+import contextvars
+import ipaddress
 import json
 import logging
 import os
+import socket
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 import httpx
 
-logger = logging.getLogger(__name__)
-
 from packages.core.external_api_versions import LINKEDIN as _LINKEDIN_PIN
+
+logger = logging.getLogger(__name__)
 
 _API = "https://api.linkedin.com"
 _MAX_CHARS = 12_000
+_MAX_UPLOAD_BYTES = 50 * 1024 * 1024
 # LinkedIn-Version follows YYYYMM; centralized so CI can flag it when
 # stale. Bump in packages/core/external_api_versions.py.
 _VERSION = _LINKEDIN_PIN.value
+
+_call_context_var: contextvars.ContextVar[Dict[str, Any]] = contextvars.ContextVar(
+    "linkedin_mcp_call_context",
+    default={},
+)
+
+
+def set_call_context(ctx: Dict[str, Any]) -> None:
+    """Set the actor/entity context used to authorize local media reads."""
+    _call_context_var.set(dict(ctx or {}))
+
+
+def clear_call_context() -> None:
+    _call_context_var.set({})
+
+
+def _call_context() -> Dict[str, Any]:
+    return _call_context_var.get()
 
 
 # ── MCP Protocol ─────────────────────────────────────────────────────────────
@@ -52,14 +73,20 @@ async def call_tool(
     handler = _HANDLERS.get(name)
     if not handler:
         return _error(f"Unknown tool: {name}")
+    if not isinstance(arguments, dict):
+        return _error("arguments must be an object")
+    arguments = dict(arguments)
 
     spec = _TOOLS.get(name, {})
-    missing = [p for p in spec.get("required", []) if arguments.get(p) in (None, "")]
+    missing = [p for p in spec.get("required", []) if _is_blank(arguments.get(p))]
     if missing:
         return _error(f"Missing required params: {', '.join(missing)}")
+    token = bearer_token.strip() if isinstance(bearer_token, str) else ""
+    if not token:
+        return _error("LinkedIn access token is missing. Connect LinkedIn first.")
 
     try:
-        text = await handler(bearer_token, arguments)
+        text = await handler(token, arguments)
         return {"content": [{"type": "text", "text": text}], "isError": False}
     except Exception as e:
         logger.exception("LinkedIn MCP tool %s failed", name)
@@ -67,6 +94,10 @@ async def call_tool(
 
 
 from packages.core.ai.mcp._http import mcp_err as _error  # noqa: E402, F401
+
+
+def _is_blank(value: Any) -> bool:
+    return value is None or (isinstance(value, str) and not value.strip())
 
 
 # ── LinkedIn API client ───────────────────────────────────────────────────────
@@ -155,6 +186,11 @@ def _parse_nango_ref(token: str) -> Optional[Dict[str, str]]:
     return {
         "provider_config_key": provider_config_key,
         "connection_id": connection_id,
+        **(
+            {"nango_secret": str(data["nango_secret"]).strip()}
+            if str(data.get("nango_secret") or "").strip()
+            else {}
+        ),
     }
 
 
@@ -168,7 +204,11 @@ async def _request_via_nango(
     use_rest: bool,
 ) -> httpx.Response:
     """Call LinkedIn through Nango proxy so Manor never handles user tokens."""
-    secret = (os.environ.get("NANGO_SECRET_KEY") or "").strip()
+    secret = (
+        nango_ref.get("nango_secret")
+        or os.environ.get("NANGO_SECRET_KEY")
+        or ""
+    ).strip()
     if not secret:
         raise RuntimeError("NANGO_SECRET_KEY is not configured for LinkedIn proxy calls")
 
@@ -277,18 +317,135 @@ def _format_err(msg: str) -> str:
 
 
 async def _read_bytes(src: str) -> bytes:
-    """Fetch bytes from an HTTPS URL or read from a local path.
-    Local paths are typically /mnt/manor/... but any abs path works."""
+    """Read a bounded media source from the actor's entity or the public web."""
     src = (src or "").strip()
-    if src.startswith("http://") or src.startswith("https://"):
-        async with httpx.AsyncClient(timeout=120.0) as client:
-            r = await client.get(src)
-            r.raise_for_status()
-            return r.content
-    p = Path(src)
-    if not (p.exists() and p.is_file()):
-        raise RuntimeError(f"Local file not found or not a file: {src}")
-    return p.read_bytes()
+    if not src:
+        raise RuntimeError("Media source is required")
+    if urlsplit(src).scheme:
+        _validate_remote_url(src)
+        async with httpx.AsyncClient(
+            timeout=120.0,
+            follow_redirects=False,
+        ) as client:
+            async with client.stream("GET", src) as response:
+                if 300 <= response.status_code < 400:
+                    raise RuntimeError("Media URL redirects are not allowed")
+                response.raise_for_status()
+                length = response.headers.get("content-length")
+                if length:
+                    try:
+                        declared_length = int(length)
+                    except ValueError:
+                        raise RuntimeError("Media source has an invalid size") from None
+                    if declared_length < 0 or declared_length > _MAX_UPLOAD_BYTES:
+                        raise RuntimeError("Media source exceeds the 50 MiB upload limit")
+                chunks: list[bytes] = []
+                total = 0
+                async for chunk in response.aiter_bytes():
+                    total += len(chunk)
+                    if total > _MAX_UPLOAD_BYTES:
+                        raise RuntimeError("Media source exceeds the 50 MiB upload limit")
+                    chunks.append(chunk)
+                return b"".join(chunks)
+
+    context = _call_context()
+    entity_id = str(context.get("entity_id") or "").strip()
+    if not entity_id:
+        raise RuntimeError("Local media requires an Entity filesystem context")
+    from packages.core.ai.runtime.file_actions import (
+        runtime_entity_filesystem_read_lock,
+        runtime_guard_file_read_access,
+        runtime_open_entity_file_snapshot,
+    )
+    from packages.core.services.entity_fs import EntityFilesystemError, get_entity_root
+
+    entity_root = get_entity_root(entity_id)
+    try:
+        async with runtime_entity_filesystem_read_lock(entity_root):
+            resolved_path, relative_path = _resolve_local_source(src)
+            if context.get("workspace_id"):
+                blocked = await runtime_guard_file_read_access(
+                    entity_id=entity_id,
+                    user_id=str(context.get("user_id") or "") or None,
+                    workspace_id=str(context["workspace_id"]),
+                    runtime_envelope=context.get("runtime_envelope"),
+                    tool_name="mcp__linkedin__upload_media",
+                    paths=[relative_path],
+                )
+                if blocked:
+                    raise RuntimeError("Local media access denied for this Workspace")
+
+            with runtime_open_entity_file_snapshot(
+                entity_id,
+                relative_path,
+                expected_resolved_path=str(resolved_path),
+            ) as snapshot:
+                with open(snapshot.descriptor_path, "rb") as handle:
+                    data = handle.read(_MAX_UPLOAD_BYTES + 1)
+    except (EntityFilesystemError, OSError):
+        raise RuntimeError(f"Local file not found or not a file: {src}") from None
+    if len(data) > _MAX_UPLOAD_BYTES:
+        raise RuntimeError("Media source exceeds the 50 MiB upload limit")
+    return data
+
+
+def _validate_remote_url(src: str) -> None:
+    parsed = urlsplit(src)
+    if parsed.scheme.lower() != "https":
+        raise RuntimeError("Media URL must use HTTPS")
+    if parsed.username or parsed.password or not parsed.hostname:
+        raise RuntimeError("Media URL must identify a public HTTPS host")
+    try:
+        port = parsed.port
+    except ValueError:
+        raise RuntimeError("Media URL must identify a public HTTPS host") from None
+    if port not in (None, 443):
+        raise RuntimeError("Media URL must identify a public HTTPS host")
+    host = parsed.hostname.rstrip(".").lower()
+    if host in {"localhost", "localhost.localdomain"} or host.endswith(".local"):
+        raise RuntimeError("Media URL must resolve to a public host")
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        try:
+            addresses = {
+                info[4][0]
+                for info in socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM)
+            }
+        except OSError:
+            raise RuntimeError("Media URL host could not be resolved safely") from None
+    else:
+        addresses = {str(address)}
+    for value in addresses:
+        resolved = ipaddress.ip_address(value)
+        if not resolved.is_global:
+            raise RuntimeError("Media URL must resolve to a public host")
+
+
+def _resolve_local_source(src: str) -> tuple[Path, str]:
+    context = _call_context()
+    entity_id = str(context.get("entity_id") or "").strip()
+    if not entity_id:
+        raise RuntimeError("Local media requires an Entity filesystem context")
+    from packages.core.services.entity_fs import get_entity_root
+    from packages.core.services.knowledge_visibility import is_user_visible_path
+
+    root = Path(get_entity_root(entity_id)).resolve()
+    candidate = Path(src)
+    if not candidate.is_absolute():
+        candidate = root / candidate
+    try:
+        resolved = candidate.resolve(strict=True)
+        relative = resolved.relative_to(root).as_posix()
+    except (FileNotFoundError, OSError, ValueError):
+        raise RuntimeError(
+            "Local media must be a user-visible file inside the Entity filesystem"
+        ) from None
+    if not resolved.is_file() or not relative or not is_user_visible_path(relative):
+        raise RuntimeError(
+            "Local media must be a user-visible file inside the Entity filesystem"
+        )
+    return resolved, relative
 
 
 async def _put_binary(url: str, content: bytes, *, content_type: Optional[str] = None) -> Tuple[int, str, Dict[str, str]]:
@@ -595,12 +752,12 @@ _TOOLS: Dict[str, Dict[str, Any]] = {
         "description": (
             "Upload an image to LinkedIn and return its URN. Pass that "
             "URN to create_post via image_urn (or image_urns for "
-            "multi-image). Source can be an HTTPS URL or a local path "
-            "(typically /mnt/manor/...)."
+            "multi-image). Source must be a public HTTPS URL or a "
+            "user-visible path in the Entity filesystem."
         ),
         "properties": {
             "owner_urn": _prop("urn:li:person:{id} or urn:li:organization:{id}"),
-            "src": _prop("HTTPS URL or local file path"),
+            "src": _prop("Public HTTPS URL or user-visible path in the Entity filesystem"),
         },
         "required": ["owner_urn", "src"],
     },
@@ -608,12 +765,12 @@ _TOOLS: Dict[str, Dict[str, Any]] = {
         "description": (
             "Upload a video to LinkedIn (handles single-part and "
             "multipart automatically) and return its URN. Pass to "
-            "create_post via video_urn. Source can be HTTPS URL or "
-            "local path."
+            "create_post via video_urn. Source must be a public HTTPS URL "
+            "or a user-visible path in the Entity filesystem."
         ),
         "properties": {
             "owner_urn": _prop("urn:li:person:{id} or urn:li:organization:{id}"),
-            "src": _prop("HTTPS URL or local file path (e.g. /mnt/manor/.../clip.mp4)"),
+            "src": _prop("Public HTTPS URL or user-visible path in the Entity filesystem"),
         },
         "required": ["owner_urn", "src"],
     },
@@ -625,7 +782,7 @@ _TOOLS: Dict[str, Dict[str, Any]] = {
         ),
         "properties": {
             "owner_urn": _prop("urn:li:person:{id} or urn:li:organization:{id}"),
-            "src": _prop("HTTPS URL or local file path"),
+            "src": _prop("Public HTTPS URL or user-visible path in the Entity filesystem"),
         },
         "required": ["owner_urn", "src"],
     },

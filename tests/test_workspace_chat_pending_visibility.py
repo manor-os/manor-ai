@@ -100,6 +100,49 @@ async def test_old_plan_thread_card_survives_main_chat_pagination(
 
 
 @pytest.mark.asyncio
+async def test_plan_thread_card_is_visible_before_main_conversation_exists(
+    client: AsyncClient, db_session,
+):
+    """A fresh Workspace can block in a background Plan before its first chat.
+
+    The main view is a projection, not a requirement that a ``workspace_main``
+    row already exists, so the unresolved thread card must still render.
+    """
+    headers = await _register(client, "ws_pending_no_main")
+    me = (await client.get("/api/v1/auth/me", headers=headers)).json()
+    workspace_id = await _workspace(client, headers)
+
+    thread_id = generate_ulid()
+    card_id = generate_ulid()
+    db_session.add(Conversation(
+        id=thread_id, entity_id=me["entity_id"], workspace_id=workspace_id,
+        title="plan 00PLAN", channel="workspace", scope="workspace_thread",
+        thread_ref_kind="plan", thread_ref_id="00PLAN",
+    ))
+    db_session.add(Message(
+        id=card_id, conversation_id=thread_id, role="assistant",
+        content="Approval needed", author_kind="system",
+        message_kind="hitl_request",
+        pending_action={
+            "kind": "governance_approval",
+            "step_id": "00STEP",
+            "plan_id": "00PLAN",
+        },
+    ))
+    await db_session.commit()
+
+    resp = await client.get(
+        f"/api/v1/workspaces/{workspace_id}/chat/messages/page",
+        headers=headers,
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert [row["id"] for row in body["items"]] == [card_id]
+    assert body["open_action_count"] == 1
+    assert body["open_actions_complete"] is True
+
+
+@pytest.mark.asyncio
 async def test_resolved_cards_are_not_pinned(client: AsyncClient, db_session):
     """Only OPEN work is force-surfaced; answered cards stay in their thread."""
     headers = await _register(client, "ws_pending_resolved")

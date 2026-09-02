@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from typing import AsyncIterator, Optional, Tuple
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -12,9 +13,63 @@ from packages.core.ai.runtime import (
     runtime_execute_skill_review_completion,
 )
 from packages.core.models.skill import Skill
+from packages.core.models.permission import Visibility
 from packages.core.services.skill_bundle import assemble_skill_bundle, extract_json_object
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class GeneratedSkillDraft:
+    """Provider-produced Skill definition before any persistence."""
+
+    spec: dict
+    review_rounds: int
+
+
+@dataclass(frozen=True)
+class GeneratedSkillVersion:
+    """Portable version identity for one copy-on-write generated Skill."""
+
+    version: str
+    config: dict
+
+
+class GeneratedSkillVersionFactory:
+    """Own version/family semantics for generated Skill replacements."""
+
+    @staticmethod
+    def _next_patch(previous_version: str | None) -> str:
+        if not previous_version:
+            return "1.0.0"
+        parts = str(previous_version).strip().split(".")
+        if not parts or any(not part.isdigit() for part in parts):
+            return "1.0.0"
+        while len(parts) < 3:
+            parts.append("0")
+        parts = parts[:3]
+        parts[2] = str(int(parts[2]) + 1)
+        return ".".join(parts)
+
+    @classmethod
+    def for_scheduled_job(
+        cls,
+        *,
+        job_key: str,
+        previous_version: str | None,
+    ) -> GeneratedSkillVersion:
+        version = cls._next_patch(previous_version)
+        return GeneratedSkillVersion(
+            version=version,
+            config={
+                "version_family": f"scheduled-job:{job_key}",
+                "generated_version": version,
+                **(
+                    {"previous_version": str(previous_version)}
+                    if previous_version else {}
+                ),
+            },
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -44,26 +99,13 @@ def _bump_version(version: str) -> str:
 # Public API
 # ---------------------------------------------------------------------------
 
-async def generate_skill_streaming(
+async def _draft_skill_spec(
     prompt: str,
-    entity_id: str,
-    db: AsyncSession,
     *,
-    category: Optional[str] = None,
-    tags: Optional[list[str]] = None,
-    config_overrides: Optional[dict] = None,
-) -> AsyncIterator[Tuple[str, object]]:
-    """Generate a skill, yielding progress as it goes.
-
-    Yields ``("step", label)`` tuples narrating what the AI is doing, then a
-    final ``("skill", skill)`` tuple with the created :class:`Skill`. Surfacing
-    progress keeps the HTTP connection alive (avoiding Cloudflare's 100s 524
-    timeout) and lets the UI show the build steps like the chat tool trace.
-    """
-    from packages.core.services.skill_service import create_skill
-
-    # ── Step 1: Draft initial skill spec ──
-    yield ("step", "Drafting the skill")
+    entity_id: str,
+    category: Optional[str],
+    tags: Optional[list[str]],
+) -> dict:
     completion = await runtime_execute_skill_generation_completion(
         prompt,
         entity_id=entity_id,
@@ -73,14 +115,16 @@ async def generate_skill_streaming(
     raw = completion.content
     if not raw or not raw.strip():
         raise ValueError("LLM returned empty response for skill generation")
+    return _extract_json(raw)
 
-    spec = _extract_json(raw)
 
-    # ── Step 2: Review pass ──
-    # One refine round keeps creation responsive — the detailed generation
-    # prompt already produces a strong draft, and extra rounds (each a full
-    # ~8k-token completion) made "Building…" feel stuck.
-    yield ("step", "Reviewing and refining")
+async def _review_skill_spec(
+    spec: dict,
+    *,
+    entity_id: str,
+) -> GeneratedSkillDraft:
+    """Review one draft without requiring or retaining a database session."""
+
     attempt = 0
     for attempt in range(1):
         review = await runtime_execute_skill_review_completion(
@@ -119,16 +163,54 @@ async def generate_skill_streaming(
             # Couldn't parse refined spec — keep current and move on
             logger.debug("Could not parse refined spec on attempt %d, keeping current", attempt + 1)
             break
+    return GeneratedSkillDraft(
+        spec=spec,
+        review_rounds=min(attempt + 1, 3),
+    )
 
-    # ── Step 5: Package + save the final skill ──
-    # When the spec produced standalone scripts/references, this turns it into a
-    # sandbox bundle (SKILL.md + files) that runs through the same executor as
-    # builtin skills; otherwise it stays a prompt skill.
-    yield ("step", "Packaging and saving")
+
+async def generate_skill_draft(
+    prompt: str,
+    entity_id: str,
+    *,
+    category: Optional[str] = None,
+    tags: Optional[list[str]] = None,
+) -> GeneratedSkillDraft:
+    """Run all billable generation passes without a database connection."""
+
+    spec = await _draft_skill_spec(
+        prompt,
+        entity_id=entity_id,
+        category=category,
+        tags=tags,
+    )
+    return await _review_skill_spec(spec, entity_id=entity_id)
+
+
+async def persist_generated_skill_draft(
+    draft: GeneratedSkillDraft,
+    *,
+    prompt: str,
+    entity_id: str,
+    db: AsyncSession,
+    category: Optional[str] = None,
+    tags: Optional[list[str]] = None,
+    config_overrides: Optional[dict] = None,
+    owner_user_id: str | None = None,
+    workspace_id: str | None = None,
+    visibility: str = Visibility.ENTITY,
+    version: str = "1.0.0",
+) -> Skill:
+    """Package and persist a provider-produced Skill draft."""
+
+    from packages.core.services.skill_service import create_skill
+
+    spec = draft.spec
+
     base_config = {
         "source": "llm-generated",
         "complexity": spec.get("complexity", "primary"),
-        "review_rounds": min(attempt + 1, 3),
+        "review_rounds": draft.review_rounds,
     }
     if config_overrides:
         base_config.update(dict(config_overrides))
@@ -148,9 +230,60 @@ async def generate_skill_streaming(
         category=spec.get("category") or category,
         tags=spec.get("tags") or tags or [],
         config=config,
+        owner_user_id=owner_user_id,
+        workspace_id=workspace_id,
+        visibility=visibility,
+        version=version,
     )
 
     logger.info("Generated skill %s (%s) for entity %s", skill.id, skill.name, entity_id)
+    return skill
+
+
+async def generate_skill_streaming(
+    prompt: str,
+    entity_id: str,
+    db: AsyncSession,
+    *,
+    category: Optional[str] = None,
+    tags: Optional[list[str]] = None,
+    config_overrides: Optional[dict] = None,
+    owner_user_id: str | None = None,
+    workspace_id: str | None = None,
+    visibility: str = Visibility.ENTITY,
+) -> AsyncIterator[Tuple[str, object]]:
+    """Generate a skill, yielding progress as it goes.
+
+    Yields ``("step", label)`` tuples narrating what the AI is doing, then a
+    final ``("skill", skill)`` tuple with the created :class:`Skill`. Surfacing
+    progress keeps the HTTP connection alive (avoiding Cloudflare's 100s 524
+    timeout) and lets the UI show the build steps like the chat tool trace.
+    """
+
+    yield ("step", "Drafting the skill")
+    spec = await _draft_skill_spec(
+        prompt,
+        entity_id=entity_id,
+        category=category,
+        tags=tags,
+    )
+    yield ("step", "Reviewing and refining")
+    draft = await _review_skill_spec(spec, entity_id=entity_id)
+    # Standalone scripts/references become a sandbox bundle; prompt-only
+    # definitions keep the ordinary Skill representation.
+    yield ("step", "Packaging and saving")
+    skill = await persist_generated_skill_draft(
+        draft,
+        prompt=prompt,
+        entity_id=entity_id,
+        db=db,
+        category=category,
+        tags=tags,
+        config_overrides=config_overrides,
+        owner_user_id=owner_user_id,
+        workspace_id=workspace_id,
+        visibility=visibility,
+    )
     yield ("skill", skill)
 
 
@@ -162,6 +295,9 @@ async def generate_skill(
     category: Optional[str] = None,
     tags: Optional[list[str]] = None,
     config_overrides: Optional[dict] = None,
+    owner_user_id: str | None = None,
+    workspace_id: str | None = None,
+    visibility: str = Visibility.ENTITY,
 ) -> Skill:
     """Generate a skill using the draft → review → package flow.
 
@@ -176,6 +312,9 @@ async def generate_skill(
         category=category,
         tags=tags,
         config_overrides=config_overrides,
+        owner_user_id=owner_user_id,
+        workspace_id=workspace_id,
+        visibility=visibility,
     ):
         if kind == "skill":
             skill = payload  # type: ignore[assignment]
@@ -207,6 +346,30 @@ async def update_skill(
     if existing.entity_id != entity_id:
         raise PermissionError(f"Skill {skill_id} does not belong to entity {entity_id}")
 
+    patch = await build_skill_update_patch(
+        existing,
+        change_description,
+        entity_id,
+    )
+
+    updated = await skill_service.update_skill(
+        db, skill_id, entity_id, **patch,
+    )
+
+    if not updated:
+        raise ValueError(f"Failed to update skill {skill_id}")
+
+    logger.info("Patched skill %s to v%s for entity %s", skill_id, patch["version"], entity_id)
+    return updated
+
+
+async def build_skill_update_patch(
+    existing: Skill,
+    change_description: str,
+    entity_id: str,
+) -> dict:
+    """Produce an LLM Skill patch without performing a database write."""
+
     completion = await runtime_execute_skill_patch_completion(
         existing,
         change_description,
@@ -222,13 +385,4 @@ async def update_skill(
     # Bump version
     new_version = _bump_version(existing.version or "1.0.0")
     patch["version"] = new_version
-
-    updated = await skill_service.update_skill(
-        db, skill_id, entity_id, **patch,
-    )
-
-    if not updated:
-        raise ValueError(f"Failed to update skill {skill_id}")
-
-    logger.info("Patched skill %s to v%s for entity %s", skill_id, new_version, entity_id)
-    return updated
+    return patch

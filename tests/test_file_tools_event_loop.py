@@ -57,20 +57,36 @@ def fs_root(tmp_path):
 
 
 @pytest.fixture
-def slow_walk(monkeypatch):
-    """Make the filesystem walk itself slow, with a BLOCKING sleep.
+def slow_scan(monkeypatch):
+    """Make each blocking scan entry point slow with a BLOCKING sleep.
 
     time.sleep is the point: it is what a real 1.9 GB read/decode does to the
     thread it runs on. If the scan runs on the event loop, nothing else in the
     process makes progress for its duration.
     """
-    real_walk = os.walk
+    real_grep_scan = file_tools._scan_grep_files
+    real_scan_batch = file_tools._next_scan_batch
 
-    def walking_molasses(*args, **kwargs):
+    def slow_grep_scan(*args, **kwargs):
         time.sleep(SCAN_HOLD_SECONDS)
-        yield from real_walk(*args, **kwargs)
+        return real_grep_scan(*args, **kwargs)
 
-    monkeypatch.setattr(file_tools.os, "walk", walking_molasses)
+    def slow_scan_batch(*args, **kwargs):
+        time.sleep(SCAN_HOLD_SECONDS)
+        return real_scan_batch(*args, **kwargs)
+
+    monkeypatch.setattr(file_tools, "_scan_grep_files", slow_grep_scan)
+    monkeypatch.setattr(file_tools, "_next_scan_batch", slow_scan_batch)
+
+
+@pytest.fixture(autouse=True)
+def allow_test_files(monkeypatch):
+    """Keep these scan-scheduling tests independent from Knowledge ACLs."""
+
+    async def allow_all(*_args, **_kwargs):
+        return set()
+
+    monkeypatch.setattr(file_tools, "_blocked_doc_paths", allow_all)
 
 
 async def _count_ticks_during(coro):
@@ -84,7 +100,7 @@ async def _count_ticks_during(coro):
 
 
 @pytest.mark.asyncio
-async def test_grep_does_not_freeze_the_event_loop(fs_root, slow_walk):
+async def test_grep_does_not_freeze_the_event_loop(fs_root, slow_scan):
     """The exact incident: a long content scan must not stop the SSE keepalive."""
     raw, ticks = await _count_ticks_during(
         _grep_files(ENTITY, pattern="ssh-ed25519", max_matches=10)
@@ -99,7 +115,7 @@ async def test_grep_does_not_freeze_the_event_loop(fs_root, slow_walk):
 
 
 @pytest.mark.asyncio
-async def test_glob_does_not_freeze_the_event_loop(fs_root, slow_walk):
+async def test_glob_does_not_freeze_the_event_loop(fs_root, slow_scan):
     raw, ticks = await _count_ticks_during(_glob_files(ENTITY, pattern="**/*.md"))
     body = json.loads(raw)
     assert body.get("count") == 1, body
@@ -107,7 +123,7 @@ async def test_glob_does_not_freeze_the_event_loop(fs_root, slow_walk):
 
 
 @pytest.mark.asyncio
-async def test_recursive_list_does_not_freeze_the_event_loop(fs_root, slow_walk):
+async def test_recursive_list_does_not_freeze_the_event_loop(fs_root, slow_scan):
     raw, ticks = await _count_ticks_during(_list_files(ENTITY, recursive=True))
     body = json.loads(raw)
     assert body.get("count") == 2, body
@@ -121,7 +137,8 @@ async def test_scan_errors_still_surface_as_tool_errors(fs_root, monkeypatch):
     def explode(*args, **kwargs):
         raise RuntimeError("disk went away")
 
-    monkeypatch.setattr(file_tools.os, "walk", explode)
+    monkeypatch.setattr(file_tools, "_scan_grep_files", explode)
+    monkeypatch.setattr(file_tools, "_next_scan_batch", explode)
 
     for raw in (
         await _grep_files(ENTITY, pattern="x"),

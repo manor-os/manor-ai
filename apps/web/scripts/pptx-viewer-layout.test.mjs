@@ -37,6 +37,23 @@ test("PPTX viewer keeps rendered fidelity while exposing native video playback",
   assert.match(styles, /\.pptx-native-video\s*\{[\s\S]*?position:\s*absolute/);
 });
 
+test("PPTX CSS fallback thumbnails preserve slide geometry and bound their DOM", () => {
+  assert.match(fileViewerSource, /function PptxCssSlidePreview\(/);
+  assert.match(fileViewerSource, /function pptxThumbnailFitStyle\(/);
+  assert.match(fileViewerSource, /presentationPointsToCqh/);
+  assert.match(pptxViewerSource, /<PptxCssSlidePreview slide=\{slide\} slideIndex=\{activeSlide\} \/>/);
+  assert.match(
+    pptxViewerSource,
+    /visibleCssThumbnailIndexes\.has\(slideIndex\) \|\| slideIndex === activeSlide/,
+  );
+  assert.match(pptxViewerSource, /new IntersectionObserver\(/);
+  assert.match(pptxViewerSource, /rootMargin: "0px 384px"/);
+  assert.doesNotMatch(pptxViewerSource, /const thumbBg:/);
+  assert.match(styles, /\.pptx-document-thumbnail-preview\s*\{[\s\S]*?container-type:\s*size/);
+  assert.match(styles, /\.pptx-document-thumbnail-preview\s*\{[\s\S]*?transform:\s*translate\(-50%, -50%\)/);
+  assert.match(styles, /\.pptx-document-thumbnail-preview\s*\{[\s\S]*?pointer-events:\s*none/);
+});
+
 test("mobile app shell reserves the remaining height for viewer content", () => {
   assert.match(styles, /@media \(max-width:\s*768px\)\s*\{[\s\S]*?\.app-main-shell\s*\{[\s\S]*?display:\s*flex/);
   assert.match(styles, /@media \(max-width:\s*768px\)\s*\{[\s\S]*?\.app-content-panel\s*\{[\s\S]*?flex:\s*1 1 0/);

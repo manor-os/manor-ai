@@ -14,14 +14,14 @@ from typing import Any
 
 import httpx
 
+from packages.core.services.runtime_paths import atomic_write_text, private_runtime_dir
+
 logger = logging.getLogger(__name__)
 
 OPENROUTER_MODELS_URL = "https://openrouter.ai/api/v1/models"
-DEFAULT_CACHE_PATH = "/tmp/manor_openrouter_pricing_cache.json"
-
-
 def pricing_cache_path() -> str:
-    return (os.getenv("OPENROUTER_PRICING_CACHE_PATH") or DEFAULT_CACHE_PATH).strip()
+    configured = (os.getenv("OPENROUTER_PRICING_CACHE_PATH") or "").strip()
+    return configured or str(private_runtime_dir("cache") / "openrouter-pricing.json")
 
 
 def _to_float(v: Any) -> float | None:
@@ -77,8 +77,6 @@ async def sync_openrouter_pricing_cache(*, timeout_s: float = 30.0) -> dict[str,
         "models": models,
     }
     p = Path(pricing_cache_path())
-    p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(json.dumps(payload, ensure_ascii=False))
+    atomic_write_text(p, json.dumps(payload, ensure_ascii=False))
     logger.info("openrouter pricing sync: wrote %d models to %s", len(models), str(p))
     return {"count": len(models), "path": str(p)}
-

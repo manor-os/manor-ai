@@ -20,6 +20,7 @@ Operational notes:
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import logging
 from typing import Optional
@@ -59,6 +60,7 @@ class VaultKeyProvider:
         transit_key: str = "manor-keys",
         audit_sink: Optional[AuditSink] = None,
         mount_point: str = "transit",
+        allow_bootstrap: bool = True,
     ):
         if not addr:
             raise ValueError("VaultKeyProvider requires VAULT_ADDR")
@@ -90,6 +92,7 @@ class VaultKeyProvider:
         self._key = transit_key
         self._mount = mount_point
         self._audit = audit_sink or NullAuditSink()
+        self._allow_bootstrap = allow_bootstrap
         self._key_ensured = False
 
     # ── Setup ──
@@ -107,7 +110,10 @@ class VaultKeyProvider:
             self._key_ensured = True
             return
         except self._hvac_exceptions["InvalidPath"]:
-            pass
+            if not self._allow_bootstrap:
+                raise CredentialError(
+                    "vault transit key is unavailable and bootstrap is disabled"
+                ) from None
         except self._hvac_exceptions["VaultError"] as exc:
             raise CredentialError(f"vault transit key check failed: {exc}") from exc
 
@@ -144,6 +150,51 @@ class VaultKeyProvider:
         self._key_ensured = True
 
     # ── KeyProvider API ──
+
+    def cluster_id(self) -> str:
+        """Return a stable Vault identity without exposing secrets.
+
+        Vault's file storage does not always expose ``cluster_id`` through
+        ``/sys/health``. The Transit key's first-version creation time is
+        immutable for that Vault/key pair and readable by the runtime token,
+        so it is a suitable non-secret fallback for migration safety checks.
+        """
+        try:
+            status = self._client.sys.read_health_status(method="GET")
+            if hasattr(status, "json"):
+                status = status.json()
+            if isinstance(status, dict):
+                cluster_id = status.get("cluster_id")
+                if isinstance(cluster_id, str) and cluster_id.strip():
+                    return cluster_id.strip()
+        except Exception:  # noqa: BLE001
+            pass
+
+        try:
+            response = self._client.secrets.transit.read_key(
+                name=self._key,
+                mount_point=self._mount,
+            )
+            data = response.get("data") if isinstance(response, dict) else None
+            keys = data.get("keys") if isinstance(data, dict) else None
+            first_version = keys.get("1") if isinstance(keys, dict) else None
+            creation_time = first_version.get("creation_time") if isinstance(first_version, dict) else None
+            if not isinstance(creation_time, str) or not creation_time.strip():
+                raise CredentialError("vault cluster identity is unavailable")
+            identity = json.dumps(
+                {
+                    "creation_time": creation_time,
+                    "mount_point": self._mount,
+                    "name": self._key,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            return f"transit-key:{hashlib.sha256(identity.encode('utf-8')).hexdigest()}"
+        except CredentialError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            raise CredentialError("vault cluster identity is unavailable") from exc
 
     def encrypt(self, plaintext: bytes, context: dict[str, str]) -> str:
         self._ensure_transit_key()

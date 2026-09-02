@@ -22,8 +22,8 @@ test("floating chat resets explicit chat mode after a successful turn", () => {
     "FloatingChat should define a per-turn chat-mode reset helper",
   );
   assert.ok(
-    /await startStream\([\s\S]*?\);\s*if \(requestChatMode\) resetChatModeAfterTurn\(\);/.test(floatingSource),
-    "FloatingChat should reset non-auto chat mode after the stream finishes",
+    /await startStream\([\s\S]*?\);\s*if \(!sendSucceeded\) \{[\s\S]*?return isResponseSurfaceSubmission \? responseSurfaceResult : false;\s*\}\s*clearPendingChatRetry\(\);\s*if \(!isResponseSurfaceSubmission && requestChatMode\) resetChatModeAfterTurn\(\);/.test(floatingSource),
+    "FloatingChat should reset non-auto chat mode after an ordinary stream, without changing the composer for a response-surface submission",
   );
 });
 
@@ -33,8 +33,8 @@ test("embedded chat resets explicit chat mode after a successful turn", () => {
     "EmbeddedChat should define a per-turn chat-mode reset helper",
   );
   assert.ok(
-    /await startStream\([\s\S]*?\);\s*if \(requestChatMode\) resetChatModeAfterTurn\(\);/.test(embeddedSource),
-    "EmbeddedChat should reset non-auto chat mode after the stream finishes",
+    /const turnChatMode = options\.responseSurfaceSubmission\s*\? undefined[\s\S]*?if \(turnChatMode\) resetChatModeAfterTurn\(\);/.test(embeddedSource),
+    "EmbeddedChat should reset the mode used by an ordinary turn, without changing the composer for a response-surface submission",
   );
 });
 

@@ -75,6 +75,23 @@ def runtime_task_billable_user_id(task_or_row: Any | None) -> str | None:
     return None
 
 
+async def runtime_resolve_task_billable_user_id(
+    db: Any,
+    task_or_row: Any | None,
+) -> str | None:
+    """Resolve a Task's billable User, including trusted legacy recovery."""
+
+    task_id = _normalized_billable_user_id(_row_value(task_or_row, "id"))
+    if not db or not task_id:
+        return runtime_task_billable_user_id(task_or_row)
+
+    from packages.core.services.task_requester_identity import (
+        resolve_task_execution_user_id,
+    )
+
+    return await resolve_task_execution_user_id(db, task_or_row)
+
+
 def runtime_ensure_billing_context(
     entity_id: str,
     source: str = RUNTIME_SYSTEM_SOURCE,
@@ -344,9 +361,18 @@ async def runtime_ensure_task_billing_context(
             Task.creator_id,
             Task.owner_id,
             Task.assignee_id,
+            Task.id,
+            Task.details,
         ).where(Task.id == task_id)
     )
-    scope = _billing_scope_from_row(result.first())
+    row = result.first()
+    scope = _billing_scope_from_row(row)
+    resolved_user_id = await runtime_resolve_task_billable_user_id(db, row)
+    scope = RuntimeResolvedBillingScope(
+        entity_id=scope.entity_id,
+        workspace_id=scope.workspace_id,
+        user_id=resolved_user_id,
+    )
     scope = await _resolve_scope_byok(db, scope, model_role=model_role)
     _bind_resolved_billing_scope(scope, source=source)
     return scope

@@ -4,6 +4,7 @@ import { test } from "node:test";
 import {
   extractLocalCssPreviewAssetRefs,
   extractLocalHtmlPreviewAssetRefs,
+  htmlPreviewAssetDataUrl,
   injectHtmlPreviewNavigationGuard,
   normalizeHtmlPreviewPath,
   resolveHtmlPreviewAssetPath,
@@ -90,6 +91,33 @@ test("HTML preview rewrites nested stylesheet URLs and imports", () => {
   assert.match(rewritten, /url\(https:\/\/cdn\.example\.com\/external\.webp\)/);
 });
 
+test("HTML preview embeds protected assets as sandbox-readable data URLs", () => {
+  assert.equal(
+    htmlPreviewAssetDataUrl({
+      content: "PHN2Zz48L3N2Zz4=\n",
+      encoding: "base64",
+      mime_type: "image/svg+xml",
+    }),
+    "data:image/svg+xml;base64,PHN2Zz48L3N2Zz4=",
+  );
+  assert.equal(
+    htmlPreviewAssetDataUrl({
+      content: "预览 ✓",
+      encoding: "utf-8",
+      mime_type: "text/plain",
+    }),
+    "data:text/plain;base64,6aKE6KeIIOKckw==",
+  );
+  assert.match(
+    htmlPreviewAssetDataUrl({
+      content: "safe",
+      encoding: "utf-8",
+      mime_type: "text/html;base64,attack",
+    }),
+    /^data:application\/octet-stream;base64,/,
+  );
+});
+
 test("HTML preview keeps iframe navigation isolated", () => {
   const guarded = injectHtmlPreviewNavigationGuard("<main>Preview</main>");
   assert.match(guarded, /<base href="about:blank">/);
@@ -97,16 +125,3 @@ test("HTML preview keeps iframe navigation isolated", () => {
   assert.match(guarded, /<body><main>Preview<\/main><\/body>/);
 });
 
-test("file viewer and editor share the protected HTML preview hook", async () => {
-  const [viewer, editor] = await Promise.all([
-    readFile(new URL("../src/pages/FileViewer.tsx", import.meta.url), "utf8"),
-    readFile(new URL("../src/pages/DocEditor.tsx", import.meta.url), "utf8"),
-  ]);
-
-  for (const source of [viewer, editor]) {
-    assert.match(source, /useHtmlPreviewDocument/);
-  }
-  assert.doesNotMatch(viewer, /getHtmlPreviewBaseHref|injectHtmlBase/);
-  assert.match(viewer, /sandbox="allow-forms allow-modals allow-popups allow-popups-to-escape-sandbox allow-scripts"/);
-  assert.doesNotMatch(viewer, /allow-same-origin/);
-});

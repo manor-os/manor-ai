@@ -1517,7 +1517,10 @@ def test_chrome_minimal_compaction_preserves_filtered_gmail_page_content():
     compacted = json.loads(compacted_text)
 
     assert len(compacted_text) <= 12000
-    assert compacted["_tool_result_truncated"]["strategy"] == "chrome_browser_minimal_context"
+    assert compacted["_tool_result_truncated"]["strategy"] in {
+        "chrome_browser_minimal_context",
+        "chrome_action_ultra_minimal_context",
+    }
     assert compacted["filter_summary"]["matched_refs"] == ["e60"]
     assert "Reply" in compacted["pageContent"]
     assert any(item.get("ref") == "e60" for item in compacted["semantic_refs"])
@@ -2045,6 +2048,52 @@ def test_chrome_read_page_compaction_keeps_active_dialog_refs_when_semantic_floo
 
     assert len(compacted_text) <= 12_000
     assert compacted["snapshot_id"] == "snap-youtube-upload"
-    assert compacted["_tool_result_truncated"]["strategy"] == "chrome_browser_minimal_context"
+    assert compacted["_tool_result_truncated"]["strategy"] in {
+        "chrome_browser_minimal_context",
+        "chrome_action_ultra_minimal_context",
+    }
     assert compacted["dialog_candidates"][0]["field_refs"][:2] == ["e201", "e202"]
+    assert compacted["input_candidates"][0]["ref"] == "e201"
     assert compacted["next_actions"][0]["tool"] == "fill_or_select"
+    assert compacted["next_actions"][0]["ref"] == "e201"
+
+
+def test_chrome_ultra_minimal_compaction_preserves_one_actionable_ref():
+    loop_module = importlib.import_module("packages.core.ai.agentic_loop")
+    payload = {
+        "ok": True,
+        "status": "read_page",
+        "snapshot_id": "snap-youtube-details",
+        "tabId": 42,
+        "url": "https://studio.youtube.com/videos/upload",
+        "state_hint": {"action": "read_page", "next": "use_page_candidates"},
+        "input_candidates": [
+            {
+                "ref": "e1",
+                "label": "Add a title that describes your video...",
+                "role": "textbox",
+            }
+        ],
+        "next_actions": [
+            {
+                "tool": "fill_or_select",
+                "ref": "e1",
+                "label": "Add a title that describes your video...",
+            }
+        ],
+    }
+
+    compacted = loop_module._build_ultra_minimal_chrome_action_result(
+        "mcp__chrome__read_page",
+        payload,
+        digest="digest",
+    )
+
+    assert compacted["snapshot_id"] == "snap-youtube-details"
+    assert compacted["next_actions"] == [
+        {
+            "tool": "fill_or_select",
+            "ref": "e1",
+            "label": "Add a title that describes your video...",
+        }
+    ]

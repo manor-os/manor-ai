@@ -142,9 +142,9 @@ export default function PageHeader({
   const controlsClass =
     "flex w-full min-w-0 flex-row flex-wrap items-center justify-start gap-2.5 2xl:mt-1 2xl:flex-1 2xl:flex-nowrap 2xl:justify-end";
   const groupClass =
-    "flex min-w-0 flex-none flex-wrap items-center gap-2.5 md:flex-nowrap md:justify-end";
+    "flex min-w-0 max-w-full flex-none flex-wrap items-center gap-2.5 md:flex-nowrap md:justify-end";
   const actionsClass =
-    "flex min-w-0 flex-wrap items-center gap-2.5 md:flex-none md:justify-end";
+    "flex min-w-0 max-w-full flex-wrap items-center gap-2.5 md:flex-none md:justify-end";
 
   const header = (
     <header

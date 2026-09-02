@@ -74,6 +74,32 @@ def test_every_architecture_node_has_an_independent_test_entry() -> None:
         assert phrase in text
 
 
+def test_twilio_voice_runtime_has_credit_lifecycle_and_portability_contracts() -> None:
+    architecture = _read(ARCHITECTURE)
+    checklist = _read(CHECKLIST)
+
+    for phrase in (
+        "TwilioVoiceCallSession",
+        "Browser/Twilio Realtime Voice usage",
+        "pending/connecting",
+        "not Blueprint-portable",
+    ):
+        assert phrase in architecture
+    assert "packages/core/services/voice/realtime.py" in architecture
+    assert "packages/core/services/voice/stt.py" not in architecture
+    assert "packages/core/services/voice/tts.py" not in architecture
+    assert "tests/test_twilio_realtime_voice.py" in checklist
+    assert "tests/test_twilio_voice_runtime.py" in checklist
+    assert "tests/test_user_lifecycle.py" in checklist
+    assert "tests/test_workspace_purge_owned_resources.py" in checklist
+
+    for portable_module in (
+        "packages/core/blueprints/payload.py",
+        "packages/core/blueprints/exporter.py",
+    ):
+        assert "TwilioVoiceCallSession" not in _read(ROOT / portable_module)
+
+
 def test_blueprint_skill_requires_workspace_architecture_first() -> None:
     text = _read(BLUEPRINT_SKILL)
     assert "manor-workspace-architecture" in text

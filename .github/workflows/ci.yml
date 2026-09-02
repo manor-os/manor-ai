@@ -1,10 +1,9 @@
 name: CI
 
 on:
-  # PRs run CI before merge. dev pushes already run Deploy, so do not run
-  # the full CI again for the merge commit.
-  push:
-    branches: [main]
+  # PRs run CI before merge. dev/main pushes already run the K8s release
+  # workflows, so do not
+  # run the full CI again for merge commits.
   pull_request:
     branches: [dev, main]
   workflow_dispatch:
@@ -74,7 +73,7 @@ jobs:
         run: python scripts/check_api_versions.py
 
   typecheck-frontend:
-    name: Frontend Build
+    name: Frontend checks
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -82,7 +81,7 @@ jobs:
       - name: Set up Node
         uses: actions/setup-node@v7
         with:
-          node-version: "20"
+          node-version: "22.13.0"
           cache: "npm"
           cache-dependency-path: apps/web/package-lock.json
 
@@ -96,26 +95,33 @@ jobs:
           BUILD_VERSION: ${{ github.sha }}
         run: npm run build
 
-  web-source-smoke:
-    name: Web source smoke
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-
-      - name: Set up Node
-        uses: actions/setup-node@v7
-        with:
-          node-version: "20"
-          cache: "npm"
-          cache-dependency-path: apps/web/package-lock.json
-
-      - name: Install deps
-        working-directory: apps/web
-        run: npm ci
-
       - name: Run source smoke tests
         working-directory: apps/web
         run: npm run test:source
+
+      - name: Run Response Surface browser policy smoke
+        working-directory: apps/web
+        env:
+          PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH: /usr/bin/google-chrome
+        run: npm run test:response-surface-browser
+
+      - name: Run Diagram preview browser smoke
+        working-directory: apps/web
+        env:
+          PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH: /usr/bin/google-chrome
+        run: npm run test:diagram-preview-browser
+
+      - name: Run Document table preservation browser smoke
+        working-directory: apps/web
+        env:
+          PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH: /usr/bin/google-chrome
+        run: npm run test:document-table-preservation-browser
+
+      - name: Run File comment focus browser smoke
+        working-directory: apps/web
+        env:
+          PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH: /usr/bin/google-chrome
+        run: npm run test:file-comment-focus-browser
 
 
   python-smoke:
@@ -161,12 +167,12 @@ jobs:
         env:
           TEST_DATABASE_URL: postgresql+asyncpg://manor:manor_secret@localhost:5432/manor_test
           MANOR_FS_ENABLED: "false"
-          PYTHONPATH: .
+          PYTHONPATH: .:tests
           REDIS_URL: redis://localhost:6379/0
         run: >
           python -m pytest tests/
           -m "oss_smoke"
-          -q --tb=short -p no:warnings
+          -x -q --tb=short -p no:warnings
 
   python-regression:
     name: Python regression suite
@@ -176,7 +182,6 @@ jobs:
     # - main/main-targeting PRs run the broader regression gate.
     # - manual runs can opt into this gate with test_level=regression.
     if: >-
-      github.event_name == 'push' && github.ref_name == 'main' ||
       github.event_name == 'pull_request' && github.base_ref == 'main' ||
       github.event_name == 'workflow_dispatch' && inputs.test_level == 'regression'
     services:
@@ -219,10 +224,10 @@ jobs:
         env:
           TEST_DATABASE_URL: postgresql+asyncpg://manor:manor_secret@localhost:5432/manor_test
           MANOR_FS_ENABLED: "false"
-          PYTHONPATH: .
+          PYTHONPATH: .:tests
           REDIS_URL: redis://localhost:6379/0
         run: >
           python -m pytest tests/
           -m "oss_smoke or oss_regression"
-          -q --tb=short -p no:warnings
+          -x -q --tb=short -p no:warnings
 

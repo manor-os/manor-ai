@@ -232,8 +232,13 @@ async def runtime_resolve_text_completion_route(
         routed_metadata = resolved_metadata
         if resolved_metadata and resolved_model:
             routed_metadata = {**resolved_metadata, "_resolved_model": resolved_model}
+            if tenant_metadata:
+                # Keep the concrete model attached even when a saved tenant
+                # credential is provider-incompatible. The downstream model
+                # gateway uses this marker to ignore that key and fall back to
+                # the compatible Manor-managed route.
+                resolved_metadata = routed_metadata
         if metadata_has_native_byok(routed_metadata):
-            resolved_metadata = routed_metadata
             byok = True
     except Exception:
         resolved_metadata = metadata
@@ -275,6 +280,7 @@ async def runtime_execute_text_completion(
     response_format: dict[str, Any] | None = None,
     max_tokens: int | None = None,
     model: str | None = None,
+    reasoning_effort: str | None = None,
     byok: bool | None = None,
     stream_handler: Any | None = None,
     metadata: dict[str, Any] | None = None,
@@ -308,15 +314,17 @@ async def runtime_execute_text_completion(
             source=source,
             **billing_kwargs,
         )
-    content, usage = await chat_completion(
-        list(messages),
-        temperature=temperature,
-        response_format=response_format,
-        max_tokens=max_tokens,
-        model=resolved_model,
-        stream_handler=stream_handler,
-        metadata=resolved_metadata,
-    )
+    completion_kwargs: dict[str, Any] = {
+        "temperature": temperature,
+        "response_format": response_format,
+        "max_tokens": max_tokens,
+        "model": resolved_model,
+        "stream_handler": stream_handler,
+        "metadata": resolved_metadata,
+    }
+    if reasoning_effort is not None:
+        completion_kwargs["reasoning_effort"] = reasoning_effort
+    content, usage = await chat_completion(list(messages), **completion_kwargs)
     return RuntimeTextCompletionResult(
         content=content or "",
         usage=dict(usage or {}),

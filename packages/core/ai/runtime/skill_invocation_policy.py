@@ -131,14 +131,14 @@ def retain_required_skill_invocation_policies(
 
 def render_skill_invocation_policy(
     *,
-    skill_slug: str,
+    skill_id: str,
     policy: SkillInvocationPolicy,
 ) -> str:
     """Render a validated policy without embedding product-specific logic."""
 
     trigger = policy.semantic_trigger.rstrip(". ")
     return (
-        f'- When {trigger}, you must call `invoke_skill(skill="{skill_slug}", '
+        f'- When {trigger}, you must call `invoke_skill(skill_id="{skill_id}", '
         "input=<current user request>)` before answering. Determine whether the "
         "policy applies from semantic meaning, not literal keyword matching. "
         "Treat the Skill result and its references as the primary source of "

@@ -1,0 +1,9 @@
+.chat-voice-input-actions, .chat-voice-playback { display: inline-flex; align-items: center; gap: 4px; }
+.chat-voice-input-actions { flex-shrink: 0; }
+.chat-voice-playback { position: relative; }
+.chat-message-actions:has(.chat-voice-playback .chat-message-action--active) { opacity: .72; pointer-events: auto; transform: none; }
+.chat-voice-status { padding: 6px 12px; font-size: 12px; color: var(--text-muted); overflow-wrap: anywhere; }
+.chat-voice-status--error { color: var(--danger, var(--text-default)); }
+.chat-voice-playback-error { position: absolute; bottom: 100%; right: 0; z-index: 10; width: min(260px, 65vw); padding: 8px 12px; background: var(--surface-panel); color: var(--text-default); border-radius: var(--radius-control); box-shadow: var(--shadow-md); font-size: 12px; overflow-wrap: anywhere; }
+.chat-voice-input-actions button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.chat-voice-input-actions button:disabled { opacity: .45; cursor: not-allowed; }

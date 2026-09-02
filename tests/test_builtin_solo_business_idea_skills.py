@@ -8,6 +8,7 @@ from packages.core.ai.runtime.skill_invocation_policy import (
     REQUIRED_BEFORE_ANSWER,
     SkillInvocationPolicy,
 )
+from packages.core.ai.runtime.skill_forcing import runtime_resolve_manual_skill_refs
 from packages.core.ai.runtime.skills import render_runtime_available_skills_section
 from packages.core.services.builtin_skill_loader import (
     _parse_frontmatter,
@@ -196,6 +197,7 @@ def test_semantic_policies_force_the_right_default_skill_before_answering():
         skills.append(
             SimpleNamespace(
                 entity_id=None,
+                id=slug,
                 slug=slug,
                 name=slug,
                 display_name=slug,
@@ -214,8 +216,8 @@ def test_semantic_policies_force_the_right_default_skill_before_answering():
 
     assert section is not None
     assert "### Required Skill Invocation Policies" in section
-    assert 'invoke_skill(skill="solo-business-idea-finder"' in section
-    assert 'invoke_skill(skill="solo-business-idea-review"' in section
+    assert 'invoke_skill(skill_id="solo-business-idea-finder"' in section
+    assert 'invoke_skill(skill_id="solo-business-idea-review"' in section
     assert "semantic meaning, not literal keyword matching" in section
 
 
@@ -236,3 +238,16 @@ async def test_default_idea_skills_seed_as_shared_platform_rows(db_session):
         assert skill.config["skill_dir"].endswith(f"/skills/{slug}")
         assert skill.config["invocation_policy"]["mode"] == REQUIRED_BEFORE_ANSWER
         assert skill.config["source_sha256"]
+
+    resolved, missing = await runtime_resolve_manual_skill_refs(
+        db_session,
+        entity_id="entity_idea_skill_slug_resolution",
+        agent_id=None,
+        manual_skill_refs=(
+            '[{"kind":"slug","value":"solo-business-idea-finder"}]'
+        ),
+    )
+
+    assert missing == []
+    assert [skill["slug"] for skill in resolved] == ["solo-business-idea-finder"]
+    assert [skill["id"] for skill in resolved] == [ideas["solo-business-idea-finder"].id]

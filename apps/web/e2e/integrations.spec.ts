@@ -1,10 +1,10 @@
-import { test, expect, request as pwRequest } from "@playwright/test";
+import { test, expect } from "@playwright/test";
 
 /**
  * Browser end-to-end test for the e-commerce / marketplace MCP integration
  * cards (PR #160). Drives a real browser against a real backend:
  *
- *   1. register a user via the real /api/v1/auth/register API → JWT
+ *   1. log in with the seeded local demo account via the real API → JWT
  *   2. inject the token (localStorage "manor_token") the way the app stores it
  *   3. load /integrations — the page fetches GET /api/v1/integrations/mcp-servers
  *      through the Vite dev proxy
@@ -16,20 +16,17 @@ const API = process.env.E2E_API ?? "http://localhost:8000";
 
 const PLATFORMS = ["Shopify", "WooCommerce", "Square", "TikTok Shop", "Amazon"];
 
-test("Integrations page renders the e-commerce MCP cards from the live API", async ({ page }) => {
-  // 1. register via the real backend
-  const api = await pwRequest.newContext({ baseURL: API });
-  const username = `e2e_${Date.now()}`;
-  const reg = await api.post("/api/v1/auth/register", {
+test("Integrations page renders the e-commerce MCP cards from the live API", async ({ page, request }) => {
+  // 1. authenticate against the real backend. Registration may require email
+  // verification, while the local stack contract guarantees this demo account.
+  const login = await request.post(`${API}/api/v1/auth/login`, {
     data: {
-      username,
-      email: `${username}@e2e.test`,
-      password: "securepass123",
-      entity_name: "E2E Co",
+      email: "demo@manor.local",
+      password: "manor-demo",
     },
   });
-  expect(reg.ok(), `register failed: ${reg.status()}`).toBeTruthy();
-  const { access_token } = await reg.json();
+  expect(login.ok(), `login failed: ${login.status()}`).toBeTruthy();
+  const { access_token } = await login.json();
   expect(access_token).toBeTruthy();
 
   // 2. authenticate the browser session the way the app does

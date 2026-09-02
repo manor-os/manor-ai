@@ -133,11 +133,22 @@ async def _handle_update(cc_id: str, update: Dict[str, Any]) -> None:
             cc = (await db.execute(
                 select(ChannelConfig).where(ChannelConfig.id == cc_id)
             )).scalar_one_or_none()
-        if not cc:
-            return
+            if not cc:
+                return
+            from packages.core.services.channel_credentials import lease_channel_credentials
+            try:
+                credentials = await lease_channel_credentials(
+                    db, cc, reason="channel.telegram.poller.handle_update",
+                )
+            except ValueError:
+                logger.warning("Telegram poller: credential source unavailable config=%s", cc_id)
+                return
 
         from packages.core.services.channels.telegram_adapter import TelegramAdapter
-        token = (cc.credentials or {}).get("bot_token", "")
+        token = credentials.get("bot_token", "")
+        if not token:
+            logger.warning("Telegram poller: missing bot token config=%s", cc_id)
+            return
         adapter = TelegramAdapter(bot_token=token)
         parsed = await adapter.handle_update(update)
         if not parsed:
@@ -268,12 +279,20 @@ class TelegramPoller:
                     ChannelConfig.status == "active",
                 )
             )).scalars().all()
+            from packages.core.services.channel_credentials import lease_channel_credentials
 
-        desired: Dict[str, str] = {}
-        for cc in rows:
-            token = (cc.credentials or {}).get("bot_token")
-            if token:
-                desired[cc.id] = token
+            desired: Dict[str, str] = {}
+            for cc in rows:
+                try:
+                    credentials = await lease_channel_credentials(
+                        db, cc, reason="channel.telegram.poller.reconcile",
+                    )
+                except ValueError:
+                    logger.warning("Telegram poller: credential source unavailable config=%s", cc.id)
+                    continue
+                token = credentials.get("bot_token")
+                if token:
+                    desired[cc.id] = token
 
         # Start new, stop removed
         for cc_id, token in desired.items():

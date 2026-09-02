@@ -484,6 +484,97 @@ def test_video_prompt_audio_policy_defaults_to_silent_picture():
     assert "Final dialogue, BGM, ambience, SFX, and subtitles" in prompt
 
 
+@pytest.mark.asyncio
+async def test_openrouter_local_image_reference_skips_public_url_preflight(monkeypatch):
+    from packages.core.ai.tools import extended_tools
+
+    async def resolve_model(_user_id, _entity_id):
+        return "bytedance/seedance-2.0"
+
+    async def resolve_credentials(_user_id, _entity_id, role):
+        assert role == "video"
+        return "sk-or-user-key", "", True
+
+    def unexpected_public_preflight(*_args, **_kwargs):
+        raise AssertionError("OpenRouter image references should not require PUBLIC_BASE_URL")
+
+    monkeypatch.setattr(extended_tools, "_resolve_user_video_model", resolve_model)
+    monkeypatch.setattr(extended_tools, "_resolve_user_media_credentials", resolve_credentials)
+    monkeypatch.setattr(extended_tools, "_video_reference_public_base_error", unexpected_public_preflight)
+    monkeypatch.setattr(
+        extended_tools,
+        "_video_capability_error",
+        lambda **_kwargs: "stop after reference preflight",
+    )
+
+    result = json.loads(
+        await extended_tools._generate_video_handler(
+            entity_id="entity",
+            user_id="user",
+            prompt="Animate the supplied stick figure.",
+            first_frame_url="/api/v1/fs/entity/images/stickman.png",
+            duration=5,
+            generate_audio=False,
+        )
+    )
+
+    assert result["status"] == "failed"
+    assert result["error"] == "stop after reference preflight"
+
+
+@pytest.mark.asyncio
+async def test_vercel_local_video_reference_requires_public_url_preflight(monkeypatch):
+    from packages.core.ai.tools import extended_tools
+    from packages.core.services.model_gateway import ModelGatewayRoute
+
+    reference_video_url = "/api/v1/fs/entity/videos/motion.mp4"
+
+    async def resolve_model(_user_id, _entity_id):
+        return "bytedance/seedance-2.0"
+
+    async def resolve_credentials(_user_id, _entity_id, role):
+        assert role == "video"
+        return "sk-or-user-key", "", True
+
+    async def resolve_vercel_route(*_args, **_kwargs):
+        return ModelGatewayRoute(
+            api_key="vck-managed-key",
+            base_url="https://ai-gateway.vercel.sh/v1",
+            provider="vercel",
+            source="official",
+            source_detail="test",
+        )
+
+    def public_preflight(references, _entity_id):
+        assert references == [reference_video_url]
+        return "video references need a signed public URL"
+
+    monkeypatch.setattr(extended_tools, "_resolve_user_video_model", resolve_model)
+    monkeypatch.setattr(extended_tools, "_resolve_user_media_credentials", resolve_credentials)
+    monkeypatch.setattr(extended_tools, "_resolve_official_model_route", resolve_vercel_route)
+    monkeypatch.setattr(extended_tools, "_video_reference_public_base_error", public_preflight)
+    monkeypatch.setattr(
+        extended_tools,
+        "_video_capability_error",
+        lambda **_kwargs: "stop after reference preflight",
+    )
+
+    result = json.loads(
+        await extended_tools._generate_video_handler(
+            entity_id="entity",
+            user_id="user",
+            prompt="Use the motion clip as a video reference.",
+            reference_video_urls=[reference_video_url],
+            duration=5,
+            generate_audio=False,
+            route_provider="vercel",
+        )
+    )
+
+    assert result["status"] == "failed"
+    assert result["error"] == "video references need a signed public URL"
+
+
 def test_video_local_reference_requires_https_public_base(monkeypatch, tmp_path):
     from packages.core import config as core_config
     from packages.core.ai.tools.extended_tools import _video_reference_public_base_error

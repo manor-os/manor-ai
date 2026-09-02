@@ -128,18 +128,24 @@ test("system workflow messages use the assistant avatar on both chat surfaces", 
 });
 
 test("publication approval prompts do not render a duplicate message bubble", () => {
-  for (const path of [
-    "../src/components/EmbeddedChat.tsx",
-    "../src/components/FloatingChat.tsx",
-  ]) {
-    const source = read(path);
+  const embeddedSource = read("../src/components/EmbeddedChat.tsx");
+  const floatingSource = read("../src/components/FloatingChat.tsx");
+  for (const source of [embeddedSource, floatingSource]) {
     assert.match(source, /发布\|发表\|delete/);
     assert.match(source, /publish\|publicat\|post/);
-    assert.match(
-      source,
-      /hasAssistantBlocks\s*&&\s*!canRetryFromContent\s*&&\s*!suppressApprovalBubble/,
-    );
   }
+  assert.match(
+    embeddedSource,
+    /export function assistantMessageRendersInlineFileSurfaces[\s\S]*?!isApprovalBoilerplateContent\(message\)/,
+  );
+  assert.match(
+    embeddedSource,
+    /hasAssistantBlocks\s*&&\s*!canRetryFromContent\s*&&\s*renderAssistantBubble/,
+  );
+  assert.match(
+    floatingSource,
+    /hasAssistantBlocks\s*&&\s*!canRetryFromContent\s*&&\s*!suppressApprovalBubble/,
+  );
 });
 
 test("resolved approval cards hide their redundant linked system receipt", () => {

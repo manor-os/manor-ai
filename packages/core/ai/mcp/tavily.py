@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import logging
 from typing import Any, Dict, List
+from urllib.parse import urlparse
 
 import httpx
 
@@ -102,7 +103,8 @@ async def call_tool(
     arguments: Dict[str, Any],
     bearer_token: str,
 ) -> Dict[str, Any]:
-    if not bearer_token:
+    api_key = bearer_token.strip() if isinstance(bearer_token, str) else ""
+    if not api_key:
         return _error(
             "Tavily API key is missing. Get one at "
             "https://app.tavily.com/home and add it under "
@@ -112,9 +114,13 @@ async def call_tool(
     handler = _HANDLERS.get(name)
     if handler is None:
         return _error(f"Unknown tavily tool: {name}")
+    if not isinstance(arguments, dict):
+        return _error("arguments must be an object")
+    arguments = dict(arguments)
 
     try:
-        return _content(await handler(arguments, bearer_token))
+        _validate_arguments(name, arguments)
+        return _content(await handler(arguments, api_key))
     except httpx.HTTPStatusError as exc:
         body = exc.response.text[:500] if exc.response is not None else ""
         return _error(f"Tavily HTTP {exc.response.status_code}: {body}")
@@ -125,6 +131,84 @@ async def call_tool(
 
 # ── Handlers ────────────────────────────────────────────────────────────────
 
+_STRING_ARGUMENTS = {
+    "search": {"query", "search_depth", "topic"},
+}
+_BOOLEAN_ARGUMENTS = {
+    "search": {"include_answer", "include_raw_content"},
+    "extract": {"include_images"},
+}
+_ARRAY_ARGUMENTS = {
+    "search": {"include_domains", "exclude_domains"},
+    "extract": {"urls"},
+}
+
+
+def _validate_arguments(name: str, arguments: dict[str, Any]) -> None:
+    """Reject malformed MCP arguments before constructing a provider request."""
+    for field in _STRING_ARGUMENTS.get(name, ()):
+        value = arguments.get(field)
+        if value is not None and not isinstance(value, str):
+            raise ValueError(f"{field} must be a string")
+
+    for field in _BOOLEAN_ARGUMENTS.get(name, ()):
+        value = arguments.get(field)
+        if value is not None and not isinstance(value, bool):
+            raise ValueError(f"{field} must be a boolean")
+
+    for field in _ARRAY_ARGUMENTS.get(name, ()):
+        value = arguments.get(field)
+        if value is None:
+            continue
+        if not isinstance(value, (list, tuple)):
+            raise ValueError(f"{field} must be an array")
+        if any(not isinstance(item, str) for item in value):
+            raise ValueError(f"{field} items must be strings")
+
+def _max_results(value: Any) -> int:
+    if value is None or value == "":
+        return 5
+    if isinstance(value, bool):
+        raise ValueError("max_results must be an integer")
+    if isinstance(value, float) and not value.is_integer():
+        raise ValueError("max_results must be an integer")
+    try:
+        count = int(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("max_results must be an integer") from exc
+    if count < 1:
+        raise ValueError("max_results must be at least 1")
+    return min(count, 20)
+
+
+def _domain_list(value: Any, *, field: str) -> list[str]:
+    if value is None:
+        return []
+    if not isinstance(value, (list, tuple)):
+        raise ValueError(f"{field} must be an array of domain strings")
+    domains = [str(item).strip() for item in value]
+    if any(not domain for domain in domains):
+        raise ValueError(f"{field} must not contain empty domains")
+    return domains
+
+
+def _url_list(value: Any) -> list[str]:
+    if not isinstance(value, (list, tuple)):
+        raise ValueError("urls must be an array of URL strings")
+    if not value:
+        raise ValueError("urls is required")
+    if len(value) > 20:
+        raise ValueError("urls must contain at most 20 URLs")
+    urls = [str(item).strip() for item in value]
+    if any(not url for url in urls):
+        raise ValueError("urls must not contain empty values")
+    for url in urls:
+        parsed = urlparse(url)
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+            raise ValueError("urls must contain absolute HTTP(S) URLs")
+    return urls
+
+
 async def _search(args: Dict[str, Any], api_key: str) -> str:
     query = (args.get("query") or "").strip()
     if not query:
@@ -133,16 +217,20 @@ async def _search(args: Dict[str, Any], api_key: str) -> str:
     body: Dict[str, Any] = {
         "api_key": api_key,
         "query": query,
-        "max_results": int(args.get("max_results") or 5),
+        "max_results": _max_results(args.get("max_results")),
         "search_depth": args.get("search_depth") or "basic",
         "topic": args.get("topic") or "general",
         "include_answer": args.get("include_answer", True),
         "include_raw_content": bool(args.get("include_raw_content")),
     }
-    if args.get("include_domains"):
-        body["include_domains"] = list(args["include_domains"])
-    if args.get("exclude_domains"):
-        body["exclude_domains"] = list(args["exclude_domains"])
+    if args.get("include_domains") is not None:
+        body["include_domains"] = _domain_list(
+            args["include_domains"], field="include_domains",
+        )
+    if args.get("exclude_domains") is not None:
+        body["exclude_domains"] = _domain_list(
+            args["exclude_domains"], field="exclude_domains",
+        )
 
     async with httpx.AsyncClient(timeout=_TIMEOUT) as cx:
         r = await cx.post(f"{_API}/search", json=body)
@@ -166,9 +254,7 @@ async def _search(args: Dict[str, Any], api_key: str) -> str:
 
 
 async def _extract(args: Dict[str, Any], api_key: str) -> str:
-    urls = args.get("urls") or []
-    if not urls:
-        raise ValueError("urls is required")
+    urls = _url_list(args.get("urls"))
 
     body = {
         "api_key": api_key,

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+from datetime import datetime, timedelta, timezone
 from typing import Literal
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query
@@ -10,23 +11,105 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from packages.core.constants.task import CONVERSATION_LOG_TYPES
-from packages.core.constants.execution import DEFAULT_AGENT_MAX_TURNS
+from packages.core.constants.task_actors import TaskActor
+from packages.core.constants.execution import (
+    DEFAULT_AGENT_MAX_TURNS,
+    ScheduledJobSkillGenerationStatus,
+)
+from packages.core.constants.execution import (
+    SCHEDULED_JOB_SKILL_GENERATION_RECHECK_SECONDS,
+)
 from packages.core.database import get_db
 from packages.core.models.user import User
+from packages.core.models.workspace import Workspace
 from packages.core.services.scheduler_service import (
     create_scheduled_job, list_scheduled_jobs, get_scheduled_job,
-    update_scheduled_job, delete_scheduled_job, toggle_scheduled_job,
+    mutate_scheduled_job, delete_scheduled_job, toggle_scheduled_job,
     summarize_scheduled_jobs,
     list_job_runs,
     create_agent_execution, list_agent_executions, update_agent_execution,
+    defer_scheduled_job_skill_generation,
+    scheduled_job_workspace_scope,
 )
 from apps.api.deps import get_current_user, require_workspace_readable, require_workspace_writable
-from packages.core.services.workspace_access import readable_workspace_ids_for_user
+from packages.core.services.workspace_access import (
+    readable_workspace_ids_for_user,
+    user_writable_workspace_ids,
+)
+from packages.core.workspaces import is_sandbox_workspace
 
 jobs_router = APIRouter(prefix="/api/v1/jobs", tags=["scheduled-jobs"])
 executions_router = APIRouter(prefix="/api/v1/executions", tags=["agent-executions"])
 
 logger = logging.getLogger(__name__)
+
+
+async def _legacy_compatible_workspace_gate(
+    db: AsyncSession,
+    user: User,
+    workspace_id: str | None,
+    *,
+    writable: bool,
+) -> bool:
+    """Gate real Workspace ids while preserving old opaque job labels."""
+    normalized = str(workspace_id or "").strip()
+    if not normalized:
+        return False
+    known = (await db.execute(
+        select(Workspace.id).where(
+            Workspace.id == normalized,
+        ).limit(1)
+    )).scalar_one_or_none()
+    if known:
+        if writable:
+            await require_workspace_writable(db, user, normalized)
+        else:
+            await require_workspace_readable(db, user, normalized)
+        return True
+    return False
+
+
+async def _can_manage_workspace_resource(
+    db: AsyncSession,
+    user: User,
+    workspace_id: str | None,
+) -> bool:
+    """Project write capability for a Workspace resource detail response."""
+    normalized = str(workspace_id or "").strip()
+    if not normalized:
+        return True
+    known = (await db.execute(
+        select(Workspace.id).where(
+            Workspace.id == normalized,
+        ).limit(1)
+    )).scalar_one_or_none()
+    if not known:
+        return True
+    return normalized in await user_writable_workspace_ids(
+        db,
+        entity_id=user.entity_id,
+        workspace_ids={normalized},
+        user_id=user.id,
+        role=user.role,
+    )
+
+
+async def _workspace_status_for_job(
+    db: AsyncSession,
+    user: User,
+    workspace_id: str | None,
+) -> str | None:
+    """Return the live Workspace status for a real job binding."""
+    normalized = str(workspace_id or "").strip()
+    if not normalized:
+        return None
+    return (await db.execute(
+        select(Workspace.status).where(
+            Workspace.id == normalized,
+            Workspace.entity_id == user.entity_id,
+            Workspace.deleted_at.is_(None),
+        ).limit(1)
+    )).scalar_one_or_none()
 
 
 # ── Schemas: Scheduled Jobs ──
@@ -36,6 +119,7 @@ class ScheduledJobResponse(BaseModel):
     job_id: str
     entity_id: str | None = None
     workspace_id: str | None = None
+    workspace_status: str | None = None
     name: str | None = None
     job_type: str = "cron"
     schedule_kind: str | None = None
@@ -60,8 +144,14 @@ class ScheduledJobResponse(BaseModel):
     last_status: str | None = None
     last_error: str | None = None
     consecutive_errors: int = 0
+    skill_generation_status: ScheduledJobSkillGenerationStatus = (
+        ScheduledJobSkillGenerationStatus.IDLE
+    )
+    skill_generation_attempts: int = 0
+    skill_generation_error: str | None = None
     created_at: str | None = None
     updated_at: str | None = None
+    can_manage: bool = True
 
 
 class ScheduledJobCreateRequest(BaseModel):
@@ -178,10 +268,29 @@ class AgentExecutionListResponse(BaseModel):
 
 # ── Helpers ──
 
-def _job_response(j, *, last_error: str | None = None) -> ScheduledJobResponse:
+def _job_response(
+    j,
+    *,
+    last_error: str | None = None,
+    can_manage: bool = True,
+    workspace_status: str | None = None,
+) -> ScheduledJobResponse:
+    generation_revision = getattr(j, "skill_generation_revision", None)
+    generation_error = getattr(j, "skill_generation_last_error", None)
+    if generation_revision is not None:
+        generation_status = (
+            ScheduledJobSkillGenerationStatus.PENDING
+            if bool(j.enabled)
+            else ScheduledJobSkillGenerationStatus.PAUSED
+        )
+    elif generation_error:
+        generation_status = ScheduledJobSkillGenerationStatus.FAILED
+    else:
+        generation_status = ScheduledJobSkillGenerationStatus.IDLE
     return ScheduledJobResponse(
         id=j.id, job_id=j.job_id, entity_id=j.entity_id,
         workspace_id=j.workspace_id, name=j.name, job_type=j.job_type,
+        workspace_status=workspace_status,
         schedule_kind=j.schedule_kind, cron_expr=j.cron_expr,
         every_seconds=j.every_seconds, run_at=j.run_at, timezone=j.timezone,
         payload_message=j.payload_message, agent_id=j.agent_id,
@@ -192,13 +301,19 @@ def _job_response(j, *, last_error: str | None = None) -> ScheduledJobResponse:
         default_delivery_mode=j.default_delivery_mode,
         goal_id=j.goal_id, goal_step_id=j.goal_step_id,
         manor_task_id=j.manor_task_id,
-        enabled=j.enabled, delete_after_run=j.delete_after_run,
+        enabled=bool(j.enabled and (workspace_status is None or workspace_status == "active")), delete_after_run=j.delete_after_run,
         last_run_at=j.last_run_at.isoformat() if j.last_run_at else None,
         last_status=j.last_status,
         last_error=last_error,
         consecutive_errors=j.consecutive_errors or 0,
+        skill_generation_status=generation_status,
+        skill_generation_attempts=(
+            getattr(j, "skill_generation_attempts", 0) or 0
+        ),
+        skill_generation_error=generation_error,
         created_at=j.created_at.isoformat() if j.created_at else None,
         updated_at=j.updated_at.isoformat() if j.updated_at else None,
+        can_manage=can_manage,
     )
 
 
@@ -285,13 +400,10 @@ async def list_jobs(
     # that has no Workspace row. Preserve that legacy filter behavior while
     # enforcing membership for real, persisted Workspaces.
     if workspace_id:
-        from packages.core.models.workspace import Workspace
-
         workspace_exists = (await db.execute(
             select(Workspace.id).where(
                 Workspace.id == workspace_id,
                 Workspace.entity_id == user.entity_id,
-                Workspace.deleted_at.is_(None),
             ).limit(1)
         )).scalar_one_or_none()
         if workspace_exists:
@@ -320,9 +432,45 @@ async def list_jobs(
         db,
         [job.job_id for job in jobs if (job.consecutive_errors or 0) > 0],
     )
+    job_workspace_ids = {
+        str(job.workspace_id)
+        for job in jobs
+        if job.workspace_id
+    }
+    real_job_workspace_ids = set((await db.execute(
+        select(Workspace.id).where(
+            Workspace.deleted_at.is_(None),
+            Workspace.id.in_(job_workspace_ids),
+        )
+    )).scalars()) if job_workspace_ids else set()
+    workspace_statuses = {
+        str(workspace_id): status
+        for workspace_id, status in (await db.execute(
+            select(Workspace.id, Workspace.status).where(
+                Workspace.deleted_at.is_(None),
+                Workspace.id.in_(real_job_workspace_ids),
+            )
+        )).all()
+    } if real_job_workspace_ids else {}
+    writable_ws = await user_writable_workspace_ids(
+        db,
+        entity_id=user.entity_id,
+        workspace_ids={str(value) for value in real_job_workspace_ids},
+        user_id=user.id,
+        role=user.role,
+    )
     return ScheduledJobListResponse(
         items=[
-            _job_response(job, last_error=latest_errors.get(job.job_id))
+            _job_response(
+                job,
+                last_error=latest_errors.get(job.job_id),
+                can_manage=(
+                    not job.workspace_id
+                    or str(job.workspace_id) not in real_job_workspace_ids
+                    or str(job.workspace_id) in writable_ws
+                ),
+                workspace_status=workspace_statuses.get(str(job.workspace_id)) if job.workspace_id else None,
+            )
             for job in jobs
         ],
         total=total,
@@ -338,29 +486,79 @@ async def create_job(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    await require_workspace_writable(db, user, req.workspace_id)
-    job = await create_scheduled_job(
-        db, user.entity_id, req.job_id, req.name,
-        job_type=req.job_type, schedule_kind=req.schedule_kind,
-        cron_expr=req.cron_expr, every_seconds=req.every_seconds,
-        run_at=req.run_at, timezone_str=req.timezone,
-        payload_message=req.payload_message, agent_id=req.agent_id,
-        execution_type=req.execution_type, execution_target=req.execution_target,
-        workspace_id=req.workspace_id,
-        conversation_id=req.conversation_id,
-        default_delivery_mode=req.default_delivery_mode,
-        user_id=user.id,
+    try:
+        scheduled_job_workspace_scope(req.workspace_id, req.execution_target)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    workspace_known = await _legacy_compatible_workspace_gate(
+        db,
+        user,
+        req.workspace_id,
+        writable=True,
     )
+    if req.workspace_id and not workspace_known:
+        raise HTTPException(404, "Workspace not found")
+    try:
+        job = await create_scheduled_job(
+            db, user.entity_id, req.job_id, req.name,
+            job_type=req.job_type, schedule_kind=req.schedule_kind,
+            cron_expr=req.cron_expr, every_seconds=req.every_seconds,
+            run_at=req.run_at, timezone_str=req.timezone,
+            payload_message=req.payload_message, agent_id=req.agent_id,
+            execution_type=req.execution_type, execution_target=req.execution_target,
+            workspace_id=req.workspace_id,
+            conversation_id=req.conversation_id,
+            default_delivery_mode=req.default_delivery_mode,
+            user_id=user.id,
+            require_workspace=bool(req.workspace_id),
+        )
+    except ValueError as exc:
+        if str(exc) == "Workspace not found":
+            raise HTTPException(404, "Workspace not found") from exc
+        raise
+    if req.workspace_id:
+        workspace = (await db.execute(
+            select(Workspace).where(
+                Workspace.id == req.workspace_id,
+                Workspace.entity_id == user.entity_id,
+                Workspace.deleted_at.is_(None),
+            )
+        )).scalar_one_or_none()
+        if workspace is not None and workspace.status != "active":
+            job.enabled = False
+            job.next_run_at = None
+            job.skill_generation_next_attempt_at = None
+            await db.flush()
 
-    # Auto-generate a frozen execution skill in the background
-    if req.payload_message and req.agent_id:
+    # Commit the producer before publishing its background consumer. This also
+    # releases every lifecycle/resource lock before billable provider work.
+    response = _job_response(job)
+    if req.payload_message and req.agent_id and job.enabled:
+        generation_args = (
+            job.id,
+            req.payload_message,
+            req.name or "",
+            int(job.revision or 1),
+        )
+        await db.commit()
         try:
             from packages.core.tasks.ai_tasks import generate_job_skill
-            generate_job_skill.delay(job.id, req.payload_message, req.name or "")
+            generate_job_skill.delay(*generation_args)
+            await defer_scheduled_job_skill_generation(
+                db,
+                job_id=generation_args[0],
+                revision=generation_args[3],
+                next_attempt_at=datetime.now(timezone.utc)
+                + timedelta(
+                    seconds=SCHEDULED_JOB_SKILL_GENERATION_RECHECK_SECONDS
+                ),
+            )
+            await db.commit()
         except Exception as e:
-            logger.warning("Failed to dispatch skill generation for job %s: %s", job.job_id, e)
+            await db.rollback()
+            logger.warning("Failed to dispatch skill generation for job %s: %s", req.job_id, e)
 
-    return _job_response(job)
+    return response
 
 
 @jobs_router.get("/{job_id}", response_model=ScheduledJobResponse)
@@ -372,8 +570,12 @@ async def get_job(
     job = await get_scheduled_job(db, job_id, user.entity_id)
     if not job:
         raise HTTPException(404, "Scheduled job not found")
-    await require_workspace_readable(db, user, job.workspace_id)
-    return _job_response(job)
+    await _legacy_compatible_workspace_gate(db, user, job.workspace_id, writable=False)
+    return _job_response(
+        job,
+        can_manage=await _can_manage_workspace_resource(db, user, job.workspace_id),
+        workspace_status=await _workspace_status_for_job(db, user, job.workspace_id),
+    )
 
 
 @jobs_router.put("/{job_id}", response_model=ScheduledJobResponse)
@@ -383,52 +585,91 @@ async def update_job(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    # Capture the task message BEFORE the update so we only regenerate the
-    # linked skill (a slow LLM call) when the message actually changed —
-    # otherwise editing just the schedule (e.g. the time) would block the save
-    # on skill regeneration, leaving the UI stuck on "saving".
-    from packages.core.services.scheduler_service import get_scheduled_job
-    _existing = await get_scheduled_job(db, job_id, user.entity_id)
-    if not _existing:
+    existing = await get_scheduled_job(db, job_id, user.entity_id)
+    if not existing:
         raise HTTPException(404, "Scheduled job not found")
-    await require_workspace_writable(db, user, _existing.workspace_id)
-    _old_message = _existing.payload_message if _existing else None
-
-    job = await update_scheduled_job(
-        db, job_id, user.entity_id, **req.model_dump(exclude_none=True),
+    await _legacy_compatible_workspace_gate(
+        db,
+        user,
+        existing.workspace_id,
+        writable=True,
     )
-    if not job:
+    if req.execution_target is not None:
+        try:
+            scheduled_job_workspace_scope(
+                existing.workspace_id,
+                req.execution_target,
+            )
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+
+    mutation = await mutate_scheduled_job(
+        db,
+        job_id,
+        user.entity_id,
+        changed_by_kind=TaskActor.USER.value,
+        changed_by_id=user.id,
+        **req.model_dump(exclude_none=True),
+    )
+    if mutation is None:
         raise HTTPException(404, "Scheduled job not found")
+    job = mutation.job
+    # The factory uses a nested transaction while holding the row lock. SQLAlchemy
+    # may expire server-managed columns when that savepoint closes, so reload the
+    # locked row before constructing the response or generation payload.
+    await db.refresh(job)
 
-    # Regenerate the procedure only when the task message actually changed.
-    message_changed = bool(req.payload_message) and req.payload_message != _old_message
-    if message_changed and job.agent_id:
-        skill_id = (job.execution_target or {}).get("skill_id")
-        if skill_id:
-            # Update the existing skill via LLM patch
-            try:
-                from packages.core.services.skill_generator import update_skill
-                await update_skill(
-                    skill_id, f"Updated task: {req.payload_message}",
-                    user.entity_id, db,
-                )
-                # Refresh execution_script from updated skill
-                from packages.core.services.skill_service import get_skill
-                updated_skill = await get_skill(db, skill_id)
-                if updated_skill:
-                    job.execution_script = updated_skill.system_prompt
-                    await db.flush()
-            except Exception as e:
-                logger.warning("Failed to update skill for job %s: %s", job_id, e)
-        else:
-            # No skill yet — generate in background
-            try:
-                from packages.core.tasks.ai_tasks import generate_job_skill
-                generate_job_skill.delay(job.id, req.payload_message, job.name or "")
-            except Exception as e:
-                logger.warning("Failed to dispatch skill generation for job %s: %s", job_id, e)
+    # The locked factory diff is authoritative under concurrent PUTs. Two
+    # same-payload requests serialize on the Job row and only the one that
+    # actually changed the revision publishes generation work.
+    generation_inputs_changed = (
+        bool(job.enabled)
+        and bool(job.payload_message)
+        and bool(job.agent_id)
+        and (
+            "payload_message" in mutation.content_patch
+            or "agent_id" in mutation.content_patch
+        )
+    )
+    response = _job_response(
+        job,
+        workspace_status=await _workspace_status_for_job(
+            db,
+            user,
+            job.workspace_id,
+        ),
+    )
+    if generation_inputs_changed:
+        generation_args = (
+            job.id,
+            job.payload_message,
+            job.name or "",
+            int(job.revision or 1),
+        )
+        await db.commit()
+        try:
+            from packages.core.tasks.ai_tasks import generate_job_skill
 
-    return _job_response(job)
+            generate_job_skill.delay(*generation_args)
+            await defer_scheduled_job_skill_generation(
+                db,
+                job_id=generation_args[0],
+                revision=generation_args[3],
+                next_attempt_at=datetime.now(timezone.utc)
+                + timedelta(
+                    seconds=SCHEDULED_JOB_SKILL_GENERATION_RECHECK_SECONDS
+                ),
+            )
+            await db.commit()
+        except Exception as e:
+            await db.rollback()
+            logger.warning(
+                "Failed to dispatch skill generation for job %s: %s",
+                job_id,
+                e,
+            )
+
+    return response
 
 
 @jobs_router.delete("/{job_id}", status_code=204)
@@ -440,7 +681,7 @@ async def delete_job(
     existing = await get_scheduled_job(db, job_id, user.entity_id)
     if not existing:
         raise HTTPException(404, "Scheduled job not found")
-    await require_workspace_writable(db, user, existing.workspace_id)
+    await _legacy_compatible_workspace_gate(db, user, existing.workspace_id, writable=True)
     deleted = await delete_scheduled_job(db, job_id, user.entity_id)
     if not deleted:
         raise HTTPException(404, "Scheduled job not found")
@@ -456,11 +697,31 @@ async def toggle_job(
     existing = await get_scheduled_job(db, job_id, user.entity_id)
     if not existing:
         raise HTTPException(404, "Scheduled job not found")
-    await require_workspace_writable(db, user, existing.workspace_id)
-    job = await toggle_scheduled_job(db, job_id, user.entity_id, req.enabled)
+    await _legacy_compatible_workspace_gate(db, user, existing.workspace_id, writable=True)
+    if req.enabled and existing.workspace_id:
+        workspace = (await db.execute(
+            select(Workspace).where(
+                Workspace.id == existing.workspace_id,
+                Workspace.entity_id == user.entity_id,
+                Workspace.deleted_at.is_(None),
+            )
+        )).scalar_one_or_none()
+        if workspace is not None and workspace.status != "active":
+            raise HTTPException(409, "Workspace is not active - resume it before enabling automations")
+    job = await toggle_scheduled_job(
+        db,
+        job_id,
+        user.entity_id,
+        req.enabled,
+        changed_by_kind=TaskActor.USER.value,
+        changed_by_id=user.id,
+    )
     if not job:
         raise HTTPException(404, "Scheduled job not found")
-    return _job_response(job)
+    return _job_response(
+        job,
+        workspace_status=await _workspace_status_for_job(db, user, job.workspace_id),
+    )
 
 
 @jobs_router.get("/{job_id}/runs", response_model=list[JobRunResponse])
@@ -474,7 +735,7 @@ async def get_job_runs(
     job = await get_scheduled_job(db, job_id, user.entity_id)
     if not job:
         raise HTTPException(404, "Scheduled job not found")
-    await require_workspace_readable(db, user, job.workspace_id)
+    await _legacy_compatible_workspace_gate(db, user, job.workspace_id, writable=False)
     runs = await list_job_runs(db, job.job_id, limit=limit)
     return [_run_response(r) for r in runs]
 
@@ -512,7 +773,7 @@ async def get_job_run_detail(
     job = await get_scheduled_job(db, job_id, user.entity_id)
     if not job:
         raise HTTPException(404, "Scheduled job not found")
-    await require_workspace_readable(db, user, job.workspace_id)
+    await _legacy_compatible_workspace_gate(db, user, job.workspace_id, writable=False)
 
     run = (await db.execute(
         select(ScheduledJobRun).where(
@@ -609,9 +870,24 @@ async def run_job_now(
     job = await get_scheduled_job(db, job_id, user.entity_id)
     if not job:
         raise HTTPException(404, "Scheduled job not found")
-    await require_workspace_writable(db, user, job.workspace_id)
+    await _legacy_compatible_workspace_gate(db, user, job.workspace_id, writable=True)
     if not job.enabled:
         raise HTTPException(409, "Job is disabled — enable it before running")
+    if job.workspace_id:
+        workspace = (await db.execute(
+            select(Workspace).where(
+                Workspace.id == job.workspace_id,
+                Workspace.entity_id == user.entity_id,
+                Workspace.deleted_at.is_(None),
+            )
+        )).scalar_one_or_none()
+        if workspace is not None and workspace.status != "active":
+            raise HTTPException(409, "Workspace is not active - resume it before running automations")
+        if workspace is not None and is_sandbox_workspace(workspace):
+            raise HTTPException(
+                409,
+                "Workspace simulation cannot run ordinary automations",
+            )
 
     now = datetime.now(timezone.utc)
     request_key = idempotency_key or generate_ulid()
@@ -660,7 +936,7 @@ async def create_execution(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    await require_workspace_writable(db, user, req.workspace_id)
+    await _legacy_compatible_workspace_gate(db, user, req.workspace_id, writable=True)
     execution = await create_agent_execution(
         db, user.entity_id, req.agent_id,
         task_id=req.task_id, conversation_id=req.conversation_id,
@@ -686,7 +962,7 @@ async def update_execution(
     )).scalar_one_or_none()
     if not execution_row:
         raise HTTPException(404, "Agent execution not found")
-    await require_workspace_writable(db, user, execution_row.workspace_id)
+    await _legacy_compatible_workspace_gate(db, user, execution_row.workspace_id, writable=True)
     execution = await update_agent_execution(
         db, execution_id, **req.model_dump(exclude_none=True),
     )

@@ -14,6 +14,7 @@ Supported providers (refresh endpoint + client credentials from env):
   gmail           GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET
   google_calendar GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET
   google_drive    GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET
+  youtube         GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET
   linkedin        LINKEDIN_CLIENT_ID / LINKEDIN_CLIENT_SECRET
   github          GITHUB_CLIENT_ID / GITHUB_CLIENT_SECRET
   twitter_x       X_CLIENT_ID / X_CLIENT_SECRET
@@ -31,11 +32,13 @@ import httpx
 from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from packages.core.credentials import CredentialDecryptError
 from packages.core.models.document import Integration
 from packages.core.models.user import OAuthAccount
 from packages.core.services.oauth_account_credentials import (
     clear_oauth_account_tokens,
     lease_oauth_account_tokens,
+    mark_oauth_account_credential_reconnect_required,
     store_oauth_account_tokens,
 )
 from packages.core.services.provider_keys import canonical_provider_key, provider_key_aliases
@@ -46,6 +49,11 @@ logger = logging.getLogger(__name__)
 # ── Provider config ─────────────────────────────────────────────────────────
 
 _PROVIDER_CONFIG: dict[str, dict[str, str]] = {
+    "robinhood": {
+        "token_url": "https://api.robinhood.com/oauth2/token/",
+        "client_id_env": "ROBINHOOD_CLIENT_ID",
+        "client_secret_env": "",
+    },
     "gmail": {
         "token_url": "https://oauth2.googleapis.com/token",
         "client_id_env": "GOOGLE_CLIENT_ID",
@@ -57,6 +65,11 @@ _PROVIDER_CONFIG: dict[str, dict[str, str]] = {
         "client_secret_env": "GOOGLE_CLIENT_SECRET",
     },
     "google_drive": {
+        "token_url": "https://oauth2.googleapis.com/token",
+        "client_id_env": "GOOGLE_CLIENT_ID",
+        "client_secret_env": "GOOGLE_CLIENT_SECRET",
+    },
+    "youtube": {
         "token_url": "https://oauth2.googleapis.com/token",
         "client_id_env": "GOOGLE_CLIENT_ID",
         "client_secret_env": "GOOGLE_CLIENT_SECRET",
@@ -302,11 +315,29 @@ async def _refresh_oauth_accounts(db: AsyncSession) -> int:
     changed = False
     for row in rows:
         provider = canonical_provider_key(row.provider)
-        creds = lease_oauth_account_tokens(
-            row,
-            requester_id="oauth_refresh_task",
-            reason="oauth.token.refresh",
-        )
+        try:
+            creds = lease_oauth_account_tokens(
+                row,
+                requester_id="oauth_refresh_task",
+                reason="oauth.token.refresh",
+            )
+        except CredentialDecryptError:
+            # A ciphertext rejected by the credential backend cannot be
+            # refreshed. Mark just this account for reconnect and remove it
+            # from the due-token scan so one bad row cannot abort every
+            # account's minute-by-minute refresh tick.
+            mark_oauth_account_credential_reconnect_required(
+                row,
+                provider=provider,
+            )
+            logger.warning(
+                "oauth_refresh: account %s (%s) credentials could not be decrypted; "
+                "marked for reconnect",
+                row.id,
+                provider,
+            )
+            changed = True
+            continue
         refresh_token = creds.get("refresh_token")
         if not refresh_token:
             continue

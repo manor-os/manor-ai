@@ -38,14 +38,14 @@ def load_docs_deploy() -> dict:
     return yaml.safe_load(text.replace("\non:", "\n'on':", 1))
 
 
-def test_ci_runs_first_phase_on_pull_requests_and_main_pushes() -> None:
+def test_ci_runs_first_phase_on_pull_requests_and_manual_dispatch() -> None:
     workflow = load_ci()
     triggers = workflow["on"]
 
     assert triggers["workflow_dispatch"]["inputs"]["test_level"]["default"] == "smoke"
     assert triggers["workflow_dispatch"]["inputs"]["test_level"]["options"] == ["smoke", "regression"]
     assert triggers["pull_request"]["branches"] == ["dev", "main"]
-    assert triggers["push"]["branches"] == ["main"]
+    assert "push" not in triggers
 
 
 def test_pull_request_gate_keeps_docker_e2e_out_of_required_jobs() -> None:
@@ -56,7 +56,6 @@ def test_pull_request_gate_keeps_docker_e2e_out_of_required_jobs() -> None:
         "lint",
         "api-versions",
         "typecheck-frontend",
-        "web-source-smoke",
         "python-smoke",
         "python-regression",
     } <= set(jobs)
@@ -81,19 +80,41 @@ def test_ruff_is_advisory_until_the_existing_baseline_is_clean() -> None:
     assert "::warning::" in ruff_steps["Ruff format check"]
 
 
+def test_frontend_checks_share_one_install_for_build_and_source_smoke() -> None:
+    jobs = load_ci()["jobs"]
+    frontend_job = jobs["typecheck-frontend"]
+    assert "web-source-smoke" not in jobs
+    steps = [step for step in frontend_job["steps"] if isinstance(step, dict)]
+    step_names = [step.get("name", "") for step in steps]
+    assert "Build" in step_names
+    assert "Run source smoke tests" in step_names
+    focus_step = next(
+        step for step in steps if step.get("name") == "Run File comment focus browser smoke"
+    )
+    assert focus_step["run"] == "npm run test:file-comment-focus-browser"
+    assert focus_step["env"]["PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH"] == "/usr/bin/google-chrome"
+    assert sum(step.get("run") == "npm ci" for step in frontend_job["steps"] if isinstance(step, dict)) == 1
+
+
 def test_python_smoke_tests_are_the_required_first_phase_python_gate() -> None:
     smoke_job = load_ci()["jobs"]["python-smoke"]
     run_commands = "\n".join(step.get("run", "") for step in smoke_job["steps"] if isinstance(step, dict))
 
     assert "continue-on-error" not in smoke_job
-    if not IS_PUBLIC_EXPORT:
-        assert re.search(r"python -m pytest\s+tests/(\s|$)", run_commands) is not None
-        assert "not e2e and not manual and not slow and not network and not docker and not cloud" in run_commands
-    else:
-        assert re.search(r"python -m pytest\s+tests/(\s|$)", run_commands) is not None
-        assert '-m "oss_smoke"' in run_commands
-        assert "tests/test_ci_first_phase.py" not in run_commands
-        assert "tests/test_integrations.py" not in run_commands
+    assert re.search(r"python -m pytest\s+tests/(\s|$)", run_commands) is not None
+    assert '-m "oss_smoke"' in run_commands
+    assert "tests/test_integrations.py" not in run_commands
+
+
+def test_python_ci_jobs_stop_on_the_first_test_failure() -> None:
+    jobs = load_ci()["jobs"]
+    job_names = ["python-smoke", "python-regression"]
+
+    for job_name in job_names:
+        run_commands = "\n".join(
+            step.get("run", "") for step in jobs[job_name]["steps"] if isinstance(step, dict)
+        )
+        assert re.search(r"(?:^|\s)-x(?:\s|$)", run_commands) is not None
 
 
 def test_python_regression_suite_runs_only_for_main_or_manual_opt_in() -> None:
@@ -103,7 +124,8 @@ def test_python_regression_suite_runs_only_for_main_or_manual_opt_in() -> None:
     assert "continue-on-error" not in regression_job
     assert "regression" in regression_job["name"].lower()
     condition = regression_job["if"]
-    assert "github.ref_name == 'main'" in condition
+    assert "github.event_name == 'push'" not in condition
+    assert "github.ref_name == 'main'" not in condition
     assert "github.base_ref == 'main'" in condition
     assert "inputs.test_level == 'regression'" in condition
     if not IS_PUBLIC_EXPORT:
@@ -153,18 +175,15 @@ def test_docs_deploy_builds_artifact_and_publishes_only_when_requested() -> None
     job = workflow["jobs"]["build-and-deploy"]
     steps = job["steps"]
 
-    # Docs deploy on dev pushes that touch docs content (the v* tag trigger
-    # was removed: tags were never pushed, and a paths filter alongside a
-    # tags filter would silently skip tag deploys).
-    assert triggers["push"]["branches"] == ["dev"]
-    assert "tags" not in triggers["push"]
-    assert triggers["push"]["paths"] == [
-        "docs-site/**",
-        ".github/workflows/deploy-docs.yml",
-    ]
+    assert triggers["push"]["tags"] == ["v*"]
+    assert "branches" not in triggers["push"]
+    assert "paths" not in triggers["push"]
     assert triggers["workflow_dispatch"]["inputs"]["publish"]["default"] is False
     assert triggers["workflow_dispatch"]["inputs"]["publish"]["type"] == "boolean"
-    assert "if" not in job
+    assert job["if"] == (
+        "github.event_name == 'workflow_dispatch' || "
+        "(github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v'))"
+    )
     assert any(
         step.get("uses") == "actions/setup-node@v7"
         and step.get("with", {}).get("node-version") == "20"

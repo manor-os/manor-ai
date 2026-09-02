@@ -1,8 +1,42 @@
 #!/bin/bash
 set -e
 
+_MANOR_SERVICE_ROLE_RAW="${MANOR_SERVICE_ROLE:-}"
+MANOR_SERVICE_ROLE="${_MANOR_SERVICE_ROLE_RAW:-api}"
+MANOR_FS_MOUNT_MANAGED="${MANOR_FS_MOUNT_MANAGED:-juicefs}"
+_JUICEFS_MOUNTED_BY_ENTRYPOINT=0
+
+ROLE_VALIDATION_ERROR="$(python3 - <<'PYEOF'
+from packages.core.service_role import validate_service_role_for_deployment
+
+error = validate_service_role_for_deployment()
+if error:
+    print(error)
+PYEOF
+)"
+if [ -n "$ROLE_VALIDATION_ERROR" ]; then
+    echo "[entrypoint] $ROLE_VALIDATION_ERROR" >&2
+    exit 1
+fi
+
 # Mount JuiceFS entity filesystem if enabled
-if [ "${MANOR_FS_ENABLED}" = "true" ] && command -v juicefs &>/dev/null; then
+if [ "${MANOR_FS_ENABLED}" = "true" ] && [ "$MANOR_FS_MOUNT_MANAGED" = "external" ]; then
+    MANOR_FS_ROOT="${MANOR_FS_ROOT:-/mnt/manor}"
+    echo "[entrypoint] Filesystem mount is externally managed at $MANOR_FS_ROOT."
+    if [ ! -d "$MANOR_FS_ROOT" ]; then
+        echo "[entrypoint] Filesystem root $MANOR_FS_ROOT does not exist." >&2
+        if [ "${DEPLOYMENT_MODE:-oss}" = "cloud" ]; then
+            exit 1
+        fi
+        mkdir -p "$MANOR_FS_ROOT"
+    fi
+    if ! touch "$MANOR_FS_ROOT/.accesschk" 2>/dev/null; then
+        echo "[entrypoint] Filesystem root $MANOR_FS_ROOT is not writable." >&2
+        if [ "${DEPLOYMENT_MODE:-oss}" = "cloud" ]; then
+            exit 1
+        fi
+    fi
+elif [ "${MANOR_FS_ENABLED}" = "true" ] && [ "$MANOR_FS_MOUNT_MANAGED" = "juicefs" ] && command -v juicefs &>/dev/null; then
     MANOR_FS_ROOT="${MANOR_FS_ROOT:-/mnt/manor}"
     JUICEFS_META="${JUICEFS_META_URL:-redis://${REDIS_HOST:-redis}:${REDIS_PORT:-6379}/1}"
 
@@ -48,6 +82,7 @@ if [ "${MANOR_FS_ENABLED}" = "true" ] && command -v juicefs &>/dev/null; then
         --no-usage-report \
         --background; then
         echo "[entrypoint] JuiceFS mounted at $MANOR_FS_ROOT"
+        _JUICEFS_MOUNTED_BY_ENTRYPOINT=1
     else
         echo "[entrypoint] JuiceFS mount failed" >&2
         if [ "${DEPLOYMENT_MODE:-oss}" = "cloud" ]; then
@@ -69,8 +104,11 @@ if [ "${MANOR_FS_ENABLED}" = "true" ] && command -v juicefs &>/dev/null; then
             exit 1
         fi
     fi
-elif [ "${MANOR_FS_ENABLED}" = "true" ] && [ "${DEPLOYMENT_MODE:-oss}" = "cloud" ]; then
+elif [ "${MANOR_FS_ENABLED}" = "true" ] && [ "$MANOR_FS_MOUNT_MANAGED" = "juicefs" ] && [ "${DEPLOYMENT_MODE:-oss}" = "cloud" ]; then
     echo "[entrypoint] JuiceFS binary not found; refusing to start in cloud with MANOR_FS_ENABLED=true" >&2
+    exit 1
+elif [ "${MANOR_FS_ENABLED}" = "true" ]; then
+    echo "[entrypoint] Unsupported MANOR_FS_MOUNT_MANAGED=$MANOR_FS_MOUNT_MANAGED" >&2
     exit 1
 fi
 
@@ -87,10 +125,23 @@ fi
 #   • Existing DB (alembic_version present):
 #       Run `alembic upgrade heads` to apply any pending migrations.
 # ---------------------------------------------------------------------------
-if [ -f "alembic.ini" ] && [ -n "${DATABASE_URL_SYNC:-}" ]; then
+MANOR_RUN_DB_BOOTSTRAP="${MANOR_RUN_DB_BOOTSTRAP:-}"
+if [ -z "$MANOR_RUN_DB_BOOTSTRAP" ]; then
+    if [ "${MANOR_SERVICE_ROLE:-}" = "migration" ]; then
+        MANOR_RUN_DB_BOOTSTRAP="true"
+    elif [ -z "$_MANOR_SERVICE_ROLE_RAW" ]; then
+        MANOR_RUN_DB_BOOTSTRAP="true"
+    else
+        MANOR_RUN_DB_BOOTSTRAP="false"
+    fi
+fi
+
+if [ -f "alembic.ini" ] && [ -n "${DATABASE_URL_SYNC:-}" ] && [ "$MANOR_RUN_DB_BOOTSTRAP" = "true" ]; then
+    DATABASE_WAIT_ATTEMPTS="${DATABASE_WAIT_ATTEMPTS:-15}"
+    DATABASE_WAIT_DELAY_SECONDS="${DATABASE_WAIT_DELAY_SECONDS:-2}"
     echo "[entrypoint] Waiting for database ..."
     DB_READY="false"
-    for i in $(seq 1 15); do
+    for i in $(seq 1 "$DATABASE_WAIT_ATTEMPTS"); do
         if python3 -c "
 import sqlalchemy, sys
 try:
@@ -102,12 +153,12 @@ except Exception:
             DB_READY="true"
             break
         fi
-        echo "[entrypoint] DB not ready (attempt $i/15), retrying in 2s ..."
-        sleep 2
+        echo "[entrypoint] DB not ready (attempt $i/$DATABASE_WAIT_ATTEMPTS), retrying in ${DATABASE_WAIT_DELAY_SECONDS}s ..."
+        sleep "$DATABASE_WAIT_DELAY_SECONDS"
     done
 
     if [ "$DB_READY" != "true" ]; then
-        echo "[entrypoint] ERROR: Database still not reachable after 15 attempts; exiting." >&2
+        echo "[entrypoint] ERROR: Database still not reachable after $DATABASE_WAIT_ATTEMPTS attempts; exiting." >&2
         exit 1
     fi
 
@@ -176,6 +227,8 @@ PYEOF
         # Seed MCP catalog and system tool_definitions.
         python3 scripts/init_db.py || echo "[entrypoint] WARNING: init_db seed step failed (non-fatal)"
     fi
+elif [ -f "alembic.ini" ] && [ -n "${DATABASE_URL_SYNC:-}" ]; then
+    echo "[entrypoint] Skipping database bootstrap for MANOR_SERVICE_ROLE=$MANOR_SERVICE_ROLE."
 fi
 
 # ---------------------------------------------------------------------------
@@ -191,7 +244,7 @@ fi
 # stop_grace_period notes in docker-compose.yml).
 # ---------------------------------------------------------------------------
 _unmount_juicefs() {
-    if [ "${MANOR_FS_ENABLED}" = "true" ]; then
+    if [ "${MANOR_FS_ENABLED}" = "true" ] && [ "$MANOR_FS_MOUNT_MANAGED" = "juicefs" ] && [ "$_JUICEFS_MOUNTED_BY_ENTRYPOINT" = "1" ]; then
         local root="${MANOR_FS_ROOT:-/mnt/manor}"
         if mountpoint -q "$root" 2>/dev/null; then
             echo "[entrypoint] Unmounting JuiceFS at $root ..."

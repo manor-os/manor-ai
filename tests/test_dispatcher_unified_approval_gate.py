@@ -32,9 +32,10 @@ from packages.core.governance.approvals import grant_approval
 from packages.core.models.hitl_request import HitlRequest
 from packages.core.models.base import generate_ulid
 from packages.core.models.execution import ExecutionPlan, ExecutionStep
-from packages.core.models.worker import SubscriptionWorker, Worker
+from packages.core.models.worker import SubscriptionWorker, Worker, WorkerActivityLog
 from packages.core.models.workspace import Agent, AgentSubscription, Workspace
 from packages.core.models.task import Task
+from packages.core.models.user import User, UserMembership
 
 
 async def _scenario(
@@ -70,6 +71,7 @@ async def _scenario(
     subscription_id = generate_ulid()
     task_rows = []
     plan_task_id = None
+    approval_actor_id = "operator"
     if proposal_authorized:
         predecessor_task_id = generate_ulid()
         plan_task_id = generate_ulid()
@@ -120,6 +122,20 @@ async def _scenario(
             ),
         ]
     db.add_all(task_rows + [
+        User(
+            id=approval_actor_id,
+            entity_id=entity_id,
+            email=f"{approval_actor_id}-{entity_id}@example.com",
+            password_hash="test-only",
+            role="owner",
+            status="active",
+        ),
+        UserMembership(
+            user_id=approval_actor_id,
+            entity_id=entity_id,
+            role="owner",
+            status="active",
+        ),
         Workspace(id=workspace_id, entity_id=entity_id,
                   name="Gated workspace", status="active"),
         worker,
@@ -161,6 +177,7 @@ async def _scenario(
     return {
         "entity_id": entity_id, "workspace_id": workspace_id,
         "plan_id": plan_id, "step_id": step_id, "worker": worker,
+        "approval_actor_id": approval_actor_id,
     }
 
 
@@ -171,6 +188,67 @@ async def _open_requests(db, entity_id):
             HitlRequest.status == "pending",
         )
     )).scalars().all())
+
+
+@pytest.mark.asyncio
+async def test_setup_regression_blocks_existing_pending_step_before_lease(
+    db_session,
+):
+    s = await _scenario(
+        db_session,
+        requires_approval=False,
+        risk_level="low",
+    )
+    workspace = await db_session.get(Workspace, s["workspace_id"])
+    workspace.settings = {
+        "_blueprint": {
+            "blueprint_id": "builtin:lease-gate",
+            "live_setup_requirements": [{
+                "kind": "note",
+                "detail": "Restore the required setup.",
+                "payload": {},
+                "blocking": True,
+            }],
+        },
+    }
+    await db_session.flush()
+
+    blocked = await Dispatcher().checkout_steps_for_worker(
+        db_session,
+        s["worker"],
+        max_n=1,
+    )
+    step = await db_session.get(ExecutionStep, s["step_id"])
+
+    assert blocked == []
+    assert step.step_status == "pending"
+    assert step.current_lease_id is None
+
+    workspace.settings = {
+        "_blueprint": {
+            "blueprint_id": "builtin:lease-gate",
+            "live_setup_requirements": [],
+        },
+    }
+    await db_session.flush()
+
+    resumed = await Dispatcher().checkout_steps_for_worker(
+        db_session,
+        s["worker"],
+        max_n=1,
+    )
+
+    assert len(resumed) == 1
+    assert resumed[0][1].id == s["step_id"]
+    admission = (
+        await db_session.execute(
+            select(WorkerActivityLog).where(
+                WorkerActivityLog.lease_id == resumed[0][0].id,
+                WorkerActivityLog.event == "lease_grant",
+            )
+        )
+    ).scalar_one()
+    assert admission.payload_summary["workspace_setup_admission"] == "not_required"
 
 
 def _repark(step):
@@ -220,7 +298,12 @@ async def test_grant_lets_the_step_through_next_checkout__289_317(db_session, mo
     assert step.step_status == "waiting_human"
 
     request = (await _open_requests(db_session, s["entity_id"]))[0]
-    await grant_approval(db_session, request, by_user_id="operator", via="chat_card")
+    await grant_approval(
+        db_session,
+        request,
+        by_user_id=s["approval_actor_id"],
+        via="chat_card",
+    )
     _repark(step)
     await db_session.flush()
 

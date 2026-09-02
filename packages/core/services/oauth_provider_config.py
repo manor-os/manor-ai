@@ -35,6 +35,10 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from packages.core.external_api_versions import META_GRAPH
+from packages.core.services.official_remote_mcp import (
+    OfficialRemoteMCPFactory,
+)
+from packages.core.services.robinhood_oauth import ROBINHOOD_MCP_ENDPOINT
 
 logger = logging.getLogger(__name__)
 _OAUTH_SECRET_DECRYPT_WARNED: set[str] = set()
@@ -55,7 +59,17 @@ class OAuthProviderConfig:
 
 # ── Static per-provider OAuth endpoints + default scopes ─────────────────────
 
+_PAYPAL_OAUTH = OfficialRemoteMCPFactory.paypal_oauth()
+
 _PROVIDER_OAUTH_META: dict[str, dict[str, str]] = {
+    "robinhood": {
+        "authorize_url": "https://robinhood.com/oauth",
+        "token_url": "https://api.robinhood.com/oauth2/token/",
+        "scopes": "internal",
+        "client_id_env": "ROBINHOOD_CLIENT_ID",
+        "client_secret_env": "",  # public PKCE client; never a shared secret
+        "token_endpoint_auth_method": "none",
+    },
     "gmail": {
         "authorize_url": "https://accounts.google.com/o/oauth2/v2/auth",
         "token_url": "https://oauth2.googleapis.com/token",
@@ -112,14 +126,17 @@ _PROVIDER_OAUTH_META: dict[str, dict[str, str]] = {
     "slack": {
         "authorize_url": "https://slack.com/oauth/v2/authorize",
         "token_url": "https://slack.com/api/oauth.v2.access",
-        "scopes": "chat:write,channels:read,channels:history,users:read",
+        "scopes": (
+            "chat:write,channels:read,channels:history,users:read,"
+            "app_mentions:read,im:history"
+        ),
         "client_id_env": "SLACK_CLIENT_ID",
         "client_secret_env": "SLACK_CLIENT_SECRET",
     },
     "discord": {
         "authorize_url": "https://discord.com/api/oauth2/authorize",
         "token_url": "https://discord.com/api/oauth2/token",
-        "scopes": "identify bot messages.read",
+        "scopes": "bot applications.commands",
         "client_id_env": "DISCORD_CLIENT_ID",
         "client_secret_env": "DISCORD_CLIENT_SECRET",
     },
@@ -149,16 +166,11 @@ _PROVIDER_OAUTH_META: dict[str, dict[str, str]] = {
     "linkedin": {
         "authorize_url": "https://www.linkedin.com/oauth/v2/authorization",
         "token_url": "https://www.linkedin.com/oauth/v2/accessToken",
-        # Member-level scopes always work after standard "Sign In with
-        # LinkedIn" + "Share on LinkedIn" product approval.
-        # Org-* scopes additionally require LinkedIn's "Community
-        # Management API" partner approval — until that lands the
-        # OAuth consent screen will silently drop them, but tools that
-        # need them will return a clear 403 at call time.
-        "scopes": (
-            "w_member_social openid profile email "
-            "r_organization_admin r_organization_social w_organization_social"
-        ),
+        # Keep the default grant limited to products available to ordinary
+        # LinkedIn developer apps. Organization scopes require separate
+        # Community Management API approval and must be added deliberately by
+        # an approved app rather than making every OAuth request invalid.
+        "scopes": "w_member_social openid profile email",
         "client_id_env": "LINKEDIN_CLIENT_ID",
         "client_secret_env": "LINKEDIN_CLIENT_SECRET",
     },
@@ -266,29 +278,24 @@ _PROVIDER_OAUTH_META: dict[str, dict[str, str]] = {
         )
     },
 
-    # PayPal OAuth — sandbox vs live picked at import time from
-    # ``PAYPAL_ENVIRONMENT`` (default: sandbox). Same client_id/secret
-    # env names; the URLs differ.
-    "paypal": (
-        {
-            "authorize_url": "https://www.paypal.com/connect",
-            "token_url": "https://api-m.paypal.com/v1/oauth2/token",
-            "scopes": "openid profile email https://uri.paypal.com/services/payments/realtimepayment",
-            "client_id_env": "PAYPAL_CLIENT_ID",
-            "client_secret_env": "PAYPAL_CLIENT_SECRET",
-        } if os.getenv("PAYPAL_ENVIRONMENT", "sandbox").lower() == "live" else {
-            "authorize_url": "https://www.sandbox.paypal.com/connect",
-            "token_url": "https://api-m.sandbox.paypal.com/v1/oauth2/token",
-            "scopes": "openid profile email https://uri.paypal.com/services/payments/realtimepayment",
-            "client_id_env": "PAYPAL_CLIENT_ID",
-            "client_secret_env": "PAYPAL_CLIENT_SECRET",
-        }
-    ),
+    # PayPal OAuth endpoints and complete action scopes come from the same
+    # factory as the remote MCP catalog.
+    "paypal": {
+        "authorize_url": _PAYPAL_OAUTH.authorize_url,
+        "token_url": _PAYPAL_OAUTH.token_url,
+        "scopes": _PAYPAL_OAUTH.scopes,
+        "client_id_env": _PAYPAL_OAUTH.client_id_env,
+        "client_secret_env": _PAYPAL_OAUTH.client_secret_env,
+    },
 }
 
 
 def is_oauth_provider(server_key: str) -> bool:
     return server_key in _PROVIDER_OAUTH_META
+
+
+def oauth_client_secret_required(server_key: str) -> bool:
+    return _PROVIDER_OAUTH_META.get(server_key, {}).get("token_endpoint_auth_method") != "none"
 
 
 def oauth_client_configured(server_key: str, server: object | None = None) -> bool:
@@ -304,7 +311,8 @@ def oauth_client_configured(server_key: str, server: object | None = None) -> bo
 
     env_client_id = os.getenv(meta["client_id_env"], "").strip()
     env_client_secret = os.getenv(meta["client_secret_env"], "").strip()
-    if env_client_id and env_client_secret:
+    needs_secret = oauth_client_secret_required(server_key)
+    if env_client_id and (env_client_secret or not needs_secret):
         return True
 
     if server is None:
@@ -318,7 +326,7 @@ def oauth_client_configured(server_key: str, server: object | None = None) -> bo
         str(getattr(server, "credential_ref", "") or "").strip()
         or str(cfg.get("oauth_client_secret") or "").strip()
     )
-    return bool(client_id and secret_present)
+    return bool(client_id and (secret_present or not needs_secret))
 
 
 def _warn_oauth_secret_decrypt_failed(
@@ -367,10 +375,8 @@ def _warn_oauth_secret_lease_failed(
 
 # Providers whose token endpoint requires HTTP Basic auth for confidential
 # clients and rejects body-only credentials with 401 unauthorized_client.
-# Twitter/X is the canonical case — its docs state Basic auth is mandatory
-# and including ``client_secret`` in the body returns "Missing valid
-# authorization header".
-_BASIC_AUTH_PROVIDERS: frozenset[str] = frozenset({"twitter_x"})
+# Twitter/X and Notion require the client credentials in this header.
+_BASIC_AUTH_PROVIDERS: frozenset[str] = frozenset({"twitter_x", "notion"})
 
 # Providers that name the client identifier ``client_key`` instead of the
 # OAuth-standard ``client_id`` — in BOTH the authorize URL query and the token
@@ -392,11 +398,21 @@ _GOOGLE_PROVIDERS: frozenset[str] = frozenset(
 # offline-access/prompt parameters or PKCE. Sending those generic parameters
 # can make the dialog reject an otherwise valid request.
 _FACEBOOK_PROVIDERS: frozenset[str] = frozenset({"facebook"})
+# Notion's public connection flow has its own ``owner=user`` parameter and
+# does not support PKCE or the Google-only offline/prompt parameters.
+_NON_PKCE_PROVIDERS: frozenset[str] = frozenset(
+    {"facebook", "discord", "linkedin", "notion"}
+)
 
 
 def is_google_provider(server_key: str) -> bool:
     """True for the Google-family OAuth providers (shared GOOGLE_CLIENT_ID)."""
     return server_key in _GOOGLE_PROVIDERS
+
+
+def oauth_provider_uses_pkce(server_key: str) -> bool:
+    """Return whether the provider's authorization-code flow uses PKCE."""
+    return server_key not in _NON_PKCE_PROVIDERS
 
 
 def apply_authorize_param_conventions(
@@ -426,13 +442,30 @@ def apply_authorize_param_conventions(
             ["select_account"] + [v for v in existing if v != "select_account"]
         )
     if config.server_key in _FACEBOOK_PROVIDERS:
+        for key in ("access_type", "prompt"):
+            out.pop(key, None)
+    if config.server_key == "robinhood":
+        out.pop("access_type", None)
+        out.pop("prompt", None)
+        out["resource"] = ROBINHOOD_MCP_ENDPOINT
+    if config.server_key == "discord":
+        for key in ("access_type", "prompt"):
+            out.pop(key, None)
+        out["integration_type"] = "0"
+        out["permissions"] = "68672"
+    if config.server_key == "notion":
         for key in (
+            "scope",
             "access_type",
             "prompt",
             "code_challenge",
             "code_challenge_method",
         ):
             out.pop(key, None)
+        out["owner"] = "user"
+    if not oauth_provider_uses_pkce(config.server_key):
+        out.pop("code_challenge", None)
+        out.pop("code_challenge_method", None)
     return out
 
 
@@ -451,6 +484,10 @@ def build_token_request_auth(
     """
     headers: dict[str, str] = {"Accept": "application/json"}
     out_body = dict(body)
+    if not oauth_client_secret_required(config.server_key):
+        out_body.pop("client_secret", None)
+    if config.server_key == "robinhood":
+        out_body["resource"] = ROBINHOOD_MCP_ENDPOINT
 
     if config.server_key in _BASIC_AUTH_PROVIDERS:
         token = base64.b64encode(
@@ -458,6 +495,16 @@ def build_token_request_auth(
         ).decode()
         headers["Authorization"] = f"Basic {token}"
         out_body.pop("client_secret", None)
+        if config.server_key == "twitter_x":
+            # X confidential clients authenticate both values in Basic auth;
+            # its token endpoint rejects a duplicate client_id in the body.
+            out_body.pop("client_id", None)
+
+    if config.server_key == "notion":
+        # Notion carries both client credentials exclusively in Basic auth
+        # and requires a JSON token request body.
+        headers["Content-Type"] = "application/json"
+        out_body.pop("client_id", None)
 
     if config.server_key in _CLIENT_KEY_PROVIDERS and "client_id" in out_body:
         out_body["client_key"] = out_body.pop("client_id")
@@ -492,6 +539,7 @@ async def resolve_oauth_config(
     scopes = meta["scopes"]
     env_client_id = os.getenv(meta["client_id_env"], "").strip() or None
     env_client_secret = os.getenv(meta["client_secret_env"], "").strip() or None
+    needs_secret = oauth_client_secret_required(server_key)
 
     if server:
         cfg = server.default_config if isinstance(server.default_config, dict) else {}
@@ -507,7 +555,7 @@ async def resolve_oauth_config(
 
         # Vault-backed secret (preferred path) → fall through to legacy
         # plaintext in default_config if credential_ref is empty.
-        if server.credential_ref:
+        if server.credential_ref and needs_secret:
             from packages.core.credentials import (
                 CredentialDecryptError,
                 CredentialNotFound,
@@ -525,13 +573,16 @@ async def resolve_oauth_config(
                 secret_decrypt_error = exc
             except Exception as exc:  # noqa: BLE001
                 secret_lease_error = exc
-        elif isinstance(cfg, dict):
+        elif isinstance(cfg, dict) and needs_secret:
             client_secret = cfg.get("oauth_client_secret") or None
 
     # Pre-bootstrap/env-recovery fallback: read env as a pair so we never
     # accidentally combine a DB client_id with an unrelated env secret.
     using_env_fallback = False
-    if (not client_id or not client_secret) and env_client_id and env_client_secret:
+    if (
+        (not client_id or (needs_secret and not client_secret))
+        and env_client_id and (env_client_secret or not needs_secret)
+    ):
         env_matches_db_id = bool(client_id and env_client_id == client_id)
         db_row_is_env_seeded = bool(server and source == "env")
         can_use_env_pair = (
@@ -559,13 +610,13 @@ async def resolve_oauth_config(
             using_env_fallback=using_env_fallback,
         )
 
-    if not client_id or not client_secret:
+    if not client_id or (needs_secret and not client_secret):
         return None
 
     return OAuthProviderConfig(
         server_key=server_key,
         client_id=client_id,
-        client_secret=client_secret,
+        client_secret=client_secret or "",
         authorize_url=meta["authorize_url"],
         token_url=meta["token_url"],
         scopes=scopes,
@@ -608,9 +659,10 @@ async def save_oauth_config(
         cfg["oauth_scopes"] = scopes
     cfg.pop("oauth_client_secret", None)  # never store plaintext
     server.default_config = cfg
-    get_credential_service().store_mcp_server(
-        server, {"oauth_client_secret": client_secret},
-    )
+    if oauth_client_secret_required(server_key):
+        get_credential_service().store_mcp_server(
+            server, {"oauth_client_secret": client_secret},
+        )
     await db.flush()
     return True
 
@@ -619,7 +671,7 @@ async def seed_oauth_clients_from_env(db: AsyncSession) -> dict[str, str]:
     """Bootstrap MCPServer rows from env vars on startup.
 
     For each provider in ``_PROVIDER_OAUTH_META``: if the env client_id
-    + secret are set, upsert them into the MCPServer row with
+    and any required secret are set, upsert them into the MCPServer row with
     ``_oauth_source = "env"``. UI-set rows
     (``_oauth_source = "ui"``) are left alone — admin overrides win.
 
@@ -648,7 +700,10 @@ async def seed_oauth_clients_from_env(db: AsyncSession) -> dict[str, str]:
         server_key
         for server_key, meta in _PROVIDER_OAUTH_META.items()
         if os.getenv(meta["client_id_env"], "").strip()
-        and os.getenv(meta["client_secret_env"], "").strip()
+        and (
+            os.getenv(meta["client_secret_env"], "").strip()
+            or not oauth_client_secret_required(server_key)
+        )
     ]
     if configured_server_keys:
         # Startup self-check: surface the exact callback each provider sends to
@@ -664,23 +719,22 @@ async def seed_oauth_clients_from_env(db: AsyncSession) -> dict[str, str]:
                 for key in configured_server_keys
             ),
         )
-        health = await asyncio.to_thread(cs.health)
-        if not health.ok:
-            detail = health.detail or "credential backend unavailable"
-            for server_key, meta in _PROVIDER_OAUTH_META.items():
-                env_id = os.getenv(meta["client_id_env"], "").strip()
-                env_secret = os.getenv(meta["client_secret_env"], "").strip()
-                if env_id and env_secret:
-                    actions[server_key] = f"error: CredentialBackendUnavailable: {detail}"
-                else:
-                    actions[server_key] = "missing"
-            return actions
+        if any(oauth_client_secret_required(key) for key in configured_server_keys):
+            health = await asyncio.to_thread(cs.health)
+            if not health.ok:
+                detail = health.detail or "credential backend unavailable"
+                for key in configured_server_keys:
+                    if oauth_client_secret_required(key):
+                        actions[key] = f"error: CredentialBackendUnavailable: {detail}"
 
     for server_key, meta in _PROVIDER_OAUTH_META.items():
         try:
+            if server_key in actions:
+                continue
             env_id = os.getenv(meta["client_id_env"], "").strip()
             env_secret = os.getenv(meta["client_secret_env"], "").strip()
-            if not env_id or not env_secret:
+            needs_secret = oauth_client_secret_required(server_key)
+            if not env_id or (needs_secret and not env_secret):
                 actions[server_key] = "missing"
                 continue
 
@@ -704,7 +758,7 @@ async def seed_oauth_clients_from_env(db: AsyncSession) -> dict[str, str]:
             # unnecessarily (Vault writes log audit events).
             existing_id = cfg.get("oauth_client_id")
             existing_secret = None
-            if server.credential_ref:
+            if server.credential_ref and needs_secret:
                 try:
                     leased = cs.lease_mcp_server(
                         server,
@@ -717,7 +771,7 @@ async def seed_oauth_clients_from_env(db: AsyncSession) -> dict[str, str]:
             else:
                 existing_secret = cfg.get("oauth_client_secret")
 
-            if existing_id == env_id and existing_secret == env_secret:
+            if existing_id == env_id and (not needs_secret or existing_secret == env_secret):
                 actions[server_key] = "unchanged"
                 continue
 
@@ -725,7 +779,8 @@ async def seed_oauth_clients_from_env(db: AsyncSession) -> dict[str, str]:
             cfg["_oauth_source"] = "env"
             cfg.pop("oauth_client_secret", None)
             server.default_config = cfg
-            cs.store_mcp_server(server, {"oauth_client_secret": env_secret})
+            if needs_secret:
+                cs.store_mcp_server(server, {"oauth_client_secret": env_secret})
 
             # Commit this provider before the next iteration. Without
             # the per-provider commit the session would stay in a

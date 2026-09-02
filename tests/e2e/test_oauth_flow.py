@@ -26,14 +26,15 @@ pytestmark = [pytest.mark.e2e, pytest.mark.manual]
 # ── In-process: helper primitives ────────────────────────────────────
 
 
-def test_begin_authorization_emits_pkce_challenge() -> None:
+@pytest.mark.asyncio
+async def test_begin_authorization_emits_pkce_challenge() -> None:
     """``begin_authorization`` must add ``code_challenge`` +
     ``code_challenge_method=S256`` to the URL and stash a verifier in
     the pending map. Twitter v2 enforces it; everyone else ignores
     unknown params."""
     from packages.core.services.oauth_flow import (
         begin_authorization,
-        _pending_oauth_states,
+        get_pending_state,
     )
 
     class _Cfg:
@@ -43,7 +44,7 @@ def test_begin_authorization_emits_pkce_challenge() -> None:
         scopes = "tweet.read users.read offline.access"
         authorize_url = "https://x.com/i/oauth2/authorize"
 
-    start = begin_authorization(
+    start = await begin_authorization(
         config=_Cfg(),
         user_id="u_e2e",
         redirect_uri="https://example.com/cb",
@@ -52,8 +53,7 @@ def test_begin_authorization_emits_pkce_challenge() -> None:
     assert qs["code_challenge_method"] == ["S256"]
     assert len(qs["code_challenge"][0]) == 43, "S256 challenge should be 43 chars (base64url no pad)"
     assert qs["state"] == [start.state]
-    pending = _pending_oauth_states.get(start.state)
-    assert pending is not None
+    pending = await get_pending_state(start.state, server_key="twitter_x")
     assert pending["user_id"] == "u_e2e"
     assert pending["server_key"] == "twitter_x"
     assert len(pending["code_verifier"]) == 86, "verifier should be 64 random bytes URL-safe (≈86 chars)"

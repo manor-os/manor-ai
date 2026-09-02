@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
 from packages.core.constants.task import AI_LOG_TYPES, TaskLogType
 from packages.core.ai.engine import ChatMessage
+from packages.core.ai.llm_client import CreditExhaustedError
 from packages.core.ai.runtime.artifacts import (
     runtime_artifact_tracking_scope,
     runtime_extract_artifact_urls_from_tool_result,
@@ -251,6 +253,37 @@ class RuntimeTaskAgentTurnResult:
     supervisor_evidence: list[dict[str, str]] = field(default_factory=list)
 
 
+class RuntimeTaskProviderError(RuntimeError):
+    """A model-provider failure surfaced through the response usage payload."""
+
+    def __init__(self, message: str, *, retryable: bool) -> None:
+        super().__init__(message)
+        self.retryable = retryable
+
+
+_RETRYABLE_TASK_PROVIDER_ERROR = re.compile(
+    r"\bHTTP[ :]*(?:429|500|502|503|504|524)\b"
+    r"|\b(?:ConnectError|ConnectTimeout|ReadTimeout|RemoteProtocolError|TimeoutError)\b"
+    r"|service (?:is )?temporarily unavailable"
+    r"|empty llm response",
+    re.I,
+)
+
+
+def runtime_task_provider_error_is_retryable(error: Any) -> bool:
+    """Return whether a provider error can reasonably clear on a later run."""
+    return bool(_RETRYABLE_TASK_PROVIDER_ERROR.search(str(error or "")))
+
+
+def _raise_task_provider_error(usage: Mapping[str, Any] | None) -> None:
+    error = str((usage or {}).get("error") or "").strip()
+    if error:
+        raise RuntimeTaskProviderError(
+            error,
+            retryable=runtime_task_provider_error_is_retryable(error),
+        )
+
+
 @dataclass(frozen=True)
 class RuntimeTaskFinalResponseResult:
     """Result for the no-tools final scheduled-task completion."""
@@ -348,6 +381,12 @@ def _supervisor_tool_names_for_call(tool_name: str, tool_args: Mapping[str, Any]
         action = str(tool_args.get("action") or "").strip()
         if action:
             names.append(f"{tool_name}:{action}")
+        if tool_name == "manor" and action == "workspace":
+            raw_params = tool_args.get("params")
+            params = raw_params if isinstance(raw_params, Mapping) else {}
+            workspace_action = str(params.get("action") or "").strip()
+            if workspace_action:
+                names.append(f"manor:workspace:{workspace_action}")
     return names
 
 
@@ -383,25 +422,36 @@ def _load_search_result_tool_schemas(
     allowed_tool_names: Iterable[str] | None,
 ) -> None:
     match_schemas: dict[str, dict[str, Any]] = {}
+    match_manifests: dict[str, dict[str, Any]] = {}
+    discovered_names: set[str] = set()
     for match in search_result.get("matches", []):
         if not isinstance(match, dict):
             continue
+        match_name = str(match.get("name") or "").strip()
+        if match_name:
+            match_manifests[match_name] = match
         schema = match.get("schema")
         if not isinstance(schema, dict):
             continue
-        match_name = str(match.get("name") or "").strip()
         schema_name = _schema_name(schema)
         if match_name:
             match_schemas[match_name] = schema
         if schema_name:
             match_schemas[schema_name] = schema
+            match_manifests[schema_name] = match
+            if match.get("available") is not False:
+                discovered_names.add(schema_name)
 
     def _search_schema(name: str) -> dict[str, Any] | None:
         return runtime_tool_schema(name) or match_schemas.get(name)
 
     search_tool_schema_resolver = runtime_tool_schema_resolver(
         get_schema=_search_schema,
-        allowed_tool_names=allowed_tool_names,
+        allowed_tool_names=(
+            None
+            if allowed_tool_names is None
+            else set(allowed_tool_names) | discovered_names
+        ),
     )
     load_names = [str(name) for name in (search_result.get("loaded_tools") or []) if name]
     if not load_names:
@@ -418,6 +468,19 @@ def _load_search_result_tool_schemas(
         schema = search_tool_schema_resolver(name)
         if not isinstance(schema, dict):
             continue
+        manifest = match_manifests.get(name)
+        if manifest is not None:
+            from packages.core.ai.runtime.tool_discovery import (
+                runtime_apply_integration_account_options_to_schema,
+            )
+
+            schema = runtime_apply_integration_account_options_to_schema(
+                schema,
+                manifest.get("account_options"),
+                requires_explicit_account=bool(
+                    manifest.get("requires_explicit_account")
+                ),
+            )
         schema_name = _schema_name(schema)
         if schema_name and schema_name not in loaded_tool_names:
             tools.append(schema)
@@ -444,19 +507,37 @@ async def runtime_execute_task_agent_turn(
     metadata: dict[str, Any] | None = None,
     temperature: float | None = None,
     max_tokens: int | None = None,
+    forced_tool_calls: list[dict[str, Any]] | None = None,
 ) -> RuntimeTaskAgentTurnResult:
     """Run one scheduled-task agent turn through Runtime-owned tool plumbing."""
 
-    response = await runtime_execute_task_agent_chat(
-        engine=engine,
-        messages=messages,
-        tools=tools,
-        system_prompt=system_prompt,
-        metadata=metadata,
-        temperature=temperature,
-        max_tokens=max_tokens,
-    )
+    if forced_tool_calls:
+        response = ChatMessage(
+            role="assistant",
+            content="",
+            tool_calls=[
+                {
+                    "id": f"scheduled-skill-{index}",
+                    "name": str(call.get("name") or ""),
+                    "arguments": dict(call.get("arguments") or {}),
+                }
+                for index, call in enumerate(forced_tool_calls, start=1)
+                if str(call.get("name") or "").strip()
+            ],
+            usage={},
+        )
+    else:
+        response = await runtime_execute_task_agent_chat(
+            engine=engine,
+            messages=messages,
+            tools=tools,
+            system_prompt=system_prompt,
+            metadata=metadata,
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
     usage = dict(response.usage or {})
+    _raise_task_provider_error(usage)
     tool_calls = list(response.tool_calls or [])
     if not tool_calls:
         return RuntimeTaskAgentTurnResult(
@@ -677,6 +758,16 @@ async def runtime_review_task_agent_output(
             worker_model=worker_model,
             metadata=metadata,
         )
+        _raise_task_provider_error(response.usage)
+    except RuntimeTaskProviderError as exc:
+        if exc.retryable:
+            raise
+        return {
+            "verdict": RUNTIME_TASK_VERDICT_FAILED,
+            "reason": f"Supervisor provider configuration failed: {exc}",
+        }
+    except CreditExhaustedError:
+        raise
     except Exception as exc:
         return {
             "verdict": RUNTIME_TASK_VERDICT_NEEDS_REPLAN,
@@ -712,6 +803,7 @@ async def runtime_execute_task_final_response(
         temperature=temperature,
         max_tokens=max_tokens,
     )
+    _raise_task_provider_error(response.usage)
     content = response.content or ""
     finalized = bool(content.strip())
     if finalized:

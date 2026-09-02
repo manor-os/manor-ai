@@ -162,6 +162,29 @@ def scope_workspace_artifact_path(
     return _clean_rel_dir("/".join(parts))
 
 
+def collision_safe_artifact_path(entity_root: str, rel_path: str) -> str:
+    """Return the exact new path a generated artifact should authorize.
+
+    Callers must run their mutation guard against this returned path and then
+    persist to the same path. Deterministic numeric suffixes keep an approval
+    retry bound to the same target while that target remains available.
+    """
+    normalized = _clean_rel_dir(rel_path)
+    target = os.path.join(entity_root, normalized)
+    if not os.path.exists(target):
+        return normalized
+
+    rel_dir, filename = os.path.split(normalized)
+    base, ext = os.path.splitext(filename)
+    suffix = 1
+    while True:
+        candidate_name = f"{base}_{suffix}{ext}"
+        candidate = "/".join(part for part in (rel_dir, candidate_name) if part)
+        if not os.path.exists(os.path.join(entity_root, candidate)):
+            return candidate
+        suffix += 1
+
+
 def build_generated_media_filename(
     *,
     prompt: str,

@@ -84,7 +84,11 @@ export default function Reports() {
       const html = typeof result === "string" ? result : (result as any).html || JSON.stringify(result);
       const blob = new Blob([html], { type: "text/html" });
       const url = URL.createObjectURL(blob);
-      window.open(url, "_blank");
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = `manor-${tab}-report-${dateFrom}-${dateTo}.html`;
+      link.click();
+      window.setTimeout(() => URL.revokeObjectURL(url), 0);
     } catch {
       toast.error(t("page.reports.export_failed"), t("page.reports.could_not_generate_html_report"));
     }

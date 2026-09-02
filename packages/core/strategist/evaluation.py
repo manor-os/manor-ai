@@ -32,7 +32,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from packages.core.constants.task import TaskStatus
 from packages.core.memory.service import record_memory
-from packages.core.models.goal import Goal, GoalMeasurement, GoalTaskLink
+from packages.core.models.goal import Goal, GoalMeasurement
 from packages.core.models.task import Task
 from packages.core.models.workspace import Workspace, WorkspaceActivity
 from packages.core.models.base import generate_ulid
@@ -253,22 +253,21 @@ async def _upsert_link(
     db: AsyncSession, *, goal_id: str, task_id: str,
     estimated_impact: Decimal, actual_impact: Decimal,
 ) -> None:
-    existing = (await db.execute(
-        select(GoalTaskLink).where(
-            GoalTaskLink.goal_id == goal_id,
-            GoalTaskLink.task_id == task_id,
+    from packages.core.goals.service import link_task_to_goal
+
+    try:
+        await link_task_to_goal(
+            db,
+            goal_id=goal_id,
+            task_id=task_id,
+            contribution="direct",
+            estimated_impact=estimated_impact,
+            actual_impact=actual_impact,
         )
-    )).scalar_one_or_none()
-    if existing:
-        existing.estimated_impact = estimated_impact
-        existing.actual_impact = actual_impact
+    except ValueError:
+        # Outcome evaluation is best effort when a Goal is deleted after the
+        # evaluation snapshot was loaded.
         return
-    db.add(GoalTaskLink(
-        goal_id=goal_id, task_id=task_id,
-        contribution="direct",
-        estimated_impact=estimated_impact,
-        actual_impact=actual_impact,
-    ))
 
 
 async def _emit_pattern_learnings(

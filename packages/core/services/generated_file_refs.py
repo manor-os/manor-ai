@@ -1,20 +1,20 @@
 """Canonical generated-file references shared by Tasks and Chat.
 
-Producer tool payloads use several equivalent fields (``fs_path``, ``path``,
-``url``, ``document_id``).  UI surfaces must not guess which one is an
-openable address.  This module normalizes those aliases, assigns the one
-canonical ``open_url`` consumed by clients, and deduplicates references by
-their durable document or entity-filesystem identity.
+Producer tool payloads use several equivalent address fields (``fs_path``,
+``path``, ``url``), while ``document_id`` is the only accepted Document
+identity. This module normalizes addresses, assigns the canonical ``open_url``
+consumed by clients, and deduplicates references by durable document or
+entity-filesystem identity.
 """
 from __future__ import annotations
 
 import os
 import re
+from dataclasses import dataclass
 from typing import Any, Iterable
 from urllib.parse import quote, unquote, urlsplit
 
 
-_DOCUMENT_ID_KEYS = ("document_id", "documentId", "doc_id", "id")
 _FS_PATH_KEYS = ("fs_path", "path", "file_path", "output_path", "saved_to", "local_path")
 _URL_KEYS = (
     "open_url",
@@ -30,9 +30,10 @@ _URL_KEYS = (
     "public_url",
     "url",
 )
+_PREVIEW_URL_KEYS = ("previewUrl", "preview_url")
 _NAME_KEYS = ("name", "filename", "file_name", "original_name", "title")
 _LOCAL_MACHINE_PATH_RE = re.compile(
-    r"^(?:~/|/(?:Users|Volumes|private|tmp|var|etc)/|[A-Za-z]:[\\/])",
+    r"^(?:~/|/(?:Users|Volumes|home|root|private|tmp|var|etc)/|[A-Za-z]:[\\/])",
     re.I,
 )
 
@@ -54,7 +55,7 @@ def _platform_fs_parts(value: Any) -> tuple[str, str] | None:
     if not text:
         return None
     parsed = urlsplit(text)
-    path = unquote(parsed.path or "").replace("\\", "/")
+    path = parsed.path or ""
     prefix = "/api/v1/fs/"
     if path.startswith(prefix):
         scoped = path[len(prefix):]
@@ -65,7 +66,9 @@ def _platform_fs_parts(value: Any) -> tuple[str, str] | None:
     entity_id, separator, rel_path = scoped.partition("/")
     if not separator or not entity_id or not rel_path:
         return None
-    return unquote(entity_id), rel_path.lstrip("/")
+    # Decode URL components once, then treat the resulting path literally.
+    normalized = _normalized_relative_path(unquote(rel_path))
+    return (unquote(entity_id), normalized) if normalized else None
 
 
 def entity_id_from_file_reference(value: Any) -> str:
@@ -73,9 +76,21 @@ def entity_id_from_file_reference(value: Any) -> str:
     return parts[0] if parts else ""
 
 
-def canonical_fs_path(value: Any) -> str:
-    """Return an entity-relative path, never a host-machine absolute path."""
+def _normalized_relative_path(text: str) -> str:
+    path = text.replace("\\", "/")
+    if _LOCAL_MACHINE_PATH_RE.match(path):
+        return ""
+    is_absolute_route = path.startswith("/")
+    normalized = os.path.normpath(path.lstrip("/")).replace(os.sep, "/")
+    if normalized in {"", "."} or normalized == ".." or normalized.startswith("../"):
+        return ""
+    if is_absolute_route and normalized.startswith(("viewer/", "api/v1/", "documents/")):
+        return ""
+    return normalized
 
+
+def canonical_fs_path(value: Any) -> str:
+    """Normalize literal storage paths; decode only filesystem URL components."""
     text = _text(value)
     if not text:
         return ""
@@ -85,16 +100,8 @@ def canonical_fs_path(value: Any) -> str:
     parsed = urlsplit(text)
     if parsed.scheme or parsed.netloc:
         return ""
-    decoded = unquote((parsed.path or text)).replace("\\", "/")
-    if _LOCAL_MACHINE_PATH_RE.match(decoded):
-        return ""
-    is_absolute_route = decoded.startswith("/")
-    normalized = os.path.normpath(decoded.lstrip("/")).replace(os.sep, "/")
-    if normalized in {"", "."} or normalized == ".." or normalized.startswith("../"):
-        return ""
-    if is_absolute_route and normalized.startswith(("viewer/", "api/v1/", "documents/")):
-        return ""
-    return normalized
+    # A raw filename can contain #, ?, or literal percent-encoded-looking text.
+    return _normalized_relative_path(text)
 
 
 def entity_fs_open_url(entity_id: Any, fs_path: Any) -> str:
@@ -121,20 +128,25 @@ def canonical_file_markdown_link(name: Any, open_url: Any) -> str | None:
     return f"[{label}]({address})"
 
 
+def canonical_document_id(value: Any) -> str:
+    """Reject filenames/URLs in the field reserved for opaque Document keys."""
+    text = _text(value)
+    return text if re.fullmatch(r"[A-Za-z0-9_-]+", text) else ""
+
+
 def _document_id(ref: dict[str, Any]) -> str:
-    for key in _DOCUMENT_ID_KEYS:
-        value = _text(ref.get(key))
-        if not value:
-            continue
-        if key == "id" and not (
-            ref.get("mime_type")
-            or ref.get("mimeType")
-            or ref.get("file_type")
-            or ref.get("fileType")
-        ):
-            continue
-        return value
-    return ""
+    return canonical_document_id(ref.get("document_id"))
+
+
+def generated_file_ref_url_keys(ref: dict[str, Any]) -> tuple[str, ...]:
+    """A preview is an address fallback, never an alias of a known file."""
+    if (
+        _document_id(ref)
+        or any(canonical_fs_path(ref.get(key)) for key in _FS_PATH_KEYS)
+        or _first_text(ref, _URL_KEYS)
+    ):
+        return _URL_KEYS
+    return _PREVIEW_URL_KEYS
 
 
 def _ref_fs_path(ref: dict[str, Any]) -> str:
@@ -142,7 +154,7 @@ def _ref_fs_path(ref: dict[str, Any]) -> str:
         path = canonical_fs_path(ref.get(key))
         if path:
             return path
-    for key in _URL_KEYS:
+    for key in generated_file_ref_url_keys(ref):
         parts = _platform_fs_parts(ref.get(key))
         if parts:
             return parts[1]
@@ -153,7 +165,7 @@ def _ref_entity_id(ref: dict[str, Any], fallback: Any = None) -> str:
     entity = _text(fallback or ref.get("entity_id") or ref.get("entityId"))
     if entity:
         return entity
-    for key in _URL_KEYS:
+    for key in generated_file_ref_url_keys(ref):
         entity = entity_id_from_file_reference(ref.get(key))
         if entity:
             return entity
@@ -161,11 +173,90 @@ def _ref_entity_id(ref: dict[str, Any], fallback: Any = None) -> str:
 
 
 def _external_url(ref: dict[str, Any]) -> str:
-    for key in _URL_KEYS:
+    for key in generated_file_ref_url_keys(ref):
         value = _text(ref.get(key))
         if value.startswith(("http://", "https://", "data:", "blob:")):
             return value
     return ""
+
+
+def _canonical_viewer_address(value: Any) -> str:
+    # Only our relative viewer route is a Document address. An external site's
+    # /viewer/<id> must not acquire a local Document identity.
+    match = re.fullmatch(r"/viewer/([^/?#]+)/?(?:[?#].*)?", _text(value))
+    document_id = canonical_document_id(unquote(match[1])) if match else ""
+    return f"/viewer/{document_id}" if document_id else ""
+
+
+@dataclass(frozen=True)
+class ArtifactReferenceIdentity:
+    """Canonical identities for one producer reference."""
+
+    document_id: str
+    fs_path: str
+    entity_id: str
+
+
+class ArtifactReferenceFactory:
+    """Create canonical generated-file refs from heterogeneous tool output."""
+
+    def __init__(self, *, entity_id: Any = None) -> None:
+        self.entity_id = entity_id
+
+    def inspect(self, raw_ref: dict[str, Any]) -> ArtifactReferenceIdentity:
+        return ArtifactReferenceIdentity(
+            document_id=_document_id(raw_ref),
+            fs_path=_ref_fs_path(raw_ref),
+            entity_id=_ref_entity_id(raw_ref, self.entity_id),
+        )
+
+    def create(self, raw_ref: dict[str, Any]) -> dict[str, Any]:
+        """Normalize one producer reference and assign its canonical open URL."""
+
+        ref = dict(raw_ref)
+        # Never trust a producer-authored display link. Rebuild it from the
+        # canonical identity below so label and destination cannot disagree.
+        ref.pop("markdown_link", None)
+        identity = self.inspect(ref)
+
+        if identity.document_id:
+            ref["document_id"] = identity.document_id
+        else:
+            ref.pop("document_id", None)
+        # Do not preserve an invalid viewer address as an explicit fallback.
+        for key in (*_URL_KEYS, *_PREVIEW_URL_KEYS):
+            address = _text(ref.get(key))
+            if address.startswith("/viewer/") and not _canonical_viewer_address(address):
+                ref.pop(key, None)
+        if identity.fs_path:
+            ref["fs_path"] = identity.fs_path
+
+        if identity.document_id:
+            open_url = f"/viewer/{quote(identity.document_id, safe='')}"
+            ref["viewer_url"] = open_url
+        else:
+            open_url = entity_fs_open_url(identity.entity_id, identity.fs_path)
+            if not open_url:
+                explicit = _first_text(ref, ("open_url", "openUrl", "viewer_url", "viewerUrl"))
+                open_url = explicit or _external_url(ref)
+            if not open_url:
+                open_url = next((
+                    _text(ref.get(key)) for key in generated_file_ref_url_keys(ref)
+                    if _canonical_viewer_address(ref.get(key))
+                ), "")
+            if not open_url and identity.fs_path:
+                # Legacy rows may predate the entity id on the serialized ref.
+                # A trusted client can still read this path in the active entity.
+                open_url = identity.fs_path
+        if open_url:
+            ref["open_url"] = open_url
+            name = _first_text(ref, _NAME_KEYS)
+            if not name and identity.fs_path:
+                name = os.path.basename(identity.fs_path.rstrip("/"))
+            markdown_link = canonical_file_markdown_link(name, open_url)
+            if markdown_link:
+                ref["markdown_link"] = markdown_link
+        return ref
 
 
 def canonical_generated_file_ref(
@@ -173,52 +264,19 @@ def canonical_generated_file_ref(
     *,
     entity_id: Any = None,
 ) -> dict[str, Any]:
-    """Normalize one producer reference and assign its canonical ``open_url``."""
+    """Compatibility wrapper around the shared reference factory."""
 
-    ref = dict(raw_ref)
-    # Never trust a producer-authored display link. Rebuild it from the
-    # canonical identity below so label and destination cannot disagree.
-    ref.pop("markdown_link", None)
-    document_id = _document_id(ref)
-    fs_path = _ref_fs_path(ref)
-    scoped_entity_id = _ref_entity_id(ref, entity_id)
-
-    if document_id:
-        ref["document_id"] = document_id
-    if fs_path:
-        ref["fs_path"] = fs_path
-
-    if document_id:
-        open_url = f"/viewer/{quote(document_id, safe='')}"
-        ref["viewer_url"] = open_url
-    else:
-        open_url = entity_fs_open_url(scoped_entity_id, fs_path)
-        if not open_url:
-            explicit = _first_text(ref, ("open_url", "openUrl", "viewer_url", "viewerUrl"))
-            open_url = explicit or _external_url(ref)
-        if not open_url and fs_path:
-            # Legacy rows may predate the entity id on the serialized ref.  A
-            # trusted client can still read this exact path in the active entity.
-            open_url = fs_path
-    if open_url:
-        ref["open_url"] = open_url
-        name = _first_text(ref, _NAME_KEYS)
-        if not name and fs_path:
-            name = os.path.basename(fs_path.rstrip("/"))
-        markdown_link = canonical_file_markdown_link(name, open_url)
-        if markdown_link:
-            ref["markdown_link"] = markdown_link
-    return ref
+    return ArtifactReferenceFactory(entity_id=entity_id).create(raw_ref)
 
 
 def generated_file_ref_aliases(ref: dict[str, Any]) -> set[str]:
     aliases: set[str] = set()
-    document_id = _document_id(ref)
-    if document_id:
-        aliases.add(f"document:{document_id}")
-    fs_path = _ref_fs_path(ref)
-    if fs_path:
-        aliases.add(f"fs:{fs_path}")
+    identity = ArtifactReferenceFactory().inspect(ref)
+    if identity.document_id:
+        aliases.add(f"document:{identity.document_id}")
+        aliases.add(f"open:/viewer/{identity.document_id}")
+    if identity.fs_path:
+        aliases.add(f"fs:{identity.fs_path}")
     external = _external_url(ref)
     if external and not _platform_fs_parts(external):
         aliases.add(f"url:{external}")
@@ -229,6 +287,10 @@ def generated_file_ref_aliases(ref: dict[str, Any]) -> set[str]:
             aliases.add(f"fs:{platform[1]}")
         elif not open_url.startswith("/viewer/"):
             aliases.add(f"open:{open_url}")
+    for key in generated_file_ref_url_keys(ref):
+        viewer = _canonical_viewer_address(ref.get(key))
+        if viewer:
+            aliases.add(f"open:{viewer}")
     return aliases
 
 
@@ -274,6 +336,9 @@ def dedupe_generated_file_refs(
 
 
 __all__ = [
+    "ArtifactReferenceFactory",
+    "ArtifactReferenceIdentity",
+    "canonical_document_id",
     "canonical_file_markdown_link",
     "canonical_fs_path",
     "canonical_generated_file_ref",
@@ -281,4 +346,5 @@ __all__ = [
     "entity_fs_open_url",
     "entity_id_from_file_reference",
     "generated_file_ref_aliases",
+    "generated_file_ref_url_keys",
 ]

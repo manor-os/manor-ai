@@ -20,6 +20,7 @@ These tests hold four contracts:
 from __future__ import annotations
 
 import json
+import re
 
 import pytest
 
@@ -43,6 +44,16 @@ def fs_root(tmp_path):
     finally:
         settings.MANOR_FS_ENABLED = old_enabled
         settings.MANOR_FS_ROOT = old_root
+
+
+@pytest.fixture(autouse=True)
+def allow_test_files(monkeypatch):
+    """Keep grep budget tests independent from Knowledge ACL projection."""
+
+    async def allow_all(*_args, **_kwargs):
+        return set()
+
+    monkeypatch.setattr(file_tools, "_blocked_doc_paths", allow_all)
 
 
 def _write(root, rel, data: bytes):
@@ -139,8 +150,7 @@ async def test_no_hint_when_scan_completed(fs_root):
     assert "hint" not in body
 
 
-@pytest.mark.asyncio
-async def test_wall_clock_budget_also_truncates(fs_root, monkeypatch):
+def test_wall_clock_budget_also_truncates(fs_root, monkeypatch):
     """Byte budget and wall-clock budget are independent OR'd conditions —
     prove the clock one trips too, deterministically (no real sleeping)."""
     _write(fs_root, "a.txt", b"NEEDLE in a\n")
@@ -157,10 +167,17 @@ async def test_wall_clock_budget_also_truncates(fs_root, monkeypatch):
 
     monkeypatch.setattr(file_tools.time, "monotonic", fake_monotonic)
 
-    body = json.loads(await _grep_files(ENTITY, pattern="NEEDLE"))
+    body = file_tools._scan_grep_files(
+        str(fs_root),
+        str(fs_root),
+        re.compile("NEEDLE"),
+        "",
+        50,
+        0,
+    )
     assert body["truncated"] is True
     assert body["resume_cursor"] is None, "budget must trip before the first file is scanned"
-    assert body["count"] == 0
+    assert body["matches"] == []
 
 
 @pytest.mark.asyncio

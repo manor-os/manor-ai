@@ -227,6 +227,320 @@ def test_n8n_connections_become_next():
     assert set(by_id["If"].next) == {"Slack", "HTTP Request"}
 
 
+def test_n8n_noop_passes_the_current_item_unchanged():
+    import asyncio
+    from packages.core.ai.workflow_runner import WorkflowRunner
+    from packages.core.models.workflow import WorkflowRun
+
+    raw = {
+        "name": "No-op data flow",
+        "nodes": [
+            {
+                "name": "Start",
+                "type": "n8n-nodes-base.manualTrigger",
+                "parameters": {},
+            },
+            {
+                "name": "No Op",
+                "type": "n8n-nodes-base.noOp",
+                "parameters": {},
+            },
+        ],
+        "connections": {
+            "Start": {
+                "main": [[{"node": "No Op", "type": "main", "index": 0}]],
+            }
+        },
+    }
+    node = next(
+        candidate for candidate in import_workflow(raw).graph.nodes
+        if candidate.id == "No Op"
+    )
+    item = {"id": 7, "name": "Ada"}
+    run = WorkflowRun(
+        id="r", workflow_id="w", entity_id="e",
+        variables={"Start": item}, step_results={},
+    )
+
+    result = asyncio.run(WorkflowRunner()._execute_step(node.to_step(), run, None))
+
+    assert result["output"] == item
+
+
+def test_n8n_preserves_retry_and_error_output_execution_settings():
+    raw = {
+        "name": "Retry and recover",
+        "nodes": [
+            {
+                "name": "Start",
+                "type": "n8n-nodes-base.manualTrigger",
+                "parameters": {},
+            },
+            {
+                "name": "Request",
+                "type": "n8n-nodes-base.httpRequest",
+                "parameters": {"url": "https://example.invalid"},
+                "retryOnFail": True,
+                "maxTries": 4,
+                "waitBetweenTries": 250,
+                "onError": "continueErrorOutput",
+            },
+            {
+                "name": "Success",
+                "type": "n8n-nodes-base.set",
+                "parameters": {},
+            },
+            {
+                "name": "Recover",
+                "type": "n8n-nodes-base.set",
+                "parameters": {},
+            },
+        ],
+        "connections": {
+            "Start": {
+                "main": [[{"node": "Request", "type": "main", "index": 0}]],
+            },
+            "Request": {
+                "main": [
+                    [{"node": "Success", "type": "main", "index": 0}],
+                    [{"node": "Recover", "type": "main", "index": 0}],
+                ],
+            },
+        },
+    }
+
+    request = next(
+        node for node in import_workflow(raw).graph.nodes if node.id == "Request"
+    )
+
+    assert request.next == ["Success"]
+    assert request.config["error_next"] == ["Recover"]
+    assert request.config["on_error"] == "continue_error"
+    assert request.config["retry_on_fail"] is True
+    assert request.config["max_tries"] == 4
+    assert request.config["retry_wait_ms"] == 250
+
+
+def test_n8n_switch_keeps_error_output_separate_without_fallback():
+    raw = {
+        "name": "Switch error",
+        "nodes": [
+            {
+                "name": "Switch",
+                "type": "n8n-nodes-base.switch",
+                "parameters": {
+                    "rules": {
+                        "values": [{"operation": "equal", "value2": "ready"}]
+                    }
+                },
+                "onError": "continueErrorOutput",
+            },
+            {
+                "name": "Ready",
+                "type": "n8n-nodes-base.set",
+                "parameters": {},
+            },
+            {
+                "name": "Recover",
+                "type": "n8n-nodes-base.set",
+                "parameters": {},
+            },
+        ],
+        "connections": {
+            "Switch": {
+                "main": [
+                    [{"node": "Ready", "type": "main", "index": 0}],
+                    [{"node": "Recover", "type": "main", "index": 0}],
+                ],
+            }
+        },
+    }
+
+    switch = next(
+        node for node in import_workflow(raw).graph.nodes if node.id == "Switch"
+    )
+
+    assert switch.config["cases"][0]["next"] == ["Ready"]
+    assert switch.config["default_next"] == []
+    assert switch.config["error_next"] == ["Recover"]
+
+
+def test_n8n_loop_keeps_both_normal_outputs_before_error_output():
+    raw = {
+        "name": "Loop error",
+        "nodes": [
+            {
+                "name": "Loop",
+                "type": "n8n-nodes-base.splitInBatches",
+                "typeVersion": 3,
+                "parameters": {},
+                "onError": "continueErrorOutput",
+            },
+            {"name": "Done", "type": "n8n-nodes-base.noOp", "parameters": {}},
+            {"name": "Body", "type": "n8n-nodes-base.noOp", "parameters": {}},
+            {"name": "Recover", "type": "n8n-nodes-base.noOp", "parameters": {}},
+        ],
+        "connections": {
+            "Loop": {
+                "main": [
+                    [{"node": "Done", "type": "main", "index": 0}],
+                    [{"node": "Body", "type": "main", "index": 0}],
+                    [{"node": "Recover", "type": "main", "index": 0}],
+                ]
+            }
+        },
+    }
+
+    loop = next(node for node in import_workflow(raw).graph.nodes if node.id == "Loop")
+
+    assert loop.next == ["Done", "Body"]
+    assert loop.config["error_next"] == ["Recover"]
+
+
+def test_n8n_switch_expression_mode_preserves_all_normal_outputs():
+    raw = {
+        "name": "Expression switch error",
+        "nodes": [
+            {
+                "name": "Switch",
+                "type": "n8n-nodes-base.switch",
+                "typeVersion": 3,
+                "parameters": {
+                    "mode": "expression",
+                    "numberOutputs": 3,
+                    "output": "={{ $json.route }}",
+                },
+                "onError": "continueErrorOutput",
+            },
+            *[
+                {"name": name, "type": "n8n-nodes-base.noOp", "parameters": {}}
+                for name in ("Zero", "One", "Two", "Recover")
+            ],
+        ],
+        "connections": {
+            "Switch": {
+                "main": [
+                    [{"node": "Zero", "type": "main", "index": 0}],
+                    [{"node": "One", "type": "main", "index": 0}],
+                    [{"node": "Two", "type": "main", "index": 0}],
+                    [{"node": "Recover", "type": "main", "index": 0}],
+                ]
+            }
+        },
+    }
+
+    switch = next(
+        node for node in import_workflow(raw).graph.nodes if node.id == "Switch"
+    )
+
+    assert switch.next == ["Zero", "One", "Two"]
+    assert switch.config["switch_mode"] == "expression"
+    assert switch.config["output_index"] == "{{route}}"
+    assert switch.config["output_next"] == [["Zero"], ["One"], ["Two"]]
+    assert switch.config["error_next"] == ["Recover"]
+
+
+def test_n8n_switch_numeric_fallback_reuses_an_existing_output():
+    raw = {
+        "name": "Numeric switch fallback",
+        "nodes": [
+            {
+                "name": "Switch",
+                "type": "n8n-nodes-base.switch",
+                "typeVersion": 3,
+                "parameters": {
+                    "rules": {
+                        "values": [{"operation": "equal", "value2": "ready"}]
+                    },
+                    "options": {"fallbackOutput": 0},
+                },
+                "onError": "continueErrorOutput",
+            },
+            {"name": "Ready", "type": "n8n-nodes-base.noOp", "parameters": {}},
+            {"name": "Recover", "type": "n8n-nodes-base.noOp", "parameters": {}},
+        ],
+        "connections": {
+            "Switch": {
+                "main": [
+                    [{"node": "Ready", "type": "main", "index": 0}],
+                    [{"node": "Recover", "type": "main", "index": 0}],
+                ]
+            }
+        },
+    }
+
+    switch = next(
+        node for node in import_workflow(raw).graph.nodes if node.id == "Switch"
+    )
+
+    assert switch.config["default_next"] == ["Ready"]
+    assert switch.config["error_next"] == ["Recover"]
+
+
+def test_n8n_switch_preserves_all_matching_outputs_option():
+    raw = {
+        "name": "All matching routes",
+        "nodes": [
+            {
+                "name": "Switch",
+                "type": "n8n-nodes-base.switch",
+                "typeVersion": 3.4,
+                "parameters": {
+                    "rules": {
+                        "values": [
+                            {"operation": "larger", "value2": 5},
+                            {"operation": "larger", "value2": 0},
+                        ]
+                    },
+                    "options": {"allMatchingOutputs": True},
+                },
+            },
+            {"name": "High", "type": "n8n-nodes-base.noOp", "parameters": {}},
+            {"name": "Positive", "type": "n8n-nodes-base.noOp", "parameters": {}},
+        ],
+        "connections": {
+            "Switch": {
+                "main": [
+                    [{"node": "High", "type": "main", "index": 0}],
+                    [{"node": "Positive", "type": "main", "index": 0}],
+                ]
+            }
+        },
+    }
+
+    switch = next(
+        node for node in import_workflow(raw).graph.nodes if node.id == "Switch"
+    )
+
+    assert switch.config["all_matching_outputs"] is True
+
+
+def test_n8n_preserves_always_output_data_and_execute_once_settings():
+    raw = {
+        "name": "Execution settings",
+        "nodes": [
+            {
+                "name": "Set",
+                "type": "n8n-nodes-base.set",
+                "parameters": {},
+                "alwaysOutputData": True,
+                "executeOnce": True,
+            }
+        ],
+        "connections": {},
+    }
+
+    node = next(
+        candidate for candidate in import_workflow(raw).graph.nodes
+        if candidate.id == "Set"
+    )
+
+    assert node.config["always_output_data"] is True
+    assert node.config["execute_once"] is True
+    assert node.config["n8n"]["alwaysOutputData"] is True
+    assert node.config["n8n"]["executeOnce"] is True
+
+
 def test_n8n_preserves_credentials_in_config():
     result = import_workflow(N8N_JSON)
     slack = next(n for n in result.graph.nodes if n.id == "Slack")
@@ -479,6 +793,101 @@ def test_n8n_translates_http():
     assert http.config["body"] == '{"a": 1}'
 
 
+def test_n8n_set_v32_preserves_field_shape_and_include_selection():
+    raw = {
+        "name": "Edit fields v3.2",
+        "nodes": [
+            {
+                "name": "Set",
+                "type": "n8n-nodes-base.set",
+                "typeVersion": 3.2,
+                "parameters": {
+                    "fields": {
+                        "values": [{
+                            "name": "profile.name",
+                            "type": "stringValue",
+                            "stringValue": "Ada",
+                        }]
+                    },
+                    "include": "selected",
+                    "includeFields": "id, email",
+                },
+            }
+        ],
+        "connections": {},
+    }
+
+    node = next(
+        candidate for candidate in import_workflow(raw).graph.nodes
+        if candidate.id == "Set"
+    )
+
+    assert node.config["set"] == {"profile.name": "Ada"}
+    assert node.config["include_mode"] == "selected"
+    assert node.config["include_fields"] == ["id", "email"]
+
+
+def test_n8n_empty_set_keeps_an_explicit_item_mapping():
+    raw = {
+        "name": "Empty edit fields",
+        "nodes": [
+            {
+                "name": "Start",
+                "type": "n8n-nodes-base.manualTrigger",
+                "parameters": {},
+            },
+            {
+                "name": "Set",
+                "type": "n8n-nodes-base.set",
+                "typeVersion": 3.4,
+                "parameters": {"assignments": {"assignments": []}},
+            },
+        ],
+        "connections": {
+            "Start": {
+                "main": [[{"node": "Set", "type": "main", "index": 0}]],
+            }
+        },
+    }
+
+    node = next(
+        candidate for candidate in import_workflow(raw).graph.nodes
+        if candidate.id == "Set"
+    )
+
+    assert node.config["set"] == {}
+    assert node.config["include_mode"] == "none"
+    assert node.config["items"] == "{{Start}}"
+
+
+def test_n8n_set_raw_mode_preserves_json_output_template():
+    raw = {
+        "name": "Raw edit fields",
+        "nodes": [{
+            "name": "Set",
+            "type": "n8n-nodes-base.set",
+            "typeVersion": 3.4,
+            "parameters": {
+                "mode": "raw",
+                "jsonOutput": (
+                    '{"fullName":"{{ $json.first }} {{ $json.last }}",'
+                    '"active":true}'
+                ),
+            },
+        }],
+        "connections": {},
+    }
+
+    node = next(
+        candidate for candidate in import_workflow(raw).graph.nodes
+        if candidate.id == "Set"
+    )
+
+    assert node.config["raw_json"] == (
+        '{"fullName":"{{first}} {{last}}","active":true}'
+    )
+
+
 def test_n8n_translates_if_v2_and_splits_branches():
     result = import_workflow(N8N_RICH)
     if_node = next(n for n in result.graph.nodes if n.id == "If")
@@ -651,7 +1060,7 @@ def test_n8n_switch_builds_cases_with_branch_targets():
             {"conditions": {"combinator": "and", "conditions": [
                 {"leftValue": "={{ $json.tier }}", "rightValue": "pro",
                  "operator": {"operation": "equals"}}]}},
-        ]}}},
+        ]}, "options": {"fallbackOutput": "extra"}}},
         {"name": "VipPath", "type": "n8n-nodes-base.noOp", "parameters": {}},
         {"name": "ProPath", "type": "n8n-nodes-base.noOp", "parameters": {}},
         {"name": "Fallback", "type": "n8n-nodes-base.noOp", "parameters": {}},
@@ -681,7 +1090,7 @@ def test_n8n_switch_routes_in_runner():
             {"conditions": {"combinator": "and", "conditions": [
                 {"leftValue": "={{ $json.tier }}", "rightValue": "vip",
                  "operator": {"operation": "equals"}}]}},
-        ]}}},
+        ]}, "options": {"fallbackOutput": "extra"}}},
         {"name": "VipPath", "type": "n8n-nodes-base.noOp", "parameters": {}},
         {"name": "Fallback", "type": "n8n-nodes-base.noOp", "parameters": {}},
     ], "connections": {"Switch": {"main": [

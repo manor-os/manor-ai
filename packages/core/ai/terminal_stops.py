@@ -60,13 +60,17 @@ def is_terminal_tool_success(result: Any) -> bool:
     Two signals, most authoritative first:
 
     1. the result carries the ``control`` block the loop attaches whenever a
-       terminal-tool policy fires (``{"terminal": True, ...}``). This covers
-       *any* policy, including skill-configured ones whose ``stop_reason`` is
-       an arbitrary string nobody could have registered in advance;
+       terminal-tool policy fires (``{"terminal": True, ...}``). Explicit
+       ``terminal_failure`` controls are excluded. This covers any successful
+       policy, including skill-configured ones whose ``stop_reason`` is an
+       arbitrary string nobody could have registered in advance;
     2. the stop reason is a registered terminal success — for results rebuilt
        or serialized without the control block.
     """
     control = getattr(result, "control", None)
-    if isinstance(control, dict) and control.get("terminal"):
-        return True
+    if isinstance(control, dict):
+        if control.get("terminal_failure") is True:
+            return False
+        if control.get("terminal"):
+            return True
     return is_terminal_success_stop_reason(getattr(result, "stop_reason", None))

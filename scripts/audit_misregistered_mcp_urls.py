@@ -25,7 +25,7 @@ from packages.core.database import async_session
 from packages.core.models.document import Document
 
 
-OBSERVATION_SOURCES = frozenset({"browser_mcp", "chrome", "local_browser"})
+OBSERVATION_SOURCES = frozenset({"browser_mcp", "chrome"})
 OBSERVATION_TOOL_ACTIONS = frozenset({
     "get_content",
     "get_interactive_elements",

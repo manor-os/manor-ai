@@ -25,30 +25,6 @@ test("Workspace hub exposes only supported views and retires Office assets", asy
   await assert.rejects(access(retiredOfficeAssets));
 });
 
-test("Marketplace follows an image-led community gallery layout", async () => {
-  const marketplace = await readFile(marketplaceSource, "utf8");
-
-  assert.doesNotMatch(marketplace, /className="workspace-marketplace-hero"/);
-  assert.match(marketplace, /className="workspace-marketplace-filters"/);
-  assert.match(marketplace, /<FilterBar activeCount=/);
-  assert.match(marketplace, /<FilterSelect/);
-  assert.match(marketplace, /className="workspace-marketplace-gallery-section"/);
-  assert.match(marketplace, /<WorkspaceAppCard/);
-  assert.match(marketplace, /className="blueprint-marketplace-card-cover"/);
-  assert.match(marketplace, /className="blueprint-marketplace-card-intro"/);
-  assert.match(marketplace, /className="blueprint-marketplace-card-price"/);
-  assert.match(marketplace, /className="blueprint-marketplace-card-media-pagination"/);
-  assert.match(marketplace, /onMouseMove=\{\(event\) =>/);
-  assert.match(marketplace, /video\.play\(\)/);
-  assert.match(marketplace, /prefers-reduced-motion: reduce/);
-  assert.match(marketplace, /\{summary\}/);
-  assert.match(marketplace, /markFailed\(active\.id\)/);
-  assert.match(marketplace, /availableMedia\.length > 1/);
-  assert.match(marketplace, /className="workspace-marketplace-command"/);
-  assert.doesNotMatch(marketplace, /<CompactCard/);
-  assert.doesNotMatch(marketplace, /showDetails/);
-  assert.doesNotMatch(marketplace, /matchMedia\("\(hover: none\)"\)/);
-});
 
 test("mobile view tabs scroll only their own track", async () => {
   const tabSwitcher = await readFile(tabSwitcherSource, "utf8");

@@ -33,6 +33,8 @@ import TabSwitcher from "./ui/TabSwitcher";
 
 type MediaSource = "upload" | "knowledge" | "online" | "generate";
 
+const DEFAULT_ALLOWED_KINDS: InsertableMediaKind[] = ["image", "video"];
+
 type MediaInsertDialogProps = {
   open: boolean;
   onClose: () => void;
@@ -153,7 +155,7 @@ export default function MediaInsertDialog({
   open,
   onClose,
   onInsert,
-  allowedKinds = ["image", "video"],
+  allowedKinds = DEFAULT_ALLOWED_KINDS,
   defaultKind = allowedKinds[0] || "image",
   title = t("component.media_insert.title"),
 }: MediaInsertDialogProps) {
@@ -173,14 +175,15 @@ export default function MediaInsertDialog({
   const [error, setError] = useState("");
 
   useEffect(() => {
-    if (!open) {
-      abortRef.current?.abort();
-      abortRef.current = null;
-      setBusy(null);
-      setError("");
-      return;
-    }
-    if (!allowedKinds.includes(kind)) setKind(defaultKind);
+    if (open) return;
+    abortRef.current?.abort();
+    abortRef.current = null;
+    setBusy(null);
+    setError("");
+  }, [open]);
+
+  useEffect(() => {
+    if (open && !allowedKinds.includes(kind)) setKind(defaultKind);
   }, [allowedKinds, defaultKind, kind, open]);
 
   useEffect(() => {

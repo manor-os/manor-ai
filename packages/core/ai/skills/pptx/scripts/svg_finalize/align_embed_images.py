@@ -53,6 +53,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 from urllib.parse import unquote
 from xml.etree import ElementTree as ET
+from defusedxml import ElementTree as SafeET
 
 # Reuse helpers from the previous standalone modules.
 from .crop_images import crop_image_to_size, get_crop_anchor, parse_preserve_aspect_ratio
@@ -332,7 +333,7 @@ def count_office_vector_refs_in_svg(svg_path: str | Path) -> int:
     svg_path = Path(svg_path)
     svg_dir = svg_path.parent.resolve()
     try:
-        tree = ET.parse(svg_path)
+        tree = SafeET.parse(svg_path)
     except ET.ParseError:
         return 0
     count = 0
@@ -371,7 +372,7 @@ def align_and_embed_images_in_svg(
     ET.register_namespace('xlink', XLINK_NS)
 
     try:
-        tree = ET.parse(svg_path)
+        tree = SafeET.parse(svg_path)
     except ET.ParseError as exc:
         if verbose:
             print(f'  [ERROR] {svg_path.name}: parse failed ({exc})')

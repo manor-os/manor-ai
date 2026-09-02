@@ -154,7 +154,7 @@ async def test_writes_and_reads_the_stable_workspace_receipt(
 
     async def sync_to_knowledge(**kwargs):
         synced.append(kwargs)
-        return SimpleNamespace(id="document-1")
+        return SimpleNamespace(document_id="document-1")
 
     monkeypatch.setattr(module, "ensure_workspace_artifact_directory", ensure_directory)
     monkeypatch.setattr(module, "runtime_entity_file_root", lambda entity_id: str(tmp_path))

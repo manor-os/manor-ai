@@ -23,10 +23,19 @@ from packages.core.workers.registry import (
     ensure_internal_worker,
     get_worker,
     list_workers_for_subscription,
+    mark_stale_external_workers_offline,
     register_external_worker,
     rotate_worker_secret,
     update_worker_status,
     verify_worker_secret,
+)
+from packages.core.workers.protocol import (
+    CURRENT_WORKER_PROTOCOL_VERSION,
+    UnsupportedWorkerProtocol,
+    WORKER_PROTOCOL_HEADER,
+    WorkerProtocolVersion,
+    require_current_worker_protocol,
+    worker_protocol_header_value,
 )
 
 __all__ = [
@@ -38,6 +47,13 @@ __all__ = [
     "verify_worker_secret",
     "bind_subscription",
     "list_workers_for_subscription",
+    "mark_stale_external_workers_offline",
     "get_worker",
     "update_worker_status",
+    "CURRENT_WORKER_PROTOCOL_VERSION",
+    "UnsupportedWorkerProtocol",
+    "WORKER_PROTOCOL_HEADER",
+    "WorkerProtocolVersion",
+    "require_current_worker_protocol",
+    "worker_protocol_header_value",
 ]

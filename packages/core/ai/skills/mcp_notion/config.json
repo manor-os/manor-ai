@@ -1,0 +1,17 @@
+{
+  "id": "mcp_notion",
+  "name": "mcp_notion",
+  "type": "runtime_guidance",
+  "description": "Search, read, query, create, and update content shared with the connected Notion Integration.",
+  "category": "productivity",
+  "output_format": "guidance",
+  "tags": ["notion", "pages", "databases", "runtime-guidance", "builtin", "mcp"],
+  "tools": [
+    "mcp__notion__search",
+    "mcp__notion__get_page",
+    "mcp__notion__query_database",
+    "mcp__notion__create_page",
+    "mcp__notion__update_page",
+    "mcp__notion__append_block_children"
+  ]
+}

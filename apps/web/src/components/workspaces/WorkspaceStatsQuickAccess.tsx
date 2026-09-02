@@ -9,6 +9,7 @@ import {
   type WorkspaceStatsQuickView,
 } from "../../lib/api";
 import { preserveReturnToInHistory } from "../../lib/chatRouteReferences";
+import { fileReferenceKind } from "../../lib/fileReferences";
 import { relativeTime } from "../../lib/format";
 import { t } from "../../lib/i18n";
 import { formatUserFacingLabel } from "../../lib/taskDisplay";
@@ -18,11 +19,17 @@ import {
   workspaceStatAttentionPresentation,
 } from "../../lib/workspaceStats";
 import {
+  nextSeenTaskAttentionKeys,
+  parseSeenTaskAttention,
+  serializeSeenTaskAttention,
+  unseenTaskAttentionSeverity,
+} from "../../lib/workspaceTaskAttention";
+import { useAuthStore } from "../../stores/auth";
+import {
   IconArrowDown,
   IconArrowUp,
   IconCheck,
   IconChevronRight,
-  IconDocument,
   IconEye,
   IconEyeOff,
   IconFolder,
@@ -33,6 +40,7 @@ import {
   IconViewOptions,
   IconWarning,
 } from "../icons";
+import { getFileReferenceIcon } from "../contentTypeIcons";
 import AnchoredPopover from "../ui/AnchoredPopover";
 import Button from "../ui/Button";
 import LoadingSpinner from "../ui/LoadingSpinner";
@@ -46,6 +54,34 @@ interface WorkspaceStatsQuickAccessProps {
 
 type QuickViewPreference = Omit<WorkspaceStatsQuickView, "configured">;
 type WorkspaceQuickTab = "metrics" | "files" | "tasks";
+
+const TASK_ATTENTION_SEEN_STORAGE_PREFIX = "manor-workspace-task-attention-seen";
+
+function taskAttentionStorageKey(userId: string | undefined, workspaceId: string): string {
+  if (!userId || !workspaceId) return "";
+  return `${TASK_ATTENTION_SEEN_STORAGE_PREFIX}:${userId}:${workspaceId}`;
+}
+
+function readSeenTaskAttention(storageKey: string): string[] {
+  if (!storageKey || typeof window === "undefined") return [];
+  try {
+    return parseSeenTaskAttention(window.localStorage.getItem(storageKey));
+  } catch {
+    return [];
+  }
+}
+
+function writeSeenTaskAttention(storageKey: string, attentionKeys: readonly string[]): void {
+  if (!storageKey || typeof window === "undefined") return;
+  try {
+    if (attentionKeys.length > 0) {
+      window.localStorage.setItem(storageKey, serializeSeenTaskAttention(attentionKeys));
+    }
+    else window.localStorage.removeItem(storageKey);
+  } catch {
+    // Read state is best-effort when browser storage is unavailable.
+  }
+}
 
 interface WorkspaceDocumentGroup {
   id: string;
@@ -446,23 +482,37 @@ function WorkspaceFilesQuickBody({
                 className="workspace-chat-quick-file-list"
                 role="list"
               >
-                {documents.length > 0 ? documents.map((document) => (
-                  <Link
-                    className="workspace-chat-quick-file-row"
-                    to={`/viewer/${document.id}`}
-                    state={{ returnTo, chatReturnTo: returnTo }}
-                    role="listitem"
-                    key={document.id}
-                    onClick={() => preserveReturnToInHistory(returnTo)}
-                  >
-                    <IconDocument size={15} />
-                    <span>
-                      <strong title={document.name}>{document.name}</strong>
-                      <small>{document.file_type || t("page.workspace_detail.file")}</small>
-                    </span>
-                    <IconChevronRight size={13} />
-                  </Link>
-                )) : (
+                {documents.length > 0 ? documents.map((document) => {
+                  const documentKind = fileReferenceKind(
+                    document.name,
+                    document.mime_type,
+                    document.file_type,
+                  );
+                  const DocumentTypeIcon = getFileReferenceIcon(documentKind);
+                  return (
+                    <Link
+                      className="workspace-chat-quick-file-row"
+                      to={`/viewer/${document.id}`}
+                      state={{ returnTo, chatReturnTo: returnTo }}
+                      role="listitem"
+                      key={document.id}
+                      onClick={() => preserveReturnToInHistory(returnTo)}
+                    >
+                      <span
+                        aria-hidden="true"
+                        className="workspace-chat-quick-file-type-icon"
+                        data-file-kind={documentKind}
+                      >
+                        <DocumentTypeIcon size={15} />
+                      </span>
+                      <span className="workspace-chat-quick-file-copy">
+                        <strong title={document.name}>{document.name}</strong>
+                        <small>{document.file_type || t("page.workspace_detail.file")}</small>
+                      </span>
+                      <IconChevronRight size={13} />
+                    </Link>
+                  );
+                }) : (
                   <div className="workspace-chat-quick-folder-empty">
                     {t("component.workspace_chat.folder_is_empty")}
                   </div>
@@ -504,6 +554,10 @@ function taskStatusBadgeType(status: string): string {
 
 function taskStatusNeedsAttention(status: string): boolean {
   return ["waiting_on_customer", "on_hold", "blocked", "failed"].includes(status);
+}
+
+function taskAttentionOccurrenceKey(task: Task): string {
+  return `${task.id}:${task.status}:${task.status_changed_at || task.created_at || "unknown"}`;
 }
 
 interface WorkspaceTasksQuickBodyProps {
@@ -585,6 +639,8 @@ export default function WorkspaceStatsQuickAccess({
 }: WorkspaceStatsQuickAccessProps) {
   const queryClient = useQueryClient();
   const location = useLocation();
+  const currentUserId = useAuthStore((state) => state.user?.id);
+  const taskAttentionSeenStorageKey = taskAttentionStorageKey(currentUserId, workspaceId);
   const currentReturnTo = useMemo(() => {
     const returnSearch = new URLSearchParams(location.search);
     if (location.pathname === "/chat") returnSearch.set("workspace", workspaceId);
@@ -592,9 +648,15 @@ export default function WorkspaceStatsQuickAccess({
     return `${location.pathname}${serializedSearch ? `?${serializedSearch}` : ""}${location.hash}`;
   }, [location.hash, location.pathname, location.search, workspaceId]);
   const [activeTab, setActiveTab] = useState<WorkspaceQuickTab>("metrics");
+  const [quickAccessOpen, setQuickAccessOpen] = useState(false);
+  const [pageIsActive, setPageIsActive] = useState(false);
   const [editing, setEditing] = useState(false);
   const [adding, setAdding] = useState(false);
   const [preference, setPreference] = useState<QuickViewPreference | null>(null);
+  const [taskAttentionSeenState, setTaskAttentionSeenState] = useState(() => ({
+    storageKey: taskAttentionSeenStorageKey,
+    attentionKeys: readSeenTaskAttention(taskAttentionSeenStorageKey),
+  }));
   const statsQuery = useQuery({
     queryKey: ["workspace-stats", workspaceId],
     queryFn: () => api.workspaces.stats.list(workspaceId),
@@ -621,8 +683,14 @@ export default function WorkspaceStatsQuickAccess({
     staleTime: 30_000,
   });
   const taskBriefsQuery = useQuery({
-    queryKey: ["workspace-quick-task-briefs", workspaceId],
+    queryKey: ["tasks", "workspace-quick-briefs", workspaceId],
     queryFn: () => api.tasks.list({ workspace_id: workspaceId, limit: 20 }),
+    enabled: Boolean(workspaceId),
+    staleTime: 30_000,
+  });
+  const taskAttentionQuery = useQuery({
+    queryKey: ["tasks", "workspace-attention", workspaceId],
+    queryFn: () => api.tasks.listAttention(workspaceId),
     enabled: Boolean(workspaceId),
     staleTime: 30_000,
   });
@@ -640,6 +708,42 @@ export default function WorkspaceStatsQuickAccess({
   }, [workspaceId]);
 
   useEffect(() => {
+    setTaskAttentionSeenState({
+      storageKey: taskAttentionSeenStorageKey,
+      attentionKeys: readSeenTaskAttention(taskAttentionSeenStorageKey),
+    });
+  }, [taskAttentionSeenStorageKey]);
+
+  useEffect(() => {
+    if (typeof document === "undefined" || typeof window === "undefined") return undefined;
+    const updatePageIsActive = () => {
+      setPageIsActive(document.visibilityState === "visible" && document.hasFocus());
+    };
+    updatePageIsActive();
+    document.addEventListener("visibilitychange", updatePageIsActive);
+    window.addEventListener("focus", updatePageIsActive);
+    window.addEventListener("blur", updatePageIsActive);
+    return () => {
+      document.removeEventListener("visibilitychange", updatePageIsActive);
+      window.removeEventListener("focus", updatePageIsActive);
+      window.removeEventListener("blur", updatePageIsActive);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!taskAttentionSeenStorageKey || typeof window === "undefined") return undefined;
+    const handleStorage = (event: StorageEvent) => {
+      if (event.key !== taskAttentionSeenStorageKey) return;
+      setTaskAttentionSeenState({
+        storageKey: taskAttentionSeenStorageKey,
+        attentionKeys: parseSeenTaskAttention(event.newValue),
+      });
+    };
+    window.addEventListener("storage", handleStorage);
+    return () => window.removeEventListener("storage", handleStorage);
+  }, [taskAttentionSeenStorageKey]);
+
+  useEffect(() => {
     if (!quickViewQuery.data) return;
     setPreference({
       ordered_stat_ids: quickViewQuery.data.ordered_stat_ids,
@@ -650,6 +754,7 @@ export default function WorkspaceStatsQuickAccess({
   const stats = statsQuery.data?.items || [];
   const documentGroups = (Array.isArray(filesQuery.data) ? filesQuery.data : []) as WorkspaceDocumentGroup[];
   const taskBriefs = taskBriefsQuery.data?.items || [];
+  const attentionTasks = taskAttentionQuery.data || [];
   const installedKeys = useMemo(
     () => new Set(stats.flatMap((stat) => [stat.key, stat.library_key || ""])),
     [stats],
@@ -678,10 +783,25 @@ export default function WorkspaceStatsQuickAccess({
     workspaceStatAttentionPresentation(stat.freshness_status)
   )).filter(Boolean);
   const hasCollectionError = stats.some((stat) => stat.freshness_status === "collection_error");
-  const tasksNeedingAttention = taskBriefs.filter((task) => taskStatusNeedsAttention(task.status));
-  const hasTaskError = tasksNeedingAttention.some((task) => (
-    task.status === "blocked" || task.status === "failed"
-  ));
+  const tasksNeedingAttention = attentionTasks.filter((task) => taskStatusNeedsAttention(task.status));
+  const taskAttentionKeys = tasksNeedingAttention
+    .map(taskAttentionOccurrenceKey)
+    .sort();
+  const seenTaskAttentionKeys = taskAttentionSeenState.storageKey === taskAttentionSeenStorageKey
+    ? taskAttentionSeenState.attentionKeys
+    : [];
+  const taskAttentionIsVisible = quickAccessOpen && activeTab === "tasks" && pageIsActive;
+  const unseenAttentionSeverity = unseenTaskAttentionSeverity(
+    tasksNeedingAttention.map((task) => ({
+      key: taskAttentionOccurrenceKey(task),
+      status: task.status,
+    })),
+    seenTaskAttentionKeys,
+  );
+  const hasUnseenTaskAttention = Boolean(
+    !taskAttentionIsVisible
+    && unseenAttentionSeverity,
+  );
   const metricsTabStatus: "warning" | "danger" | undefined = statsQuery.isError
     ? "danger"
     : hasCollectionError
@@ -689,13 +809,36 @@ export default function WorkspaceStatsQuickAccess({
       : attention.length > 0
         ? "warning"
         : undefined;
-  const tasksTabStatus: "warning" | "danger" | undefined = taskBriefsQuery.isError
+  const tasksTabStatus: "warning" | "danger" | undefined = (
+    taskBriefsQuery.isError || taskAttentionQuery.isError
+  )
     ? "danger"
-    : hasTaskError
-      ? "danger"
-      : tasksNeedingAttention.length > 0
-        ? "warning"
-        : undefined;
+    : !hasUnseenTaskAttention
+      ? undefined
+      : unseenAttentionSeverity;
+
+  useEffect(() => {
+    if (!taskAttentionQuery.isSuccess) return;
+    if (taskAttentionSeenState.storageKey !== taskAttentionSeenStorageKey) return;
+    const nextAttentionKeys = nextSeenTaskAttentionKeys(
+      taskAttentionKeys,
+      seenTaskAttentionKeys,
+      taskAttentionIsVisible,
+    );
+    if (nextAttentionKeys.join("|") === seenTaskAttentionKeys.join("|")) return;
+    setTaskAttentionSeenState({
+      storageKey: taskAttentionSeenStorageKey,
+      attentionKeys: nextAttentionKeys,
+    });
+    writeSeenTaskAttention(taskAttentionSeenStorageKey, nextAttentionKeys);
+  }, [
+    seenTaskAttentionKeys,
+    taskAttentionIsVisible,
+    taskAttentionKeys,
+    taskAttentionSeenStorageKey,
+    taskAttentionSeenState.storageKey,
+    taskAttentionQuery.isSuccess,
+  ]);
   const addStatMutation = useMutation({
     mutationFn: async (entry: WorkspaceStatLibraryEntry) => {
       const connection = entry.available_connections.find((candidate) => candidate.is_default)
@@ -781,9 +924,9 @@ export default function WorkspaceStatsQuickAccess({
       label: t("component.workspace_chat.tasks"),
       icon: <IconList size={14} />,
       status: tasksTabStatus,
-      statusLabel: taskBriefsQuery.isError
+      statusLabel: taskBriefsQuery.isError || taskAttentionQuery.isError
         ? t("component.workspace_chat.task_briefs_load_failed")
-        : tasksNeedingAttention.length > 0
+        : hasUnseenTaskAttention
           ? t("page.tasks.needs_attention")
           : undefined,
     },
@@ -797,6 +940,7 @@ export default function WorkspaceStatsQuickAccess({
       persistentBreakpoint={1280}
       persistentPlacement="below-anchor"
       persistentInlineInset={24}
+      onOpenChange={setQuickAccessOpen}
       ariaLabel={ariaLabel}
       panelClassName="workspace-chat-stats-popover"
       trigger={(

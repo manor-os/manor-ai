@@ -1,9 +1,10 @@
 /**
  * TabSwitcher — light segmented-control for switching views.
  *
- * Visual language: slate-50 track, white active tile with teal text,
+ * Visual language: warm-neutral track, white active tile with strong text,
  * subtle hover on inactive tiles. Calm + neutral so it sits well next
- * to the new Card / IconTile primitives.
+ * to the Card / IconTile primitives. Use `appearance="minimal"` for a
+ * borderless secondary navigation row.
  *
  * Usage:
  *   <TabSwitcher tabs={[{ key: "board", label: "Board" }]} value={view} onChange={setView} />
@@ -28,14 +29,31 @@ interface TabSwitcherProps {
   value: string;
   onChange: (key: string) => void;
   size?: "sm" | "md";
+  /**
+   * `minimal` removes the track so a secondary navigation can sit directly
+   * on the page surface without adding another bordered container.
+   */
+  appearance?: "segmented" | "minimal";
   className?: string;
   wrap?: boolean;
   ariaLabel?: string;
 }
 
-export default function TabSwitcher({ tabs, value, onChange, size = "md", className = "", wrap = false, ariaLabel }: TabSwitcherProps) {
+export default function TabSwitcher({
+  tabs,
+  value,
+  onChange,
+  size = "md",
+  appearance = "segmented",
+  className = "",
+  wrap = false,
+  ariaLabel,
+}: TabSwitcherProps) {
   const tabRefs = useRef<Record<string, HTMLButtonElement | null>>({});
-  const pad = size === "sm" ? "4px 12px" : "5px 14px";
+  const minimal = appearance === "minimal";
+  const pad = minimal
+    ? (size === "sm" ? "4px 9px" : "5px 11px")
+    : (size === "sm" ? "4px 12px" : "5px 14px");
   const fs = size === "sm" ? 12 : 13;
   const r = size === "sm" ? 7 : 8;
   const controlHeight = size === "sm" ? 32 : 36;
@@ -63,17 +81,17 @@ export default function TabSwitcher({ tabs, value, onChange, size = "md", classN
 
   return (
     <div
-      className={`manor-tab-switcher ${className}`}
+      className={`manor-tab-switcher manor-tab-switcher--${appearance} ${className}`}
       role="tablist"
       aria-label={ariaLabel}
       style={{
         display: wrap ? "flex" : "inline-flex",
         flexWrap: wrap ? "wrap" : "nowrap",
-        gap: 2,
-        padding: 2,
-        height: wrap ? "auto" : controlHeight,
+        gap: minimal ? 4 : 2,
+        padding: minimal ? 0 : 2,
+        height: minimal ? "auto" : (wrap ? "auto" : controlHeight),
         minHeight: controlHeight,
-        width: "fit-content",
+        width: minimal ? "100%" : "fit-content",
         maxWidth: "100%",
         alignSelf: "flex-start",
         boxSizing: "border-box",
@@ -82,9 +100,9 @@ export default function TabSwitcher({ tabs, value, onChange, size = "md", classN
         overflowY: "hidden",
         WebkitOverflowScrolling: "touch",
         scrollbarWidth: "none",
-        background: "var(--surface-muted)",
-        border: "1px solid var(--border-subtle)",
-        borderRadius: r + 3,
+        background: minimal ? "transparent" : "var(--surface-muted)",
+        border: minimal ? "none" : "1px solid var(--border-subtle)",
+        borderRadius: minimal ? 0 : r + 3,
       }}
     >
       {tabs.map((tab) => {
@@ -120,9 +138,9 @@ export default function TabSwitcher({ tabs, value, onChange, size = "md", classN
               whiteSpace: "nowrap",
               border: "none", cursor: "pointer",
               transition: "background 0.15s ease, color 0.15s ease",
-              background: active ? "var(--surface-panel)" : "transparent",
+              background: active ? (minimal ? "var(--surface-muted)" : "var(--surface-panel)") : "transparent",
               color: active ? "var(--text-strong)" : "var(--text-muted)",
-              boxShadow: active ? "var(--shadow-sm)" : "none",
+              boxShadow: active && !minimal ? "var(--shadow-sm)" : "none",
             }}
             onMouseEnter={!active ? (e) => {
               e.currentTarget.style.color = "var(--text-strong)";

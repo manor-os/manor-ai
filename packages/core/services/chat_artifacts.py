@@ -6,6 +6,7 @@ import os
 import re
 from typing import Any
 
+from packages.core.ai.runtime.composite_tools import RuntimeCompositeToolCallFactory
 from packages.core.services.generated_file_refs import (
     canonical_generated_file_ref,
     dedupe_generated_file_refs,
@@ -35,7 +36,6 @@ _URL_KEYS = (
     "url",
 )
 _PATH_KEYS = ("fs_path", "path", "file_path", "output_path", "saved_to", "local_path")
-_DOCUMENT_ID_KEYS = ("document_id", "documentId", "doc_id")
 _CREATION_FLAGS = (
     "created",
     "generated",
@@ -334,7 +334,7 @@ def chat_attachments_from_tool_results(tool_results: list[dict] | None) -> list[
         if tool_name.lower() in _EXPLICIT_ARTIFACT_TOOL_NAMES and not display_requested:
             return
 
-        document_id = _first_text(obj, _DOCUMENT_ID_KEYS) or _text(obj.get("id") if obj.get("mime_type") or obj.get("file_type") else "")
+        document_id = _text(obj.get("document_id"))
         url = _first_text(obj, _URL_KEYS)
         fs_path = _first_text(obj, _PATH_KEYS)
         reference = url or fs_path
@@ -368,7 +368,16 @@ def chat_attachments_from_tool_results(tool_results: list[dict] | None) -> list[
             continue
         payload = _parse_json(item.get("raw_result", item.get("result")))
         if isinstance(payload, dict):
-            add_from_obj(payload, tool_name=_text(item.get("name")), inherited_created=False)
+            arguments = item.get("arguments")
+            canonical_call = RuntimeCompositeToolCallFactory.create(
+                _text(item.get("name")),
+                arguments if isinstance(arguments, dict) else {},
+            )
+            add_from_obj(
+                payload,
+                tool_name=canonical_call.tool_name,
+                inherited_created=False,
+            )
 
     attachments: list[dict[str, Any]] = []
     for ref in dedupe_generated_file_refs(canonical_refs, entity_id=entity_id)[:12]:
@@ -383,7 +392,7 @@ def chat_attachments_from_tool_results(tool_results: list[dict] | None) -> list[
         if ref.get("markdown_link"):
             attachment["markdown_link"] = _text(ref.get("markdown_link"))
         if document_id:
-            attachment["id"] = document_id
+            attachment["document_id"] = document_id
         if fs_path:
             attachment["fs_path"] = fs_path
         if ref.get("file_type"):

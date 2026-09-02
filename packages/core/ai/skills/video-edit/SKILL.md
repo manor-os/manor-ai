@@ -89,7 +89,7 @@ Write or update project source inside the active Sandbox with:
 
 Split large projects into logical batches. Every successful call writes inside
 the Sandbox and atomically synchronizes the same editable files back to Manor.
-Do not use general entity `write_file`/`edit_file` for a session started with
+Do not use general entity `generate_file`/`patch_file` for a session started with
 `operation="start"`. Include at minimum:
 
 - `BRIEF.md` — objective, audience, message, deliverable, and constraints;

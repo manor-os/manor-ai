@@ -24,6 +24,9 @@ from apps.api.deps import get_current_user
 from packages.core.database import get_db
 from packages.core.models.user import User
 from packages.core.services.entity_service import get_workspace
+from packages.core.services.marketplace_resource_links import (
+    MarketplaceIdentityConflictError,
+)
 from packages.core.templates import (
     REGISTRY,
     TemplateError,
@@ -109,10 +112,12 @@ async def apply_goal_template(
     )
     try:
         result = await apply_template(db, req.template_key, inp)
+    except MarketplaceIdentityConflictError as exc:
+        raise HTTPException(409, str(exc)) from exc
     except TemplateError as exc:
         # Param-validation / unknown-key errors surface as 400 — these
         # are user-actionable, not server bugs.
-        raise HTTPException(400, str(exc))
+        raise HTTPException(400, str(exc)) from exc
 
     await db.commit()
     return ApplyTemplateResponse(

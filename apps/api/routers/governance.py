@@ -33,6 +33,7 @@ from packages.core.governance import (
 from packages.core.governance.policy import policy_to_dict
 from packages.core.models.governance import GovernancePolicy
 from packages.core.models.user import User
+from packages.core.permissions import user_is_effective_entity_admin
 from packages.core.services.entity_service import get_workspace
 from sqlalchemy import select
 
@@ -218,7 +219,7 @@ async def revoke_standing_grant(
     Returns the remaining grants after the revoke.
     """
     await _require_workspace(db, workspace_id, user.entity_id)
-    if user.role not in ("owner", "admin"):
+    if not await user_is_effective_entity_admin(db, user):
         raise HTTPException(403, "Only entity owners or admins can revoke standing grants")
     if kind == "action":
         removed = await remove_auto_approve_action(
@@ -315,7 +316,7 @@ async def put_approval_matrix(
     from packages.core.proposals.constants import STRATEGIST_ACTION_KEYS
 
     await _require_workspace(db, workspace_id, user.entity_id)
-    if user.role not in ("owner", "admin"):
+    if not await user_is_effective_entity_admin(db, user):
         raise HTTPException(403, "Only entity owners or admins can change approval automation")
     if req.action_key not in STRATEGIST_ACTION_KEYS:
         raise HTTPException(400, f"unknown proposal action_key: {req.action_key}")

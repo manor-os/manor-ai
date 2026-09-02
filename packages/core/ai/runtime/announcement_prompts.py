@@ -20,6 +20,7 @@ _SEVERITY_TONE_HINTS: dict[str, str] = {
 }
 
 
+
 def runtime_announcement_draft_system_prompt(severity: str) -> str:
     """Runtime-owned system prompt for platform announcement drafting."""
 
@@ -73,3 +74,5 @@ async def runtime_execute_announcement_draft_completion(
         source=RUNTIME_ANNOUNCEMENT_DRAFT_SOURCE,
         max_tokens=1500,
     )
+
+

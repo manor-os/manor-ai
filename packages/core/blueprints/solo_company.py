@@ -23,7 +23,8 @@ CONFIG_ORDER = (
     "product-video-studio-v1.json",
     "solo-video-account-studio-v1.json",
     "solo-content-distribution-studio-v1.json",
-    "solo-faceless-stickman-studio-v1.json",
+    "solo-creator-fundraising-room-v1.json",
+    "solo-creator-partnership-studio-v1.json",
     "solo-productized-service-os-v1.json",
     "solo-digital-product-store-v1.json",
 )

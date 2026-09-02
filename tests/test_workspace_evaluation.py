@@ -24,6 +24,104 @@ from packages.core.services.runtime_learning import list_runtime_evidence
 
 
 @pytest.mark.asyncio
+async def test_empty_workspace_evaluation_has_no_health_score_or_confidence(db_session) -> None:
+    entity_id = generate_ulid()
+    workspace_id = generate_ulid()
+    db_session.add(Workspace(id=workspace_id, entity_id=entity_id, name="Empty Evaluation Workspace"))
+    await db_session.commit()
+
+    snapshot = await build_workspace_evaluation(
+        db_session,
+        workspace_id,
+        entity_id=entity_id,
+        window_days=30,
+        now=datetime.now(timezone.utc),
+    )
+
+    assert snapshot["overall"]["score"] is None
+    assert snapshot["overall"]["confidence"] == "insufficient"
+
+
+@pytest.mark.asyncio
+async def test_workspace_evaluation_ignores_manual_audit_records_without_execution_evidence(db_session) -> None:
+    entity_id = generate_ulid()
+    workspace_id = generate_ulid()
+    db_session.add_all([
+        Workspace(id=workspace_id, entity_id=entity_id, name="Manual Audit Only Workspace"),
+        RuntimeEvidence(
+            id=generate_ulid(),
+            entity_id=entity_id,
+            workspace_id=workspace_id,
+            evidence_type="task_status_change",
+            source="task_ui",
+            status="succeeded",
+            summary="Operator moved a task to in progress.",
+            details={"status": "in_progress"},
+            metrics={},
+        ),
+    ])
+    await db_session.commit()
+
+    snapshot = await build_workspace_evaluation(
+        db_session,
+        workspace_id,
+        entity_id=entity_id,
+        window_days=30,
+        now=datetime.now(timezone.utc),
+    )
+
+    assert snapshot["dimensions"]["learning"]["runtime_evidence_count"] == 1
+    assert snapshot["overall"]["score"] is None
+    assert snapshot["overall"]["confidence"] == "insufficient"
+
+
+@pytest.mark.asyncio
+async def test_workspace_evaluation_requires_execution_evidence_beyond_manual_goal_measurement(
+    db_session,
+) -> None:
+    now = datetime.now(timezone.utc)
+    entity_id = generate_ulid()
+    workspace_id = generate_ulid()
+    goal_id = generate_ulid()
+    db_session.add_all([
+        Workspace(id=workspace_id, entity_id=entity_id, name="Manual Goal Only Workspace"),
+        Goal(
+            id=goal_id,
+            entity_id=entity_id,
+            workspace_id=workspace_id,
+            title="Manual score should not be execution evidence",
+            metric_key="manual_metric",
+            baseline_value=Decimal("0"),
+            current_value=Decimal("100"),
+            target_value=Decimal("100"),
+            current_value_updated_at=now,
+            measurement_source={"provider": "manual"},
+            status="achieved",
+        ),
+        GoalMeasurement(
+            goal_id=goal_id,
+            measured_at=now,
+            value=Decimal("100"),
+            source="manual",
+            meta={"entered_by": "operator"},
+        ),
+    ])
+    await db_session.commit()
+
+    snapshot = await build_workspace_evaluation(
+        db_session,
+        workspace_id,
+        entity_id=entity_id,
+        window_days=30,
+        now=now,
+    )
+
+    assert snapshot["dimensions"]["goal_impact"]["aggregate"]["measured_goal_count"] == 1
+    assert snapshot["overall"]["score"] is None
+    assert snapshot["overall"]["confidence"] == "insufficient"
+
+
+@pytest.mark.asyncio
 async def test_workspace_evaluation_rolls_up_runtime_dimensions(db_session) -> None:
     now = datetime.now(timezone.utc)
     entity_id = generate_ulid()

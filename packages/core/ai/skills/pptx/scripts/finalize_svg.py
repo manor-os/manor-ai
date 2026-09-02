@@ -71,9 +71,9 @@ def process_flatten_text(svg_file: Path, verbose: bool = False) -> bool:
     """Flatten text in a single SVG file (in-place modification)"""
     try:
         from svg_finalize.flatten_tspan import flatten_text_with_tspans
-        from xml.etree import ElementTree as ET
+        from defusedxml import ElementTree as SafeET
 
-        tree = ET.parse(str(svg_file))
+        tree = SafeET.parse(str(svg_file))
         changed = flatten_text_with_tspans(tree)
 
         if changed:

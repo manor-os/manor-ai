@@ -7,20 +7,28 @@ registers it as a document in the entity's knowledge base.
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import logging
 import os
 from typing import Any
 
 from packages.core.ai.runtime.file_actions import (
+    RuntimeFileCommitError,
+    RuntimeFileProjectionError,
+    RuntimeFileProjectionTransactionFactory,
     runtime_entity_file_root,
-    runtime_get_document_for_entity,
+    runtime_entity_filesystem_mutation_lock,
     runtime_guard_file_mutation,
-    runtime_sync_entity_file_to_knowledge,
-    runtime_trigger_document_embeddings,
-    runtime_write_entity_file_atomic,
 )
-from packages.core.ai.runtime.tool_context import runtime_tool_call_context_from_kwargs
+from packages.core.ai.runtime.file_contracts import FileMutationAction
+from packages.core.ai.runtime.tool_context import runtime_tool_call_context_from_handler
+from packages.core.services.generated_media_naming import (
+    collision_safe_artifact_path,
+    resolve_workspace_artifact_base_dir,
+    scope_workspace_artifact_path,
+)
+from packages.core.services.workspace_layout import WorkspaceArtifactDir
 
 logger = logging.getLogger(__name__)
 
@@ -41,9 +49,17 @@ SAVE_SANDBOX_FILE_SCHEMA = {
         "parameters": {
             "type": "object",
             "properties": {
+                "sandbox_id": {
+                    "type": "string",
+                    "description": "Sandbox ID returned by sandbox_create or invoke_skill.",
+                },
+                "file_path": {
+                    "type": "string",
+                    "description": "Path inside the sandbox to read. Defaults to filename for compatibility.",
+                },
                 "filename": {
                     "type": "string",
-                    "description": "The filename to retrieve from the sandbox (e.g. 'report.pptx').",
+                    "description": "Destination filename in Manor Knowledge, e.g. 'report.pptx'.",
                 },
                 "document_name": {
                     "type": "string",
@@ -63,7 +79,7 @@ SAVE_SANDBOX_FILE_SCHEMA = {
                     "description": "intermediate hides; final shows as artifact.",
                 },
             },
-            "required": ["filename"],
+            "required": ["sandbox_id", "filename"],
         },
     },
 }
@@ -78,8 +94,17 @@ LIST_SANDBOX_FILES_SCHEMA = {
         ),
         "parameters": {
             "type": "object",
-            "properties": {},
-            "required": [],
+            "properties": {
+                "sandbox_id": {
+                    "type": "string",
+                    "description": "Sandbox ID returned by sandbox_create or invoke_skill.",
+                },
+                "path": {
+                    "type": "string",
+                    "description": "Directory inside the sandbox to list. Defaults to /skill.",
+                },
+            },
+            "required": ["sandbox_id"],
         },
     },
 }
@@ -134,170 +159,223 @@ def _artifact_display_params(kwargs: dict[str, Any]) -> tuple[bool, str]:
     return display, role
 
 
+def _get_sandbox_service_url() -> str:
+    return os.getenv("SANDBOX_SERVICE_URL", "").strip()
+
+
+def _get_sandbox_api_token() -> str:
+    return os.getenv("SANDBOX_API_TOKEN", "").strip()
+
+
+def _get_client():
+    from packages.core.services.sandbox_sdk import SandboxClient
+
+    return SandboxClient(
+        base_url=_get_sandbox_service_url(),
+        timeout=180.0,
+        api_token=_get_sandbox_api_token(),
+    )
+
+
 # ---------------------------------------------------------------------------
 # Handlers
 # ---------------------------------------------------------------------------
 
-async def _save_sandbox_file(entity_id: str, **kwargs: Any) -> str:
-    runtime_context = runtime_tool_call_context_from_kwargs(kwargs)
-    filename = kwargs.get("filename", "")
+async def _save_sandbox_file(entity_id: str, user_id: str = "", **kwargs: Any) -> str:
+    runtime_context = runtime_tool_call_context_from_handler(kwargs, user_id=user_id)
+    sandbox_id = str(kwargs.get("sandbox_id") or "").strip()
+    filename = str(kwargs.get("filename") or "").strip()
+    file_path = str(kwargs.get("file_path") or kwargs.get("path") or filename).strip()
+    if not sandbox_id:
+        return json.dumps({
+            "error": (
+                "sandbox_id is required. Use sandbox_save_result, or provide "
+                "sandbox_id plus file_path for save_sandbox_file."
+            )
+        })
     if not filename:
         return json.dumps({"error": "filename is required"})
+    if not file_path:
+        return json.dumps({"error": "file_path is required"})
 
     document_name = kwargs.get("document_name") or filename
     display_as_artifact, artifact_role = _artifact_display_params(kwargs)
     safe_filename = os.path.basename(filename)
-    if safe_filename != filename:
+    if safe_filename != filename or safe_filename in {"", ".", ".."}:
         return json.dumps({"error": "filename must be a plain file name, not a path"})
 
-    sandbox_url = os.getenv("SANDBOX_SERVICE_URL", "")
-    if not sandbox_url:
+    if not _get_sandbox_service_url():
         return json.dumps({"error": "Sandbox service not configured"})
 
     # Step 1: Retrieve file from sandbox
     try:
-        import httpx
-
-        async with httpx.AsyncClient(timeout=30) as client:
-            resp = await client.post(
-                f"{sandbox_url.rstrip('/')}/files/retrieve",
-                json={"path": filename},
+        client = _get_client()
+        try:
+            read_result = await client.read_file_base64(
+                sandbox_id=sandbox_id,
+                path=file_path,
             )
-            if resp.status_code == 404:
-                return json.dumps({
-                    "error": f"File '{filename}' not found in sandbox. "
-                    "Make sure the script saves files to /tmp/sandbox-output/ directory.",
-                    "hint": "Modify your script to save output to /tmp/sandbox-output/",
-                })
-            if resp.status_code == 413:
-                return json.dumps({"error": "File too large (max 50MB)"})
-            resp.raise_for_status()
-            data = resp.json()
+        finally:
+            await client.close()
     except Exception as e:
         logger.error("Failed to retrieve file from sandbox: %s", e)
         return json.dumps({"error": f"Failed to retrieve file from sandbox: {e}"})
 
     # Step 2: Decode content
-    content_bytes = base64.b64decode(data["content_base64"])
+    content_bytes = base64.b64decode(read_result.content_base64)
 
     # Step 3: Save to entity filesystem
     entity_dir = runtime_entity_file_root(entity_id)
     if not entity_dir:
         return json.dumps({"error": "Entity filesystem is not enabled"})
 
-    blocked = await runtime_guard_file_mutation(
-        entity_id=entity_id,
-        user_id=kwargs.get("user_id") or runtime_context.user_id,
-        conversation_id=runtime_context.conversation_id,
-        tool_name="save_sandbox_file",
-        action="save_file",
-        paths=[safe_filename],
-        approval_token=kwargs.get("approval_token"),
-        content_preview={
-            "save_as": safe_filename,
-            "source": filename,
-            "document_name": document_name,
-            "bytes": len(content_bytes),
-        },
-    )
-    if blocked:
-        return blocked
-
     rel_path = safe_filename
-    target = os.path.join(entity_dir, rel_path)
-
-    # Avoid overwriting existing files
-    if os.path.exists(target):
-        import time as _time
-        base, ext_part = os.path.splitext(safe_filename)
-        rel_path = f"{base}_{int(_time.time())}{ext_part}"
-
-    try:
-        target = runtime_write_entity_file_atomic(
-            entity_id,
-            rel_path,
-            content_bytes,
-            expected_size=len(content_bytes),
-            allow_empty=False,
-        )
-    except Exception as exc:  # noqa: BLE001
-        return json.dumps({"error": f"Entity filesystem is not available: {exc}"})
-
-    # Step 4: Register in documents database
-    from packages.core.database import async_session
-
-    sync = await runtime_sync_entity_file_to_knowledge(
-        entity_id=entity_id,
-        abs_path=target,
-        entity_root=entity_dir,
-        source="sandbox",
-        created_by=kwargs.get("user_id") or runtime_context.user_id or "ai-agent",
-        force=True,
-        workspace_id=runtime_context.workspace_id,
-        task_id=runtime_context.task_id,
-        agent_id=kwargs.get("agent_id") or runtime_context.agent_id,
-        conversation_id=runtime_context.conversation_id,
-        user_id=kwargs.get("user_id") or runtime_context.user_id,
-        tool_name="save_sandbox_file",
-    )
-    async with async_session() as db:
-        doc = (
-            await runtime_get_document_for_entity(
-                db,
+    if runtime_context.workspace_id:
+        try:
+            workspace_base = await resolve_workspace_artifact_base_dir(
                 entity_id=entity_id,
-                document_id=sync.document_id,
+                workspace_id=runtime_context.workspace_id,
+                task_id=runtime_context.task_id,
             )
-            if sync.document_id
-            else None
+        except Exception as exc:  # noqa: BLE001
+            return json.dumps({"error": f"Workspace artifact scope is unavailable: {exc}"})
+        if not workspace_base:
+            return json.dumps({"error": "Workspace artifact scope is unavailable"})
+        rel_path = scope_workspace_artifact_path(
+            rel_path,
+            workspace_base,
+            default_subdir=WorkspaceArtifactDir.ARTIFACTS.value,
         )
-        if not doc:
-            return json.dumps({"error": f"Document sync failed: {sync.reason}"})
+    async with runtime_entity_filesystem_mutation_lock(entity_dir):
+        rel_path = collision_safe_artifact_path(entity_dir, rel_path)
 
-        # Trigger embedding for text-based documents
-        if doc.file_type in ("txt", "md", "csv", "json", "html", "pdf"):
-            runtime_trigger_document_embeddings(doc.id)
+        blocked = await runtime_guard_file_mutation(
+            entity_id=entity_id,
+            user_id=runtime_context.user_id,
+            conversation_id=runtime_context.conversation_id,
+            workspace_id=runtime_context.workspace_id,
+            task_id=runtime_context.task_id,
+            runtime_envelope=runtime_context.runtime_envelope,
+            tool_name="save_sandbox_file",
+            action=FileMutationAction.SAVE_FILE,
+            paths=[rel_path],
+            approval_token=kwargs.get("approval_token"),
+            content_preview={
+                "save_as": rel_path,
+                "source": file_path,
+                "document_name": document_name,
+                "bytes": len(content_bytes),
+            },
+            approval_payload={
+                "save_as": rel_path,
+                "content_sha256": hashlib.sha256(content_bytes).hexdigest(),
+            },
+        )
+        if blocked:
+            return blocked
 
-        result = {
-            "saved": True,
-            "display_as_artifact": display_as_artifact,
-            "artifact_role": artifact_role,
-            "document_id": doc.id,
-            "name": doc.name,
-            "file_size": doc.file_size,
-            "mime_type": doc.mime_type,
-            "message": f"File '{doc.name}' saved to knowledge base successfully.",
-        }
+        content_sha256 = hashlib.sha256(content_bytes).hexdigest()
+        try:
+            async with RuntimeFileProjectionTransactionFactory.create(
+                entity_id,
+            ) as transaction:
+                target = transaction.write_bytes(
+                    rel_path,
+                    content_bytes,
+                    expected_content_sha256=content_sha256,
+                    expected_size=len(content_bytes),
+                    allow_empty=False,
+                    require_missing=True,
+                )
+                sync = await transaction.project_file(
+                    abs_path=target,
+                    entity_root=entity_dir,
+                    source="sandbox",
+                    created_by=runtime_context.user_id or "ai-agent",
+                    force=True,
+                    workspace_id=runtime_context.workspace_id,
+                    task_id=runtime_context.task_id,
+                    agent_id=runtime_context.agent_id,
+                    conversation_id=runtime_context.conversation_id,
+                    user_id=runtime_context.user_id,
+                    tool_name="save_sandbox_file",
+                    expected_content_sha256=content_sha256,
+                )
+                await transaction.commit()
+        except RuntimeFileCommitError as exc:
+            return json.dumps({
+                "error": f"Entity filesystem is not available: {exc}",
+                "saved": False,
+            })
+        except RuntimeFileProjectionError as exc:
+            return json.dumps({
+                "error": (
+                    "Document sync failed and the saved file was rolled back: "
+                    f"{exc.reason}"
+                ),
+                "saved": False,
+                "knowledge_sync_reason": exc.reason,
+            })
+        except Exception as exc:  # noqa: BLE001
+            return json.dumps({"error": f"File was not committed: {exc}", "saved": False})
 
-    # Step 5: Clean up sandbox copy
-    try:
-        import httpx
-
-        async with httpx.AsyncClient(timeout=10) as client:
-            await client.delete(
-                f"{sandbox_url.rstrip('/')}/files/{safe_filename}"
-            )
-    except Exception:
-        pass  # Non-critical
+    saved_name = getattr(sync, "name", None) or os.path.basename(target)
+    file_size = getattr(sync, "file_size", None)
+    mime_type = getattr(sync, "mime_type", None)
+    if file_size is None:
+        file_size = len(content_bytes)
+    if not mime_type:
+        extension = os.path.splitext(saved_name)[1].lower().lstrip(".")
+        mime_type = _MIME_MAP.get(extension, "application/octet-stream")
+    result = {
+        "saved": True,
+        "display_as_artifact": display_as_artifact,
+        "artifact_role": artifact_role,
+        "document_id": sync.document_id,
+        "name": saved_name,
+        "file_size": file_size,
+        "mime_type": mime_type,
+        "message": f"File '{saved_name}' saved to knowledge base successfully.",
+    }
 
     return json.dumps(result)
 
 
 async def _list_sandbox_files(entity_id: str, **kwargs: Any) -> str:
-    sandbox_url = os.getenv("SANDBOX_SERVICE_URL", "")
-    if not sandbox_url:
+    sandbox_id = str(kwargs.get("sandbox_id") or "").strip()
+    path = str(kwargs.get("path") or "/skill").strip() or "/skill"
+    if not sandbox_id:
+        return json.dumps({"error": "sandbox_id is required"})
+    if not _get_sandbox_service_url():
         return json.dumps({"error": "Sandbox service not configured"})
 
     try:
-        import httpx
+        import shlex
 
-        async with httpx.AsyncClient(timeout=10) as client:
-            resp = await client.get(f"{sandbox_url.rstrip('/')}/files")
-            resp.raise_for_status()
-            data = resp.json()
+        client = _get_client()
+        try:
+            result = await client.exec(
+                sandbox_id=sandbox_id,
+                command=f"find {shlex.quote(path)} -maxdepth 3 -type f | sort | head -200",
+                timeout=20,
+            )
+        finally:
+            await client.close()
     except Exception as e:
         return json.dumps({"error": f"Failed to list sandbox files: {e}"})
 
-    return json.dumps(data)
+    files = [
+        line.strip()
+        for line in (result.stdout or "").splitlines()
+        if line.strip()
+    ]
+    return json.dumps({
+        "sandbox_id": sandbox_id,
+        "path": path,
+        "files": files,
+        "exit_code": result.exit_code,
+        "stderr": result.stderr,
+    })
 
 
 # ---------------------------------------------------------------------------

@@ -20,13 +20,24 @@ logger = logging.getLogger(__name__)
 
 STALE_STREAM_GRACE_MINUTES = 10
 
+ORIGIN_USER_MESSAGE_ID_META_KEY = "origin_user_message_id"
+
 STREAM_MESSAGE_IDENTITY_META_KEYS = (
     "channel_type",
     "chat_id",
     "sender_id",
     "source_id",
     "session_id",
+    "client_turn_id",
+    ORIGIN_USER_MESSAGE_ID_META_KEY,
 )
+
+
+def assistant_message_origin_meta(
+    origin_user_message_id: str | None,
+) -> dict[str, str]:
+    value = str(origin_user_message_id or "").strip()
+    return {ORIGIN_USER_MESSAGE_ID_META_KEY: value} if value else {}
 
 
 def assistant_stream_interrupted_meta(meta: dict | None = None) -> dict:
@@ -47,6 +58,7 @@ async def add_message(
     attachments: dict | list | None = None,
     author_subscription_id: str | None = None,
     meta: dict | None = None,
+    response_surface_event_id: str | None = None,
     message_kind: str = "text",
     pending_action: dict | None = None,
     refs: list[dict] | None = None,
@@ -64,6 +76,7 @@ async def add_message(
         attachments=attachments,
         token_usage=token_usage,
         meta=meta or {},
+        response_surface_event_id=response_surface_event_id,
         author_kind=author_kind,
         author_subscription_id=author_subscription_id if author_kind == "agent" else None,
         message_kind=message_kind,
@@ -140,11 +153,32 @@ async def resolve_author_subscription_id(
     entity_id: str | None,
     workspace_id: str | None,
     agent_id: str | None,
+    conversation_id: str | None = None,
 ) -> str | None:
     """Find the workspace deployment row for an agent response."""
 
     if not entity_id or not workspace_id or not agent_id:
         return None
+    if conversation_id:
+        bound_sub = (await db.execute(
+            select(AgentSubscription.id)
+            .join(
+                Conversation,
+                Conversation.agent_subscription_id == AgentSubscription.id,
+            )
+            .where(
+                Conversation.id == conversation_id,
+                Conversation.entity_id == entity_id,
+                Conversation.workspace_id == workspace_id,
+                Conversation.agent_id == agent_id,
+                AgentSubscription.entity_id == entity_id,
+                AgentSubscription.workspace_id == workspace_id,
+                AgentSubscription.agent_id == agent_id,
+                AgentSubscription.status == "active",
+            )
+        )).scalar_one_or_none()
+        if bound_sub:
+            return bound_sub
     sub = (await db.execute(
         select(AgentSubscription.id).where(
             AgentSubscription.entity_id == entity_id,
@@ -171,16 +205,19 @@ async def create_assistant_stream_placeholder(
     entity_id: str | None,
     workspace_id: str | None,
     agent_id: str | None,
+    author_subscription_id: str | None = None,
     meta: dict | None = None,
 ) -> Message:
     """Create a durable assistant row before a long-running stream starts."""
 
-    author_subscription_id = await resolve_author_subscription_id(
-        db,
-        entity_id=entity_id,
-        workspace_id=workspace_id,
-        agent_id=agent_id,
-    )
+    if author_subscription_id is None:
+        author_subscription_id = await resolve_author_subscription_id(
+            db,
+            entity_id=entity_id,
+            workspace_id=workspace_id,
+            agent_id=agent_id,
+            conversation_id=conversation_id,
+        )
     return await add_message(
         db,
         conversation_id,
@@ -216,6 +253,7 @@ async def save_or_update_assistant_stream_message(
                 entity_id=entity_id,
                 workspace_id=workspace_id,
                 agent_id=agent_id,
+                conversation_id=conversation_id,
             )
             action = (
                 pending_action
@@ -225,6 +263,12 @@ async def save_or_update_assistant_stream_message(
             if message_id:
                 existing_meta = (await save_db.execute(
                     select(Message.meta).where(
+                        Message.id == message_id,
+                        Message.conversation_id == conversation_id,
+                    )
+                )).scalar_one_or_none()
+                existing_author_subscription_id = (await save_db.execute(
+                    select(Message.author_subscription_id).where(
                         Message.id == message_id,
                         Message.conversation_id == conversation_id,
                     )
@@ -247,7 +291,10 @@ async def save_or_update_assistant_stream_message(
                         token_usage=token_usage,
                         meta=merged_meta,
                         author_kind="agent",
-                        author_subscription_id=author_subscription_id,
+                        author_subscription_id=(
+                            existing_author_subscription_id
+                            or author_subscription_id
+                        ),
                         message_kind=message_kind,
                         pending_action=action,
                     )
@@ -306,6 +353,17 @@ async def save_assistant_stream_error_message(
     meta: dict | None = None,
 ) -> str | None:
     """Persist a streaming failure so workspace chat/history keeps it."""
+    error_meta = dict(meta or {})
+    # A failed turn must never retain a successful, interactive assistant
+    # surface. Keep durable identity/runtime metadata, but remove the blocks
+    # that could still accept actions after the turn has failed.
+    error_meta.pop("assistant_blocks", None)
+    error_meta.pop("assistant_blocks_schema", None)
+    error_meta.update({
+        "stream_status": "error",
+        "stream_error": True,
+        "error_message": error_message,
+    })
     return await save_or_update_assistant_stream_message(
         conversation_id=conversation_id,
         entity_id=entity_id,
@@ -313,12 +371,7 @@ async def save_assistant_stream_error_message(
         agent_id=agent_id,
         message_id=message_id,
         content=runtime_assistant_stream_error_content(error_message),
-        meta={
-            "stream_status": "error",
-            "stream_error": True,
-            "error_message": error_message,
-            **(meta or {}),
-        },
+        meta=error_meta,
     )
 
 

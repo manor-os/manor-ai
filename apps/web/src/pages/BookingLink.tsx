@@ -2,19 +2,39 @@ import { useEffect, useMemo, useState } from "react";
 import { useMutation, useQuery } from "@tanstack/react-query";
 import { useNavigate, useParams } from "react-router-dom";
 import LoadingSpinner from "../components/ui/LoadingSpinner";
+import Select from "../components/ui/Select";
 import { IconCalendar, IconCheck, IconChevronLeft, IconChevronRight, IconClock, IconExternalLink, IconManorLogo } from "../components/icons";
 import { api, ApiError } from "../lib/api";
 import type { BookingAvailableSlot, BookingConfirmation } from "../lib/types";
 
-const DAY_LABELS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
-const CALENDAR_WEEKDAYS = ["M", "T", "W", "T", "F", "S", "S"];
+const CALENDAR_WEEKDAYS = ["S", "M", "T", "W", "T", "F", "S"];
+const AVAILABILITY_REFRESH_INTERVAL_MS = 30_000;
 
 function locationLabel(value: string): string {
   return value.replace("_", " ");
 }
 
-function dateKey(slot: BookingAvailableSlot): string {
-  return slot.starts_at.slice(0, 10);
+function browserTimeZone(): string {
+  try {
+    return Intl.DateTimeFormat().resolvedOptions().timeZone || "";
+  } catch {
+    return "";
+  }
+}
+
+function dateKeyFromInstant(value: string | Date, timezone: string): string {
+  const parts = new Intl.DateTimeFormat("en-US", {
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    timeZone: timezone,
+  }).formatToParts(new Date(value));
+  const values = Object.fromEntries(parts.map((part) => [part.type, part.value]));
+  return `${values.year}-${values.month}-${values.day}`;
+}
+
+function dateKey(slot: BookingAvailableSlot, timezone: string): string {
+  return dateKeyFromInstant(slot.starts_at, timezone);
 }
 
 function parseDateKey(key: string): Date {
@@ -33,6 +53,23 @@ function monthKeyFromDateKey(key: string): string {
   return `${key.slice(0, 7)}-01`;
 }
 
+function monthKeyFromInstant(value: string | Date, timezone: string): string {
+  return monthKeyFromDateKey(dateKeyFromInstant(value, timezone));
+}
+
+function monthKeysInRange(startsAt: string, endsAt: string, timezone: string): string[] {
+  const first = parseDateKey(monthKeyFromInstant(startsAt, timezone));
+  const lastInstant = new Date(Math.max(new Date(endsAt).getTime() - 1, 0));
+  const last = parseDateKey(monthKeyFromInstant(lastInstant, timezone));
+  const months: string[] = [];
+  const cursor = new Date(first);
+  while (cursor <= last) {
+    months.push(formatDateKeyFromDate(cursor).slice(0, 7) + "-01");
+    cursor.setMonth(cursor.getMonth() + 1, 1);
+  }
+  return months;
+}
+
 function formatMonthLabel(monthKey: string): string {
   return new Intl.DateTimeFormat(undefined, {
     month: "long",
@@ -43,9 +80,9 @@ function formatMonthLabel(monthKey: string): string {
 function calendarCells(monthKey: string) {
   const monthDate = parseDateKey(monthKey);
   const firstOfMonth = new Date(monthDate.getFullYear(), monthDate.getMonth(), 1, 12);
-  const mondayOffset = (firstOfMonth.getDay() + 6) % 7;
+  const sundayOffset = firstOfMonth.getDay();
   const start = new Date(firstOfMonth);
-  start.setDate(firstOfMonth.getDate() - mondayOffset);
+  start.setDate(firstOfMonth.getDate() - sundayOffset);
 
   return Array.from({ length: 42 }, (_, index) => {
     const cellDate = new Date(start);
@@ -78,6 +115,27 @@ function formatWhen(startsAt: string, endsAt: string, timezone: string): string 
   return `${date}, ${start} - ${end}`;
 }
 
+function formatSlotLabel(startsAt: string, endsAt: string, timezone: string): string {
+  const formatter = new Intl.DateTimeFormat(undefined, {
+    hour: "numeric",
+    minute: "2-digit",
+    timeZone: timezone,
+  });
+  return `${formatter.format(new Date(startsAt))} - ${formatter.format(new Date(endsAt))}`;
+}
+
+function timeZoneOptions(...preferred: string[]) {
+  const intlWithSupportedValues = Intl as typeof Intl & {
+    supportedValuesOf?: (key: "timeZone") => string[];
+  };
+  const supported = intlWithSupportedValues.supportedValuesOf?.("timeZone") || [];
+  const values = Array.from(new Set([...preferred.filter(Boolean), ...supported]));
+  return values.map((value) => ({
+    value,
+    label: value.replaceAll("_", " "),
+  }));
+}
+
 export default function BookingLink() {
   const { ownerId, slug = "" } = useParams<{ ownerId?: string; slug: string }>();
   const navigate = useNavigate();
@@ -86,17 +144,42 @@ export default function BookingLink() {
   const [guestName, setGuestName] = useState("");
   const [guestEmail, setGuestEmail] = useState("");
   const [note, setNote] = useState("");
-  const [visibleMonth, setVisibleMonth] = useState("");
+  const [visibleMonth, setVisibleMonth] = useState(() =>
+    monthKeyFromInstant(new Date(), browserTimeZone() || "UTC"),
+  );
   const [confirmation, setConfirmation] = useState<BookingConfirmation | null>(null);
+  const [viewerTimezone, setViewerTimezone] = useState(browserTimeZone);
+  const [availabilityChanged, setAvailabilityChanged] = useState(false);
 
-  const { data, isLoading, error } = useQuery({
-    queryKey: ["public-booking-link", ownerId || "", slug],
-    queryFn: () => api.calendarSettings.publicBookingLink(slug, ownerId),
-    enabled: Boolean(slug),
+  const { data, isLoading, error, refetch } = useQuery({
+    queryKey: ["public-booking-link", ownerId || "", slug, visibleMonth, viewerTimezone],
+    queryFn: () => api.calendarSettings.publicBookingLink(
+      slug,
+      ownerId,
+      visibleMonth.slice(0, 7),
+      viewerTimezone || undefined,
+    ),
+    enabled: Boolean(slug && visibleMonth),
+    staleTime: 0,
+    refetchInterval: confirmation ? false : AVAILABILITY_REFRESH_INTERVAL_MS,
+    refetchIntervalInBackground: false,
+    refetchOnWindowFocus: !confirmation,
   });
+  const availabilityUnavailable = error instanceof ApiError && error.status === 503;
 
   const slots = data?.available_slots || [];
-  const enabledHours = (data?.working_hours || []).filter((row) => row.enabled);
+  const displayTimezone = viewerTimezone || data?.timezone || "UTC";
+  const timezoneOptions = useMemo(
+    () => timeZoneOptions(displayTimezone, data?.timezone || ""),
+    [data?.timezone, displayTimezone],
+  );
+
+  useEffect(() => {
+    if (!viewerTimezone && data?.timezone) {
+      setViewerTimezone(data.timezone);
+      setVisibleMonth(monthKeyFromInstant(new Date(), data.timezone));
+    }
+  }, [data?.timezone, viewerTimezone]);
 
   useEffect(() => {
     if (!ownerId && data?.owner_id && data.slug) {
@@ -107,7 +190,7 @@ export default function BookingLink() {
   const groupedSlots = useMemo(() => {
     const groups = new Map<string, BookingAvailableSlot[]>();
     slots.forEach((slot) => {
-      const key = dateKey(slot);
+      const key = dateKey(slot, displayTimezone);
       groups.set(key, [...(groups.get(key) || []), slot]);
     });
     return Array.from(groups.entries())
@@ -116,7 +199,7 @@ export default function BookingLink() {
         key,
         items: [...items].sort((a, b) => a.starts_at.localeCompare(b.starts_at)),
       }));
-  }, [slots]);
+  }, [displayTimezone, slots]);
 
   const slotsByDate = useMemo(() => {
     const map = new Map<string, BookingAvailableSlot[]>();
@@ -124,50 +207,49 @@ export default function BookingLink() {
     return map;
   }, [groupedSlots]);
 
-  const availableMonthKeys = useMemo(
-    () => Array.from(new Set(groupedSlots.map((group) => monthKeyFromDateKey(group.key)))),
-    [groupedSlots],
-  );
+  const availableMonthKeys = useMemo(() => {
+    if (!data) return [];
+    if (data.availability_range_start && data.availability_range_end) {
+      return monthKeysInRange(
+        data.availability_range_start,
+        data.availability_range_end,
+        displayTimezone,
+      );
+    }
+    return Array.from(new Set(
+      groupedSlots.map((group) => monthKeyFromDateKey(group.key)),
+    ));
+  }, [data, displayTimezone, groupedSlots]);
 
   useEffect(() => {
-    if (!groupedSlots.length) return;
+    if (!groupedSlots.length) {
+      if (selectedSlot) {
+        setSelectedSlot("");
+        setSelectedDate("");
+        setAvailabilityChanged(true);
+      }
+      return;
+    }
     const slotExists = slots.some((slot) => slot.starts_at === selectedSlot);
-    if (!selectedSlot || !slotExists) {
+    if (selectedSlot && !slotExists) {
+      setSelectedSlot("");
+      setSelectedDate("");
+      setAvailabilityChanged(true);
+      return;
+    }
+    if (!selectedSlot && !availabilityChanged) {
       const firstGroup = groupedSlots[0];
       setSelectedDate(firstGroup.key);
       setSelectedSlot(firstGroup.items[0]?.starts_at || "");
-      setVisibleMonth(monthKeyFromDateKey(firstGroup.key));
       return;
     }
-    if (!visibleMonth) {
-      setVisibleMonth(monthKeyFromDateKey(selectedDate || groupedSlots[0].key));
-    }
-  }, [groupedSlots, selectedDate, selectedSlot, slots, visibleMonth]);
+  }, [availabilityChanged, groupedSlots, selectedSlot, slots]);
 
   const activeSlots = slotsByDate.get(selectedDate) || [];
   const chosenSlot = slots.find((slot) => slot.starts_at === selectedSlot) || null;
-  const currentMonth = visibleMonth || availableMonthKeys[0] || "";
+  const currentMonth = visibleMonth;
   const currentMonthIndex = availableMonthKeys.indexOf(currentMonth);
   const calendarDays = currentMonth ? calendarCells(currentMonth) : [];
-
-  const selectDate = (key: string) => {
-    const items = slotsByDate.get(key);
-    if (!items?.length) return;
-    setSelectedDate(key);
-    setSelectedSlot(items[0].starts_at);
-  };
-
-  const moveMonth = (direction: -1 | 1) => {
-    if (currentMonthIndex < 0) return;
-    const nextMonth = availableMonthKeys[currentMonthIndex + direction];
-    if (!nextMonth) return;
-    setVisibleMonth(nextMonth);
-    const firstGroupInMonth = groupedSlots.find((group) => monthKeyFromDateKey(group.key) === nextMonth);
-    if (firstGroupInMonth) {
-      setSelectedDate(firstGroupInMonth.key);
-      setSelectedSlot(firstGroupInMonth.items[0]?.starts_at || "");
-    }
-  };
 
   const bookMutation = useMutation({
     mutationFn: () => {
@@ -177,10 +259,46 @@ export default function BookingLink() {
         guest_name: guestName.trim(),
         guest_email: guestEmail.trim(),
         note: note.trim() || null,
+        timezone: displayTimezone,
       }, ownerId);
     },
-    onSuccess: (result) => setConfirmation(result),
   });
+
+  const selectSlot = (startsAt: string) => {
+    setSelectedSlot(startsAt);
+    setAvailabilityChanged(false);
+    bookMutation.reset();
+  };
+
+  const selectDate = (key: string) => {
+    const items = slotsByDate.get(key);
+    if (!items?.length) return;
+    setSelectedDate(key);
+    selectSlot(items[0].starts_at);
+  };
+
+  const moveMonth = (direction: -1 | 1) => {
+    if (currentMonthIndex < 0) return;
+    const nextMonth = availableMonthKeys[currentMonthIndex + direction];
+    if (!nextMonth) return;
+    setVisibleMonth(nextMonth);
+    setSelectedDate("");
+    setSelectedSlot("");
+    setAvailabilityChanged(false);
+    bookMutation.reset();
+  };
+
+  const submitBooking = async () => {
+    try {
+      const result = await bookMutation.mutateAsync();
+      setConfirmation(result);
+    } catch (mutationError) {
+      if (!(mutationError instanceof ApiError) || mutationError.status !== 409) return;
+      setSelectedSlot("");
+      setAvailabilityChanged(true);
+      await refetch();
+    }
+  };
 
   const canSubmit = Boolean(chosenSlot && guestName.trim() && guestEmail.trim() && !bookMutation.isPending);
 
@@ -204,11 +322,15 @@ export default function BookingLink() {
           </section>
         )}
 
-        {!isLoading && (error || !data) && (
+        {!isLoading && !confirmation && (error || !data) && (
           <section className="booking-shell booking-shell--single">
             <div className="booking-empty-state booking-empty-state--stacked">
-              <h1>Booking link unavailable</h1>
-              <p>This link is disabled or no longer exists.</p>
+              <h1>{availabilityUnavailable ? "Availability temporarily unavailable" : "Booking link unavailable"}</h1>
+              <p>
+                {availabilityUnavailable
+                  ? "The connected calendars could not be checked. Please try again shortly."
+                  : "This link is disabled or no longer exists."}
+              </p>
             </div>
           </section>
         )}
@@ -221,11 +343,13 @@ export default function BookingLink() {
               </div>
               <h1 className="booking-title">{data.name}</h1>
               <p className="booking-confirmed-time">
-                {formatWhen(confirmation.starts_at, confirmation.ends_at, confirmation.timezone)}
+                {formatWhen(confirmation.starts_at, confirmation.ends_at, displayTimezone)}
               </p>
               <p className="booking-confirmed-copy">
                 {confirmation.calendar_event_created
-                  ? `Calendar invitation sent to ${confirmation.guest_email}.`
+                  ? confirmation.host_email
+                    ? `Calendar invitation from ${confirmation.host_email} sent to ${confirmation.guest_email}.`
+                    : `Calendar invitation sent to ${confirmation.guest_email}.`
                   : confirmation.email_sent
                     ? `Confirmation email sent to ${confirmation.guest_email}.`
                     : "Your booking is confirmed."}
@@ -246,7 +370,7 @@ export default function BookingLink() {
           </section>
         )}
 
-        {!isLoading && data && !confirmation && (
+        {!isLoading && !error && data && !confirmation && (
           <section className="booking-shell">
             <aside className="booking-side">
               <div className="booking-side-main">
@@ -267,7 +391,7 @@ export default function BookingLink() {
                   <IconExternalLink size={14} /> {locationLabel(data.location_type)}
                 </span>
                 <span className="booking-pill booking-pill--timezone">
-                  {data.timezone}
+                  {displayTimezone}
                 </span>
               </div>
 
@@ -276,79 +400,82 @@ export default function BookingLink() {
               )}
 
               <div>
-                <h2 className="booking-section-title">Availability</h2>
-                <div className="booking-availability-grid">
-                  {enabledHours.map((row) => (
-                    <div key={row.day_of_week} className="booking-availability-card">
-                      <span>{DAY_LABELS[row.day_of_week]}</span>
-                      <strong>{row.start} - {row.end}</strong>
-                    </div>
-                  ))}
-                  {enabledHours.length === 0 && (
-                    <div className="booking-muted-line">No availability configured.</div>
-                  )}
-                </div>
+                <h2 className="booking-section-title">Time zone</h2>
+                <Select
+                  value={displayTimezone}
+                  onChange={(nextTimezone) => {
+                    setViewerTimezone(nextTimezone);
+                    setSelectedDate("");
+                    setSelectedSlot("");
+                    setAvailabilityChanged(false);
+                    setVisibleMonth(monthKeyFromInstant(new Date(), nextTimezone));
+                    bookMutation.reset();
+                  }}
+                  options={timezoneOptions}
+                  dropdownMinWidth={260}
+                  buttonStyle={{ width: "100%", minHeight: 40, fontSize: 12 }}
+                  dropdownStyle={{ maxHeight: 280 }}
+                />
+                <p className="booking-muted-line" style={{ marginTop: 8 }}>
+                  Times are shown in your local time zone. You can change it here.
+                </p>
               </div>
             </aside>
 
             <div className="booking-content">
               <div className="booking-time-section">
                 <h2 className="booking-content-title">Select a time</h2>
-                {groupedSlots.length === 0 ? (
-                  <div className="booking-no-slots">
-                    No times available right now.
-                  </div>
-                ) : (
-                  <div className="booking-slot-picker">
-                    <div className="booking-calendar-panel">
-                      <div className="booking-calendar-header">
-                        <button
-                          type="button"
-                          className="booking-calendar-nav"
-                          aria-label="Previous month"
-                          disabled={currentMonthIndex <= 0}
-                          onClick={() => moveMonth(-1)}
-                        >
-                          <IconChevronLeft size={14} />
-                        </button>
-                        <strong>{currentMonth ? formatMonthLabel(currentMonth) : "Available dates"}</strong>
-                        <button
-                          type="button"
-                          className="booking-calendar-nav"
-                          aria-label="Next month"
-                          disabled={currentMonthIndex < 0 || currentMonthIndex >= availableMonthKeys.length - 1}
-                          onClick={() => moveMonth(1)}
-                        >
-                          <IconChevronRight size={14} />
-                        </button>
-                      </div>
-                      <div className="booking-calendar-weekdays">
-                        {CALENDAR_WEEKDAYS.map((label, index) => (
-                          <span key={`${label}-${index}`}>{label}</span>
-                        ))}
-                      </div>
-                      <div className="booking-calendar-grid">
-                        {calendarDays.map((cell) => {
-                          const daySlots = slotsByDate.get(cell.key) || [];
-                          const active = cell.key === selectedDate;
-                          const available = daySlots.length > 0;
-                          return (
-                            <button
-                              key={cell.key}
-                              type="button"
-                              onClick={() => selectDate(cell.key)}
-                              aria-pressed={active}
-                              disabled={!available}
-                              className={`booking-calendar-day${active ? " is-active" : ""}${cell.isCurrentMonth ? "" : " is-outside"}${available ? " is-available" : ""}`}
-                              aria-label={available ? `${cell.key}, ${daySlots.length} available times` : `${cell.key}, no available times`}
-                            >
-                              <span>{cell.day}</span>
-                              {available && <small>{daySlots.length}</small>}
-                            </button>
-                          );
-                        })}
-                      </div>
+                <div className="booking-slot-picker">
+                  <div className="booking-calendar-panel">
+                    <div className="booking-calendar-header">
+                      <button
+                        type="button"
+                        className="booking-calendar-nav"
+                        aria-label="Previous month"
+                        disabled={currentMonthIndex <= 0}
+                        onClick={() => moveMonth(-1)}
+                      >
+                        <IconChevronLeft size={14} />
+                      </button>
+                      <strong>{currentMonth ? formatMonthLabel(currentMonth) : "Available dates"}</strong>
+                      <button
+                        type="button"
+                        className="booking-calendar-nav"
+                        aria-label="Next month"
+                        disabled={currentMonthIndex < 0 || currentMonthIndex >= availableMonthKeys.length - 1}
+                        onClick={() => moveMonth(1)}
+                      >
+                        <IconChevronRight size={14} />
+                      </button>
                     </div>
+                    <div className="booking-calendar-weekdays">
+                      {CALENDAR_WEEKDAYS.map((label, index) => (
+                        <span key={`${label}-${index}`}>{label}</span>
+                      ))}
+                    </div>
+                    <div className="booking-calendar-grid">
+                      {calendarDays.map((cell) => {
+                        const daySlots = slotsByDate.get(cell.key) || [];
+                        const active = cell.key === selectedDate;
+                        const available = daySlots.length > 0;
+                        return (
+                          <button
+                            key={cell.key}
+                            type="button"
+                            onClick={() => selectDate(cell.key)}
+                            aria-pressed={active}
+                            disabled={!available}
+                            className={`booking-calendar-day${active ? " is-active" : ""}${cell.isCurrentMonth ? "" : " is-outside"}${available ? " is-available" : ""}`}
+                            aria-label={available ? `${cell.key}, ${daySlots.length} available times` : `${cell.key}, no available times`}
+                          >
+                            <span>{cell.day}</span>
+                            {available && <small>{daySlots.length}</small>}
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </div>
+                  {activeSlots.length > 0 ? (
                     <div className="booking-slot-grid">
                       {activeSlots.map((slot) => {
                         const active = slot.starts_at === selectedSlot;
@@ -356,17 +483,21 @@ export default function BookingLink() {
                           <button
                             key={slot.starts_at}
                             type="button"
-                            onClick={() => setSelectedSlot(slot.starts_at)}
+                            onClick={() => selectSlot(slot.starts_at)}
                             aria-pressed={active}
                             className={`booking-slot-button${active ? " is-active" : ""}`}
                           >
-                            {slot.label}
+                            {formatSlotLabel(slot.starts_at, slot.ends_at, displayTimezone)}
                           </button>
                         );
                       })}
                     </div>
-                  </div>
-                )}
+                  ) : (
+                    <div className="booking-no-slots">
+                      No times available in this month. Try another month.
+                    </div>
+                  )}
+                </div>
               </div>
 
               <div className="booking-form">
@@ -375,7 +506,12 @@ export default function BookingLink() {
                   {chosenSlot && (
                     <div className="booking-selected-time">
                       <span>Selected</span>
-                      <strong>{formatWhen(chosenSlot.starts_at, chosenSlot.ends_at, data.timezone)}</strong>
+                      <strong>{formatWhen(chosenSlot.starts_at, chosenSlot.ends_at, displayTimezone)}</strong>
+                    </div>
+                  )}
+                  {availabilityChanged && (
+                    <div className="booking-availability-notice" role="status" aria-live="polite">
+                      Your previous time is no longer available. Please choose another slot.
                     </div>
                   )}
                 </div>
@@ -392,11 +528,15 @@ export default function BookingLink() {
                   <textarea className="manor-input" value={note} onChange={(event) => setNote(event.target.value)} rows={3} placeholder="Optional" style={{ resize: "vertical", paddingTop: 10 }} />
                 </div>
                 {bookMutation.error && (
-                  <div className="booking-error-text">
-                    {bookMutation.error instanceof ApiError ? bookMutation.error.message : "Could not book this time"}
+                  <div className="booking-error-text" role="alert" aria-live="polite">
+                    {bookMutation.error instanceof ApiError && bookMutation.error.status === 409
+                      ? "That time is no longer available. Choose another slot."
+                      : bookMutation.error instanceof ApiError
+                        ? bookMutation.error.message
+                        : "Could not book this time"}
                   </div>
                 )}
-                <button className="btn-manor booking-submit" type="button" disabled={!canSubmit} onClick={() => bookMutation.mutate()}>
+                <button className="btn-manor booking-submit" type="button" disabled={!canSubmit} onClick={() => { void submitBooking(); }}>
                   {bookMutation.isPending ? "Booking..." : "Book meeting"}
                 </button>
               </div>

@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import logging
-import os
 import json
 import hashlib
 import posixpath
@@ -11,7 +10,7 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, Optional
 
-from sqlalchemy import and_, case, or_, select
+from sqlalchemy import and_, case, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from packages.core.ai.runtime import (
@@ -20,15 +19,20 @@ from packages.core.ai.runtime import (
     runtime_load_sandbox_context,
     runtime_sandbox_context_owner_matches,
     runtime_binding_owner_matches,
+    runtime_public_failure_payload,
     runtime_skill_binding_ref,
 )
 from packages.core.models.base import generate_ulid
 from packages.core.models.permission import Visibility
 from packages.core.models.skill import Skill, AgentSkillBinding
+from packages.core.services.reusable_resource_locks import (
+    lock_agent_skill_binding_references,
+)
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_SKILL_MAX_ROUNDS = 200
+INSTRUCTIONS_ONLY_SKILL_EXECUTION_MODE = "instructions_only"
 
 # Script extensions that indicate a sandbox skill when found in skill_dir
 _SCRIPT_EXTENSIONS = {".py", ".sh", ".bash", ".js", ".ts", ".rb"}
@@ -44,6 +48,38 @@ def _sandbox_skill_error_response(skill: Skill, message: str) -> dict:
         "rounds": 0,
         "stop_reason": "error",
         "error": message,
+    }
+
+
+async def _destroy_unadmitted_sandbox(client: Any, sandbox_id: str) -> bool:
+    """Compensate a Sandbox that cannot receive its authorization context."""
+
+    from packages.core.services.sandbox_sdk.exceptions import SandboxNotFoundError
+
+    try:
+        await client.destroy(sandbox_id=sandbox_id)
+    except SandboxNotFoundError:
+        pass
+    except Exception:
+        logger.exception(
+            "[skill_service] failed to destroy unadmitted sandbox=%s",
+            sandbox_id,
+        )
+        return False
+    return True
+
+
+def _instructions_only_skill_response(skill: Skill, instructions: str) -> dict:
+    """Return guidance to the calling Agent without starting a child executor."""
+
+    return {
+        "skill": skill.name,
+        "content": str(instructions or "").strip(),
+        "usage": {},
+        "tools_used": [],
+        "rounds": 0,
+        "stop_reason": "instructions_loaded",
+        "instructions_only": True,
     }
 
 
@@ -77,7 +113,7 @@ def _sandbox_skill_runtime_contract(
         "- Follow the packaged skill workflow, scripts, templates, references, gates, and quality checks described by `/skill/SKILL.md`.",
         "- Do not replace the skill workflow with an ad-hoc generator or direct output script unless `/skill/SKILL.md` explicitly instructs that route.",
         "- Helper files may only support the workflow described by `/skill/SKILL.md`; they must not substitute a different output pipeline.",
-        "- `sandbox_exec` is available for sandbox commands, but the expected path is to run bundled skill scripts or explicit helper files.",
+        "- `sandbox` action `exec` is available for commands, but the expected path is to run bundled skill scripts or explicit helper files.",
         "- Before saving a final artifact, verify that the artifact path, intermediate evidence, and quality gates match `/skill/SKILL.md`.",
         "- If a required dependency, script, or workflow gate is missing, stop and report the blocker instead of inventing a shortcut.",
         "",
@@ -89,11 +125,15 @@ def _sandbox_skill_runtime_contract(
             "- The entity filesystem is mounted read-only at `/workspace/`. "
             "Uploaded chat files are available under `/workspace/uploads/chat/...`."
             if expected_workspace_volume
-            else "- No entity filesystem mount is available in this sandbox; use attachment text already provided in the chat context."
+            else (
+                "- No entity filesystem mount is available in this sandbox. "
+                "Use `sandbox` action `write_file` with `workspace_path` or direct content "
+                "to inject required inputs before execution."
+            )
         ),
         "- Never use `/mnt/user-data` for Manor uploads. It is not the upload mount.",
-        "- Read skill files with `sandbox_read_file(path=\"/skill/SKILL.md\")` or targeted `sandbox_exec` commands such as `sed -n '1,160p' /skill/SKILL.md`.",
-        "- Write new files with `sandbox_write_file`; do not use `cat >`, `echo >`, `printf >`, `tee >`, or heredoc writes.",
+        "- Read skill files with `sandbox(action='read_file', params={'sandbox_id': ..., 'path':'/skill/SKILL.md'})` or targeted `exec` commands.",
+        "- Write new files with `sandbox` action `write_file`; do not use `cat >`, `echo >`, `printf >`, `tee >`, or heredoc writes.",
         "- Do not use host shell/file tools such as `bash`, `read_file`, or root filesystem searches to inspect sandbox or workspace files.",
         "- `/tmp/` is writable for temporary files and npm cache.",
         "",
@@ -105,20 +145,21 @@ def _sandbox_skill_runtime_contract(
         "## Skill Input",
         skill_input or "Use the latest user request and conversation context as the skill input.",
         "",
+        "## Next Tool Guidance",
+        f"- Use `sandbox(action='exec', params={{'sandbox_id':'{sandbox_id}','command':'...'}})` or action `read_file` for additional targeted inspection when needed.",
+        "- For long text files, paginate `read_file` with `offset` and `limit`; continue from `next_offset` instead of rereading the whole file.",
+        "- Run the bundled scripts/workflow required by `/skill/SKILL.md`.",
+        (
+            "- After the final artifact exists, call `sandbox` action `save_result` with "
+            "`artifact_role=\"final\"` so Chat receives a clickable file card; use "
+            "`artifact_role=\"intermediate\"` for supporting files that should stay hidden."
+        ),
+        "- Call `sandbox` action `destroy` once after the final artifact has been saved to release the sandbox.",
+        "",
         "## Skill Instructions",
         "The following is the complete `/skill/SKILL.md` loaded for this run. Follow it exactly.",
         "",
         skill_instructions,
-        "",
-        "## Next Tool Guidance",
-        f"- Use `sandbox_exec(sandbox_id=\"{sandbox_id}\", command=\"...\")` or `sandbox_read_file` for additional targeted inspection when needed.",
-        "- Run the bundled scripts/workflow required by `/skill/SKILL.md`.",
-        (
-            "- After the final artifact exists, call `sandbox_save_result` with "
-            "`artifact_role=\"final\"` so Chat receives a clickable file card; use "
-            "`artifact_role=\"intermediate\"` for supporting files that should stay hidden."
-        ),
-        "- Call `sandbox_destroy` once after the final artifact has been saved to release the sandbox.",
     ])
     return "\n".join(lines)
 
@@ -137,6 +178,11 @@ def _normalize_requested_slug(value: object) -> str:
     slug = re.sub(r"-+", "-", slug)
     slug = re.sub(r"_+", "_", slug)
     return slug.strip("-_")
+
+
+def skill_slug_lookup_key(value: object) -> str:
+    """Return the stable lookup key shared by hyphenated and underscored slugs."""
+    return _normalize_requested_slug(value).replace("-", "_")
 
 
 _PLACEHOLDER_SKILL_IDENTIFIERS = {
@@ -488,10 +534,12 @@ async def _seed_builtin_skills(db: AsyncSession) -> None:
     """Seed platform built-in skills (idempotent, best-effort)."""
     from packages.core.services.builtin_skill_loader import seed_builtin_skills
     try:
-        await seed_builtin_skills(db)
-        await db.commit()
+        # A failed best-effort seed must not roll back the request transaction.
+        # Session.rollback() expires authenticated ORM rows and can trigger
+        # MissingGreenlet when the route later reads their scalar attributes.
+        async with db.begin_nested():
+            await seed_builtin_skills(db)
     except Exception:
-        await db.rollback()
         logger.warning("Built-in skill seed skipped", exc_info=True)
 
 
@@ -524,6 +572,7 @@ async def _workspace_operation_skill_ids(
     entity_id: str,
     agent_id: str,
     workspace_id: str | None,
+    agent_subscription_id: str | None = None,
 ) -> set[str]:
     if not workspace_id:
         return set()
@@ -555,11 +604,28 @@ async def _workspace_operation_skill_ids(
             AgentSubscription.status == "active",
         )
     )).scalars().all())
-    service_keys = {
-        str(sub.service_key or "").strip()
-        for sub in subs
-        if sub.agent_id == agent_id and str(sub.service_key or "").strip()
-    }
+    current_subscription = next(
+        (
+            sub for sub in subs
+            if agent_subscription_id
+            and sub.id == agent_subscription_id
+            and sub.agent_id == agent_id
+        ),
+        None,
+    )
+    subscription_scope_supplied = bool(agent_subscription_id)
+    service_keys = (
+        {str(current_subscription.service_key).strip()}
+        if current_subscription
+        and str(current_subscription.service_key or "").strip()
+        else set()
+        if subscription_scope_supplied
+        else {
+            str(sub.service_key or "").strip()
+            for sub in subs
+            if sub.agent_id == agent_id and str(sub.service_key or "").strip()
+        }
+    )
     subscription_agent_ids_by_id = {sub.id: sub.agent_id for sub in subs}
     is_master = is_master_agent(agent_id, None)
 
@@ -572,6 +638,13 @@ async def _workspace_operation_skill_ids(
             current_service_keys=service_keys,
             task_service_keys=None,
             subscription_agent_ids_by_id=subscription_agent_ids_by_id,
+            current_subscription_id=(
+                current_subscription.id
+                if current_subscription
+                else ""
+                if subscription_scope_supplied
+                else None
+            ),
         ):
             ref = runtime_skill_binding_ref(binding)
             if ref:
@@ -590,7 +663,12 @@ async def _workspace_operation_skill_ids(
 
 
 async def list_skills_for_agent(
-    db: AsyncSession, entity_id: str, agent_id: str, *, workspace_id: str | None = None,
+    db: AsyncSession,
+    entity_id: str,
+    agent_id: str,
+    *,
+    workspace_id: str | None = None,
+    agent_subscription_id: str | None = None,
 ) -> list[Skill]:
     """Skills the given agent may use.
 
@@ -617,6 +695,7 @@ async def list_skills_for_agent(
         entity_id=entity_id,
         agent_id=agent_id,
         workspace_id=workspace_id,
+        agent_subscription_id=agent_subscription_id,
     ))
 
     # Build the combined filter
@@ -628,7 +707,7 @@ async def list_skills_for_agent(
     result = await db.execute(
         select(Skill)
         .where(accessibility, Skill.status == "active")
-        .order_by(Skill.created_at.desc())
+        .order_by(Skill.created_at.desc(), Skill.id.asc())
     )
     return list(result.scalars().all())
 
@@ -669,22 +748,14 @@ async def get_skill_by_slug(
     instead of raising MultipleResultsFound in the middle of a plan.
     """
     requested_slug = _normalize_requested_slug(slug)
-    canonical_slug = _normalize_skill_identifier(requested_slug)
-    slug_aliases = {
-        value
-        for value in (
-            requested_slug,
-            canonical_slug,
-            canonical_slug.replace("_", "-"),
-        )
-        if value
-    }
-    conditions = [Skill.slug.in_(slug_aliases), Skill.status == "active"]
-    slug_priority = case(
-        (Skill.slug == requested_slug, 0),
-        (Skill.slug == canonical_slug, 1),
-        else_=2,
-    )
+    if not requested_slug:
+        return None
+    alias_key = skill_slug_lookup_key(requested_slug)
+    conditions = [
+        func.replace(func.lower(Skill.slug), "-", "_") == alias_key,
+        Skill.status == "active",
+    ]
+    exact_priority = case((Skill.slug == requested_slug, 0), else_=1)
     if entity_id:
         conditions.append(
             or_(Skill.entity_id == entity_id, Skill.entity_id.is_(None))
@@ -702,7 +773,7 @@ async def get_skill_by_slug(
         .where(*conditions)
         .order_by(
             priority.asc(),
-            slug_priority.asc(),
+            exact_priority.asc(),
             Skill.created_at.desc(),
             Skill.id.desc(),
         )
@@ -782,9 +853,19 @@ async def create_skill(
         cfg = skill.config or {}
         minio_dir = _save_skill_files_to_minio(skill, system_prompt, cfg)
         if minio_dir:
-            # Persist the computed dir name so loads/deletes can resolve it
-            skill.config = {**cfg, "minio_dir": minio_dir}
-            await db.flush()
+            try:
+                # Persist the computed dir name so loads/deletes can resolve it.
+                # If this DB write fails, the caller never receives ``skill``
+                # and therefore cannot clean the already-written object prefix.
+                skill.config = {**cfg, "minio_dir": minio_dir}
+                await db.flush()
+            except Exception:
+                _delete_skill_files_best_effort(
+                    skill,
+                    {**cfg, "minio_dir": minio_dir},
+                    context="create rollback",
+                )
+                raise
 
     return skill
 
@@ -936,7 +1017,38 @@ def _save_skill_files_to_minio(skill: Skill, prompt: str, cfg: dict) -> Optional
             "[skill_service] MinIO file save failed skill=%s entity=%s: %s",
             skill.id, skill.entity_id, exc,
         )
+        _delete_skill_files_best_effort(
+            skill,
+            cfg,
+            context="partial save",
+        )
         return None
+
+
+def _delete_skill_files_best_effort(
+    skill: Skill,
+    cfg: dict,
+    *,
+    context: str,
+) -> None:
+    """Remove one uncommitted Skill prefix without hiding the root error."""
+
+    try:
+        from packages.core.services.skill_file_storage import delete_skill_files
+
+        delete_skill_files(
+            skill.entity_id,
+            skill.id,
+            skill_dir=cfg.get("minio_dir") or None,
+            config=cfg,
+        )
+    except Exception:
+        logger.warning(
+            "[skill_service] %s MinIO cleanup failed skill=%s",
+            context,
+            skill.id,
+            exc_info=True,
+        )
 
 
 # ── Skill type detection ──
@@ -977,10 +1089,13 @@ async def _invoke_sandbox_skill(
     user_id: Optional[str],
     input_text: str,
     *,
+    agent_id: Optional[str] = None,
     conversation_id: Optional[str] = None,
     on_sub_tool_start=None,
     on_sub_tool_end=None,
-) -> dict:
+    runtime_tool_context: Optional[Mapping[str, Any]] = None,
+    db: AsyncSession | None = None,
+) -> Any:
     """Invoke a sandbox skill via the Sandbox Service.
 
     Flow:
@@ -993,8 +1108,14 @@ async def _invoke_sandbox_skill(
          `content` so the parent LLM can drive execution via sandbox tools.
     """
     from packages.core.config import get_settings as _get_settings
-    sandbox_url = _get_settings().SANDBOX_SERVICE_URL.strip()
-    if not sandbox_url:
+    settings = _get_settings()
+    sandbox_url = settings.SANDBOX_SERVICE_URL.strip()
+    sandbox_api_token = settings.SANDBOX_API_TOKEN.strip()
+    durable_external = (
+        settings.MANOR_RUNTIME_EXECUTION_MODE == "durable"
+        and settings.SANDBOX_COORDINATION_MODE == "external-runner"
+    )
+    if not sandbox_url and not (durable_external and settings.SANDBOX_RUNNERS_JSON.strip()):
         return _sandbox_skill_error_response(
             skill,
             f"Sandbox service not configured (SANDBOX_SERVICE_URL unset). "
@@ -1095,20 +1216,206 @@ async def _invoke_sandbox_skill(
             pass
     allowed_keys = list(env.keys())
 
-    # Entity-filesystem mount (read-only)
     config_overrides = None
     expected_workspace_volume: str | None = None
-    manor_fs_root = os.getenv("MANOR_FS_ROOT", "")
-    if manor_fs_root and entity_id and os.getenv("MANOR_FS_ENABLED", "").lower() in ("true", "1"):
-        entity_path = os.path.join(manor_fs_root, entity_id)
-        if os.path.isdir(entity_path):
-            expected_workspace_volume = f"{entity_path}:/workspace:ro"
-            config_overrides = {"volumes": [expected_workspace_volume]}
+
+    from packages.core.services.sandbox_sdk import SandboxClient
+
+    context = dict(runtime_tool_context or {})
+    runtime_run_id = str(context.get("_runtime_run_id_from_context") or "")
+    runtime_tool_call_id = str(context.get("_runtime_tool_call_id_from_context") or "")
+    create_kwargs = {
+        "skill_name": skill.slug or skill.name,
+        "files": files,
+        "env": env,
+        "allowed_sensitive_keys": allowed_keys,
+        "auto_install": True,
+        "config": config_overrides,
+    }
+
+    existing_ctx = await runtime_load_sandbox_context(conversation_id or "")
+    existing_sandbox_id = (
+        (existing_ctx or {}).get("sandbox_id")
+        if runtime_sandbox_context_owner_matches(
+            existing_ctx,
+            entity_id=entity_id,
+            user_id=user_id,
+        )
+        and str((existing_ctx or {}).get("agent_id") or "") == str(agent_id or "")
+        else None
+    )
+    reservation = None
+    if durable_external and runtime_run_id and runtime_tool_call_id:
+        if db is None:
+            return _sandbox_skill_error_response(
+                skill,
+                "Durable Runtime database context is unavailable for Sandbox admission.",
+            )
+        from packages.core.ai.runtime.control import RuntimeToolSuspension
+        from packages.core.models.runtime_run import (
+            RuntimeRun,
+            SandboxReservation,
+            SandboxReservationStatus,
+        )
+        from packages.core.services.sandbox_queue_service import (
+            enqueue_sandbox_reservation,
+            resolve_sandbox_runner,
+        )
+
+        reservation = (
+            await db.execute(
+                select(SandboxReservation).where(
+                    SandboxReservation.runtime_run_id == runtime_run_id,
+                    SandboxReservation.tool_call_id == runtime_tool_call_id,
+                )
+            )
+        ).scalar_one_or_none()
+        if reservation is not None and reservation.status in {
+            SandboxReservationStatus.ALLOCATED.value,
+            SandboxReservationStatus.CONSUMED.value,
+        }:
+            if not reservation.sandbox_id:
+                return _sandbox_skill_error_response(
+                    skill,
+                    "Sandbox allocation is missing its Sandbox identity.",
+                )
+            runner = await resolve_sandbox_runner(db, reservation.sandbox_id)
+            sandbox_url = runner.base_url
+            result_sandbox_id = reservation.sandbox_id
+            skill_info_parts = [f"sandbox_id: {result_sandbox_id}  *(allocated)*"]
+            if script_keys:
+                skill_info_parts.append(
+                    f"scripts ({len(script_keys)}): {_compact_skill_items(script_keys)}"
+                )
+            if files.get("requirements.txt"):
+                skill_info_parts.append("dependencies: installed from requirements.txt")
+            if env:
+                skill_info_parts.append(
+                    f"credentials_injected ({len(env)}): {_compact_skill_items(set(env.keys()))}"
+                )
+            was_allocated = reservation.status == SandboxReservationStatus.ALLOCATED.value
+            if conversation_id:
+                try:
+                    await runtime_init_sandbox_context(
+                        conversation_id,
+                        result_sandbox_id,
+                        skill.id,
+                        entity_id=entity_id,
+                        user_id=user_id,
+                        agent_id=agent_id,
+                    )
+                except Exception as exc:
+                    if was_allocated:
+                        from packages.core.services.sandbox_queue_service import (
+                            release_sandbox_instance,
+                        )
+
+                        cleanup_client = SandboxClient(
+                            base_url=sandbox_url,
+                            timeout=180.0,
+                            api_token=sandbox_api_token,
+                        )
+                        try:
+                            destroyed = await _destroy_unadmitted_sandbox(
+                                cleanup_client,
+                                result_sandbox_id,
+                            )
+                        finally:
+                            await cleanup_client.close()
+                        reservation.last_error = "sandbox_context_persistence_failed"
+                        if destroyed:
+                            await release_sandbox_instance(
+                                db,
+                                sandbox_id=result_sandbox_id,
+                            )
+                        else:
+                            reservation.status = SandboxReservationStatus.RELEASE_PENDING.value
+                            reservation.version += 1
+                        await db.commit()
+                    return _sandbox_skill_error_response(
+                        skill,
+                        "Sandbox owner context could not be persisted; no Sandbox "
+                        f"tool access was granted. Details: {exc}",
+                    )
+            if was_allocated:
+                from datetime import datetime, timezone
+
+                reservation.status = SandboxReservationStatus.CONSUMED.value
+                reservation.consumed_at = datetime.now(timezone.utc)
+                reservation.version += 1
+            await db.commit()
+            return {
+                "skill": skill.name,
+                "content": _sandbox_skill_runtime_contract(
+                    skill=skill,
+                    sandbox_id=result_sandbox_id,
+                    skill_info_parts=skill_info_parts,
+                    expected_workspace_volume=expected_workspace_volume,
+                    skill_input=str(input_text or "").strip(),
+                    skill_instructions=instructions,
+                ),
+                "usage": {},
+                "tools_used": [],
+                "rounds": 0,
+                "stop_reason": "sandbox_ready",
+                "sandbox_id": result_sandbox_id,
+            }
+        if reservation is not None and reservation.status in {
+            SandboxReservationStatus.PENDING_CHECKPOINT.value,
+            SandboxReservationStatus.QUEUED.value,
+            SandboxReservationStatus.REQUEUED.value,
+            SandboxReservationStatus.ALLOCATING.value,
+        }:
+            return RuntimeToolSuspension(
+                kind="waiting_resource",
+                reservation_id=reservation.id,
+                poll_after_seconds=settings.SANDBOX_QUEUE_POLL_SECONDS,
+                deadline_at=reservation.deadline_at,
+            )
+        if reservation is not None:
+            return _sandbox_skill_error_response(
+                skill,
+                f"Sandbox reservation ended with status '{reservation.status}'.",
+            )
+
+        if existing_sandbox_id:
+            try:
+                runner = await resolve_sandbox_runner(db, existing_sandbox_id)
+                sandbox_url = runner.base_url
+            except Exception:
+                existing_sandbox_id = None
+        if not existing_sandbox_id:
+            run = await db.get(RuntimeRun, runtime_run_id)
+            if run is None or run.entity_id != entity_id or run.user_id != user_id:
+                return _sandbox_skill_error_response(
+                    skill,
+                    "Durable Runtime identity could not be verified for Sandbox admission.",
+                )
+            reservation = await enqueue_sandbox_reservation(
+                db,
+                run=run,
+                tool_call_id=runtime_tool_call_id,
+                request_payload={
+                    **create_kwargs,
+                    "source": "workspace" if skill.entity_id else "builtin",
+                },
+                activate=False,
+            )
+            await db.commit()
+            return RuntimeToolSuspension(
+                kind="waiting_resource",
+                reservation_id=reservation.id,
+                poll_after_seconds=settings.SANDBOX_QUEUE_POLL_SECONDS,
+                deadline_at=reservation.deadline_at,
+            )
 
     # ── 4. Create or reuse sandbox ──────────────────────────────────
-    from packages.core.services.sandbox_sdk import SandboxClient
-    from packages.core.services.sandbox_sdk.exceptions import SandboxError
-    client = SandboxClient(base_url=sandbox_url, timeout=180.0)
+    from packages.core.services.sandbox_sdk.exceptions import SandboxCapacityError, SandboxError
+    client = SandboxClient(
+        base_url=sandbox_url,
+        timeout=180.0,
+        api_token=sandbox_api_token,
+    )
     result_sandbox_id: str
     skill_info_parts: list[str] = []
 
@@ -1131,95 +1438,9 @@ async def _invoke_sandbox_skill(
     except SandboxError as exc:
         logger.debug("[skill_service] sandbox health check failed before create: %s", exc)
 
-    def _sandbox_has_expected_workspace_mount(info) -> bool:
-        if not expected_workspace_volume:
-            return True
-        config = getattr(info, "config", {}) or {}
-        volumes = config.get("volumes") if isinstance(config, dict) else None
-        if not isinstance(volumes, list):
-            return False
-        expected_parts = expected_workspace_volume.split(":")
-        for volume in volumes:
-            if not isinstance(volume, str):
-                continue
-            parts = volume.split(":")
-            if len(parts) >= 2 and parts[0] == expected_parts[0] and parts[1] == "/workspace":
-                return True
-        return False
-
     try:
-        existing_ctx = await runtime_load_sandbox_context(conversation_id or "")
-        existing_sandbox_id = (existing_ctx or {}).get("sandbox_id")
-
-        if existing_sandbox_id and not runtime_sandbox_context_owner_matches(
-            existing_ctx,
-            entity_id=entity_id,
-            user_id=user_id,
-        ):
-            logger.info(
-                "[skill_service] sandbox reuse skipped: owner mismatch skill=%s sandbox=%s",
-                skill.name, existing_sandbox_id,
-            )
-            existing_sandbox_id = None
-
-        same_skill_ready = False
-        expected_skill_name = skill.slug or skill.name
-        if (
-            existing_sandbox_id
-            and str((existing_ctx or {}).get("skill_id") or "").strip()
-            == expected_skill_name
-        ):
+        if existing_sandbox_id:
             try:
-                current_status = await client.status(existing_sandbox_id)
-                current_state = str(getattr(current_status, "status", "") or "").strip().lower()
-                if expected_workspace_volume and not _sandbox_has_expected_workspace_mount(
-                    current_status,
-                ):
-                    logger.info(
-                        "[skill_service] same-skill reuse skipped: missing /workspace mount "
-                        "skill=%s sandbox=%s",
-                        skill.name,
-                        existing_sandbox_id,
-                    )
-                    existing_sandbox_id = None
-                elif (
-                    current_state == "ready"
-                    and str(getattr(current_status, "skill_name", "") or "").strip()
-                    == expected_skill_name
-                ):
-                    result_sandbox_id = existing_sandbox_id
-                    same_skill_ready = True
-                    skill_info_parts.append(
-                        f"sandbox_id: {result_sandbox_id}  *(reused, skill already loaded)*"
-                    )
-                    logger.info(
-                        "[skill_service] same-skill sandbox reused: skill=%s sandbox=%s",
-                        skill.name,
-                        existing_sandbox_id,
-                    )
-                elif current_state == "executing":
-                    await client.close()
-                    return _sandbox_skill_error_response(
-                        skill,
-                        "The active skill sandbox is still executing. Wait for its current "
-                        "command to finish, then retry the continuation.",
-                    )
-                else:
-                    existing_sandbox_id = None
-            except SandboxError:
-                existing_sandbox_id = None
-
-        if existing_sandbox_id and not same_skill_ready:
-            try:
-                if expected_workspace_volume:
-                    status = await client.status(existing_sandbox_id)
-                    if not _sandbox_has_expected_workspace_mount(status):
-                        logger.info(
-                            "[skill_service] sandbox reuse skipped: missing /workspace mount skill=%s sandbox=%s",
-                            skill.name, existing_sandbox_id,
-                        )
-                        existing_sandbox_id = None
-                        raise RuntimeError("sandbox missing expected /workspace mount")
                 load_result = await client.load_skill(
                     sandbox_id=existing_sandbox_id,
                     skill_name=skill.slug or skill.name,
@@ -1241,9 +1462,22 @@ async def _invoke_sandbox_skill(
                     "[skill_service] sandbox reused: skill=%s sandbox=%s",
                     skill.name, existing_sandbox_id,
                 )
-            except RuntimeError as reuse_skip:
-                if str(reuse_skip) != "sandbox missing expected /workspace mount":
-                    raise
+                if conversation_id:
+                    try:
+                        await runtime_init_sandbox_context(
+                            conversation_id,
+                            result_sandbox_id,
+                            skill.id,
+                            entity_id=entity_id,
+                            user_id=user_id,
+                            agent_id=agent_id,
+                        )
+                    except Exception as exc:
+                        return _sandbox_skill_error_response(
+                            skill,
+                            "Sandbox owner context could not be persisted; no Sandbox "
+                            f"tool access was granted. Details: {exc}",
+                        )
             except SandboxError as busy_exc:
                 if busy_exc.status_code == 409:
                     await client.close()
@@ -1262,18 +1496,20 @@ async def _invoke_sandbox_skill(
 
         if not existing_sandbox_id:
             try:
-                create_kwargs = {
-                    "skill_name": skill.slug or skill.name,
-                    "files": files,
-                    "env": env,
-                    "allowed_sensitive_keys": allowed_keys,
-                    "auto_install": True,
-                    "config": config_overrides,
-                }
                 if skill.entity_id:
                     create_result = await client.create_from_files(**create_kwargs)
                 else:
                     create_result = await client.create_from_builtin(**create_kwargs)
+            except SandboxCapacityError as exc:
+                logger.warning(
+                    "[skill_service] sandbox capacity full skill=%s status=%s error=%s",
+                    skill.name, getattr(exc, "status_code", None), exc,
+                )
+                return _sandbox_skill_error_response(
+                    skill,
+                    "Sandbox resources are busy. Please retry later.\n"
+                    f"Details: {exc}",
+                )
             except SandboxError as exc:
                 logger.warning(
                     "[skill_service] sandbox create failed skill=%s status=%s error=%s",
@@ -1307,17 +1543,26 @@ async def _invoke_sandbox_skill(
                     f"env_blocked ({len(create_result.env_blocked)}): "
                     f"{_compact_skill_items(create_result.env_blocked)}"
                 )
+            if conversation_id:
+                try:
+                    await runtime_init_sandbox_context(
+                        conversation_id,
+                        result_sandbox_id,
+                        skill.id,
+                        entity_id=entity_id,
+                        user_id=user_id,
+                        agent_id=agent_id,
+                    )
+                except Exception as exc:
+                    await _destroy_unadmitted_sandbox(client, result_sandbox_id)
+                    return _sandbox_skill_error_response(
+                        skill,
+                        "Sandbox owner context could not be persisted; the newly "
+                        f"created Sandbox was destroyed. Details: {exc}",
+                    )
             logger.info(
                 "[skill_service] sandbox created: skill=%s sandbox=%s entity=%s",
                 skill.name, result_sandbox_id, entity_id or "(none)",
-            )
-        if conversation_id:
-            await runtime_init_sandbox_context(
-                conversation_id,
-                result_sandbox_id,
-                skill.slug or skill.name,
-                entity_id=entity_id,
-                user_id=user_id,
             )
     finally:
         await client.close()
@@ -1375,7 +1620,7 @@ async def invoke_skill(
     2. Detect skill type (prompt vs sandbox)
     3a. Sandbox skill → create/reuse a Sandbox Service sandbox via SandboxClient; return a
         context block (sandbox_id + SKILL.md) for the parent LLM to drive via
-        sandbox_exec / sandbox_destroy tool calls.
+        sandbox exec / destroy actions.
     3b. Prompt skill  → agentic_loop with skill's declared tools only.
     4. Return {content, usage, tools_used, rounds}
     """
@@ -1384,6 +1629,36 @@ async def invoke_skill(
         skill = await get_skill_by_slug(db, skill_id_or_slug, entity_id)
     if not skill:
         return {"error": f"Skill not found: {skill_id_or_slug}"}
+
+    from packages.core.ai.runtime.skills import runtime_skill_is_eligible
+
+    eligible, eligibility_code = await runtime_skill_is_eligible(
+        db,
+        skill,
+        entity_id=entity_id,
+        workspace_id=workspace_id,
+        user_id=user_id,
+        # An enforced Agent binding is an explicit execution grant. Direct and
+        # manually selected Skill calls still require the actor to read the
+        # entity-owned Skill itself.
+        enforce_user_access=bool(
+            manual_skill_selected
+            or (user_id and not (agent_id and enforce_agent_access))
+        ),
+    )
+    if not eligible:
+        if eligibility_code == "skill_workspace_contract_missing":
+            return {
+                "error": (
+                    f"Skill '{skill.slug or skill.name}' is not available in the "
+                    "current Workspace."
+                ),
+                "code": eligibility_code,
+            }
+        return {
+            "error": f"Skill not found: {skill_id_or_slug}",
+            "code": eligibility_code,
+        }
 
     if runtime_envelope is not None:
         surface = getattr(runtime_envelope, "surface", None)
@@ -1465,11 +1740,21 @@ async def invoke_skill(
                 }
 
     if agent_id and enforce_agent_access:
+        runtime_metadata = (
+            getattr(runtime_envelope, "metadata", None)
+            if runtime_envelope is not None
+            else None
+        )
         available = await list_skills_for_agent(
             db,
             entity_id,
             agent_id,
             workspace_id=workspace_id,
+            agent_subscription_id=(
+                runtime_metadata.get("agent_subscription_id")
+                if isinstance(runtime_metadata, dict)
+                else None
+            ),
         )
         if skill.id not in {item.id for item in available}:
             return {
@@ -1502,9 +1787,12 @@ async def invoke_skill(
     if skill_type == "sandbox":
         return await _invoke_sandbox_skill(
             skill, entity_id, user_id, input_text,
+            agent_id=agent_id,
             conversation_id=conversation_id,
             on_sub_tool_start=on_sub_tool_start,
             on_sub_tool_end=on_sub_tool_end,
+            runtime_tool_context=runtime_tool_context,
+            db=db,
         )
 
     # Prompt skill — load system_prompt from MinIO when available, else fall back to DB
@@ -1525,42 +1813,30 @@ async def invoke_skill(
     skill_extra_files = _load_prompt_skill_extra_files(skill, config)
     effective_prompt = minio_prompt if minio_prompt else skill.system_prompt
     effective_prompt = _append_skill_bundle_manifest(effective_prompt, skill_extra_files)
-    if str(skill.slug or "").strip().lower() in {
-        "stickman-video-creator",
-        "stickman_video_creator",
-    }:
-        runtime_artifact_root = str(
-            dict(runtime_tool_context or {}).get(
-                "_workflow_lineage_root_run_id_from_context"
-            )
-            or dict(runtime_tool_context or {}).get("_workflow_run_id_from_context")
-            or ""
-        ).strip()
-        if runtime_artifact_root:
-            effective_prompt = (
-                f"{effective_prompt.rstrip()}\n\n"
-                "## Runtime-Enforced Workflow Artifact Scope\n"
-                f"The authoritative run_artifact_prefix is `runs/{runtime_artifact_root}`. "
-                "It is stable across retries in this Workflow lineage and overrides the "
-                "topic-slug fallback. Use this exact prefix for every Task-scoped read and "
-                "write. The Runtime transparently remaps generated-media paths into this "
-                "prefix and will not let a root-level or different-run artifact satisfy "
-                "recovery, QA, or publication. Workspace-owned identity references remain "
-                "outside this prefix. For generate_file and generate_video, the tool schema "
-                "calls this required path argument `name` (not `output_name`); always pass "
-                "name inside the authoritative prefix."
-            )
+    if config.get("execution_mode") == INSTRUCTIONS_ONLY_SKILL_EXECUTION_MODE:
+        return _instructions_only_skill_response(skill, effective_prompt)
     authorization_user_message = (
         input_text if active_user_message is None else active_user_message
     )
     from packages.core.ai.runtime import (
         runtime_execute_skill_agent_loop,
         runtime_prepare_prompt_skill_tool_surface,
+        runtime_prompt_skill_execution_contract,
+        runtime_prompt_skill_execution_guidance,
         runtime_prompt_skill_registered_tool_executor,
+        runtime_prompt_skill_required_arguments,
         runtime_prompt_skill_tool_executor,
         runtime_prompt_skill_tool_schema_resolver,
         runtime_terminal_tool_result_policy_for_skill,
     )
+
+    execution_contract = runtime_prompt_skill_execution_contract(skill)
+    execution_guidance = runtime_prompt_skill_execution_guidance(
+        execution_contract,
+        runtime_tool_context,
+    )
+    if execution_guidance:
+        effective_prompt = f"{effective_prompt}\n\n{execution_guidance}"
 
     tool_surface = runtime_prepare_prompt_skill_tool_surface(
         skill,
@@ -1582,7 +1858,7 @@ async def invoke_skill(
     # A skill is real work — generating documents, running scripts,
     # iterating on errors — and cutting it off mid-task produces worse
     # outcomes than letting it finish (the parent agent re-does the
-    # work, doubling cost). 200 rounds is a safety ceiling for genuinely
+    # work, doubling cost). 20 rounds is a safety ceiling for genuinely
     # stuck loops, not a deadline. Skills that converge in 3-5 rounds
     # cost nothing extra; the cap only bites on pathological retries.
     # Override per-skill via DB ``config.max_rounds`` when a skill needs
@@ -1606,6 +1882,7 @@ async def invoke_skill(
             runtime_envelope=skill_runtime_envelope,
             skill_slug=(skill.slug or skill.name or ""),
             runtime_tool_context=runtime_tool_context,
+            execution_contract=execution_contract,
         ),
         read_bundle_file=lambda tool_args: _try_read_skill_bundle_file(
             skill_extra_files,
@@ -1619,6 +1896,9 @@ async def invoke_skill(
     skill_tool_schema_resolver = runtime_prompt_skill_tool_schema_resolver(
         declared_tool_names=tool_surface.declared_tool_names,
         allowed_tool_names=tool_surface.allowed_tool_names,
+        required_arguments_by_tool=runtime_prompt_skill_required_arguments(
+            execution_contract,
+        ),
     )
 
     runtime_policy = runtime_terminal_tool_result_policy_for_skill(skill)
@@ -1651,7 +1931,7 @@ async def invoke_skill(
     )
     control = getattr(result, "control", None) or {}
 
-    return {
+    response = {
         "skill": skill.name,
         "content": result.content,
         "usage": result.usage,
@@ -1663,8 +1943,34 @@ async def invoke_skill(
         "replace_visible_text": bool(control.get("replace_visible_text")),
         "control": control,
         "error": getattr(result, "error", None),
-        "limit_detail": getattr(result, "error_detail", None),
+        "limit_detail": runtime_public_failure_payload(
+            getattr(result, "error_detail", None)
+        ),
     }
+    from packages.core.ai.runtime.skill_routing import is_chrome_skill
+
+    if is_chrome_skill(skill.slug, skill.name):
+        from packages.core.ai.runtime.chrome_run import (
+            chrome_outcome_for_result,
+            commit_chrome_runtime_state,
+        )
+
+        child_metadata = getattr(skill_runtime_envelope, "metadata", None)
+        outcome = chrome_outcome_for_result(
+            child_metadata,
+            skill=str(skill.slug or skill.name or "chrome"),
+            goal=authorization_user_message,
+            content=result.content,
+            stop_reason=result.stop_reason,
+            error=getattr(result, "error", None),
+            control=control,
+        )
+        commit_chrome_runtime_state(
+            getattr(runtime_envelope, "metadata", None),
+            child_metadata,
+        )
+        response["chrome_outcome"] = outcome.to_dict()
+    return response
 
 
 # ── Agent Skill Bindings ──
@@ -1730,6 +2036,12 @@ async def bind_skill_to_agent(
     if skill.entity_id is not None and skill.entity_id != entity_id:
         return None
 
+    await lock_agent_skill_binding_references(
+        db,
+        entity_id=entity_id,
+        agent_id=agent_id,
+        skill_id=skill_id,
+    )
     existing = await db.execute(
         select(AgentSkillBinding).where(
             AgentSkillBinding.agent_id == agent_id,

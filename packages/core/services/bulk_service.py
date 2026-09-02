@@ -13,6 +13,7 @@ from packages.core.models.task import Task
 from packages.core.models.document import Document
 from packages.core.models.people import Client
 from packages.core.services.tool_cache_version import bump_tool_cache_version
+from packages.core.services.comment_service import delete_resource_comments
 
 
 # ── Bulk task operations ──
@@ -47,6 +48,16 @@ async def bulk_delete_documents(
     """Delete multiple documents. Returns count deleted."""
     if not document_ids:
         return 0
+    matching_ids = set((await db.execute(
+        select(Document.id)
+        .where(
+            Document.id.in_(document_ids),
+            Document.entity_id == entity_id,
+        )
+        .order_by(Document.id)
+        .with_for_update()
+    )).scalars().all())
+    await delete_resource_comments(db, entity_id, "document", matching_ids)
     result = await db.execute(
         delete(Document)
         .where(Document.id.in_(document_ids), Document.entity_id == entity_id)

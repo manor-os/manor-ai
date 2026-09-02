@@ -30,6 +30,11 @@ from packages.core.blueprints.payload import (
     migrate_payload,
     validate_payload,
 )
+from packages.core.constants.blueprints import (
+    BLUEPRINT_KNOWLEDGE_MAX_DOCUMENT_BYTES,
+    BLUEPRINT_KNOWLEDGE_MAX_DOCUMENTS,
+    BLUEPRINT_KNOWLEDGE_MAX_TOTAL_BYTES,
+)
 
 
 # ── Sample payloads ───────────────────────────────────────────────────
@@ -178,6 +183,222 @@ def test_detect_version_non_dict_raises():
         detect_version("not a dict")  # type: ignore[arg-type]
 
 
+def test_contract_variables_require_unique_non_secret_keys():
+    payload = _v11_payload()
+    payload["contract"]["variables"] = [
+        {"key": "brand_name"},
+        {"key": "brand_name"},
+    ]
+    with pytest.raises(PayloadError, match="duplicates"):
+        validate_payload(payload)
+
+    payload["contract"]["variables"] = [{"key": "api_token"}]
+    with pytest.raises(PayloadError, match="credential-shaped"):
+        validate_payload(payload)
+
+
+def test_mcp_requirements_reject_duplicate_canonical_provider_aliases():
+    payload = _v11_payload()
+    payload["contract"]["requires"]["mcp_servers"] = [
+        {"slug": "x", "required": False},
+        {"slug": "twitter_x", "required": True},
+    ]
+
+    with pytest.raises(PayloadError, match="duplicates canonical provider 'twitter_x'"):
+        validate_payload(payload)
+
+
+@pytest.mark.parametrize("field", ["required", "install_blocking"])
+def test_mcp_requirement_boolean_flags_are_strict(field: str):
+    payload = _v11_payload()
+    payload["contract"]["requires"]["mcp_servers"] = [{
+        "slug": "chrome",
+        field: "false",
+    }]
+
+    with pytest.raises(PayloadError, match=rf"{field} must be a boolean"):
+        validate_payload(payload)
+
+
+def test_runtime_derived_scheduled_jobs_are_not_portable():
+    payload = _v11_payload()
+    payload["recipe"]["scheduled_jobs"] = [{
+        "job_id": "gm:source-goal-id",
+        "execution_type": "goal_measurement",
+    }]
+    with pytest.raises(PayloadError, match="runtime-derived"):
+        validate_payload(payload)
+
+
+def test_scheduled_skill_requires_portable_target():
+    payload = _v11_payload()
+    payload["recipe"]["scheduled_jobs"] = [{
+        "job_id": "pending-skill",
+        "execution_type": "skill",
+        "execution_target": {},
+    }]
+
+    with pytest.raises(PayloadError, match="portable Skill target"):
+        validate_payload(payload)
+
+
+def test_scheduled_workflow_requires_declared_portable_target():
+    payload = _v11_payload()
+    payload["recipe"]["scheduled_jobs"] = [{
+        "job_id": "pending-workflow",
+        "execution_type": "workflow",
+        "execution_target": {"workflow_slug": "missing-flow"},
+    }]
+
+    with pytest.raises(PayloadError, match="portable Workflow target"):
+        validate_payload(payload)
+
+
+def _startup_agent_job(job_id: str, *, job_type: str = "manual") -> dict:
+    return {
+        "job_id": job_id,
+        "job_type": job_type,
+        "schedule_kind": None,
+        "execution_type": "agent",
+        "execution_target": {"service_key": "social.x.poster"},
+        "payload_message": "Prepare the Workspace.",
+    }
+
+
+def test_blueprint_startup_job_references_must_resolve():
+    payload = _v11_payload()
+    payload["recipe"]["operating_model"]["settings"] = {
+        "blocking_setup": {
+            "checks": [{"key": "identity", "setup_job_id": "missing-setup"}],
+            "on_ready_job_id": "missing-ready",
+        }
+    }
+
+    with pytest.raises(PayloadError, match="setup_job_id.*missing-setup"):
+        validate_payload(payload)
+
+
+def test_blueprint_startup_setup_job_must_be_manual_and_enabled():
+    payload = _v11_payload()
+    payload["recipe"]["scheduled_jobs"] = [
+        {
+            **_startup_agent_job("prepare-identity", job_type="cron"),
+            "schedule_kind": "cron",
+            "cron_expr": "0 7 * * *",
+        },
+    ]
+    payload["recipe"]["operating_model"]["settings"] = {
+        "blocking_setup": {
+            "checks": [
+                {"key": "identity", "setup_job_id": "prepare-identity"},
+            ],
+        }
+    }
+
+    with pytest.raises(PayloadError, match="setup_job_id.*manual"):
+        validate_payload(payload)
+
+    payload["recipe"]["scheduled_jobs"][0] = {
+        **_startup_agent_job("prepare-identity"),
+        "enabled": False,
+    }
+    with pytest.raises(PayloadError, match="setup_job_id.*disabled"):
+        validate_payload(payload)
+
+
+def test_blueprint_startup_accepts_opt_in_manual_setup_and_ready_job():
+    payload = _v11_payload()
+    payload["recipe"]["scheduled_jobs"] = [
+        _startup_agent_job("prepare-identity"),
+        {
+            "job_id": "first-review",
+            "job_type": "cron",
+            "schedule_kind": "cron",
+            "cron_expr": "0 7 * * *",
+            "execution_type": "strategist_review",
+            "execution_target": {},
+            "payload_message": "Review the Workspace.",
+        },
+    ]
+    payload["recipe"]["operating_model"]["settings"] = {
+        "blocking_setup": {
+            "checks": [
+                {"key": "identity", "setup_job_id": "prepare-identity"},
+                {"key": "browser", "kind": "integration_provider"},
+            ],
+            "on_ready_job_id": "first-review",
+        }
+    }
+
+    validate_payload(payload)
+
+
+def _youtube_publication_workflow() -> dict:
+    return {
+        "slug": "publish-video",
+        "run_inputs": [{
+            "key": "youtube_visibility",
+            "type": "string",
+            "schema": {"type": "string", "enum": ["public", "private"]},
+        }],
+        "proposal_authorization": {
+            "kind": "youtube_publication_v1",
+            "action_key": "workspace.proposal.workflow_run.external",
+            "when": {"input_key": "youtube_visibility", "equals": "public"},
+            "destination": "studio.youtube.com",
+            "upload_step_id": "upload_video",
+            "publish_step_id": "publish_video",
+            "ttl_seconds": 86400,
+        },
+        "steps": [
+            {"id": "upload_video", "type": "agent", "next": ["publish_video"]},
+            {"id": "publish_video", "type": "agent", "next": ["done"]},
+            {"id": "done", "type": "end", "next": []},
+        ],
+    }
+
+
+def test_workflow_proposal_authorization_accepts_allowlisted_publication_contract():
+    payload = _v11_payload()
+    payload["recipe"]["workflows"] = [_youtube_publication_workflow()]
+
+    validate_payload(payload)
+
+
+@pytest.mark.parametrize(
+    ("patch", "match"),
+    [
+        ({"kind": "arbitrary_action_v1"}, "kind"),
+        ({"action_key": "chrome.anything"}, "action_key"),
+        ({"destination": "example.com"}, "destination"),
+        ({"publish_step_id": "missing"}, "publish_step_id"),
+        ({"when": {"input_key": "missing", "equals": "public"}}, "input_key"),
+        ({"when": {"input_key": "youtube_visibility", "equals": "private"}}, "equals"),
+    ],
+)
+def test_workflow_proposal_authorization_rejects_untrusted_scope(patch, match):
+    payload = _v11_payload()
+    workflow = _youtube_publication_workflow()
+    workflow["proposal_authorization"].update(patch)
+    payload["recipe"]["workflows"] = [workflow]
+
+    with pytest.raises(PayloadError, match=match):
+        validate_payload(payload)
+
+
+@pytest.mark.parametrize("execution_type", ["agent", "agent_message"])
+def test_scheduled_agent_requires_portable_service_target(execution_type):
+    payload = _v11_payload()
+    payload["recipe"]["scheduled_jobs"] = [{
+        "job_id": "targetless-agent",
+        "execution_type": execution_type,
+        "execution_target": {},
+    }]
+
+    with pytest.raises(PayloadError, match="portable Agent service_key target"):
+        validate_payload(payload)
+
+
 # ── Migration: v1.0 → v1.1 ────────────────────────────────────────────
 
 
@@ -272,9 +493,135 @@ def test_migrate_does_not_mutate_input():
 def test_migrate_v11_is_idempotent():
     p11 = _v11_payload()
     out = migrate_payload(p11)
-    # Same dict reference is fine — migrate_payload returns input
-    # untouched when version already matches.
-    assert out is p11 or out == p11
+    assert out == p11
+
+
+def test_migrate_v11_assigns_unique_goal_keys_without_splitting_shared_metric():
+    p11 = _v11_payload()
+    p11["recipe"]["goals"] = [
+        {"title": "Trial signups", "metric_key": "signup_count"},
+        {"title": "Paid signups", "metric_key": "signup_count"},
+        {
+            "title": "Qualified signups",
+            "goal_key": "goal_trial_signups",
+            "metric_key": "signup_count",
+        },
+    ]
+    snapshot = copy.deepcopy(p11)
+
+    migrated = migrate_payload(p11)
+
+    assert p11 == snapshot
+    assert [goal["goal_key"] for goal in migrated["recipe"]["goals"]] == [
+        "goal_trial_signups_2",
+        "goal_paid_signups",
+        "goal_trial_signups",
+    ]
+    assert {goal["metric_key"] for goal in migrated["recipe"]["goals"]} == {"signup_count"}
+    assert migrate_payload(migrated) == migrated
+
+
+def test_migrate_v11_rejects_duplicate_explicit_goal_keys():
+    p11 = _v11_payload()
+    p11["recipe"]["goals"] = [
+        {
+            "title": "Trial signups",
+            "goal_key": "signup_target",
+            "metric_key": "signup_count",
+            "target_value": 100,
+        },
+        {
+            "title": "Paid signups",
+            "goal_key": "signup_target",
+            "metric_key": "signup_count",
+            "target_value": 25,
+        },
+    ]
+
+    with pytest.raises(PayloadError, match="goal_key duplicates"):
+        migrate_payload(p11)
+
+
+def test_migrate_v11_normalizes_legacy_operating_model_goals():
+    p11 = _v11_payload()
+    del p11["recipe"]["goals"]
+    p11["recipe"]["operating_model"]["goals"] = [
+        {
+            "title": "Trial signups",
+            "goal_key": "signup_count",
+            "metric_key": "signup_count",
+            "target_value": 10,
+        },
+        {
+            "title": "Paid signups",
+            "goal_key": "signup_count",
+            "metric_key": "signup_count",
+            "target_value": 5,
+        },
+    ]
+
+    migrated = migrate_payload(p11)
+
+    expected_keys = ["signup_count", "signup_count_2"]
+    assert [goal["goal_key"] for goal in migrated["recipe"]["goals"]] == expected_keys
+    assert "goals" not in migrated["recipe"]["operating_model"]
+
+
+def test_migrate_v11_explicit_empty_recipe_goals_override_legacy_goals():
+    p11 = _v11_payload()
+    p11["recipe"]["goals"] = []
+    p11["recipe"]["operating_model"]["goals"] = [
+        {
+            "title": "Legacy signups",
+            "goal_key": "legacy_signups",
+            "metric_key": "signup_count",
+            "target_value": 10,
+        }
+    ]
+
+    migrated = migrate_payload(p11)
+
+    assert migrated["recipe"]["goals"] == []
+    assert "goals" not in migrated["recipe"]["operating_model"]
+
+
+def test_migrate_v11_uses_recipe_goals_as_the_canonical_identity_source():
+    p11 = _v11_payload()
+    p11["recipe"]["goals"] = [
+        {
+            "title": "Paid signups",
+            "goal_key": "paid_signups",
+            "metric_key": "signup_count",
+        }
+    ]
+    p11["recipe"]["operating_model"]["goals"] = [
+        {
+            "title": "Phantom signups",
+            "goal_key": "phantom_signups",
+            "metric_key": "signup_count",
+        }
+    ]
+
+    migrated = migrate_payload(p11)
+
+    assert migrated["recipe"]["goals"][0]["goal_key"] == "paid_signups"
+    assert "goals" not in migrated["recipe"]["operating_model"]
+
+
+def test_explicit_null_recipe_goals_fails_before_legacy_goals_are_dropped():
+    p11 = _v11_payload()
+    p11["recipe"]["goals"] = None
+    p11["recipe"]["operating_model"]["goals"] = [
+        {
+            "title": "Legacy signups",
+            "goal_key": "legacy_signups",
+            "metric_key": "signup_count",
+            "target_value": 10,
+        }
+    ]
+
+    with pytest.raises(PayloadError, match=r"payload\.recipe\.goals must be an array"):
+        validate_payload(p11)
 
 
 def test_migrate_unknown_version_raises():
@@ -304,23 +651,27 @@ def test_v11_task_policy_sections_are_not_portable():
 def test_v11_task_policy_rejects_source_entity_user_ids():
     p = _v11_payload()
     p["recipe"]["sla_policies"] = [{"key": "review", "threshold_hours": 24}]
-    p["recipe"]["escalation_rules"] = [{
-        "key": "late",
-        "sla_policy_key": "review",
-        "action": "notify",
-        "notify_user_ids": ["source-user"],
-    }]
+    p["recipe"]["escalation_rules"] = [
+        {
+            "key": "late",
+            "sla_policy_key": "review",
+            "action": "notify",
+            "notify_user_ids": ["source-user"],
+        }
+    ]
     with pytest.raises(PayloadError, match="sla_policies.*not portable"):
         validate_payload(p)
 
 
 def test_v11_task_policy_rejects_unknown_sla_reference():
     p = _v11_payload()
-    p["recipe"]["escalation_rules"] = [{
-        "key": "late",
-        "sla_policy_key": "missing",
-        "action": "notify",
-    }]
+    p["recipe"]["escalation_rules"] = [
+        {
+            "key": "late",
+            "sla_policy_key": "missing",
+            "action": "notify",
+        }
+    ]
     with pytest.raises(PayloadError, match="escalation_rules.*not portable"):
         validate_payload(p)
 
@@ -393,6 +744,34 @@ def test_v11_embedded_agent_declared_tool_passes():
         }
     ]
     validate_payload(p)  # should not raise
+
+
+def test_v11_exact_skill_binding_requires_nonempty_slug():
+    p = _v11_payload()
+    marketplace_id = "01EXACTMARKETPLACESKILL00"
+    p["contract"]["requires"]["skills"] = [
+        {
+            "slug": "manor/triage",
+            "marketplace_source": "platform",
+            "marketplace_id": marketplace_id,
+        }
+    ]
+    p["embedded"]["agents"] = [
+        {
+            "slug": "calvin-reply",
+            "tool_bindings": [],
+            "skill_bindings": ["manor/triage"],
+            "skill_binding_refs": [
+                {
+                    "marketplace_source": "platform",
+                    "marketplace_id": marketplace_id,
+                }
+            ],
+        }
+    ]
+
+    with pytest.raises(PayloadError, match=r"skill_binding_refs\[0\].*slug"):
+        validate_payload(p)
 
 
 # ── Rule 5: embedded skill tools ⊆ declared tools ─────────────────────
@@ -489,6 +868,76 @@ def test_v11_knowledge_pack_non_md_raises():
         }
     ]
     with pytest.raises(PayloadError, match="\\.md"):
+        validate_payload(p)
+
+
+def test_v11_knowledge_pack_duplicate_path_raises():
+    p = _v11_payload()
+    p["embedded"]["knowledge_packs"] = [{
+        "slug": "intel",
+        "mode": "inline_text",
+        "starter_documents": [
+            {"key": "first", "path": "shared.md", "body_md": "first"},
+            {"key": "second", "path": "shared.md", "body_md": "second"},
+        ],
+    }]
+
+    with pytest.raises(PayloadError, match="duplicate starter document path"):
+        validate_payload(p)
+
+
+def test_v11_shared_knowledge_key_requires_identical_content():
+    p = _v11_payload()
+    p["embedded"]["knowledge_packs"] = [
+        {
+            "slug": "one",
+            "mode": "inline_text",
+            "starter_documents": [
+                {"key": "shared", "path": "shared.md", "body_md": "same"},
+            ],
+        },
+        {
+            "slug": "two",
+            "mode": "inline_text",
+            "starter_documents": [
+                {"key": "shared", "path": "shared.md", "body_md": "changed"},
+            ],
+        },
+    ]
+
+    with pytest.raises(PayloadError, match="describes conflicting content"):
+        validate_payload(p)
+
+    p["embedded"]["knowledge_packs"][1]["starter_documents"][0]["body_md"] = "same"
+    validate_payload(p)
+
+
+def test_v11_knowledge_starter_content_is_bounded():
+    p = _v11_payload()
+    p["embedded"]["knowledge_packs"] = [{
+        "slug": "large",
+        "mode": "inline_text",
+        "starter_documents": [{
+            "path": "large.md",
+            "body_md": "x" * (BLUEPRINT_KNOWLEDGE_MAX_DOCUMENT_BYTES + 1),
+        }],
+    }]
+    with pytest.raises(PayloadError, match="exceeds .* bytes"):
+        validate_payload(p)
+
+    p["embedded"]["knowledge_packs"][0]["starter_documents"] = [
+        {"path": f"{index}.md", "body_md": "x"}
+        for index in range(BLUEPRINT_KNOWLEDGE_MAX_DOCUMENTS + 1)
+    ]
+    with pytest.raises(PayloadError, match="maximum of .* starter documents"):
+        validate_payload(p)
+
+    chunk_size = BLUEPRINT_KNOWLEDGE_MAX_DOCUMENT_BYTES
+    p["embedded"]["knowledge_packs"][0]["starter_documents"] = [
+        {"path": f"{index}.md", "body_md": "x" * chunk_size}
+        for index in range((BLUEPRINT_KNOWLEDGE_MAX_TOTAL_BYTES // chunk_size) + 1)
+    ]
+    with pytest.raises(PayloadError, match="total bytes"):
         validate_payload(p)
 
 
@@ -624,6 +1073,93 @@ def test_workspace_stats_and_goal_stat_key_pass():
     validate_payload(p)
 
 
+@pytest.mark.parametrize(
+    ("goal", "message"),
+    [
+        ("not-an-object", r"recipe\.goals\[0\] must be an object"),
+        ({"target_value": 1}, r"recipe\.goals\[0\] requires title"),
+        ({"title": "Missing target"}, r"recipe\.goals\[0\] requires target_value"),
+        (
+            {"title": "Bad target", "target_value": "NaN"},
+            r"recipe\.goals\[0\]\.target_value must be a finite number",
+        ),
+        (
+            {"title": "Huge target", "target_value": "1e20"},
+            r"recipe\.goals\[0\]\.target_value exceeds the supported numeric range",
+        ),
+        (
+            {"title": "Over-precise target", "target_value": "0.00001"},
+            r"recipe\.goals\[0\]\.target_value must have at most 4 decimal places",
+        ),
+        (
+            {
+                "title": "Over-precise baseline",
+                "target_value": 1,
+                "baseline_value": "0.00009",
+            },
+            r"recipe\.goals\[0\]\.baseline_value must have at most 4 decimal places",
+        ),
+        (
+            {
+                "title": "Long identity",
+                "goal_key": "x" * 101,
+                "target_value": 1,
+            },
+            r"recipe\.goals\[0\]\.goal_key must be a string of at most 100 characters",
+        ),
+        (
+            {"title": "Bad description", "target_value": 1, "description": 42},
+            r"recipe\.goals\[0\]\.description must be a string",
+        ),
+        (
+            {"title": "Bad deadline", "target_value": 1, "deadline": "tomorrow"},
+            r"recipe\.goals\[0\]\.deadline must be an ISO date",
+        ),
+        (
+            {"title": "Bad source", "target_value": 1, "measurement_source": "api"},
+            r"recipe\.goals\[0\]\.measurement_source must be an object",
+        ),
+        (
+            {
+                "title": "Bad cadence",
+                "target_value": 1,
+                "measurement_source": {"provider": "workspace_internal"},
+                "measurement_cadence": "fortnightly",
+            },
+            r"recipe\.goals\[0\]\.measurement_cadence unsupported",
+        ),
+        (
+            {
+                "title": "Impossible cadence",
+                "target_value": 1,
+                "measurement_source": {"provider": "workspace_internal"},
+                "measurement_cadence": "0 0 31 2 *",
+            },
+            r"recipe\.goals\[0\]\.measurement_cadence unsupported",
+        ),
+    ],
+)
+def test_goal_records_fail_closed_before_install(goal, message):
+    p = _v11_payload()
+    p["recipe"]["goals"] = [goal]
+
+    with pytest.raises(PayloadError, match=message):
+        validate_payload(p)
+
+
+def test_goal_numbers_allow_insignificant_trailing_zeroes_at_database_scale():
+    p = _v11_payload()
+    p["recipe"]["goals"] = [
+        {
+            "title": "Exact rate",
+            "target_value": "9999999999999999.9999",
+            "baseline_value": "1.23000",
+        }
+    ]
+
+    validate_payload(p)
+
+
 def test_exempted_config_fields_to_set_passes():
     # config_fields_to_set is the allowlist mechanism itself; the
     # field name LISTS other fields but is itself safe.
@@ -647,6 +1183,57 @@ def test_pre_migration_scan_catches_v10_credential_ref():
     p = _v10_payload()
     p["workspace"]["credential_ref"] = "vault:LEAK"
     with pytest.raises(PayloadError, match="credential_ref"):
+        validate_payload(p)
+
+
+@pytest.mark.parametrize(
+    ("section", "value", "message"),
+    [
+        ("custom_fields", [{}], r"custom_fields\[0\]\.name is required"),
+        ("custom_fields", ["bad"], r"custom_fields\[0\] must be an object"),
+        ("stats", [{}], r"stats\[0\] requires library_key or key and name"),
+        ("workflows", [{}], r"workflows\[0\]\.slug is required"),
+    ],
+)
+def test_installable_record_sections_fail_before_workspace_creation(
+    section,
+    value,
+    message,
+):
+    p = _v11_payload()
+    p["recipe"][section] = value
+
+    with pytest.raises(PayloadError, match=message):
+        validate_payload(p)
+
+
+def test_scheduled_job_rejects_local_runtime_ids():
+    p = _v11_payload()
+    p["recipe"]["scheduled_jobs"] = [{
+        "job_id": "private-agent-job",
+        "execution_type": "agent_message",
+        "agent_id": "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        "execution_target": {
+            "workflow_id": "01ARZ3NDEKTSV4RRFFQ69G5FAW",
+        },
+    }]
+
+    with pytest.raises(PayloadError, match="local runtime reference"):
+        validate_payload(p)
+
+
+def test_subworkflow_requires_declared_portable_component_key():
+    p = _v11_payload()
+    p["recipe"]["workflows"] = [{
+        "slug": "parent",
+        "steps": [{
+            "id": "child",
+            "type": "subworkflow",
+            "config": {"source_workflow_key": "missing-child"},
+        }],
+    }]
+
+    with pytest.raises(PayloadError, match="missing Blueprint Flow"):
         validate_payload(p)
 
 

@@ -1,0 +1,27 @@
+.live-chat-call {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+  text-align: center;
+}
+.live-chat-call__meta { display: flex; align-items: center; gap: 8px; color: var(--text-muted); font-size: 11px; }
+.live-chat-call__timer { font-variant-numeric: tabular-nums; }
+.live-chat-call__orb { display: grid; place-items: center; height: 132px; }
+.live-chat-call__state { margin: 0; color: var(--text-strong); font-size: 20px; font-weight: 600; }
+.live-chat-call__mode::before { content: "·"; margin-right: 8px; }
+.live-chat-call__disclosure { margin: 4px 0 0; color: var(--text-faint); font-size: 11px; }
+.live-chat-call__settings { display: flex; align-items: center; justify-content: center; gap: 10px; min-height: 36px; margin-top: 4px; }
+.live-chat-call__input { display: flex; align-items: center; gap: 7px; width: 88px; height: 36px; padding: 0 10px; border-radius: 10px; box-sizing: border-box; color: var(--text-muted); background: var(--surface-muted); }
+.live-chat-call__input meter { width: 52px; height: 8px; accent-color: var(--accent); }
+.live-chat-call__captions { width: 100%; max-height: 128px; margin-top: 4px; overflow-y: auto; text-align: left; overflow-wrap: anywhere; }
+.live-chat-call__captions p { margin: 8px 0; color: var(--text-default); font-size: 13px; line-height: 1.55; }
+.live-chat-call__captions span { display: block; margin-bottom: 2px; font-size: 11px; color: var(--text-muted); }
+.live-chat-call__captions .live-chat-call__user { color: var(--text-muted); }
+.live-chat-call__actions { display: flex; flex-wrap: wrap; justify-content: center; gap: 8px; padding: 10px 0 2px; }
+.live-chat-call__actions button { min-height: 44px; }
+.live-chat-call__error { color: var(--chip-danger-fg); font-size: 13px; overflow-wrap: anywhere; }
+@media (max-width: 480px) {
+  .live-chat-call__orb { height: 116px; }
+  .live-chat-call__captions { max-height: 108px; }
+}

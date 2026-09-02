@@ -5,9 +5,11 @@ from pathlib import Path
 
 import pytest
 from httpx import AsyncClient
+from sqlalchemy import select
 
 from packages.core.config import get_settings
-from packages.core.models.blueprint import WorkspaceBlueprint
+from packages.core.models.blueprint import BlueprintFavorite, WorkspaceBlueprint
+from packages.core.models.user import User
 from tests.marketplace_helpers import _force_fallback_verification, _register
 
 
@@ -83,6 +85,75 @@ async def test_blueprint_favorites_are_cross_tenant_marketplace_signals(
         headers=user_headers,
     )
     assert response.json() == {"is_favorited": False, "favorite_count": 0}
+
+
+async def test_legacy_platform_favorite_alias_toggles_the_canonical_row(
+    client: AsyncClient,
+    db_session,
+    monkeypatch,
+):
+    _force_fallback_verification(monkeypatch)
+    headers, entity_id = await _register(client, "bp_legacy_favorite")
+    user = (await db_session.execute(
+        select(User).where(User.entity_id == entity_id)
+    )).scalar_one()
+    slug = "legacy-platform-favorite"
+    blueprint = WorkspaceBlueprint(
+        id="01LEGACYFAVORITEBLUEPRNT",
+        entity_id=None,
+        slug=slug,
+        title="Legacy platform Blueprint",
+        payload={"manifest": {"blueprint_version": "1.1", "slug": slug}},
+        payload_version="1.1",
+        status="published",
+    )
+    legacy_remix = WorkspaceBlueprint(
+        entity_id=entity_id,
+        slug="legacy-platform-remix",
+        title="Legacy platform remix",
+        payload={"manifest": {"blueprint_version": "1.1"}},
+        payload_version="1.1",
+        status="published",
+        remixed_from_id=f"builtin:{slug}",
+    )
+    db_session.add_all([
+        blueprint,
+        legacy_remix,
+        BlueprintFavorite(
+            blueprint_id=f"builtin:{slug}",
+            entity_id=entity_id,
+            user_id=user.id,
+        ),
+    ])
+    await db_session.commit()
+
+    detail = await client.get(
+        f"/api/v1/blueprints/{blueprint.id}",
+        headers=headers,
+    )
+    assert detail.status_code == 200, detail.text
+    assert detail.json()["favorite_count"] == 1
+    assert detail.json()["is_favorited"] is True
+    assert detail.json()["remix_count"] == 1
+
+    response = await client.post(
+        f"/api/v1/blueprints/builtin:{slug}/favorite",
+        headers=headers,
+    )
+    assert response.status_code == 200, response.text
+    assert response.json() == {"is_favorited": False, "favorite_count": 0}
+
+    response = await client.post(
+        f"/api/v1/blueprints/{slug}/favorite",
+        headers=headers,
+    )
+    assert response.status_code == 200, response.text
+    assert response.json() == {"is_favorited": True, "favorite_count": 1}
+    favorites = list((await db_session.execute(
+        select(BlueprintFavorite).where(BlueprintFavorite.user_id == user.id)
+    )).scalars().all())
+    assert len(favorites) == 1
+    assert favorites[0].blueprint_id == blueprint.id
 
 
 async def test_draft_blueprint_rejects_favorite_action(

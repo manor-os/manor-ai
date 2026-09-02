@@ -7,7 +7,7 @@ Handles:
 - Message type handling (text, image, voice, video, location, link)
 
 Configuration:
-  Credentials are stored in ChannelConfig.credentials:
+  Credentials are leased from the ChannelConfig's source Integration:
     app_id       — WeChat Official Account AppID
     app_secret   — WeChat Official Account AppSecret
     token        — Callback verification token
@@ -16,6 +16,7 @@ Configuration:
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import time
 from defusedxml import ElementTree as ET
@@ -125,12 +126,28 @@ class WeChatAdapter:
         elif msg_type == "event":
             content = f"Event: {raw.get('Event', '')} {raw.get('EventKey', '')}".strip()
 
+        msg_id = raw.get("MsgId")
+        if not msg_id and msg_type == "event":
+            # WeChat event callbacks (subscribe/menu scans) omit MsgId. Hash
+            # the canonical payload so provider retries share the same
+            # durable receipt key while distinct event timestamps remain
+            # separate messages.
+            canonical_event = json.dumps(
+                raw,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            msg_id = "event:" + hashlib.sha256(
+                canonical_event.encode("utf-8"),
+            ).hexdigest()
+
         return {
             "sender_id": raw.get("FromUserName", ""),
             "recipient_id": raw.get("ToUserName", ""),
             "message_type": msg_type,
             "content": content,
-            "msg_id": raw.get("MsgId"),
+            "msg_id": msg_id,
             "media_id": raw.get("MediaId"),
             "raw": raw,
         }
@@ -297,11 +314,11 @@ class WeChatAdapter:
 
 # ── Polymorphic ChannelAdapter wrapper ──────────────────────────────────────
 
-from typing import Optional as _Optional
+from typing import Optional as _Optional  # noqa: E402
 
-from packages.core.models.channel import ChannelConfig as _CC
-from packages.core.services.channels.base import (
-    ChannelAdapter, NormalizedInbound, register_adapter,
+from packages.core.models.channel import ChannelConfig as _CC  # noqa: E402
+from packages.core.services.channels.base import (  # noqa: E402
+    ChannelAdapter, ChannelTextSendError, NormalizedInbound, register_adapter,
 )
 
 
@@ -313,13 +330,15 @@ class WeChatChannelAdapter(ChannelAdapter):
 
     channel_type = "wechat"
 
-    def _build(self, cc: _CC) -> WeChatAdapter:
-        creds = cc.credentials or {}
+    async def _build(self, cc: _CC, *, reason: str) -> WeChatAdapter:
+        creds = await self.credentials(cc, reason=reason)
         app_id = creds.get("app_id")
         app_secret = creds.get("app_secret")
         token = creds.get("token", "")
         if not (app_id and app_secret):
-            raise RuntimeError("WeChat ChannelConfig missing app_id / app_secret")
+            raise ChannelTextSendError.determinate(
+                "WeChat ChannelConfig missing app_id / app_secret"
+            )
         return WeChatAdapter(
             app_id=app_id, app_secret=app_secret, token=token,
             encoding_aes_key=creds.get("encoding_aes_key"),
@@ -335,14 +354,16 @@ class WeChatChannelAdapter(ChannelAdapter):
         nonce = query.get("nonce", "")
         if not (sig and ts and nonce):
             return False
-        token = (cc.credentials or {}).get("token", "")
+        credentials = await self.credentials(cc, reason="channel.wechat.verify_inbound")
+        token = credentials.get("token", "")
         return WeChatAdapter._sign(token, ts, nonce) == sig
 
     async def parse_inbound(self, cc: _CC, *, headers, query, body) -> _Optional[NormalizedInbound]:
         if not body:
             return None
         try:
-            parsed = await self._build(cc).handle_message(body.decode("utf-8"))
+            adapter = await self._build(cc, reason="channel.wechat.parse_inbound")
+            parsed = await adapter.handle_message(body.decode("utf-8"))
         except Exception:
             return None
         return NormalizedInbound(
@@ -358,7 +379,7 @@ class WeChatChannelAdapter(ChannelAdapter):
         )
 
     async def send_text(self, cc: _CC, to: str, text: str, **kwargs: Any) -> dict[str, Any]:
-        adapter = self._build(cc)
+        adapter = await self._build(cc, reason="channel.wechat.send_text")
         await adapter.send_text(to, text)
         return {"status": "sent"}
 

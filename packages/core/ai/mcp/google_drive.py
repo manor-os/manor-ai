@@ -1,13 +1,19 @@
 """
 Google Drive MCP server — in-process MCP for Google Drive API v3.
 
-Scopes used:
-  - https://www.googleapis.com/auth/drive (full access)
-  - or https://www.googleapis.com/auth/drive.readonly (read-only)
-  - or https://www.googleapis.com/auth/drive.file (files created by app)
+Configured scopes:
+  - https://www.googleapis.com/auth/drive.readonly for user-directed search/read
+  - https://www.googleapis.com/auth/drive.file for files created by Manor or
+    explicitly opened/shared with Manor
+
+The full ``drive`` scope is intentionally not requested. Consequently the
+``files.emptyTrash`` API is intentionally not exposed: Google documents that
+operation as requiring the full ``drive`` scope. Per-file delete remains
+available for app-authorized files through ``drive.file``.
 
 Auth: Google OAuth access_token (from entity integration config, auto-refreshed).
 """
+
 from __future__ import annotations
 
 import json
@@ -22,9 +28,51 @@ logger = logging.getLogger(__name__)
 _API = "https://www.googleapis.com/drive/v3"
 _UPLOAD_API = "https://www.googleapis.com/upload/drive/v3"
 _MAX_CHARS = 12_000
+_APP_FILE_BOUNDARY = "Only files created by Manor or explicitly opened/shared with Manor can be modified."
+_TEXT_APPLICATION_MIME_TYPES = frozenset(
+    {
+        "application/graphql",
+        "application/javascript",
+        "application/json",
+        "application/ld+json",
+        "application/rtf",
+        "application/sql",
+        "application/toml",
+        "application/x-httpd-php",
+        "application/x-javascript",
+        "application/x-ndjson",
+        "application/x-yaml",
+        "application/xml",
+        "application/yaml",
+    }
+)
+
+
+def _path_segment(value: Any) -> str:
+    """Encode an opaque Drive resource id as one URL path segment."""
+    return quote(str(value), safe="")
+
+
+def _is_text_mime(value: Any) -> bool:
+    mime = str(value or "").split(";", 1)[0].strip().lower()
+    return (
+        mime.startswith("text/")
+        or mime in _TEXT_APPLICATION_MIME_TYPES
+        or mime.endswith("+json")
+        or mime.endswith("+xml")
+    )
+
+
+def _binary_read_error(name: Any, mime: Any) -> RuntimeError:
+    return RuntimeError(
+        f"Drive file {str(name or '').strip() or 'content'} is binary "
+        f"({mime or 'unknown MIME'}). Use the file/artifact pipeline instead "
+        "of the text read tool."
+    )
 
 
 # ── MCP Protocol ─────────────────────────────────────────────────────────────
+
 
 def list_tools() -> List[Dict[str, Any]]:
     return [_tool_def(name, spec) for name, spec in _TOOLS.items()]
@@ -35,17 +83,28 @@ async def call_tool(
     arguments: Dict[str, Any],
     bearer_token: str,
 ) -> Dict[str, Any]:
+    token = bearer_token.strip() if isinstance(bearer_token, str) else ""
+    if not token:
+        return _error("Google Drive access token is missing. Reconnect Google on the Integration page.")
+
     handler = _HANDLERS.get(name)
     if not handler:
         return _error(f"Unknown tool: {name}")
+    if not isinstance(arguments, dict):
+        return _error("arguments must be an object")
+    arguments = dict(arguments)
 
     spec = _TOOLS.get(name, {})
-    missing = [p for p in spec.get("required", []) if arguments.get(p) in (None, "")]
+    missing = [
+        p
+        for p in spec.get("required", [])
+        if arguments.get(p) is None or (isinstance(arguments.get(p), str) and not arguments[p].strip())
+    ]
     if missing:
         return _error(f"Missing required params: {', '.join(missing)}")
 
     try:
-        text = await handler(bearer_token, arguments)
+        text = await handler(token, arguments)
         return {"content": [{"type": "text", "text": text}], "isError": False}
     except Exception as e:
         logger.exception("Google Drive MCP tool %s failed", name)
@@ -57,6 +116,7 @@ def _error(msg: str) -> Dict[str, Any]:
 
 
 # ── Google Drive API client ──────────────────────────────────────────────────
+
 
 async def _api(
     token: str,
@@ -74,8 +134,11 @@ async def _api(
 
     async with httpx.AsyncClient(timeout=20.0) as client:
         resp = await client.request(
-            method, url, headers=headers,
-            json=body, params=params or {},
+            method,
+            url,
+            headers=headers,
+            json=body,
+            params=params or {},
         )
 
     if resp.status_code == 401:
@@ -117,7 +180,34 @@ async def _api_raw(token: str, url: str) -> str:
     return text
 
 
+def _raise_drive_response_error(resp: httpx.Response) -> None:
+    if resp.status_code == 401:
+        raise RuntimeError("Google Drive auth failed. Reconnect Google on the Integration page.")
+    if resp.status_code == 403:
+        raise RuntimeError(f"Google Drive forbidden (scope or permissions): {resp.text[:300]}")
+    if resp.status_code == 404:
+        raise RuntimeError("Not found.")
+    raise RuntimeError(f"Google Drive API error ({resp.status_code}): {resp.text[:300]}")
+
+
+def _max_results(value: Any, *, default: int = 20) -> int:
+    if value is None or value == "":
+        return default
+    if isinstance(value, bool):
+        raise ValueError("max_results must be an integer between 1 and 100")
+    try:
+        count = int(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("max_results must be an integer between 1 and 100") from exc
+    if isinstance(value, float) and value != count:
+        raise ValueError("max_results must be an integer between 1 and 100")
+    if count < 1:
+        raise ValueError("max_results must be at least 1")
+    return min(count, 100)
+
+
 # ── Tool handlers ─────────────────────────────────────────────────────────────
+
 
 def _q_escape(value: str) -> str:
     """Escape a value for a Drive query string literal. Drive has no
@@ -129,7 +219,7 @@ def _q_escape(value: str) -> str:
 async def _list_files(token: str, args: Dict) -> str:
     """List files and folders in Google Drive."""
     params: Dict[str, Any] = {
-        "pageSize": min(int(args.get("max_results") or 20), 100),
+        "pageSize": _max_results(args.get("max_results")),
         "fields": "files(id,name,mimeType,modifiedTime,size,parents,webViewLink),nextPageToken",
         "orderBy": "modifiedTime desc",
     }
@@ -151,7 +241,7 @@ async def _list_files(token: str, args: Dict) -> str:
 async def _get_file(token: str, args: Dict) -> str:
     """Get file metadata."""
     fields = "id,name,mimeType,modifiedTime,createdTime,size,parents,webViewLink,description,owners"
-    return await _api(token, "GET", f"files/{args['file_id']}", params={"fields": fields})
+    return await _api(token, "GET", f"files/{_path_segment(args['file_id'])}", params={"fields": fields})
 
 
 async def _read_file(token: str, args: Dict) -> str:
@@ -161,12 +251,12 @@ async def _read_file(token: str, args: Dict) -> str:
     # First get metadata to determine type
     async with httpx.AsyncClient(timeout=15.0) as client:
         resp = await client.get(
-            f"{_API}/files/{file_id}",
+            f"{_API}/files/{_path_segment(file_id)}",
             params={"fields": "mimeType,name"},
             headers={"Authorization": f"Bearer {token}"},
         )
     if not resp.is_success:
-        return f"Failed to get file info: {resp.status_code}"
+        _raise_drive_response_error(resp)
     meta = resp.json()
     mime = meta.get("mimeType", "")
 
@@ -178,10 +268,14 @@ async def _read_file(token: str, args: Dict) -> str:
     }
     if mime in export_map:
         export_mime = args.get("export_format") or export_map[mime]
-        url = f"{_API}/files/{file_id}/export?mimeType={quote(export_mime)}"
+        if not isinstance(export_mime, str) or not _is_text_mime(export_mime):
+            raise _binary_read_error(meta.get("name"), export_mime)
+        url = f"{_API}/files/{_path_segment(file_id)}/export?mimeType={quote(export_mime)}"
         return await _api_raw(token, url)
     else:
-        url = f"{_API}/files/{file_id}?alt=media"
+        if not _is_text_mime(mime):
+            raise _binary_read_error(meta.get("name"), mime)
+        url = f"{_API}/files/{_path_segment(file_id)}?alt=media"
         return await _api_raw(token, url)
 
 
@@ -190,7 +284,7 @@ async def _search_files(token: str, args: Dict) -> str:
     query = args["query"]
     params: Dict[str, Any] = {
         "q": f"fullText contains '{_q_escape(query)}' and trashed = false",
-        "pageSize": min(int(args.get("max_results") or 20), 100),
+        "pageSize": _max_results(args.get("max_results")),
         "fields": "files(id,name,mimeType,modifiedTime,size,webViewLink),nextPageToken",
         "orderBy": "modifiedTime desc",
     }
@@ -228,28 +322,30 @@ async def _move_file(token: str, args: Dict) -> str:
     # Get current parents
     async with httpx.AsyncClient(timeout=15.0) as client:
         resp = await client.get(
-            f"{_API}/files/{file_id}",
+            f"{_API}/files/{_path_segment(file_id)}",
             params={"fields": "parents"},
             headers={"Authorization": f"Bearer {token}"},
         )
     if not resp.is_success:
-        return f"Failed to get file parents: {resp.status_code}"
+        _raise_drive_response_error(resp)
     current_parents = ",".join(resp.json().get("parents", []))
 
     return await _api(
-        token, "PATCH", f"files/{file_id}",
+        token,
+        "PATCH",
+        f"files/{_path_segment(file_id)}",
         params={"addParents": new_parent, "removeParents": current_parents},
     )
 
 
 async def _rename_file(token: str, args: Dict) -> str:
     """Rename a file."""
-    return await _api(token, "PATCH", f"files/{args['file_id']}", {"name": args["new_name"]})
+    return await _api(token, "PATCH", f"files/{_path_segment(args['file_id'])}", {"name": args["new_name"]})
 
 
 async def _delete_file(token: str, args: Dict) -> str:
     """Move a file to trash."""
-    return await _api(token, "PATCH", f"files/{args['file_id']}", {"trashed": True})
+    return await _api(token, "PATCH", f"files/{_path_segment(args['file_id'])}", {"trashed": True})
 
 
 async def _share_file(token: str, args: Dict) -> str:
@@ -264,7 +360,7 @@ async def _share_file(token: str, args: Dict) -> str:
     else:
         body["type"] = "anyone"
 
-    return await _api(token, "POST", f"files/{file_id}/permissions", body)
+    return await _api(token, "POST", f"files/{_path_segment(file_id)}/permissions", body)
 
 
 async def _get_about(token: str, args: Dict) -> str:
@@ -278,30 +374,28 @@ async def _copy_file(token: str, args: Dict) -> str:
         body["name"] = args["name"]
     if args.get("folder_id"):
         body["parents"] = [args["folder_id"]]
-    return await _api(token, "POST", f"files/{args['file_id']}/copy", body=body)
+    return await _api(token, "POST", f"files/{_path_segment(args['file_id'])}/copy", body=body)
 
 
 async def _restore_file(token: str, args: Dict) -> str:
     """Pull a file out of Trash."""
-    return await _api(token, "PATCH", f"files/{args['file_id']}", {"trashed": False})
+    return await _api(token, "PATCH", f"files/{_path_segment(args['file_id'])}", {"trashed": False})
 
 
 async def _delete_file_permanent(token: str, args: Dict) -> str:
     """HARD-delete (skip trash). Irreversible — use delete_file for the
     trash-then-restore safety net."""
-    return await _api(token, "DELETE", f"files/{args['file_id']}")
-
-
-async def _empty_trash(token: str, args: Dict) -> str:
-    """Permanently delete every file in the user's Trash."""
-    return await _api(token, "DELETE", "files/trash")
+    return await _api(token, "DELETE", f"files/{_path_segment(args['file_id'])}")
 
 
 # ── Permissions ─────────────────────────────────────────────────────────────
 
+
 async def _list_permissions(token: str, args: Dict) -> str:
     return await _api(
-        token, "GET", f"files/{args['file_id']}/permissions",
+        token,
+        "GET",
+        f"files/{_path_segment(args['file_id'])}/permissions",
         params={"fields": "permissions(id,type,role,emailAddress,displayName,domain,allowFileDiscovery)"},
     )
 
@@ -309,39 +403,46 @@ async def _list_permissions(token: str, args: Dict) -> str:
 async def _update_permission(token: str, args: Dict) -> str:
     body: Dict[str, Any] = {"role": args["role"]}
     return await _api(
-        token, "PATCH",
-        f"files/{args['file_id']}/permissions/{args['permission_id']}",
+        token,
+        "PATCH",
+        f"files/{_path_segment(args['file_id'])}/permissions/{_path_segment(args['permission_id'])}",
         body=body,
     )
 
 
 async def _delete_permission(token: str, args: Dict) -> str:
     return await _api(
-        token, "DELETE",
-        f"files/{args['file_id']}/permissions/{args['permission_id']}",
+        token,
+        "DELETE",
+        f"files/{_path_segment(args['file_id'])}/permissions/{_path_segment(args['permission_id'])}",
     )
 
 
 # ── Revisions ───────────────────────────────────────────────────────────────
 
+
 async def _list_revisions(token: str, args: Dict) -> str:
     return await _api(
-        token, "GET", f"files/{args['file_id']}/revisions",
+        token,
+        "GET",
+        f"files/{_path_segment(args['file_id'])}/revisions",
         params={"fields": "revisions(id,modifiedTime,lastModifyingUser,size,keepForever)"},
     )
 
 
 async def _get_revision(token: str, args: Dict) -> str:
     return await _api(
-        token, "GET",
-        f"files/{args['file_id']}/revisions/{args['revision_id']}",
+        token,
+        "GET",
+        f"files/{_path_segment(args['file_id'])}/revisions/{_path_segment(args['revision_id'])}",
     )
 
 
 async def _delete_revision(token: str, args: Dict) -> str:
     return await _api(
-        token, "DELETE",
-        f"files/{args['file_id']}/revisions/{args['revision_id']}",
+        token,
+        "DELETE",
+        f"files/{_path_segment(args['file_id'])}/revisions/{_path_segment(args['revision_id'])}",
     )
 
 
@@ -352,7 +453,9 @@ _COMMENT_FIELDS = "id,content,htmlContent,createdTime,modifiedTime,resolved,auth
 
 async def _list_comments(token: str, args: Dict) -> str:
     return await _api(
-        token, "GET", f"files/{args['file_id']}/comments",
+        token,
+        "GET",
+        f"files/{_path_segment(args['file_id'])}/comments",
         params={"fields": f"comments({_COMMENT_FIELDS})"},
     )
 
@@ -362,15 +465,19 @@ async def _create_comment(token: str, args: Dict) -> str:
     if args.get("quoted_text"):
         body["quotedFileContent"] = {"value": args["quoted_text"]}
     return await _api(
-        token, "POST", f"files/{args['file_id']}/comments",
-        body=body, params={"fields": _COMMENT_FIELDS},
+        token,
+        "POST",
+        f"files/{_path_segment(args['file_id'])}/comments",
+        body=body,
+        params={"fields": _COMMENT_FIELDS},
     )
 
 
 async def _resolve_comment(token: str, args: Dict) -> str:
     return await _api(
-        token, "PATCH",
-        f"files/{args['file_id']}/comments/{args['comment_id']}",
+        token,
+        "PATCH",
+        f"files/{_path_segment(args['file_id'])}/comments/{_path_segment(args['comment_id'])}",
         body={"resolved": True},
         params={"fields": _COMMENT_FIELDS},
     )
@@ -378,21 +485,24 @@ async def _resolve_comment(token: str, args: Dict) -> str:
 
 async def _delete_comment(token: str, args: Dict) -> str:
     return await _api(
-        token, "DELETE",
-        f"files/{args['file_id']}/comments/{args['comment_id']}",
+        token,
+        "DELETE",
+        f"files/{_path_segment(args['file_id'])}/comments/{_path_segment(args['comment_id'])}",
     )
 
 
 async def _create_reply(token: str, args: Dict) -> str:
     return await _api(
-        token, "POST",
-        f"files/{args['file_id']}/comments/{args['comment_id']}/replies",
+        token,
+        "POST",
+        f"files/{_path_segment(args['file_id'])}/comments/{_path_segment(args['comment_id'])}/replies",
         body={"content": args["content"]},
         params={"fields": "id,content,createdTime,author"},
     )
 
 
 # ── Tool definitions ──────────────────────────────────────────────────────────
+
 
 def _prop(desc: str, type_: str = "string") -> Dict[str, str]:
     return {"type": type_, "description": desc}
@@ -418,10 +528,10 @@ _TOOLS: Dict[str, Dict[str, Any]] = {
         "required": ["file_id"],
     },
     "read_file": {
-        "description": "Read file content. Google Docs export as text, Sheets as CSV, others download raw",
+        "description": "Read text content. Google Docs export as text and Sheets as CSV; binary files require the file/artifact pipeline",
         "properties": {
             "file_id": _prop("Google Drive file ID"),
-            "export_format": _prop("Export MIME type override (e.g. text/plain, text/csv, application/pdf)"),
+            "export_format": _prop("Optional text export MIME type override (e.g. text/plain or text/csv)"),
         },
         "required": ["file_id"],
     },
@@ -437,7 +547,9 @@ _TOOLS: Dict[str, Dict[str, Any]] = {
         "description": "Create a new file (Google Doc, Sheet, etc.) — metadata only",
         "properties": {
             "name": _prop("File name"),
-            "mime_type": _prop("MIME type (e.g. application/vnd.google-apps.document for Google Doc, application/vnd.google-apps.spreadsheet for Sheet)"),
+            "mime_type": _prop(
+                "MIME type (e.g. application/vnd.google-apps.document for Google Doc, application/vnd.google-apps.spreadsheet for Sheet)"
+            ),
             "folder_id": _prop("Parent folder ID"),
             "description": _prop("File description"),
         },
@@ -452,7 +564,7 @@ _TOOLS: Dict[str, Dict[str, Any]] = {
         "required": ["name"],
     },
     "move_file": {
-        "description": "Move a file to a different folder",
+        "description": f"Move a file to a different folder. {_APP_FILE_BOUNDARY}",
         "properties": {
             "file_id": _prop("File ID to move"),
             "folder_id": _prop("Destination folder ID"),
@@ -460,7 +572,7 @@ _TOOLS: Dict[str, Dict[str, Any]] = {
         "required": ["file_id", "folder_id"],
     },
     "rename_file": {
-        "description": "Rename a file in Google Drive",
+        "description": f"Rename a file in Google Drive. {_APP_FILE_BOUNDARY}",
         "properties": {
             "file_id": _prop("File ID to rename"),
             "new_name": _prop("New file name"),
@@ -468,14 +580,14 @@ _TOOLS: Dict[str, Dict[str, Any]] = {
         "required": ["file_id", "new_name"],
     },
     "delete_file": {
-        "description": "Move a file to trash in Google Drive",
+        "description": f"Move a file to trash in Google Drive. {_APP_FILE_BOUNDARY}",
         "properties": {
             "file_id": _prop("File ID to trash"),
         },
         "required": ["file_id"],
     },
     "share_file": {
-        "description": "Share a file — grant access to a user by email or make it public",
+        "description": (f"Share a file — grant access to a user by email or make it public. {_APP_FILE_BOUNDARY}"),
         "properties": {
             "file_id": _prop("File ID to share"),
             "email": _prop("Email address to share with (omit for public link)"),
@@ -491,7 +603,8 @@ _TOOLS: Dict[str, Dict[str, Any]] = {
     "copy_file": {
         "description": (
             "Duplicate a file. Useful for templating: copy a Doc / Sheet "
-            "and rename / refile in one step."
+            "and rename / refile in one step. "
+            f"{_APP_FILE_BOUNDARY}"
         ),
         "properties": {
             "file_id": _prop("Source file ID"),
@@ -501,22 +614,18 @@ _TOOLS: Dict[str, Dict[str, Any]] = {
         "required": ["file_id"],
     },
     "restore_file": {
-        "description": "Restore a file from Trash (un-trash).",
+        "description": f"Restore a file from Trash (un-trash). {_APP_FILE_BOUNDARY}",
         "properties": {"file_id": _prop("File ID")},
         "required": ["file_id"],
     },
     "delete_file_permanent": {
         "description": (
             "Permanently delete a file (skip Trash). NOT reversible — "
-            "use delete_file for the safe two-stage path."
+            "use delete_file for the safe two-stage path. "
+            f"{_APP_FILE_BOUNDARY}"
         ),
         "properties": {"file_id": _prop("File ID")},
         "required": ["file_id"],
-    },
-    "empty_trash": {
-        "description": "Permanently delete every file in the user's Trash. NOT reversible.",
-        "properties": {},
-        "required": [],
     },
     # ── Permissions ──
     "list_permissions": {
@@ -525,7 +634,7 @@ _TOOLS: Dict[str, Dict[str, Any]] = {
         "required": ["file_id"],
     },
     "update_permission": {
-        "description": "Change a single permission's role on a file.",
+        "description": f"Change a single permission's role on a file. {_APP_FILE_BOUNDARY}",
         "properties": {
             "file_id": _prop("File ID"),
             "permission_id": _prop("Permission ID from list_permissions"),
@@ -534,7 +643,7 @@ _TOOLS: Dict[str, Dict[str, Any]] = {
         "required": ["file_id", "permission_id", "role"],
     },
     "delete_permission": {
-        "description": "Revoke a single permission from a file.",
+        "description": f"Revoke a single permission from a file. {_APP_FILE_BOUNDARY}",
         "properties": {
             "file_id": _prop("File ID"),
             "permission_id": _prop("Permission ID from list_permissions"),
@@ -558,7 +667,8 @@ _TOOLS: Dict[str, Dict[str, Any]] = {
     "delete_revision": {
         "description": (
             "Delete a single revision. The current revision can't be "
-            "deleted (only superseded by a newer one)."
+            "deleted (only superseded by a newer one). "
+            f"{_APP_FILE_BOUNDARY}"
         ),
         "properties": {
             "file_id": _prop("File ID"),
@@ -575,7 +685,8 @@ _TOOLS: Dict[str, Dict[str, Any]] = {
     "create_comment": {
         "description": (
             "Add a comment to a file. Pass quoted_text to anchor the "
-            "comment to a specific quote (Docs/Sheets only)."
+            "comment to a specific quote (Docs/Sheets only). "
+            f"{_APP_FILE_BOUNDARY}"
         ),
         "properties": {
             "file_id": _prop("File ID"),
@@ -585,7 +696,7 @@ _TOOLS: Dict[str, Dict[str, Any]] = {
         "required": ["file_id", "content"],
     },
     "resolve_comment": {
-        "description": "Mark a comment thread as resolved.",
+        "description": f"Mark a comment thread as resolved. {_APP_FILE_BOUNDARY}",
         "properties": {
             "file_id": _prop("File ID"),
             "comment_id": _prop("Comment ID"),
@@ -593,7 +704,7 @@ _TOOLS: Dict[str, Dict[str, Any]] = {
         "required": ["file_id", "comment_id"],
     },
     "delete_comment": {
-        "description": "Delete a comment (and its replies).",
+        "description": f"Delete a comment (and its replies). {_APP_FILE_BOUNDARY}",
         "properties": {
             "file_id": _prop("File ID"),
             "comment_id": _prop("Comment ID"),
@@ -601,7 +712,7 @@ _TOOLS: Dict[str, Dict[str, Any]] = {
         "required": ["file_id", "comment_id"],
     },
     "create_reply": {
-        "description": "Reply to an existing comment thread.",
+        "description": f"Reply to an existing comment thread. {_APP_FILE_BOUNDARY}",
         "properties": {
             "file_id": _prop("File ID"),
             "comment_id": _prop("Comment ID to reply under"),
@@ -626,7 +737,6 @@ _HANDLERS = {
     "copy_file": _copy_file,
     "restore_file": _restore_file,
     "delete_file_permanent": _delete_file_permanent,
-    "empty_trash": _empty_trash,
     "list_permissions": _list_permissions,
     "update_permission": _update_permission,
     "delete_permission": _delete_permission,

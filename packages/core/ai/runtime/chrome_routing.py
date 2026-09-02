@@ -55,6 +55,7 @@ CHROME_MCP_TOOLS = frozenset({
     "mcp__chrome__ping_tab",
     "mcp__chrome__read_page",
     "mcp__chrome__resolve_target",
+    "mcp__chrome__execute_cached_step",
     "mcp__chrome__computer",
     "mcp__chrome__wait",
     "mcp__chrome__get_interactive_elements",
@@ -93,6 +94,7 @@ CHROME_KNOWLEDGE_LOCAL_MCP_TOOLS = frozenset({
 CHROME_LOCAL_BROWSER_DEFAULT_TOOLS = (
     "mcp__chrome__open_or_reuse",
     "mcp__chrome__read_page",
+    "mcp__chrome__execute_cached_step",
     "mcp__chrome__click_element",
     "mcp__chrome__fill_or_select",
     "mcp__chrome__wait",
@@ -277,6 +279,7 @@ _CHROME_PAGE_MUTATION_TOOLS = frozenset({
     "mcp__chrome__reload",
     "mcp__chrome__handle_js_dialog",
     "mcp__chrome__click_element",
+    "mcp__chrome__execute_cached_step",
     "mcp__chrome__fill_or_select",
     "mcp__chrome__scroll",
     "mcp__chrome__scroll_wheel",
@@ -289,6 +292,7 @@ _CHROME_PAGE_MUTATION_TOOLS = frozenset({
 })
 _CHROME_TRUSTED_POST_ACTION_TOOLS = frozenset({
     "mcp__chrome__click_element",
+    "mcp__chrome__execute_cached_step",
     "mcp__chrome__fill_or_select",
     "mcp__chrome__type_text",
     "mcp__chrome__press_key",
@@ -343,6 +347,7 @@ _CHROME_WORKFLOW_REQUIRES_SESSION_NAME_TOOLS = frozenset({
     "mcp__chrome__js_dialog",
     "mcp__chrome__handle_js_dialog",
     "mcp__chrome__read_page",
+    "mcp__chrome__execute_cached_step",
     "mcp__chrome__computer",
     "mcp__chrome__wait",
     "mcp__chrome__get_interactive_elements",
@@ -452,7 +457,7 @@ def runtime_blocked_generic_web_for_chrome_local_browser(
         ),
         "next_step": (
             "Return to the normal Chrome skill path. If the `chrome` skill is "
-            "listed in Available Skills, call invoke_skill with skill=\"chrome\" "
+            "listed in Available Skills, call invoke_skill with skill_id=<ID of chrome in Available Skills> "
             "and the latest user request. If invoke_skill is deferred, load "
             "invoke_skill with search_tools; do not load Chrome MCP tools "
             "directly from the parent chat. The Chrome skill owns the "
@@ -845,40 +850,6 @@ def runtime_record_chrome_tool_result(
         "next_required_tool": "mcp__chrome__read_page",
     }
     state["post_action_read_credit"] = True
-
-
-def runtime_restore_chrome_confirmation_receipt(
-    *,
-    runtime_metadata: dict[str, Any] | None,
-    tool_name: str,
-    approval_id: Any,
-    confirmation_mode: Any,
-    policy_category: Any,
-    preapproved: Any,
-    arguments: dict[str, Any],
-    destination: Any = "",
-    data_summary: Any = "",
-) -> None:
-    """Restore a persisted Chrome approval receipt for a resumed runtime."""
-    canonical_tool = _canonical_chrome_tool_name(tool_name)
-    approval_id_text = str(approval_id or "").strip()
-    if (
-        runtime_metadata is None
-        or canonical_tool not in CHROME_MCP_TOOLS
-        or not approval_id_text
-    ):
-        return
-    state = _chrome_runtime_contract_state(runtime_metadata)
-    state["pending_chrome_confirmation"] = {
-        "approval_id": approval_id_text,
-        "tool_name": canonical_tool,
-        "confirmation_mode": str(confirmation_mode or "").strip(),
-        "policy_category": str(policy_category or "").strip(),
-        "preapproved": preapproved is True,
-        "destination": str(destination or "").strip(),
-        "data_summary": str(data_summary or "").strip(),
-        "action_signature": _chrome_action_signature(canonical_tool, arguments),
-    }
 
 
 def _blocked_chrome_confirmation_action(

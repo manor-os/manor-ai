@@ -17,9 +17,11 @@ Both checks are recursive over nested dicts/lists and case-insensitive.
 """
 from __future__ import annotations
 
-from typing import Any, Literal
+from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+from packages.core.constants.review import ConsolidationReportStatus
 
 HUMAN_PARTICIPATION_DOMAIN = "human_participation"
 
@@ -95,7 +97,7 @@ class ConsolidationReportModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     domain: str
-    status: Literal["complete", "partial", "failed"]
+    status: ConsolidationReportStatus
     summary: str
     metrics: dict[str, Any] = Field(default_factory=dict)
     observations: list[Observation] = Field(default_factory=list)

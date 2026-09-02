@@ -41,6 +41,7 @@ from sqlalchemy.sql import or_
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from packages.core.constants.models import (
+    CATALOG_ONLY_ROLES,
     DEFAULTS,
     model_preference_is_available,
     resolve_model_for_role,
@@ -532,9 +533,19 @@ def resolve_llm_metadata_from_settings(
     )
     if not api_key or not str(api_key).strip():
         return None
+    key_model_bindings = settings.get("llm_api_key_models") or {}
+    # Catalog-only role credentials must carry an explicit model binding.
+    # Older settings documents sometimes retained a media-role key after its
+    # catalog model was removed; treating ``models.{role}`` as an implicit
+    # binding would silently resurrect that stale credential against the new
+    # default. The account model endpoints persist ``llm_api_key_models``
+    # whenever a role key is saved, while primary and general LLM-role
+    # credentials remain compatible with legacy settings.
+    if key_role in CATALOG_ONLY_ROLES and key_role not in key_model_bindings:
+        return None
     bound_model = str(
-        (settings.get("llm_api_key_models") or {}).get(key_role)
-        or (settings.get("models") or {}).get(key_role)
+        key_model_bindings.get(key_role)
+        or ((settings.get("models") or {}).get(key_role) if key_role == "primary" else "")
         or ""
     ).strip()
     if bound_model and bound_model != str(selected_model or "").strip():

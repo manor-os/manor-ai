@@ -59,6 +59,34 @@ def test_user_default_channels_dedupe_and_drop_unknown():
     assert chans == ["inapp", "telegram", "email"]
 
 
+def test_whatsapp_is_not_a_user_notification_route():
+    user_route = select_channels(
+        kind="task_failed",
+        severity="warn",
+        user_prefs={"notifications": {"default_channels": ["whatsapp"]}},
+    )
+    workspace_route = select_channels(
+        kind="task_failed",
+        severity="warn",
+        user_prefs=None,
+        workspace_settings={
+            "notification_policy": {"default_routes": ["whatsapp"]},
+        },
+    )
+    entity_route = select_channels(
+        kind="task_failed",
+        severity="warn",
+        user_prefs=None,
+        entity_settings={
+            "notification_policy": {"default_routes": ["whatsapp"]},
+        },
+    )
+
+    assert user_route == ["inapp"]
+    assert workspace_route == ["inapp"]
+    assert entity_route == ["inapp"]
+
+
 # ── by_kind overrides ──────────────────────────────────────────────────────
 
 
@@ -250,7 +278,7 @@ def test_full_precedence_chain():
             "default_routes": ["telegram"],
         }
     }
-    entity = {"notification_policy": {"default_routes": ["whatsapp"]}}
+    entity = {"notification_policy": {"default_routes": ["discord"]}}
 
     # user.by_kind wins
     assert select_channels(
@@ -288,7 +316,7 @@ def test_full_precedence_chain():
         user_prefs=workspace_only_user,
         workspace_settings=None,
         entity_settings=entity,
-    ) == ["inapp", "whatsapp"]
+    ) == ["inapp", "discord"]
 
 
 @pytest.mark.parametrize("severity", ["info", "warn", "critical"])

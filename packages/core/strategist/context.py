@@ -14,12 +14,21 @@ from typing import Any, Optional
 from sqlalchemy import desc, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from packages.core.constants.goals import GoalStatus
+from packages.core.constants.proposal import (
+    ProposalItemKind,
+    ProposalItemStatus,
+    ProposalStatus,
+)
 from packages.core.constants.task import TaskStatus
 from packages.core.goals.scheduling import measurement_source_requires_external_provider
 from packages.core.models.execution import ExecutionPlan
 from packages.core.models.goal import Goal
 from packages.core.models.task import Task
 from packages.core.models.workspace import Agent, AgentSubscription, Workspace, WorkspaceActivity
+from packages.core.services.oauth_account_credentials import (
+    oauth_account_is_runtime_usable_clause,
+)
 from packages.core.services.provider_keys import canonical_provider_key
 from packages.core.services.workspace_readiness import (
     check_workspace_readiness,
@@ -279,45 +288,12 @@ async def _installed_workspace_flows(
     db: AsyncSession,
     workspace: Workspace,
 ) -> list[dict[str, Any]]:
-    from packages.core.models.workflow import WorkflowBinding, WorkflowDefinition
-    from packages.core.services.workspace_workflow_router import normalize_chat_entrypoint
+    from packages.core.services.workspace_flow_catalog import list_workspace_flows
 
-    blueprint_slug = str(
-        ((workspace.settings or {}).get("_blueprint") or {}).get("blueprint_slug")
-        or ""
-    ).strip()
-    if not blueprint_slug:
-        return []
-    rows = (await db.execute(
-        select(WorkflowBinding, WorkflowDefinition)
-        .join(WorkflowDefinition, WorkflowDefinition.id == WorkflowBinding.workflow_id)
-        .where(
-            WorkflowBinding.entity_id == workspace.entity_id,
-            WorkflowBinding.workspace_id == workspace.id,
-            WorkflowBinding.enabled.is_(True),
-            WorkflowBinding.status == "active",
-            WorkflowDefinition.is_active.is_(True),
-            WorkflowDefinition.status == "active",
-        )
-        .order_by(WorkflowBinding.name.asc(), WorkflowBinding.id.asc())
-    )).all()
-    descriptors: list[dict[str, Any]] = []
-    for binding, workflow in rows:
-        workflow_slug = str(
-            (binding.config or {}).get("workspace_blueprint_workflow_slug") or ""
-        ).strip()
-        entrypoint = normalize_chat_entrypoint(binding, workflow)
-        if not workflow_slug or entrypoint is None:
-            continue
-        descriptors.append({
-            "blueprint_slug": blueprint_slug,
-            "workflow_slug": workflow_slug,
-            "binding_id": binding.id,
-            "title": entrypoint.title,
-            "description": entrypoint.description,
-            "inputs": [dict(item) for item in entrypoint.run_inputs],
-        })
-    return descriptors
+    return [
+        flow.descriptor()
+        for flow in await list_workspace_flows(db, workspace)
+    ]
 
 
 async def _agents_by_id(
@@ -361,7 +337,7 @@ async def _active_provider_keys(db: AsyncSession, entity_id: str) -> set[str]:
             .join(User, User.id == OAuthAccount.user_id)
             .where(
                 User.entity_id == entity_id,
-                OAuthAccount.access_token.isnot(None),
+                oauth_account_is_runtime_usable_clause(),
             )
         )).scalars().all())
         out.update(_canonical_provider_values(rows))
@@ -487,7 +463,7 @@ async def _active_goals(
         select(Goal).where(
             Goal.entity_id == entity_id,
             Goal.workspace_id == workspace_id,
-            Goal.status == "active",
+            Goal.status == GoalStatus.ACTIVE.value,
         ).order_by(Goal.priority.desc(), Goal.created_at.desc())
     )).scalars().all())
 
@@ -548,9 +524,9 @@ async def _open_proposed_items(
         .join(ProposalRecord, ProposalRecord.id == ProposalItemRecord.proposal_id)
         .where(
             ProposalItemRecord.workspace_id == workspace_id,
-            ProposalItemRecord.status == "proposed",
-            ProposalItemRecord.kind != "task",
-            ProposalRecord.status == "open",
+            ProposalItemRecord.status == ProposalItemStatus.PROPOSED,
+            ProposalItemRecord.kind != ProposalItemKind.TASK,
+            ProposalRecord.status == ProposalStatus.OPEN,
         )
         .order_by(desc(ProposalItemRecord.created_at))
     )).all()
@@ -610,7 +586,7 @@ async def _recent_proposal_outcomes(
                 buckets["rejected"].append(t)
             else:
                 buckets["abandoned"].append(t)
-        elif t.status in {"failed", "blocked"}:
+        elif t.status in {TaskStatus.FAILED, TaskStatus.BLOCKED}:
             buckets["abandoned"].append(t)
         else:
             buckets["in_progress"].append(t)

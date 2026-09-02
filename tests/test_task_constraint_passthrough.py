@@ -8,8 +8,14 @@ extractor → planner prompt block → subagent prompt injection.
 """
 from __future__ import annotations
 
+from types import SimpleNamespace
+
+import pytest
+
 from packages.core.plans.task_constraints import (
+    binding_constraints_forbid_artifact_writes,
     extract_binding_constraints,
+    plan_requires_artifact_write,
     render_constraints_block,
 )
 
@@ -101,3 +107,118 @@ def test_subagent_prompt_injection_noop_without_constraints():
     assert _with_binding_constraints(
         "Do the work.", {"task_binding_constraints": []},
     ) == "Do the work."
+
+
+def test_explicit_artifact_write_prohibition_is_structured_for_runtime_gates():
+    details = {
+        "runtime_context": {
+            "instructions": (
+                "Keep this inspection read-only. Do not create or write files, "
+                "including artifact generation."
+            ),
+        },
+    }
+
+    assert binding_constraints_forbid_artifact_writes(details) is True
+    assert plan_requires_artifact_write({
+        "steps": [{"key": "save", "output_shape": "ArtifactResult"}],
+    }) is True
+
+
+def test_artifact_write_prohibition_matches_failed_step_wording():
+    details = {
+        "runtime_context": {
+            "rules": [
+                {
+                    "description": (
+                        "The binding constraints explicitly prohibit creating or "
+                        "writing files, including artifact generation."
+                    ),
+                },
+            ],
+        },
+    }
+
+    assert binding_constraints_forbid_artifact_writes(details) is True
+
+
+def test_source_file_prohibition_does_not_block_separate_generated_artifact():
+    details = {
+        "runtime_context": {
+            "instructions": "Do not write source files; generate a separate PDF artifact.",
+        },
+    }
+
+    assert binding_constraints_forbid_artifact_writes(details) is False
+
+
+@pytest.mark.parametrize(
+    "instruction",
+    [
+        "No files should be deleted; create report.pdf.",
+        "No files were deleted. Save the final result as report.pdf.",
+        "No artifacts may be removed; generate a new PDF artifact.",
+    ],
+)
+def test_file_retention_wording_does_not_forbid_new_artifacts(instruction):
+    details = {"runtime_context": {"instructions": instruction}}
+
+    assert binding_constraints_forbid_artifact_writes(details) is False
+
+
+@pytest.mark.parametrize(
+    "instruction",
+    [
+        "No files should be created.",
+        "No artifacts may be generated.",
+        "No files; reply inline only.",
+    ],
+)
+def test_explicit_no_output_wording_still_forbids_artifacts(instruction):
+    details = {"runtime_context": {"instructions": instruction}}
+
+    assert binding_constraints_forbid_artifact_writes(details) is True
+
+
+def test_optional_envelope_file_slot_does_not_make_text_step_an_artifact_write():
+    assert plan_requires_artifact_write({
+        "steps": [
+            {
+                "key": "summarize",
+                "expected_output_schema": {
+                    "type": "object",
+                    "required": ["summary"],
+                    "properties": {
+                        "summary": {"type": "string"},
+                        "files": {"type": "array", "items": {"type": "object"}},
+                    },
+                },
+            },
+        ],
+    }) is False
+
+
+def test_planner_rejects_artifact_step_that_violates_binding_constraint():
+    from packages.core.plans.planner import _required_plan_step_errors
+    from packages.core.plans.schema import Plan, PlanStep
+
+    task = SimpleNamespace(
+        details={
+            "runtime_context": {
+                "instructions": "Do not create or write files.",
+            },
+        },
+    )
+    plan = Plan(steps=[
+        PlanStep(
+            key="materialize",
+            kind="subagent",
+            service_key="knowledge",
+            params={"prompt": "Save a closeout artifact."},
+            output_shape="ArtifactResult",
+        ),
+    ])
+
+    assert _required_plan_step_errors(task, plan) == [
+        "step 'materialize' requires a saved artifact but USER CONSTRAINTS prohibit file/artifact writes",
+    ]

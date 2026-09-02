@@ -15,6 +15,7 @@ from typing import Any
 from sqlalchemy import desc, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from packages.core.constants.goals import GoalStatus
 from packages.core.memory.canonical import (
     ensure_workspace_memory_docs,
     write_workspace_memory_file,
@@ -103,7 +104,7 @@ async def _active_goals(db: AsyncSession, workspace: Workspace) -> list[Goal]:
         select(Goal).where(
             Goal.entity_id == workspace.entity_id,
             Goal.workspace_id == workspace.id,
-            Goal.status == "active",
+            Goal.status == GoalStatus.ACTIVE.value,
         ).order_by(Goal.priority.desc(), Goal.created_at.desc()).limit(20)
     )).scalars().all())
 
@@ -241,7 +242,7 @@ def _task_artifact_entries(tasks: list[Task]) -> list[WorkspaceFileEntry]:
         }
         for file in _collect_output_files(actual):
             location = _file_location(file)
-            document_id = str(file.get("document_id") or file.get("doc_id") or "").strip()
+            document_id = str(file.get("document_id") or "").strip()
             if not location and not document_id:
                 continue
             step_key = str(file.get("step") or file.get("step_key") or file.get("key") or "").strip()
@@ -352,7 +353,7 @@ def _collect_output_files(actual_output: dict[str, Any]) -> list[dict[str, Any]]
         if not isinstance(item, dict):
             continue
         location = _file_location(item)
-        doc_id = str(item.get("document_id") or item.get("doc_id") or "").strip()
+        doc_id = str(item.get("document_id") or "").strip()
         key = doc_id or location or f"artifact:{idx}"
         if key in seen:
             continue

@@ -2,7 +2,11 @@
 import pytest
 from httpx import AsyncClient
 
-from tests.marketplace_helpers import _force_fallback_verification, _register
+from tests.marketplace_helpers import (
+    _force_fallback_verification,
+    _register,
+    _restricted_staff_headers,
+)
 
 
 pytestmark = pytest.mark.asyncio
@@ -35,6 +39,37 @@ async def test_set_free_price_always_allowed(client: AsyncClient, db_session, mo
 
 
 @pytest.mark.parametrize("client", CLOUD, indirect=True)
+async def test_same_entity_staff_without_billing_permission_cannot_set_price(
+    client: AsyncClient, db_session, monkeypatch,
+):
+    from packages.core.models.blueprint import WorkspaceBlueprint
+
+    _force_fallback_verification(monkeypatch)
+    owner_headers, entity_id = await _register(client, "pricing_rbac_owner")
+    staff_headers = await _restricted_staff_headers(
+        client,
+        owner_headers,
+        "pricing_rbac_staff",
+    )
+    bp_id = await _make_blueprint(
+        db_session,
+        entity_id,
+        slug="bp-pricing-rbac",
+    )
+
+    r = await client.put(
+        f"/api/v1/blueprints/{bp_id}/pricing",
+        headers=staff_headers,
+        json={"price_cents": 0},
+    )
+
+    assert r.status_code == 403, r.text
+    db_session.expire_all()
+    blueprint = await db_session.get(WorkspaceBlueprint, bp_id)
+    assert blueprint.price_cents is None
+
+
+@pytest.mark.parametrize("client", CLOUD, indirect=True)
 async def test_paid_price_requires_charges_enabled(client: AsyncClient, db_session, monkeypatch):
     _force_fallback_verification(monkeypatch)
     headers, entity_id = await _register(client, "pricing_gate")
@@ -55,6 +90,32 @@ async def test_paid_price_requires_charges_enabled(client: AsyncClient, db_sessi
                          headers=headers, json={"price_cents": 4900})
     assert r.status_code == 200, r.text
     assert r.json()["price_cents"] == 4900
+
+
+@pytest.mark.parametrize("client", CLOUD, indirect=True)
+async def test_paid_price_requires_payouts_enabled(
+    client: AsyncClient, db_session, monkeypatch,
+):
+    _force_fallback_verification(monkeypatch)
+    headers, entity_id = await _register(client, "pricing_payout_gate")
+    bp_id = await _make_blueprint(db_session, entity_id, slug="bp-payout-gate")
+
+    from packages.core.models.merchant import MerchantAccount
+    db_session.add(MerchantAccount(
+        entity_id=entity_id,
+        stripe_account_id="acct_pricing_payout_1",
+        charges_enabled=True,
+        payouts_enabled=False,
+        onboarding_status="pending",
+    ))
+    await db_session.commit()
+
+    r = await client.put(
+        f"/api/v1/blueprints/{bp_id}/pricing",
+        headers=headers,
+        json={"price_cents": 4900},
+    )
+    assert r.status_code == 409
 
 
 @pytest.mark.parametrize("client", CLOUD, indirect=True)

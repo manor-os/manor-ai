@@ -11,6 +11,7 @@
  * Variants control sizing only; the structure is identical so the
  * sidebar and full view stay visually consistent.
  */
+import { useEffect, useRef } from "react";
 import ChatMarkdown from "../ChatMarkdown";
 import UserAvatar from "../ui/UserAvatar";
 import { IconDocument } from "../icons";
@@ -74,6 +75,8 @@ export interface TaskLogItemProps {
    *  assigned agent when the comment is generically attributed to
    *  ``AI Agent`` / ``AI Supervisor`` (the plan executor's default). */
   task?: Task;
+  /** Route to restore when a file inside this log is closed. */
+  returnTo?: string;
 }
 
 /* ── Author resolution ─────────────────────────────── */
@@ -168,6 +171,17 @@ function resolveAuthor(log: any, users: User[], agents: Agent[], staff: Array<Re
     }
     const fallback = isStepExecutionLog(log) ? taskAgentFallback(task) : null;
     if (fallback) return fallback;
+  }
+
+  if (
+    log.log_type === "create"
+    && task?.author_agent_name
+  ) {
+    return {
+      name: task.author_agent_name,
+      avatarUrl: task.author_agent_avatar,
+      kind: isMasterAgent(task.author_agent_id) ? "manor" : "agent",
+    };
   }
 
   // 2. System events
@@ -287,6 +301,11 @@ function shortId(value?: string | null) {
   return value ? value.slice(-6) : "";
 }
 
+function taskLogAnchorId(taskId: string | undefined, logId: string | undefined, index: number) {
+  const identity = `${taskId || "task"}-${logId || `index-${index}`}`;
+  return `task-log-${identity.replace(/[^A-Za-z0-9_-]/g, "-")}`;
+}
+
 function diagnosticItems(meta: Record<string, any> | null | undefined) {
   if (!meta) return [];
   const items: { label: string; value: string; tone?: "danger" | "muted" }[] = [];
@@ -305,10 +324,30 @@ function diagnosticItems(meta: Record<string, any> | null | undefined) {
 
 export default function TaskLogItem({
   log, index = 0, variant = "full", formatTime,
-  users = [], agents = [], staff = [], task,
+  users = [], agents = [], staff = [], task, returnTo,
 }: TaskLogItemProps) {
   const v = VARIANT_STYLES[variant];
   const author = resolveAuthor(log, users, agents, staff, task);
+  const rowRef = useRef<HTMLDivElement | null>(null);
+  const sourceAnchorId = taskLogAnchorId(task?.id, log?.id, index);
+  const sourceReturnTo = returnTo
+    ? `${returnTo.split("#")[0]}#${encodeURIComponent(sourceAnchorId)}`
+    : undefined;
+
+  useEffect(() => {
+    if (!sourceReturnTo || typeof window === "undefined") return;
+    let activeHash = window.location.hash.slice(1);
+    try {
+      activeHash = decodeURIComponent(activeHash);
+    } catch {
+      // Keep the raw hash when it is not valid percent-encoded text.
+    }
+    if (activeHash !== sourceAnchorId) return;
+    const frame = window.requestAnimationFrame(() => {
+      rowRef.current?.scrollIntoView({ block: "center", inline: "nearest" });
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [sourceAnchorId, sourceReturnTo]);
 
   const isStatus     = log.log_type === "status_change";
   const isEval       = log.log_type === "evaluation";
@@ -333,7 +372,7 @@ export default function TaskLogItem({
   const diagnostics = diagnosticItems(log.meta);
 
   return (
-    <div style={{
+    <div id={sourceAnchorId} ref={rowRef} style={{
       display: "flex", gap: v.rowGap, alignItems: "flex-start",
       padding: `${v.rowPadY}px 0`,
       borderTop: index > 0 ? "1px solid rgba(231,229,228,0.25)" : "none",
@@ -415,7 +454,7 @@ export default function TaskLogItem({
             </p>
           ) : (
             <div style={{ fontSize: v.fontMain, color: "#57534e", lineHeight: 1.6 }}>
-              <ChatMarkdown content={formatUserFacingStructuredText(log.content)} />
+              <ChatMarkdown content={formatUserFacingStructuredText(log.content)} returnTo={sourceReturnTo} />
             </div>
           )
         )}

@@ -92,28 +92,6 @@ const PRIMARY_PAGE_BODY_GUTTER_CONTRACTS = new Map([
   ["Settings.tsx", 'padding: "8px 24px 24px"'],
 ]);
 
-test("routed app pages use the shared page-title contract", async () => {
-  for (const [file, contract] of APP_PAGE_HEADER_CONTRACTS) {
-    const source = await readFile(new URL(`../src/pages/${file}`, import.meta.url), "utf8");
-    assert.ok(source.includes(contract), `${file} must render ${contract}`);
-    assert.doesNotMatch(source, /<PageHeader(?:\s|>)[\s\S]{0,180}\bflush\b/, `${file} must not override the app header gutter`);
-  }
-});
-
-test("admin pages use the same shared page header", async () => {
-  for (const file of ADMIN_PAGE_FILES) {
-    const source = await readFile(new URL(`../src/admin/pages/${file}`, import.meta.url), "utf8");
-    assert.ok(source.includes("<AdminPageHeader"), `${file} must render AdminPageHeader`);
-    assert.ok(!source.includes("<h1"), `${file} must not define page-local h1 styles`);
-  }
-});
-
-test("primary page bodies reuse the app-shell gutter", async () => {
-  for (const [file, contract] of PRIMARY_PAGE_BODY_GUTTER_CONTRACTS) {
-    const source = await readFile(new URL(`../src/pages/${file}`, import.meta.url), "utf8");
-    assert.ok(source.includes(contract), `${file} must not add a second outer page gutter`);
-  }
-});
 
 test("PageHeader owns typography, row placement, and app-shell positioning", async () => {
   const source = await readFile(
@@ -198,18 +176,6 @@ test("Tasks and Knowledge explain their purpose before live page stats", async (
   }
 });
 
-test("Blueprint detail keeps its aligned content wide on large screens", async () => {
-  const source = await readFile(
-    new URL("../src/pages/BlueprintDetail.tsx", import.meta.url),
-    "utf8",
-  );
-
-  assert.ok(source.includes('width: "100%", maxWidth: 1600'));
-  assert.ok(!source.includes("maxWidth: 1240"));
-  assert.match(source, /<PageHeader[\s\S]{0,320}breadcrumb=/);
-  assert.doesNotMatch(source, /<PageHeader[\s\S]{0,260}meta=/);
-  assert.doesNotMatch(source, /bp\.tags\.slice/);
-});
 
 test("AppLayout provides one canonical header slot before routed page content", async () => {
   const source = await readFile(

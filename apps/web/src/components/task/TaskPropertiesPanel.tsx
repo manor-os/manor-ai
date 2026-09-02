@@ -27,9 +27,17 @@ import { MANOR_AGENT_ID, MANOR_AGENT_NAME, MANOR_AGENT_TYPE, isMasterAgent } fro
 import type { Task, Agent, User } from "../../lib/types";
 import { t } from "../../lib/i18n";
 import { friendlyPersonName, isAutomationIdentity } from "../../lib/taskDisplay";
+import { isInteractiveTaskType } from "../../lib/taskTypes";
 
 
 type Variant = "compact" | "full";
+type AssignmentPickerMode = "assignment" | "session-host" | "human-assignee";
+
+export interface WorkspaceAgentSubscriptionOption {
+  id: string;
+  agent_id: string;
+  role_label?: string | null;
+}
 
 const VARIANT_STYLES: Record<Variant, { labelW: number; padY: number; fontSize: number; iconSize: number; pickerMaxWidth: number }> = {
   compact: { labelW: 90,  padY: 8,  fontSize: 12, iconSize: 12, pickerMaxWidth: 220 },
@@ -55,6 +63,16 @@ function workspaceAgentTeamName(task: Task): string {
     return t("component.task_properties_panel.workspace_service_agent_team_named", { service: serviceName });
   }
   return t("component.task_properties_panel.workspace_agent_team");
+}
+
+export function filterWorkspaceScopedAgents(
+  agents: Agent[],
+  workspaceId?: string | null,
+  workspaceAgentIds?: readonly string[],
+): Agent[] {
+  if (!workspaceId) return agents;
+  const allowedIds = new Set(workspaceAgentIds || []);
+  return agents.filter((agent) => allowedIds.has(agent.id));
 }
 
 /* ── Generic labeled row primitive ─────────────────────── */
@@ -115,10 +133,13 @@ export function PropertyRow({
 /* ── Assignee picker (rich, with avatars + search) ─────── */
 
 export function AssigneePicker({
-  task, agents, users, staff = [], currentUser, onSelect, style,
+  task, agents, workspaceAgentIds, workspaceAgentSubscriptions = [], users,
+  staff = [], currentUser, mode = "assignment", onSelect, style,
 }: {
   task: Task;
   agents: Agent[];
+  workspaceAgentIds?: readonly string[];
+  workspaceAgentSubscriptions?: readonly WorkspaceAgentSubscriptionOption[];
   users: User[];
   staff?: Array<{
     id?: string;
@@ -130,6 +151,7 @@ export function AssigneePicker({
     status?: string | null;
   }>;
   currentUser: User | null;
+  mode?: AssignmentPickerMode;
   onSelect: (patch: Partial<Task>) => void;
   style?: React.CSSProperties;
 }) {
@@ -186,36 +208,81 @@ export function AssigneePicker({
     ? users.find((u) => u.entity_id === task.assignee_id && (u.role === "owner" || u.role === "admin"))
     : null;
   const isManor = isMasterAgent(task.agent_id, task.agent_type) || isMasterAgent(task.assignee_id);
+  const isSessionHostPicker = mode === "session-host";
+  const isHumanAssigneePicker = mode === "human-assignee";
+  const isSessionManor = Boolean(
+    isSessionHostPicker
+    && task.session_host_available === true
+    && isMasterAgent(task.session_host_agent_id)
+  );
   const isWorkspaceAgentTeam = Boolean(task.workspace_id && !task.agent_id && !task.assignee_id && !isManor);
   const ownerServiceLabel = humanizeServiceKey(task.owner_service_key);
   const workspaceTeamName = workspaceAgentTeamName(task);
 
-  const rawDisplayName = isManor
-    ? MANOR_AGENT_NAME
-    : isWorkspaceAgentTeam
-      ? workspaceTeamName
-      : matchedAgent?.name
-        || task.assignee_name
-        || (matchedUser?.display_name || matchedUser?.email)
-        || (matchedStaff?.display_name || matchedStaff?.name || matchedStaff?.email)
-        || (matchedOwnerUser?.display_name || matchedOwnerUser?.email)
-        || (task.assignee_id === currentUser?.id || task.assignee_id === currentUser?.entity_id
-          ? (currentUser?.display_name || currentUser?.email)
-          : null)
-        || (task.assignee_id ? t("component.comment_thread.user") : null);
+  const sessionHostName = [
+    task.session_host_name,
+    task.session_host_role_label,
+  ].filter(Boolean).join(" · ");
+  const humanAssigneeName = task.assignee_name
+    || (matchedUser?.display_name || matchedUser?.email)
+    || (matchedStaff?.display_name || matchedStaff?.name || matchedStaff?.email)
+    || (matchedOwnerUser?.display_name || matchedOwnerUser?.email)
+    || (task.assignee_id === currentUser?.id || task.assignee_id === currentUser?.entity_id
+      ? (currentUser?.display_name || currentUser?.email)
+      : null)
+    || (task.assignee_id ? t("component.comment_thread.user") : null);
+  const rawDisplayName = isSessionHostPicker
+    ? sessionHostName || t("page.task_detail.session_host_unavailable")
+    : isHumanAssigneePicker
+      ? humanAssigneeName
+    : isManor
+      ? MANOR_AGENT_NAME
+      : isWorkspaceAgentTeam
+        ? workspaceTeamName
+        : matchedAgent?.name
+          || task.assignee_name
+          || (matchedUser?.display_name || matchedUser?.email)
+          || (matchedStaff?.display_name || matchedStaff?.name || matchedStaff?.email)
+          || (matchedOwnerUser?.display_name || matchedOwnerUser?.email)
+          || (task.assignee_id === currentUser?.id || task.assignee_id === currentUser?.entity_id
+            ? (currentUser?.display_name || currentUser?.email)
+            : null)
+          || (task.assignee_id ? t("component.comment_thread.user") : null);
   const displayName = rawDisplayName ? friendlyPersonName(rawDisplayName, t("component.comment_thread.user")) : null;
 
   const displayType: "agent" | "manor" | "workspace" | "user" | "none" =
-    isManor ? "manor" : isWorkspaceAgentTeam ? "workspace" : (task.agent_id || matchedAssigneeAgent) ? "agent" : displayName ? "user" : "none";
+    isSessionHostPicker
+      ? isSessionManor
+        ? "manor"
+        : task.session_host_available === true ? "agent" : "none"
+      : isHumanAssigneePicker
+        ? displayName ? "user" : "none"
+      : isManor
+        ? "manor"
+        : isWorkspaceAgentTeam
+          ? "workspace"
+          : (task.agent_id || matchedAssigneeAgent)
+            ? "agent"
+            : displayName ? "user" : "none";
 
-  const displayAvatar = isManor
-    ? null
-    : matchedAgent?.avatar_url
-      || task.assignee_avatar
-      || matchedUser?.avatar_url
-      || matchedStaff?.avatar_url
-      || matchedOwnerUser?.avatar_url
-      || (task.assignee_id === currentUser?.id || task.assignee_id === currentUser?.entity_id ? currentUser?.avatar_url : null);
+  const displayAvatar = isSessionHostPicker
+    ? isSessionManor
+      ? null
+      : task.session_host_available === true ? task.session_host_avatar : null
+    : isHumanAssigneePicker
+      ? task.assignee_avatar
+        || matchedUser?.avatar_url
+        || matchedStaff?.avatar_url
+        || matchedOwnerUser?.avatar_url
+        || (task.assignee_id === currentUser?.id || task.assignee_id === currentUser?.entity_id ? currentUser?.avatar_url : null)
+    : isManor
+      ? null
+      : matchedAgent?.avatar_url
+        || task.assignee_avatar
+        || matchedUser?.avatar_url
+        || matchedStaff?.avatar_url
+        || matchedOwnerUser?.avatar_url
+        || (task.assignee_id === currentUser?.id || task.assignee_id === currentUser?.entity_id ? currentUser?.avatar_url : null);
 
   type Option = {
     id: string; name: string; type: "agent" | "manor" | "workspace" | "user" | "none"; badge: string;
@@ -225,8 +292,13 @@ export function AssigneePicker({
     const identity = [u.id, u.display_name, u.email, (u as any).name].filter(Boolean).join(" ");
     return !isAutomationIdentity(identity);
   });
+  const assignableAgents = filterWorkspaceScopedAgents(
+    agents,
+    task.workspace_id,
+    workspaceAgentIds,
+  );
 
-  const options: Option[] = [
+  const generalOptions: Option[] = [
     {
       id: isWorkspaceAgentTeam ? "__workspace_agent_team__" : "__unassign__",
       name: isWorkspaceAgentTeam
@@ -250,7 +322,7 @@ export function AssigneePicker({
       id: "__manor__", name: MANOR_AGENT_NAME, type: "manor", badge: t("component.task_properties_panel.master"),
       patch: { agent_id: MANOR_AGENT_ID, agent_type: MANOR_AGENT_TYPE, assignee_id: "" as any },
     },
-    ...agents.map((a) => ({
+    ...assignableAgents.map((a) => ({
       id: `agent:${a.id}`, name: a.name, type: "agent" as const, badge: t("component.task_log_item.agent"),
       avatarUrl: a.avatar_url,
       patch: { agent_id: a.id, agent_type: "agent", assignee_id: "" as any },
@@ -281,24 +353,90 @@ export function AssigneePicker({
         patch: { assignee_id: (s.user_id || s.id) as any, agent_id: "" as any, agent_type: "" as any },
       })),
   ];
+  const sessionOptions: Option[] = [
+    {
+      id: "__manor__",
+      name: MANOR_AGENT_NAME,
+      type: "manor",
+      badge: t("component.task_properties_panel.master"),
+      patch: {
+        agent_id: MANOR_AGENT_ID,
+        agent_type: MANOR_AGENT_TYPE,
+        owner_service_key: "",
+        owner_subscription_id: "",
+      },
+    },
+    ...workspaceAgentSubscriptions.flatMap((subscription) => {
+      const agent = assignableAgents.find(
+        (candidate) => candidate.id === subscription.agent_id,
+      );
+      if (!agent) return [];
+      return [{
+        id: `subscription:${subscription.id}`,
+        name: agent.name,
+        type: "agent" as const,
+        badge: subscription.role_label
+          ? humanizeServiceKey(subscription.role_label)
+          : t("component.task_log_item.agent"),
+        avatarUrl: agent.avatar_url,
+        patch: {
+          agent_id: agent.id,
+          agent_type: "agent",
+          owner_service_key: "",
+          owner_subscription_id: subscription.id,
+        },
+      }];
+    }),
+  ];
+  const humanAssigneeOptions: Option[] = [
+    {
+      id: "__unassign__",
+      name: t("component.task_properties_panel.unassigned"),
+      type: "none",
+      badge: "",
+      patch: { assignee_id: "" as any },
+    },
+    ...generalOptions
+      .filter((option) => option.id.startsWith("user:") || option.id.startsWith("staff:"))
+      .map((option) => ({
+        ...option,
+        patch: { assignee_id: option.patch.assignee_id },
+      })),
+  ];
+  const options = isSessionHostPicker
+    ? sessionOptions
+    : isHumanAssigneePicker
+      ? humanAssigneeOptions
+      : generalOptions;
 
   const filtered = query
     ? options.filter((o) => o.name.toLowerCase().includes(query.toLowerCase()))
     : options;
 
   const isCurrent = (o: Option): boolean => {
-    if (o.id === "__unassign__") return !task.assignee_id && !task.agent_id && !isManor;
+    if (o.id === "__unassign__") {
+      return isHumanAssigneePicker
+        ? !task.assignee_id
+        : !task.assignee_id && !task.agent_id && !isManor;
+    }
     if (o.id === "__workspace_agent_team__") return isWorkspaceAgentTeam;
-    if (o.id === "__manor__") return isManor;
+    if (o.id === "__manor__") return isSessionHostPicker ? isSessionManor : isManor;
+    if (o.id.startsWith("subscription:")) {
+      return o.id.slice("subscription:".length) === task.owner_subscription_id;
+    }
     if (o.id.startsWith("agent:")) {
       const agentId = o.id.slice(6);
       return agentId === task.agent_id || (!task.agent_id && agentId === task.assignee_id);
     }
-    if (o.id.startsWith("user:")) return o.id.slice(5) === task.assignee_id && !task.agent_id && !matchedAssigneeAgent;
+    if (o.id.startsWith("user:")) {
+      return o.id.slice(5) === task.assignee_id
+        && (isHumanAssigneePicker || (!task.agent_id && !matchedAssigneeAgent));
+    }
     if (o.id.startsWith("staff:")) {
       const staffId = o.id.slice(6);
       const staffRow = staff.find((s) => s.id === staffId);
-      return !task.agent_id && (staffId === task.assignee_id || staffRow?.user_id === task.assignee_id);
+      return (isHumanAssigneePicker || !task.agent_id)
+        && (staffId === task.assignee_id || staffRow?.user_id === task.assignee_id);
     }
     return false;
   };
@@ -396,6 +534,9 @@ export function AssigneePicker({
 export interface TaskPropertiesPanelProps {
   task: Task;
   agents: Agent[];
+  /** Active Agent subscriptions for this Task's Workspace. */
+  workspaceAgentIds?: readonly string[];
+  workspaceAgentSubscriptions?: readonly WorkspaceAgentSubscriptionOption[];
   users?: User[];
   staff?: Array<Record<string, any>>;
   currentUser?: User | null;
@@ -416,7 +557,8 @@ export interface TaskPropertiesPanelProps {
 }
 
 export default function TaskPropertiesPanel({
-  task, agents, users = [], staff = [], currentUser = null,
+  task, agents, workspaceAgentIds, workspaceAgentSubscriptions = [], users = [],
+  staff = [], currentUser = null,
   variant = "full",
   showPriority = true, showCategory = true, showSla = false,
   showRequester = true,
@@ -434,6 +576,7 @@ export default function TaskPropertiesPanel({
     && !isMasterAgent(task.assignee_id)
   );
   const assigneeHelp = t("component.task_properties_panel.assignee_help");
+  const isTaskSession = isInteractiveTaskType(task.task_type);
   const statusKeys = statusTransitions?.[task.status] || Object.keys(STATUS_CONFIG);
   const statusOptions = statusKeys
     .filter((key) => STATUS_CONFIG[key])
@@ -512,6 +655,38 @@ export default function TaskPropertiesPanel({
         ),
       });
     }
+
+    const authorAgentId = task.author_agent_id;
+    const matchedAuthorAgent = authorAgentId
+      ? agents.find((agent) => agent.id === authorAgentId)
+      : null;
+    const authorAgentName = isMasterAgent(authorAgentId)
+      ? MANOR_AGENT_NAME
+      : task.author_agent_name || matchedAuthorAgent?.name || null;
+    if (authorAgentName) {
+      rows.push({
+        key: "author-agent",
+        node: (
+          <PropertyRow
+            label={t("component.task_properties_panel.agent_author")}
+            variant={variant}
+            icon={<IconAgent size={v.iconSize} />}
+          >
+            <span style={{ display: "inline-flex", alignItems: "center", gap: 8, padding: "2px 0" }}>
+              <UserAvatar
+                name={authorAgentName}
+                type={isMasterAgent(authorAgentId) ? "manor" : "agent"}
+                avatarUrl={task.author_agent_avatar || matchedAuthorAgent?.avatar_url}
+                size={variant === "compact" ? 22 : 26}
+              />
+              <span style={{ fontSize: v.fontSize, color: "#292524", fontWeight: 500 }}>
+                {authorAgentName}
+              </span>
+            </span>
+          </PropertyRow>
+        ),
+      });
+    }
   }
   if (showPriority) {
     rows.push({
@@ -528,21 +703,54 @@ export default function TaskPropertiesPanel({
       ),
     });
   }
+  if (isTaskSession) {
+    rows.push({
+      key: "session-host",
+      node: (
+        <PropertyRow
+          label={t("page.task_detail.session_host_label")}
+          variant={variant}
+          icon={<IconAgent size={v.iconSize} />}
+          help={task.session_host_available === false
+            ? t("page.task_detail.session_host_unavailable_copy")
+            : undefined}
+        >
+          <AssigneePicker
+            task={task}
+            agents={agents}
+            workspaceAgentIds={workspaceAgentIds}
+            workspaceAgentSubscriptions={workspaceAgentSubscriptions}
+            users={users}
+            staff={staff}
+            currentUser={currentUser}
+            mode="session-host"
+            onSelect={onUpdate}
+            style={{ maxWidth: v.pickerMaxWidth }}
+          />
+        </PropertyRow>
+      ),
+    });
+  }
   rows.push({
     key: "assignee",
     node: (
       <PropertyRow
         label={t("component.embedded_chat.assignee")}
         variant={variant}
-        icon={(isAI || isWorkspaceAgentTeamAssignee) ? <IconAgent size={v.iconSize} /> : <IconUser size={v.iconSize} />}
+        icon={isTaskSession
+          ? <IconUser size={v.iconSize} />
+          : (isAI || isWorkspaceAgentTeamAssignee) ? <IconAgent size={v.iconSize} /> : <IconUser size={v.iconSize} />}
         help={assigneeHelp}
       >
         <AssigneePicker
           task={task}
           agents={agents}
+          workspaceAgentIds={workspaceAgentIds}
+          workspaceAgentSubscriptions={workspaceAgentSubscriptions}
           users={users}
           staff={staff}
           currentUser={currentUser}
+          mode={isTaskSession ? "human-assignee" : "assignment"}
           onSelect={onUpdate}
           style={{ maxWidth: v.pickerMaxWidth }}
         />

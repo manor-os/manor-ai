@@ -1621,6 +1621,72 @@ test("newer compact action overrides stale Chat action and owns resolution", asy
   );
 });
 
+test("failed Chat workflow fallback retries its current node through the Workflow runtime", async () => {
+  const hostModule = await loadHostHelpers();
+  const retryAction = hostModule.selectWorkspaceWorkflowInterventionAction({
+    id: "youtube-visibility-retry",
+    title: "Publish video",
+    status: "failed",
+    currentNodeId: "set_youtube_visibility",
+    nodes: [],
+    action: null,
+  });
+
+  assert.deepEqual(retryAction, {
+    kind: "workflow_retry",
+    workflow_run_id: "youtube-visibility-retry",
+    step_id: "set_youtube_visibility",
+    retry_from_step_id: "set_youtube_visibility",
+    editable_input_schema: { type: "object", properties: {} },
+    options: ["retry"],
+  });
+  assert.equal(
+    hostModule.selectWorkspaceWorkflowInterventionAction({
+      id: "unrecoverable-failure",
+      title: "Publish video",
+      status: "failed",
+      currentNodeId: null,
+      nodes: [],
+      action: null,
+    }).kind,
+    "workflow_cancel",
+  );
+  assert.match(hostSource, /api\.workflows\.retryRun\(/);
+  assert.match(
+    hostSource,
+    /normalizedChoice === "retry"[\s\S]*?retryMutation\.mutateAsync\(/,
+  );
+});
+
+test("failed Chat workflow fallback retains the server retry checkpoint", async () => {
+  const hostModule = await loadHostHelpers();
+  const run = hostModule.mergeWorkflowRunView(
+    {
+      id: "youtube-visibility-retry",
+      status: "failed",
+      current_step_id: "youtube_visibility_blocked",
+      retry_from_step_id: "set_youtube_visibility",
+      updated_at: "2026-08-17T00:00:00Z",
+      workflow_steps: [],
+      intervention: null,
+    },
+    {
+      id: "youtube-visibility-retry",
+      title: "Publish video",
+      status: "failed",
+      currentNodeId: "youtube_visibility_blocked",
+      nodes: [],
+      action: null,
+    },
+  );
+
+  assert.equal(run.retryFromStepId, "set_youtube_visibility");
+  assert.equal(
+    hostModule.selectWorkspaceWorkflowInterventionAction(run).retry_from_step_id,
+    "set_youtube_visibility",
+  );
+});
+
 test("truncated compact action hydrates from the same message-backed Chat action", async () => {
   const hostModule = await loadHostHelpers();
   const fullRetryAction = {
@@ -1800,7 +1866,9 @@ test("workspace workflow host renders one panel, an accessible switcher, and act
 test("workflow host scopes controls and errors to the selected authorized run", () => {
   assert.match(hostSource, /const canControl = Boolean\(runCapabilities\?\.can_control\)/);
   assert.match(hostSource, /canCancelRun = canControl/);
-  assert.match(hostSource, /disabled=\{resolving \|\| !canControl\}/);
+  assert.match(hostSource, /workspacePaused\?: boolean/);
+  assert.match(hostSource, /workspacePaused = false/);
+  assert.match(hostSource, /disabled=\{workspacePaused \|\| resolving \|\| !canControl\}/);
   assert.match(hostSource, /actionMessageId === resolveMessageId/);
   assert.match(hostSource, /const actionMessageId = nonEmptyString\(interventionAction\?\.message_id\)/);
   assert.doesNotMatch(hostSource, /actionMessage\?\.id/);
@@ -1818,7 +1886,7 @@ test("workflow run cancellation is confirmed from the compact header action", ()
   assert.match(hostSource, /className="workflow-run-cancel-action"/);
   assert.match(hostSource, /title=\{cancelActionLabel\}/);
   assert.match(hostSource, /aria-label=\{cancelActionLabel\}/);
-  assert.match(hostSource, /disabled=\{resolving\}/);
+  assert.match(hostSource, /disabled=\{workspacePaused \|\| resolving\}/);
   assert.match(hostSource, /cancelMutation\.isPending\s*\? <LoadingSpinner size=\{13\} \/>/);
   assert.match(hostSource, /<IconStop size=\{13\}/);
   assert.doesNotMatch(hostSource, /<span>\{cancelActionLabel\}<\/span>/);

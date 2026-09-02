@@ -23,7 +23,8 @@ Channels:
     Legacy (in-app only):
       - "db"          — persist to notifications table (also pushes WS)
       - "ws"          — WebSocket push to the user's connected sessions
-      - "broadcast"   — entity-wide WS broadcast
+      - "broadcast"   — workspace-scoped WS broadcast when workspace_id is set,
+                        otherwise entity-wide
 
     Multi-channel (when ``channels=None``):
       - resolve via ``notification_routing.resolve_channel_targets`` and
@@ -42,12 +43,54 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime, timezone
-from typing import Optional, Sequence
+from typing import Awaitable, Callable, Sequence
+
+from packages.core.constants.notification_types import (
+    NotificationChannel,
+    NotificationDeliveryStatus,
+    NotificationDispatchStatus,
+    NotificationOutboxStatus,
+)
+from packages.core.services.notification_targets import (
+    NotificationDeliveryTargetFactory,
+)
 
 logger = logging.getLogger(__name__)
 
 # Used by callers that want the old "persist + WS" behaviour explicitly.
-LEGACY_INAPP_CHANNELS: list[str] = ["db", "ws"]
+LEGACY_INAPP_CHANNELS: list[str] = [
+    NotificationChannel.DATABASE.value,
+    NotificationChannel.WEBSOCKET.value,
+]
+_LEGACY_CHANNELS = {
+    NotificationChannel.DATABASE.value,
+    NotificationChannel.WEBSOCKET.value,
+    NotificationChannel.BROADCAST.value,
+}
+_DELIVERED_TARGET_KEYS = "_delivered_target_keys"
+
+
+def _delivery_intent_payload(payload: dict) -> dict:
+    intent = dict(payload)
+    intent.pop(_DELIVERED_TARGET_KEYS, None)
+    return intent
+
+
+async def _broadcast_notification(
+    *,
+    entity_id: str,
+    workspace_id: str | None,
+    event: str,
+    data: dict,
+) -> None:
+    if workspace_id:
+        from packages.core.services.realtime import _broadcast_workspace
+
+        await _broadcast_workspace(entity_id, workspace_id, event, data)
+        return
+    from packages.core.services.realtime import _broadcast
+
+    await _broadcast(entity_id, event, data)
 
 
 async def notify(
@@ -67,6 +110,7 @@ async def notify(
     callback_payload: dict | None = None,
     expires_in_seconds: int | None = None,
     deliver_at: datetime | None = None,
+    idempotency_key: str | None = None,
 ) -> None:
     """Dispatch a notification through the resolved channels.
 
@@ -92,25 +136,62 @@ async def notify(
         reply; when they do, ``dispatch_inbound`` matches their text
         against the action keys and fires the callback.
     """
-    # Future delivery — persist a pending row and let the sweeper kick
-    # off the real fan-out at deliver_at. Past timestamps fall through
-    # to immediate dispatch (catching up after worker downtime is the
-    # whole point of the sweeper).
+    from packages.core.services.notification_service import (
+        normalize_notification_workspace_scope,
+    )
+
+    meta, workspace_id = normalize_notification_workspace_scope(
+        meta=meta,
+        workspace_id=workspace_id,
+    )
+    if channels is not None and not channels:
+        return
+    if not _render_for_external(
+        title=title,
+        body=body,
+        link=link,
+    ).strip():
+        raise ValueError("notification must include user-visible content")
+    if not await notification_recipient_is_authorized(
+        entity_id=entity_id,
+        user_id=user_id,
+        workspace_id=workspace_id,
+    ):
+        logger.debug(
+            "notify: dropping inaccessible workspace notification user=%s workspace=%s",
+            user_id,
+            workspace_id,
+        )
+        return
+
+    meta = _compose_meta(
+        meta,
+        severity=severity,
+        workspace_id=workspace_id,
+        actions=actions,
+        callback_kind=callback_kind,
+    )
+
+    # Future delivery persists one hidden Notification plus its outbox row.
+    # Immediate routed delivery uses the same outbox, then attempts it before
+    # returning; a process crash leaves a recoverable pending row.
     if deliver_at is not None:
         now = datetime.now(timezone.utc)
         if deliver_at.tzinfo is None:
             deliver_at = deliver_at.replace(tzinfo=timezone.utc)
         if deliver_at > now:
-            await _schedule_for_later(
+            await _persist_routed_notification(
                 entity_id=entity_id, user_id=user_id, type=type, title=title,
                 body=body, link=link, meta=meta, severity=severity,
                 workspace_id=workspace_id, actions=actions,
                 callback_kind=callback_kind, callback_payload=callback_payload,
                 expires_in_seconds=expires_in_seconds, deliver_at=deliver_at,
+                channels=list(channels) if channels is not None else None,
+                idempotency_key=idempotency_key,
             )
             return
 
-    if channels is not None:
+    if channels is not None and all(channel in _LEGACY_CHANNELS for channel in channels):
         await _legacy_dispatch(
             entity_id=entity_id,
             user_id=user_id,
@@ -120,10 +201,12 @@ async def notify(
             link=link,
             meta=meta,
             channels=list(channels),
+            workspace_id=workspace_id,
+            idempotency_key=idempotency_key,
         )
         return
 
-    await _routed_dispatch(
+    await _persist_routed_notification(
         entity_id=entity_id,
         user_id=user_id,
         type=type,
@@ -137,12 +220,64 @@ async def notify(
         callback_kind=callback_kind,
         callback_payload=callback_payload,
         expires_in_seconds=expires_in_seconds,
+        deliver_at=deliver_at,
+        channels=list(channels) if channels is not None else None,
+        idempotency_key=idempotency_key,
     )
 
 
-# ── Scheduled delivery ────────────────────────────────────────────────────
+async def _user_can_receive_workspace_notification(
+    *,
+    entity_id: str,
+    user_id: str,
+    workspace_id: str,
+    db=None,
+) -> bool:
+    """Keep every notification channel inside the Workspace read boundary."""
+    from packages.core.database import async_session
+    from packages.core.permissions import resolve_effective_user_role_name
+    from packages.core.services.workspace_access import user_can_read_workspace_id
 
-async def _schedule_for_later(
+    async def _authorized(session) -> bool:
+        role = await resolve_effective_user_role_name(
+            session,
+            user_id=user_id,
+            entity_id=entity_id,
+        )
+        return await user_can_read_workspace_id(
+            session,
+            workspace_id=workspace_id,
+            entity_id=entity_id,
+            user_id=user_id,
+            role=role,
+        )
+
+    if db is not None:
+        return await _authorized(db)
+    async with async_session() as session:
+        return await _authorized(session)
+
+
+async def notification_recipient_is_authorized(
+    *,
+    entity_id: str,
+    user_id: str,
+    workspace_id: str | None,
+    db=None,
+) -> bool:
+    if not workspace_id:
+        return True
+    return await _user_can_receive_workspace_notification(
+        entity_id=entity_id,
+        user_id=user_id,
+        workspace_id=workspace_id,
+        db=db,
+    )
+
+
+# ── Durable routed delivery ───────────────────────────────────────────────
+
+async def _persist_routed_notification(
     *,
     entity_id: str,
     user_id: str,
@@ -157,117 +292,194 @@ async def _schedule_for_later(
     callback_kind: str | None,
     callback_payload: dict | None,
     expires_in_seconds: int | None,
-    deliver_at: datetime,
+    deliver_at: datetime | None,
+    channels: list[str] | None,
+    idempotency_key: str | None,
 ) -> None:
-    """Persist a Notification row with dispatch_status='pending' so the
-    sweeper picks it up at the requested time.
+    """Persist the in-app fact and external fan-out intent atomically."""
+    from sqlalchemy import select
 
-    All the producer's args are stashed under ``meta._scheduled`` so the
-    sweeper can replay the call verbatim — including actions / callback
-    / severity that would otherwise be lost when reloading the row.
-    """
     from packages.core.database import async_session
-    from packages.core.models.notification import Notification
+    from packages.core.models.notification import NotificationOutboxEvent
+    from packages.core.services.notification_service import create_notification_once
 
-    payload_meta = dict(meta or {})
-    payload_meta["_scheduled"] = {
+    now = datetime.now(timezone.utc)
+    scheduled = deliver_at is not None and deliver_at > now
+    available_at = deliver_at if scheduled and deliver_at is not None else now
+    payload = {
         "severity": severity,
-        "workspace_id": workspace_id,
         "actions": actions,
         "callback_kind": callback_kind,
         "callback_payload": callback_payload,
         "expires_in_seconds": expires_in_seconds,
         "link": link,
+        "channels": channels,
+        "deliver_at": deliver_at.isoformat() if deliver_at is not None else None,
     }
 
     async with async_session() as db:
-        db.add(Notification(
-            entity_id=entity_id,
-            user_id=user_id,
-            type=type,
-            title=title,
-            content=body,
-            meta=payload_meta,
+        notification, created = await create_notification_once(
+            db,
+            entity_id,
+            user_id,
+            type,
+            title,
+            body=body,
+            link=link,
+            meta=meta,
+            workspace_id=workspace_id,
+            idempotency_key=idempotency_key,
             deliver_at=deliver_at,
-            dispatch_status="pending",
-        ))
+            dispatch_status=(
+                NotificationDispatchStatus.PENDING.value
+                if scheduled
+                else NotificationDispatchStatus.DISPATCHED.value
+            ),
+            push_realtime=not scheduled,
+        )
+        if created:
+            db.add(NotificationOutboxEvent(
+                notification_id=notification.id,
+                payload=payload,
+                status=NotificationOutboxStatus.PENDING.value,
+                available_at=available_at,
+            ))
+        else:
+            existing_outbox = (
+                await db.execute(
+                    select(NotificationOutboxEvent).where(
+                        NotificationOutboxEvent.notification_id == notification.id,
+                    )
+                )
+            ).scalar_one_or_none()
+            if (
+                existing_outbox is None
+                or _delivery_intent_payload(dict(existing_outbox.payload or {})) != payload
+            ):
+                raise ValueError(
+                    "notification idempotency_key already exists with different delivery intent"
+                )
         await db.commit()
 
+    if not scheduled:
+        from packages.core.services.notification_scheduler import (
+            dispatch_notification_outbox,
+        )
 
-# ── Routed dispatch ────────────────────────────────────────────────────────
+        async with async_session() as db:
+            await dispatch_notification_outbox(
+                db,
+                notification_id=notification.id,
+            )
 
-async def _routed_dispatch(
+
+async def dispatch_persisted_notification(
     *,
+    notification_id: str,
     entity_id: str,
     user_id: str,
     type: str,
     title: str,
     body: str | None,
-    link: str | None,
     meta: dict | None,
-    severity: str | None,
     workspace_id: str | None,
-    actions: list[dict] | None = None,
-    callback_kind: str | None = None,
-    callback_payload: dict | None = None,
-    expires_in_seconds: int | None = None,
+    payload: dict,
+    delivered_target_keys: set[str] | None = None,
+    before_external_target: Callable[[], Awaitable[bool]] | None = None,
+    on_target_delivered: Callable[[str], Awaitable[None]] | None = None,
 ) -> None:
-    """User-preference-driven fan-out across in-app + external channels."""
+    """Fan out an already committed Notification without creating another."""
     from packages.core.database import async_session
     from packages.core.services.notification_routing import (
         resolve_channel_targets,
     )
 
-    notification_id: Optional[str] = None
-    targets = []
-    inapp_only = False
+    severity = payload.get("severity")
+    actions = payload.get("actions")
+    callback_kind = payload.get("callback_kind")
+    callback_payload = payload.get("callback_payload")
+    expires_in_seconds = payload.get("expires_in_seconds")
+    link = payload.get("link")
+    channels = payload.get("channels")
+    delivered_targets = set(delivered_target_keys or ())
 
-    # Phase 1: persist the in-app notification + resolve channels in one
-    # transaction so a single DB session covers both lookups.
-    async with async_session() as db:
-        try:
-            targets = await resolve_channel_targets(
-                db,
-                entity_id=entity_id,
-                user_id=user_id,
-                kind=type,
-                severity=severity,
-                workspace_id=workspace_id,
-            )
-        except Exception:
-            logger.warning(
-                "notify: channel resolution failed for type=%s — falling back to in-app",
-                type,
-                exc_info=True,
-            )
-            inapp_only = True
+    async def external_target_is_authorized() -> bool:
+        if before_external_target is None:
+            return True
+        return await before_external_target()
 
-        try:
-            from packages.core.services.notification_service import create_notification
+    async def mark_target_delivered(target_key: str) -> None:
+        if on_target_delivered is not None:
+            await on_target_delivered(target_key)
+        delivered_targets.add(target_key)
 
-            notif = await create_notification(
-                db,
+    explicit_external_channels: list[str] | None = None
+    if channels is not None:
+        active_channels = list(channels) if isinstance(channels, list) else []
+        if NotificationChannel.BROADCAST.value in active_channels:
+            broadcast_target = NotificationDeliveryTargetFactory.broadcast(
                 entity_id,
-                user_id,
-                type=type,
-                title=title,
-                body=body,
-                link=link,
-                meta=_compose_meta(
-                    meta, severity=severity, workspace_id=workspace_id,
-                    actions=actions, callback_kind=callback_kind,
-                ),
-            )
-            notification_id = notif.id
-            await db.commit()
-        except Exception:
-            logger.warning(
-                "notify: in-app persist failed for type=%s user=%s",
-                type, user_id, exc_info=True,
-            )
+                workspace_id=workspace_id,
+            ).key
+            if broadcast_target not in delivered_targets:
+                if not await external_target_is_authorized():
+                    return
+                broadcast_event = (meta or {}).get("broadcast_event") or type
+                await _broadcast_notification(
+                    entity_id=entity_id,
+                    workspace_id=workspace_id,
+                    event=broadcast_event,
+                    data={
+                        "title": title,
+                        "body": body,
+                        "link": link,
+                        **(meta or {}),
+                    },
+                )
+                await mark_target_delivered(broadcast_target)
+        explicit_external_channels = [
+            channel
+            for channel in active_channels
+            if channel not in _LEGACY_CHANNELS
+            and channel != NotificationChannel.INAPP.value
+        ]
+        if not explicit_external_channels:
+            return
 
-    if inapp_only or not targets:
-        return
+    async with async_session() as db:
+        targets = await resolve_channel_targets(
+            db,
+            entity_id=entity_id,
+            user_id=user_id,
+            kind=type,
+            severity=severity,
+            workspace_id=workspace_id,
+            explicit_channels=explicit_external_channels,
+            allow_registered_email=not bool(actions),
+        )
+
+    delivery_errors: list[str] = []
+    if explicit_external_channels is not None:
+        resolved_channel_types = {
+            choice.channel_type
+            for choice in targets
+            if choice.channel_type != NotificationChannel.INAPP.value
+            and (choice.contact is not None or choice.address)
+        }
+        resolved_channel_types.update(
+            NotificationDeliveryTargetFactory.parse(target_key).channel_type
+            for target_key in delivered_targets
+        )
+        missing_channel_types = [
+            channel
+            for channel in dict.fromkeys(explicit_external_channels)
+            if channel not in resolved_channel_types
+        ]
+        if missing_channel_types:
+            delivery_errors.append(
+                "notification explicit channel has no active target: "
+                + ", ".join(missing_channel_types)
+            )
 
     # Phase 2: dispatch external channels. Each gets its own short-lived
     # session so a single adapter failure (or slow network) doesn't hold
@@ -284,22 +496,49 @@ async def _routed_dispatch(
         actions=None,  # adapter renders actions; we just give it the body
     )
     if not rendered.strip():
+        if delivery_errors:
+            raise RuntimeError("; ".join(delivery_errors))
+        if any(
+            choice.channel_type != NotificationChannel.INAPP.value
+            for choice in targets
+        ):
+            raise RuntimeError(
+                "notification external delivery has no user-visible content"
+            )
         return
 
     for choice in targets:
-        if choice.channel_type == "inapp":
+        if choice.channel_type == NotificationChannel.INAPP.value:
             continue
+        target_key = NotificationDeliveryTargetFactory.external(
+            channel_type=choice.channel_type,
+            contact_id=choice.contact.id if choice.contact is not None else None,
+            address=choice.address,
+        ).key
+        if target_key in delivered_targets:
+            continue
+        if not await external_target_is_authorized():
+            return
         if choice.contact is None:
-            if choice.channel_type == "email" and choice.address:
-                await _deliver_via_registered_email(
+            if (
+                choice.channel_type == NotificationChannel.EMAIL.value
+                and choice.address
+            ):
+                delivered = await _deliver_via_registered_email(
                     to_address=choice.address,
                     title=title,
                     text=rendered,
                     entity_id=entity_id,
                     user_id=user_id,
                 )
+                if not delivered:
+                    delivery_errors.append(
+                        f"notification email delivery failed for {choice.address}"
+                    )
+                else:
+                    await mark_target_delivered(target_key)
             continue
-        await _deliver_via_channel_gateway(
+        delivered = await _deliver_via_channel_gateway(
             channel_contact_id=choice.contact.id,
             text=rendered,
             notification_id=notification_id,
@@ -310,6 +549,15 @@ async def _routed_dispatch(
             callback_payload=callback_payload,
             expires_in_seconds=expires_in_seconds,
         )
+        if not delivered:
+            delivery_errors.append(
+                f"notification channel delivery failed for {choice.channel_type}"
+            )
+        else:
+            await mark_target_delivered(target_key)
+
+    if delivery_errors:
+        raise RuntimeError("; ".join(delivery_errors))
 
 
 async def _deliver_via_registered_email(
@@ -319,7 +567,7 @@ async def _deliver_via_registered_email(
     text: str,
     entity_id: str,
     user_id: str,
-) -> None:
+) -> bool:
     """Send an email notification to the user's registered email address.
 
     Email is the one external channel that has a natural default identity
@@ -337,14 +585,19 @@ async def _deliver_via_registered_email(
             db.add(MessageLog(
                 entity_id=entity_id,
                 direction="outbound",
-                channel_type="email",
+                channel_type=NotificationChannel.EMAIL.value,
                 to_address=to_address,
                 subject=f"Manor AI: {title}",
                 content=text,
-                status="sent" if sent else "failed",
+                status=(
+                    NotificationDeliveryStatus.SENT.value
+                    if sent
+                    else NotificationDeliveryStatus.FAILED.value
+                ),
                 error_message=None if sent else "email_service_failed",
             ))
             await db.commit()
+        return bool(sent)
     except Exception:
         logger.warning(
             "notify: registered-email dispatch failed for user=%s email=%s",
@@ -352,6 +605,7 @@ async def _deliver_via_registered_email(
             to_address,
             exc_info=True,
         )
+        return False
 
 
 async def _deliver_via_channel_gateway(
@@ -361,7 +615,7 @@ async def _deliver_via_channel_gateway(
     callback_kind: str | None = None,
     callback_payload: dict | None = None,
     expires_in_seconds: int | None = None,
-) -> None:
+) -> bool:
     """Send one rendered notification through channel outbound delivery.
 
     Loads the contact in a fresh session and hands it to
@@ -378,7 +632,7 @@ async def _deliver_via_channel_gateway(
     from sqlalchemy import select
 
     from packages.core.database import async_session
-    from packages.core.models.channel import ChannelContact
+    from packages.core.models.channel import ChannelConfig, ChannelContact
     from packages.core.models.notification import NotificationDelivery
     from packages.core.models.task import Conversation
     from packages.core.services.channel_outbound_delivery import (
@@ -389,14 +643,45 @@ async def _deliver_via_channel_gateway(
     try:
         async with async_session() as db:
             contact = (await db.execute(
-                select(ChannelContact).where(ChannelContact.id == channel_contact_id)
+                select(ChannelContact)
+                .join(
+                    ChannelConfig,
+                    ChannelConfig.id == ChannelContact.channel_config_id,
+                )
+                .where(
+                    ChannelContact.id == channel_contact_id,
+                    ChannelContact.entity_id == entity_id,
+                    ChannelContact.user_id == user_id,
+                    ChannelContact.status == "active",
+                    ChannelConfig.entity_id == entity_id,
+                    ChannelConfig.channel_type == ChannelContact.channel_type,
+                    ChannelConfig.status == "active",
+                )
             )).scalar_one_or_none()
             if not contact:
                 logger.debug(
-                    "notify: contact %s vanished before dispatch",
+                    "notify: contact %s is no longer an active delivery target",
                     channel_contact_id,
                 )
-                return
+                return False
+            existing_delivery = None
+            if actions and notification_id:
+                existing_delivery = (
+                    await db.execute(
+                        select(NotificationDelivery)
+                        .where(
+                            NotificationDelivery.notification_id == notification_id,
+                            NotificationDelivery.channel_contact_id == contact.id,
+                        )
+                        .order_by(NotificationDelivery.created_at.desc())
+                        .limit(1)
+                    )
+                ).scalar_one_or_none()
+                if existing_delivery and existing_delivery.status in {
+                    NotificationDeliveryStatus.SENT.value,
+                    NotificationDeliveryStatus.RESOLVED.value,
+                }:
+                    return True
             if actions:
                 result = await send_actionable_outbound_to_contact(
                     db,
@@ -432,27 +717,35 @@ async def _deliver_via_channel_gateway(
                     )
 
                 send_ok = bool(result.get("sent"))
-                db.add(NotificationDelivery(
+                delivery = existing_delivery or NotificationDelivery(
                     notification_id=notification_id,
                     entity_id=entity_id,
                     user_id=user_id,
                     channel_contact_id=contact.id,
                     channel_type=contact.channel_type,
-                    conversation_id=conv_row.id if conv_row else None,
-                    message_log_id=result.get("message_log_id"),
-                    actions=actions,
-                    callback_kind=callback_kind,
-                    callback_payload=callback_payload,
-                    status="sent" if send_ok else "failed",
-                    error_message=None if send_ok else result.get("error"),
-                    expires_at=expires_at,
-                ))
+                )
+                delivery.conversation_id = conv_row.id if conv_row else None
+                delivery.message_log_id = result.get("message_log_id")
+                delivery.actions = actions
+                delivery.callback_kind = callback_kind
+                delivery.callback_payload = callback_payload
+                delivery.status = (
+                    NotificationDeliveryStatus.SENT.value
+                    if send_ok
+                    else NotificationDeliveryStatus.FAILED.value
+                )
+                delivery.error_message = None if send_ok else result.get("error")
+                delivery.expires_at = expires_at
+                if existing_delivery is None:
+                    db.add(delivery)
             await db.commit()
+            return bool(result.get("sent"))
     except Exception:
         logger.warning(
             "notify: channel dispatch failed for contact=%s",
             channel_contact_id, exc_info=True,
         )
+        return False
 
 
 def _render_for_external(
@@ -524,31 +817,39 @@ async def _legacy_dispatch(
     link: str | None,
     meta: dict | None,
     channels: list[str],
+    workspace_id: str | None,
+    idempotency_key: str | None,
 ) -> None:
-    """The original notify() body — kept verbatim for callers that pass
-    explicit ``channels=`` lists. Behaviour is unchanged."""
+    """Back-compat dispatch for callers that pass legacy channel names."""
     active_channels = list(channels)
 
-    if "db" in active_channels:
+    if NotificationChannel.DATABASE.value in active_channels:
         try:
             from packages.core.database import async_session
-            from packages.core.services.notification_service import (
-                create_notification,
-            )
+            from packages.core.services.notification_service import create_notification_once
 
             async with async_session() as db:
-                await create_notification(
+                _notification, created = await create_notification_once(
                     db, entity_id, user_id,
                     type=type, title=title,
                     body=body, link=link, meta=meta,
+                    workspace_id=workspace_id,
+                    idempotency_key=idempotency_key,
                 )
                 await db.commit()
             # create_notification already does the WS push.
-            active_channels = [c for c in active_channels if c != "ws"]
+            active_channels = [
+                channel
+                for channel in active_channels
+                if channel != NotificationChannel.WEBSOCKET.value
+            ]
+            if not created:
+                return
         except Exception:
             logger.warning("notify: DB persist failed for type=%s", type, exc_info=True)
+            raise
 
-    if "ws" in active_channels:
+    if NotificationChannel.WEBSOCKET.value in active_channels:
         try:
             from packages.core.services.realtime import push_notification
 
@@ -558,20 +859,23 @@ async def _legacy_dispatch(
                 "content": body,
                 "link": link,
                 "metadata": meta or {},
-            })
+            }, entity_id=entity_id, workspace_id=workspace_id)
         except Exception:
             logger.debug("notify: WS push failed for user=%s", user_id)
 
-    if "broadcast" in active_channels:
+    if NotificationChannel.BROADCAST.value in active_channels:
         try:
-            from packages.core.services.realtime import _broadcast
-
             broadcast_event = (meta or {}).get("broadcast_event") or type
-            await _broadcast(entity_id, broadcast_event, {
-                "title": title,
-                "body": body,
-                "link": link,
-                **(meta or {}),
-            })
+            await _broadcast_notification(
+                entity_id=entity_id,
+                workspace_id=workspace_id,
+                event=broadcast_event,
+                data={
+                    "title": title,
+                    "body": body,
+                    "link": link,
+                    **(meta or {}),
+                },
+            )
         except Exception:
             logger.debug("notify: broadcast failed for entity=%s", entity_id)

@@ -20,6 +20,7 @@ from datetime import timedelta
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from packages.core.constants.review import ConsolidationReportStatus
 from packages.core.consolidators.base import SnapshotContext, evidence_ids
 from packages.core.consolidators.contract import (
     ConsolidationReportModel,
@@ -162,7 +163,7 @@ class LearningEvidenceConsolidator:
         }
         return ConsolidationReportModel(
             domain=self.domain,
-            status="complete",
+            status=ConsolidationReportStatus.COMPLETE,
             summary=(
                 f"{len(evaluation_events)} evaluation(s), {counted_rejections} "
                 f"rejection(s) this window; {sample_size} labeled outcome(s) in "

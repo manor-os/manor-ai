@@ -712,6 +712,33 @@ async def test_always_approve_grants_every_strategist_action_key(
     assert task.status == "in_progress"
 
 
+async def test_always_approve_requires_standing_grant_authority(
+    client: AsyncClient, monkeypatch,
+):
+    """Proposal authority alone cannot create blanket future consent."""
+    ctx = await _seed_cohort(
+        client, monkeypatch, "item_cohort_always_editor",
+        payload_for=lambda job, goal: _payload(tasks=[_task_entry()]),
+    )
+    card = await _proposal_card(ctx["workspace_id"])
+    editor_headers = await _add_editor(ctx, "always_editor")
+
+    resp = await _resolve(
+        client,
+        ctx,
+        card.id,
+        {"choice": "always_approve"},
+        headers=editor_headers,
+    )
+
+    assert resp.status_code == 403, resp.text
+    assert "manage_standing_grants" in resp.json()["detail"]
+    unresolved = await _get(Message, card.id)
+    assert unresolved.resolved_at is None
+    task = await _get(Task, ctx["task_ids"][0])
+    assert task.status == "proposed"
+
+
 async def test_task_only_cohort_still_passes_on_approve_tasks_alone(
     client: AsyncClient, monkeypatch,
 ):

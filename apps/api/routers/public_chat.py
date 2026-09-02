@@ -16,6 +16,8 @@ URLs:
 """
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
 import logging
 import secrets
@@ -25,20 +27,25 @@ from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, UploadFile, status
 from fastapi.responses import Response, StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from packages.core.ai.runtime import ChannelRuntimeContext, ChatSurface
+from packages.core.cache import cache
+from packages.core.contracts.webchat_page import (
+    WebchatPage,
+    public_webchat_page,
+)
 from packages.core.database import get_db
 from packages.core.models.channel import ChannelConfig, ChannelContact
 from packages.core.models.document import Channel
 from packages.core.models.task import Conversation
 from packages.core.models.user import User
 from packages.core.config import get_settings
-from packages.core.services.auth_service import decode_token, get_user_by_id
 from packages.core.services.channel_bindings import (
     channel_runtime_config,
+    channel_workspace_is_routable,
     resolve_public_webchat_channel_by_token,
 )
 from packages.core.services.channel_contacts import (
@@ -59,8 +66,24 @@ from packages.core.services.runtime_file_context import (
     runtime_message_with_file_attachments,
     runtime_saved_message_with_file_references,
 )
+from apps.api.deps import get_current_user, security
+from apps.api.middleware.rate_limit import RateLimiter, client_ip
+from apps.api.chat_audio import (
+    ChatAudioScope,
+    SPEECH_CHUNK_LENGTH,
+    acquire_audio_lease,
+    chat_speech_response,
+    enforce_public_audio_budget,
+    transcribe_chat_upload,
+)
+from apps.api.streaming_concurrency import acquire_chat_stream_lease
 
 logger = logging.getLogger(__name__)
+
+_BLOCKED_VISITOR_DETAIL = {
+    "code": "visitor_blocked",
+    "message": "This chat visitor is blocked.",
+}
 
 router = APIRouter(prefix="/api/v1/public/chat", tags=["public-chat"])
 _CLOUD_EMAIL_VERIFICATION_ENABLED = False
@@ -69,6 +92,14 @@ _SSE_HEADERS = {
     "Connection": "keep-alive",
     "X-Accel-Buffering": "no",
 }
+_public_action_limiter = RateLimiter()
+_PUBLIC_ACTION_QUEUE_ERROR = "Workflow could not be queued. Please try again."
+_PUBLIC_ACTION_ATTEMPT_LIMIT = 30
+_PUBLIC_ACTION_ATTEMPT_WINDOW_SECONDS = 300
+_PUBLIC_ACTION_CREATE_LIMIT = 10
+_PUBLIC_ACTION_CREATE_WINDOW_SECONDS = 3600
+_PUBLIC_ACTION_RETRY_LIMIT = 6
+_PUBLIC_ACTION_RETRY_WINDOW_SECONDS = 300
 
 _QR_ECC_CODEWORDS_PER_BLOCK_LOW = [
     -1, 7, 10, 15, 20, 26, 18, 20, 24, 30, 18,
@@ -90,6 +121,23 @@ async def _resolve_channel_by_token(
     if not binding:
         raise HTTPException(404, "Chat not configured")
     return cc, binding
+
+
+async def _resolve_public_page(
+    db: AsyncSession,
+    *,
+    value: object,
+    binding: Channel,
+) -> WebchatPage | None:
+    """Resolve explicitly published Workspace references at read time."""
+    from packages.core.services.webchat_page import resolve_workspace_webchat_page
+
+    return await resolve_workspace_webchat_page(
+        db,
+        value=value,
+        entity_id=binding.entity_id,
+        workspace_id=binding.workspace_id,
+    )
 
 
 def _safe_next_path(token: str) -> str:
@@ -148,21 +196,23 @@ def _display_name_for_user(user: User) -> str:
 
 
 async def _optional_current_user(request: Request, db: AsyncSession) -> User | None:
-    """Return the logged-in Manor user when a bearer token is present."""
-    header = request.headers.get("authorization") or ""
-    prefix = "bearer "
-    if not header.lower().startswith(prefix):
+    """Use the shared auth contract, including token/session revocation."""
+    credentials = await security(request)
+    if not credentials:
         return None
-    claims = decode_token(header[len(prefix):].strip())
-    if not claims:
+    try:
+        return await get_current_user(request, credentials=credentials, db=db)
+    except HTTPException as exc:
+        if exc.status_code != status.HTTP_401_UNAUTHORIZED:
+            raise
+        # Expired/revoked credentials can only use genuinely anonymous sessions.
+        # The channel login gate and claimed-contact check still apply below.
+        from packages.core.services.auth_context import set_current_mfa_verified
+
+        set_current_mfa_verified(False)
+        request.state.auth_claims = {}
+        request.state.impersonation = None
         return None
-    user_id = claims.get("sub")
-    if not user_id:
-        return None
-    user = await get_user_by_id(db, str(user_id))
-    if not user or user.status != "active":
-        return None
-    return user
 
 
 def _qr_num_raw_data_modules(version: int) -> int:
@@ -427,6 +477,11 @@ async def _require_chat_access(
                 "signup_url": signup_url,
             },
         )
+    if user and await find_claimed_webchat_contact_for_user(
+        db, cc=cc, user=user, status="blocked",
+    ):
+        # A new or already-active session cannot reset this channel's block.
+        raise HTTPException(status.HTTP_403_FORBIDDEN, _BLOCKED_VISITOR_DETAIL)
     return user
 
 
@@ -492,19 +547,23 @@ async def _ensure_session_contact_for_user(
             source_id=session_id,
             sender_name=sender_name,
         )
-    elif not user and channel_contact_requires_claimed_user(contact):
+    # Only a different authenticated visitor may replace a blocked session;
+    # missing or revoked credentials must still honor the known contact block.
+    if user and channel_contact_claimed_by_other_user(contact, user):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="This chat session belongs to a signed-in visitor.",
+            detail={"code": "session_mismatch", "message": "This chat session belongs to another signed-in visitor."},
         )
-    elif sender_name and not contact.display_name:
+    if contact.status == "blocked":
+        raise HTTPException(status.HTTP_403_FORBIDDEN, _BLOCKED_VISITOR_DETAIL)
+    if not user and channel_contact_requires_claimed_user(contact):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={"code": "session_mismatch", "message": "This chat session belongs to a signed-in visitor."},
+        )
+    if sender_name and not contact.display_name:
         contact.display_name = sender_name
     if user:
-        if channel_contact_claimed_by_other_user(contact, user):
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="This chat session belongs to another signed-in visitor.",
-            )
         link_channel_contact_to_user(
             contact,
             user,
@@ -554,6 +613,23 @@ class CustomerRegisterRequest(BaseModel):
     display_name: str | None = None
 
 
+class PublicActionRequest(BaseModel):
+    session_id: str = Field(min_length=1, max_length=128)
+    submission_id: str = Field(
+        min_length=16,
+        max_length=80,
+        pattern=r"^[A-Za-z0-9_-]+$",
+    )
+    values: dict[str, str] = Field(default_factory=dict, max_length=6)
+
+    @field_validator("values")
+    @classmethod
+    def validate_values(cls, values: dict[str, str]) -> dict[str, str]:
+        if any(not key or len(key) > 80 or not value.strip() or len(value) > 1000 for key, value in values.items()):
+            raise ValueError("Public action fields must be 1-80 characters with values up to 1000 characters")
+        return {key: value.strip() for key, value in values.items()}
+
+
 class ChatInfoResponse(BaseModel):
     channel_name: str
     workspace_name: str | None = None
@@ -566,6 +642,7 @@ class ChatInfoResponse(BaseModel):
     login_url: str | None = None
     signup_url: str | None = None
     auth_hint: str | None = None
+    public_page: WebchatPage | None = None
 
 
 class ChatEmbedResponse(BaseModel):
@@ -577,7 +654,7 @@ class ChatEmbedResponse(BaseModel):
 
 # ── Endpoints ──────────────────────────────────────────────────────────────
 
-@router.get("/{token}")
+@router.get("/{token}", response_model=ChatInfoResponse)
 async def get_chat_info(
     token: str,
     db: AsyncSession = Depends(get_db),
@@ -607,15 +684,19 @@ async def get_chat_info(
             agent_name = agent_name or getattr(agent, "display_name", None) or agent.name
             agent_avatar = agent.avatar_url
 
-    # Load workspace name
+    # Load the same deliberate public identity used by page modules/editor.
     workspace_name = None
     if binding.workspace_id:
         from packages.core.models.workspace import Workspace
-        ws = (await db.execute(
-            select(Workspace.name).where(Workspace.id == binding.workspace_id)
-        )).scalar_one_or_none()
-        if ws:
-            workspace_name = ws[0] if isinstance(ws, tuple) else ws
+        from packages.core.services.webchat_page import public_workspace_name
+
+        workspace = await db.scalar(select(Workspace).where(
+            Workspace.id == binding.workspace_id,
+            Workspace.entity_id == binding.entity_id,
+            Workspace.deleted_at.is_(None),
+        ))
+        if workspace:
+            workspace_name = public_workspace_name(workspace) or None
 
     config = channel_runtime_config(cc, binding)
     login_url, signup_url = _chat_auth_urls(config, token)
@@ -631,6 +712,11 @@ async def get_chat_info(
         login_url=login_url,
         signup_url=signup_url,
         auth_hint=config.get("auth_hint"),
+        public_page=await _resolve_public_page(
+            db,
+            value=config.get("public_page"),
+            binding=binding,
+        ),
     )
 
 
@@ -721,6 +807,172 @@ async def create_or_resume_session(
     )
 
 
+@router.post("/{token}/actions/{module_id}", status_code=202)
+async def run_public_page_action(
+    token: str,
+    module_id: str,
+    body: PublicActionRequest,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
+    """Start one Workflow explicitly published by this Webchat binding."""
+    cc, channel_binding = await _resolve_channel_by_token(db, token)
+    user = await _require_chat_access(cc, token, request, db, channel_binding)
+    config = channel_runtime_config(cc, channel_binding)
+    if not channel_binding.workspace_id:
+        raise HTTPException(404, "Public action not found")
+    page = public_webchat_page(config.get("public_page"))
+    module = next((item for item in page.modules if item.id == module_id), None) if page else None
+    if module is None or module.type != "workspace_action":
+        raise HTTPException(404, "Public action not found")
+    if set(body.values) != set(module.fields):
+        raise HTTPException(422, "Public action fields do not match the published form")
+
+    actor_key = f"user:{user.id}" if user else f"ip:{client_ip(request)}"
+    attempt_limit = await _public_action_limiter.check(
+        f"webchat-action-attempt:{token}:{actor_key}",
+        _PUBLIC_ACTION_ATTEMPT_LIMIT,
+        _PUBLIC_ACTION_ATTEMPT_WINDOW_SECONDS,
+    )
+    if not attempt_limit.allowed:
+        raise HTTPException(
+            429,
+            "Too many action attempts",
+            headers={
+                "Retry-After": str(
+                    attempt_limit.retry_after
+                    or _PUBLIC_ACTION_ATTEMPT_WINDOW_SECONDS
+                )
+            },
+        )
+
+    conversation = await find_public_webchat_conversation_by_session(
+        db,
+        entity_id=cc.entity_id,
+        channel_config_id=cc.id,
+        session_id=body.session_id,
+    )
+    if conversation is None:
+        raise HTTPException(404, "Chat session not found")
+    await _ensure_session_contact_for_user(
+        db,
+        cc=cc,
+        session_id=body.session_id,
+        user=user,
+        conversation=conversation,
+        sender_name=_display_name_for_user(user) if user else None,
+    )
+
+    from packages.core.models.workflow import WorkflowBinding, WorkflowRun
+    from packages.core.services.workflow_service import start_workflow_from_binding
+
+    workflow_binding = await db.scalar(
+        select(WorkflowBinding)
+        .where(
+            WorkflowBinding.id == module.binding_id,
+            WorkflowBinding.entity_id == cc.entity_id,
+            WorkflowBinding.workspace_id == channel_binding.workspace_id,
+            WorkflowBinding.trigger_type == "manual",
+            WorkflowBinding.enabled.is_(True),
+            WorkflowBinding.status == "active",
+        )
+        .with_for_update()
+    )
+    if workflow_binding is None:
+        raise HTTPException(409, "Public action is unavailable")
+    existing_run = await db.scalar(
+        select(WorkflowRun)
+        .where(
+            WorkflowRun.binding_id == workflow_binding.id,
+            WorkflowRun.entity_id == cc.entity_id,
+            WorkflowRun.workspace_id == channel_binding.workspace_id,
+            WorkflowRun.trigger_source == "public_webchat",
+            WorkflowRun.webchat_submission_id == body.submission_id,
+            WorkflowRun.webchat_module_id == module.id,
+            WorkflowRun.webchat_session_id == body.session_id,
+        )
+        .order_by(WorkflowRun.created_at.desc())
+        .limit(1)
+    )
+    if existing_run is not None:
+        if existing_run.status == "pending":
+            retry_limit = await _public_action_limiter.check(
+                f"webchat-action-retry:{token}:{body.submission_id}:{actor_key}",
+                _PUBLIC_ACTION_RETRY_LIMIT,
+                _PUBLIC_ACTION_RETRY_WINDOW_SECONDS,
+            )
+            if not retry_limit.allowed:
+                await db.commit()
+                raise HTTPException(
+                    429,
+                    "Too many action retry attempts",
+                    headers={
+                        "Retry-After": str(
+                            retry_limit.retry_after
+                            or _PUBLIC_ACTION_RETRY_WINDOW_SECONDS
+                        )
+                    },
+                )
+            from packages.core.ai.workflow_runner import WorkflowRunner
+
+            queued = WorkflowRunner.enqueue(existing_run.id)
+            if not queued:
+                await db.commit()
+                raise HTTPException(503, _PUBLIC_ACTION_QUEUE_ERROR)
+        await db.commit()
+        return {"accepted": True, "queued": True, "duplicate": True}
+
+    creation_limit = await _public_action_limiter.check(
+        f"webchat-action-create:{token}:{actor_key}",
+        _PUBLIC_ACTION_CREATE_LIMIT,
+        _PUBLIC_ACTION_CREATE_WINDOW_SECONDS,
+    )
+    if not creation_limit.allowed:
+        raise HTTPException(
+            429,
+            "Too many action submissions",
+            headers={
+                "Retry-After": str(
+                    creation_limit.retry_after
+                    or _PUBLIC_ACTION_CREATE_WINDOW_SECONDS
+                )
+            },
+        )
+    trigger_data = {
+        **body.values,
+        "fields": body.values,
+        "webchat_submission_id": body.submission_id,
+        "webchat_module_id": module.id,
+        "webchat_session_id": body.session_id,
+        "webchat_channel_config_id": cc.id,
+    }
+    try:
+        run = await start_workflow_from_binding(
+            db,
+            workflow_binding,
+            trigger_data=trigger_data,
+            trigger_source="public_webchat",
+            started_by=user.id if user else None,
+            execution_workspace_id=channel_binding.workspace_id,
+        )
+    except ValueError as exc:
+        raise HTTPException(409, "Public action is unavailable") from exc
+    # Persist a durable dispatch boundary before talking to the broker. The
+    # runner transitions pending -> running after it acquires execution.
+    run.status = "pending"
+    run.webchat_session_id = body.session_id
+    run.webchat_module_id = module.id
+    run.webchat_submission_id = body.submission_id
+    await db.commit()
+
+    from packages.core.ai.workflow_runner import WorkflowRunner
+
+    queued = WorkflowRunner.enqueue(run.id)
+    if not queued:
+        raise HTTPException(503, _PUBLIC_ACTION_QUEUE_ERROR)
+    return {"accepted": True, "queued": True}
+
+
 @router.post("/{token}/auth/register")
 async def register_customer_for_chat(
     token: str,
@@ -759,8 +1011,12 @@ async def register_customer_for_chat(
         from packages.core.services.email_verification_service import create_verification
 
         user.status = "pending"
-        await db.flush()
-        code = await create_verification(user.email, user.id)
+        await db.commit()
+        code = await create_verification(
+            user.email,
+            user.id,
+            password_hash=user.password_hash,
+        )
         await send_verification_email(user.email, code)
         return {
             "requires_verification": True,
@@ -769,6 +1025,7 @@ async def register_customer_for_chat(
         }
 
     mark_user_login(user, source="public_chat.register")
+    await db.commit()
     token_value = create_access_token(
         user.id,
         entity.id,
@@ -820,6 +1077,25 @@ async def send_message(
         chat_id=req.session_id,
         content=req.text,
         attachments=req.attachments,
+        runtime_metadata=(
+            {
+                "voice_session_mode": "chat_gateway",
+                **(
+                    {
+                        "voice_origin_message_id": str(
+                            request.state.voice_origin_message_id
+                        ),
+                        "origin_user_message_id": str(
+                            request.state.voice_origin_message_id
+                        ),
+                    }
+                    if getattr(request.state, "voice_origin_message_id", None)
+                    else {}
+                ),
+            }
+            if getattr(request.state, "voice_session_mode", None) == "chat_gateway"
+            else None
+        ),
     )
 
     response = {
@@ -845,6 +1121,7 @@ async def stream_message(
     request: Request,
     session_id: str = Form(...),
     message: str = Form(""),
+    client_turn_id: str | None = Form(None, max_length=64, pattern=r"^[A-Za-z0-9_-]+$"),
     files: list[UploadFile] = File(default=[]),
     db: AsyncSession = Depends(get_db),
 ):
@@ -853,190 +1130,323 @@ async def stream_message(
     if not text and not files:
         raise HTTPException(422, "message or file is required")
 
-    cc, binding = await _resolve_channel_by_token(db, token)
-    user = await _require_chat_access(cc, token, request, db, binding)
-    sender_name = _display_name_for_user(user) if user else None
+    lease = await acquire_chat_stream_lease(scope="public-chat")
+    try:
+        cc, binding = await _resolve_channel_by_token(db, token)
+        user = await _require_chat_access(cc, token, request, db, binding)
+        sender_name = _display_name_for_user(user) if user else None
 
-    contact = await _ensure_session_contact_for_user(
-        db,
-        cc=cc,
-        session_id=session_id,
-        user=user,
-        sender_name=sender_name,
-    )
+        contact = await _ensure_session_contact_for_user(
+            db,
+            cc=cc,
+            session_id=session_id,
+            user=user,
+            sender_name=sender_name,
+        )
 
-    from packages.core.services.agent_subscription_service import resolve_subscription
-    from packages.core.services.channel_gateway import dispatch_inbound
-    from packages.core.services.conversation_messages import add_message
-    from packages.core.services.conversation_messages import create_assistant_stream_placeholder
-    from packages.core.ai.runtime import runtime_stream_chat_turn
+        from packages.core.services.agent_subscription_service import resolve_subscription
+        from packages.core.services.channel_gateway import dispatch_inbound
+        from packages.core.services.conversation_messages import add_message
+        from packages.core.services.conversation_messages import create_assistant_stream_placeholder
+        from packages.core.ai.runtime import runtime_stream_chat_turn
 
-    sub = await resolve_subscription(db, binding=binding, contact=contact)
-    if await _external_reply_policy_blocks_stream(
-        db,
-        entity_id=cc.entity_id,
-        workspace_id=sub.workspace_id,
-    ):
-        await db.commit()
-        attachment_names = [f.filename or "attachment" for f in files]
-        dispatch_text = text or "Attached file(s)"
-        if attachment_names:
-            dispatch_text = (
-                f"{dispatch_text}\n\n"
-                f"[Attached files: {', '.join(attachment_names)}]"
-            ).strip()
-        result = await dispatch_inbound(
+        sub = await resolve_subscription(db, binding=binding, contact=contact)
+        if sub.source == "invalid":
+            raise HTTPException(404, "Chat not configured")
+        if not await channel_workspace_is_routable(
+            db,
+            sub.workspace_id,
             entity_id=cc.entity_id,
-            channel_config_id=cc.id,
+        ):
+            raise HTTPException(404, "Chat not found")
+
+        if await _external_reply_policy_blocks_stream(
+            db,
+            entity_id=cc.entity_id,
+            workspace_id=sub.workspace_id,
+        ):
+            await db.commit()
+            attachment_names = [f.filename or "attachment" for f in files]
+            dispatch_text = text or "Attached file(s)"
+            if attachment_names:
+                dispatch_text = (
+                    f"{dispatch_text}\n\n"
+                    f"[Attached files: {', '.join(attachment_names)}]"
+                ).strip()
+            result = await dispatch_inbound(
+                entity_id=cc.entity_id,
+                channel_config_id=cc.id,
+                channel_type="webchat",
+                sender_id=session_id,
+                sender_name=sender_name,
+                chat_id=session_id,
+                content=dispatch_text,
+                attachments=[
+                    {
+                        "name": f.filename or "attachment",
+                        "content_type": f.content_type,
+                    }
+                    for f in files
+                ] or None,
+            )
+            status_value = str(result.get("status") or "ok")
+            if status_value == "approval_required":
+                notice = "Thanks, your message was sent. The reply is waiting for team approval and will appear here once approved."
+            elif status_value in {"blocked_by_governance", "no_reply", "error"}:
+                notice = "Thanks, your message was sent. The team will follow up here shortly."
+            else:
+                notice = str(result.get("reply") or "Message sent. Waiting for a reply...")
+            return StreamingResponse(
+                lease.wrap(_single_message_stream(
+                    conversation_id=result.get("conversation_id"),
+                    content=notice,
+                    status_value=status_value,
+                )),
+                media_type="text/event-stream",
+                headers=_SSE_HEADERS,
+            )
+
+        contact_user_id = getattr(contact, "user_id", None)
+        profile = contact.profile or {}
+        verified_customer_user_id = profile.get("verified_customer_user_id")
+        tool_user_id = (
+            user.id
+            if user
+            else contact_user_id
+            or verified_customer_user_id
+        )
+
+        conv = await get_or_create_channel_conversation(
+            db,
+            entity_id=cc.entity_id,
             channel_type="webchat",
+            channel_config_id=cc.id,
+            channel_contact_id=contact.id,
             sender_id=session_id,
             sender_name=sender_name,
             chat_id=session_id,
-            content=dispatch_text,
-            attachments=[
-                {
-                    "name": f.filename or "attachment",
-                    "content_type": f.content_type,
-                }
-                for f in files
-            ] or None,
+            agent_id=sub.agent_id,
+            user_id=contact_user_id or binding.user_id,
+            workspace_id=sub.workspace_id,
+            agent_subscription_id=sub.id,
         )
-        status_value = str(result.get("status") or "ok")
-        if status_value == "approval_required":
-            notice = "Thanks, your message was sent. The reply is waiting for team approval and will appear here once approved."
-        elif status_value in {"blocked_by_governance", "no_reply", "error"}:
-            notice = "Thanks, your message was sent. The team will follow up here shortly."
-        else:
-            notice = str(result.get("reply") or "Message sent. Waiting for a reply...")
-        return StreamingResponse(
-            _single_message_stream(
-                conversation_id=result.get("conversation_id"),
-                content=notice,
-                status_value=status_value,
-            ),
-            media_type="text/event-stream",
-            headers=_SSE_HEADERS,
+        sender_display = _public_chat_sender_display(
+            user=user,
+            contact=contact,
+            conversation=conv,
         )
-
-    contact_user_id = getattr(contact, "user_id", None)
-    profile = contact.profile or {}
-    verified_customer_user_id = profile.get("verified_customer_user_id")
-    tool_user_id = (
-        user.id
-        if user
-        else contact_user_id
-        or verified_customer_user_id
-    )
-
-    conv = await get_or_create_channel_conversation(
-        db,
-        entity_id=cc.entity_id,
-        channel_type="webchat",
-        channel_config_id=cc.id,
-        channel_contact_id=contact.id,
-        sender_id=session_id,
-        sender_name=sender_name,
-        chat_id=session_id,
-        agent_id=sub.agent_id,
-        user_id=contact_user_id or binding.user_id,
-        workspace_id=sub.workspace_id,
-        agent_subscription_id=sub.id,
-    )
-    sender_display = _public_chat_sender_display(
-        user=user,
-        contact=contact,
-        conversation=conv,
-    )
-    meta = dict(conv.meta or {})
-    meta.update({
-        "session_id": session_id,
-        "visitor_name": sender_display,
-        "visitor_email": user.email if user else profile.get("verified_customer_email"),
-        "channel_config_id": cc.id,
-        "sender_id": session_id,
-        "sender_name": sender_display,
-        "chat_id": session_id,
-    })
-    conv.meta = meta
-
-    file_context_turn = await prepare_runtime_file_context_turn(
-        message=text,
-        document_ids=[],
-        files=files,
-        entity_id=cc.entity_id,
-        db=db,
-        workspace_id=sub.workspace_id,
-        user_id=tool_user_id,
-    )
-    llm_base_message = file_context_turn.cleaned_message or "Please review the attached file(s)."
-    llm_message = runtime_message_with_file_attachments(
-        llm_base_message,
-        file_context_turn.attachments,
-    )
-    saved_text = runtime_saved_message_with_file_references(
-        text or "Attached file(s)",
-        file_context_turn.attachments,
-    )
-    await add_message(
-        db,
-        conv.id,
-        role="user",
-        content=saved_text,
-        meta={
-            "channel_type": "webchat",
+        meta = dict(conv.meta or {})
+        meta.update({
+            "session_id": session_id,
+            "visitor_name": sender_display,
+            "visitor_email": user.email if user else profile.get("verified_customer_email"),
+            "channel_config_id": cc.id,
             "sender_id": session_id,
             "sender_name": sender_display,
             "chat_id": session_id,
-            "attachment_count": len(files),
-        },
-    )
-    assistant_placeholder = await create_assistant_stream_placeholder(
-        db,
-        conv.id,
-        entity_id=cc.entity_id,
-        workspace_id=sub.workspace_id,
-        agent_id=sub.agent_id,
-        meta={
-            "channel_type": "webchat",
-            "sender_id": session_id,
-            "chat_id": session_id,
-            "session_id": session_id,
-        },
-    )
-    await db.commit()
+        })
+        conv.meta = meta
 
-    return StreamingResponse(
-        runtime_stream_chat_turn(
-            llm_message,
-            conv.id,
-            surface=ChatSurface.PUBLIC_CUSTOMER_CHAT,
+        file_context_turn = await prepare_runtime_file_context_turn(
+            message=text,
+            document_ids=[],
+            files=files,
             entity_id=cc.entity_id,
-            user_id=tool_user_id,
-            agent_id=sub.agent_id,
+            db=db,
             workspace_id=sub.workspace_id,
-            assistant_message_id=assistant_placeholder.id,
-            channel_context=ChannelRuntimeContext(
-                channel_type="webchat",
-                source_id=session_id,
-                display_name=sender_display,
-                user_id=tool_user_id,
-                role=getattr(contact, "role", None) or "external",
-                is_verified=bool(tool_user_id),
-                conversation_id=conv.id,
-                channel_contact_id=contact.id,
-                channel_language=channel_runtime_config(cc, binding).get("language"),
-            ),
-            runtime_metadata={
-                "channel_label": cc.name or binding.name or "public webchat",
-                "channel_language": channel_runtime_config(cc, binding).get("language"),
-                "visitor_entity_id": getattr(user, "entity_id", None),
-                "visitor_verified": bool(user),
-                **file_context_turn.runtime_metadata,
+            user_id=tool_user_id,
+            surface=ChatSurface.PUBLIC_CUSTOMER_CHAT,
+        )
+        llm_base_message = file_context_turn.cleaned_message or "Please review the attached file(s)."
+        llm_message = runtime_message_with_file_attachments(
+            llm_base_message,
+            file_context_turn.attachments,
+        )
+        saved_text = runtime_saved_message_with_file_references(
+            text or "Attached file(s)",
+            file_context_turn.attachments,
+        )
+        # Correlation survives losing the first SSE event; it grants no access.
+        turn_meta = {"client_turn_id": client_turn_id} if client_turn_id else {}
+        await add_message(
+            db,
+            conv.id,
+            role="user",
+            content=saved_text,
+            meta={
+                "channel_type": "webchat",
+                "sender_id": session_id,
+                "sender_name": sender_display,
+                "chat_id": session_id,
+                "attachment_count": len(files),
+                **turn_meta,
             },
-        ),
-        media_type="text/event-stream",
-        headers=_SSE_HEADERS,
+        )
+        assistant_placeholder = await create_assistant_stream_placeholder(
+            db,
+            conv.id,
+            entity_id=cc.entity_id,
+            workspace_id=sub.workspace_id,
+            agent_id=sub.agent_id,
+            meta={
+                "channel_type": "webchat",
+                "sender_id": session_id,
+                "chat_id": session_id,
+                "session_id": session_id,
+                **turn_meta,
+            },
+        )
+        await db.commit()
+
+        return StreamingResponse(
+            lease.wrap(runtime_stream_chat_turn(
+                llm_message,
+                conv.id,
+                surface=ChatSurface.PUBLIC_CUSTOMER_CHAT,
+                entity_id=cc.entity_id,
+                user_id=tool_user_id,
+                agent_id=sub.agent_id,
+                workspace_id=sub.workspace_id,
+                assistant_message_id=assistant_placeholder.id,
+                channel_context=ChannelRuntimeContext(
+                    channel_type="webchat",
+                    source_id=session_id,
+                    display_name=sender_display,
+                    user_id=tool_user_id,
+                    role=getattr(contact, "role", None) or "external",
+                    is_verified=bool(tool_user_id),
+                    conversation_id=conv.id,
+                    channel_contact_id=contact.id,
+                    channel_language=channel_runtime_config(cc, binding).get("language"),
+                ),
+                runtime_metadata={
+                    "channel_label": cc.name or binding.name or "public webchat",
+                    "channel_language": channel_runtime_config(cc, binding).get("language"),
+                    "visitor_entity_id": getattr(user, "entity_id", None),
+                    "visitor_verified": bool(user),
+                    **file_context_turn.runtime_metadata,
+                },
+            )),
+            media_type="text/event-stream",
+            headers=_SSE_HEADERS,
+        )
+    except BaseException:
+        await lease.release()
+        raise
+
+
+class PublicSpeechRequest(BaseModel):
+    session_id: str = Field(min_length=1, max_length=128)
+    message_id: str = Field(min_length=1, max_length=128)
+    offset: int = Field(default=0, ge=0)
+    length: int = Field(default=SPEECH_CHUNK_LENGTH, ge=1, le=SPEECH_CHUNK_LENGTH)
+
+
+async def _public_audio_scope(db, token, request, session_id):
+    cc, binding = await _resolve_channel_by_token(db, token)
+    user = await _require_chat_access(cc, token, request, db, binding)
+    conv = await find_public_webchat_conversation_by_session(
+        db, entity_id=cc.entity_id, channel_config_id=cc.id, session_id=session_id,
     )
+    if not conv:
+        raise HTTPException(404, "Chat session not found")
+    contact = await _ensure_session_contact_for_user(
+        db, cc=cc, session_id=session_id, user=user, conversation=conv,
+    )
+    from packages.core.services.agent_subscription_service import resolve_subscription
+
+    sub = await resolve_subscription(db, binding=binding, contact=contact)
+    if sub.source == "invalid" or not await channel_workspace_is_routable(
+        db, sub.workspace_id, entity_id=cc.entity_id,
+    ):
+        raise HTTPException(404, "Chat not found")
+    # Use the channel's configured billing owner, never an anonymous visitor
+    # or a customer account from a different Entity.
+    owner_id = cc.owner_user_id
+    if not owner_id:
+        raise HTTPException(503, "Chat voice is not configured")
+    return ChatAudioScope(cc.entity_id, owner_id, sub.workspace_id, conv.id, sub.agent_id)
+
+
+@router.post("/{token}/audio/transcribe")
+async def transcribe_public_chat_audio(
+    token: str,
+    request: Request,
+    session_id: str = Form(..., min_length=1, max_length=128),
+    file: UploadFile = File(...),
+    language: str | None = Form(None, max_length=35),
+    db: AsyncSession = Depends(get_db),
+):
+    await enforce_public_audio_budget(request, token, session_id, "transcribe")
+    scope = await _public_audio_scope(db, token, request, session_id)
+    lease = await acquire_audio_lease()
+    try:
+        return await transcribe_chat_upload(db, scope, file, language)
+    finally:
+        await lease.release()
+
+
+@router.post("/{token}/audio/speech")
+async def public_chat_speech(
+    token: str,
+    body: PublicSpeechRequest,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
+    await enforce_public_audio_budget(request, token, body.session_id, "speech")
+    scope = await _public_audio_scope(db, token, request, body.session_id)
+    messages = await list_public_webchat_messages(
+        db, scope.conversation_id, session_id=body.session_id, message_ids=[body.message_id],
+    )
+    message = next((m for m in messages if m["id"] == body.message_id and m["role"] == "assistant"), None)
+    if not message:
+        raise HTTPException(404, "Reply not found")
+    if message.get("stream_status") in {"running", "streaming", "interrupted", "error"}:
+        raise HTTPException(409, "Reply is not complete")
+    # Never accept arbitrary public TTS text or read internal/unpublished replies.
+    text = message["content"][body.offset:body.offset + body.length]
+    cache_identity = hashlib.sha256(
+        "\0".join(
+            (
+                scope.entity_id,
+                scope.conversation_id or "",
+                body.message_id,
+                str(body.offset),
+                str(body.length),
+                text,
+            )
+        ).encode("utf-8")
+    ).hexdigest()
+    cache_key = f"public-voice-speech:v1:{cache_identity}"
+    cached = await cache.get(cache_key)
+    if isinstance(cached, dict):
+        encoded = cached.get("audio")
+        media_type = cached.get("media_type")
+        if isinstance(encoded, str) and isinstance(media_type, str):
+            try:
+                audio = base64.b64decode(encoded, validate=True)
+            except ValueError:
+                audio = b""
+            if audio:
+                return Response(
+                    audio,
+                    media_type=media_type,
+                    headers={"Cache-Control": "private, no-store"},
+                )
+    lease = await acquire_audio_lease()
+    try:
+        response = await chat_speech_response(db, scope, text)
+        await cache.set(
+            cache_key,
+            {
+                "audio": base64.b64encode(bytes(response.body)).decode("ascii"),
+                "media_type": response.media_type,
+            },
+            ttl=10 * 60,
+        )
+        return response
+    finally:
+        await lease.release()
 
 
 @router.get("/{token}/messages")
@@ -1045,6 +1455,7 @@ async def poll_messages(
     request: Request,
     session_id: str = Query(...),
     after: str = Query("", description="Message ID to fetch after (for pagination)"),
+    refresh: list[str] = Query(default=[], max_length=50, description="Known message IDs to refresh after streaming"),
     db: AsyncSession = Depends(get_db),
 ):
     """Poll for messages in a webchat session. Returns newest messages."""
@@ -1061,16 +1472,15 @@ async def poll_messages(
     if not conv:
         return {"messages": []}
 
-    if user:
-        await _ensure_session_contact_for_user(
-            db,
-            cc=cc,
-            session_id=session_id,
-            user=user,
-            conversation=conv,
-        )
+    await _ensure_session_contact_for_user(
+        db,
+        cc=cc,
+        session_id=session_id,
+        user=user,
+        conversation=conv,
+    )
 
-    return {
+    response = {
         "messages": await list_public_webchat_messages(
             db,
             conv.id,
@@ -1078,6 +1488,11 @@ async def poll_messages(
             after=after or None,
         ),
     }
+    if refresh:
+        response["updates"] = await list_public_webchat_messages(
+            db, conv.id, session_id=session_id, message_ids=refresh,
+        )
+    return response
 
 
 @router.get("/{token}/qr")
@@ -1267,7 +1682,7 @@ async def get_embed_script(
     var iframe = document.createElement("iframe");
     iframe.src = chatUrl;
     iframe.title = (options.title || defaultLabel || "Manor AI") + " chat";
-    iframe.allow = "clipboard-write";
+    iframe.allow = "clipboard-write; microphone";
     iframe.style.display = "none";
     iframe.style.position = "absolute";
     iframe.style.right = "0";

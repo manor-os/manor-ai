@@ -19,6 +19,7 @@ from __future__ import annotations
 import abc
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import Any, AsyncIterator, Dict, List, Optional
 
 from packages.core.models.channel import ChannelConfig
@@ -50,9 +51,110 @@ class NormalizedInbound:
     message_type: str = "text"   # text | image | voice | video | file | event
     attachments: List[dict] = field(default_factory=list)
     external_message_id: Optional[str] = None
+    # Slack Events API replies must stay in the originating thread. Kept
+    # optional so every other channel retains its existing delivery contract.
+    thread_ts: Optional[str] = None
 
     # Arbitrary channel-specific context that may be useful later
     raw: Dict[str, Any] = field(default_factory=dict)
+
+
+class ChannelTextSendRetryMode(str, Enum):
+    """Whether an adapter can safely repeat an ambiguous text send."""
+
+    AT_LEAST_ONCE = "at_least_once"
+    PROVIDER_IDEMPOTENT = "provider_idempotent"
+
+
+class ChannelTextSendResultStatus(str, Enum):
+    """Closed adapter result vocabulary understood by channel delivery."""
+
+    QUEUED = "queued"
+    SENT = "sent"
+    DELIVERED = "delivered"
+    FAILED = "failed"
+    DEFERRED = "deferred"
+    UNKNOWN = "unknown"
+
+
+def channel_text_send_result(
+    status: ChannelTextSendResultStatus,
+    *,
+    details: dict[str, Any] | None = None,
+    **evidence: Any,
+) -> dict[str, Any]:
+    """Build a normalized adapter result without open-coded status strings."""
+
+    result = dict(details or {})
+    result.update(evidence)
+    result["status"] = status.value
+    return result
+
+
+class ChannelTextSendFailureDisposition(str, Enum):
+    """Whether a failed send could still have been accepted upstream."""
+
+    DETERMINATE = "determinate"
+    AMBIGUOUS = "ambiguous"
+
+
+class ChannelTextSendError(RuntimeError):
+    """Typed adapter failure used to choose the safe approval retry path."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        disposition: ChannelTextSendFailureDisposition,
+        reason_code: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.disposition = disposition
+        self.reason_code = reason_code
+
+    @classmethod
+    def determinate(
+        cls,
+        message: str,
+        *,
+        reason_code: str | None = None,
+    ) -> ChannelTextSendError:
+        """Build an error proving the provider did not accept the send."""
+
+        return cls(
+            message,
+            disposition=ChannelTextSendFailureDisposition.DETERMINATE,
+            reason_code=reason_code,
+        )
+
+    @classmethod
+    def ambiguous(
+        cls,
+        message: str,
+        *,
+        reason_code: str | None = None,
+    ) -> ChannelTextSendError:
+        """Build an error whose provider acceptance cannot be established."""
+
+        return cls(
+            message,
+            disposition=ChannelTextSendFailureDisposition.AMBIGUOUS,
+            reason_code=reason_code,
+        )
+
+    @classmethod
+    def from_http_status(
+        cls,
+        message: str,
+        *,
+        status_code: int,
+        reason_code: str | None = None,
+    ) -> ChannelTextSendError:
+        """Classify an HTTP rejection without treating 5xx as definitive."""
+
+        if 400 <= status_code < 500 and status_code != 408:
+            return cls.determinate(message, reason_code=reason_code)
+        return cls.ambiguous(message, reason_code=reason_code)
 
 
 # ── Adapter ABC ─────────────────────────────────────────────────────────────
@@ -67,6 +169,20 @@ class ChannelAdapter(abc.ABC):
     #: Stable key — must match ``ChannelConfig.channel_type`` and the
     #: ``Channel.type`` binding value.
     channel_type: str = ""
+    text_send_retry_mode = ChannelTextSendRetryMode.AT_LEAST_ONCE
+
+    async def credentials(self, cc: ChannelConfig, *, reason: str) -> dict:
+        """Lease this config's current credential source just before use."""
+        from packages.core.services.channel_credentials import (
+            lease_channel_config_credentials,
+        )
+
+        try:
+            return await lease_channel_config_credentials(cc, reason=reason)
+        except ValueError as exc:
+            # Credential-source rejection happens before provider I/O and is
+            # therefore safe to reopen instead of quarantining as ambiguous.
+            raise ChannelTextSendError.determinate(str(exc)) from exc
 
     # ── Outbound ────────────────────────────────────────────────────────
 
@@ -75,7 +191,13 @@ class ChannelAdapter(abc.ABC):
         self, cc: ChannelConfig, to: str, text: str, **kwargs: Any,
     ) -> Dict[str, Any]:
         """Send a plain text reply. ``to`` is whatever the adapter's
-        ``parse_inbound`` put in ``NormalizedInbound.reply_to``."""
+        ``parse_inbound`` put in ``NormalizedInbound.reply_to``.
+
+        Implementations must return an explicit ``sent``, ``delivered``, or
+        ``queued`` status after provider acceptance. Validation and other
+        pre-provider failures must raise ``ChannelTextSendError.determinate``;
+        uncertain provider/network outcomes use ``.ambiguous``.
+        """
 
     async def send_attachment(
         self,

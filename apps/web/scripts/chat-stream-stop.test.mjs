@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import assert from "node:assert/strict";
 import { Buffer } from "node:buffer";
+import { readFile } from "node:fs/promises";
 import { build } from "esbuild";
 
 globalThis.localStorage = {
@@ -10,7 +11,10 @@ globalThis.localStorage = {
 };
 
 const entryPoint = `
-  export { useChatStreamStore } from "../src/stores/chatStream.ts";
+  export {
+    shouldIgnoreLocallyStoppedStreamUpdate,
+    useChatStreamStore,
+  } from "../src/stores/chatStream.ts";
 `;
 
 const bundled = await build({
@@ -33,15 +37,18 @@ const moduleUrl = `data:text/javascript;base64,${Buffer.from(
   bundled.outputFiles[0].text,
 ).toString("base64")}`;
 
-const { useChatStreamStore } = await import(moduleUrl);
+const { shouldIgnoreLocallyStoppedStreamUpdate, useChatStreamStore } =
+  await import(moduleUrl);
 
 useChatStreamStore.getState().reset();
 
 const pausedMessages = [
   { role: "user", content: "Open Chrome and list files" },
   {
+    id: "msg_manual_pause",
     role: "assistant",
     content: "",
+    meta: { stream_status: "streaming" },
     tool_calls: [
       {
         name: "invoke_skill",
@@ -112,5 +119,76 @@ assert.equal(
   "error",
   "stopping should finish the active process step",
 );
+assert.equal(
+  stoppedAssistant.meta?.stream_status,
+  "interrupted",
+  "stopping should clear the persisted active-stream marker immediately",
+);
+assert.equal(
+  stoppedAssistant.meta?.stream_interrupted,
+  true,
+  "stopping should mark the local transcript as interrupted",
+);
+assert.equal(
+  shouldIgnoreLocallyStoppedStreamUpdate(
+    "conv_manual_pause",
+    "msg_manual_pause",
+    "streaming",
+  ),
+  true,
+  "late streaming snapshots for the manually stopped message should not resurrect tool calls",
+);
+assert.equal(
+  shouldIgnoreLocallyStoppedStreamUpdate(
+    "conv_manual_pause",
+    "msg_other_turn",
+    "streaming",
+  ),
+  false,
+  "a later assistant message in the same conversation must still be followable",
+);
+assert.equal(
+  shouldIgnoreLocallyStoppedStreamUpdate(
+    "conv_manual_pause",
+    "msg_manual_pause",
+    "interrupted",
+  ),
+  false,
+  "the persisted interrupted terminal state should still be allowed through",
+);
+
+const [workspaceChatSource, floatingSource, embeddedSource] = await Promise.all([
+  readFile(new URL("../src/components/WorkspaceChat.tsx", import.meta.url), "utf8"),
+  readFile(new URL("../src/components/FloatingChat.tsx", import.meta.url), "utf8"),
+  readFile(new URL("../src/components/EmbeddedChat.tsx", import.meta.url), "utf8"),
+]);
+
+assert.match(
+  workspaceChatSource,
+  /const handleStopRequest = useCallback/,
+  "workspace chat should coordinate its local stop with the persisted chat turn",
+);
+assert.match(
+  workspaceChatSource,
+  /api\.chat\.cancelPendingFileApprovals\(convId, pendingHITLIds\(localMsgs\)\)/,
+  "workspace chat should request server-side cancellation before abandoning the SSE stream",
+);
+assert.match(
+  workspaceChatSource,
+  /onStop=\{handleStopRequest\}/,
+  "the workspace composer should use the coordinated stop handler",
+);
+for (const source of [floatingSource, embeddedSource]) {
+  assert.match(
+    source,
+    /shouldIgnoreLocallyStoppedStreamUpdate\(\s*currentConvId,\s*snapshot\.message_id,\s*snapshot\.status,/,
+    "chat surfaces should ignore late running snapshots for a locally stopped turn",
+  );
+  assert.match(
+    source,
+    /shouldIgnoreLocallyStoppedStreamUpdate\(currentConvId, messageId\)/,
+    "chat surfaces should ignore late message refreshes for a locally stopped turn",
+  );
+}
 
 console.log("chat stream stop checks passed");

@@ -48,15 +48,19 @@ async def provision_solo_agent(
     # 2. Install each recommended marketplace skill (idempotent) so it can be
     #    bound. Built-in skills are skipped (already seeded above).
     warnings: list[str] = []
-    slug_to_mid: dict[str, str] = {}
+    slug_to_mids: dict[str, list[str]] = {}
     if is_cloud():
         pass
     for slug in skills:
         if slug in _BUILTIN_SKILLS:
             continue
-        mid = slug_to_mid.get(slug)
-        if mid:
+        marketplace_ids = slug_to_mids.get(slug) or []
+        if len(marketplace_ids) == 1:
             pass
+        elif len(marketplace_ids) > 1:
+            warnings.append(
+                f"Marketplace skill slug {slug!r} is ambiguous; configure its exact id."
+            )
         else:
             warnings.append(f"Marketplace skill {slug!r} is unavailable in this deployment.")
 

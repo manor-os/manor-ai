@@ -27,6 +27,44 @@ logger = logging.getLogger(__name__)
 
 _API = "https://graph.microsoft.com/v1.0"
 _MAX_CHARS = 12_000
+_TEXT_APPLICATION_MIME_TYPES = frozenset({
+    "application/graphql",
+    "application/javascript",
+    "application/json",
+    "application/ld+json",
+    "application/rtf",
+    "application/sql",
+    "application/toml",
+    "application/x-httpd-php",
+    "application/x-javascript",
+    "application/x-ndjson",
+    "application/x-yaml",
+    "application/xml",
+    "application/yaml",
+})
+
+
+def _path_segment(value: Any) -> str:
+    """Encode an opaque Graph resource id as one URL path segment."""
+    return quote(str(value), safe="")
+
+
+def _is_text_mime(value: Any) -> bool:
+    mime = str(value or "").split(";", 1)[0].strip().lower()
+    return (
+        mime.startswith("text/")
+        or mime in _TEXT_APPLICATION_MIME_TYPES
+        or mime.endswith("+json")
+        or mime.endswith("+xml")
+    )
+
+
+def _binary_read_error(name: Any, mime: Any) -> RuntimeError:
+    return RuntimeError(
+        f"OneDrive file {str(name or '').strip() or 'content'} is binary "
+        f"({mime or 'unknown MIME'}). Use the file/artifact pipeline instead "
+        "of the text read tool."
+    )
 
 
 # ── MCP Protocol ─────────────────────────────────────────────────────────────
@@ -38,15 +76,24 @@ def list_tools() -> List[Dict[str, Any]]:
 async def call_tool(
     name: str, arguments: Dict[str, Any], bearer_token: str,
 ) -> Dict[str, Any]:
+    token = bearer_token.strip() if isinstance(bearer_token, str) else ""
+    if not token:
+        return _error(
+            "Microsoft Graph access token is missing. Reconnect Microsoft on the Integration page."
+        )
+
     handler = _HANDLERS.get(name)
     if not handler:
         return _error(f"Unknown tool: {name}")
+    if not isinstance(arguments, dict):
+        return _error("arguments must be an object")
+    arguments = dict(arguments)
     spec = _TOOLS.get(name, {})
     missing = [p for p in spec.get("required", []) if arguments.get(p) in (None, "")]
     if missing:
         return _error(f"Missing required params: {', '.join(missing)}")
     try:
-        text = await handler(bearer_token, arguments)
+        text = await handler(token, arguments)
         return {"content": [{"type": "text", "text": text}], "isError": False}
     except Exception as exc:  # noqa: BLE001
         logger.exception("OneDrive MCP tool %s failed", name)
@@ -133,6 +180,22 @@ async def _api_upload_text(
         return resp.text[:_MAX_CHARS]
 
 
+def _top(value: Any, *, default: int, maximum: int) -> int:
+    if value is None or value == "":
+        return default
+    if isinstance(value, bool):
+        raise ValueError(f"top must be an integer between 1 and {maximum}")
+    try:
+        count = int(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"top must be an integer between 1 and {maximum}") from exc
+    if isinstance(value, float) and value != count:
+        raise ValueError(f"top must be an integer between 1 and {maximum}")
+    if count < 1:
+        raise ValueError("top must be at least 1")
+    return min(count, maximum)
+
+
 # ── Tool handlers ───────────────────────────────────────────────────────────
 
 # Browse + read
@@ -145,11 +208,11 @@ async def _list_files(token: str, args: Dict) -> str:
     if path:
         endpoint = f"me/drive/root:/{quote(path.strip('/'))}:/children"
     elif folder_id:
-        endpoint = f"me/drive/items/{folder_id}/children"
+        endpoint = f"me/drive/items/{_path_segment(folder_id)}/children"
     else:
         endpoint = "me/drive/root/children"
     params: Dict[str, Any] = {
-        "$top": min(int(args.get("top") or 50), 200),
+        "$top": _top(args.get("top"), default=50, maximum=200),
         "$orderby": args.get("order_by") or "lastModifiedDateTime DESC",
     }
     if args.get("select"):
@@ -159,7 +222,7 @@ async def _list_files(token: str, args: Dict) -> str:
 
 async def _get_file(token: str, args: Dict) -> str:
     """Item metadata by id."""
-    return await _api(token, "GET", f"me/drive/items/{args['file_id']}")
+    return await _api(token, "GET", f"me/drive/items/{_path_segment(args['file_id'])}")
 
 
 async def _get_file_by_path(token: str, args: Dict) -> str:
@@ -170,22 +233,38 @@ async def _get_file_by_path(token: str, args: Dict) -> str:
 
 
 async def _read_file(token: str, args: Dict) -> str:
-    """Download text content of a file. For Office docs (Word / Excel /
-    PowerPoint) use the dedicated MCPs (ms_excel) or convert via the
-    ``format`` query param (e.g. ``format=pdf`` returns a PDF render).
-
-    Plain text / Markdown / source code files come back as-is."""
+    """Download text content only after validating the item's MIME type."""
     fid = args["file_id"]
-    fmt = args.get("format")
-    suffix = f"?format={fmt}" if fmt else ""
-    return await _api_raw(token, f"me/drive/items/{fid}/content{suffix}")
+    fmt = str(args.get("format") or "").strip().lower()
+    if fmt:
+        raise RuntimeError(
+            f"format={fmt} is not supported by the OneDrive text read tool; "
+            "use the file/artifact pipeline for converted or binary files."
+        )
+    metadata_text = await _api(
+        token,
+        "GET",
+        f"me/drive/items/{_path_segment(fid)}",
+        params={"$select": "id,name,file"},
+    )
+    try:
+        metadata = json.loads(metadata_text)
+    except (json.JSONDecodeError, TypeError) as exc:
+        raise RuntimeError("OneDrive file metadata was not valid JSON.") from exc
+    if not isinstance(metadata, dict):
+        raise RuntimeError("OneDrive file metadata was not an object.")
+    file_info = metadata.get("file")
+    mime = file_info.get("mimeType") if isinstance(file_info, dict) else ""
+    if not _is_text_mime(mime):
+        raise _binary_read_error(metadata.get("name"), mime)
+    return await _api_raw(token, f"me/drive/items/{_path_segment(fid)}/content")
 
 
 async def _search_files(token: str, args: Dict) -> str:
     return await _api(
         token, "GET",
-        f"me/drive/root/search(q='{quote(args['query'])}')",
-        params={"$top": min(int(args.get("top") or 25), 100)},
+        f"me/drive/root/search(q='{quote(str(args['query']), safe='')}')",
+        params={"$top": _top(args.get("top"), default=25, maximum=100)},
     )
 
 
@@ -199,7 +278,7 @@ async def _upload_text_file(token: str, args: Dict) -> str:
     content = args.get("content") or ""
     folder_id = args.get("folder_id")
     if folder_id:
-        path = f"me/drive/items/{folder_id}:/{quote(name)}:/content"
+        path = f"me/drive/items/{_path_segment(folder_id)}:/{quote(name)}:/content"
     else:
         path = f"me/drive/root:/{quote(name)}:/content"
     return await _api_upload_text(
@@ -216,7 +295,7 @@ async def _create_folder(token: str, args: Dict) -> str:
         "@microsoft.graph.conflictBehavior": args.get("conflict_behavior") or "rename",
     }
     if parent_id:
-        path = f"me/drive/items/{parent_id}/children"
+        path = f"me/drive/items/{_path_segment(parent_id)}/children"
     else:
         path = "me/drive/root/children"
     return await _api(token, "POST", path, body=body)
@@ -228,25 +307,25 @@ async def _copy_file(token: str, args: Dict) -> str:
         body["name"] = args["name"]
     if args.get("destination_folder_id"):
         body["parentReference"] = {"id": args["destination_folder_id"]}
-    return await _api(token, "POST", f"me/drive/items/{args['file_id']}/copy", body=body)
+    return await _api(token, "POST", f"me/drive/items/{_path_segment(args['file_id'])}/copy", body=body)
 
 
 async def _move_file(token: str, args: Dict) -> str:
     return await _api(
-        token, "PATCH", f"me/drive/items/{args['file_id']}",
+        token, "PATCH", f"me/drive/items/{_path_segment(args['file_id'])}",
         body={"parentReference": {"id": args["destination_folder_id"]}},
     )
 
 
 async def _rename_file(token: str, args: Dict) -> str:
     return await _api(
-        token, "PATCH", f"me/drive/items/{args['file_id']}",
+        token, "PATCH", f"me/drive/items/{_path_segment(args['file_id'])}",
         body={"name": args["new_name"]},
     )
 
 
 async def _delete_file(token: str, args: Dict) -> str:
-    return await _api(token, "DELETE", f"me/drive/items/{args['file_id']}")
+    return await _api(token, "DELETE", f"me/drive/items/{_path_segment(args['file_id'])}")
 
 
 # Permissions / sharing
@@ -262,7 +341,7 @@ async def _create_share_link(token: str, args: Dict) -> str:
     if args.get("expires_at"):
         body["expirationDateTime"] = args["expires_at"]
     return await _api(
-        token, "POST", f"me/drive/items/{args['file_id']}/createLink", body=body,
+        token, "POST", f"me/drive/items/{_path_segment(args['file_id'])}/createLink", body=body,
     )
 
 
@@ -279,31 +358,31 @@ async def _invite(token: str, args: Dict) -> str:
     if args.get("message"):
         body["message"] = args["message"]
     return await _api(
-        token, "POST", f"me/drive/items/{args['file_id']}/invite", body=body,
+        token, "POST", f"me/drive/items/{_path_segment(args['file_id'])}/invite", body=body,
     )
 
 
 async def _list_permissions(token: str, args: Dict) -> str:
-    return await _api(token, "GET", f"me/drive/items/{args['file_id']}/permissions")
+    return await _api(token, "GET", f"me/drive/items/{_path_segment(args['file_id'])}/permissions")
 
 
 async def _delete_permission(token: str, args: Dict) -> str:
     return await _api(
         token, "DELETE",
-        f"me/drive/items/{args['file_id']}/permissions/{args['permission_id']}",
+        f"me/drive/items/{_path_segment(args['file_id'])}/permissions/{_path_segment(args['permission_id'])}",
     )
 
 
 # Versions / drive info
 
 async def _list_versions(token: str, args: Dict) -> str:
-    return await _api(token, "GET", f"me/drive/items/{args['file_id']}/versions")
+    return await _api(token, "GET", f"me/drive/items/{_path_segment(args['file_id'])}/versions")
 
 
 async def _restore_version(token: str, args: Dict) -> str:
     return await _api(
         token, "POST",
-        f"me/drive/items/{args['file_id']}/versions/{args['version_id']}/restoreVersion",
+        f"me/drive/items/{_path_segment(args['file_id'])}/versions/{_path_segment(args['version_id'])}/restoreVersion",
     )
 
 
@@ -315,14 +394,14 @@ async def _get_drive_info(token: str, args: Dict) -> str:
 async def _get_recent_files(token: str, args: Dict) -> str:
     return await _api(
         token, "GET", "me/drive/recent",
-        params={"$top": min(int(args.get("top") or 25), 100)},
+        params={"$top": _top(args.get("top"), default=25, maximum=100)},
     )
 
 
 async def _get_shared_with_me(token: str, args: Dict) -> str:
     return await _api(
         token, "GET", "me/drive/sharedWithMe",
-        params={"$top": min(int(args.get("top") or 25), 100)},
+        params={"$top": _top(args.get("top"), default=25, maximum=100)},
     )
 
 
@@ -359,13 +438,13 @@ _TOOLS: Dict[str, Dict[str, Any]] = {
     },
     "read_file": {
         "description": (
-            "Download a file's content as text. For Office docs use the "
-            "ms_excel module or pass format=pdf for a PDF render. "
-            "Plain text / Markdown / code files come back as-is."
+            "Download plain text, Markdown, source, JSON, XML, or CSV content. "
+            "Office documents and other binary files require the dedicated "
+            "tool or file/artifact pipeline."
         ),
         "properties": {
             "file_id": _prop("Drive item ID"),
-            "format": _prop("Optional Graph format hint, e.g. 'pdf' to get a PDF render"),
+            "format": _prop("Reserved; binary format conversion is not supported by this text tool"),
         },
         "required": ["file_id"],
     },

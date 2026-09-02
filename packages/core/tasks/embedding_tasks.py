@@ -30,6 +30,7 @@ EMBEDDING_MAX_STALE_RECOVERIES = _positive_int_env(
     3,
 )
 EMBEDDING_SWEEP_LIMIT = _positive_int_env("EMBEDDING_SWEEP_LIMIT", 50)
+_WORKSPACE_DELETED_BLOCK_REASON = "workspace_deleted"
 
 
 async def recover_stale_embedding_documents(
@@ -53,6 +54,7 @@ async def recover_stale_embedding_documents(
     processing_stale_before = checked_at - timedelta(seconds=max(1, processing_stale_seconds))
     pending_stale_before = checked_at - timedelta(seconds=max(1, pending_stale_seconds))
     pending_age = func.coalesce(Document.updated_at, Document.created_at)
+    blocked_reason = Document.metadata_["indexing"]["blocked_reason"].astext
     heartbeat_epoch = Document.metadata_["indexing"]["heartbeat_epoch"]
     heartbeat_at = case(
         (
@@ -131,6 +133,8 @@ async def recover_stale_embedding_documents(
             .where(
                 Document.vector_status == VectorStatus.PENDING,
                 Document.is_trashed.is_(False),
+                func.coalesce(blocked_reason, "")
+                != _WORKSPACE_DELETED_BLOCK_REASON,
                 pending_age < pending_stale_before,
                 Document.id.not_in(requeued) if requeued else True,
             )

@@ -2,8 +2,14 @@
 Google Calendar MCP server — in-process MCP for Google Calendar API.
 
 Scopes used:
-  - https://www.googleapis.com/auth/calendar (full calendar access)
-  - or https://www.googleapis.com/auth/calendar.events (events only)
+  - https://www.googleapis.com/auth/calendar.events for event operations
+  - https://www.googleapis.com/auth/calendar.calendarlist.readonly to list
+    subscribed calendars
+  - https://www.googleapis.com/auth/calendar.events.freebusy for availability
+
+The broader ``calendar`` scope is intentionally not requested.  This server
+does not create/delete calendars, change calendar properties or ACLs, or
+modify the user's calendar-list subscriptions.
 
 Auth: Google OAuth access_token (from entity integration config, auto-refreshed).
 """
@@ -12,6 +18,7 @@ from __future__ import annotations
 import json
 import logging
 from typing import Any, Dict, List, Optional
+from urllib.parse import quote
 
 import httpx
 
@@ -19,6 +26,11 @@ logger = logging.getLogger(__name__)
 
 _API = "https://www.googleapis.com/calendar/v3"
 _MAX_CHARS = 12_000
+
+
+def _path_segment(value: Any) -> str:
+    """Encode a Google resource id without treating its contents as a URL."""
+    return quote(str(value), safe="@")
 
 
 # ── MCP Protocol ─────────────────────────────────────────────────────────────
@@ -32,17 +44,31 @@ async def call_tool(
     arguments: Dict[str, Any],
     bearer_token: str,
 ) -> Dict[str, Any]:
+    token = bearer_token.strip() if isinstance(bearer_token, str) else ""
+    if not token:
+        return _error(
+            "Google Calendar access token is missing. Reconnect Google on the Integration page."
+        )
+
     handler = _HANDLERS.get(name)
     if not handler:
         return _error(f"Unknown tool: {name}")
+    if not isinstance(arguments, dict):
+        return _error("arguments must be an object")
+    arguments = dict(arguments)
 
     spec = _TOOLS.get(name, {})
-    missing = [p for p in spec.get("required", []) if arguments.get(p) in (None, "")]
+    missing = [
+        p
+        for p in spec.get("required", [])
+        if arguments.get(p) is None
+        or (isinstance(arguments.get(p), str) and not arguments[p].strip())
+    ]
     if missing:
         return _error(f"Missing required params: {', '.join(missing)}")
 
     try:
-        text = await handler(bearer_token, arguments)
+        text = await handler(token, arguments)
         return {"content": [{"type": "text", "text": text}], "isError": False}
     except Exception as e:
         logger.exception("Google Calendar MCP tool %s failed", name)
@@ -55,13 +81,13 @@ def _error(msg: str) -> Dict[str, Any]:
 
 # ── Google Calendar API client ───────────────────────────────────────────────
 
-async def _api(
+async def _api_json(
     token: str,
     method: str,
     path: str,
     body: Optional[Dict] = None,
     params: Optional[Dict] = None,
-) -> str:
+) -> Any:
     url = f"{_API}/{path.lstrip('/')}" if not path.startswith("http") else path
     headers = {
         "Authorization": f"Bearer {token}",
@@ -82,14 +108,28 @@ async def _api(
     if resp.status_code == 404:
         raise RuntimeError("Not found.")
     if resp.status_code == 204:
-        return json.dumps({"success": True})
+        return {"success": True}
     if not resp.is_success:
         raise RuntimeError(f"Google Calendar API error ({resp.status_code}): {resp.text[:300]}")
 
+    if not resp.text:
+        return {"success": True}
     try:
-        data = resp.json()
+        return resp.json()
     except Exception:
-        return resp.text[:_MAX_CHARS]
+        return resp.text
+
+
+async def _api(
+    token: str,
+    method: str,
+    path: str,
+    body: Optional[Dict] = None,
+    params: Optional[Dict] = None,
+) -> str:
+    data = await _api_json(token, method, path, body=body, params=params)
+    if isinstance(data, str):
+        return data[:_MAX_CHARS]
 
     out = json.dumps(data, ensure_ascii=False, indent=2, default=str)
     if len(out) > _MAX_CHARS:
@@ -97,12 +137,86 @@ async def _api(
     return out
 
 
+async def list_calendars_data(token: str) -> List[Dict[str, Any]]:
+    """Return every calendar without applying the MCP text-output limit."""
+    calendars: List[Dict[str, Any]] = []
+    page_token = ""
+    seen_tokens: set[str] = set()
+    while True:
+        params: Dict[str, Any] = {"maxResults": 250}
+        if page_token:
+            params["pageToken"] = page_token
+        data = await _api_json(token, "GET", "users/me/calendarList", params=params)
+        if not isinstance(data, dict) or not isinstance(data.get("items", []), list):
+            raise RuntimeError("Google Calendar returned an invalid calendar list")
+        page_items = data.get("items", [])
+        if any(not isinstance(item, dict) for item in page_items):
+            raise RuntimeError("Google Calendar returned an invalid calendar item")
+        calendars.extend(page_items)
+        next_token = str(data.get("nextPageToken") or "")
+        if not next_token:
+            return calendars
+        if next_token in seen_tokens:
+            raise RuntimeError("Google Calendar returned a repeated page token")
+        seen_tokens.add(next_token)
+        page_token = next_token
+
+
+async def query_freebusy_data(token: str, args: Dict[str, Any]) -> Dict[str, Any]:
+    """Return free/busy data without applying the MCP text-output limit."""
+    raw = args["calendars"]
+    if isinstance(raw, list):
+        calendar_ids = [str(item) for item in raw if item]
+    else:
+        calendar_ids = [item.strip() for item in str(raw).split(",") if item.strip()]
+    calendar_ids = list(dict.fromkeys(calendar_ids))
+    if not calendar_ids:
+        raise ValueError("freebusy_query needs at least one calendar in `calendars`.")
+
+    merged: Dict[str, Any] | None = None
+    merged_calendars: Dict[str, Any] = {}
+    for offset in range(0, len(calendar_ids), 50):
+        batch = calendar_ids[offset:offset + 50]
+        body: Dict[str, Any] = {
+            "timeMin": args["time_min"],
+            "timeMax": args["time_max"],
+            "items": [{"id": calendar_id} for calendar_id in batch],
+        }
+        if args.get("timezone"):
+            body["timeZone"] = args["timezone"]
+        data = await _api_json(token, "POST", "freeBusy", body=body)
+        if not isinstance(data, dict) or not isinstance(data.get("calendars"), dict):
+            raise RuntimeError("Google Calendar returned an invalid free/busy response")
+        if merged is None:
+            merged = {key: value for key, value in data.items() if key != "calendars"}
+        merged_calendars.update(data["calendars"])
+
+    result = merged or {}
+    result["calendars"] = merged_calendars
+    return result
+
+
 # ── Tool handlers ─────────────────────────────────────────────────────────────
 
-async def _list_events(token: str, args: Dict) -> str:
-    calendar_id = args.get("calendar_id") or "primary"
+def _max_results(value: Any, *, default: int) -> int:
+    if value is None or value == "":
+        return default
+    if isinstance(value, bool):
+        raise ValueError("max_results must be an integer between 1 and 250")
+    try:
+        count = int(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("max_results must be an integer between 1 and 250") from exc
+    if isinstance(value, float) and value != count:
+        raise ValueError("max_results must be an integer between 1 and 250")
+    if count < 1:
+        raise ValueError("max_results must be at least 1")
+    return min(count, 250)
+
+
+def _list_events_params(args: Dict) -> Dict[str, Any]:
     params: Dict[str, Any] = {
-        "maxResults": min(int(args.get("max_results") or 10), 250),
+        "maxResults": _max_results(args.get("max_results"), default=10),
         "singleEvents": "true",
         "orderBy": "startTime",
     }
@@ -112,20 +226,90 @@ async def _list_events(token: str, args: Dict) -> str:
         params["timeMax"] = args["time_max"]
     if args.get("query"):
         params["q"] = args["query"]
-    return await _api(token, "GET", f"calendars/{calendar_id}/events", params=params)
+    return params
+
+
+async def list_events_data(token: str, args: Dict) -> Dict[str, Any]:
+    """Return every event page without applying the MCP text-output limit."""
+    calendar_id = args.get("calendar_id") or "primary"
+    base_params = _list_events_params(args)
+    items: List[Dict[str, Any]] = []
+    metadata: Dict[str, Any] = {}
+    page_token = ""
+    seen_tokens: set[str] = set()
+    while True:
+        params = dict(base_params)
+        if page_token:
+            params["pageToken"] = page_token
+        data = await _api_json(
+            token,
+            "GET",
+            f"calendars/{_path_segment(calendar_id)}/events",
+            params=params,
+        )
+        if not isinstance(data, dict) or not isinstance(data.get("items", []), list):
+            raise RuntimeError("Google Calendar returned an invalid event list")
+        page_items = data.get("items", [])
+        if any(not isinstance(item, dict) for item in page_items):
+            raise RuntimeError("Google Calendar returned an invalid event item")
+        if not metadata:
+            metadata = {
+                key: value
+                for key, value in data.items()
+                if key not in {"items", "nextPageToken"}
+            }
+        items.extend(page_items)
+        next_token = str(data.get("nextPageToken") or "")
+        if not next_token:
+            return {**metadata, "items": items}
+        if next_token in seen_tokens:
+            raise RuntimeError("Google Calendar returned a repeated page token")
+        seen_tokens.add(next_token)
+        page_token = next_token
+
+
+async def _list_events(token: str, args: Dict) -> str:
+    calendar_id = args.get("calendar_id") or "primary"
+    return await _api(
+        token,
+        "GET",
+        f"calendars/{_path_segment(calendar_id)}/events",
+        params=_list_events_params(args),
+    )
 
 
 async def _get_event(token: str, args: Dict) -> str:
     calendar_id = args.get("calendar_id") or "primary"
-    return await _api(token, "GET", f"calendars/{calendar_id}/events/{args['event_id']}")
+    return await _api(
+        token,
+        "GET",
+        f"calendars/{_path_segment(calendar_id)}/events/{_path_segment(args['event_id'])}",
+    )
 
 
-async def _create_event(token: str, args: Dict) -> str:
+async def get_event_data(token: str, args: Dict) -> Dict[str, Any]:
+    """Return one event without applying the MCP text-output limit."""
+    calendar_id = args.get("calendar_id") or "primary"
+    data = await _api_json(
+        token,
+        "GET",
+        f"calendars/{_path_segment(calendar_id)}/events/{_path_segment(args['event_id'])}",
+    )
+    if not isinstance(data, dict):
+        raise RuntimeError("Google Calendar returned an invalid event")
+    return data
+
+
+def _create_event_request(
+    args: Dict,
+) -> tuple[str, Dict[str, Any], Dict[str, Any]]:
     calendar_id = args.get("calendar_id") or "primary"
     start_time = args["start_time"]
     end_time = args.get("end_time") or start_time
 
     body: Dict[str, Any] = {"summary": args["summary"]}
+    if args.get("event_id"):
+        body["id"] = str(args["event_id"])
 
     # dateTime for times with T, date for all-day events
     if "T" in start_time:
@@ -158,8 +342,22 @@ async def _create_event(token: str, args: Dict) -> str:
         }
         params["conferenceDataVersion"] = "1"
 
+    return f"calendars/{_path_segment(calendar_id)}/events", body, params
+
+
+async def create_event_data(token: str, args: Dict) -> Dict[str, Any]:
+    """Create an event and return its full resource without MCP truncation."""
+    path, body, params = _create_event_request(args)
+    data = await _api_json(token, "POST", path, body=body, params=params)
+    if not isinstance(data, dict):
+        raise RuntimeError("Google Calendar returned an invalid created event")
+    return data
+
+
+async def _create_event(token: str, args: Dict) -> str:
+    path, body, params = _create_event_request(args)
     # sendUpdates=all so attendees actually receive the invitation email.
-    return await _api(token, "POST", f"calendars/{calendar_id}/events", body, params=params)
+    return await _api(token, "POST", path, body, params=params)
 
 
 async def _update_event(token: str, args: Dict) -> str:
@@ -183,13 +381,13 @@ async def _update_event(token: str, args: Dict) -> str:
         body["attendees"] = [{"email": e} for e in emails]
     if not body:
         return "No fields to update. Provide at least one of: summary, description, location, start_time, end_time, attendees."
-    return await _api(token, "PATCH", f"calendars/{calendar_id}/events/{args['event_id']}", body,
+    return await _api(token, "PATCH", f"calendars/{_path_segment(calendar_id)}/events/{_path_segment(args['event_id'])}", body,
                       params={"sendUpdates": "all"})
 
 
 async def _delete_event(token: str, args: Dict) -> str:
     calendar_id = args.get("calendar_id") or "primary"
-    return await _api(token, "DELETE", f"calendars/{calendar_id}/events/{args['event_id']}")
+    return await _api(token, "DELETE", f"calendars/{_path_segment(calendar_id)}/events/{_path_segment(args['event_id'])}")
 
 
 async def _list_calendars(token: str, args: Dict) -> str:
@@ -201,30 +399,18 @@ async def _freebusy_query(token: str, args: Dict) -> str:
     returns the busy-block ranges per calendar so the caller can find
     a slot when everyone is free.
     """
-    raw = args["calendars"]
-    cal_ids: List[str]
-    if isinstance(raw, list):
-        cal_ids = [str(x) for x in raw if x]
-    else:
-        cal_ids = [c.strip() for c in str(raw).split(",") if c.strip()]
-    if not cal_ids:
-        return "freebusy_query needs at least one calendar in `calendars`."
-
-    body: Dict[str, Any] = {
-        "timeMin": args["time_min"],
-        "timeMax": args["time_max"],
-        "items": [{"id": c} for c in cal_ids],
-    }
-    if args.get("timezone"):
-        body["timeZone"] = args["timezone"]
-    return await _api(token, "POST", "freeBusy", body=body)
+    data = await query_freebusy_data(token, args)
+    out = json.dumps(data, ensure_ascii=False, indent=2, default=str)
+    if len(out) > _MAX_CHARS:
+        return out[:_MAX_CHARS] + "\n… (truncated)"
+    return out
 
 
 async def _list_event_instances(token: str, args: Dict) -> str:
     """List concrete instances of a recurring event."""
     calendar_id = args.get("calendar_id") or "primary"
     params: Dict[str, Any] = {
-        "maxResults": min(int(args.get("max_results") or 25), 250),
+        "maxResults": _max_results(args.get("max_results"), default=25),
     }
     if args.get("time_min"):
         params["timeMin"] = args["time_min"]
@@ -232,7 +418,7 @@ async def _list_event_instances(token: str, args: Dict) -> str:
         params["timeMax"] = args["time_max"]
     return await _api(
         token, "GET",
-        f"calendars/{calendar_id}/events/{args['event_id']}/instances",
+        f"calendars/{_path_segment(calendar_id)}/events/{_path_segment(args['event_id'])}/instances",
         params=params,
     )
 
@@ -253,7 +439,11 @@ async def _respond_to_invite(token: str, args: Dict) -> str:
     event_id = args["event_id"]
     user_email = args.get("attendee_email")
 
-    current = await _api(token, "GET", f"calendars/{calendar_id}/events/{event_id}")
+    current = await _api(
+        token,
+        "GET",
+        f"calendars/{_path_segment(calendar_id)}/events/{_path_segment(event_id)}",
+    )
     try:
         evt = json.loads(current)
     except Exception:
@@ -281,7 +471,7 @@ async def _respond_to_invite(token: str, args: Dict) -> str:
         attendees.append({"email": user_email, "responseStatus": response})
     return await _api(
         token, "PATCH",
-        f"calendars/{calendar_id}/events/{event_id}",
+        f"calendars/{_path_segment(calendar_id)}/events/{_path_segment(event_id)}",
         body={"attendees": attendees},
         params={"sendUpdates": "all"},
     )
@@ -292,7 +482,7 @@ async def _quick_add_event(token: str, args: Dict) -> str:
     becomes a real calendar event."""
     calendar_id = args.get("calendar_id") or "primary"
     return await _api(
-        token, "POST", f"calendars/{calendar_id}/events/quickAdd",
+        token, "POST", f"calendars/{_path_segment(calendar_id)}/events/quickAdd",
         params={"text": args["text"]},
     )
 
@@ -303,7 +493,7 @@ async def _move_event(token: str, args: Dict) -> str:
     src = args.get("calendar_id") or "primary"
     return await _api(
         token, "POST",
-        f"calendars/{src}/events/{args['event_id']}/move",
+        f"calendars/{_path_segment(src)}/events/{_path_segment(args['event_id'])}/move",
         params={"destination": args["destination_calendar_id"]},
     )
 
@@ -313,7 +503,11 @@ async def _list_event_attendees(token: str, args: Dict) -> str:
     event. (The full event payload includes them, but agents asking
     'who hasn't responded yet?' shouldn't have to parse the rest.)"""
     calendar_id = args.get("calendar_id") or "primary"
-    raw = await _api(token, "GET", f"calendars/{calendar_id}/events/{args['event_id']}")
+    raw = await _api(
+        token,
+        "GET",
+        f"calendars/{_path_segment(calendar_id)}/events/{_path_segment(args['event_id'])}",
+    )
     try:
         evt = json.loads(raw)
     except Exception:
@@ -365,6 +559,7 @@ _TOOLS: Dict[str, Dict[str, Any]] = {
         "description": "Create a new Google Calendar event",
         "properties": {
             "calendar_id": _prop("Calendar ID (default: 'primary')"),
+            "event_id": _prop("Optional client-generated idempotency ID"),
             "summary": _prop("Event title"),
             "start_time": _prop("Start time (ISO 8601: '2026-04-17T10:00:00-04:00' or '2026-04-17' for all-day)"),
             "end_time": _prop("End time (ISO 8601, defaults to start_time)"),

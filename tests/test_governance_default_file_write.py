@@ -25,6 +25,9 @@ def test_get_policy_falls_back_to_file_write_granting_default():
     import packages.core.governance.service as gov
 
     class _FakeResult:
+        def one_or_none(self):
+            return None
+
         def scalar_one_or_none(self):
             return None
 

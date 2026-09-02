@@ -8,6 +8,7 @@ into a blanket claim that all outbound work is blocked.
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import asdict, dataclass, field
 from typing import Any, Iterable
 
@@ -16,6 +17,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from packages.core.constants.execution import (
     WorkerStatus,
+)
+from packages.core.constants.blueprints import (
+    BlueprintInstallTodoKind,
+    installed_blueprint_job_id,
 )
 from packages.core.models.channel import ChannelConfig
 from packages.core.models.goal import Goal
@@ -105,6 +110,13 @@ class WorkspaceReadinessReport:
         }
 
 
+def normalize_workspace_setup_task_key(value: object) -> str:
+    """Use the Strategist task-key shape for persisted setup allowlists."""
+
+    base = re.sub(r"[^a-zA-Z0-9_]+", "_", str(value or "").strip().lower())
+    return re.sub(r"_+", "_", base).strip("_")[:80]
+
+
 WORKSPACE_READINESS_PARTS: tuple[WorkspaceReadinessPartSpec, ...] = (
     WorkspaceReadinessPartSpec(
         key="blocking_setup",
@@ -130,8 +142,8 @@ WORKSPACE_READINESS_PARTS: tuple[WorkspaceReadinessPartSpec, ...] = (
     WorkspaceReadinessPartSpec(
         key="goals",
         name="Goals",
-        role="Direction and measurement: tells Strategist what progress means.",
-        check="At least one active Goal scoped to this workspace.",
+        role="Optional direction and measurement for goal-attributed work.",
+        check="Active Goals are reported when configured; their absence does not block work.",
     ),
     WorkspaceReadinessPartSpec(
         key="integrations",
@@ -240,6 +252,47 @@ def missing_required_channels(
     return missing
 
 
+def matching_blueprint_channels(
+    configured_channels: list[dict[str, Any]],
+    requirement: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Match a declared route, not any account with the same channel type.
+
+    Installed identities pin indistinguishable same-type requirements. Older
+    declarations and newly paired accounts may resolve by their portable route
+    fields, but ambiguous matches are never evidence of a ready requirement.
+    """
+    fields = (
+        "channel_type", "provider", "role", "linked_service_key",
+        "channel_config_id", "channel_binding_id",
+    )
+    requirement_key = requirement.get("blueprint_requirement_key")
+    return [
+        channel for channel in configured_channels
+        if all(
+            not requirement.get(key)
+            or str(channel.get(key) or "").strip() == str(requirement[key]).strip()
+            for key in fields
+        )
+        and (
+            not requirement_key or not channel.get("blueprint_requirement_key")
+            or channel["blueprint_requirement_key"] == requirement_key
+        )
+    ]
+
+
+def blueprint_channel_is_ready(
+    configured_channels: list[dict[str, Any]],
+    requirement: dict[str, Any],
+) -> bool:
+    channel_type = str(requirement.get("channel_type") or requirement.get("type") or "").strip()
+    if channel_type in BUILT_IN_CHANNEL_TYPES:
+        return True
+    return bool(channel_type) and len(matching_blueprint_channels(
+        configured_channels, {**requirement, "channel_type": channel_type},
+    )) == 1
+
+
 async def list_configured_workspace_channels(
     db: AsyncSession,
     workspace: Workspace,
@@ -289,8 +342,8 @@ async def list_configured_workspace_channels(
         channel_type = str(row.channel_type or "")
         provider = str(row.provider or channel_type)
         key = (role, channel_type, provider)
-        if key in seen:
-            continue
+        # Distinct accounts with identical labels still satisfy different
+        # Blueprint requirements; retain their identities for live checks.
         seen.add(key)
         out.append({
             "role": role,
@@ -303,6 +356,7 @@ async def list_configured_workspace_channels(
             "source_scope": "workspace" if row.workspace_id == workspace.id else "shared",
             "channel_config_id": row.id,
             "channel_binding_id": binding.id if binding else None,
+            "blueprint_requirement_key": merged_config.get("blueprint_requirement_key"),
         })
 
     for role, block in iter_workspace_channel_blocks(workspace.operating_model or {}):
@@ -436,13 +490,12 @@ def build_workspace_readiness_report(
         ),
         _part_status(
             spec_by_key["goals"],
-            status="ready" if goals else "missing",
+            status="ready" if goals else "not_required",
             summary=(
                 f"{len(goals)} active goal(s)."
                 if goals
-                else "No active goals; Strategist cannot rank work by impact."
+                else "No active goals configured; Strategist can prioritize primary work without goal attribution."
             ),
-            missing_setup_key="" if goals else "no_goals",
             details={"count": len(goals)},
         ),
         _integration_status(
@@ -505,18 +558,39 @@ async def evaluate_workspace_blocking_setup(
 ) -> WorkspaceReadinessPartStatus | None:
     """Evaluate the Blueprint-owned setup gate for one Workspace.
 
-    The configuration is persisted under ``Workspace.settings.blocking_setup``
-    during Blueprint installation.  Results are derived on every read rather
-    than cached, so replacing a deleted asset or reconnecting Chrome takes
-    effect immediately and stale ``ready`` flags cannot bypass the gate.
+    Declarative checks live under ``Workspace.settings.blocking_setup`` and
+    installed requirements under ``settings._blueprint.live_setup_requirements``.
+    Results are derived on every read rather than cached, so replacing or
+    disabling a dependency takes effect immediately and stale ``ready`` flags
+    cannot bypass the gate.
     """
 
-    setup = (workspace.settings or {}).get("blocking_setup")
-    if not isinstance(setup, dict):
-        return None
+    settings = workspace.settings or {}
+    setup = settings.get("blocking_setup")
+    setup = setup if isinstance(setup, dict) else {}
     checks = setup.get("checks")
-    if not isinstance(checks, list) or not checks:
-        return None
+    checks = checks if isinstance(checks, list) else []
+    blueprint = settings.get("_blueprint")
+    blueprint = blueprint if isinstance(blueprint, dict) else {}
+    live_requirements = blueprint.get("live_setup_requirements")
+    missing_live_contract = bool(blueprint) and not isinstance(
+        live_requirements,
+        list,
+    )
+    requirement_source = (
+        live_requirements
+        if isinstance(live_requirements, list)
+        else []
+    )
+    # ``check_keys`` is used by one post-install assertion to inspect a
+    # declared subset. Durable install requirements are the workspace-wide
+    # gate and must not leak unrelated blockers into that scoped assertion;
+    # ordinary runtime callers pass no filter and still evaluate all of them.
+    install_todos = [] if check_keys is not None else [
+        todo
+        for todo in requirement_source
+        if isinstance(todo, dict) and bool(todo.get("blocking", True))
+    ]
 
     selected_checks = [
         check
@@ -527,7 +601,7 @@ async def evaluate_workspace_blocking_setup(
             or str(check.get("key") or "").strip() in check_keys
         )
     ]
-    if not selected_checks:
+    if not selected_checks and not install_todos and not missing_live_contract:
         return None
 
     integration_checks = [
@@ -535,9 +609,29 @@ async def evaluate_workspace_blocking_setup(
         for check in selected_checks
         if str(check.get("kind") or "").strip() == "integration_provider"
         and str(check.get("provider") or "").strip()
+        and bool(check.get("blocking", True))
     ]
+    from packages.core.services.provider_keys import canonical_provider_key
+
+    blocking_integration_check_providers = {
+        canonical_provider_key(check.get("provider"))
+        for check in integration_checks
+        if bool(check.get("blocking", True))
+    }
+    integration_todo_providers = [
+        str((todo.get("payload") or {}).get("provider") or "").strip()
+        for todo in install_todos
+        if str(todo.get("kind") or "").strip() == BlueprintInstallTodoKind.MISSING_INTEGRATION.value
+        and isinstance(todo.get("payload"), dict)
+        and str((todo.get("payload") or {}).get("provider") or "").strip()
+    ]
+    declared_integration_providers = {
+        str(check.get("provider") or "").strip()
+        for check in integration_checks
+        if str(check.get("provider") or "").strip()
+    }
     integration_states: dict[str, Any] = {}
-    if integration_checks:
+    if integration_checks or integration_todo_providers:
         from packages.core.services.integration_resolution import (
             integration_provider_readiness,
         )
@@ -546,17 +640,32 @@ async def evaluate_workspace_blocking_setup(
             db,
             entity_id=workspace.entity_id,
             user_id=str((workspace.settings or {}).get("created_by_user_id") or "") or None,
-            provider_keys=[str(check["provider"]) for check in integration_checks],
+            provider_keys=[
+                *[str(check["provider"]) for check in integration_checks],
+                *integration_todo_providers,
+            ],
         )
 
     results: list[dict[str, Any]] = []
+    if missing_live_contract:
+        results.append({
+            "ready": False,
+            "reason": (
+                "This legacy Blueprint install has no trusted live setup "
+                "contract. Re-sync or upgrade the Blueprint before normal work."
+            ),
+            "key": "blueprint_live_setup_contract",
+            "kind": "blueprint_install_todo",
+            "todo_kind": BlueprintInstallTodoKind.LIVE_SETUP_CONTRACT.value,
+            "blocking": True,
+            "setup_task_key": "",
+            "setup_job_id": "",
+        })
     for check in selected_checks:
         kind = str(check.get("kind") or "").strip()
         if kind == "workspace_identity_assets":
             result = _workspace_identity_setup_result(workspace, check)
         elif kind == "integration_provider":
-            from packages.core.services.provider_keys import canonical_provider_key
-
             provider = canonical_provider_key(check.get("provider"))
             state = integration_states.get(provider)
             result = {
@@ -588,20 +697,85 @@ async def evaluate_workspace_blocking_setup(
         })
         results.append(result)
 
+    configured_channels = (
+        await list_configured_workspace_channels(db, workspace)
+        if any(
+            str(todo.get("kind") or "") == BlueprintInstallTodoKind.CHANNEL.value
+            for todo in install_todos
+        )
+        else []
+    )
+    used_channel_accounts: set[str] = set()
+    for index, todo in enumerate(install_todos):
+        todo_kind = str(todo.get("kind") or "").strip()
+        todo_payload = todo.get("payload")
+        todo_payload = todo_payload if isinstance(todo_payload, dict) else {}
+        # Required integrations are also persisted as generic install
+        # requirements. When a Blueprint owns the same provider through a
+        # richer declarative setup check, evaluate that single canonical check
+        # instead of reporting the same dependency twice.
+        if (
+            todo_kind == BlueprintInstallTodoKind.MISSING_INTEGRATION.value
+            and canonical_provider_key(todo_payload.get("provider"))
+            in blocking_integration_check_providers
+        ):
+            continue
+        # A blocking_setup todo is the install-time snapshot of the declarative
+        # checks evaluated above. Re-adding it would keep readiness red after
+        # those concrete checks become ready.
+        # Integration checks have their own missing_integration todo; keeping
+        # that row out of this aggregate prevents duplicate setup blockers.
+        todo_provider = str((todo.get("payload") or {}).get("provider") or "").strip()
+        if (
+            str(todo.get("kind") or "").strip()
+            == BlueprintInstallTodoKind.MISSING_INTEGRATION.value
+            and todo_provider in declared_integration_providers
+        ):
+            continue
+        if (
+            todo_kind == BlueprintInstallTodoKind.BLOCKING_SETUP.value
+            and selected_checks
+        ):
+            continue
+        available_channels = [
+            channel for channel in configured_channels
+            if channel.get("channel_config_id") not in used_channel_accounts
+        ]
+        result = await _blueprint_install_todo_result(
+            db,
+            workspace,
+            todo,
+            integration_states=integration_states,
+            configured_channels=available_channels,
+        )
+        if todo_kind == BlueprintInstallTodoKind.CHANNEL.value and result["ready"]:
+            matches = matching_blueprint_channels(available_channels, todo_payload)
+            if len(matches) == 1 and matches[0].get("channel_config_id"):
+                used_channel_accounts.add(matches[0]["channel_config_id"])
+        result.update({
+            "key": f"blueprint_install_todo:{index}",
+            "kind": "blueprint_install_todo",
+            "todo_kind": str(todo.get("kind") or "setup").strip(),
+            "blocking": True,
+            "setup_task_key": "",
+            "setup_job_id": "",
+        })
+        results.append(result)
+
     incomplete = [
         result
         for result in results
         if result["blocking"] and not result["ready"]
     ]
     configured_allowed_keys = {
-        str(value or "").strip()
+        normalize_workspace_setup_task_key(value)
         for value in setup.get("allowed_setup_task_keys") or []
-        if str(value or "").strip()
+        if normalize_workspace_setup_task_key(value)
     }
     incomplete_setup_keys = [
-        str(result.get("setup_task_key") or "").strip()
+        normalize_workspace_setup_task_key(result.get("setup_task_key"))
         for result in incomplete
-        if str(result.get("setup_task_key") or "").strip()
+        if normalize_workspace_setup_task_key(result.get("setup_task_key"))
     ]
     allowed_setup_task_keys = list(dict.fromkeys(
         key
@@ -629,6 +803,405 @@ async def evaluate_workspace_blocking_setup(
             "allowed_setup_task_keys": allowed_setup_task_keys,
         },
     )
+
+
+async def _blueprint_install_todo_result(
+    db: AsyncSession,
+    workspace: Workspace,
+    todo: dict[str, Any],
+    *,
+    integration_states: dict[str, Any],
+    configured_channels: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Re-evaluate one durable Blueprint install blocker from live state."""
+
+    kind = str(todo.get("kind") or "").strip()
+    payload = todo.get("payload")
+    payload = payload if isinstance(payload, dict) else {}
+    detail = str(todo.get("detail") or "Blueprint setup is incomplete.")
+
+    if kind == BlueprintInstallTodoKind.CHANNEL.value:
+        ready = blueprint_channel_is_ready(configured_channels, payload)
+        return {"ready": ready, "reason": "Channel is configured." if ready else detail}
+
+    if kind == BlueprintInstallTodoKind.BROWSER_SESSION.value:
+        from packages.core.models.integration_session import IntegrationSession
+
+        stmt = select(IntegrationSession.id).where(
+            IntegrationSession.entity_id == workspace.entity_id,
+            IntegrationSession.status == "active",
+        )
+        provider = str(payload.get("provider") or "").strip()
+        label = str(payload.get("label") or "").strip()
+        if provider:
+            stmt = stmt.where(IntegrationSession.provider == provider)
+        if label:
+            stmt = stmt.where(IntegrationSession.label == label)
+        ready = (await db.execute(stmt.limit(1))).scalar_one_or_none() is not None
+        return {"ready": ready, "reason": "Browser session is active." if ready else detail}
+
+    if kind == BlueprintInstallTodoKind.MISSING_INTEGRATION.value:
+        from packages.core.services.provider_keys import canonical_provider_key
+
+        provider = canonical_provider_key(payload.get("provider"))
+        state = integration_states.get(provider)
+        return {
+            "ready": bool(state and state.ready),
+            "reason": "Integration is connected." if state and state.ready else detail,
+            "provider": provider,
+        }
+
+    if kind == BlueprintInstallTodoKind.MISSING_AGENT.value:
+        from packages.core.models.workspace import Agent
+
+        service_key = str(payload.get("service_key") or "").strip()
+        expected_slug = str(payload.get("agent_slug") or "").strip()
+        expected_marketplace_id = str(
+            payload.get("marketplace_agent_id") or ""
+        ).strip()
+        expected_installed_id = str(
+            payload.get("installed_agent_id")
+            or payload.get("placeholder_agent_id")
+            or ""
+        ).strip()
+        stmt = (
+            select(AgentSubscription, Agent)
+            .join(Agent, Agent.id == AgentSubscription.agent_id)
+            .where(
+                AgentSubscription.workspace_id == workspace.id,
+                AgentSubscription.entity_id == workspace.entity_id,
+                AgentSubscription.status == "active",
+                Agent.status == "active",
+                Agent.deleted_at.is_(None),
+            )
+        )
+        if service_key:
+            stmt = stmt.where(AgentSubscription.service_key == service_key)
+        rows = list((await db.execute(stmt)).all())
+        matching_subscriptions: list[AgentSubscription] = []
+        for subscription, agent in rows:
+            source_agent_id = str(
+                (agent.config or {}).get("source_agent_id") or ""
+            ).strip()
+            if expected_installed_id:
+                identity_matches = str(agent.id) == expected_installed_id
+            elif expected_marketplace_id:
+                identity_matches = (
+                    str(agent.id) == expected_marketplace_id
+                    or source_agent_id == expected_marketplace_id
+                )
+            elif expected_slug:
+                identity_matches = str(agent.slug or "").strip() == expected_slug
+            else:
+                # Generic agent_callable post-install checks intentionally name
+                # only a service. They still require an active runtime worker;
+                # identity-specific MISSING_AGENT todos take the stricter paths
+                # above and cannot be satisfied by a different Agent.
+                identity_matches = True
+            if identity_matches:
+                matching_subscriptions.append(subscription)
+        callable_subscription_ids = await _runtime_bound_subscription_ids(
+            db,
+            workspace,
+            matching_subscriptions,
+        )
+        ready = bool(callable_subscription_ids)
+        return {
+            "ready": ready,
+            "reason": "Required Agent subscription is callable." if ready else detail,
+        }
+
+    if kind == BlueprintInstallTodoKind.KNOWLEDGE_PACK_CONTENT.value:
+        from packages.core.models.document import Document, DocumentGroupMember
+
+        group_id = str(payload.get("document_group_id") or "").strip()
+        ready = False
+        if group_id:
+            ready = (await db.execute(
+                select(Document.id)
+                .join(DocumentGroupMember, DocumentGroupMember.document_id == Document.id)
+                .where(
+                    Document.entity_id == workspace.entity_id,
+                    DocumentGroupMember.group_id == group_id,
+                    Document.is_trashed == False,  # noqa: E712
+                )
+                .limit(1)
+            )).scalar_one_or_none() is not None
+        return {"ready": ready, "reason": "Knowledge content is available." if ready else detail}
+
+    if kind == BlueprintInstallTodoKind.POST_INSTALL_CHECK.value:
+        check = payload.get("check")
+        check = check if isinstance(check, dict) else {}
+        check_kind = str(check.get("kind") or "").strip()
+        if check_kind == "agent_callable":
+            return await _blueprint_install_todo_result(
+                db,
+                workspace,
+                {
+                    "kind": BlueprintInstallTodoKind.MISSING_AGENT.value,
+                    "detail": detail,
+                    "payload": {"service_key": check.get("service_key")},
+                },
+                integration_states=integration_states,
+                configured_channels=configured_channels,
+            )
+        if check_kind == "session_alive":
+            return await _blueprint_install_todo_result(
+                db,
+                workspace,
+                {
+                    "kind": BlueprintInstallTodoKind.BROWSER_SESSION.value,
+                    "detail": detail,
+                    "payload": {
+                        "provider": check.get("provider"),
+                        "label": check.get("session_label"),
+                    },
+                },
+                integration_states=integration_states,
+                configured_channels=configured_channels,
+            )
+        if check_kind == "cron_scheduled":
+            from packages.core.models.scheduler import ScheduledJob
+
+            job_id = str(check.get("job_id") or "").strip()
+            scoped_job_id = installed_blueprint_job_id(job_id, workspace.id)
+            ready = (await db.execute(
+                select(ScheduledJob.id)
+                .where(
+                    ScheduledJob.workspace_id == workspace.id,
+                    ScheduledJob.job_id == scoped_job_id,
+                    ScheduledJob.enabled.is_(True),
+                )
+                .limit(1)
+            )).scalar_one_or_none() is not None
+            return {"ready": ready, "reason": "Scheduled job is installed." if ready else detail}
+
+        if check_kind in {"workflow_present", "workflow_dryrun"}:
+            from packages.core.models.workflow import (
+                WorkflowBinding,
+                WorkflowDefinition,
+            )
+
+            workflow_slug = str(check.get("workflow_slug") or "").strip()
+            bindings = list((await db.execute(
+                select(WorkflowBinding)
+                .join(
+                    WorkflowDefinition,
+                    WorkflowDefinition.id == WorkflowBinding.workflow_id,
+                )
+                .where(
+                    WorkflowBinding.workspace_id == workspace.id,
+                    WorkflowBinding.entity_id == workspace.entity_id,
+                    WorkflowBinding.enabled.is_(True),
+                    WorkflowBinding.status == "active",
+                    WorkflowDefinition.entity_id == workspace.entity_id,
+                    WorkflowDefinition.is_active.is_(True),
+                    WorkflowDefinition.status == "active",
+                )
+            )).scalars().all())
+            ready = any(
+                str((binding.config or {}).get("workspace_blueprint_workflow_slug") or "").strip()
+                == workflow_slug
+                for binding in bindings
+            )
+            return {"ready": ready, "reason": "Workflow is installed." if ready else detail}
+
+    if kind in {
+        BlueprintInstallTodoKind.MCP_SERVER.value,
+        BlueprintInstallTodoKind.MCP_CONFIGURATION.value,
+    }:
+        from packages.core.models.mcp import AgentMCPBinding, MCPServer
+        from packages.core.models.workspace import Agent
+
+        server_slug = str(payload.get("server_slug") or "").strip()
+        agent_slug = str(payload.get("agent_slug") or "").strip()
+        installed_agent_id = str(payload.get("installed_agent_id") or "").strip()
+        agent_component_key = str(
+            payload.get("agent_component_key") or ""
+        ).strip()
+        deployed_agent_ids = select(AgentSubscription.agent_id).where(
+            AgentSubscription.workspace_id == workspace.id,
+            AgentSubscription.entity_id == workspace.entity_id,
+            AgentSubscription.status == "active",
+        )
+        binding_stmt = (
+            select(AgentMCPBinding, MCPServer)
+            .join(Agent, Agent.id == AgentMCPBinding.agent_id)
+            .join(MCPServer, MCPServer.id == AgentMCPBinding.mcp_server_id)
+            .where(
+                Agent.entity_id == workspace.entity_id,
+                Agent.status == "active",
+                Agent.deleted_at.is_(None),
+                or_(
+                    Agent.workspace_id == workspace.id,
+                    Agent.id.in_(deployed_agent_ids),
+                ),
+                AgentMCPBinding.status == "active",
+                MCPServer.server_key == server_slug,
+                MCPServer.status == "active",
+            )
+        )
+        if installed_agent_id:
+            binding_stmt = binding_stmt.where(Agent.id == installed_agent_id)
+        elif agent_component_key:
+            binding_stmt = binding_stmt.where(
+                Agent.config["source_blueprint_component_key"].astext
+                == agent_component_key
+            )
+        else:
+            binding_stmt = binding_stmt.where(Agent.slug == agent_slug)
+        rows = list((await db.execute(binding_stmt)).all())
+        expected_allowed_tools = payload.get("allowed_tools")
+        required_config_fields = [
+            str(field).strip()
+            for field in (
+                payload.get("required_config_fields")
+                or payload.get("config_override_allowlist")
+                or []
+            )
+            if str(field).strip()
+        ]
+        ready = False
+        for agent_binding, _server in rows:
+            if "allowed_tools" in payload:
+                if expected_allowed_tools is None:
+                    if agent_binding.allowed_tools is not None:
+                        continue
+                elif (
+                    agent_binding.allowed_tools is None
+                    or set(agent_binding.allowed_tools) != set(expected_allowed_tools)
+                ):
+                    continue
+            config_override = dict(agent_binding.config_override or {})
+            if any(
+                field not in config_override
+                or config_override[field] is None
+                or (
+                    isinstance(config_override[field], str)
+                    and not config_override[field].strip()
+                )
+                for field in required_config_fields
+            ):
+                continue
+            ready = True
+            break
+        return {
+            "ready": ready,
+            "reason": "MCP binding is configured and active." if ready else detail,
+        }
+
+    if kind == BlueprintInstallTodoKind.MISSING_SKILL.value:
+        from packages.core.models.skill import AgentSkillBinding, Skill
+        from packages.core.models.workspace import Agent
+
+        skill_slug = str(payload.get("skill_slug") or "").strip()
+        agent_slug = str(payload.get("agent_slug") or "").strip()
+        installed_skill_id = str(payload.get("installed_skill_id") or "").strip()
+        marketplace_skill_id = str(
+            payload.get("marketplace_skill_id") or ""
+        ).strip()
+        skill_component_key = str(
+            payload.get("skill_component_key") or ""
+        ).strip()
+        installed_agent_id = str(payload.get("installed_agent_id") or "").strip()
+        agent_component_key = str(
+            payload.get("agent_component_key") or ""
+        ).strip()
+        deployed_agent_ids = select(AgentSubscription.agent_id).where(
+            AgentSubscription.workspace_id == workspace.id,
+            AgentSubscription.entity_id == workspace.entity_id,
+            AgentSubscription.status == "active",
+        )
+        rows = list((await db.execute(
+            select(AgentSkillBinding, Agent, Skill)
+            .join(Agent, Agent.id == AgentSkillBinding.agent_id)
+            .join(Skill, Skill.id == AgentSkillBinding.skill_id)
+            .where(
+                Agent.entity_id == workspace.entity_id,
+                Agent.status == "active",
+                Agent.deleted_at.is_(None),
+                or_(
+                    Agent.workspace_id == workspace.id,
+                    Agent.id.in_(deployed_agent_ids),
+                ),
+                AgentSkillBinding.status == "active",
+                Skill.status == "active",
+            )
+        )).all())
+        ready = False
+        for _binding, agent, skill in rows:
+            if installed_agent_id:
+                if str(agent.id) != installed_agent_id:
+                    continue
+            elif agent_component_key:
+                if str(
+                    (agent.config or {}).get(
+                        "source_blueprint_component_key"
+                    )
+                    or ""
+                ).strip() != agent_component_key:
+                    continue
+            elif str(agent.slug or "").strip() != agent_slug:
+                continue
+            source_skill_id = str(
+                (skill.config or {}).get("source_skill_id") or ""
+            ).strip()
+            source_component_key = str(
+                (skill.config or {}).get("source_blueprint_component_key") or ""
+            ).strip()
+            if installed_skill_id:
+                identity_matches = str(skill.id) == installed_skill_id
+            elif marketplace_skill_id:
+                identity_matches = (
+                    str(skill.id) == marketplace_skill_id
+                    or source_skill_id == marketplace_skill_id
+                )
+            elif skill_component_key:
+                identity_matches = source_component_key == skill_component_key
+            else:
+                identity_matches = str(skill.slug or "").strip() == skill_slug
+            if identity_matches:
+                ready = True
+                break
+        return {"ready": ready, "reason": "Skill binding is active." if ready else detail}
+
+    # Unknown future todo kinds remain fail-closed until a concrete evaluator
+    # is added.
+    return {"ready": False, "reason": detail}
+
+
+async def evaluate_current_workspace_blocking_setup(
+    db: AsyncSession,
+    *,
+    workspace_id: str,
+    entity_id: str | None = None,
+) -> WorkspaceReadinessPartStatus | None:
+    """Reload the Workspace before making a new setup admission decision."""
+
+    stmt = (
+        select(Workspace)
+        .where(
+            Workspace.id == workspace_id,
+            Workspace.deleted_at.is_(None),
+        )
+        .execution_options(populate_existing=True)
+    )
+    if entity_id:
+        stmt = stmt.where(Workspace.entity_id == entity_id)
+    workspace = (await db.execute(stmt)).scalar_one_or_none()
+    if workspace is None or str(getattr(workspace, "status", "active") or "") != "active":
+        spec = next(
+            spec for spec in WORKSPACE_READINESS_PARTS
+            if spec.key == "blocking_setup"
+        )
+        return _part_status(
+            spec,
+            status="missing",
+            summary="Workspace is unavailable for new runtime work.",
+            missing_setup_key="workspace_unavailable",
+            details={"ready": False, "incomplete_checks": []},
+        )
+    return await evaluate_workspace_blocking_setup(db, workspace)
 
 
 def _workspace_identity_setup_result(

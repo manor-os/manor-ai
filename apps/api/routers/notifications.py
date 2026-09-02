@@ -20,6 +20,7 @@ from packages.core.services.notification_service import (
     mark_all_read, delete_notification, count_unread,
 )
 from packages.core.services.auth_service import list_user_memberships
+from packages.core.services.workspace_access import readable_workspace_ids_for_user
 from packages.core.services.settings_service import (
     get_user_preferences,
     update_user_preferences,
@@ -80,12 +81,34 @@ def _to_response(n) -> NotificationResponse:
     )
 
 
-async def _notification_entity_scope(db: AsyncSession, user: User) -> list[str]:
+async def _notification_access_scope(
+    db: AsyncSession,
+    user: User,
+) -> tuple[list[str], list[str], list[str]]:
     rows = await list_user_memberships(db, user)
-    entity_ids = [membership.entity_id for membership, _entity in rows]
-    if user.entity_id not in entity_ids:
-        entity_ids.append(user.entity_id)
-    return entity_ids
+    roles_by_entity = {
+        membership.entity_id: membership.role
+        for membership, _entity in rows
+    }
+    roles_by_entity.setdefault(user.entity_id, user.role)
+
+    restricted_entity_ids: list[str] = []
+    readable_workspace_ids: set[str] = set()
+    for entity_id, role in roles_by_entity.items():
+        readable = await readable_workspace_ids_for_user(
+            db,
+            entity_id=entity_id,
+            user_id=user.id,
+            role=role,
+        )
+        if readable is not None:
+            restricted_entity_ids.append(entity_id)
+            readable_workspace_ids.update(readable)
+    return (
+        list(roles_by_entity),
+        restricted_entity_ids,
+        sorted(readable_workspace_ids),
+    )
 
 
 # ── Endpoints ──
@@ -98,13 +121,24 @@ async def list_my_notifications(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    entity_ids = await _notification_entity_scope(db, user)
+    entity_ids, restricted_entity_ids, readable_workspace_ids = (
+        await _notification_access_scope(db, user)
+    )
     items, total = await list_notifications(
         db, user.entity_id, user.id,
         entity_ids=entity_ids,
+        restricted_workspace_entity_ids=restricted_entity_ids,
+        readable_workspace_ids=readable_workspace_ids,
         unread_only=unread_only, limit=limit, offset=offset,
     )
-    unread = await count_unread(db, user.entity_id, user.id, entity_ids=entity_ids)
+    unread = await count_unread(
+        db,
+        user.entity_id,
+        user.id,
+        entity_ids=entity_ids,
+        restricted_workspace_entity_ids=restricted_entity_ids,
+        readable_workspace_ids=readable_workspace_ids,
+    )
     return NotificationListResponse(
         items=[_to_response(n) for n in items],
         total=total,
@@ -131,8 +165,17 @@ async def mark_all_as_read(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    entity_ids = await _notification_entity_scope(db, user)
-    count = await mark_all_read(db, user.entity_id, user.id, entity_ids=entity_ids)
+    entity_ids, restricted_entity_ids, readable_workspace_ids = (
+        await _notification_access_scope(db, user)
+    )
+    count = await mark_all_read(
+        db,
+        user.entity_id,
+        user.id,
+        entity_ids=entity_ids,
+        restricted_workspace_entity_ids=restricted_entity_ids,
+        readable_workspace_ids=readable_workspace_ids,
+    )
     return MarkAllReadResponse(count=count)
 
 
@@ -142,7 +185,17 @@ async def mark_one_as_read(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    success = await mark_read(db, notification_id, user.id)
+    entity_ids, restricted_entity_ids, readable_workspace_ids = (
+        await _notification_access_scope(db, user)
+    )
+    success = await mark_read(
+        db,
+        notification_id,
+        user.id,
+        entity_ids=entity_ids,
+        restricted_workspace_entity_ids=restricted_entity_ids,
+        readable_workspace_ids=readable_workspace_ids,
+    )
     if not success:
         raise HTTPException(404, "Notification not found")
     # Re-fetch to return updated state
@@ -161,7 +214,17 @@ async def delete_one_notification(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    success = await delete_notification(db, notification_id, user.id)
+    entity_ids, restricted_entity_ids, readable_workspace_ids = (
+        await _notification_access_scope(db, user)
+    )
+    success = await delete_notification(
+        db,
+        notification_id,
+        user.id,
+        entity_ids=entity_ids,
+        restricted_workspace_entity_ids=restricted_entity_ids,
+        readable_workspace_ids=readable_workspace_ids,
+    )
     if not success:
         raise HTTPException(404, "Notification not found")
 
@@ -306,7 +369,7 @@ async def get_notification_preferences(
     )
 
 
-# ── Channel link tokens (end-user "claim Telegram as me") ─────────────────
+# ── Channel link tokens (end-user "claim channel as me") ─────────────────
 
 
 class StartChannelLinkRequest(BaseModel):
@@ -328,9 +391,8 @@ async def start_channel_link(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Mint a short-lived token + deep link so the user can bind their
-    Telegram (or future channels) to their Manor account by sending
-    ``/start <token>`` to the bot."""
+    """Mint a short-lived claim token so the user can bind a supported
+    channel identity to their Manor account by sending ``/start <token>``."""
     from packages.core.services.notification_channel_linking import start_link
 
     try:

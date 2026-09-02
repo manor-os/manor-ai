@@ -16,10 +16,16 @@ from __future__ import annotations
 import pytest
 
 from packages.core.constants.approvals import AuthorizeScope, HitlType
-from packages.core.governance.approvals import validate_hitl_payload
+from packages.core.governance.approvals import grant_approval, validate_hitl_payload
+from packages.core.models.hitl_request import HitlRequest
 from packages.core.services.hitl_options import (
+    HumanDecisionIntent,
     approval_options,
+    decision_intent_for_hitl,
+    decision_options_for_hitl,
+    external_reply_decision_intent,
     one_time_approval_options,
+    review_card_options,
 )
 
 
@@ -46,6 +52,96 @@ def test_a_card_with_no_standing_subject_offers_approve_once():
     assert one_time_approval_options(
         ["approve", "always_approve", "reject"],
     ) == ["approve", "reject"]
+    assert one_time_approval_options(["always_approve"]) == ["approve", "reject"]
+    assert review_card_options(["always_approve"]) == [
+        "approve", "request_changes", "reject",
+    ]
+    assert review_card_options(
+        ["approve", "always_approve", "reject"],
+    ) == ["approve", "request_changes", "reject"]
+
+
+@pytest.mark.asyncio
+async def test_review_request_cannot_be_promoted_to_standing() -> None:
+    request = HitlRequest(
+        entity_id="ent_1",
+        workspace_id="ws_1",
+        origin_kind="step",
+        status="pending",
+        dedup_key="step:step_1",
+        hitl_type=HitlType.REVIEW.value,
+        payload={},
+        context={},
+    )
+
+    with pytest.raises(ValueError, match="only valid for authorize"):
+        await grant_approval(
+            None,
+            request,
+            by_user_id="user_1",
+            via="test",
+            standing=True,
+        )
+
+
+def test_typed_decision_projection_distinguishes_authorize_review_and_error():
+    assert decision_options_for_hitl(HitlType.AUTHORIZE.value) == [
+        "approve", "always_approve", "reject",
+    ]
+    assert review_card_options() == ["approve", "request_changes", "reject"]
+    assert decision_options_for_hitl(HitlType.REVIEW.value) == [
+        "approve", "request_changes", "reject",
+    ]
+    assert decision_options_for_hitl(HitlType.ERROR.value) == ["retry", "cancel"]
+    assert decision_intent_for_hitl(
+        HitlType.AUTHORIZE.value, "always_approve",
+    ) is HumanDecisionIntent.APPROVE_STANDING
+    assert decision_intent_for_hitl(
+        HitlType.REVIEW.value, "request_changes",
+    ) is HumanDecisionIntent.REQUEST_CHANGES
+    assert decision_intent_for_hitl(
+        HitlType.ERROR.value, "retry",
+    ) is HumanDecisionIntent.RETRY
+
+
+@pytest.mark.parametrize(
+    ("choice", "intent"),
+    [
+        ("accept", HumanDecisionIntent.APPROVE),
+        ("revise", HumanDecisionIntent.REQUEST_CHANGES),
+        ("cancel", HumanDecisionIntent.CANCEL),
+    ],
+)
+def test_typed_review_decisions_keep_legacy_explicit_buttons_working(
+    choice: str,
+    intent: HumanDecisionIntent,
+):
+    assert decision_intent_for_hitl(HitlType.REVIEW.value, choice) is intent
+
+
+@pytest.mark.parametrize(
+    ("choice", "intent"),
+    [
+        ("confirm", HumanDecisionIntent.APPROVE),
+        ("rejected", HumanDecisionIntent.DENY),
+        ("cancel", HumanDecisionIntent.CANCEL),
+    ],
+)
+def test_typed_authorize_decisions_keep_legacy_buttons_working(
+    choice: str,
+    intent: HumanDecisionIntent,
+):
+    assert external_reply_decision_intent(choice) is intent
+
+
+@pytest.mark.parametrize("choice", ["confirm", "rejected", "cancel"])
+def test_external_legacy_buttons_do_not_expand_general_authorize_choices(
+    choice: str,
+):
+    assert decision_intent_for_hitl(
+        HitlType.AUTHORIZE.value,
+        choice,
+    ) is HumanDecisionIntent.OTHER
 
 
 # ── §4.3 scope ─────────────────────────────────────────────────────

@@ -45,6 +45,62 @@ def test_gpt56_chat_completion_tools_disable_reasoning() -> None:
 
 
 @pytest.mark.asyncio
+async def test_plain_chat_completion_forwards_explicit_reasoning_effort(monkeypatch) -> None:
+    from packages.core.ai import llm_client
+
+    captured: dict = {}
+
+    async def fake_resolve_llm_routing_for_model(*_args, **_kwargs):
+        return SimpleNamespace(
+            api_key="sk-or-" + "o" * 32,
+            base_url="https://openrouter.ai/api/v1",
+            provider="openrouter",
+            source="official",
+        )
+
+    async def fake_preflight_credit_check():
+        return None
+
+    async def fake_post(url, headers, payload, *, call_type):
+        captured.update(
+            {
+                "url": url,
+                "headers": headers,
+                "payload": dict(payload),
+                "call_type": call_type,
+            }
+        )
+        request = httpx.Request("POST", url)
+        return httpx.Response(
+            200,
+            request=request,
+            json={
+                "choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            },
+        )
+
+    monkeypatch.setattr(
+        llm_client,
+        "resolve_llm_routing_for_model",
+        fake_resolve_llm_routing_for_model,
+    )
+    monkeypatch.setattr(llm_client, "_preflight_credit_check", fake_preflight_credit_check)
+    monkeypatch.setattr(llm_client, "_post_chat_with_reasoning_retry", fake_post)
+    monkeypatch.setattr(llm_client, "_record_llm_call", lambda **_kwargs: None)
+
+    content, usage = await llm_client.chat_completion(
+        [{"role": "user", "content": "classify"}],
+        model="anthropic/claude-fable-5",
+        reasoning_effort="none",
+    )
+
+    assert content == "ok"
+    assert usage["total"] == 2
+    assert captured["payload"]["reasoning_effort"] == "none"
+
+
+@pytest.mark.asyncio
 async def test_kimi_byok_tool_call_uses_native_adapter(monkeypatch) -> None:
     from packages.core.ai import llm_client
 
@@ -159,6 +215,46 @@ async def test_llm_stream_iterator_fails_fast_when_provider_stalls(monkeypatch) 
 
     with pytest.raises(TimeoutError, match="stalled"):
         async for _line in llm_client._iter_stream_lines_with_idle_timeout(SlowResponse()):
+            pass
+
+
+@pytest.mark.asyncio
+async def test_llm_stream_iterator_ignores_transport_heartbeats(monkeypatch) -> None:
+    from packages.core.ai import llm_client
+
+    class HeartbeatOnlyResponse:
+        async def aiter_lines(self):
+            for _ in range(20):
+                await asyncio.sleep(0.003)
+                yield ": keep-alive"
+                yield ""
+
+    monkeypatch.setenv("LLM_STREAM_IDLE_TIMEOUT_SECONDS", "0.01")
+
+    with pytest.raises(TimeoutError, match="stalled"):
+        async for _line in llm_client._iter_stream_lines_with_idle_timeout(
+            HeartbeatOnlyResponse()
+        ):
+            pass
+
+
+@pytest.mark.asyncio
+async def test_llm_stream_iterator_ignores_data_heartbeats(monkeypatch) -> None:
+    from packages.core.ai import llm_client
+
+    class HeartbeatOnlyResponse:
+        async def aiter_lines(self):
+            for index in range(20):
+                await asyncio.sleep(0.003)
+                event_type = "ping" if index % 2 == 0 else "heartbeat"
+                yield f'data: {{"type": "{event_type}"}}'
+
+    monkeypatch.setenv("LLM_STREAM_IDLE_TIMEOUT_SECONDS", "0.01")
+
+    with pytest.raises(TimeoutError, match="stalled"):
+        async for _line in llm_client._iter_stream_lines_with_idle_timeout(
+            HeartbeatOnlyResponse()
+        ):
             pass
 
 

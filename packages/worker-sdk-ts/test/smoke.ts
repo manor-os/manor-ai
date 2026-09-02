@@ -8,7 +8,12 @@
 
 import { ManorClient } from "../src/client.js";
 import { ManorWorker } from "../src/worker.js";
-import { Lease, NeedHumanInput } from "../src/types.js";
+import {
+  Lease,
+  LeaseResultFactory,
+  NeedHumanInput,
+  WorkerClientError,
+} from "../src/types.js";
 
 interface FakeCall {
   path: string;
@@ -107,7 +112,10 @@ async function caseSuccessfulLease(): Promise<void> {
   let received: Lease | undefined;
   worker.handle({ kind: "action", provider: "demo" }, async (lease) => {
     received = lease;
-    return { result: { echo: lease.params.msg }, cost: { api_calls: 1, usd: 0.01 } };
+    return LeaseResultFactory.envelope({
+      result: { echo: lease.params.msg },
+      cost: { api_calls: 1, usd: 0.01 },
+    });
   });
   await worker.runForever();
 
@@ -118,11 +126,27 @@ async function caseSuccessfulLease(): Promise<void> {
   const completeBody = completeCall!.body as { result?: { echo?: string }; cost?: { usd?: number } };
   assert(completeBody.result?.echo === "hi", "result body sent to server");
   assert(completeBody.cost?.usd === 0.01, "cost forwarded to server");
+  assert(
+    (completeCall!.body as { task_output_value_kind?: string }).task_output_value_kind === "task_payload",
+    "completion discriminator sent to server",
+  );
   const heartbeatCall = calls.find((c) => c.path.endsWith("/heartbeat"));
   const heartbeatBody = heartbeatCall!.body as { capabilities?: { supported_capabilities?: string[] } };
   assert(
     heartbeatBody.capabilities?.supported_capabilities?.[0] === "external.social",
     "runtime capabilities included in heartbeat",
+  );
+  const completionHeartbeat = calls.find((call) => {
+    const body = call.body as { completed_since_last?: Array<{ lease_id?: string }> };
+    return body.completed_since_last?.some((item) => item.lease_id === "lease_01");
+  });
+  assert(completionHeartbeat !== undefined, "completion is replayed on heartbeat");
+  const completionHeartbeatBody = completionHeartbeat.body as {
+    completed_since_last: Array<{ task_output_value_kind?: string }>;
+  };
+  assert(
+    completionHeartbeatBody.completed_since_last[0]?.task_output_value_kind === "task_payload",
+    "heartbeat completion discriminator sent to server",
   );
   assert(
     calls.every((c) => c.headers["Authorization"] === "Bearer wks_01"),
@@ -132,6 +156,41 @@ async function caseSuccessfulLease(): Promise<void> {
     calls.every((c) => c.headers["Manor-Worker-Id"] === "wkr_01"),
     "worker-id header set on every call",
   );
+  assert(
+    calls.every((c) => c.headers["Manor-Protocol-Version"] === "2"),
+    "v2 protocol header set on every call",
+  );
+}
+
+async function caseReservedBusinessKeysRemainPayload(): Promise<void> {
+  console.log("\n[case] reserved business keys remain a task payload");
+  const { fetch, calls } = buildFakeFetch();
+  const worker = new ManorWorker({
+    endpoint: "http://test.local",
+    workerId: "wkr_01",
+    secret: "wks_01",
+    client: new ManorClient({
+      endpoint: "http://test.local",
+      workerId: "wkr_01",
+      secret: "wks_01",
+      fetchImpl: fetch,
+    }),
+    logger: silentLogger(),
+  });
+  worker.handle({ kind: "action", provider: "demo" }, async () => ({
+    result: 42,
+    status: "ok",
+  }));
+  await worker.runForever();
+
+  const completeCall = calls.find((call) => call.path.endsWith("/complete"));
+  const body = completeCall?.body as {
+    result?: { result?: number; status?: string };
+    cost?: unknown;
+  };
+  assert(body.result?.result === 42, "business result key remains inside payload");
+  assert(body.result?.status === "ok", "business payload fields remain intact");
+  assert(body.cost === undefined, "business payload does not become transport cost");
 }
 
 async function caseNeedHuman(): Promise<void> {
@@ -209,6 +268,76 @@ async function caseNoHandler(): Promise<void> {
   assert(body.will_retry === false, "no-handler is non-retryable");
 }
 
+async function caseRegistrationDeclaresProtocolV2(): Promise<void> {
+  console.log("\n[case] direct SDK registration declares protocol v2");
+  let requestBody: unknown;
+  const client = new ManorClient({
+    endpoint: "http://test.local",
+    fetchImpl: async (_input, init) => {
+      requestBody = init?.body ? JSON.parse(init.body as string) : null;
+      return jsonResp(200, { worker_id: "wkr_01", worker_secret: "wks_01" });
+    },
+  });
+  await client.register({
+    kind: "custom_http",
+    display_name: "test worker",
+    capabilities: { supported_kinds: ["action"], protocol_version: 1 },
+  });
+  const body = requestBody as { capabilities?: { protocol_version?: number } };
+  assert(
+    body.capabilities?.protocol_version === 2,
+    "SDK registration cannot advertise the removed v1 protocol",
+  );
+}
+
+async function caseProtocolUpgradeStopsWithoutRetrying(): Promise<void> {
+  console.log("\n[case] protocol upgrade response stops without retrying");
+  let calls = 0;
+  const client = new ManorClient({
+    endpoint: "http://test.local",
+    workerId: "wkr_legacy",
+    secret: "wks_legacy",
+    maxAttempts: 3,
+    fetchImpl: async () => {
+      calls += 1;
+      return jsonResp(426, { detail: "re-register worker" });
+    },
+  });
+  let error: unknown;
+  try {
+    await client.heartbeat({
+      state: "idle",
+      active_leases: [],
+      completed_since_last: [],
+      capacity: { can_accept_leases: 0 },
+    });
+  } catch (exc) {
+    error = exc;
+  }
+  assert(error instanceof WorkerClientError, "426 is surfaced as WorkerClientError");
+  assert(error.requiresOperatorAction, "426 is classified as requiring operator action");
+  assert(calls === 1, "426 is not retried as a transient response");
+
+  const logMessages: string[] = [];
+  const worker = new ManorWorker({
+    endpoint: "http://test.local",
+    workerId: "wkr_legacy",
+    secret: "wks_legacy",
+    client,
+    logger: {
+      info: () => {},
+      warn: () => {},
+      error: (message) => logMessages.push(message),
+    },
+  });
+  await worker.runForever();
+  assert(calls === 2, "worker loop stops after its first 426 heartbeat");
+  assert(
+    logMessages.some((message) => message.includes("re-register")),
+    "worker loop explains the required recovery action",
+  );
+}
+
 function silentLogger() {
   return { info: () => {}, warn: () => {}, error: () => {} };
 }
@@ -217,9 +346,12 @@ function silentLogger() {
 
 (async () => {
   await caseSuccessfulLease();
+  await caseReservedBusinessKeysRemainPayload();
   await caseNeedHuman();
   await caseHandlerThrows();
   await caseNoHandler();
+  await caseRegistrationDeclaresProtocolV2();
+  await caseProtocolUpgradeStopsWithoutRetrying();
   if (process.exitCode && process.exitCode !== 0) {
     console.error("\nSMOKE FAILED");
     process.exit(process.exitCode);

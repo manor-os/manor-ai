@@ -8,11 +8,12 @@ decision it pauses the step and posts a chat card via
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import fnmatch
 from typing import Optional
 
-from sqlalchemy import desc, func, select
+from sqlalchemy import desc, event, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from packages.core.governance.policy import (
@@ -24,15 +25,116 @@ from packages.core.governance.policy import (
     policy_from_dict,
     policy_to_dict,
 )
+from packages.core.governance.approval_scope import approval_scope_key
 from packages.core.constants.approvals import HitlType
 from packages.core.constants.pending_actions import PendingActionKind
-from packages.core.services.hitl_options import approval_options, error_card_options
+from packages.core.services.hitl_options import decision_options_for_hitl
 from packages.core.models.governance import (
     GovernancePolicy,
     GovernanceRevision,
 )
+from packages.core.governance.policy_cache import (
+    GovernancePolicyCache,
+    GovernancePolicyCacheFactory,
+    GovernancePolicyCacheUnavailable,
+    GovernancePolicyMutationFence,
+    GovernancePolicySnapshot,
+)
 
 logger = logging.getLogger(__name__)
+
+_POLICY_CACHE_MUTATIONS_KEY = "governance_policy_cache_mutations"
+_POLICY_CACHE_LISTENERS_KEY = "governance_policy_cache_listeners"
+
+
+def _schedule_cache_task(loop, callback, *args) -> None:
+    if loop.is_closed():
+        return
+
+    try:
+        if asyncio.get_running_loop() is loop:
+            loop.create_task(callback(*args))
+            return
+    except RuntimeError:
+        pass
+
+    def schedule() -> None:
+        loop.create_task(callback(*args))
+
+    if loop.is_running():
+        loop.call_soon_threadsafe(schedule)
+
+
+def _publish_policy_cache_after_commit(session) -> None:
+    if session.in_nested_transaction():
+        return
+    mutations = session.info.pop(_POLICY_CACHE_MUTATIONS_KEY, [])
+    for loop, policy_cache, fence, snapshot, _owner in mutations:
+        _schedule_cache_task(
+            loop,
+            policy_cache.commit_mutation,
+            fence,
+            snapshot,
+        )
+
+
+def _release_policy_cache_after_rollback(session) -> None:
+    if session.in_nested_transaction():
+        return
+    rolled_back = session.info.pop(_POLICY_CACHE_MUTATIONS_KEY, [])
+    for loop, policy_cache, fence, _snapshot, _owner in rolled_back:
+        _schedule_cache_task(loop, policy_cache.rollback_mutation, fence)
+
+
+def _release_policy_cache_after_soft_rollback(
+    session,
+    previous_transaction,
+) -> None:
+    if not previous_transaction.nested:
+        return
+    mutations = session.info.get(_POLICY_CACHE_MUTATIONS_KEY, [])
+    rolled_back = [
+        item
+        for item in mutations
+        if _transaction_descends_from(item[4], previous_transaction)
+    ]
+    session.info[_POLICY_CACHE_MUTATIONS_KEY] = [
+        item for item in mutations if item not in rolled_back
+    ]
+    for loop, policy_cache, fence, _snapshot, _owner in rolled_back:
+        _schedule_cache_task(loop, policy_cache.rollback_mutation, fence)
+
+
+def _transaction_descends_from(transaction, ancestor) -> bool:
+    while transaction is not None:
+        if transaction is ancestor:
+            return True
+        transaction = transaction.parent
+    return False
+
+
+def _register_policy_cache_mutation(
+    db: AsyncSession,
+    *,
+    policy_cache: GovernancePolicyCache,
+    fence: GovernancePolicyMutationFence,
+    snapshot: GovernancePolicySnapshot,
+) -> None:
+    sync_session = db.sync_session
+    owner = sync_session.get_nested_transaction()
+    sync_session.info.setdefault(_POLICY_CACHE_MUTATIONS_KEY, []).append(
+        (asyncio.get_running_loop(), policy_cache, fence, snapshot, owner)
+    )
+    if sync_session.info.get(_POLICY_CACHE_LISTENERS_KEY):
+        return
+    event.listen(sync_session, "after_commit", _publish_policy_cache_after_commit)
+    event.listen(sync_session, "after_rollback", _release_policy_cache_after_rollback)
+    event.listen(
+        sync_session,
+        "after_soft_rollback",
+        _release_policy_cache_after_soft_rollback,
+    )
+    sync_session.info[_POLICY_CACHE_LISTENERS_KEY] = True
 
 
 # ── Read ──────────────────────────────────────────────────────────────
@@ -42,14 +144,30 @@ async def get_policy(
 ) -> WorkspacePolicy:
     """Return the current policy for a workspace, falling back to
     DEFAULT_POLICY if the operator never customised one."""
+    policy_cache = GovernancePolicyCacheFactory.create_default()
+    cached = await policy_cache.get_current(workspace_id)
+    if cached is not None:
+        return policy_from_dict(cached.policy)
+
     row = (await db.execute(
-        select(GovernancePolicy).where(
+        select(GovernancePolicy.policy, GovernancePolicy.revision).where(
             GovernancePolicy.workspace_id == workspace_id
         )
-    )).scalar_one_or_none()
+    )).one_or_none()
     if row is None:
-        return DEFAULT_POLICY
-    return policy_from_dict(row.policy)
+        snapshot = GovernancePolicySnapshot(
+            workspace_id=workspace_id,
+            revision=0,
+            policy=policy_to_dict(DEFAULT_POLICY),
+        )
+    else:
+        snapshot = GovernancePolicySnapshot(
+            workspace_id=workspace_id,
+            revision=int(row.revision or 0),
+            policy=dict(row.policy or {}),
+        )
+    await policy_cache.store_if_current(snapshot)
+    return policy_from_dict(snapshot.policy)
 
 
 async def list_revisions(
@@ -96,6 +214,11 @@ async def update_policy(
     )).scalar_one_or_none() or 0
     next_revision = max((row.revision if row else 0) or 0, max_revision) + 1
 
+    policy_cache = GovernancePolicyCacheFactory.create_default()
+    fence = await policy_cache.begin_mutation(workspace_id)
+    if not fence.active:
+        raise GovernancePolicyCacheUnavailable(workspace_id)
+
     if row is None:
         row = GovernancePolicy(
             workspace_id=workspace_id,
@@ -109,6 +232,17 @@ async def update_policy(
         row.policy = persisted
         row.revision = next_revision
         row.updated_by = changed_by
+
+    _register_policy_cache_mutation(
+        db,
+        policy_cache=policy_cache,
+        fence=fence,
+        snapshot=GovernancePolicySnapshot(
+            workspace_id=workspace_id,
+            revision=next_revision,
+            policy=persisted,
+        ),
+    )
 
     db.add(GovernanceRevision(
         workspace_id=workspace_id,
@@ -132,25 +266,28 @@ async def add_auto_approve_action(
     entity_id: str,
     workspace_id: str,
     action_key: str,
+    resource_id: Optional[str] = None,
     changed_by: Optional[str] = None,
 ) -> bool:
-    """Add ``action_key`` to a workspace's ``auto_approve_actions`` (idempotent).
+    """Add an action scope to a workspace's ``auto_approve_actions``.
 
     Backs the "always allow" approval choice: once the operator picks it, the
-    same action_key stops triggering HITL on future steps. Returns True if the
-    action was newly added (a policy revision was written), False if it was
-    already auto-approved or inputs were missing. Caller commits.
+    same action scope stops triggering HITL on future steps. ``resource_id``
+    narrows the grant when the caller wants a single concrete object. Returns
+    True if the scope was newly added (a policy revision was written), False
+    if it was already auto-approved or inputs were missing. Caller commits.
     """
-    if not workspace_id or not action_key:
+    scope_key = approval_scope_key(action_key, resource_id)
+    if not workspace_id or not scope_key:
         return False
     from dataclasses import replace
 
     policy = await get_policy(db, workspace_id)
-    if action_key in policy.auto_approve_actions:
+    if scope_key in policy.auto_approve_actions:
         return False
     new_policy = replace(
         policy,
-        auto_approve_actions=[*policy.auto_approve_actions, action_key],
+        auto_approve_actions=[*policy.auto_approve_actions, scope_key],
     )
     await update_policy(
         db,
@@ -158,7 +295,7 @@ async def add_auto_approve_action(
         workspace_id=workspace_id,
         policy=new_policy,
         changed_by=changed_by,
-        change_summary=f"always-approve action: {action_key}",
+        change_summary=f"always-approve action: {scope_key}",
     )
     return True
 
@@ -205,6 +342,7 @@ async def remove_auto_approve_action(
     entity_id: str,
     workspace_id: str,
     action_key: str,
+    resource_id: Optional[str] = None,
     changed_by: Optional[str] = None,
 ) -> bool:
     """Remove ``action_key`` from a workspace's ``auto_approve_actions``.
@@ -214,17 +352,18 @@ async def remove_auto_approve_action(
     policy revision was written), False if it was not granted or inputs
     were missing. Caller commits.
     """
-    if not workspace_id or not action_key:
+    scope_key = approval_scope_key(action_key, resource_id)
+    if not workspace_id or not scope_key:
         return False
     from dataclasses import replace
 
     policy = await get_policy(db, workspace_id)
-    if action_key not in policy.auto_approve_actions:
+    if scope_key not in policy.auto_approve_actions:
         return False
     new_policy = replace(
         policy,
         auto_approve_actions=[
-            key for key in policy.auto_approve_actions if key != action_key
+            key for key in policy.auto_approve_actions if key != scope_key
         ],
     )
     await update_policy(
@@ -233,7 +372,7 @@ async def remove_auto_approve_action(
         workspace_id=workspace_id,
         policy=new_policy,
         changed_by=changed_by,
-        change_summary=f"revoke always-approve action: {action_key}",
+        change_summary=f"revoke always-approve action: {scope_key}",
     )
     return True
 
@@ -284,6 +423,7 @@ async def check_step_policy(
     workspace_id: Optional[str],
     kind: str,
     action_key: Optional[str],
+    resource_id: Optional[str] = None,
     risk_level: str,
     capability_id: Optional[str] = None,
     spent_credits_per_kind: Optional[dict[str, int]] = None,
@@ -302,6 +442,7 @@ async def check_step_policy(
         policy,
         kind=kind,
         action_key=action_key,
+        resource_id=resource_id,
         risk_level=risk_level,
         capability_id=capability_id,
         spent_credits_per_kind=spent_credits_per_kind,
@@ -323,9 +464,10 @@ async def workspace_policy_auto_approves(
     *,
     workspace_id: Optional[str],
     action_key: Optional[str] = None,
+    resource_id: Optional[str] = None,
     capability_id: Optional[str] = None,
 ) -> bool:
-    """True when the workspace's policy *explicitly* auto-approves this action
+    """True when the workspace's policy *explicitly* auto-approves this scope
     or capability. Used by the dispatcher so a workspace can override a
     capability's intrinsic ``required_approval``. Workspace-less steps return
     False (nothing to opt into)."""
@@ -333,7 +475,10 @@ async def workspace_policy_auto_approves(
         return False
     policy = await get_policy(db, workspace_id)
     return policy_auto_approves(
-        policy, action_key=action_key, capability_id=capability_id
+        policy,
+        action_key=action_key,
+        resource_id=resource_id,
+        capability_id=capability_id,
     )
 
 
@@ -478,9 +623,12 @@ async def post_hitl_card(
             if action_to_take:
                 body = f"{body} {action_to_take}"
             prompt = what_happened
-            # Retry / cancel, not approve / always / reject: see
-            # error_card_options().
-            options = error_card_options()
+            # Retry / cancel, not approve / always / reject.
+            options = decision_options_for_hitl(hitl_type)
+        elif hitl_type == HitlType.REVIEW.value:
+            body = f"📄 **Review needed** — step `{step_key}` is waiting for your feedback."
+            prompt = reason or f"Review the material produced by step `{step_key}`."
+            options = decision_options_for_hitl(hitl_type)
         else:
             body = (
                 f"⛔ **Approval needed** — step `{step_key}` "
@@ -491,11 +639,9 @@ async def post_hitl_card(
                 f"Approve this step once? {kind}/{action_key or capability_id or 'unknown action'} "
                 f"matched governance rule {matched_rule or 'unknown'}."
             )
-            # "always_approve" lets the operator persist this approval at the
-            # workspace layer. Prefer a concrete action_key when available;
-            # otherwise persist the capability_id (for subagent/file.write
-            # style steps that do not have a provider action).
-            options = approval_options()
+            # Authorize keeps the standing-grant option. Review is handled in
+            # the branch above and can never grant a future diff.
+            options = decision_options_for_hitl(hitl_type)
         pending_action = {
             "kind": PendingActionKind.GOVERNANCE_APPROVAL.value,
             "step_id": step_id,
@@ -516,6 +662,20 @@ async def post_hitl_card(
             "payload": card_payload,
             "options": options,
         }
+        if hitl_type == HitlType.REVIEW.value:
+            # WorkflowApprovalReview deliberately consumes a top-level
+            # ``review`` value. Keep the canonical payload intact for the
+            # resolver/audit trail, while projecting the material under
+            # review into the shared card shape used by task and workflow
+            # reviews. Without this adapter a typed review request falls
+            # through to the generic approval summary and the operator
+            # cannot inspect the file/diff they are deciding on.
+            pending_action["review"] = card_payload.get("diff", card_payload)
+            pending_action["review_title"] = str(
+                card_payload.get("title")
+                or card_payload.get("review_title")
+                or f"Review {step_key}"
+            )
         if db is not None:
             await chat_service.post_message(
                 db,
@@ -562,9 +722,11 @@ async def resolve_stale_hitl_cards(
     step_ids: Optional[list[str]] = None,
     task_id: Optional[str] = None,
     reason: str = "origin_terminal",
+    choice: str = "expired",
+    pending_action_kinds: Optional[list[str]] = None,
+    for_update: bool = False,
 ) -> int:
-    """Mark unresolved governance-approval chat cards resolved when their
-    origin is gone.
+    """Mark matching unresolved HITL chat cards resolved when their origin is gone.
 
     The companion of ``approvals.resolve_origin_requests``: when a plan/step
     reaches a terminal state, the HitlRequest is expired there and the
@@ -580,6 +742,9 @@ async def resolve_stale_hitl_cards(
 
     from packages.core.models.task import Message
 
+    action_kinds = pending_action_kinds or [
+        PendingActionKind.GOVERNANCE_APPROVAL.value,
+    ]
     conds = []
     if plan_id:
         conds.append(Message.pending_action["plan_id"].as_string() == plan_id)
@@ -587,23 +752,21 @@ async def resolve_stale_hitl_cards(
         conds.append(Message.pending_action["step_id"].as_string().in_(list(step_ids)))
     if task_id:
         conds.append(Message.pending_action["task_id"].as_string() == task_id)
-    rows = (
-        await db.execute(
-            select(Message).where(
-                Message.pending_action.isnot(None),
-                Message.pending_action["kind"].as_string()
-                == PendingActionKind.GOVERNANCE_APPROVAL.value,
-                Message.resolved_at.is_(None),
-                or_(*conds),
-            )
-        )
-    ).scalars().all()
+    query = select(Message).where(
+        Message.pending_action.isnot(None),
+        Message.pending_action["kind"].as_string().in_(action_kinds),
+        Message.resolved_at.is_(None),
+        or_(*conds),
+    )
+    if for_update:
+        query = query.with_for_update()
+    rows = (await db.execute(query)).scalars().all()
     now = datetime.now(timezone.utc)
     for msg in rows:
         msg.resolved_at = now
-        msg.resolution = {"choice": "expired", "reason": reason}
+        msg.resolution = {"choice": choice, "reason": reason}
     if rows:
         logger.info(
-            "governance: resolved %d stale approval card(s) (%s)", len(rows), reason,
+            "governance: resolved %d stale HITL card(s) (%s)", len(rows), reason,
         )
     return len(rows)

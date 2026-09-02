@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from decimal import Decimal
-from typing import Optional
+from typing import Any, Optional
 
 from sqlalchemy import (
     BigInteger,
@@ -164,7 +164,9 @@ class WorkLease(Base, TimestampMixin):
         DateTime(timezone=True),
     )
 
-    result: Mapped[Optional[dict]] = mapped_column(JSONB)
+    # Worker lease results follow the step's JSON Schema and are not limited
+    # to objects (arrays/scalars/null are valid hard payloads).
+    result: Mapped[Any] = mapped_column(JSONB, nullable=True)
     evidence_refs: Mapped[list] = mapped_column(JSONB, nullable=False, server_default="[]")
     cost: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default="{}")
     error: Mapped[Optional[dict]] = mapped_column(JSONB)

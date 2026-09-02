@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 import logging
 from typing import Any, Dict, List, Optional
+from urllib.parse import quote, urlsplit
 
 import httpx
 
@@ -25,6 +26,12 @@ logger = logging.getLogger(__name__)
 
 _API = "https://graph.microsoft.com/v1.0"
 _MAX_CHARS = 12_000
+_API_PARTS = urlsplit(_API)
+
+
+def _path_segment(value: Any) -> str:
+    """Encode an opaque Graph resource id as one URL path segment."""
+    return quote(str(value), safe="")
 
 
 def list_tools() -> List[Dict[str, Any]]:
@@ -34,15 +41,24 @@ def list_tools() -> List[Dict[str, Any]]:
 async def call_tool(
     name: str, arguments: Dict[str, Any], bearer_token: str,
 ) -> Dict[str, Any]:
+    token = bearer_token.strip() if isinstance(bearer_token, str) else ""
+    if not token:
+        return _error(
+            "Microsoft Graph access token is missing. Reconnect Microsoft on the Integration page."
+        )
+
     handler = _HANDLERS.get(name)
     if not handler:
         return _error(f"Unknown tool: {name}")
+    if not isinstance(arguments, dict):
+        return _error("arguments must be an object")
+    arguments = dict(arguments)
     spec = _TOOLS.get(name, {})
     missing = [p for p in spec.get("required", []) if arguments.get(p) in (None, "")]
     if missing:
         return _error(f"Missing required params: {', '.join(missing)}")
     try:
-        text = await handler(bearer_token, arguments)
+        text = await handler(token, arguments)
         return {"content": [{"type": "text", "text": text}], "isError": False}
     except Exception as exc:  # noqa: BLE001
         logger.exception("MS Calendar MCP tool %s failed", name)
@@ -54,18 +70,40 @@ from packages.core.ai.mcp._http import mcp_err as _error  # noqa: E402, F401
 
 # ── HTTP client ─────────────────────────────────────────────────────────────
 
-async def _api(
+
+def _api_url(path: str) -> str:
+    parsed = urlsplit(path)
+    if not parsed.scheme and not parsed.netloc:
+        return f"{_API}/{path.lstrip('/')}"
+    try:
+        port = parsed.port or 443
+    except ValueError as exc:
+        raise RuntimeError("MS Calendar refused an untrusted Microsoft Graph URL") from exc
+    api_path = _API_PARTS.path.rstrip("/")
+    if (
+        parsed.scheme != _API_PARTS.scheme
+        or parsed.hostname != _API_PARTS.hostname
+        or port != 443
+        or parsed.username is not None
+        or parsed.password is not None
+        or not (parsed.path == api_path or parsed.path.startswith(f"{api_path}/"))
+    ):
+        raise RuntimeError("MS Calendar refused an untrusted Microsoft Graph URL")
+    return path
+
+
+async def _api_json(
     token: str, method: str, path: str,
     body: Optional[Dict] = None, params: Optional[Dict] = None,
-) -> str:
-    url = f"{_API}/{path.lstrip('/')}" if not path.startswith("http") else path
+) -> Any:
+    url = _api_url(path)
     headers = {
         "Authorization": f"Bearer {token}",
         "Accept": "application/json",
         "Content-Type": "application/json",
     }
     async with httpx.AsyncClient(timeout=20.0) as client:
-        resp = await client.request(method, url, headers=headers, json=body, params=params or {})
+        resp = await client.request(method, url, headers=headers, json=body, params=params)
     if resp.status_code == 401:
         raise RuntimeError("MS Calendar auth failed. Reconnect Microsoft on the Integration page.")
     if resp.status_code == 403:
@@ -73,19 +111,64 @@ async def _api(
     if resp.status_code == 404:
         raise RuntimeError("Not found.")
     if resp.status_code in (202, 204):
-        return json.dumps({"success": True})
+        return {"success": True}
     if not resp.is_success:
         raise RuntimeError(f"MS Calendar API error ({resp.status_code}): {resp.text[:300]}")
     if not resp.text:
-        return json.dumps({"success": True})
+        return {"success": True}
     try:
-        data = resp.json()
+        return resp.json()
     except Exception:
-        return resp.text[:_MAX_CHARS]
+        return resp.text
+
+
+async def _api(
+    token: str, method: str, path: str,
+    body: Optional[Dict] = None, params: Optional[Dict] = None,
+) -> str:
+    data = await _api_json(token, method, path, body=body, params=params)
+    if isinstance(data, str):
+        return data[:_MAX_CHARS]
     out = json.dumps(data, ensure_ascii=False, indent=2, default=str)
     if len(out) > _MAX_CHARS:
         return out[:_MAX_CHARS] + "\n… (truncated)"
     return out
+
+
+async def _paged_values(
+    token: str,
+    path: str,
+    params: Optional[Dict] = None,
+) -> List[Dict[str, Any]]:
+    values: List[Dict[str, Any]] = []
+    next_path = path
+    next_params = params
+    seen_links: set[str] = set()
+    while True:
+        data = await _api_json(token, "GET", next_path, params=next_params)
+        if not isinstance(data, dict) or not isinstance(data.get("value", []), list):
+            raise RuntimeError("MS Calendar returned an invalid paged response")
+        page_values = data.get("value", [])
+        if any(not isinstance(item, dict) for item in page_values):
+            raise RuntimeError("MS Calendar returned an invalid paged item")
+        values.extend(page_values)
+        next_link = str(data.get("@odata.nextLink") or "")
+        if not next_link:
+            return values
+        if next_link in seen_links:
+            raise RuntimeError("MS Calendar returned a repeated next page link")
+        seen_links.add(next_link)
+        next_path = next_link
+        next_params = None
+
+
+async def list_calendars_data(token: str) -> List[Dict[str, Any]]:
+    """Return every calendar without applying the MCP text-output limit."""
+    return await _paged_values(
+        token,
+        "me/calendars",
+        {"$select": "id,name,isDefaultCalendar,canEdit"},
+    )
 
 
 def _to_attendees(value: Any, attendee_type: str = "required") -> List[Dict[str, Any]]:
@@ -119,7 +202,25 @@ def _build_event_body(args: Dict[str, Any]) -> Dict[str, Any]:
     if args.get("reminder_minutes_before") is not None:
         body["reminderMinutesBeforeStart"] = int(args["reminder_minutes_before"])
         body["isReminderOn"] = True
+    if args.get("transaction_id"):
+        body["transactionId"] = str(args["transaction_id"])
     return body
+
+
+def _top(value: Any, *, default: int) -> int:
+    if value is None or value == "":
+        return default
+    if isinstance(value, bool):
+        raise ValueError("top must be an integer between 1 and 500")
+    try:
+        count = int(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("top must be an integer between 1 and 500") from exc
+    if isinstance(value, float) and value != count:
+        raise ValueError("top must be an integer between 1 and 500")
+    if count < 1:
+        raise ValueError("top must be at least 1")
+    return min(count, 500)
 
 
 # ── Tool handlers ───────────────────────────────────────────────────────────
@@ -132,41 +233,66 @@ async def _list_calendars(token: str, args: Dict) -> str:
 
 # Events
 
-async def _list_events(token: str, args: Dict) -> str:
-    """Pull events from a window. ``timeMin/timeMax`` map to Graph's
-    calendarView endpoint when both are present (recommended — expands
-    recurring events into their concrete instances)."""
+def _list_events_request(args: Dict) -> tuple[str, Dict[str, Any]]:
     calendar = args.get("calendar_id")
-    base = f"me/calendars/{calendar}" if calendar else "me"
+    base = f"me/calendars/{_path_segment(calendar)}" if calendar else "me"
     if args.get("time_min") and args.get("time_max"):
         endpoint = f"{base}/calendarView"
         params: Dict[str, Any] = {
             "startDateTime": args["time_min"],
             "endDateTime": args["time_max"],
-            "$top": min(int(args.get("top") or 50), 500),
+            "$top": _top(args.get("top"), default=50),
             "$orderby": "start/dateTime ASC",
         }
     else:
         endpoint = f"{base}/events"
         params = {
-            "$top": min(int(args.get("top") or 25), 500),
+            "$top": _top(args.get("top"), default=25),
             "$orderby": "start/dateTime ASC",
         }
     if args.get("filter"):
         params["$filter"] = args["filter"]
     if args.get("select"):
         params["$select"] = args["select"]
+    return endpoint, params
+
+
+async def list_events_data(token: str, args: Dict) -> List[Dict[str, Any]]:
+    """Return every event page without applying the MCP text-output limit."""
+    endpoint, params = _list_events_request(args)
+    return await _paged_values(token, endpoint, params)
+
+
+async def _list_events(token: str, args: Dict) -> str:
+    """Pull events from a window. ``timeMin/timeMax`` map to Graph's
+    calendarView endpoint when both are present (recommended — expands
+    recurring events into their concrete instances)."""
+    endpoint, params = _list_events_request(args)
     return await _api(token, "GET", endpoint, params=params)
 
 
 async def _get_event(token: str, args: Dict) -> str:
-    return await _api(token, "GET", f"me/events/{args['event_id']}")
+    return await _api(token, "GET", f"me/events/{_path_segment(args['event_id'])}")
+
+
+def _create_event_request(args: Dict) -> tuple[str, Dict[str, Any]]:
+    body = _build_event_body(args)
+    calendar_id = args.get("calendar_id")
+    path = f"me/calendars/{_path_segment(calendar_id)}/events" if calendar_id else "me/events"
+    return path, body
+
+
+async def create_event_data(token: str, args: Dict) -> Dict[str, Any]:
+    """Create an event and return its full resource without MCP truncation."""
+    path, body = _create_event_request(args)
+    data = await _api_json(token, "POST", path, body=body)
+    if not isinstance(data, dict):
+        raise RuntimeError("MS Calendar returned an invalid created event")
+    return data
 
 
 async def _create_event(token: str, args: Dict) -> str:
-    body = _build_event_body(args)
-    cal = args.get("calendar_id")
-    path = f"me/calendars/{cal}/events" if cal else "me/events"
+    path, body = _create_event_request(args)
     return await _api(token, "POST", path, body=body)
 
 
@@ -187,11 +313,11 @@ async def _update_event(token: str, args: Dict) -> str:
         body["attendees"] = _to_attendees(args["attendees"], "required")
     if not body:
         return "No fields to update."
-    return await _api(token, "PATCH", f"me/events/{args['event_id']}", body=body)
+    return await _api(token, "PATCH", f"me/events/{_path_segment(args['event_id'])}", body=body)
 
 
 async def _delete_event(token: str, args: Dict) -> str:
-    return await _api(token, "DELETE", f"me/events/{args['event_id']}")
+    return await _api(token, "DELETE", f"me/events/{_path_segment(args['event_id'])}")
 
 
 async def _cancel_event(token: str, args: Dict) -> str:
@@ -201,7 +327,7 @@ async def _cancel_event(token: str, args: Dict) -> str:
     if args.get("comment"):
         body["comment"] = args["comment"]
     return await _api(
-        token, "POST", f"me/events/{args['event_id']}/cancel", body=body,
+        token, "POST", f"me/events/{_path_segment(args['event_id'])}/cancel", body=body,
     )
 
 
@@ -212,7 +338,7 @@ async def _accept_event(token: str, args: Dict) -> str:
     if args.get("comment"):
         body["comment"] = args["comment"]
     return await _api(
-        token, "POST", f"me/events/{args['event_id']}/accept", body=body,
+        token, "POST", f"me/events/{_path_segment(args['event_id'])}/accept", body=body,
     )
 
 
@@ -221,7 +347,7 @@ async def _decline_event(token: str, args: Dict) -> str:
     if args.get("comment"):
         body["comment"] = args["comment"]
     return await _api(
-        token, "POST", f"me/events/{args['event_id']}/decline", body=body,
+        token, "POST", f"me/events/{_path_segment(args['event_id'])}/decline", body=body,
     )
 
 
@@ -230,7 +356,7 @@ async def _tentatively_accept_event(token: str, args: Dict) -> str:
     if args.get("comment"):
         body["comment"] = args["comment"]
     return await _api(
-        token, "POST", f"me/events/{args['event_id']}/tentativelyAccept", body=body,
+        token, "POST", f"me/events/{_path_segment(args['event_id'])}/tentativelyAccept", body=body,
     )
 
 
@@ -238,11 +364,11 @@ async def _tentatively_accept_event(token: str, args: Dict) -> str:
 
 async def _list_event_instances(token: str, args: Dict) -> str:
     return await _api(
-        token, "GET", f"me/events/{args['event_id']}/instances",
+        token, "GET", f"me/events/{_path_segment(args['event_id'])}/instances",
         params={
             "startDateTime": args["time_min"],
             "endDateTime": args["time_max"],
-            "$top": min(int(args.get("top") or 50), 500),
+            "$top": _top(args.get("top"), default=50),
         },
     )
 
@@ -325,6 +451,7 @@ _TOOLS: Dict[str, Dict[str, Any]] = {
         "description": "Create a new event. Set is_online_meeting=true to attach a Teams meeting link.",
         "properties": {
             "calendar_id": _prop("Calendar ID (default: primary)"),
+            "transaction_id": _prop("Optional client id used to deduplicate retries"),
             "subject": _prop("Event title"),
             "start_time": _prop("ISO 8601 start"),
             "end_time": _prop("ISO 8601 end (default: same as start_time)"),

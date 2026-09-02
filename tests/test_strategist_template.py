@@ -14,13 +14,18 @@ focus on the new helpers.
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass, field
+import json
+from types import SimpleNamespace
 from typing import Any
+from unittest.mock import patch
 
 import pytest
 
 from packages.core.blueprints.payload import migrate_payload
 from packages.core.ai.runtime.strategist import (
+    RUNTIME_STRATEGIST_WORKFLOW_RUN_GUIDANCE,
     runtime_strategist_user_prompt,
     runtime_strategist_template_block as _format_strategist_template,
 )
@@ -84,6 +89,61 @@ class _StubProposal:
     tasks: list = field(default_factory=list)
     notes: str | None = None
     summary: str = ""
+
+
+def test_strategist_prompt_closes_db_transaction_before_runtime_completion() -> None:
+    from packages.core.strategist.context import StrategistContext
+    from packages.core.strategist.prompt import generate_proposal
+
+    class FakeDb:
+        committed = False
+
+        def in_transaction(self) -> bool:
+            return True
+
+        async def commit(self) -> None:
+            self.committed = True
+
+    db = FakeDb()
+    ctx = StrategistContext(
+        workspace=SimpleNamespace(
+            id="ws_1",
+            entity_id="ent_1",
+            name="Ops Workspace",
+        ),
+    )
+
+    async def fake_load_skill_preamble(_db, _entity_id):
+        return None
+
+    async def fake_runtime_completion(_system_prompt, _user_prompt, **_kwargs):
+        assert db.committed is True
+        return SimpleNamespace(
+            content=json.dumps(
+                {
+                    "review_id": "rv_idle_timeout",
+                    "summary": "No new tasks this cycle.",
+                    "tasks": [],
+                }
+            )
+        )
+
+    with (
+        patch(
+            "packages.core.strategist.prompt._load_skill_preamble",
+            new=fake_load_skill_preamble,
+        ),
+        patch(
+            "packages.core.strategist.prompt.runtime_execute_strategist_completion",
+            new=fake_runtime_completion,
+        ),
+    ):
+        proposal = asyncio.run(
+            generate_proposal(ctx, review_id="rv_idle_timeout", db=db)
+        )
+
+    assert proposal.review_id == "rv_idle_timeout"
+    assert db.committed is True
 
 
 # ── Skip-condition evaluator ──────────────────────────────────────────
@@ -364,6 +424,14 @@ def test_format_template_empty_returns_empty_string():
     assert _format_strategist_template(ctx) == ""
 
 
+def test_workflow_run_guidance_prevents_duplicate_active_work():
+    guidance = RUNTIME_STRATEGIST_WORKFLOW_RUN_GUIDANCE
+    assert "pending, running" in guidance
+    assert "Never propose a fresh run" in guidance
+    assert "completed scheduled Flow" in guidance
+    assert "failed, blocked, or needs_input" in guidance
+
+
 def test_format_template_business_model_block():
     ctx = _StubCtx(
         strategist_template={
@@ -521,6 +589,7 @@ def test_installer_merge_nested_cadence_splits_for_legacy():
                 },
                 "business_model": {"model_type": "saas"},
                 "do_not_propose": ["never"],
+                "use_goals": False,
             },
             "prompts": [],
             "subscriptions": [],
@@ -546,7 +615,7 @@ def test_installer_merge_nested_cadence_splits_for_legacy():
         tc = cadence_obj.get("trigger_conditions")
         if tc is not None:
             merged["trigger_conditions"] = tc
-    for key in ("business_model", "do_not_propose"):
+    for key in ("business_model", "do_not_propose", "use_goals"):
         if key in strategist_cfg:
             merged[key] = strategist_cfg[key]
 
@@ -557,6 +626,7 @@ def test_installer_merge_nested_cadence_splits_for_legacy():
     # And the other fields land verbatim:
     assert merged["business_model"]["model_type"] == "saas"
     assert merged["do_not_propose"] == ["never"]
+    assert merged["use_goals"] is False
 
 
 def test_v10_payload_carries_no_strategist_template():

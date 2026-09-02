@@ -19,6 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from packages.core.database import async_session
 from packages.core.models.workspace import Workspace
+from packages.core.services.workspace_access import lock_workspace_access_boundary
 from packages.core.services.workspace_operation_service import repair_workspace_operation_runtime
 
 logger = logging.getLogger(__name__)
@@ -76,14 +77,21 @@ async def repair_workspace_operation_runtime_backfill(
             report.skipped_marked += 1
             continue
         if not _has_repairable_runtime_payload(row):
+            workspace = await lock_workspace_access_boundary(
+                db,
+                workspace_id=workspace_id,
+                entity_id=entity_id,
+            )
+            if workspace is None or workspace.deleted_at is not None:
+                await db.rollback()
+                continue
+            settings = dict(workspace.settings or {})
             settings[_REPAIR_KEY] = {
                 "completed": True,
                 "last_run_at": datetime.now(timezone.utc).isoformat(),
                 "result": {"skipped": "empty"},
             }
-            workspace = await db.get(Workspace, workspace_id)
-            if workspace is not None:
-                workspace.settings = settings
+            workspace.settings = settings
             await db.commit()
             report.skipped_empty += 1
             continue
@@ -98,14 +106,21 @@ async def repair_workspace_operation_runtime_backfill(
                 entity_id,
                 user_id=None,
             )
+            workspace = await lock_workspace_access_boundary(
+                db,
+                workspace_id=workspace_id,
+                entity_id=entity_id,
+            )
+            if workspace is None or workspace.deleted_at is not None:
+                await db.rollback()
+                continue
+            settings = dict(workspace.settings or {})
             settings[_REPAIR_KEY] = {
                 "completed": True,
                 "last_run_at": datetime.now(timezone.utc).isoformat(),
                 "result": _summarize_repair_result(repair_result or {}),
             }
-            workspace = await db.get(Workspace, workspace_id)
-            if workspace is not None:
-                workspace.settings = settings
+            workspace.settings = settings
             await db.commit()
             report.repaired += 1
             logger.info(

@@ -15,13 +15,15 @@ import {
 
 
 const FAILED_RETRYABLE_STEP_STATUSES = new Set(["failed", "skipped", "cancelled"]);
-const WAITING_RETRYABLE_STEP_STATUSES = new Set(["waiting_human"]);
 const RETRYABLE_STEP_STATUSES = new Set([
   ...FAILED_RETRYABLE_STEP_STATUSES,
-  ...WAITING_RETRYABLE_STEP_STATUSES,
   "paused",
 ]);
-const TERMINAL_PLAN_STATUSES = new Set(["completed"]);
+const RETRYABLE_PLAN_STATUSES = new Set(["failed", "needs_attention", "paused", "cancelled"]);
+const TASK_RECOVERY_DISPATCH_FAILURE_TYPES = new Set([
+  "PlanContinuationDispatchFailed",
+  "TaskRetryDispatchFailed",
+]);
 
 const PLAN_STATUS_LABELS: Record<string, string> = {
   draft: t("component.task_execution_timeline.draft"),
@@ -353,6 +355,7 @@ function dedupeOutputFiles(files: any[]): any[] {
 
 interface TaskExecutionTimelineProps {
   plan?: ExecutionPlan | null;
+  taskStatus?: string | null;
   steps: ExecutionStep[];
   isLoading?: boolean;
   isPending?: boolean;
@@ -364,6 +367,7 @@ interface TaskExecutionTimelineProps {
 
 export default function TaskExecutionTimeline({
   plan,
+  taskStatus,
   steps,
   isLoading = false,
   isPending = false,
@@ -388,36 +392,42 @@ export default function TaskExecutionTimeline({
 
   const retryableSteps = steps.filter((step) => RETRYABLE_STEP_STATUSES.has(step.step_status));
   const failedRetryableSteps = steps.filter((step) => FAILED_RETRYABLE_STEP_STATUSES.has(step.step_status));
-  const waitingRetryableSteps = steps.filter((step) => WAITING_RETRYABLE_STEP_STATUSES.has(step.step_status));
   const otherRetryableSteps = retryableSteps.filter(
-    (step) => !FAILED_RETRYABLE_STEP_STATUSES.has(step.step_status) && !WAITING_RETRYABLE_STEP_STATUSES.has(step.step_status),
+    (step) => !FAILED_RETRYABLE_STEP_STATUSES.has(step.step_status),
   );
   const hasFailedRetryableSteps = failedRetryableSteps.length > 0;
-  const hasWaitingRetryableSteps = waitingRetryableSteps.length > 0;
   const hasOtherRetryableSteps = otherRetryableSteps.length > 0;
   const doneCount = steps.filter((step) => step.step_status === "done").length;
   const failedCount = steps.filter((step) => ["failed", "skipped", "cancelled"].includes(step.step_status)).length;
   const waitingCount = steps.filter((step) => step.step_status === "waiting_human").length;
-  const canRetryPlan = retryableSteps.length > 0 && !TERMINAL_PLAN_STATUSES.has(plan.status);
+  const effectiveTaskStatus = taskStatus ?? plan.task_status;
+  const taskRecoveryOwnsRetry = Boolean(
+    plan.task_id
+    && (
+      effectiveTaskStatus === "waiting_on_customer"
+      || (
+        plan.status === "needs_attention"
+        && TASK_RECOVERY_DISPATCH_FAILURE_TYPES.has(String(plan.last_error?.type || ""))
+      )
+    ),
+  );
+  const retrySurfaceAvailable = RETRYABLE_PLAN_STATUSES.has(plan.status) && !taskRecoveryOwnsRetry;
+  const canRetryPlan = retryableSteps.length > 0 && retrySurfaceAvailable;
   const canApprovePlan = plan.status === "pending_approval" && !!onApprovePlan;
   const trimmedNote = note?.trim() || undefined;
   const stepsByKey = new Map(steps.map((step) => [step.step_key, step]));
   const toggleCollapsed = () => setCollapsed((value) => !value);
   const retryPlanLabel = hasFailedRetryableSteps
-    ? hasWaitingRetryableSteps || hasOtherRetryableSteps
+    ? hasOtherRetryableSteps
       ? t("component.task_execution_timeline.retry_blocked_steps")
       : t("component.task_execution_timeline.retry_failed_steps")
-    : hasWaitingRetryableSteps && !hasOtherRetryableSteps
-      ? t("component.task_execution_timeline.resume_waiting_steps")
-      : t("component.task_execution_timeline.retry_blocked_steps");
+    : t("component.task_execution_timeline.retry_blocked_steps");
   const retryPlanTitle = trimmedNote
     ? hasFailedRetryableSteps
-      ? hasWaitingRetryableSteps || hasOtherRetryableSteps
+      ? hasOtherRetryableSteps
         ? t("component.task_execution_timeline.retry_blocked_steps_with_the_comment_box_as_note")
         : t("component.task_execution_timeline.retry_failed_steps_with_the_comment_box_as_note")
-      : hasWaitingRetryableSteps && !hasOtherRetryableSteps
-        ? t("component.task_execution_timeline.resume_waiting_steps_with_the_comment_box_as_input")
-        : t("component.task_execution_timeline.retry_blocked_steps_with_the_comment_box_as_note")
+      : t("component.task_execution_timeline.retry_blocked_steps_with_the_comment_box_as_note")
     : retryPlanLabel;
 
   return (
@@ -520,8 +530,7 @@ export default function TaskExecutionTimeline({
             {steps.map((step, index) => {
               const meta = STEP_STATUS_META[step.step_status] || STEP_STATUS_META.pending;
               const Icon = meta.Icon;
-              const canRetryStep = RETRYABLE_STEP_STATUSES.has(step.step_status) && !TERMINAL_PLAN_STATUSES.has(plan.status) && !!onRetryStep;
-              const isWaitingRetryStep = WAITING_RETRYABLE_STEP_STATUSES.has(step.step_status);
+              const canRetryStep = RETRYABLE_STEP_STATUSES.has(step.step_status) && retrySurfaceAvailable && !!onRetryStep;
               const output = extractOutputSummary(step.result);
               const detailSections = stepDetailSections(step);
               const executor = stepExecutor(step);
@@ -752,15 +761,11 @@ export default function TaskExecutionTimeline({
                         fontSize: 11, fontWeight: 750, whiteSpace: "nowrap",
                       }}
                       title={trimmedNote
-                        ? isWaitingRetryStep
-                          ? t("component.task_execution_timeline.resume_this_step_with_the_comment_box_as_input")
-                          : t("component.task_execution_timeline.retry_this_step_with_the_comment_box_as_note")
-                        : isWaitingRetryStep
-                          ? t("component.task_execution_timeline.resume_this_step")
-                          : t("component.task_execution_timeline.retry_this_step")}
+                        ? t("component.task_execution_timeline.retry_this_step_with_the_comment_box_as_note")
+                        : t("component.task_execution_timeline.retry_this_step")}
                     >
                       <IconRefresh size={11} />
-                      {isWaitingRetryStep ? t("component.task_execution_timeline.resume") : t("page.announcements.retry")}</button>
+                      {t("page.announcements.retry")}</button>
                   )}
                 </div>
               );

@@ -103,25 +103,15 @@ async def _duckduckgo_news(
 ) -> list[dict[str, Any]]:
     """Key-free news fallback for when GDELT errors or comes back empty."""
     try:
-        from packages.core.ai.tools.web_tools import DDGS, _DDGS_AVAILABLE
-    except Exception:
-        return []
-    if not _DDGS_AVAILABLE or DDGS is None:
-        return []
-
-    def _search() -> list[dict[str, Any]]:
-        return list(
-            DDGS().news(
-                query or "news",
-                region=_DDGS_REGION_BY_LANGUAGE.get(language, "wt-wt"),
-                safesearch="moderate",
-                timelimit=_ddgs_timelimit(days),
-                max_results=min(50, max(limit * 2, limit)),
-            )
+        from packages.core.ai.runtime.tool_adapters import (
+            runtime_duckduckgo_news_results,
         )
-
-    try:
-        raw = await asyncio.to_thread(_search)
+        raw = await runtime_duckduckgo_news_results(
+            query=query,
+            region=_DDGS_REGION_BY_LANGUAGE.get(language, "wt-wt"),
+            timelimit=_ddgs_timelimit(days),
+            max_results=min(50, max(limit * 2, limit)),
+        )
     except Exception as exc:
         logger.warning("Dashboard news DuckDuckGo fallback failed: %s", exc)
         return []

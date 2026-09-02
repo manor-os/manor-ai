@@ -1,8 +1,28 @@
 import pytest
+from pydantic import ValidationError
+
+
+def test_worker_registration_schema_only_accepts_protocol_v2():
+    from apps.api.routers.workers import WorkerCapabilities
+    from packages.core.workers import (
+        CURRENT_WORKER_PROTOCOL_VERSION,
+        WorkerProtocolVersion,
+    )
+    from packages.worker_sdk.client import ManorClient
+
+    assert WorkerCapabilities(protocol_version=2).protocol_version is WorkerProtocolVersion.V2
+    assert ManorClient.PROTOCOL_VERSION == str(int(CURRENT_WORKER_PROTOCOL_VERSION))
+    with pytest.raises(ValidationError):
+        WorkerCapabilities(protocol_version=1)
+    with pytest.raises(ValidationError):
+        WorkerCapabilities()
 
 
 @pytest.mark.asyncio
-async def test_user_jwt_and_worker_secret_are_not_interchangeable(client):
+async def test_user_jwt_and_worker_secret_are_not_interchangeable(
+    client,
+    db_session,
+):
     register = await client.post(
         "/api/v1/auth/register",
         json={
@@ -29,7 +49,7 @@ async def test_user_jwt_and_worker_secret_are_not_interchangeable(client):
                 "max_risk_level": "low",
                 "uses_manor_credentials": False,
                 "deployment": "local",
-                "protocol_version": 1,
+                "protocol_version": 2,
             },
         },
     )
@@ -38,6 +58,7 @@ async def test_user_jwt_and_worker_secret_are_not_interchangeable(client):
     worker_headers = {
         "Authorization": f"Bearer {worker_payload['worker_secret']}",
         "Manor-Worker-Id": worker_payload["worker_id"],
+        "Manor-Protocol-Version": "2",
     }
 
     user_catalog = await client.get(
@@ -65,6 +86,48 @@ async def test_user_jwt_and_worker_secret_are_not_interchangeable(client):
         json={"state": "idle", "capacity": {"can_accept_leases": 0}},
     )
     assert worker_heartbeat.status_code == 200, worker_heartbeat.text
+
+    from packages.core.models.worker import Worker, WorkerActivityLog
+    from packages.core.constants.execution import WorkerStatus
+    from sqlalchemy import select
+
+    worker = await db_session.get(Worker, worker_payload["worker_id"])
+    assert worker is not None
+    worker.status = WorkerStatus.OFFLINE.value
+    await db_session.commit()
+
+    reconnected = await client.post(
+        "/api/v1/workers/heartbeat",
+        headers=worker_headers,
+        json={"state": "idle", "capacity": {"can_accept_leases": 0}},
+    )
+    assert reconnected.status_code == 200, reconnected.text
+    await db_session.refresh(worker)
+    reconnect_activity = await db_session.scalar(
+        select(WorkerActivityLog).where(
+            WorkerActivityLog.worker_id == worker.id,
+            WorkerActivityLog.event == "reconnected",
+        )
+    )
+    assert worker.status == WorkerStatus.ACTIVE.value
+    assert reconnect_activity is not None
+
+    missing_protocol = dict(worker_headers)
+    missing_protocol.pop("Manor-Protocol-Version")
+    rejected = await client.post(
+        "/api/v1/workers/heartbeat",
+        headers=missing_protocol,
+        json={"state": "idle", "capacity": {"can_accept_leases": 0}},
+    )
+    assert rejected.status_code == 426
+
+    wrong_protocol = {**worker_headers, "Manor-Protocol-Version": "1"}
+    rejected = await client.post(
+        "/api/v1/workers/heartbeat",
+        headers=wrong_protocol,
+        json={"state": "idle", "capacity": {"can_accept_leases": 0}},
+    )
+    assert rejected.status_code == 426
 
 
 @pytest.mark.asyncio
@@ -96,7 +159,7 @@ async def test_user_can_rename_owned_local_computer_with_unique_name(client):
                     "max_risk_level": "low",
                     "uses_manor_credentials": False,
                     "deployment": "local",
-                    "protocol_version": 1,
+                    "protocol_version": 2,
                 },
             },
         )

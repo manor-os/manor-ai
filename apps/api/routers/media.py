@@ -151,7 +151,7 @@ async def import_free_music(
         _workspace_storage_for_folder,
     )
 
-    _require_document_upload(user)
+    await _require_document_upload(db, user)
     source_document = await get_document(db, body.source_document_id, user.entity_id)
     if not source_document:
         raise HTTPException(404, "Source video not found")
@@ -280,7 +280,7 @@ async def finalize_video_editor_export(
         _require_document_upload,
     )
 
-    _require_document_upload(user)
+    await _require_document_upload(db, user)
     source_document = await get_document(db, source_document_id, user.entity_id)
     if not source_document:
         raise HTTPException(404, "Source video not found")

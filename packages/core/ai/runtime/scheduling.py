@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from collections.abc import Mapping
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from packages.core.ai.runtime.billing import (
@@ -86,19 +87,6 @@ def runtime_scheduled_job_prompt(
         source="payload_message" if payload_message else "name",
         includes_payload_context=False,
     )
-
-
-def runtime_scheduled_skill_prompt(
-    *,
-    skill_system_prompt: str | None,
-    input_prompt: str | None,
-) -> str:
-    """Resolve the agent prompt for scheduled skill execution."""
-
-    base_prompt = skill_system_prompt or ""
-    if input_prompt:
-        return f"{base_prompt}\n\n## Input\n{input_prompt}"
-    return base_prompt
 
 
 def _coerce_scheduled_execution_target(
@@ -196,21 +184,63 @@ async def runtime_create_scheduled_job_action(
             conversation_id=conversation_id,
             user_id=user_id,
             execution_target=resolved_execution_target,
+            require_workspace=bool(workspace_id),
         )
         await db.commit()
 
-        if payload_message and agent_id:
+        if payload_message and agent_id and job.enabled:
             try:
                 from packages.core.tasks.ai_tasks import generate_job_skill
 
-                generate_job_skill.delay(job.id, payload_message, name)
+                generate_job_skill.delay(
+                    job.id,
+                    payload_message,
+                    name,
+                    int(job.revision or 1),
+                )
+                from packages.core.constants.execution import (
+                    SCHEDULED_JOB_SKILL_GENERATION_RECHECK_SECONDS,
+                )
+                from packages.core.services.scheduler_service import (
+                    defer_scheduled_job_skill_generation,
+                )
+
+                await defer_scheduled_job_skill_generation(
+                    db,
+                    job_id=job.id,
+                    revision=int(job.revision or 1),
+                    next_attempt_at=datetime.now(timezone.utc)
+                    + timedelta(
+                        seconds=(
+                            SCHEDULED_JOB_SKILL_GENERATION_RECHECK_SECONDS
+                        )
+                    ),
+                )
+                await db.commit()
             except Exception:
                 pass
 
-    return (
-        f"Created scheduled job '{name}' "
-        f"(id={job.job_id}, {schedule_kind}: {cron_expr or every_seconds or run_at})"
-    )
+    return json.dumps({
+        "ok": True,
+        "created": True,
+        "kind": "automation",
+        "automation": {
+            "id": str(job.id),
+            "job_id": str(job.job_id),
+            "name": str(job.name),
+            "schedule_kind": str(job.schedule_kind or schedule_kind),
+            "cron_expr": job.cron_expr,
+            "every_seconds": job.every_seconds,
+            "run_at": job.run_at,
+            "timezone": job.timezone,
+            "enabled": bool(job.enabled),
+        },
+        "url": f"/jobs?job={job.job_id}",
+        "message": (
+            f"Created scheduled job '{name}' "
+            f"(id={job.job_id}, {schedule_kind}: {cron_expr or every_seconds or run_at})"
+        ),
+    }, ensure_ascii=False, default=str)
 
 
 async def runtime_list_scheduled_jobs_action(*, entity_id: str) -> str:
@@ -318,14 +348,26 @@ async def runtime_toggle_scheduled_job_action(
     entity_id: str,
     job_id: str,
     enabled: bool = True,
+    actor_id: str | None = None,
 ) -> str:
     """Enable or disable a scheduled job through the Runtime action boundary."""
 
     from packages.core.database import async_session
+    from packages.core.constants.task_actors import TaskActor
     from packages.core.services.scheduler_service import toggle_scheduled_job
 
     async with async_session() as db:
-        job = await toggle_scheduled_job(db, job_id, entity_id, enabled)
+        job = await toggle_scheduled_job(
+            db,
+            job_id,
+            entity_id,
+            enabled,
+            changed_by_kind=(
+                TaskActor.AGENT.value if actor_id else TaskActor.MANOR.value
+            ),
+            changed_by_id=actor_id,
+            require_workspace=True,
+        )
         if job:
             await db.commit()
 
@@ -346,6 +388,7 @@ async def runtime_run_scheduled_job_now_action(
     from sqlalchemy import select
 
     from packages.core.database import async_session
+    from packages.core.models.base import generate_ulid
     from packages.core.models.scheduler import ScheduledJob
 
     async with async_session() as db:
@@ -362,7 +405,12 @@ async def runtime_run_scheduled_job_now_action(
 
     from packages.core.tasks.scheduler_tasks import _dispatch_job_task
 
-    _dispatch_job_task.delay(job.id, datetime.now(timezone.utc).isoformat(), manual=True)
+    _dispatch_job_task.delay(
+        job.id,
+        datetime.now(timezone.utc).isoformat(),
+        manual=True,
+        occurrence_key=f"manual:{generate_ulid()}",
+    )
     return f"Dispatched immediate run for job '{job_id}'."
 
 

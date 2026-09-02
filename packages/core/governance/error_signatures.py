@@ -77,6 +77,21 @@ _SIGNATURES: tuple[tuple[re.Pattern[str], ExecutionErrorHint], ...] = (
             is_transient=True,
         ),
     ),
+    # Cooperative 429 backoff is raised before any model/tool work happens.
+    # Keep the match pinned to our exception's exact message so a web page or
+    # third-party payload mentioning an unrelated HTTP 429 is not mistaken for
+    # Manor's model-provider control signal.
+    (
+        re.compile(r"\bLLM rate limited; retry after \d+(?:\.\d+)?s\b", re.I),
+        ExecutionErrorHint(
+            what_happened="The AI provider is temporarily rate limiting requests.",
+            action_to_take=(
+                "Manor will wait for the provider's retry window and continue "
+                "this step automatically."
+            ),
+            is_transient=True,
+        ),
+    ),
     # The single most common real failure in production, and the one whose
     # own message is actively wrong. Every observed occurrence is an upstream
     # 503 / 524 / 502 — the provider was down or the gateway gave up waiting.

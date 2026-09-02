@@ -18,6 +18,7 @@ from packages.core.models.notification import Notification
 from packages.core.models.workspace import Workspace
 from packages.core.services.channels import ADAPTERS
 from packages.core.services.channels.base import ChannelAdapter
+from tests.test_document_permissions import _create_entity_user
 
 
 # ── Fakes ───────────────────────────────────────────────────────────────────
@@ -107,9 +108,16 @@ async def _seed_workspace(
     return ws
 
 
-async def _seed_cc(db: AsyncSession, *, entity_id: str, workspace_id: str) -> ChannelConfig:
+async def _seed_cc(
+    db: AsyncSession,
+    *,
+    entity_id: str,
+    workspace_id: str,
+    owner_user_id: str,
+) -> ChannelConfig:
     cc = ChannelConfig(
         entity_id=entity_id,
+        owner_user_id=owner_user_id,
         workspace_id=workspace_id,
         channel_type="telegram",
         provider="telegram_bot",
@@ -183,7 +191,12 @@ async def test_external_inbound_notifies_workspace_owner(
     fallback) gets a "new message" notification on their bound channel."""
     owner = await _register(client, "inbound_owner")
     ws = await _seed_workspace(db_session, entity_id=owner["entity_id"])
-    cc = await _seed_cc(db_session, entity_id=owner["entity_id"], workspace_id=ws.id)
+    cc = await _seed_cc(
+        db_session,
+        entity_id=owner["entity_id"],
+        workspace_id=ws.id,
+        owner_user_id=owner["user_id"],
+    )
     await _seed_binding(
         db_session,
         entity_id=owner["entity_id"],
@@ -258,6 +271,81 @@ async def test_external_inbound_notifies_workspace_owner(
 
 
 @pytest.mark.asyncio
+async def test_external_inbound_defaults_to_channel_owner_only(
+    client: AsyncClient,
+    db_session: AsyncSession,
+    fake_telegram: _RecordingAdapter,
+    stub_agent,
+):
+    """A user-owned channel must not alert other admins in the Entity."""
+    owner = await _register(client, "inbound_private_owner")
+    other_admin = await _create_entity_user(
+        owner["entity_id"], "inbound_private_admin", role="admin",
+    )
+    ws = await _seed_workspace(db_session, entity_id=owner["entity_id"])
+    cc = await _seed_cc(
+        db_session,
+        entity_id=owner["entity_id"],
+        workspace_id=ws.id,
+        owner_user_id=owner["user_id"],
+    )
+    await _seed_binding(
+        db_session,
+        entity_id=owner["entity_id"],
+        workspace_id=ws.id,
+        user_id=owner["user_id"],
+        cc=cc,
+    )
+    owner_contact = await _seed_contact(
+        db_session,
+        entity_id=owner["entity_id"],
+        cc=cc,
+        source_id="tg_private_owner",
+        user_id=owner["user_id"],
+        role="admin",
+    )
+    customer_contact = await _seed_contact(
+        db_session,
+        entity_id=owner["entity_id"],
+        cc=cc,
+        source_id="tg_private_customer",
+        role="external",
+    )
+    await client.put(
+        "/api/v1/notifications/preferences",
+        headers=owner["headers"],
+        json={"default_channels": ["telegram"]},
+    )
+
+    from packages.core.services.channel_gateway import dispatch_inbound
+
+    await dispatch_inbound(
+        entity_id=owner["entity_id"],
+        channel_config_id=cc.id,
+        channel_type="telegram",
+        sender_id=customer_contact.source_id,
+        sender_name="Private Customer",
+        chat_id=customer_contact.source_id,
+        content="private ping",
+    )
+
+    rows = (
+        (
+            await db_session.execute(
+                select(Notification).where(
+                    Notification.type == "channel_inbound_message",
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert {row.user_id for row in rows} == {owner["user_id"]}
+    assert other_admin["id"] not in {row.user_id for row in rows}
+    assert [s["to"] for s in fake_telegram.sent].count(owner_contact.source_id) == 1
+
+
+@pytest.mark.asyncio
 async def test_followup_inbound_within_window_is_throttled(
     client: AsyncClient,
     db_session: AsyncSession,
@@ -269,7 +357,12 @@ async def test_followup_inbound_within_window_is_throttled(
     customer turn pings the operator."""
     owner = await _register(client, "throttle_owner")
     ws = await _seed_workspace(db_session, entity_id=owner["entity_id"])
-    cc = await _seed_cc(db_session, entity_id=owner["entity_id"], workspace_id=ws.id)
+    cc = await _seed_cc(
+        db_session,
+        entity_id=owner["entity_id"],
+        workspace_id=ws.id,
+        owner_user_id=owner["user_id"],
+    )
     await _seed_binding(
         db_session,
         entity_id=owner["entity_id"],
@@ -353,7 +446,12 @@ async def test_internal_member_inbound_does_not_notify(
     notification should fire. They're not a customer."""
     owner = await _register(client, "internal_inbound_owner")
     ws = await _seed_workspace(db_session, entity_id=owner["entity_id"])
-    cc = await _seed_cc(db_session, entity_id=owner["entity_id"], workspace_id=ws.id)
+    cc = await _seed_cc(
+        db_session,
+        entity_id=owner["entity_id"],
+        workspace_id=ws.id,
+        owner_user_id=owner["user_id"],
+    )
     await _seed_binding(
         db_session,
         entity_id=owner["entity_id"],
@@ -413,7 +511,12 @@ async def test_workspace_inbound_recipients_override(
         entity_id=owner["entity_id"],
         inbound_recipients=[],
     )
-    cc = await _seed_cc(db_session, entity_id=owner["entity_id"], workspace_id=ws.id)
+    cc = await _seed_cc(
+        db_session,
+        entity_id=owner["entity_id"],
+        workspace_id=ws.id,
+        owner_user_id=owner["user_id"],
+    )
     await _seed_binding(
         db_session,
         entity_id=owner["entity_id"],

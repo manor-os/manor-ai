@@ -51,7 +51,7 @@ class User(Base, TimestampMixin, SoftDeleteMixin):
     first_name: Mapped[Optional[str]] = mapped_column(String(100))
     last_name: Mapped[Optional[str]] = mapped_column(String(100))
     phone: Mapped[Optional[str]] = mapped_column(String(20))
-    avatar_url: Mapped[Optional[str]] = mapped_column(String(500))
+    avatar_url: Mapped[Optional[str]] = mapped_column(Text)
     password_hash: Mapped[str] = mapped_column(String(255), nullable=False)
     role: Mapped[str] = mapped_column(String(20), nullable=False, default="member")
     # Roles: owner, admin, member, viewer, client
@@ -73,6 +73,8 @@ class User(Base, TimestampMixin, SoftDeleteMixin):
     totp_secret: Mapped[Optional[str]] = mapped_column(String(255))
     totp_enabled: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
     backup_codes: Mapped[Optional[list]] = mapped_column(JSONB)
+
+
 
 
 class UserMembership(Base, TimestampMixin, SoftDeleteMixin):

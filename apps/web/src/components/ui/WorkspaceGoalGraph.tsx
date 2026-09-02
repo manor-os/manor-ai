@@ -6,6 +6,8 @@ import type { StepNode } from "./StepGraph";
 import LoadingSpinner from "./LoadingSpinner";
 import EmptyState from "./EmptyState";
 import { t } from "../../lib/i18n";
+import { goalIdentityDedupeKey } from "../../lib/goalIdentity";
+import { formatGoalNumber, goalProgressPercent } from "../../lib/goalNumbers";
 
 /**
  * Workspace-level goal wire graph (canvas with pan/zoom).
@@ -48,26 +50,15 @@ function goalDisplayPace(goal: any): string | undefined {
   return undefined;
 }
 
-function goalProgressPercent(goal: any): number {
-  const current = Number(goal?.current_value ?? 0);
-  const target = Number(goal?.target_value ?? 1);
-  const baseline = Number(goal?.baseline_value ?? 0);
-  if (!Number.isFinite(current) || !Number.isFinite(target) || !Number.isFinite(baseline)) return 0;
-  if (target === baseline) return current === target ? 100 : 0;
-  return Math.min(100, Math.max(0, ((current - baseline) / (target - baseline)) * 100));
-}
-
 function hasMeasuredGoalValue(goal: any): boolean {
   return goal?.current_value !== null && goal?.current_value !== undefined && goal?.current_value !== "";
 }
 
 function formatGoalValue(value: unknown): string {
-  if (value === null || value === undefined || value === "") return t("page.workspace_detail.not_measured_yet");
-  const numeric = Number(value);
-  return Number.isFinite(numeric) ? numeric.toLocaleString() : String(value);
+  return formatGoalNumber(value) ?? t("page.workspace_detail.not_measured_yet");
 }
 
-function goalOutcomeLabel(goal: any): string {
+function goalOutcomeLabel(goal: any, linkedStat?: { name?: string | null }): string {
   const target = `${t("page.workspace_detail.target")} ${formatGoalValue(goal?.target_value)}`;
   if (hasMeasuredGoalValue(goal)) {
     return `${formatGoalValue(goal.current_value)} / ${formatGoalValue(goal.target_value)}`;
@@ -76,6 +67,7 @@ function goalOutcomeLabel(goal: any): string {
   const provider = String(goal?.measurement_source?.provider || "").trim().toLowerCase();
   if (provider === "manual") return `${t("component.workspace_goal_graph.manual_measurement_needed")} · ${target}`;
   if (provider === "workspace_internal") return `${t("page.workspace_detail.auto_measuring_workspace")} · ${target}`;
+  if (!provider && linkedStat?.name) return `${linkedStat.name} · ${target}`;
   if (!provider) return `${t("component.workspace_goal_graph.no_measurement_source")} · ${target}`;
   return `${t("page.workspace_detail.not_measured_yet")} · ${target}`;
 }
@@ -114,14 +106,6 @@ function pluralizeTask(count: number): string {
 
 const HIDDEN_GOAL_STATUSES = new Set(["paused", "abandoned", "cancelled", "archived", "deleted"]);
 
-function goalGraphDedupeKey(goal: any): string {
-  const metric = String(goal?.metric_key || goal?.goal_key || goal?.key || "").trim().toLowerCase();
-  if (metric) return `metric:${metric}`;
-  const title = String(goal?.title || goal?.name || "").trim().toLowerCase();
-  if (title) return `title:${title}`;
-  return `id:${String(goal?.id || "")}`;
-}
-
 function goalGraphCompletenessScore(goal: any): number {
   let score = 0;
   if (goal?.status === "active") score += 16;
@@ -137,7 +121,7 @@ function visibleGraphGoals(rawGoals: any[]): any[] {
   for (const goal of rawGoals || []) {
     const status = String(goal?.status || "active").toLowerCase();
     if (HIDDEN_GOAL_STATUSES.has(status)) continue;
-    const key = goalGraphDedupeKey(goal);
+    const key = goalIdentityDedupeKey(goal);
     const existing = byKey.get(key);
     if (!existing || goalGraphCompletenessScore(goal) > goalGraphCompletenessScore(existing)) {
       byKey.set(key, goal);
@@ -250,6 +234,15 @@ export default function WorkspaceGoalGraph({ workspaceId }: WorkspaceGoalGraphPr
     enabled: !!workspaceId,
   });
 
+  // Stat-bound Goals keep their measurement source in the local WorkspaceStat
+  // definition. Load that definition so the graph does not mislabel a valid
+  // stat binding as an unconfigured Goal.
+  const { data: statsRaw, isLoading: statsLoading } = useQuery({
+    queryKey: ["workspace-stats", workspaceId],
+    queryFn: () => api.workspaces.stats.list(workspaceId),
+    enabled: !!workspaceId,
+  });
+
   // Fetch active plans for workspace
   const { data: plans, isLoading: plansLoading } = useQuery({
     queryKey: ["workspace-plans", workspaceId],
@@ -282,7 +275,7 @@ export default function WorkspaceGoalGraph({ workspaceId }: WorkspaceGoalGraphPr
     enabled: planIds.length > 0,
   });
 
-  const isLoading = goalsLoading || plansLoading || tasksLoading || stepsLoading;
+  const isLoading = goalsLoading || statsLoading || plansLoading || tasksLoading || stepsLoading;
 
   if (isLoading) {
     return (
@@ -294,6 +287,8 @@ export default function WorkspaceGoalGraph({ workspaceId }: WorkspaceGoalGraphPr
 
   const rawGoalsList: any[] = Array.isArray(goalsRaw) ? goalsRaw : (goalsRaw as any)?.items ?? [];
   const goalsList = visibleGraphGoals(rawGoalsList);
+  const statsList: any[] = (statsRaw as any)?.items || [];
+  const statsById = new Map(statsList.map((stat: any) => [String(stat.id), stat]));
   const plansList: any[] = relevantGraphPlans(plans || [], goalsList);
   const rawTasksList: any[] = Array.isArray(tasksPage) ? tasksPage : (tasksPage as any)?.items ?? [];
 
@@ -624,6 +619,7 @@ export default function WorkspaceGoalGraph({ workspaceId }: WorkspaceGoalGraphPr
         />
         <GoalStatusOverview
           goals={goalsList}
+          statsById={statsById}
           isCompact={isCompact}
           selectedGoalId={selectedNode?.type === "goal" ? selectedNode.id : undefined}
           onSelectGoal={(goal) => {
@@ -650,6 +646,7 @@ export default function WorkspaceGoalGraph({ workspaceId }: WorkspaceGoalGraphPr
 
       <GoalStatusOverview
         goals={goalsList}
+        statsById={statsById}
         isCompact={isCompact}
         selectedGoalId={selectedNode?.type === "goal" ? selectedNode.id : undefined}
         onSelectGoal={(goal) => {
@@ -814,11 +811,13 @@ function GraphStat({ label, value }: { label: string; value: number | string }) 
 
 function GoalStatusOverview({
   goals,
+  statsById,
   isCompact,
   selectedGoalId,
   onSelectGoal,
 }: {
   goals: any[];
+  statsById: Map<string, any>;
   isCompact: boolean;
   selectedGoalId?: string;
   onSelectGoal: (goal: any) => void;
@@ -853,6 +852,7 @@ function GoalStatusOverview({
         {goals.map((goal) => {
           const nodeId = `goal-${goal.id}`;
           const selected = selectedGoalId === nodeId;
+          const linkedStat = goal.stat_id ? statsById.get(String(goal.stat_id)) : undefined;
           const tone = goalStatusTone(goal);
           const measured = hasMeasuredGoalValue(goal);
           const outcomeProgress = measured ? goalProgressPercent(goal) : 0;
@@ -938,7 +938,7 @@ function GoalStatusOverview({
                 }} />
               </div>
               <div className="workspace-goal-overview-outcome" style={{ fontSize: 10.5, color: "#78716c", marginBottom: 9 }}>
-                {goalOutcomeLabel(goal)}
+                {goalOutcomeLabel(goal, linkedStat)}
               </div>
 
               <div style={{ display: "flex", justifyContent: "space-between", gap: 10, marginBottom: 4 }}>

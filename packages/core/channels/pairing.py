@@ -35,9 +35,13 @@ from typing import Optional
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from packages.core.constants.agents import is_master_agent
 from packages.core.models.base import generate_ulid
 from packages.core.models.channel_pairing import ChannelPairingCode
 from packages.core.models.document import Channel
+from packages.core.services.reusable_resource_locks import (
+    lock_reusable_resource_references,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -144,6 +148,13 @@ async def redeem_pairing_code(
         raise PairingMismatch(
             f"code {code!r} was issued for {row.channel_type!r}, "
             f"got {channel_type!r}"
+        )
+
+    if agent_id and not is_master_agent(agent_id):
+        await lock_reusable_resource_references(
+            db,
+            entity_id=row.entity_id,
+            agent_ids=(agent_id,),
         )
 
     # Spawn the Channel binding.

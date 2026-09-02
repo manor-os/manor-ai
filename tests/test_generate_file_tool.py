@@ -61,7 +61,7 @@ def test_upload_text_document_alias_is_not_registered():
 
     names = [schema["function"]["name"] for schema, _ in document_tools.get_tools()]
     assert "upload_text_document" not in names
-    assert "generate_document_file" in names
+    assert "generate_document_file" not in names
 
 
 def test_generate_file_document_capability_mentions_editable_diagram_json():
@@ -76,12 +76,17 @@ def test_generate_file_audio_schema_exposes_task_scoped_narrator_mode():
     from packages.core.ai.tools.generate_file.schema import GENERATE_FILE_SCHEMA
 
     properties = GENERATE_FILE_SCHEMA["function"]["parameters"]["properties"]
+    params_properties = properties["params"]["properties"]
 
     assert properties["narration_voice_mode"]["enum"] == [
         "random_per_task",
         "fixed_per_workspace",
     ]
-    assert "Workspace settings.audio_defaults.language" in properties["language"]["description"]
+    language_description = properties["language"]["description"]
+    assert "BCP-47" in language_description
+    assert "Workspace audio language" in language_description
+    assert params_properties["workspace_asset_key"]["type"] == "string"
+    assert params_properties["reuse_if_exists"]["type"] == "boolean"
 
 
 def test_generate_file_forwards_task_scoped_narrator_mode_to_audio_runtime():
@@ -224,7 +229,7 @@ async def test_vercel_speech_uses_gateway_v4_protocol_and_decodes_audio(monkeypa
     result = await extended_tools._vercel_speech_bytes(
         api_key="vck-test-gateway-key",
         base_url="https://ai-gateway.vercel.sh/v1",
-        model="openai/tts-1",
+        model="xai/grok-tts",
         prompt="Read this exactly.",
         voice="alloy",
         audio_format="mp3",
@@ -235,13 +240,30 @@ async def test_vercel_speech_uses_gateway_v4_protocol_and_decodes_audio(monkeypa
     assert captured["url"] == "https://ai-gateway.vercel.sh/v4/ai/speech-model"
     assert captured["headers"]["ai-gateway-protocol-version"] == "0.0.1"
     assert captured["headers"]["ai-speech-model-specification-version"] == "4"
-    assert captured["headers"]["ai-model-id"] == "openai/tts-1"
+    assert captured["headers"]["ai-model-id"] == "xai/grok-tts"
     assert captured["json"] == {
         "text": "Read this exactly.",
         "voice": "alloy",
         "outputFormat": "mp3",
         "instructions": "Warm and deliberate.",
     }
+
+    await extended_tools._vercel_speech_bytes(
+        api_key="vck-test-gateway-key",
+        base_url="https://ai-gateway.vercel.sh/v1",
+        model="openai/gpt-4o-mini-tts",
+        prompt="Read this naturally.",
+        voice="marin",
+        audio_format="mp3",
+        voice_instructions="Warm and deliberate.",
+    )
+    assert captured["json"]["instructions"] == "Warm and deliberate."
+
+
+def test_legacy_openai_tts_models_do_not_accept_delivery_instructions():
+    assert extended_tools._speech_model_supports_instructions("openai/tts-1") is False
+    assert extended_tools._speech_model_supports_instructions("openai/tts-1-hd") is False
+    assert extended_tools._speech_model_supports_instructions("xai/grok-tts") is True
 
 
 def test_vercel_speech_endpoint_accepts_sdk_v4_base_url():
@@ -315,6 +337,8 @@ async def test_managed_openai_tts_prefers_vercel_then_falls_back_to_openrouter(m
             prompt="Narrate this line",
             purpose="narration",
             response_format="mp3",
+            agent_id="forged_agent",
+            _agent_id_from_context="trusted_agent",
         )
     )
 
@@ -322,6 +346,7 @@ async def test_managed_openai_tts_prefers_vercel_then_falls_back_to_openrouter(m
     assert result["status"] == "completed"
     assert result["provider"] == "openrouter"
     assert saved["is_byok"] is False
+    assert saved["agent_id"] == "trusted_agent"
 
 
 @pytest.mark.asyncio
@@ -554,6 +579,52 @@ async def test_workspace_narrator_profile_is_persisted_and_reused_across_tasks(d
 
 
 @pytest.mark.asyncio
+async def test_media_task_user_resolution_uses_scoped_task_requester(db_session):
+    from packages.core.models.base import generate_ulid
+    from packages.core.models.task import Task
+    from packages.core.models.user import User
+    from packages.core.services.task_requester_identity import TaskRequesterIdentityError
+
+    entity_id = generate_ulid()
+    user_id = generate_ulid()
+    task_id = generate_ulid()
+    db_session.add_all(
+        [
+            User(
+                id=user_id,
+                entity_id=entity_id,
+                email=f"{user_id}@test.local",
+                display_name="Media Task Requester",
+                password_hash="test-hash",
+                role="member",
+                status="active",
+            ),
+            Task(
+                id=task_id,
+                entity_id=entity_id,
+                creator_id=user_id,
+                title="Generate scoped media",
+            ),
+        ]
+    )
+    await db_session.commit()
+
+    resolved_user_id = await extended_tools._resolve_media_task_user_id(
+        "untrusted-runtime-user",
+        entity_id,
+        task_id,
+    )
+
+    assert resolved_user_id == user_id
+    with pytest.raises(TaskRequesterIdentityError, match="does not exist in the requested entity scope"):
+        await extended_tools._resolve_media_task_user_id(
+            "untrusted-runtime-user",
+            generate_ulid(),
+            task_id,
+        )
+
+
+@pytest.mark.asyncio
 async def test_workspace_studio_policy_forces_fixed_narration_when_model_omits_mode(monkeypatch):
     profile = {
         "version": 1,
@@ -565,6 +636,7 @@ async def test_workspace_studio_policy_forces_fixed_narration_when_model_omits_m
     resolved: list[dict] = []
     speech_requests: list[dict] = []
     saved_audio: list[dict] = []
+    resolve_task_user = AsyncMock(return_value="user")
 
     async def fake_studio_profile(**_kwargs):
         return {"narration_voice_mode": "fixed_per_workspace"}
@@ -603,6 +675,7 @@ async def test_workspace_studio_policy_forces_fixed_narration_when_model_omits_m
     async def fake_platform_credential(_provider):
         return "", ""
 
+    monkeypatch.setattr(extended_tools, "_resolve_media_task_user_id", resolve_task_user)
     monkeypatch.setattr(extended_tools, "_workspace_stickman_studio_profile", fake_studio_profile)
     monkeypatch.setattr(extended_tools, "_workspace_default_audio_language", fake_audio_language)
     monkeypatch.setattr(extended_tools, "_resolve_user_audio_model", fake_resolve_audio_model)
@@ -631,6 +704,7 @@ async def test_workspace_studio_policy_forces_fixed_narration_when_model_omits_m
     assert result["language"] == "zh-CN"
     assert speech_requests[0]["voice_instructions"] == "Speak in zh-CN. Calm and clear."
     assert saved_audio[0]["language"] == "zh-CN"
+    resolve_task_user.assert_awaited_once_with("user", "entity", "task-1")
 
 
 @pytest.mark.asyncio
@@ -819,6 +893,7 @@ async def test_random_per_task_narration_does_not_fall_back_to_openai_chat_audio
         "voice_instructions": "",
     }
     calls = {"chat": 0, "save": 0}
+    resolve_task_user = AsyncMock(return_value="user")
 
     async def fake_resolve_audio_model(_user_id, _entity_id, *, purpose):
         assert purpose == "narration"
@@ -845,6 +920,7 @@ async def test_random_per_task_narration_does_not_fall_back_to_openai_chat_audio
         calls["save"] += 1
         return "/api/v1/fs/entity/audio/alloy/segment.wav"
 
+    monkeypatch.setattr(extended_tools, "_resolve_media_task_user_id", resolve_task_user)
     monkeypatch.setattr(extended_tools, "_resolve_user_audio_model", fake_resolve_audio_model)
     monkeypatch.setattr(extended_tools, "_resolve_task_narrator_profile", fake_resolve_profile)
     monkeypatch.setattr(extended_tools, "_resolve_user_media_credentials", fake_credentials)
@@ -871,6 +947,7 @@ async def test_random_per_task_narration_does_not_fall_back_to_openai_chat_audio
     assert result["code"] == "provider_blocker"
     assert result["model"] == profile["model"]
     assert calls == {"chat": 0, "save": 0}
+    resolve_task_user.assert_awaited_once_with("user", "entity", "task-1")
 
 
 def test_sesame_tts_uses_an_explicit_openrouter_voice():
@@ -1301,6 +1378,165 @@ async def test_generate_file_creates_code_bundle_with_real_file_structure(tmp_pa
     assert (tmp_path / "entity/Workspaces/Demo/code/rental-website/app.js").exists()
     assert not (tmp_path / "entity/Workspaces/Demo/code/rental-website/style.txt").exists()
     assert len(synced_paths) == 3
+
+
+@pytest.mark.asyncio
+async def test_generate_file_rolls_back_entire_code_bundle_when_projection_fails(
+    tmp_path,
+    monkeypatch,
+):
+    from packages.core.config import get_settings
+
+    settings = get_settings()
+    monkeypatch.setattr(settings, "MANOR_FS_ENABLED", True)
+    monkeypatch.setattr(settings, "MANOR_FS_ROOT", str(tmp_path))
+    monkeypatch.setattr(
+        "packages.core.services.ai_file_permissions.guard_ai_file_mutation",
+        AsyncMock(return_value=None),
+    )
+
+    bundle_dir = tmp_path / "entity" / "Workspaces" / "Demo" / "code" / "demo"
+    bundle_dir.mkdir(parents=True)
+    (bundle_dir / "index.html").write_text("old index", encoding="utf-8")
+    sync_count = 0
+
+    async def fail_second_projection(**_kwargs):
+        nonlocal sync_count
+        sync_count += 1
+        if sync_count == 2:
+            return SimpleNamespace(
+                synced=False,
+                document_id=None,
+                reason="storage_limit",
+            )
+        return SimpleNamespace(
+            synced=True,
+            document_id="doc_1",
+            reason=None,
+        )
+
+    async def fake_scope_workspace_output_name(**_kwargs):
+        return "Workspaces/Demo/code/demo"
+
+    monkeypatch.setattr(
+        "packages.core.services.knowledge_sync.sync_file_to_knowledge",
+        fail_second_projection,
+    )
+    monkeypatch.setattr(
+        generate_file_tool,
+        "_scope_workspace_output_name",
+        fake_scope_workspace_output_name,
+    )
+
+    result = json.loads(await generate_file_tool._generate_file_handler(
+        entity_id="entity",
+        user_id="user",
+        conversation_id="conversation",
+        workspace_id="ws_123",
+        kind="code",
+        name="demo",
+        params={
+            "entry": "index.html",
+            "files": [
+                {"path": "index.html", "content": "new index"},
+                {"path": "styles.css", "content": "body { color: red; }"},
+            ],
+        },
+    ))
+
+    assert result["created"] is False
+    assert result["knowledge_sync_reason"] == "storage_limit"
+    assert (bundle_dir / "index.html").read_text(encoding="utf-8") == "old index"
+    assert not (bundle_dir / "styles.css").exists()
+    assert not list(bundle_dir.glob(".*.tmp-*"))
+
+
+@pytest.mark.asyncio
+async def test_code_bundle_projection_failure_rolls_back_document_and_folder_rows(
+    db_session,
+    tmp_path,
+    monkeypatch,
+):
+    from sqlalchemy import select
+
+    from packages.core.ai.runtime import file_actions
+    from packages.core.ai.tools.generate_file import code as code_tool
+    from packages.core.config import get_settings
+    from packages.core.models.base import generate_ulid
+    from packages.core.models.document import Document, DocumentFolder
+    from packages.core.models.event import EventLog
+    from packages.core.services.knowledge_sync import KnowledgeSyncResult
+
+    settings = get_settings()
+    monkeypatch.setattr(settings, "MANOR_FS_ENABLED", True)
+    monkeypatch.setattr(settings, "MANOR_FS_ROOT", str(tmp_path))
+    monkeypatch.setattr(
+        "packages.core.services.ai_file_permissions.guard_ai_file_mutation",
+        AsyncMock(return_value=None),
+    )
+
+    entity_id = generate_ulid()
+    bundle_dir = tmp_path / entity_id / "code" / "demo"
+    bundle_dir.mkdir(parents=True)
+    (bundle_dir / "main.py").write_text("old code", encoding="utf-8")
+    original_sync = file_actions.runtime_sync_entity_file_to_knowledge
+    sync_count = 0
+
+    async def fail_after_first_real_projection(**kwargs):
+        nonlocal sync_count
+        sync_count += 1
+        if sync_count == 2:
+            return KnowledgeSyncResult(False, reason="storage_limit")
+        return await original_sync(**kwargs)
+
+    async def fixed_bundle_name(**_kwargs):
+        return "demo"
+
+    monkeypatch.setattr(
+        file_actions,
+        "runtime_sync_entity_file_to_knowledge",
+        fail_after_first_real_projection,
+    )
+    monkeypatch.setattr(
+        code_tool.common,
+        "_scope_workspace_output_name",
+        fixed_bundle_name,
+    )
+
+    result = json.loads(await code_tool.handle_code(
+        entity_id=entity_id,
+        user_id="user_1",
+        conversation_id="conversation_1",
+        prompt="Build demo",
+        name="demo",
+        params={
+            "files": [
+                {"path": "main.py", "content": "print('new')"},
+                {"path": "helper.py", "content": "VALUE = 1"},
+            ],
+        },
+        kwargs={},
+        agent_id=None,
+    ))
+
+    assert result["knowledge_sync_reason"] == "storage_limit"
+    assert (bundle_dir / "main.py").read_text(encoding="utf-8") == "old code"
+    assert not (bundle_dir / "helper.py").exists()
+    documents = list((await db_session.scalars(
+        select(Document).where(Document.entity_id == entity_id),
+    )).all())
+    folders = list((await db_session.scalars(
+        select(DocumentFolder).where(DocumentFolder.entity_id == entity_id),
+    )).all())
+    events = list((await db_session.scalars(
+        select(EventLog).where(
+            EventLog.entity_id == entity_id,
+            EventLog.event_type == "document.uploaded",
+        ),
+    )).all())
+    assert documents == []
+    assert folders == []
+    assert events == []
 
 
 @pytest.mark.asyncio
@@ -3685,7 +3921,7 @@ async def test_generate_file_routes_diagram_prompt_to_document_generator(monkeyp
     assert body["created"] is True
     assert captured["entity_id"] == "entity"
     assert captured["name"] == "architecture.diagram.json"
-    assert captured["file_type"] == "json"
+    assert captured["file_type"] == "diagram.json"
     assert captured["workspace_id"] == "ws_123"
     assert captured["task_id"] == "task_123"
     assert captured["agent_id"] == "agent_123"
@@ -3695,6 +3931,511 @@ async def test_generate_file_routes_diagram_prompt_to_document_generator(monkeyp
     assert diagram["prompt"] == "Layered fuzzy system with Kalman smoothing"
     assert any(item.get("kind") == "connector" for item in diagram["elements"])
     assert any("Kalman" in item.get("text", "") for item in diagram["elements"])
+
+
+@pytest.mark.asyncio
+async def test_generate_file_rejects_over_limit_diagram_before_persistence(monkeypatch):
+    from packages.core.ai.tools.generate_file.diagram import MAX_DIAGRAM_ELEMENTS
+
+    async def unexpected_generate_document_file(**_kwargs):
+        pytest.fail("over-limit diagram must not be persisted")
+
+    import packages.core.ai.runtime as runtime_module
+
+    monkeypatch.setattr(
+        runtime_module,
+        "runtime_generate_document_file",
+        unexpected_generate_document_file,
+    )
+    prompt = "flowchart TD\n" + "\n".join(
+        f"N{index}" for index in range(MAX_DIAGRAM_ELEMENTS)
+    )
+
+    with pytest.raises(ValueError, match="too many elements"):
+        await generate_file_tool._generate_file_handler(
+            entity_id="entity",
+            user_id="user",
+            conversation_id="conversation",
+            kind="diagram",
+            name="over-limit.diagram.json",
+            prompt=prompt,
+        )
+
+
+def test_mermaid_parser_stops_during_fan_out_expansion(monkeypatch):
+    from packages.core.ai.tools.generate_file import diagram as diagram_module
+
+    monkeypatch.setattr(diagram_module, "MAX_DIAGRAM_ELEMENTS", 32)
+    sources = " & ".join(f"A{index}" for index in range(10))
+    targets = " & ".join(f"B{index}" for index in range(10))
+
+    with pytest.raises(ValueError, match="too many elements"):
+        diagram_module._parse_mermaid_flow(
+            f"flowchart TD\n{sources} --> {targets}"
+        )
+
+
+@pytest.mark.asyncio
+async def test_generate_file_rejects_over_limit_diagram_canvas_before_persistence(monkeypatch):
+    async def unexpected_generate_document_file(**_kwargs):
+        pytest.fail("over-limit diagram canvas must not be persisted")
+
+    import packages.core.ai.runtime as runtime_module
+
+    monkeypatch.setattr(
+        runtime_module,
+        "runtime_generate_document_file",
+        unexpected_generate_document_file,
+    )
+    prompt = "flowchart TD\n" + "\n".join(
+        f"N{index} --> N{index + 1}" for index in range(445)
+    )
+
+    with pytest.raises(ValueError, match="canvas is too large"):
+        await generate_file_tool._generate_file_handler(
+            entity_id="entity",
+            user_id="user",
+            conversation_id="conversation",
+            kind="diagram",
+            name="too-tall.diagram.json",
+            prompt=prompt,
+        )
+
+
+@pytest.mark.parametrize(
+    ("params", "message"),
+    [
+        ({"canvas_width": -1}, "canvas_width must be between"),
+        ({"canvas_width": 0}, "canvas_width must be between"),
+        ({"canvas_width": 319}, "canvas_width must be between"),
+        ({"canvas_height": -2}, "canvas_height must be between"),
+        ({"canvas_height": 179}, "canvas_height must be between"),
+        ({"canvas_width": "wide"}, "canvas_width must be an integer"),
+        ({"canvas_height": 600.5}, "canvas_height must be an integer"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_generate_file_rejects_invalid_diagram_canvas_before_persistence(
+    monkeypatch,
+    params,
+    message,
+):
+    async def unexpected_generate_document_file(**_kwargs):
+        pytest.fail("invalid diagram canvas must not be persisted")
+
+    import packages.core.ai.runtime as runtime_module
+
+    monkeypatch.setattr(
+        runtime_module,
+        "runtime_generate_document_file",
+        unexpected_generate_document_file,
+    )
+
+    with pytest.raises(ValueError, match=message):
+        await generate_file_tool._generate_file_handler(
+            entity_id="entity",
+            user_id="user",
+            conversation_id="conversation",
+            kind="diagram",
+            name="invalid.diagram.json",
+            prompt="Input -> Output",
+            params=params,
+        )
+
+
+@pytest.mark.asyncio
+async def test_generate_file_converts_mermaid_subgraphs_into_clean_diagram_stages(monkeypatch):
+    captured: dict = {}
+
+    async def fake_generate_document_file(**kwargs):
+        captured.update(kwargs)
+        return json.dumps({"created": True})
+
+    import packages.core.ai.runtime as runtime_module
+
+    monkeypatch.setattr(runtime_module, "runtime_generate_document_file", fake_generate_document_file)
+
+    await generate_file_tool._generate_file_handler(
+        entity_id="entity",
+        user_id="user",
+        kind="diagram",
+        name="real-estate-workspace-flow.diagram.json",
+        prompt='''flowchart TD
+    subgraph SIGNALS["1 · Signals In"]
+        A1["MLS listings &amp; price changes"]
+    end
+    subgraph WORKSPACE["2 · Manor Workspace"]
+        B1["Unified records"]
+    end
+    subgraph AGENTS["3 · AI agents"]
+        C1["Lead qualifier"]
+    end
+    SIGNALS --> WORKSPACE --> AGENTS''',
+    )
+
+    diagram = json.loads(captured["content"])
+    shape_text = [item["text"] for item in diagram["elements"] if item["kind"] == "shape"]
+    assert diagram["title"] == "real estate workspace flow"
+    assert set(shape_text) == {
+        "1 · Signals In",
+        "MLS listings & price\nchanges",
+        "2 · Manor Workspace",
+        "Unified records",
+        "3 · AI agents",
+        "Lead qualifier",
+    }
+    assert all("subgraph" not in text and "]" not in text for text in shape_text)
+    assert [item["kind"] for item in diagram["elements"]].count("connector") == 2
+
+
+@pytest.mark.asyncio
+async def test_generate_file_diagram_preserves_mermaid_branch_topology(monkeypatch):
+    captured: dict = {}
+
+    async def fake_generate_document_file(**kwargs):
+        captured.update(kwargs)
+        return json.dumps({"created": True})
+
+    import packages.core.ai.runtime as runtime_module
+
+    monkeypatch.setattr(runtime_module, "runtime_generate_document_file", fake_generate_document_file)
+
+    await generate_file_tool._generate_file_handler(
+        entity_id="entity",
+        user_id="user",
+        kind="diagram",
+        name="branch-flow.diagram.json",
+        prompt="""flowchart TD
+    A((Start)) --> B{Left}
+    A --> C[Right]""",
+    )
+
+    diagram = json.loads(captured["content"])
+    node_id_by_text = {
+        item["text"]: item["id"]
+        for item in diagram["elements"]
+        if item["kind"] == "shape"
+    }
+    links = [
+        (item["from"]["bind"]["elementId"], item["to"]["bind"]["elementId"])
+        for item in diagram["elements"]
+        if item["kind"] == "connector"
+    ]
+    assert links == [
+        (node_id_by_text["Start"], node_id_by_text["Left"]),
+        (node_id_by_text["Start"], node_id_by_text["Right"]),
+    ]
+    node_shape_by_text = {
+        item["text"]: item["shape"]
+        for item in diagram["elements"]
+        if item["kind"] == "shape"
+    }
+    assert node_shape_by_text["Start"] == "ellipse"
+    assert node_shape_by_text["Left"] == "diamond"
+
+
+@pytest.mark.asyncio
+async def test_generate_file_diagram_preserves_mermaid_fan_out(monkeypatch):
+    captured: dict = {}
+
+    async def fake_generate_document_file(**kwargs):
+        captured.update(kwargs)
+        return json.dumps({"created": True})
+
+    import packages.core.ai.runtime as runtime_module
+
+    monkeypatch.setattr(runtime_module, "runtime_generate_document_file", fake_generate_document_file)
+
+    await generate_file_tool._generate_file_handler(
+        entity_id="entity",
+        user_id="user",
+        kind="diagram",
+        name="fan-out.diagram.json",
+        prompt="flowchart LR\nA --> B & C",
+    )
+
+    diagram = json.loads(captured["content"])
+    node_id_by_text = {
+        item["text"]: item["id"]
+        for item in diagram["elements"]
+        if item["kind"] == "shape"
+    }
+    links = [
+        (item["from"]["bind"]["elementId"], item["to"]["bind"]["elementId"])
+        for item in diagram["elements"]
+        if item["kind"] == "connector"
+    ]
+    assert set(node_id_by_text) == {"A", "B", "C"}
+    assert links == [
+        (node_id_by_text["A"], node_id_by_text["B"]),
+        (node_id_by_text["A"], node_id_by_text["C"]),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_generate_file_diagram_preserves_isolated_mermaid_nodes(monkeypatch):
+    captured: dict = {}
+
+    async def fake_generate_document_file(**kwargs):
+        captured.update(kwargs)
+        return json.dumps({"created": True})
+
+    import packages.core.ai.runtime as runtime_module
+
+    monkeypatch.setattr(runtime_module, "runtime_generate_document_file", fake_generate_document_file)
+
+    await generate_file_tool._generate_file_handler(
+        entity_id="entity",
+        user_id="user",
+        kind="diagram",
+        name="mixed-flow.diagram.json",
+        prompt="""flowchart TD
+    A --> B
+    C[Isolated]
+    E
+    subgraph GROUP[Stage]
+        D[Internal detail]
+    end""",
+    )
+
+    diagram = json.loads(captured["content"])
+    shape_text = [item["text"] for item in diagram["elements"] if item["kind"] == "shape"]
+    assert set(shape_text) == {"A", "B", "Isolated", "E", "Stage", "Internal detail"}
+
+
+@pytest.mark.asyncio
+async def test_generate_file_diagram_decodes_named_and_numeric_html_entities(monkeypatch):
+    captured: dict = {}
+
+    async def fake_generate_document_file(**kwargs):
+        captured.update(kwargs)
+        return json.dumps({"created": True})
+
+    import packages.core.ai.runtime as runtime_module
+
+    monkeypatch.setattr(runtime_module, "runtime_generate_document_file", fake_generate_document_file)
+
+    await generate_file_tool._generate_file_handler(
+        entity_id="entity",
+        user_id="user",
+        kind="diagram",
+        name="entities.diagram.json",
+        prompt="flowchart LR; A[Space&nbsp;here] --> B[Dash&#x2014;here]",
+    )
+
+    diagram = json.loads(captured["content"])
+    labels = [
+        item["text"]
+        for item in diagram["elements"]
+        if item["kind"] == "shape"
+    ]
+    assert labels == ["Space here", "Dash—here"]
+
+
+@pytest.mark.asyncio
+async def test_generate_file_diagram_preserves_mermaid_edge_labels(monkeypatch):
+    captured: dict = {}
+
+    async def fake_generate_document_file(**kwargs):
+        captured.update(kwargs)
+        return json.dumps({"created": True})
+
+    import packages.core.ai.runtime as runtime_module
+
+    monkeypatch.setattr(runtime_module, "runtime_generate_document_file", fake_generate_document_file)
+
+    await generate_file_tool._generate_file_handler(
+        entity_id="entity",
+        user_id="user",
+        kind="diagram",
+        name="decision-flow.diagram.json",
+        prompt="""flowchart TD
+    A -- Yes --> B
+    A -- No --> C
+    D --- E""",
+    )
+
+    diagram = json.loads(captured["content"])
+    nodes = [item for item in diagram["elements"] if item["kind"] == "shape"]
+    assert {node["text"] for node in nodes} == {"A", "B", "C", "D", "E"}
+    connectors = [
+        item for item in diagram["elements"] if item["kind"] == "connector"
+    ]
+    assert [
+        (connector.get("label"), connector["arrowEnd"])
+        for connector in connectors
+    ] == [("Yes", True), ("No", True), (None, False)]
+
+
+@pytest.mark.asyncio
+async def test_generate_file_diagram_preserves_mermaid_endpoint_markers(monkeypatch):
+    captured: dict = {}
+
+    async def fake_generate_document_file(**kwargs):
+        captured.update(kwargs)
+        return json.dumps({"created": True})
+
+    import packages.core.ai.runtime as runtime_module
+
+    monkeypatch.setattr(runtime_module, "runtime_generate_document_file", fake_generate_document_file)
+
+    await generate_file_tool._generate_file_handler(
+        entity_id="entity",
+        user_id="user",
+        kind="diagram",
+        name="marker-flow.diagram.json",
+        prompt="""flowchart LR
+    A <--> B
+    C o--o D
+    E x--x F
+    G --o H""",
+    )
+
+    diagram = json.loads(captured["content"])
+    connectors = [
+        item for item in diagram["elements"] if item["kind"] == "connector"
+    ]
+    assert [
+        (connector.get("markerStart"), connector.get("markerEnd"))
+        for connector in connectors
+    ] == [
+        ("arrow", "arrow"),
+        ("circle", "circle"),
+        ("cross", "cross"),
+        (None, "circle"),
+    ]
+    assert [
+        (connector["arrowStart"], connector["arrowEnd"])
+        for connector in connectors
+    ] == [
+        (True, True),
+        (True, True),
+        (True, True),
+        (False, True),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_generate_file_diagram_respects_single_line_lr_and_punctuation(monkeypatch):
+    captured: dict = {}
+
+    async def fake_generate_document_file(**kwargs):
+        captured.update(kwargs)
+        return json.dumps({"created": True})
+
+    import packages.core.ai.runtime as runtime_module
+
+    monkeypatch.setattr(runtime_module, "runtime_generate_document_file", fake_generate_document_file)
+
+    await generate_file_tool._generate_file_handler(
+        entity_id="entity",
+        user_id="user",
+        kind="diagram",
+        name="horizontal.diagram.json",
+        prompt='flowchart LR; A["Call API (v2); now"] --> B[Done]; B --> C["Users\'"]; C --> D[Owner\'s queue]',
+    )
+
+    diagram = json.loads(captured["content"])
+    nodes = {
+        item["text"]: item
+        for item in diagram["elements"]
+        if item["kind"] == "shape"
+    }
+    assert list(nodes) == ["Call API (v2); now", "Done", "Users'", "Owner's queue"]
+    assert (
+        nodes["Call API (v2); now"]["x"]
+        < nodes["Done"]["x"]
+        < nodes["Users'"]["x"]
+        < nodes["Owner's queue"]["x"]
+    )
+    assert (
+        nodes["Call API (v2); now"]["y"]
+        == nodes["Done"]["y"]
+        == nodes["Users'"]["y"]
+        == nodes["Owner's queue"]["y"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_generate_file_diagram_uses_longest_dag_path(monkeypatch):
+    captured: dict = {}
+
+    async def fake_generate_document_file(**kwargs):
+        captured.update(kwargs)
+        return json.dumps({"created": True})
+
+    import packages.core.ai.runtime as runtime_module
+
+    monkeypatch.setattr(runtime_module, "runtime_generate_document_file", fake_generate_document_file)
+
+    await generate_file_tool._generate_file_handler(
+        entity_id="entity",
+        user_id="user",
+        kind="diagram",
+        name="dag.diagram.json",
+        prompt="""flowchart TD
+    A --> D
+    A --> B
+    B --> C
+    C --> D
+    D --> B""",
+    )
+
+    diagram = json.loads(captured["content"])
+    nodes = {
+        item["text"]: item
+        for item in diagram["elements"]
+        if item["kind"] == "shape"
+    }
+    assert nodes["A"]["y"] < nodes["B"]["y"] < nodes["C"]["y"] < nodes["D"]["y"]
+    connectors = [
+        item for item in diagram["elements"] if item["kind"] == "connector"
+    ]
+    node_name_by_id = {node["id"]: name for name, node in nodes.items()}
+    c_to_d = next(
+        connector
+        for connector in connectors
+        if node_name_by_id[connector["from"]["bind"]["elementId"]] == "C"
+        and node_name_by_id[connector["to"]["bind"]["elementId"]] == "D"
+    )
+    assert c_to_d["routing"] == "straight"
+    d_to_b = next(
+        connector
+        for connector in connectors
+        if node_name_by_id[connector["from"]["bind"]["elementId"]] == "D"
+        and node_name_by_id[connector["to"]["bind"]["elementId"]] == "B"
+    )
+    assert d_to_b["routing"] == "curve"
+
+
+@pytest.mark.asyncio
+async def test_generate_file_diagram_wraps_cjk_and_long_tokens(monkeypatch):
+    captured: dict = {}
+
+    async def fake_generate_document_file(**kwargs):
+        captured.update(kwargs)
+        return json.dumps({"created": True})
+
+    import packages.core.ai.runtime as runtime_module
+
+    monkeypatch.setattr(runtime_module, "runtime_generate_document_file", fake_generate_document_file)
+
+    await generate_file_tool._generate_file_handler(
+        entity_id="entity",
+        user_id="user",
+        kind="diagram",
+        name="readable.diagram.json",
+        prompt="""flowchart TD
+    A[用户输入房源目标客户和品牌资料Workspace生成短视频脚本] --> B[https://example.com/a/very/long/path]""",
+    )
+
+    diagram = json.loads(captured["content"])
+    labels = [
+        item["text"]
+        for item in diagram["elements"]
+        if item["kind"] == "shape"
+    ]
+    assert labels and all("\n" in label for label in labels)
 
 
 @pytest.mark.asyncio

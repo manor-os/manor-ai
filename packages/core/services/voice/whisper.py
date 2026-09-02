@@ -15,12 +15,15 @@ import logging
 import os
 import base64
 import json
+import math
 import re
 import unicodedata
 from dataclasses import dataclass
 from typing import Optional
 
 import httpx
+
+from packages.core.services.voice.speech_request import begin_speech_provider_request
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +62,7 @@ class WhisperResult:
     segments: list[dict] | None = None
     # Word-level timing from native verbose transcription responses.
     words: list[dict] | None = None
+    cost_usd: float | None = None
 
 
 async def transcribe_blob(
@@ -94,9 +98,9 @@ async def transcribe_blob(
 
     # Resolve API key + base URL for Whisper transcription.
     #
-    # Whisper is an audio endpoint — NOT a chat completion. OpenRouter
-    # does NOT proxy /audio/transcriptions. So we need a provider that
-    # actually supports this endpoint:
+    # Native transcription uses multipart audio; OpenRouter's dedicated STT
+    # endpoint uses JSON/base64. Timestamp alignment retains its native or
+    # reference-aligned chat-audio path.
     #   - OpenAI (api.openai.com) — the canonical Whisper host
     #   - Groq (api.groq.com) — fast Whisper, same API shape
     #   - Any OpenAI-compatible endpoint via WHISPER_BASE_URL
@@ -153,14 +157,14 @@ async def transcribe_blob(
                     f"{key_provider}."
                 )
         if requested_base_url:
-            if base_provider == "openrouter" and not use_chat_api:
+            if base_provider == "openrouter" and not use_chat_api and require_timestamps:
                 error_type = WhisperTimestampError if require_timestamps else WhisperError
                 raise error_type(
                     "Native Whisper transcription requires a timestamp-capable OpenAI-compatible "
-                    "audio transcription endpoint; OpenRouter does not proxy /audio/transcriptions."
+                    "audio transcription endpoint; OpenRouter STT does not return measured segments."
                 )
             base_url = requested_base_url
-            if selected_provider and model.startswith(f"{selected_provider}/"):
+            if base_provider != "openrouter" and selected_provider and model.startswith(f"{selected_provider}/"):
                 model = model.split("/", 1)[1]
         elif use_chat_api:
             if api_key.startswith("sk-or-"):
@@ -172,12 +176,13 @@ async def transcribe_blob(
             else:
                 raise WhisperError("Chat-audio transcription requires an OpenRouter or OpenAI API key.")
         else:
-            if api_key.startswith("sk-or-"):
+            if api_key.startswith("sk-or-") and require_timestamps:
                 raise WhisperError(
-                    "Native Whisper transcription requires an OpenAI or Groq key; "
-                    "OpenRouter does not proxy /audio/transcriptions."
+                    "Measured transcription timestamps require an OpenAI or Groq key."
                 )
-            if api_key.startswith("gsk_"):
+            if api_key.startswith("sk-or-"):
+                base_url = "https://openrouter.ai/api/v1"
+            elif api_key.startswith("gsk_"):
                 if selected_provider and selected_provider != "groq":
                     raise WhisperError(
                         f"The selected STT model uses {selected_provider}, but the saved BYOK key is for Groq."
@@ -236,10 +241,50 @@ async def transcribe_blob(
             "reference-aligned segment timestamps."
         )
 
+    is_openrouter = (httpx.URL(base_url).host or "") == "openrouter.ai"
+    if is_openrouter and not user_api_key and not require_timestamps and model == "openai/gpt-4o-audio-preview":
+        # This legacy catalog default is no longer a valid OpenRouter model.
+        # Preserve saved settings and native BYOK choices; only this managed
+        # STT route uses the supported transcription model, billed by its ID.
+        model = reported_model = "openai/whisper-1"
+        use_chat_api = False
+
+    if not use_chat_api and is_openrouter:
+        if require_timestamps:
+            raise WhisperTimestampError("OpenRouter STT does not provide measured timestamps.")
+        canonical_model = reported_model or model
+        if "/" not in canonical_model:
+            canonical_model = f"openai/{canonical_model}"
+        fmt = (filename.rsplit(".", 1)[-1] if "." in filename else "wav").lower()
+        try:
+            async with httpx.AsyncClient(timeout=60) as client:
+                begin_speech_provider_request()
+                response = await client.post(
+                    f"{base_url.rstrip('/')}/audio/transcriptions",
+                    headers={"Authorization": f"Bearer {api_key}"},
+                    json={"model": canonical_model,
+                          "input_audio": {"data": base64.b64encode(blob).decode("ascii"), "format": fmt},
+                          **({"language": language} if language else {})},
+                )
+            if response.status_code >= 300:
+                raise WhisperError(f"OpenRouter transcription failed ({response.status_code}). Check the STT model and gateway settings.")
+            payload = response.json()
+            usage = payload.get("usage") or {}
+            seconds = float(usage.get("seconds") or 0)
+            cost = usage.get("cost")
+            cost = float(cost) if cost is not None else None
+            if not math.isfinite(seconds) or seconds < 0 or (cost is not None and (not math.isfinite(cost) or cost < 0)):
+                raise ValueError("Invalid transcription usage")
+            return WhisperResult(text=str(payload.get("text") or "").strip(), duration_seconds=seconds,
+                                 model=canonical_model, cost_usd=cost)
+        except (httpx.HTTPError, ValueError, TypeError) as exc:
+            raise WhisperError("OpenRouter transcription failed. Check the speech-to-text settings and retry.") from exc
+
     if use_vercel_transcription:
         from packages.core.services.vercel_ai_gateway import vercel_gateway_post
 
         try:
+            begin_speech_provider_request()
             payload = await vercel_gateway_post(
                 api_key=api_key,
                 base_url=base_url,
@@ -364,6 +409,7 @@ async def transcribe_blob(
 
         try:
             async with httpx.AsyncClient(timeout=120.0) as client:
+                begin_speech_provider_request()
                 resp = await client.post(
                     f"{base_url}/chat/completions",
                     headers={
@@ -424,6 +470,7 @@ async def transcribe_blob(
 
     try:
         async with httpx.AsyncClient(timeout=120.0) as client:
+            begin_speech_provider_request()
             resp = await client.post(
                 f"{base_url}/audio/transcriptions",
                 headers={"Authorization": f"Bearer {api_key}"},

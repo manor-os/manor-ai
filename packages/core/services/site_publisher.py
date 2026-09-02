@@ -9,9 +9,11 @@ sources and secrets off the public internet).
 """
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 import shutil
+import tempfile
 from dataclasses import dataclass, field
 from html.parser import HTMLParser
 from typing import TYPE_CHECKING, Iterable
@@ -77,6 +79,40 @@ class SnapshotFile:
 class Snapshot:
     included: list[SnapshotFile] = field(default_factory=list)
     excluded: list[SnapshotFile] = field(default_factory=list)
+
+
+@dataclass
+class PreparedPublication:
+    """Private immutable copy used for both authorization and publication."""
+
+    entity_id: str
+    target: PublishTarget
+    snapshot: Snapshot
+    stage_dir: str
+    content_hash: str
+
+    @property
+    def included_source_paths(self) -> set[str]:
+        if self.target.kind == "file":
+            return {self.target.root_rel}
+        root_rel = self.target.root_rel.rstrip("/")
+        return {
+            f"{root_rel}/{item.rel.replace(os.sep, '/')}"
+            for item in self.snapshot.included
+        }
+
+    def cleanup(self) -> None:
+        if self.stage_dir:
+            shutil.rmtree(self.stage_dir, ignore_errors=True)
+            self.stage_dir = ""
+
+    def promote_to(self, destination: str) -> None:
+        if not self.stage_dir:
+            raise SitePublishError("prepared site snapshot is no longer available")
+        os.makedirs(os.path.dirname(destination), exist_ok=True)
+        shutil.rmtree(destination, ignore_errors=True)
+        os.replace(self.stage_dir, destination)
+        self.stage_dir = ""
 
 
 def _entity_abs(entity_id: str, rel: str) -> str:
@@ -145,6 +181,84 @@ def collect_snapshot(root_abs: str) -> Snapshot:
                 raise SitePublishError(f"total size exceeds limit of {MAX_TOTAL_BYTES} bytes")
             snap.included.append(SnapshotFile(rel=rel, size=size))
     return snap
+
+
+def _copy_snapshot_file(source: str, destination: str, *, expected_size: int) -> None:
+    if os.path.islink(source):
+        raise SitePublishError(f"symlink not allowed: {source}")
+    os.makedirs(os.path.dirname(destination), exist_ok=True)
+    with open(source, "rb") as src, open(destination, "xb") as dst:
+        shutil.copyfileobj(src, dst)
+        dst.flush()
+        os.fsync(dst.fileno())
+    actual_size = os.path.getsize(destination)
+    if actual_size != expected_size:
+        raise SitePublishError(
+            "source changed while preparing the site snapshot; save and publish again"
+        )
+
+
+def _snapshot_content_hash(stage_dir: str, snapshot: Snapshot) -> str:
+    """Return a deterministic digest for the exact staged public snapshot."""
+    digest = hashlib.sha256()
+    for item in sorted(snapshot.included, key=lambda candidate: candidate.rel):
+        rel = item.rel.replace(os.sep, "/")
+        digest.update(rel.encode("utf-8"))
+        digest.update(b"\0")
+        with open(os.path.join(stage_dir, item.rel), "rb") as staged_file:
+            while chunk := staged_file.read(1024 * 1024):
+                digest.update(chunk)
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def prepare_publication(
+    entity_id: str,
+    target: PublishTarget,
+) -> PreparedPublication:
+    """Copy one source version privately, then validate that exact copy."""
+    entity_root = get_entity_root(entity_id)
+    source_abs = _entity_abs(entity_id, target.root_rel)
+    staging_root = os.path.join(entity_root, ".sites", ".staging")
+    os.makedirs(staging_root, exist_ok=True)
+    stage_dir = tempfile.mkdtemp(prefix="publish-", dir=staging_root)
+    try:
+        if target.kind == "folder":
+            snapshot = collect_snapshot(source_abs)
+            if not any(item.rel == "index.html" for item in snapshot.included):
+                raise SitePublishError("index.html missing from folder root")
+            for item in snapshot.included:
+                _copy_snapshot_file(
+                    os.path.join(source_abs, item.rel),
+                    os.path.join(stage_dir, item.rel),
+                    expected_size=item.size,
+                )
+        else:
+            size = os.path.getsize(source_abs)
+            if size > MAX_FILE_BYTES:
+                raise SitePublishError(
+                    f"file too large ({size} bytes > {MAX_FILE_BYTES} limit)"
+                )
+            snapshot = Snapshot(included=[SnapshotFile(rel="index.html", size=size)])
+            _copy_snapshot_file(
+                source_abs,
+                os.path.join(stage_dir, "index.html"),
+                expected_size=size,
+            )
+
+        errors = check_links(stage_dir, snapshot)
+        if errors:
+            raise SitePublishError("link check failed:\n" + "\n".join(errors[:20]))
+        return PreparedPublication(
+            entity_id=entity_id,
+            target=target,
+            snapshot=snapshot,
+            stage_dir=stage_dir,
+            content_hash=_snapshot_content_hash(stage_dir, snapshot),
+        )
+    except Exception:
+        shutil.rmtree(stage_dir, ignore_errors=True)
+        raise
 
 
 def generate_site_slug(entity_id: str) -> str:
@@ -283,6 +397,19 @@ def inspect_site_bridge(entity_id: str, target: PublishTarget) -> SiteBridgeFeat
     else:
         sources = [source_abs]
 
+    return _inspect_site_bridge_sources(sources)
+
+
+def inspect_prepared_site_bridge(prepared: PreparedPublication) -> SiteBridgeFeatures:
+    sources = [
+        os.path.join(prepared.stage_dir, item.rel)
+        for item in prepared.snapshot.included
+        if item.rel.lower().endswith((".html", ".htm"))
+    ]
+    return _inspect_site_bridge_sources(sources)
+
+
+def _inspect_site_bridge_sources(sources: Iterable[str]) -> SiteBridgeFeatures:
     features = SiteBridgeFeatures()
     for source in sources:
         with open(source, encoding="utf-8", errors="replace") as html_file:
@@ -514,8 +641,11 @@ async def publish(
     entity_id: str,
     rel_path: str,
     name: str,
+    created_by_user_id: str | None = None,
+    manage_as_user=None,
     workspace_id: str | None = None,
     connections: dict | None = None,
+    prepared: PreparedPublication | None = None,
 ) -> PublishResult:
     """Snapshot-publish a folder or single HTML file. Creates or updates the
     Site row for (entity_id, source_path); each publish bumps the revision and
@@ -523,75 +653,94 @@ async def publish(
     system-generated (entity id + random) and never user-chosen."""
     from datetime import datetime, timezone
 
-    from sqlalchemy import select
+    from sqlalchemy import select, text
 
     from packages.core.models import Site
 
-    target = resolve_publish_target(entity_id, rel_path)
-    if target is None:
-        raise SitePublishError(
-            f"{rel_path!r} is not publishable: publish a folder whose root contains "
-            f"index.html, or a single .html file"
-        )
+    if prepared is None:
+        target = resolve_publish_target(entity_id, rel_path)
+        if target is None:
+            raise SitePublishError(
+                f"{rel_path!r} is not publishable: publish a folder whose root contains "
+                f"index.html, or a single .html file"
+            )
+        prepared = prepare_publication(entity_id, target)
+    else:
+        target = prepared.target
+        requested_path = (rel_path or "").strip().strip("/")
+        if prepared.entity_id != entity_id or requested_path != target.root_rel:
+            raise SitePublishError("prepared site snapshot does not match the publish target")
 
     entity_root = get_entity_root(entity_id)
-    src_abs = os.path.join(entity_root, target.root_rel)
-    if target.kind == "folder":
-        snap = collect_snapshot(src_abs)
-        if not any(f.rel == "index.html" for f in snap.included):
-            raise SitePublishError("index.html missing from folder root")
-        errors = check_links(src_abs, snap)
-        if errors:
-            raise SitePublishError("link check failed:\n" + "\n".join(errors[:20]))
-    else:
-        size = os.path.getsize(src_abs)
-        if size > MAX_FILE_BYTES:
-            raise SitePublishError(f"file too large ({size} bytes > {MAX_FILE_BYTES} limit)")
-        snap = Snapshot(included=[SnapshotFile(rel="index.html", size=size)])
-        errors = check_links(
-            os.path.dirname(src_abs),
-            snap,
-            source_overrides={"index.html": src_abs},
+    snap = prepared.snapshot
+    rev_dir = ""
+    try:
+        # Serialize revision allocation across API workers/pods for one source
+        # path. The lock is transaction-scoped and is released by commit or
+        # rollback, so a confirmed prepared snapshot can never be promoted to
+        # a revision another publisher is concurrently replacing.
+        await session.execute(
+            text("SELECT pg_advisory_xact_lock(hashtextextended(:publish_key, 0))"),
+            {"publish_key": f"site-publish:{entity_id}:{target.root_rel}"},
         )
-        if errors:
-            raise SitePublishError("link check failed:\n" + "\n".join(errors[:20]))
-
-    site = await session.scalar(
-        select(Site).where(Site.entity_id == entity_id, Site.source_path == target.root_rel)
-    )
-    if site is None:
-        chosen = await _unique_slug(session, generate_site_slug(entity_id))
-        site = Site(
-            entity_id=entity_id, name=name, slug=chosen,
-            source_path=target.root_rel, entry=target.entry,
+        site = await session.scalar(
+            select(Site)
+            .where(Site.entity_id == entity_id, Site.source_path == target.root_rel)
+            .execution_options(populate_existing=True)
         )
-        session.add(site)
-        await session.flush()
+        if site is not None and manage_as_user is not None:
+            # Re-check after the per-source advisory lock. Two first-publish
+            # requests can both observe no row before the lock; only the winner
+            # may create it, and the loser must not overwrite the winner's site.
+            from packages.core.services.site_access import (
+                SitePublishAccessDenied,
+                user_can_manage_site,
+            )
 
-    next_rev = site.revision + 1
-    site_dir = os.path.join(entity_root, ".sites", site.id)
-    rev_dir = os.path.join(site_dir, f"rev{next_rev}")
-    tmp_dir = rev_dir + ".tmp"
-    shutil.rmtree(tmp_dir, ignore_errors=True)
-    shutil.rmtree(rev_dir, ignore_errors=True)
-    os.makedirs(tmp_dir, exist_ok=True)
-    if target.kind == "folder":
-        for f in snap.included:
-            dst = os.path.join(tmp_dir, f.rel)
-            os.makedirs(os.path.dirname(dst) or tmp_dir, exist_ok=True)
-            shutil.copy2(os.path.join(src_abs, f.rel), dst)
-    else:
-        shutil.copy2(src_abs, os.path.join(tmp_dir, "index.html"))
-    os.replace(tmp_dir, rev_dir)
+            if not await user_can_manage_site(
+                session,
+                user=manage_as_user,
+                site=site,
+            ):
+                raise SitePublishAccessDenied(
+                    "Site management access is required to republish this site"
+                )
+        if site is None:
+            chosen = await _unique_slug(session, generate_site_slug(entity_id))
+            site = Site(
+                entity_id=entity_id, name=name, slug=chosen,
+                source_path=target.root_rel, entry=target.entry,
+                created_by_user_id=created_by_user_id,
+            )
+            session.add(site)
+            await session.flush()
+        elif site.created_by_user_id is None and created_by_user_id:
+            # Claim only a legacy unowned row after the caller has authorized
+            # management of that existing site.
+            site.created_by_user_id = created_by_user_id
 
-    site.revision = next_rev
-    site.status = "active"
-    site.published_at = datetime.now(timezone.utc)
-    if connections is not None:
-        site.workspace_id = workspace_id
-        site.connections = dict(connections)
-    await session.commit()
-    await session.refresh(site)
+        next_rev = site.revision + 1
+        site_dir = os.path.join(entity_root, ".sites", site.id)
+        rev_dir = os.path.join(site_dir, f"rev{next_rev}")
+        prepared.promote_to(rev_dir)
+
+        site.revision = next_rev
+        site.status = "active"
+        site.published_at = datetime.now(timezone.utc)
+        workspace_changed = workspace_id is not None and workspace_id != site.workspace_id
+        if workspace_id is not None:
+            site.workspace_id = workspace_id
+        if connections is not None:
+            site.connections = dict(connections)
+        elif workspace_changed:
+            site.connections = {}
+        try:
+            await session.commit()
+        except Exception:
+            shutil.rmtree(rev_dir, ignore_errors=True)
+            raise
+    finally:
+        prepared.cleanup()
 
     for old in os.listdir(site_dir):
         if not old.startswith("rev") or old == f"rev{next_rev}":

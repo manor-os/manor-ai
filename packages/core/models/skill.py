@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from typing import Optional
 
-from sqlalchemy import Boolean, Index, Integer, String, Text, UniqueConstraint
+from sqlalchemy import Boolean, Index, Integer, String, Text, UniqueConstraint, text
 from sqlalchemy.dialects.postgresql import ARRAY, JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -25,13 +25,21 @@ class Skill(Base, TimestampMixin):
         Index("ix_skills_tags", "tags", postgresql_using="gin"),
         Index("ix_skills_workspace", "entity_id", "workspace_id"),
         Index("ix_skills_owner", "entity_id", "owner_user_id"),
+        Index(
+            "uq_skills_builtin_slug",
+            "slug",
+            unique=True,
+            postgresql_where=text("entity_id IS NULL AND slug IS NOT NULL"),
+        ),
     )
 
     id: Mapped[str] = mapped_column(String(26), primary_key=True, default=generate_ulid)
     entity_id: Mapped[Optional[str]] = mapped_column(String(26))  # None = platform skill
     # Ownership triple read by packages/core/services/resource_access.py.
     # NULL owner = pre-migration row (only an entity admin may modify it);
-    # NULL workspace = shared entity-wide rather than scoped to one workspace.
+    # workspace_id records the owning/home Workspace for access and lifecycle.
+    # Invocation is separate: an explicit Agent binding may reuse this Skill in
+    # other Workspaces, and NULL means it has no home Workspace.
     owner_user_id: Mapped[Optional[str]] = mapped_column(String(26))
     workspace_id: Mapped[Optional[str]] = mapped_column(String(26))
     visibility: Mapped[str] = mapped_column(

@@ -22,6 +22,8 @@ from sqlalchemy import DateTime, Index, String, Text, UniqueConstraint, func
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
+from packages.core.constants.review import ConsolidationReportStatus
+
 from .base import Base, generate_ulid
 
 
@@ -46,7 +48,7 @@ class ConsolidationReport(Base):
     scope: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)  # L2 sharding slot; v1 = {}
 
     # complete|partial|failed
-    status: Mapped[str] = mapped_column(String(16), nullable=False)
+    status: Mapped[ConsolidationReportStatus] = mapped_column(String(16), nullable=False)
     summary: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
     metrics: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)

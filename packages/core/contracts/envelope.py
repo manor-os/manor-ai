@@ -158,6 +158,7 @@ def step_result_envelope_schema() -> dict:
                     "reason": {"type": "string"},
                     "blockers": {"type": "array", "items": {"type": "string"}},
                     "retryable": {"type": "boolean"},
+                    "requires_human": {"type": "boolean"},
                 },
             },
             "next_steps": {"type": "array", "items": {"type": "string"}},
@@ -432,6 +433,8 @@ def _sanitize_failure(out: dict) -> None:
             failure.pop("blockers")
     if "retryable" in failure and not isinstance(failure["retryable"], bool):
         failure.pop("retryable")
+    if "requires_human" in failure and not isinstance(failure["requires_human"], bool):
+        failure.pop("requires_human")
     out["failure"] = failure
 
 

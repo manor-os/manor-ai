@@ -24,7 +24,7 @@ import {
   buildWorkflowSnapshotNodes,
   buildWorkflowRunTimeline,
   canCancelWorkflowRun,
-  canRetryWithoutCorrection,
+  canShowDirectWorkflowRetry,
   formatWorkflowDuration,
   formatWorkflowError,
   formatWorkflowValue,
@@ -580,17 +580,16 @@ export default function WorkflowRunDetail({
     intervention
     && workflowRetrySchemaIsCompatible(intervention.editable_input_schema),
   );
-  const directRetryAllowed = Boolean(
-    controlQuery.isSuccess
-    && !intervention
-    && canRetryWithoutCorrection({
-      ...controlRun,
-      capabilities: compactRun?.capabilities || controlRun.capabilities,
-    }),
-  );
   const visibleIntervention = intervention && interventionSchemaCompatible
     ? { ...intervention, options: (intervention.options || []).filter((option) => option.toLowerCase().startsWith("retry")) }
     : null;
+  const directRetryAllowed = Boolean(
+    controlQuery.isSuccess
+    && canShowDirectWorkflowRetry({
+      ...controlRun,
+      capabilities: compactRun?.capabilities || controlRun.capabilities,
+    }, Boolean(visibleIntervention)),
+  );
   const showControlSurface = canControl && canHaveRetry && (
     controlQuery.isLoading
     || controlQuery.isError

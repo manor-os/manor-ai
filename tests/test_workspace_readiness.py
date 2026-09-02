@@ -116,7 +116,10 @@ def test_readiness_report_documents_part_roles_and_checks() -> None:
     assert "Role: Execution capacity" in text
     assert "Check: Every declared service has an active AgentSubscription" in text
     assert "External integrations: missing" in text
-    assert report.missing_setup_keys == ["no_agents", "no_goals", "no_integrations"]
+    assert report.missing_setup_keys == ["no_agents", "no_integrations"]
+    goals = next(part for part in report.parts if part.key == "goals")
+    assert goals.status == "not_required"
+    assert goals.missing_setup_key == ""
 
 
 def test_readiness_requires_every_declared_service_and_worker_binding() -> None:

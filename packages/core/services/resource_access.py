@@ -28,7 +28,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
-from sqlalchemy import select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from packages.core.models.permission import (
@@ -39,11 +39,12 @@ from packages.core.models.permission import (
     Visibility,
 )
 from packages.core.models.staff import Staff
-from packages.core.models.user import User, UserMembership
+from packages.core.permissions import resolve_effective_user_role_name
 from packages.core.models.workspace import WorkspaceStaff
 from packages.core.services.workspace_access import (
     is_entity_admin_role,
     user_can_read_workspace_id,
+    user_readable_workspace_ids,
     user_can_write_workspace_id,
 )
 
@@ -119,35 +120,16 @@ async def resolve_user_role(
     entity_id: str,
     role: str | None = None,
 ) -> str | None:
-    """Resolve the caller's role in this entity, preferring an explicit value.
-
-    Membership rows win over ``User.role`` so that a user belonging to several
-    entities is judged by the role they hold *here*.
-    """
-    if role or not user_id:
+    """Resolve the caller's authoritative role in this entity."""
+    if not user_id:
         return role
-    membership_role = (
-        await db.execute(
-            select(UserMembership.role).where(
-                UserMembership.user_id == user_id,
-                UserMembership.entity_id == entity_id,
-                UserMembership.status == "active",
-                UserMembership.deleted_at.is_(None),
-            )
-        )
-    ).scalar_one_or_none()
-    if membership_role:
-        return str(membership_role)
-    user_role = (
-        await db.execute(
-            select(User.role).where(
-                User.id == user_id,
-                User.entity_id == entity_id,
-                User.deleted_at.is_(None),
-            )
-        )
-    ).scalar_one_or_none()
-    return str(user_role) if user_role else None
+    resolved_role = await resolve_effective_user_role_name(
+        db,
+        user_id=user_id,
+        entity_id=entity_id,
+        legacy_role=role,
+    )
+    return resolved_role or None
 
 
 async def _user_subject_ids(
@@ -201,7 +183,9 @@ async def _workspace_role_subject_ids(
     subject_ids: set[str] = set()
     for workspace_id, role, expires_at in rows:
         if workspace_id and role and _expires_after_now(expires_at):
-            subject_ids.add(f"{workspace_id}:{str(role).strip().lower()}")
+            subject_ids.add(
+                f"{str(workspace_id).lower()}:{str(role).strip().lower()}"
+            )
     return subject_ids
 
 
@@ -274,6 +258,31 @@ async def user_can_access_resource(
     resolved_role = await resolve_user_role(
         db, user_id=user_id, entity_id=entity_id, role=role
     )
+    return await _user_can_access_resource_with_resolved_role(
+        db,
+        descriptor=descriptor,
+        entity_id=entity_id,
+        user_id=user_id,
+        resolved_role=resolved_role,
+        capability=capability,
+    )
+
+
+async def _user_can_access_resource_with_resolved_role(
+    db: AsyncSession,
+    *,
+    descriptor: ResourceDescriptor,
+    entity_id: str,
+    user_id: str | None,
+    resolved_role: str | None,
+    capability: str,
+) -> bool:
+    """Evaluate a resource after the caller role has been resolved once."""
+    if not descriptor.entity_id or descriptor.entity_id != entity_id:
+        return False
+    if not user_id:
+        return False
+
     if is_entity_admin_role(resolved_role):
         return True
     if descriptor.owner_user_id and descriptor.owner_user_id == user_id:
@@ -346,19 +355,119 @@ async def readable_resource_ids(
     user_id: str | None,
     role: str | None = None,
 ) -> set[str]:
-    """Subset of ``descriptors`` the user may view, for list endpoints."""
+    """Subset of ``descriptors`` the user may view, resolved in batches.
+
+    List surfaces can contain hundreds of Skills or Blueprints. Resolving role,
+    Staff aliases, Workspace roles, grants, and Workspace membership once per
+    resource turns that list into an authorization query storm. Keep the same
+    decision order as ``user_can_access_resource`` while batching each shared
+    input once.
+    """
+    candidates = [
+        descriptor
+        for descriptor in descriptors
+        if descriptor.resource_id and descriptor.entity_id == entity_id
+    ]
+    if not candidates or not user_id:
+        return set()
+
     resolved_role = await resolve_user_role(
         db, user_id=user_id, entity_id=entity_id, role=role
     )
-    visible: set[str] = set()
-    for descriptor in descriptors:
-        if await user_can_access_resource(
-            db,
-            descriptor=descriptor,
-            entity_id=entity_id,
-            user_id=user_id,
-            role=resolved_role,
-            capability=Capability.VIEW,
+    if is_entity_admin_role(resolved_role):
+        return {descriptor.resource_id for descriptor in candidates}
+
+    visible: set[str] = {
+        descriptor.resource_id
+        for descriptor in candidates
+        if descriptor.owner_user_id == user_id
+    }
+    remaining = [
+        descriptor
+        for descriptor in candidates
+        if descriptor.resource_id not in visible
+    ]
+    if not remaining:
+        return visible
+
+    user_ids = await _user_subject_ids(
+        db,
+        entity_id=entity_id,
+        user_id=user_id,
+    )
+    workspace_role_ids = await _workspace_role_subject_ids(
+        db,
+        user_id=user_id,
+    )
+    subject_clauses = []
+    if user_ids:
+        subject_clauses.append(and_(
+            ResourceGrant.subject_type == SubjectType.USER,
+            ResourceGrant.subject_id.in_(user_ids),
+        ))
+    if workspace_role_ids:
+        subject_clauses.append(and_(
+            ResourceGrant.subject_type == SubjectType.WORKSPACE_ROLE,
+            func.lower(func.trim(ResourceGrant.subject_id)).in_(
+                workspace_role_ids
+            ),
+        ))
+
+    granted_pairs: set[tuple[str, str]] = set()
+    if subject_clauses:
+        resource_types = {descriptor.resource_type for descriptor in remaining}
+        resource_ids = {descriptor.resource_id for descriptor in remaining}
+        grants = (await db.execute(
+            select(ResourceGrant).where(
+                ResourceGrant.entity_id == entity_id,
+                ResourceGrant.resource_type.in_(resource_types),
+                ResourceGrant.resource_id.in_(resource_ids),
+                ResourceGrant.status == GrantStatus.ACTIVE,
+                or_(*subject_clauses),
+            )
+        )).scalars().all()
+        for grant in grants:
+            if (
+                _expires_after_now(grant.expires_at)
+                and Capability.VIEW in (grant.capabilities or [])
+            ):
+                granted_pairs.add((grant.resource_type, grant.resource_id))
+
+    workspace_ids = {
+        str(descriptor.workspace_id)
+        for descriptor in remaining
+        if (
+            (descriptor.visibility or Visibility.ENTITY)
+            == Visibility.WORKSPACE
+            and descriptor.workspace_id
+            and (descriptor.resource_type, descriptor.resource_id)
+            not in granted_pairs
+        )
+    }
+    readable_workspaces = await user_readable_workspace_ids(
+        db,
+        entity_id=entity_id,
+        user_id=user_id,
+        role=resolved_role,
+        workspace_ids=workspace_ids,
+    ) if workspace_ids else set()
+
+    for descriptor in remaining:
+        if (descriptor.resource_type, descriptor.resource_id) in granted_pairs:
+            visible.add(descriptor.resource_id)
+            continue
+        visibility = descriptor.visibility or Visibility.ENTITY
+        if visibility == Visibility.PUBLIC:
+            visible.add(descriptor.resource_id)
+        elif (
+            visibility == Visibility.ENTITY
+            and str(resolved_role or "") in ENTITY_READ_ROLES
+        ):
+            visible.add(descriptor.resource_id)
+        elif (
+            visibility == Visibility.WORKSPACE
+            and descriptor.workspace_id
+            and str(descriptor.workspace_id) in readable_workspaces
         ):
             visible.add(descriptor.resource_id)
     return visible

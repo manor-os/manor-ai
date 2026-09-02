@@ -29,6 +29,7 @@ test("workspace automations configure scheduled and event-triggered workflows", 
 test("workspace workflows are attached independently from their automations", () => {
   assert.match(workspaceWorkflowsSource, /trigger_type: "manual"/);
   assert.match(workspaceWorkflowsSource, /workspace_attached: true/);
+  assert.match(workspaceWorkflowsSource, /chat_entrypoint:\s*\{\s*enabled: true\s*\}/);
   assert.match(workspaceWorkflowsSource, /listRuns\(\{ workspace_id: workspaceId/);
   assert.match(workspaceWorkflowsSource, /runBinding\(bindingId/);
   assert.match(workspaceWorkflowsSource, /Attach workflow/);
@@ -53,11 +54,18 @@ test("workspace workflow bindings can be created, updated, run, paused, and dele
 test("workspace workflow automation controls remain responsive and accessible", () => {
   assert.match(scheduledJobsSource, /aria-label="Workspace event name"/);
   assert.match(scheduledJobsSource, /aria-label=\{`\$\{enabled \? "Pause" : "Enable"\}/);
-  assert.match(scheduledJobsSource, /aria-label=\{`\$\{job\.enabled \? "Pause" : "Enable"\}/);
+  assert.match(scheduledJobsSource, /aria-label=\{`\$\{effectiveEnabled \? "Pause" : "Enable"\}/);
   assert.match(scheduledJobsSource, /aria-label=\{`Run \$\{/);
   assert.match(scheduledJobsSource, /aria-label=\{`Edit \$\{/);
   assert.match(scheduledJobsSource, /aria-label=\{`Delete \$\{/);
   assert.match(stylesSource, /@media \(max-width: 720px\) \{[\s\S]*?\.scheduled-job-actions/);
   assert.match(stylesSource, /\.workspace-workflow-automation-action:focus-visible/);
   assert.match(compactCardSource, /e\.target !== e\.currentTarget/);
+});
+
+test("workspace automation controls honor server-provided write capability", () => {
+  assert.match(scheduledJobsSource, /can_manage\?: boolean/);
+  assert.match(scheduledJobsSource, /const canManageJob = job\.can_manage !== false/);
+  assert.match(scheduledJobsSource, /disabled=\{!canManageJob \|\| !effectiveEnabled/);
+  assert.match(scheduledJobsSource, /disabled=\{!canManageJob\}/);
 });

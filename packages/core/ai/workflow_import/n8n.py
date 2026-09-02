@@ -290,27 +290,72 @@ class N8nImporter(WorkflowImporter):
                 canonical = "split"
             if bare == "html" and params.get("html") and not params.get("extractionValues"):
                 canonical = "transform"
-            native = self._translate(canonical, params, bare)
+            native = self._translate(
+                canonical, params, bare, rn.get("typeVersion"),
+            )
             if canonical == "agent":
                 native = self._fold_agent(native, params, ai_attach.get(name_id, {}), raw_by_key)
             elif canonical in {"llm", "extract"} and ai_attach.get(name_id):
                 native = self._fold_model(native, ai_attach[name_id], raw_by_key)
+
+            branch_outputs = branched.get(name_id, [])
+            normal_outputs = branch_outputs
+            node_next = succ.get(name_id, [])
+            if rn.get("retryOnFail") is True:
+                native["retry_on_fail"] = True
+                if rn.get("maxTries") is not None:
+                    native["max_tries"] = rn["maxTries"]
+                if rn.get("waitBetweenTries") is not None:
+                    native["retry_wait_ms"] = rn["waitBetweenTries"]
+            if rn.get("alwaysOutputData") is True:
+                native["always_output_data"] = True
+            if rn.get("executeOnce") is True:
+                native["execute_once"] = True
+
+            on_error = str(rn.get("onError") or "").strip()
+            if on_error == "continueRegularOutput":
+                native["on_error"] = "continue"
+            elif on_error == "continueErrorOutput":
+                native["on_error"] = "continue_error"
+                error_output_index = self._normal_output_count(
+                    canonical, bare, params,
+                )
+                native["error_next"] = (
+                    branch_outputs[error_output_index]
+                    if len(branch_outputs) > error_output_index
+                    else []
+                )
+                normal_outputs = branch_outputs[:error_output_index]
+                node_next = [target for output in normal_outputs for target in output]
+            elif on_error == "stopWorkflow":
+                native["on_error"] = "stop"
+
             n8n_raw = {"type": ntype, "parameters": params}
             if rn.get("credentials"):
                 n8n_raw["credentials"] = rn["credentials"]
+            for setting in (
+                "retryOnFail",
+                "maxTries",
+                "waitBetweenTries",
+                "onError",
+                "alwaysOutputData",
+                "executeOnce",
+            ):
+                if setting in rn:
+                    n8n_raw[setting] = rn[setting]
 
             node = GraphNode(
                 id=name_id, type=canonical, name=name_id,
                 config={**native, "n8n": n8n_raw},
-                next=succ.get(name_id, []),
+                next=node_next,
                 meta={"source_tool": self.source_tool, "original_type": ntype},
             )
             if canonical == "condition":
-                outs = branched.get(name_id, [])
+                outs = normal_outputs
                 node.true_next = outs[0] if len(outs) > 0 else []
                 node.false_next = outs[1] if len(outs) > 1 else []
             elif canonical == "switch":
-                node.config.update(self._switch_cases(params, branched.get(name_id, [])))
+                node.config.update(self._switch_cases(params, normal_outputs))
             nodes.append(node)
 
         # n8n passes an item stream along each edge. Manor keeps step outputs in
@@ -352,6 +397,12 @@ class N8nImporter(WorkflowImporter):
                 # which output port is followed.  Preserve the item for the
                 # downstream marketing-email composition nodes.
                 node.config.setdefault("pass_input", True)
+            elif node.type == "switch" and len(sources) == 1:
+                node.config.setdefault(
+                    "inputs",
+                    [{"key": "input", "value": f"{{{{{sources[0]}}}}}", "type": "any"}],
+                )
+                node.config.setdefault("pass_input", True)
             elif node.type in {"llm", "agent", "classifier", "extract"} and len(sources) == 1:
                 node.config.setdefault(
                     "inputs",
@@ -365,6 +416,23 @@ class N8nImporter(WorkflowImporter):
                     node.config["prompt"] = (
                         "{{input.chatInput}}" if source_type == "chatTrigger" else "{{input}}"
                     )
+
+            # Every n8n main connection carries the current item. Preserve that
+            # implicit stream as a named input even for nodes whose native
+            # translation does not otherwise need an ``items`` binding. This is
+            # also the last valid input forwarded by Continue On Error.
+            if len(sources) == 1 and node.type not in {"merge", "trigger"}:
+                inputs = node.config.setdefault("inputs", [])
+                if isinstance(inputs, list) and not any(
+                    isinstance(item, dict)
+                    and str(item.get("key") or item.get("name") or "").strip() == "input"
+                    for item in inputs
+                ):
+                    inputs.append({
+                        "key": "input",
+                        "value": f"{{{{{sources[0]}}}}}",
+                        "type": "any",
+                    })
 
         # Fallback: if the source had no usable connections (missing or scrubbed),
         # the import would be a disconnected pile. Wire the nodes left-to-right
@@ -399,7 +467,13 @@ class N8nImporter(WorkflowImporter):
 
     # ── Config translation: n8n parameters -> manor-native config ────────
 
-    def _translate(self, canonical: str, params: dict, bare: str = "") -> dict:
+    def _translate(
+        self,
+        canonical: str,
+        params: dict,
+        bare: str = "",
+        node_version=None,
+    ) -> dict:
         try:
             if canonical == "connector":
                 # Integration node -> shared connector resolution (same layer
@@ -423,6 +497,10 @@ class N8nImporter(WorkflowImporter):
                 return self._t_html_template(params)
             if canonical == "transform" and bare == "markdown":
                 return self._t_markdown(params)
+            if canonical == "transform" and bare == "set":
+                return self._t_set(params, node_version, force_mapping=True)
+            if canonical == "transform" and bare == "noOp":
+                return {"pass_input": True}
             fn = {
                 "condition": self._t_if,
                 "code": self._t_code,
@@ -778,12 +856,51 @@ class N8nImporter(WorkflowImporter):
         joiner = " or " if str(logic).lower() == "or" else " and "
         return joiner.join(exprs)
 
+    @staticmethod
+    def _switch_fallback_output(params: dict):
+        options = params.get("options") or {}
+        if "fallbackOutput" in options:
+            return options["fallbackOutput"]
+        return params.get("fallbackOutput")
+
+    def _normal_output_count(
+        self, canonical: str, bare: str, params: dict,
+    ) -> int:
+        """Return n8n's main output count before its optional error output."""
+        if canonical == "condition":
+            return 2
+        if bare == "splitInBatches":
+            # Loop Over Items v3: output 0 is Done, output 1 is Loop.
+            return 2
+        if canonical != "switch":
+            return 1
+        if str(params.get("mode") or "rules").strip().lower() == "expression":
+            try:
+                return max(1, int(params.get("numberOutputs", 4) or 4))
+            except (TypeError, ValueError):
+                return 4
+        rules = params.get("rules") or {}
+        values = rules.get("values") or rules.get("rules") or []
+        return len(values) + int(self._switch_fallback_output(params) == "extra")
+
     def _switch_cases(self, params: dict, branch_outputs: list[list[str]]) -> dict:
         """n8n switch -> {cases: [{expression, next}], default_next}.
 
         Each rule (output index i) becomes a case routed to that output's branch
         targets; the fallback output (beyond the rules) becomes default_next.
         """
+        if str(params.get("mode") or "rules").strip().lower() == "expression":
+            output_count = self._normal_output_count("switch", "switch", params)
+            return {
+                "switch_mode": "expression",
+                "output_index": self._norm_expr(params.get("output", "")),
+                "output_next": [
+                    branch_outputs[index] if index < len(branch_outputs) else []
+                    for index in range(output_count)
+                ],
+                "default_next": [],
+            }
+
         rules = params.get("rules") or {}
         values = rules.get("values") or rules.get("rules") or []
         cases = []
@@ -799,8 +916,24 @@ class N8nImporter(WorkflowImporter):
                         rule.get("operation"), rule.get("value2"),
                     )
             cases.append({"expression": expr or "", "next": nxt})
-        default_next = branch_outputs[len(values)] if len(branch_outputs) > len(values) else []
-        return {"cases": cases, "default_next": default_next}
+        fallback = self._switch_fallback_output(params)
+        if fallback == "extra":
+            fallback_index = len(values)
+        else:
+            try:
+                fallback_index = int(fallback)
+            except (TypeError, ValueError):
+                fallback_index = -1
+        default_next = (
+            branch_outputs[fallback_index]
+            if 0 <= fallback_index < len(branch_outputs)
+            else []
+        )
+        config = {"cases": cases, "default_next": default_next}
+        options = params.get("options") or {}
+        if options.get("allMatchingOutputs") is True:
+            config["all_matching_outputs"] = True
+        return config
 
     def _cond_expr(self, left, op, right) -> str | None:
         if left and str(op) in {"isEmpty", "empty"}:
@@ -875,7 +1008,9 @@ class N8nImporter(WorkflowImporter):
                 break
         return out
 
-    def _t_set(self, params: dict) -> dict:
+    def _t_set(
+        self, params: dict, node_version=None, *, force_mapping: bool = False,
+    ) -> dict:
         out: dict = {}
         asn = (params.get("assignments") or {}).get("assignments")
         if isinstance(asn, list):  # v2
@@ -883,6 +1018,13 @@ class N8nImporter(WorkflowImporter):
                 if a.get("name"):
                     value = a.get("value", "")
                     out[a["name"]] = self._norm_expr(value) if isinstance(value, str) else value
+        elif isinstance((params.get("fields") or {}).get("values"), list):
+            for field in params["fields"]["values"]:
+                name = field.get("name")
+                field_type = field.get("type")
+                if name and field_type:
+                    value = field.get(field_type, "")
+                    out[name] = self._norm_expr(value) if isinstance(value, str) else value
         else:  # v1: values.{string,number,boolean}
             values = params.get("values") or {}
             for kind in ("string", "number", "boolean"):
@@ -891,7 +1033,45 @@ class N8nImporter(WorkflowImporter):
                         default = 0 if kind == "number" else False if kind == "boolean" else ""
                         value = a.get("value", default)
                         out[a["name"]] = self._norm_expr(value) if isinstance(value, str) else value
-        cfg = {"set": out} if out else {}
+        is_raw = params.get("mode") == "raw" and params.get("jsonOutput") is not None
+        if not out and not force_mapping and not is_raw:
+            return {}
+        cfg = {"set": out, "dot_notation": True}
+        if is_raw:
+            raw_json = params["jsonOutput"]
+            cfg["raw_json"] = (
+                self._norm_expr(raw_json)
+                if isinstance(raw_json, str)
+                else raw_json
+            )
+        if (params.get("options") or {}).get("dotNotation") is False:
+            cfg["dot_notation"] = False
+
+        try:
+            version = float(node_version) if node_version is not None else None
+        except (TypeError, ValueError):
+            version = None
+        if "keepOnlySet" in params:
+            include_mode = "none" if params.get("keepOnlySet") else "all"
+        elif version is not None and 3 <= version < 3.3:
+            include_mode = str(params.get("include") or "all")
+        elif params.get("includeOtherFields") is True:
+            include_mode = str(params.get("include") or "all")
+        else:
+            include_mode = "none"
+        cfg["include_mode"] = include_mode
         if params.get("includeOtherFields") is True:
             cfg["include_other_fields"] = True
+        if include_mode == "selected":
+            cfg["include_fields"] = [
+                field.strip()
+                for field in str(params.get("includeFields") or "").split(",")
+                if field.strip()
+            ]
+        elif include_mode == "except":
+            cfg["exclude_fields"] = [
+                field.strip()
+                for field in str(params.get("excludeFields") or "").split(",")
+                if field.strip()
+            ]
         return cfg

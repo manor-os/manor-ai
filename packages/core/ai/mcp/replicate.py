@@ -126,7 +126,8 @@ async def call_tool(
     arguments: Dict[str, Any],
     bearer_token: str,
 ) -> Dict[str, Any]:
-    if not bearer_token:
+    token = bearer_token.strip() if isinstance(bearer_token, str) else ""
+    if not token:
         return _error(
             "Replicate API token is missing. Get one at "
             "https://replicate.com/account/api-tokens and add it under "
@@ -136,9 +137,13 @@ async def call_tool(
     handler = _HANDLERS.get(name)
     if handler is None:
         return _error(f"Unknown replicate tool: {name}")
+    if not isinstance(arguments, dict):
+        return _error("arguments must be an object")
+    arguments = dict(arguments)
 
     try:
-        result = await handler(arguments, bearer_token)
+        _validate_arguments(name, arguments)
+        result = await handler(arguments, token)
         return result if isinstance(result, dict) else _content(result)
     except httpx.HTTPStatusError as exc:
         body = exc.response.text[:500] if exc.response is not None else ""
@@ -150,32 +155,95 @@ async def call_tool(
 
 # ── Handlers ────────────────────────────────────────────────────────────────
 
+def _validate_arguments(name: str, arguments: dict[str, Any]) -> None:
+    """Validate non-coercible MCP fields before a prediction is submitted."""
+    string_fields = {
+        "generate_image": {"model", "aspect_ratio"},
+        "generate_video": {"model", "aspect_ratio"},
+        "run_model": {"model"},
+    }.get(name, set())
+    for field in string_fields:
+        value = arguments.get(field)
+        if value is not None and not isinstance(value, str):
+            raise ValueError(f"{field} must be a string")
+
+    if name == "generate_image" and "seed" in arguments:
+        _integer(arguments["seed"], field="seed")
+
+    if name == "run_model" and "input" in arguments and not isinstance(arguments["input"], dict):
+        raise ValueError("input must be a JSON object")
+
+
+def _integer(value: Any, *, field: str) -> int:
+    if isinstance(value, bool):
+        raise ValueError(f"{field} must be an integer")
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"{field} must be an integer") from exc
+    if isinstance(value, float) and value != parsed:
+        raise ValueError(f"{field} must be an integer")
+    return parsed
+
+def _prompt(args: Dict[str, Any]) -> str:
+    value = args.get("prompt")
+    if not isinstance(value, str):
+        raise ValueError("prompt must be a string")
+    prompt = value.strip()
+    if not prompt:
+        raise ValueError("prompt is required")
+    return prompt
+
+
+def _num_outputs(value: Any) -> int:
+    if isinstance(value, bool):
+        raise ValueError("num_outputs must be an integer")
+    if value in (None, ""):
+        return 1
+    try:
+        count = int(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("num_outputs must be an integer") from exc
+    if isinstance(value, float) and value != count:
+        raise ValueError("num_outputs must be an integer")
+    if count < 1:
+        raise ValueError("num_outputs must be at least 1")
+    return min(count, 4)
+
 async def _generate_image(args: Dict[str, Any], token: str) -> Dict[str, Any]:
     model = (args.get("model") or _DEFAULT_IMAGE_MODEL).strip()
     inp: Dict[str, Any] = {
-        "prompt": args.get("prompt") or "",
+        "prompt": _prompt(args),
         "aspect_ratio": args.get("aspect_ratio") or "1:1",
     }
-    if args.get("num_outputs"):
-        inp["num_outputs"] = int(args["num_outputs"])
+    if args.get("num_outputs") is not None:
+        inp["num_outputs"] = _num_outputs(args.get("num_outputs"))
     if args.get("seed") is not None:
-        inp["seed"] = int(args["seed"])
+        inp["seed"] = _integer(args["seed"], field="seed")
     return await _run_and_format(token, model, inp, intent="image")
 
 
 async def _generate_video(args: Dict[str, Any], token: str) -> Dict[str, Any]:
     model = (args.get("model") or _DEFAULT_VIDEO_MODEL).strip()
-    inp: Dict[str, Any] = {"prompt": args.get("prompt") or ""}
+    inp: Dict[str, Any] = {"prompt": _prompt(args)}
     if args.get("aspect_ratio"):
         inp["aspect_ratio"] = args["aspect_ratio"]
-    if args.get("duration"):
-        inp["duration"] = int(args["duration"])
+    duration_value = args.get("duration")
+    if duration_value not in (None, ""):
+        if isinstance(duration_value, bool):
+            raise ValueError("duration must be an integer")
+        duration = int(duration_value)
+        if isinstance(duration_value, float) and duration_value != duration:
+            raise ValueError("duration must be an integer")
+        if duration < 1:
+            raise ValueError("duration must be greater than 0")
+        inp["duration"] = duration
     return await _run_and_format(token, model, inp, intent="video")
 
 
 async def _run_model(args: Dict[str, Any], token: str) -> Dict[str, Any]:
     model = (args.get("model") or "").strip()
-    inp = args.get("input") or {}
+    inp = args.get("input")
     if not model:
         raise ValueError("model is required")
     if not isinstance(inp, dict):

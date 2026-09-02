@@ -1,8 +1,9 @@
 TAG ?= prod
 PYTHON ?= $(shell if [ -x .venv/bin/python ]; then printf '%s' .venv/bin/python; else printf '%s' python3; fi)
 PYTEST_DEFAULT_MARKERS ?= not e2e and not manual and not slow and not network and not docker and not cloud
+PYTEST_SMOKE_MARKERS ?= oss_smoke
 PYTEST_REGRESSION_MARKERS ?= not manual and not network and not docker and not cloud
-PYTEST_ENV = TEST_DATABASE_URL="postgresql+asyncpg://manor:manor_secret@localhost:5434/manor_test" MANOR_FS_ENABLED=false PYTHONPATH=.
+PYTEST_ENV = TEST_DATABASE_URL="postgresql+asyncpg://manor:manor_secret@localhost:5434/manor_test" MANOR_FS_ENABLED=false PYTHONPATH=.:tests
 
 .PHONY: dev test test-smoke test-regression test-manual test-e2e test-all test-ws test-embedding lint build clean docker-up
 
@@ -20,7 +21,8 @@ dev-infra:
 test:
 	$(PYTEST_ENV) $(PYTHON) -m pytest tests/ -m "$(PYTEST_DEFAULT_MARKERS)" -q --tb=short -p no:warnings
 
-test-smoke: test
+test-smoke:
+	$(PYTEST_ENV) $(PYTHON) -m pytest tests/ -m "$(PYTEST_SMOKE_MARKERS)" -q --tb=short -p no:warnings
 
 test-regression:
 	$(PYTEST_ENV) $(PYTHON) -m pytest tests/ -m "$(PYTEST_REGRESSION_MARKERS)" -q --tb=short -p no:warnings
@@ -36,7 +38,7 @@ test-all:
 	$(PYTEST_ENV) $(PYTHON) -m pytest tests/ -q --tb=short
 
 test-ws:
-	PYTHONPATH=. $(PYTHON) -m pytest tests/test_ws.py -q --tb=short
+	PYTHONPATH=.:tests $(PYTHON) -m pytest tests/test_ws.py -q --tb=short
 
 test-embedding:
 	$(PYTEST_ENV) $(PYTHON) -m pytest tests/test_embedding.py -q --tb=short

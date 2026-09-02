@@ -250,6 +250,50 @@ async def test_daily_briefing_template_installs_schedule(client):
 
 
 @pytest.mark.asyncio
+async def test_reinstall_briefing_bumps_revision_and_invalidates_old_clock(client):
+    import packages.core.database as db_module
+    from packages.core.briefing.scheduling import install_briefing_schedule
+    from packages.core.models.workspace import Workspace
+
+    headers, _entity_id = await _auth(client, "briefing_revision")
+    workspace_id = (
+        await client.post(
+            "/api/v1/workspaces",
+            headers=headers,
+            json={"name": "Revision Briefing"},
+        )
+    ).json()["id"]
+
+    async with db_module.async_session() as db:
+        workspace = await db.get(Workspace, workspace_id)
+        first = await install_briefing_schedule(
+            db,
+            workspace,
+            time_of_day="08:00",
+            timezone="UTC",
+        )
+        await db.commit()
+        first_revision = first.revision
+        first.last_run_at = datetime.now(timezone.utc)
+        first.last_status = "dispatched"
+        await db.commit()
+
+        updated = await install_briefing_schedule(
+            db,
+            workspace,
+            time_of_day="09:30",
+            timezone="America/Los_Angeles",
+        )
+        await db.commit()
+
+        assert updated.revision == first_revision + 1
+        assert updated.cron_expr == "30 9 * * *"
+        assert updated.timezone == "America/Los_Angeles"
+        assert updated.last_run_at is None
+        assert updated.last_status is None
+
+
+@pytest.mark.asyncio
 async def test_daily_briefing_template_uses_user_schedule_settings(client):
     import packages.core.database as db_module
     import packages.core.templates.recipes  # noqa: F401
@@ -323,9 +367,9 @@ async def test_daily_briefing_template_uses_user_schedule_settings(client):
 
 
 @pytest.mark.asyncio
-async def test_briefing_dispatch_passes_scheduled_job_timezone(client, monkeypatch):
+async def test_briefing_dispatch_passes_scheduled_job_timezone(client):
     import packages.core.database as db_module
-    import packages.core.tasks.ai_tasks as ai_tasks
+    from packages.core.constants.execution import ScheduledDispatchKind
     from packages.core.models.base import generate_ulid
     from packages.core.models.scheduler import ScheduledJob
     from packages.core.tasks.scheduler_tasks import _dispatch_job
@@ -338,14 +382,6 @@ async def test_briefing_dispatch_passes_scheduled_job_timezone(client, monkeypat
         json={"name": "Dispatch Timezone Room"},
     )
     workspace_id = ws_resp.json()["id"]
-
-    captured: dict = {}
-
-    def fake_apply_async(*, args=None, kwargs=None):
-        captured["args"] = args
-        captured["kwargs"] = kwargs
-
-    monkeypatch.setattr(ai_tasks.run_morning_briefing, "apply_async", fake_apply_async)
 
     job_id = generate_ulid()
     async with db_module.async_session() as db:
@@ -369,10 +405,17 @@ async def test_briefing_dispatch_passes_scheduled_job_timezone(client, monkeypat
 
     async with db_module.async_session() as db:
         job = (await db.execute(select(ScheduledJob).where(ScheduledJob.id == job_id))).scalar_one()
-        await _dispatch_job(db, job, datetime(2026, 4, 1, 22, 30, tzinfo=timezone.utc))
+        prepared = await _dispatch_job(
+            db,
+            job,
+            datetime(2026, 4, 1, 22, 30, tzinfo=timezone.utc),
+        )
 
-    assert captured["args"] == [workspace_id]
-    assert captured["kwargs"]["timezone_name"] == "Asia/Tokyo"
+    assert prepared is not None
+    dispatch, _run_id = prepared
+    assert dispatch["kind"] == ScheduledDispatchKind.MORNING_BRIEFING.value
+    assert dispatch["args"] == [workspace_id]
+    assert dispatch["kwargs"]["timezone_name"] == "Asia/Tokyo"
 
 
 @pytest.mark.asyncio

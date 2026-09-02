@@ -4,6 +4,8 @@ from types import SimpleNamespace
 
 import pytest
 
+from packages.core.ai.tools.generate_file.tool import _generate_file_handler as _generate_file
+
 from packages.core.services import artifact_knowledge
 
 
@@ -48,6 +50,87 @@ async def test_local_artifact_is_promoted_to_a_document(tmp_path, monkeypatch):
     assert calls[0]["force"] is True
     assert calls[0]["workspace_id"] == "ws_1"
     assert calls[0]["task_id"] == "task_1"
+
+
+@pytest.mark.asyncio
+async def test_existing_document_artifact_backfills_task_provenance(tmp_path, monkeypatch):
+    calls = []
+    monkeypatch.setattr(artifact_knowledge, "get_entity_root", lambda _entity_id: str(tmp_path))
+
+    async def fake_bind(**kwargs):
+        calls.append(kwargs)
+        return kwargs["document_id"]
+
+    monkeypatch.setattr(artifact_knowledge, "bind_document_to_workspace", fake_bind)
+
+    projection = await artifact_knowledge.project_artifact_refs_to_knowledge(
+        entity_id="ent_1",
+        workspace_id="ws_1",
+        task_id="task_1",
+        agent_id="agent_1",
+        refs=[{
+            "type": "file",
+            "name": "report.csv",
+            "document_id": "doc_1",
+            "viewer_url": "/viewer/doc_1",
+        }, {
+            "type": "file",
+            "name": "report-copy.csv",
+            "document_id": "doc_1",
+            "viewer_url": "/viewer/doc_1",
+        }],
+    )
+
+    assert projection.failures == []
+    assert projection.refs[0]["document_id"] == "doc_1"
+    assert projection.refs[0]["viewer_url"] == "/viewer/doc_1"
+    assert len(projection.knowledge_artifacts) == 1
+    assert calls == [{
+        "entity_id": "ent_1",
+        "document_id": "doc_1",
+        "workspace_id": "ws_1",
+        "task_id": "task_1",
+        "agent_id": "agent_1",
+        "user_id": None,
+        "tool_name": "plan_artifact_finalize",
+    }]
+
+
+@pytest.mark.asyncio
+async def test_canonical_document_id_backfills_task_provenance(tmp_path, monkeypatch):
+    bind_calls = []
+    sync_calls = []
+    monkeypatch.setattr(artifact_knowledge, "get_entity_root", lambda _entity_id: str(tmp_path))
+
+    async def fake_bind(**kwargs):
+        bind_calls.append(kwargs)
+        return "doc_existing"
+
+    async def fake_sync(**kwargs):
+        sync_calls.append(kwargs)
+        return SimpleNamespace(synced=True, document_id="doc_synced", reason=None)
+
+    monkeypatch.setattr(artifact_knowledge, "bind_document_to_workspace", fake_bind)
+    monkeypatch.setattr(artifact_knowledge, "sync_file_to_knowledge", fake_sync)
+
+    projection = await artifact_knowledge.project_artifact_refs_to_knowledge(
+        entity_id="ent_1",
+        workspace_id="ws_1",
+        task_id="task_1",
+        refs=[{
+            "type": "file",
+            "name": "report.csv",
+            "document_id": "doc_existing",
+            "url": "/viewer/doc_existing",
+            "fs_path": "Workspaces/Demo/report.csv",
+        }],
+    )
+
+    assert projection.failures == []
+    assert projection.refs[0]["document_id"] == "doc_existing"
+    assert projection.refs[0]["viewer_url"] == "/viewer/doc_existing"
+    assert bind_calls[0]["task_id"] == "task_1"
+    assert sync_calls == []
 
 
 @pytest.mark.asyncio
@@ -127,11 +210,11 @@ def test_executor_prefers_canonical_knowledge_refs_for_multi_file_results():
 
 
 @pytest.mark.asyncio
-async def test_user_facing_write_file_cannot_disable_knowledge_sync(tmp_path, monkeypatch):
+async def test_generate_document_cannot_disable_knowledge_sync(tmp_path, monkeypatch):
     import json
 
-    from packages.core.ai.tools import file_tools
     from packages.core.config import get_settings
+    from packages.core.services import knowledge_sync
 
     settings = get_settings()
     old_enabled = settings.MANOR_FS_ENABLED
@@ -147,26 +230,29 @@ async def test_user_facing_write_file_cannot_disable_knowledge_sync(tmp_path, mo
         sync_call.update(kwargs)
         return SimpleNamespace(synced=True, document_id="doc_write", reason=None)
 
-    monkeypatch.setattr(file_tools, "runtime_guard_file_mutation", allow_write)
-    monkeypatch.setattr(file_tools, "runtime_sync_entity_file_to_knowledge", sync_file)
+    monkeypatch.setattr("packages.core.ai.runtime.file_actions.runtime_guard_file_mutation", allow_write)
+    monkeypatch.setattr(knowledge_sync, "sync_file_to_knowledge", sync_file)
     try:
         (tmp_path / "ent_1").mkdir()
-        result = json.loads(await file_tools._write_file(
-            entity_id="ent_1",
-            path="deliverable.md",
-            content="# Done\n",
-            save_to_knowledge=False,
-        ))
+        result = json.loads(
+            await _generate_file(
+                kind="document",
+                entity_id="ent_1",
+                name="deliverable.md",
+                content="# Done\n",
+                agent_id="forged_agent",
+                _agent_id_from_context="agent_write",
+                save_to_knowledge=False,
+            )
+        )
     finally:
         settings.MANOR_FS_ENABLED = old_enabled
         settings.MANOR_FS_ROOT = old_root
 
     assert sync_call["force"] is True
-    assert result["document_id"] == "doc_write"
-    assert result["viewer_url"] == "/viewer/doc_write"
-    assert "save_to_knowledge" not in (
-        file_tools.WRITE_FILE_SCHEMA["function"]["parameters"]["properties"]
-    )
+    assert sync_call["agent_id"] == "agent_write"
+    assert result["document"]["document_id"] == "doc_write"
+    assert result["document"]["viewer_url"] == "/viewer/doc_write"
 
 
 def test_completed_task_output_detects_legacy_files_without_document_ids():

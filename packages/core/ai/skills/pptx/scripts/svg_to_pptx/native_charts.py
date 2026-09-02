@@ -15,6 +15,7 @@ from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 from xml.etree import ElementTree as ET
+from defusedxml import ElementTree as SafeET
 
 from pptx import Presentation
 from pptx.chart.data import BubbleChartData, CategoryChartData, XyChartData
@@ -191,7 +192,7 @@ def _xy_chart_data(spec: dict[str, Any], *, bubble: bool):
 
 def _svg_viewbox_and_slots(svg_path: Path) -> tuple[tuple[float, float], dict[str, dict[str, float]]]:
     try:
-        root = ET.parse(svg_path).getroot()
+        root = SafeET.parse(svg_path).getroot()
     except (OSError, ET.ParseError) as exc:
         raise NativeChartSpecError(f"Cannot parse SVG chart slots in {svg_path}: {exc}") from exc
     values = str(root.get("viewBox") or "").replace(",", " ").split()

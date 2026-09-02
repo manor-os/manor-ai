@@ -18,7 +18,8 @@ from sqlalchemy import func, select
 
 from packages.core.models.base import generate_ulid
 from packages.core.models.notification import Notification
-from packages.core.models.user import Entity, User
+from packages.core.models.staff import Staff
+from packages.core.models.user import Entity, User, UserMembership
 
 from packages.core.services.auth_service import hash_password
 from packages.core.services.oauth_provider_config import OAuthProviderConfig
@@ -287,7 +288,7 @@ async def test_cannot_delete_system_role(client: AsyncClient):
 
 
 @pytest.mark.asyncio
-async def test_delete_custom_role(client: AsyncClient):
+async def test_delete_custom_role(client: AsyncClient, db_session):
     """Custom roles delete cleanly; 204 No Content."""
     headers, _, _ = await _owner_headers(client, "roles_delcustom")
     create = await client.post(
@@ -296,12 +297,30 @@ async def test_delete_custom_role(client: AsyncClient):
         json={"name": "Temp", "permissions": ["tasks.read"]},
     )
     role_id = create.json()["id"]
+    staff_response = await client.post(
+        "/api/v1/staff",
+        headers=headers,
+        json={
+            "name": "Demoted Custom Role User",
+            "email": "demoted-custom-role@test.com",
+            "role_id": role_id,
+            "role": "admin",
+        },
+    )
+    assert staff_response.status_code == 201, staff_response.text
+    staff_id = staff_response.json()["id"]
 
     resp = await client.delete(
         f"/api/v1/staff/roles/{role_id}",
         headers=headers,
     )
     assert resp.status_code == 204
+
+    from packages.core.models.staff import Staff
+
+    staff = await db_session.get(Staff, staff_id)
+    assert staff.role_id is None
+    assert "role" not in (staff.meta or {})
 
 
 # ── Permission gating ───────────────────────────────────────────────────────
@@ -359,6 +378,54 @@ async def test_member_cannot_delete_role(client: AsyncClient):
         headers=member_headers,
     )
     assert resp.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_member_cannot_manufacture_or_remove_staff_authority(client: AsyncClient):
+    owner_headers, user_id, _ = await _owner_headers(client, "gate_staff_authority")
+    staff = await client.post(
+        "/api/v1/staff",
+        headers=owner_headers,
+        json={"name": "Protected Staff"},
+    )
+    assert staff.status_code == 201, staff.text
+    staff_id = staff.json()["id"]
+    member_headers = await _downgrade_to(
+        client,
+        owner_headers,
+        user_id,
+        "member",
+        "gate_staff_authority",
+    )
+
+    forged = await client.post(
+        "/api/v1/staff",
+        headers=member_headers,
+        json={
+            "name": "Forged Owner",
+            "user_id": user_id,
+            "role": "owner",
+        },
+    )
+    assert forged.status_code == 403
+
+    role_update = await client.put(
+        f"/api/v1/staff/{staff_id}",
+        headers=member_headers,
+        json={"role": "owner"},
+    )
+    assert role_update.status_code == 403
+    status_update = await client.put(
+        f"/api/v1/staff/{staff_id}",
+        headers=member_headers,
+        json={"status": "inactive"},
+    )
+    assert status_update.status_code == 403
+    deleted = await client.delete(
+        f"/api/v1/staff/{staff_id}",
+        headers=member_headers,
+    )
+    assert deleted.status_code == 403
 
 
 @pytest.mark.asyncio
@@ -883,8 +950,14 @@ async def test_people_gateway_lists_and_accepts_pending_team_invite(client: Asyn
     assert context["active_membership"]["staff_id"] == pending["invite_id"]
     assert context["active_membership"]["can_leave"] is True
     assert context["billing"]["scope"] == "company"
-    assert context["billing"]["total_credits"] is not None
-    assert context["billing"]["remaining_credits"] is not None
+    from packages.core.constants.plans import ai_credit_limits_enabled
+
+    if ai_credit_limits_enabled():
+        assert context["billing"]["total_credits"] is not None
+        assert context["billing"]["remaining_credits"] is not None
+    else:
+        assert context["billing"]["total_credits"] is None
+        assert context["billing"]["remaining_credits"] is None
 
     company_headers = {"Authorization": f"Bearer {accepted_body['access_token']}"}
     directory = await client.get("/api/v1/people/directory", headers=company_headers)
@@ -1028,6 +1101,11 @@ async def test_accept_invite_single_use(client: AsyncClient):
 @pytest.mark.asyncio
 async def test_oauth_google_accepts_team_invite(client: AsyncClient, monkeypatch: pytest.MonkeyPatch):
     """Google OAuth can consume a team invite when the Google email matches."""
+    avatar_url = (
+        "https://lh3.googleusercontent.com/a-/"
+        + ("A" * 1200)
+        + "=s96-c"
+    )
     _mock_google_oauth(
         monkeypatch,
         {
@@ -1037,7 +1115,7 @@ async def test_oauth_google_accepts_team_invite(client: AsyncClient, monkeypatch
             "name": "Google Joiner",
             "given_name": "Google",
             "family_name": "Joiner",
-            "picture": "https://example.com/avatar.png",
+            "picture": avatar_url,
         },
     )
 
@@ -1069,6 +1147,7 @@ async def test_oauth_google_accepts_team_invite(client: AsyncClient, monkeypatch
     assert target is not None
     assert target["status"] == "active"
     assert target["user_id"] == accepted_body["user_id"]
+    assert target["avatar_url"] == avatar_url
 
     replay = await client.post(
         "/api/v1/auth/oauth/google",
@@ -1185,6 +1264,141 @@ async def test_member_can_leave_team_and_access_is_disabled(client: AsyncClient)
     assert target is not None
     assert target["status"] == "inactive"
     assert target["user_id"] == accepted.json()["user_id"]
+
+
+@pytest.mark.asyncio
+async def test_membership_response_can_leave_uses_staff_role_after_demotion(
+    client: AsyncClient,
+    db_session,
+):
+    owner_headers, _, _ = await _owner_headers(client, "leave_demoted_owner")
+    invite = await client.post(
+        "/api/v1/staff/invite",
+        headers=owner_headers,
+        json={"email": "leave.demoted@test.com", "name": "Demoted Member"},
+    )
+    assert invite.status_code == 201, invite.text
+    accepted = await _register_from_staff_invite(
+        client,
+        token=invite.json()["invite_token"],
+        email="leave.demoted@test.com",
+        username="Demoted Member",
+        password="leavepass123",
+    )
+    assert accepted.status_code == 200, accepted.text
+
+    membership = (
+        await db_session.execute(
+            select(UserMembership).where(
+                UserMembership.user_id == accepted.json()["user_id"],
+                UserMembership.entity_id == accepted.json()["entity_id"],
+            )
+        )
+    ).scalar_one()
+    membership.role = "admin"
+    await db_session.flush()
+
+    from apps.api.routers.people import _membership_response
+
+    member = await db_session.get(User, accepted.json()["user_id"])
+    entity = await db_session.get(Entity, accepted.json()["entity_id"])
+    response = await _membership_response(
+        db_session,
+        membership=membership,
+        entity=entity,
+        user=member,
+        current_entity_id=membership.entity_id,
+    )
+
+    assert response.role == "admin"
+    assert response.can_leave is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["deactivate", "delete"])
+async def test_admin_revoking_staff_disables_membership_and_session(
+    client: AsyncClient,
+    db_session,
+    operation: str,
+):
+    """Admin revocation must close both request-auth and membership access."""
+    owner_headers, _, _ = await _owner_headers(client, f"admin_revoke_{operation}")
+    email = f"admin.revoke.{operation}@test.com"
+    invite = await client.post(
+        "/api/v1/staff/invite",
+        headers=owner_headers,
+        json={"email": email, "name": f"Revoked {operation.title()}"},
+    )
+    assert invite.status_code == 201, invite.text
+
+    accepted = await _register_from_staff_invite(
+        client,
+        token=invite.json()["invite_token"],
+        email=email,
+        username=f"Revoked {operation.title()}",
+        password="revokedpass123",
+    )
+    assert accepted.status_code == 200, accepted.text
+    user_id = accepted.json()["user_id"]
+    staff_id = invite.json()["staff_id"]
+    member_headers = {"Authorization": f"Bearer {accepted.json()['access_token']}"}
+
+    if operation == "deactivate":
+        revoked = await client.put(
+            f"/api/v1/staff/{staff_id}",
+            headers=owner_headers,
+            json={"status": "inactive"},
+        )
+        assert revoked.status_code == 200, revoked.text
+    else:
+        revoked = await client.delete(
+            f"/api/v1/staff/{staff_id}",
+            headers=owner_headers,
+        )
+        assert revoked.status_code == 204, revoked.text
+
+    old_session = await client.get("/api/v1/auth/me", headers=member_headers)
+    assert old_session.status_code == 401
+
+    membership = (
+        await db_session.execute(
+            select(UserMembership).where(
+                UserMembership.user_id == user_id,
+                UserMembership.staff_id == staff_id,
+            )
+        )
+    ).scalar_one()
+    assert membership.status == "inactive"
+
+    revoked_user = await db_session.get(User, user_id)
+    assert revoked_user.token_version > 0
+    assert revoked_user.status == "inactive"
+
+    staff = await db_session.get(Staff, staff_id)
+    if operation == "deactivate":
+        assert staff.status == "inactive"
+        assert staff.deleted_at is None
+
+        restored = await client.put(
+            f"/api/v1/staff/{staff_id}",
+            headers=owner_headers,
+            json={"status": "active"},
+        )
+        assert restored.status_code == 200, restored.text
+        signed_in_again = await client.post(
+            "/api/v1/auth/login",
+            json={"email": email, "password": "revokedpass123"},
+        )
+        assert signed_in_again.status_code == 200, signed_in_again.text
+        restored_headers = {
+            "Authorization": f"Bearer {signed_in_again.json()['access_token']}"
+        }
+        restored_me = await client.get("/api/v1/auth/me", headers=restored_headers)
+        assert restored_me.status_code == 200, restored_me.text
+        still_revoked = await client.get("/api/v1/auth/me", headers=member_headers)
+        assert still_revoked.status_code == 401
+    else:
+        assert staff.deleted_at is not None
 
 
 @pytest.mark.asyncio

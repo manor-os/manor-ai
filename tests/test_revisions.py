@@ -153,14 +153,40 @@ async def test_strategist_schedule_upsert_bumps_only_on_change(db_session):
     assert await _audit_rows(db_session, job.id) == []
 
     # Cadence change → bump + audit carrying the changed fields.
+    dispatched_at = datetime.now(timezone.utc)
+    again.last_run_at = dispatched_at
+    again.last_status = "dispatched"
+    await db_session.flush()
     changed = await install_strategist_schedule(db_session, workspace, cadence="weekly")
     assert changed.id == job.id
     assert changed.revision == 2
+    assert changed.last_run_at is None
+    assert changed.last_status is None
     rows = await _audit_rows(db_session, job.id)
     assert len(rows) == 1
     assert rows[0].target_kind == "scheduled_job"
     assert rows[0].revision == 2
     assert rows[0].patch.get("every_seconds") == 604800.0
+
+    # Internal reconcilers must be able to clear the field belonging to the
+    # previous schedule kind; None is a real config value here, not omission.
+    cron = await install_strategist_schedule(
+        db_session,
+        workspace,
+        cadence="0 9 * * *",
+    )
+    assert cron.revision == 3
+    assert cron.cron_expr == "0 9 * * *"
+    assert cron.every_seconds is None
+    rows = await _audit_rows(db_session, job.id)
+    assert rows[-1].patch["every_seconds"] is None
+
+    interval = await install_strategist_schedule(db_session, workspace, cadence="daily")
+    assert interval.revision == 4
+    assert interval.cron_expr is None
+    assert interval.every_seconds == 86400.0
+    rows = await _audit_rows(db_session, job.id)
+    assert rows[-1].patch["cron_expr"] is None
 
 
 # ── goals: operator config changes bump, measurements never do ────────

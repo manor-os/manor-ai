@@ -4,7 +4,7 @@ from __future__ import annotations
 import logging
 from typing import Any, Optional
 
-from sqlalchemy import select, desc
+from sqlalchemy import and_, desc, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from packages.core.models.base import generate_ulid
@@ -16,6 +16,12 @@ from packages.core.models.workspace import (
     WorkspaceActivity,
 )
 from packages.core.services.entity_service import get_workspace
+from packages.core.services.reusable_resource_locks import (
+    RESOURCE_AGENT,
+    lock_reusable_resource_reference,
+    lock_reusable_resource_references,
+    reusable_skill_ids_from_runtime_state,
+)
 
 
 # ── Operating Model Management ──
@@ -59,6 +65,14 @@ async def update_operating_model(
     ws = await get_workspace(db, workspace_id, entity_id)
     if not ws:
         return None
+    await lock_reusable_resource_references(
+        db,
+        entity_id=entity_id,
+        skill_ids=(
+            reusable_skill_ids_from_runtime_state(operating_model)
+            - reusable_skill_ids_from_runtime_state(ws.operating_model)
+        ),
+    )
     ws.operating_model = operating_model
     from packages.core.workspace_chat.context import invalidate
     invalidate(workspace_id)
@@ -192,11 +206,23 @@ async def map_agent_to_service(
     if not ws:
         raise ValueError("Workspace not found")
 
-    agent = await db.get(Agent, agent_id)
-    if not agent or agent.deleted_at is not None or agent.status != "active":
-        raise ValueError("Agent not found")
-    if agent.entity_id and agent.entity_id != entity_id and not agent.is_template:
-        raise ValueError("Agent belongs to another entity")
+    from packages.core.services.marketplace_agent_service import (
+        ensure_marketplace_agent_installed,
+    )
+
+    agent = await ensure_marketplace_agent_installed(
+        db,
+        entity_id=entity_id,
+        agent_id=agent_id,
+        allow_local=True,
+    )
+    agent_id = agent.id
+    await lock_reusable_resource_reference(
+        db,
+        entity_id=entity_id,
+        resource_type=RESOURCE_AGENT,
+        resource_id=agent_id,
+    )
 
     # Look for existing subscription for this service_key
     result = await db.execute(
@@ -250,9 +276,17 @@ async def unmap_agent_from_service(
 
 
 async def get_workspace_agent_mappings(
-    db: AsyncSession, workspace_id: str, entity_id: str
+    db: AsyncSession,
+    workspace_id: str,
+    entity_id: str,
+    *,
+    include_agent_identity: bool = False,
 ) -> list[dict]:
-    """Get all agent-to-service mappings for a workspace."""
+    """Get active Workspace AgentSubscription mappings.
+
+    Display identity is an API projection and stays opt-in so operation drafts
+    persist only the canonical portable mapping contract.
+    """
     result = await db.execute(
         select(AgentSubscription).where(
             AgentSubscription.entity_id == entity_id,
@@ -261,17 +295,58 @@ async def get_workspace_agent_mappings(
         )
     )
     subs = result.scalars().all()
-    return [
+    mappings = [
         {
-            "id": s.id,
-            "agent_id": s.agent_id,
-            "service_key": s.service_key,
-            "custom_prompt": s.custom_prompt,
-            "config": s.config,
-            "created_at": s.created_at.isoformat() if s.created_at else None,
+            "id": subscription.id,
+            "agent_id": subscription.agent_id,
+            "service_key": subscription.service_key,
+            "custom_prompt": subscription.custom_prompt,
+            "config": subscription.config,
+            "created_at": (
+                subscription.created_at.isoformat()
+                if subscription.created_at
+                else None
+            ),
         }
-        for s in subs
+        for subscription in subs
     ]
+    if not include_agent_identity:
+        return mappings
+
+    agent_ids = {subscription.agent_id for subscription in subs if subscription.agent_id}
+    agents_by_id: dict[str, Agent] = {}
+    if agent_ids:
+        agents = (await db.execute(
+            select(Agent).where(
+                Agent.id.in_(agent_ids),
+                Agent.deleted_at.is_(None),
+                or_(
+                    Agent.entity_id == entity_id,
+                    and_(
+                        Agent.entity_id.is_(None),
+                        Agent.is_template.is_(True),
+                        Agent.is_public.is_(True),
+                    ),
+                ),
+            )
+        )).scalars().all()
+        agents_by_id = {agent.id: agent for agent in agents}
+
+    for mapping in mappings:
+        agent = agents_by_id.get(mapping["agent_id"])
+        mapping["agent"] = (
+            {
+                "id": agent.id,
+                "name": agent.name,
+                "avatar_url": agent.avatar_url,
+                "avatar_seed": str(
+                    (agent.config or {}).get("source_agent_id") or agent.id
+                ),
+            }
+            if agent is not None
+            else None
+        )
+    return mappings
 
 
 # ── Activity Logging ──
@@ -290,8 +365,9 @@ async def record_activity(
     details: dict = None,
     user_id: str = None,
     agent_id: str = None,
+    dispatch_triggers: bool = True,
 ) -> None:
-    """Record an activity and dispatch matching workspace workflow triggers."""
+    """Record an activity and optionally dispatch matching workflow triggers."""
     activity = WorkspaceActivity(
         id=generate_ulid(),
         workspace_id=workspace_id,
@@ -305,15 +381,16 @@ async def record_activity(
     db.add(activity)
     await db.flush()
 
-    await _dispatch_workspace_event_triggers(
-        db,
-        entity_id=entity_id,
-        workspace_id=workspace_id,
-        event_type=event_type,
-        summary=summary,
-        details=details,
-        started_by=user_id,
-    )
+    if dispatch_triggers:
+        await _dispatch_workspace_event_triggers(
+            db,
+            entity_id=entity_id,
+            workspace_id=workspace_id,
+            event_type=event_type,
+            summary=summary,
+            details=details,
+            started_by=user_id,
+        )
 
 
 async def _dispatch_workspace_event_triggers(
@@ -433,7 +510,7 @@ def _collect_output_files(actual_output: Any) -> list[dict[str, Any]]:
         if not isinstance(file, dict):
             continue
         path = _output_file_path(file)
-        document_id = str(file.get("document_id") or file.get("doc_id") or "").strip()
+        document_id = str(file.get("document_id") or "").strip()
         external_url = str(file.get("public_url") or file.get("url") or "").strip()
         key = document_id or path or external_url or f"file:{idx}"
         if key in seen:
@@ -602,6 +679,13 @@ async def list_activity(
             for task_id in _activity_task_ids(details)
             if (summary := task_summary(task_id)) is not None
         ]
+        if row.event_type == "task.status_changed":
+            event_status = str(details.get("new_status") or "").strip()
+            if event_status:
+                summaries = [
+                    {**summary, "status": event_status}
+                    for summary in summaries
+                ]
         if summaries:
             details["task_summaries"] = summaries
             details.setdefault("primary_task", summaries[0])

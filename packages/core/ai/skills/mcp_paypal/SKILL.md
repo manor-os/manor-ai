@@ -1,14 +1,14 @@
 ---
 name: mcp_paypal
-description: Operate PayPal through the official remote PayPal MCP (mcp.paypal.com). Use when the user asks to create/send invoices, manage orders and payments, issue refunds, handle disputes, manage products or subscriptions, track shipments, or read transactions.
+description: Operate PayPal through its official remote MCP in the configured sandbox or live environment. Use when the user asks to create/send invoices, manage orders and payments, issue refunds, handle disputes, manage products or subscriptions, track shipments, or read transactions.
 version: 1.0.0
 ---
 
 # PayPal Runtime Skill
 
-Use this skill to operate **PayPal** through the official **remote** PayPal MCP at `mcp.paypal.com` (`mcp__paypal__*`). This is real money movement — treat every write as high-impact.
+Use this skill to operate **PayPal** through its official **remote** MCP in the configured sandbox or live environment (`mcp__paypal__*`). This is real money movement — treat every write as high-impact.
 
-> Tools are served by `mcp.paypal.com` at runtime; the set below is the published PayPal MCP surface and may evolve. If an expected tool is missing, report what's available rather than inventing a name.
+> Tools are served by the configured PayPal MCP endpoint at runtime; the set below is the published PayPal MCP surface and may evolve. If an expected tool is missing, report what's available rather than inventing a name.
 
 ## When To Use
 
@@ -21,7 +21,7 @@ PayPal connects via **OAuth** to the remote MCP. On an auth error, stop and ask 
 ## Core Tools
 
 Invoicing:
-- `create_invoice`, `list_invoices`, `get_invoice`, `send_invoice`, `send_invoice_reminder`, `cancel_sent_invoice`, `generate_invoice_qr_code`.
+- `create_invoice`, `create_recurring_series`, `list_invoices`, `get_invoice`, `send_invoice`, `send_invoice_reminder`, `cancel_sent_invoice`, `generate_invoice_qr_code`.
 
 Orders / payments / refunds (highest impact — see Guardrails):
 - `create_order`, `get_order`, `pay_order`, `create_refund`, `get_refund`.

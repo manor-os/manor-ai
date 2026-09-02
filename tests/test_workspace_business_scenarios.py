@@ -612,6 +612,7 @@ def _business_workspace_fields(scenario: dict[str, Any], budget_credits: int) ->
             "auto_pause_on_budget": True,
         },
         "heartbeat_cadence": "0 9 * * 1-5",
+        "heartbeat_enabled": True,
     }
 
 

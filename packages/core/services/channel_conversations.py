@@ -1,11 +1,16 @@
 from __future__ import annotations
 
+import hashlib
 from typing import Optional
 
-from sqlalchemy import desc, or_, select
+from sqlalchemy import and_, desc, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from packages.core.constants.agents import is_master_agent
 from packages.core.models.task import Conversation, Message
+from packages.core.services.reusable_resource_locks import (
+    lock_reusable_resource_references,
+)
 
 CHANNEL_HISTORY_LIMIT = 12
 
@@ -33,33 +38,55 @@ async def get_or_create_channel_conversation(
     user_id: Optional[str] = None,
     workspace_id: Optional[str] = None,
     agent_subscription_id: Optional[str] = None,
+    conversation_key: Optional[str] = None,
 ) -> Conversation:
     """Resolve the durable conversation for a channel contact.
 
-    Channel conversation identity is keyed by ``channel_contact_id`` so display
-    name changes or contact merges do not fork chat history. When an old row is
-    found, newly introduced ownership/workspace fields are backfilled.
+    Channel conversation identity is keyed by the contact/thread and its exact
+    runtime route. Display-name changes do not fork history, while a Workspace,
+    subscription, or Agent reassignment starts a clean conversation.
     """
+    if conversation_key and db.get_bind().dialect.name == "postgresql":
+        digest = hashlib.sha256(
+            f"{entity_id}\0{channel_type}\0{conversation_key}".encode(),
+        ).digest()[:8]
+        lock_key = int.from_bytes(digest, byteorder="big", signed=True)
+        await db.execute(select(func.pg_advisory_xact_lock(lock_key)))
+
+    identity_filter = (
+        Conversation.meta["conversation_key"].astext == conversation_key
+        if conversation_key
+        else Conversation.meta["channel_contact_id"].astext == channel_contact_id
+    )
     existing = await db.execute(
         select(Conversation)
         .where(
             Conversation.entity_id == entity_id,
             Conversation.channel == channel_type,
-            Conversation.meta["channel_contact_id"].astext == channel_contact_id,
+            identity_filter,
         )
         .order_by(desc(Conversation.updated_at))
         .limit(1)
     )
     conv = existing.scalar_one_or_none()
-    if conv:
+    route_matches = bool(
+        conv
+        and conv.workspace_id == workspace_id
+        and conv.agent_subscription_id == agent_subscription_id
+        and conv.agent_id == agent_id
+    )
+    if conv and route_matches:
         if user_id and not conv.user_id:
             conv.user_id = user_id
-        if workspace_id and not getattr(conv, "workspace_id", None):
-            conv.workspace_id = workspace_id
-        if agent_subscription_id and not getattr(conv, "agent_subscription_id", None):
-            conv.agent_subscription_id = agent_subscription_id
         await db.flush()
         return conv
+
+    if agent_id and not is_master_agent(agent_id):
+        await lock_reusable_resource_references(
+            db,
+            entity_id=entity_id,
+            agent_ids=(agent_id,),
+        )
 
     conv = Conversation(
         entity_id=entity_id,
@@ -75,6 +102,7 @@ async def get_or_create_channel_conversation(
             "sender_id": sender_id,
             "sender_name": sender_name,
             "chat_id": chat_id,
+            **({"conversation_key": conversation_key} if conversation_key else {}),
         },
     )
     db.add(conv)
@@ -130,12 +158,13 @@ async def list_public_webchat_messages(
     *,
     session_id: str | None = None,
     after: str | None = None,
+    message_ids: list[str] | None = None,
     limit: int = 50,
 ) -> list[dict]:
     q = select(Message).where(
         Message.conversation_id == conversation_id,
         Message.role.in_(("user", "assistant")),
-    ).order_by(Message.created_at.asc())
+    ).order_by(Message.created_at.asc(), Message.id.asc())
 
     if session_id:
         q = q.where(
@@ -148,12 +177,20 @@ async def list_public_webchat_messages(
             ),
         )
 
+    if message_ids is not None:
+        q = q.where(Message.id.in_(message_ids))
+
     if after:
-        cursor_msg = (await db.execute(
-            select(Message.created_at).where(Message.id == after)
-        )).scalar_one_or_none()
-        if cursor_msg:
-            q = q.where(Message.created_at > cursor_msg)
+        # The cursor has the same conversation/visitor visibility as the page.
+        cursor = (await db.execute(
+            q.with_only_columns(Message.created_at, Message.id)
+            .where(Message.id == after).order_by(None)
+        )).one_or_none()
+        if cursor:
+            q = q.where(or_(
+                Message.created_at > cursor.created_at,
+                and_(Message.created_at == cursor.created_at, Message.id > cursor.id),
+            ))
 
     rows = (await db.execute(q.limit(limit))).scalars().all()
     return [
@@ -162,6 +199,8 @@ async def list_public_webchat_messages(
             "role": message.role,
             "content": message.content,
             "created_at": message.created_at.isoformat() if message.created_at else None,
+            "stream_status": (message.meta or {}).get("stream_status"),
+            "client_turn_id": (message.meta or {}).get("client_turn_id"),
             "attachments": (
                 (message.attachments or {}).get("items")
                 if message.attachments
@@ -182,6 +221,7 @@ async def add_channel_inbound_message(
     chat_id: Optional[str],
     content: str,
     attachments: list[dict] | None = None,
+    meta: dict | None = None,
 ) -> Message:
     """Persist an inbound channel turn in the conversation transcript."""
     message = Message(
@@ -194,6 +234,7 @@ async def add_channel_inbound_message(
             "sender_id": sender_id,
             "sender_name": sender_name,
             "chat_id": chat_id,
+            **dict(meta or {}),
         },
     )
     db.add(message)

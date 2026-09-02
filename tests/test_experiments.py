@@ -51,9 +51,10 @@ from packages.core.models.experiment import Experiment
 from packages.core.models.feature_flag import FeatureFlag
 from packages.core.models.goal import Goal
 from packages.core.models.proposal import ProposalItemRecord, ProposalRecord
-from packages.core.models.scheduler import ScheduledJob
+from packages.core.models.scheduler import ScheduledJob, ScheduledJobRun
 from packages.core.models.workspace import Agent, AgentSubscription, Workspace
 from packages.core.models.workspace_event import WorkspaceEvent
+from packages.core.models.user import User, UserMembership
 from packages.core.services import feature_flags as feature_flags_service
 from packages.core.strategist import service as strategist_service
 from packages.core.tasks import ai_tasks
@@ -74,6 +75,7 @@ def _utcnow() -> datetime:
 
 async def _seed_workspace(db) -> Workspace:
     entity_id = generate_ulid()
+    actor_id = entity_id
     workspace = Workspace(
         id=generate_ulid(),
         entity_id=entity_id,
@@ -98,7 +100,26 @@ async def _seed_workspace(db) -> Workspace:
         service_key="ops",
         status="active",
     )
-    db.add_all([workspace, goal, agent, subscription])
+    db.add_all([
+        User(
+            id=actor_id,
+            entity_id=entity_id,
+            email=f"{actor_id}-{entity_id}@example.com",
+            password_hash="test-only",
+            role="owner",
+            status="active",
+        ),
+        UserMembership(
+            user_id=actor_id,
+            entity_id=entity_id,
+            role="owner",
+            status="active",
+        ),
+        workspace,
+        goal,
+        agent,
+        subscription,
+    ])
     await db.commit()
     return workspace
 
@@ -525,11 +546,12 @@ async def test_effective_dispatch_config_merges_only_while_running(db_session):
 
 
 async def test_dispatch_job_uses_patched_config_and_xp_correlation(db_session, monkeypatch):
-    from packages.core.models.task import Task
+    from packages.core.constants.task import TaskLogType
+    from packages.core.models.task import Task, TaskLog
     from packages.core.tasks.scheduler_tasks import _dispatch_job
 
     workspace = await _seed_workspace(db_session)
-    job = await _seed_job(db_session, workspace)
+    job = await _seed_job(db_session, workspace, user_id=workspace.entity_id)
     experiment = _experiment_row(workspace, job)
     db_session.add(experiment)
     await db_session.flush()
@@ -558,8 +580,33 @@ async def test_dispatch_job_uses_patched_config_and_xp_correlation(db_session, m
     )).scalars().all())
     auto_tasks = [t for t in tasks if (t.details or {}).get("scheduled_job_id") == job.job_id]
     assert len(auto_tasks) == 1
-    assert "patched digest message" in (auto_tasks[0].description or "")
+    auto_task = auto_tasks[0]
+    assert auto_task.creator_id == workspace.entity_id
+    assert "patched digest message" in (auto_task.description or "")
+    creation_log = await db_session.scalar(
+        select(TaskLog).where(
+            TaskLog.task_id == auto_task.id,
+            TaskLog.log_type == TaskLogType.CREATE,
+        )
+    )
+    assert creation_log is not None
+    assert creation_log.created_by == "system"
+    assert creation_log.meta["actor_kind"] == "system"
+    assert creation_log.meta["scheduled_job_id"] == job.job_id
+    assert creation_log.meta["scheduled_run_id"] == auto_task.details["scheduled_run_id"]
+    scheduled_run = await db_session.get(
+        ScheduledJobRun,
+        auto_task.details["scheduled_run_id"],
+    )
+    assert scheduled_run is not None
+    assert scheduled_run.status == "completed"
+    assert scheduled_run.completed_at is not None
+    assert scheduled_run.result == {
+        "task_id": auto_task.id,
+        "dispatch_mode": "manual_task_created",
+    }
     await db_session.refresh(job)
+    assert job.last_status == "completed"
     assert job.payload_message == "original digest message"
     assert job.execution_target[EXPERIMENT_OVERLAY_KEY]["experiment_id"] == experiment.id
 
@@ -744,13 +791,12 @@ async def test_v2_review_needs_human_then_approve_flow_starts_experiment(db_sess
     # Operator approves the review via the existing flow → the experiment
     # item is approved with the cohort, the Experiment starts, and the
     # per-item request is consumed.
-    actor = generate_ulid()
     approved_task_ids = await strategist_service.approve_proposal(
         db_session,
         entity_id=workspace.entity_id,
         review_id=result["review_id"],
         actor_kind="user",
-        actor_id=actor,
+        actor_id=workspace.entity_id,
     )
     await db_session.commit()
     assert approved_task_ids  # the cohort's task moved
@@ -787,7 +833,7 @@ async def test_v2_review_reject_flow_rejects_experiment_item(db_session, monkeyp
         reason="Not this cycle.",
         reason_code="BAD_TIMING",
         actor_kind="user",
-        actor_id=generate_ulid(),
+        actor_id=workspace.entity_id,
     )
     await db_session.commit()
 

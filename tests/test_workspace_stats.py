@@ -8,7 +8,7 @@ import pytest
 from sqlalchemy import select
 
 from packages.core.goals.measurers import twitter_x as twitter_x_measurer
-from packages.core.goals.service import create_goal
+from packages.core.goals.service import create_goal, update_goal
 from packages.core.blueprints.exporter import _export_goals, _export_stats
 from packages.core.blueprints.installer import InstallMode, _install_goal, _install_stat
 from packages.core.models.base import generate_ulid
@@ -38,6 +38,7 @@ from packages.core.stats.service import (
     list_observations,
     record_observation,
 )
+from packages.core.services.workspace_evaluation import build_workspace_evaluation
 
 
 INTERNAL_LIBRARY_EXPECTATIONS = {
@@ -444,6 +445,141 @@ async def test_manual_stat_accepts_append_only_values_without_schedule(db_sessio
 
 
 @pytest.mark.asyncio
+async def test_rebinding_goal_stat_discards_previous_metric_runtime_state(
+    db_session,
+) -> None:
+    workspace = _workspace(db_session)
+    await db_session.flush()
+    previous_stat = await create_stat(
+        db_session,
+        entity_id=workspace.entity_id,
+        workspace_id=workspace.id,
+        key="sales.qualified_leads",
+        name="Qualified leads",
+        unit="leads",
+        collector_type="manual",
+    )
+    next_stat = await create_stat(
+        db_session,
+        entity_id=workspace.entity_id,
+        workspace_id=workspace.id,
+        key="workspace.tasks.completed",
+        name="Tasks completed",
+        unit="tasks",
+        collector_type="manual",
+    )
+    goal = await create_goal(
+        db_session,
+        entity_id=workspace.entity_id,
+        workspace_id=workspace.id,
+        stat_id=previous_stat.id,
+        title="Grow qualified leads",
+        metric_key=previous_stat.key,
+        target_value=10,
+        baseline_value=0,
+    )
+    await record_observation(
+        db_session,
+        previous_stat,
+        value=4,
+        source="manual",
+    )
+    assert goal.current_value == Decimal("4")
+    assert goal.current_value_updated_at is not None
+    assert goal.pace_computed_at is not None
+
+    updated = await update_goal(
+        db_session,
+        goal.id,
+        workspace.entity_id,
+        stat_id=next_stat.id,
+    )
+
+    assert updated is not None
+    assert updated.stat_id == next_stat.id
+    assert updated.current_value is None
+    assert updated.current_value_updated_at is None
+    assert updated.pace_status is None
+    assert updated.pace_computed_at is None
+    assert updated.achieved_at is None
+
+    evaluation = await build_workspace_evaluation(
+        db_session,
+        workspace.id,
+        entity_id=workspace.entity_id,
+        now=datetime.now(timezone.utc),
+    )
+    goal_impact = evaluation["dimensions"]["goal_impact"]
+    assert goal_impact["aggregate"]["measured_goal_count"] == 0
+    assert goal_impact["goals"][0]["measurement_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_linked_goal_quantizes_stat_without_losing_observation_precision(
+    db_session,
+) -> None:
+    workspace = _workspace(db_session)
+    await db_session.flush()
+    stat = await create_stat(
+        db_session,
+        entity_id=workspace.entity_id,
+        workspace_id=workspace.id,
+        key="sales.conversion_rate",
+        name="Conversion rate",
+        unit="ratio",
+        collector_type="manual",
+        window="rolling_7d",
+    )
+    goal = await create_goal(
+        db_session,
+        entity_id=workspace.entity_id,
+        workspace_id=workspace.id,
+        stat_id=stat.id,
+        title="Improve conversion",
+        metric_key=stat.key,
+        target_value=1,
+        baseline_value=0,
+    )
+
+    observation = await record_observation(
+        db_session,
+        stat,
+        value=Decimal("0.1234499"),
+        source="manual",
+    )
+
+    assert observation.value == Decimal("0.123450")
+    assert stat.current_value == Decimal("0.123450")
+    assert goal.current_value == Decimal("0.1235")
+    [measurement] = list((await db_session.execute(select(GoalMeasurement).where(
+        GoalMeasurement.goal_id == goal.id,
+    ))).scalars().all())
+    assert measurement.value == Decimal("0.1235")
+
+    out_of_range = await record_observation(
+        db_session,
+        stat,
+        value=Decimal("10000000000000000"),
+        source="manual",
+    )
+    assert out_of_range.value == Decimal("10000000000000000")
+    assert stat.current_value == Decimal("10000000000000000")
+    assert stat.last_collection_status == "error"
+    assert goal.id in (stat.last_collection_error or "")
+    assert out_of_range.evidence == {
+        "goal_projection_errors": [{
+            "goal_id": goal.id,
+            "goal_key": goal.goal_key,
+            "reason": "exceeds the supported numeric range",
+        }],
+    }
+    assert goal.current_value == Decimal("0.1235")
+    assert len(list((await db_session.execute(select(GoalMeasurement).where(
+        GoalMeasurement.goal_id == goal.id,
+    ))).scalars().all())) == 1
+
+
+@pytest.mark.asyncio
 async def test_library_stat_allows_explicitly_disabling_default_schedule(db_session) -> None:
     workspace = _workspace(db_session)
     await db_session.flush()
@@ -479,11 +615,11 @@ async def test_blueprint_stats_install_before_linked_goals_and_export_portably(d
         entity_id=workspace.entity_id,
         workspace_id=workspace.id,
         g={
+            "goal_key": "completed_tasks",
             "title": "Complete ten tasks",
             "stat_key": "workspace.tasks.completed",
             "target_value": 10,
         },
-        mode=InstallMode.LIVE,
     )
 
     exported_stats = await _export_stats(db_session, workspace.entity_id, workspace.id)
@@ -493,6 +629,7 @@ async def test_blueprint_stats_install_before_linked_goals_and_export_portably(d
     assert goal_id
     assert exported_stats[0]["library_key"] == "workspace.tasks.completed"
     assert "current_value" not in exported_stats[0]
+    assert exported_goals[0]["goal_key"] == "completed_tasks"
     assert exported_goals[0]["stat_key"] == "workspace.tasks.completed"
     assert exported_goals[0]["measurement_source"] is None
 

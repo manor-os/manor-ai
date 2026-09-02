@@ -120,11 +120,11 @@ def test_runtime_invoke_skill_action_passes_runtime_artifacts_to_skill(monkeypat
         async def __aexit__(self, exc_type, exc, tb):
             return False
 
-    async def fake_runtime_invoke_skill(db, skill, entity_id, input_text, **kwargs):
+    async def fake_runtime_invoke_skill(db, skill_id, entity_id, input_text, **kwargs):
         del db, kwargs
         captured.update(
             {
-                "skill": skill,
+                "skill": skill_id,
                 "entity_id": entity_id,
                 "input_text": input_text,
             }
@@ -132,14 +132,22 @@ def test_runtime_invoke_skill_action_passes_runtime_artifacts_to_skill(monkeypat
         return {"content": "ok"}
 
     from packages.core import database
+    from packages.core.services import skill_service
 
     monkeypatch.setattr(database, "async_session", lambda: FakeSession())
+    monkeypatch.setattr(
+        skill_service,
+        "get_skill",
+        lambda _db, _skill_id: asyncio.sleep(0, result=SimpleNamespace(
+            status="active", entity_id=None, slug="pptx", name="pptx",
+        )),
+    )
     monkeypatch.setattr(runtime_skills, "runtime_invoke_skill", fake_runtime_invoke_skill)
 
     result = asyncio.run(
         runtime_skills.runtime_invoke_skill_action(
             entity_id="ent_1",
-            skill="pptx",
+            skill_id="pptx",
             input_text="把这些图拼成 PPT",
             runtime_context=SimpleNamespace(
                 runtime_artifact_urls=frozenset({"/api/v1/fs/ent_1/Workspaces/Story/images/page_01.png"}),

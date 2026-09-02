@@ -75,6 +75,21 @@ docker compose logs worker --tail=100
 docker compose down
 ```
 
+## Compose Network Conflicts
+
+Manor reserves two addresses near the end of a private `/24` for the Caddy and
+web proxies, outside the dynamic container pool. If the default
+`172.30.0.0/24` overlaps another local or VPN network, change the first three
+octets once in `.env`:
+
+```bash
+MANOR_DOCKER_NETWORK_PREFIX=10.50.7
+```
+
+This derives `10.50.7.0/24`, the `10.50.7.0/25` dynamic pool, and proxy
+addresses `10.50.7.250` and `10.50.7.251` together. Use three decimal octets;
+do not include a CIDR suffix.
+
 ## Rebuilding One Service
 
 ```bash

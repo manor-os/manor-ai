@@ -174,3 +174,34 @@ async def test_entity_wide_task_list_excludes_unreadable_workspaces(client: Asyn
         if isinstance(tasks, list) for t in tasks
     }
     assert "ws-only secret task" not in board_titles, board_titles
+
+
+@pytest.mark.asyncio
+async def test_missing_or_legacy_workspace_role_is_read_only(client: AsyncClient):
+    owner_headers = await _auth(client, "wsrole_owner")
+    entity_id = await _entity_id(client, owner_headers)
+    member = await _create_entity_user(entity_id, "wsrole_member", role="member")
+    async with db_module.async_session() as db:
+        ws = Workspace(
+            entity_id=entity_id,
+            name="Role allowlist",
+            settings={"access_mode": "members_only"},
+        )
+        db.add(ws)
+        await db.flush()
+        db.add(WorkspaceStaff(
+            workspace_id=ws.id,
+            user_id=member["id"],
+            role=None,
+            status="active",
+        ))
+        await db.commit()
+        from packages.core.services.workspace_access import user_can_write_workspace_id
+
+        assert not await user_can_write_workspace_id(
+            db,
+            workspace_id=ws.id,
+            entity_id=entity_id,
+            user_id=member["id"],
+            role="member",
+        )

@@ -7,6 +7,8 @@ mint side cannot silently fall through the chat bridge.
 """
 from __future__ import annotations
 
+import json
+
 import pytest
 from sqlalchemy import select
 
@@ -23,6 +25,8 @@ from packages.core.constants.execution import (
 from packages.core.models.base import generate_ulid
 from packages.core.models.execution import ExecutionPlan, ExecutionStep
 from packages.core.models.hitl_request import HitlRequest
+from packages.core.models.user import User
+from packages.core.models.workspace import Workspace
 from packages.core.services.task_blockers import (
     ANSWERABLE_BLOCKER_KINDS,
     KIND_NEEDS_LOGIN,
@@ -34,10 +38,11 @@ pytestmark = pytest.mark.asyncio
 
 
 def _mk_ids():
+    entity_id = generate_ulid()
     return {
-        "entity_id": generate_ulid(),
+        "entity_id": entity_id,
         "workspace_id": generate_ulid(),
-        "user_id": generate_ulid(),
+        "user_id": entity_id,
     }
 
 
@@ -50,6 +55,22 @@ async def _seed_blocker(
     status: str = ApprovalStatus.PENDING.value,
     origin_kind: str = ApprovalOriginKind.LEASE.value,
 ):
+    if await db.get(Workspace, workspace_id) is None:
+        db.add(Workspace(
+            id=workspace_id,
+            entity_id=entity_id,
+            name="Task blocker workspace",
+            operating_model={},
+        ))
+    user_id = entity_id
+    if await db.get(User, user_id) is None:
+        db.add(User(
+            id=user_id,
+            entity_id=entity_id,
+            email=f"task-blocker-{entity_id}@example.com",
+            password_hash="x",
+            role="owner",
+        ))
     plan = ExecutionPlan(
         id=generate_ulid(),
         entity_id=entity_id,
@@ -146,6 +167,7 @@ async def test_answer_writes_response_and_revives_plan(db_session):
     )
     await db_session.flush()
     assert result["resolved"] is True
+    assert result["_plan_to_run"] == plan.id
     fresh_step = (await db_session.execute(
         select(ExecutionStep).where(ExecutionStep.id == step.id)
     )).scalar_one()
@@ -225,6 +247,7 @@ async def test_refuse_denies_request_and_fails_step(db_session):
         "decision": "refused",
         "request_id": request.id,
         "task_id": None,
+        "_plan_to_run": step.plan_id,
     }
     fresh_request = (await db_session.execute(
         select(HitlRequest).where(HitlRequest.id == request.id)
@@ -305,3 +328,74 @@ async def test_list_open_task_blockers_scopes_and_shapes(db_session):
     assert entry["pending_kind"] == "needs_input"
     assert entry["answerable_via_tool"] is True
     assert entry["reason"].startswith("Which screenshot")
+
+
+async def test_runtime_blocker_dispatches_only_after_commit_and_recovers_failure(
+    monkeypatch,
+):
+    from packages.core.ai.runtime.workspace_blocker_actions import (
+        runtime_workspace_answer_task_blocker_action,
+    )
+    from packages.core.services import task_blockers, task_retry_service
+    from packages.core.tasks import ai_tasks
+    import packages.core.database as database
+
+    events: list[str] = []
+
+    class FakeSession:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def commit(self):
+            events.append("commit")
+
+        async def rollback(self):
+            events.append("rollback")
+
+    async def fake_answer(_db, **_kwargs):
+        events.append("resolve")
+        return {
+            "resolved": True,
+            "decision": "answered",
+            "_plan_to_run": "plan-1",
+        }
+
+    def fail_dispatch(plan_id: str):
+        assert plan_id == "plan-1"
+        events.append("dispatch")
+        raise RuntimeError("broker unavailable")
+
+    async def fake_mark(_db, **kwargs):
+        assert kwargs == {
+            "plan_id": "plan-1",
+            "user_id": "user-1",
+            "reason": "task_blocker_dispatch_failed",
+        }
+        events.append("recover")
+        return True
+
+    monkeypatch.setattr(database, "async_session", lambda: FakeSession())
+    monkeypatch.setattr(task_blockers, "answer_task_blocker", fake_answer)
+    monkeypatch.setattr(ai_tasks.run_plan, "delay", fail_dispatch)
+    monkeypatch.setattr(
+        task_retry_service,
+        "mark_plan_continuation_dispatch_failed",
+        fake_mark,
+    )
+
+    payload = json.loads(await runtime_workspace_answer_task_blocker_action(
+        entity_id="entity-1",
+        user_id="user-1",
+        workspace_id="workspace-1",
+        params={"request_id": "request-1", "answer": "continue"},
+    ))
+
+    assert payload == {
+        "resolved": True,
+        "decision": "answered",
+        "dispatched": False,
+    }
+    assert events == ["resolve", "commit", "dispatch", "recover", "commit"]

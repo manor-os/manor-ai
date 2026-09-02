@@ -43,6 +43,11 @@ _API = "https://graph.microsoft.com/v1.0"
 _MAX_CHARS = 12_000
 
 
+def _path_segment(value: Any) -> str:
+    """Encode an opaque Graph workbook resource id as one path segment."""
+    return quote(str(value), safe="")
+
+
 def list_tools() -> List[Dict[str, Any]]:
     return [_tool_def(name, spec) for name, spec in _TOOLS.items()]
 
@@ -50,15 +55,24 @@ def list_tools() -> List[Dict[str, Any]]:
 async def call_tool(
     name: str, arguments: Dict[str, Any], bearer_token: str,
 ) -> Dict[str, Any]:
+    token = bearer_token.strip() if isinstance(bearer_token, str) else ""
+    if not token:
+        return _error(
+            "Microsoft Graph access token is missing. Reconnect Microsoft on the Integration page."
+        )
+
     handler = _HANDLERS.get(name)
     if not handler:
         return _error(f"Unknown tool: {name}")
+    if not isinstance(arguments, dict):
+        return _error("arguments must be an object")
+    arguments = dict(arguments)
     spec = _TOOLS.get(name, {})
     missing = [p for p in spec.get("required", []) if arguments.get(p) in (None, "")]
     if missing:
         return _error(f"Missing required params: {', '.join(missing)}")
     try:
-        text = await handler(bearer_token, arguments)
+        text = await handler(token, arguments)
         return {"content": [{"type": "text", "text": text}], "isError": False}
     except Exception as exc:  # noqa: BLE001
         logger.exception("MS Excel MCP tool %s failed", name)
@@ -116,7 +130,23 @@ async def _api(
 
 def _wb(file_id: str) -> str:
     """Workbook root path for a OneDrive item."""
-    return f"me/drive/items/{file_id}/workbook"
+    return f"me/drive/items/{_path_segment(file_id)}/workbook"
+
+
+def _top(value: Any, *, default: int = 100) -> int:
+    if value is None or value == "":
+        return default
+    if isinstance(value, bool):
+        raise ValueError("top must be an integer between 1 and 1000")
+    try:
+        count = int(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("top must be an integer between 1 and 1000") from exc
+    if isinstance(value, float) and value != count:
+        raise ValueError("top must be an integer between 1 and 1000")
+    if count < 1:
+        raise ValueError("top must be at least 1")
+    return min(count, 1000)
 
 
 # ── Tool handlers ───────────────────────────────────────────────────────────
@@ -137,14 +167,14 @@ async def _add_worksheet(token: str, args: Dict) -> str:
 async def _delete_worksheet(token: str, args: Dict) -> str:
     return await _api(
         token, "DELETE",
-        f"{_wb(args['file_id'])}/worksheets/{quote(args['worksheet'])}",
+        f"{_wb(args['file_id'])}/worksheets/{_path_segment(args['worksheet'])}",
     )
 
 
 async def _rename_worksheet(token: str, args: Dict) -> str:
     return await _api(
         token, "PATCH",
-        f"{_wb(args['file_id'])}/worksheets/{quote(args['worksheet'])}",
+        f"{_wb(args['file_id'])}/worksheets/{_path_segment(args['worksheet'])}",
         body={"name": args["new_name"]},
     )
 
@@ -155,7 +185,7 @@ async def _read_range(token: str, args: Dict) -> str:
     """Read a range by A1 address (e.g. 'A1:C10'). Returns values + formulas + format."""
     return await _api(
         token, "GET",
-        f"{_wb(args['file_id'])}/worksheets/{quote(args['worksheet'])}"
+        f"{_wb(args['file_id'])}/worksheets/{_path_segment(args['worksheet'])}"
         f"/range(address='{args['address']}')",
         persist_changes=False,
     )
@@ -169,7 +199,7 @@ async def _read_used_range(token: str, args: Dict) -> str:
     suffix = "?$select=values" if values_only else ""
     return await _api(
         token, "GET",
-        f"{_wb(args['file_id'])}/worksheets/{quote(args['worksheet'])}/usedRange{suffix}",
+        f"{_wb(args['file_id'])}/worksheets/{_path_segment(args['worksheet'])}/usedRange{suffix}",
         persist_changes=False,
     )
 
@@ -187,7 +217,7 @@ async def _write_range(token: str, args: Dict) -> str:
         body["numberFormat"] = args["number_format"]
     return await _api(
         token, "PATCH",
-        f"{_wb(args['file_id'])}/worksheets/{quote(args['worksheet'])}"
+        f"{_wb(args['file_id'])}/worksheets/{_path_segment(args['worksheet'])}"
         f"/range(address='{args['address']}')",
         body=body,
     )
@@ -200,7 +230,7 @@ async def _update_cell(token: str, args: Dict) -> str:
     call from agent prompts ("set cell B5 to 42")."""
     return await _api(
         token, "PATCH",
-        f"{_wb(args['file_id'])}/worksheets/{quote(args['worksheet'])}"
+        f"{_wb(args['file_id'])}/worksheets/{_path_segment(args['worksheet'])}"
         f"/range(address='{args['address']}')",
         body={"values": [[args["value"]]]},
     )
@@ -211,7 +241,7 @@ async def _clear_range(token: str, args: Dict) -> str:
     apply_to = args.get("apply_to") or "Contents"  # Contents | Formats | All
     return await _api(
         token, "POST",
-        f"{_wb(args['file_id'])}/worksheets/{quote(args['worksheet'])}"
+        f"{_wb(args['file_id'])}/worksheets/{_path_segment(args['worksheet'])}"
         f"/range(address='{args['address']}')/clear",
         body={"applyTo": apply_to},
     )
@@ -229,10 +259,10 @@ async def _list_tables(token: str, args: Dict) -> str:
 
 async def _get_table_rows(token: str, args: Dict) -> str:
     """Read a table's data rows."""
-    params: Dict[str, Any] = {"$top": min(int(args.get("top") or 100), 1000)}
+    params: Dict[str, Any] = {"$top": _top(args.get("top"))}
     return await _api(
         token, "GET",
-        f"{_wb(args['file_id'])}/tables/{quote(args['table'])}/rows",
+        f"{_wb(args['file_id'])}/tables/{_path_segment(args['table'])}/rows",
         params=params, persist_changes=False,
     )
 
@@ -245,7 +275,7 @@ async def _add_table_rows(token: str, args: Dict) -> str:
         body["index"] = int(args["index"])
     return await _api(
         token, "POST",
-        f"{_wb(args['file_id'])}/tables/{quote(args['table'])}/rows/add",
+        f"{_wb(args['file_id'])}/tables/{_path_segment(args['table'])}/rows/add",
         body=body,
     )
 
@@ -262,7 +292,7 @@ async def _create_table(token: str, args: Dict) -> str:
     }
     return await _api(
         token, "POST",
-        f"{_wb(args['file_id'])}/worksheets/{quote(args['worksheet'])}/tables/add",
+        f"{_wb(args['file_id'])}/worksheets/{_path_segment(args['worksheet'])}/tables/add",
         body=body,
     )
 
@@ -293,7 +323,7 @@ async def _get_named_item_range(token: str, args: Dict) -> str:
     """Read the range a named item points at."""
     return await _api(
         token, "GET",
-        f"{_wb(args['file_id'])}/names/{quote(args['name'])}/range",
+        f"{_wb(args['file_id'])}/names/{_path_segment(args['name'])}/range",
         persist_changes=False,
     )
 

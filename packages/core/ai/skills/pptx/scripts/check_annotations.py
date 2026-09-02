@@ -20,6 +20,7 @@ Dependencies:
 import argparse
 import sys
 import xml.etree.ElementTree as ET
+from defusedxml import ElementTree as SafeET
 from pathlib import Path
 from typing import Optional
 
@@ -27,7 +28,7 @@ from typing import Optional
 def scan_svg_file(svg_path: Path) -> list[dict]:
     """Scan a single SVG file for edit annotations."""
     try:
-        tree = ET.parse(svg_path)
+        tree = SafeET.parse(svg_path)
     except ET.ParseError:
         return []
 

@@ -2,7 +2,7 @@
  * ChatInputFooter — shared chat composer footer.
  *
  * Owns: attached files (local + KB), attach menu, voice input
- * (SpeechRecognition), # autocomplete, the textarea, send/stop.
+ * (AI transcription), # autocomplete, the textarea, send/stop.
  *
  * Parent owns input value (controlled) so callers can layer extras
  * (e.g., @-mention) by wrapping onChange / onKeyDown and rendering
@@ -19,52 +19,39 @@ import {
 } from "react";
 import { createPortal } from "react-dom";
 import { createRoot, type Root } from "react-dom/client";
-import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { api } from "../lib/api";
+import { useQuery } from "@tanstack/react-query";
+import { useNavigate } from "react-router-dom";
+import { api, type IntegrationMCPServer } from "../lib/api";
+import { integrationCatalogQueryOptions } from "../lib/integrationCatalog";
+import { integrationSetupHref } from "../lib/integrationSetupLinks";
+import { useChatVoiceInput } from "../lib/useChatVoiceInput";
+import type { ChatVoiceScope } from "../lib/chatVoice";
+import { VoiceInputButton, VoiceInputStatus } from "./chat/ChatVoiceControls";
+import LiveChatCallButton from "./chat/LiveChatCallButton";
+import IntegrationLogo from "./IntegrationLogo";
+import NangoConnectButton from "./integrations/NangoConnectButton";
+import Modal from "./ui/Modal";
 import { useAuthStore } from "../stores/auth";
 import UserAvatar from "./ui/UserAvatar";
 import { type ChatMessage, useDebounced } from "../lib/chatStream";
 import { getSkillDescription } from "../pages/skills/skillTypes";
 import { shouldHandleComposerEnter } from "../lib/composerKeyboard";
+import type { ManualSkillReference } from "../lib/manualSkillRefs";
 import { InlineRowsSkeleton } from "./ui/Skeleton";
 import {
-  IconCalendar,
-  IconChat,
   IconChecklist,
   IconClose,
   IconConnection,
   IconDocument,
-  IconDollar,
-  IconEmail,
-  IconFacebook,
-  IconYouTube,
-  IconTikTok,
-  IconShoppingCart,
-  IconStore,
-  IconBox,
-  IconFolder,
   IconFlow,
-  IconGitHub,
-  IconLinkedIn,
-  IconPayPal,
   IconPlus,
-  IconSlack,
   IconSkill,
-  IconStripe,
-  IconTelegram,
-  IconTwilio,
-  IconTwitter,
   IconUpload,
-  IconWebhook,
-  IconWeChat,
-  IconWhatsApp,
-  IconCloud,
-  IconExcelGrid,
-  type IconProps,
 } from "./icons";
 import Select from "./ui/Select";
 import { t } from "../lib/i18n";
 import { usePreviewFeatureAccess } from "../lib/previewFeatureAccess";
+import { connectorAccessState } from "../lib/integration-usability.mjs";
 
 
 export interface AttachedItem {
@@ -87,6 +74,7 @@ type ComposerReferencePreviewItem = Pick<
 type ComposerDocumentOption = {
   id: string;
   name: string;
+  fs_path?: string | null;
   file_type?: string | null;
   mime_type?: string | null;
 };
@@ -95,6 +83,7 @@ function composerPreviewItemFromDoc(doc: ComposerDocumentOption): AttachedItem {
   return {
     name: doc.name,
     id: doc.id,
+    fsPath: doc.fs_path || undefined,
     type: "knowledge",
     fileType: doc.file_type || undefined,
     mimeType: doc.mime_type || undefined,
@@ -124,7 +113,7 @@ export async function createChatMessageAttachmentSnapshot(
   }
   return {
     name: item.name,
-    id: item.id,
+    document_id: item.id,
     fsPath: item.fsPath,
     type: item.type,
     fileType: item.fileType,
@@ -220,11 +209,13 @@ export interface MentionOption {
   name: string;
   subtitle?: string;
   avatarUrl?: string | null;
+  avatarSeed?: string;
 }
 
 export interface ManualSkillItem {
   id: string;
   name: string;
+  reference?: ManualSkillReference;
   slug?: string | null;
   displayName?: string | null;
   display_name?: string | null;
@@ -304,6 +295,110 @@ export function workflowInvokeToken(workflow: WorkflowInvokeItem) {
   return `%${slugifyWorkflowToken(workflow.title)}`;
 }
 
+function replaceAutocompleteTriggerRange(
+  value: string,
+  start: number,
+  replaceEnd: number,
+  token: string,
+  trigger: string,
+  cursorPos = value.length,
+) {
+  const safeStart = Math.max(0, Math.min(value.length, start));
+  const safeCursor = Math.max(0, Math.min(value.length, cursorPos));
+  const isTrigger = (index: number) =>
+    value[index] === trigger && (index === 0 || /\s/.test(value[index - 1]));
+  const isLiveTrigger = (index: number) =>
+    isTrigger(index) &&
+    (index === value.length - 1 || !/\s/.test(value[index + 1]));
+  const triggerHasNoWhitespaceBeforeCursor = (index: number) =>
+    !/[\s\n]/.test(value.substring(index + 1, safeCursor));
+  let recoveredFromLiveValue = false;
+  let resolvedStart =
+    isTrigger(safeStart) &&
+    safeStart <= safeCursor &&
+    triggerHasNoWhitespaceBeforeCursor(safeStart)
+      ? safeStart
+      : -1;
+
+  // A menu click can leave the browser selection before the typed trigger while
+  // React has already reset the stored trigger position. Recover the latest
+  // whitespace-delimited live trigger from the editor value in that case.
+  if (resolvedStart < 0) {
+    for (let index = value.length - 1; index >= 0; index -= 1) {
+      if (isLiveTrigger(index)) {
+        resolvedStart = index;
+        recoveredFromLiveValue = true;
+        break;
+      }
+    }
+  }
+  if (resolvedStart < 0) resolvedStart = safeStart;
+
+  const triggerEnd =
+    value[resolvedStart] === "%" ? resolvedStart + 1 : resolvedStart;
+  const firstWhitespaceAfterTrigger = value
+    .slice(triggerEnd)
+    .search(/\s/);
+  const queryEnd =
+    firstWhitespaceAfterTrigger < 0
+      ? value.length
+      : triggerEnd + firstWhitespaceAfterTrigger;
+  const preferredEnd =
+    !recoveredFromLiveValue && resolvedStart === safeStart
+      ? Math.max(replaceEnd, safeCursor)
+      : recoveredFromLiveValue
+        ? value.length
+        : safeCursor;
+  const safeEnd = Math.max(
+    triggerEnd,
+    Math.min(queryEnd, preferredEnd),
+  );
+  const before = value.substring(0, resolvedStart);
+  const after = value.substring(safeEnd);
+  const prefixSpacer =
+    before && !before.endsWith(" ") && !before.endsWith("\n") ? " " : "";
+  const spacer = after.startsWith(" ") || after.startsWith("\n") ? "" : " ";
+  const text = `${before}${prefixSpacer}${token}${spacer}${after}`;
+  return {
+    text,
+    cursor: before.length + prefixSpacer.length + token.length + spacer.length,
+  };
+}
+
+export function replaceWorkflowTriggerRange(
+  value: string,
+  start: number,
+  replaceEnd: number,
+  token: string,
+  cursorPos = value.length,
+) {
+  return replaceAutocompleteTriggerRange(
+    value,
+    start,
+    replaceEnd,
+    token,
+    "%",
+    cursorPos,
+  );
+}
+
+export function replaceMentionTriggerRange(
+  value: string,
+  start: number,
+  replaceEnd: number,
+  token: string,
+  cursorPos = value.length,
+) {
+  return replaceAutocompleteTriggerRange(
+    value,
+    start,
+    replaceEnd,
+    token,
+    "@",
+    cursorPos,
+  );
+}
+
 export function workflowInvokeMessage(workflow: WorkflowInvokeItem) {
   const title = workflow.title.trim() || "Flow";
   return /[.!?。！？]$/.test(title) ? title : `${title}.`;
@@ -336,90 +431,54 @@ function canShowManualSkill(skill: any) {
   return !(hasSkillEnvVars(skill) && skill?.credentials_configured === false);
 }
 
-const COMPOSER_INTEGRATION_LOGO_COLOR: Record<string, string> = {
-  gmail: "#EA4335",
-  google_calendar: "#4285F4",
-  google_drive: "#0F9D58",
-  slack: "#4A154B",
-  discord: "#5865F2",
-  telegram: "#229ED9",
-  wechat_personal: "#07C160",
-  wechat_official: "#07C160",
-  whatsapp: "#25D366",
-  twilio: "#F22F46",
-  linkedin: "#0A66C2",
-  twitter_x: "#111111",
-  github: "#181717",
-  webhook: "#57534e",
-  quickbooks: "#2CA01C",
-  stripe: "#635BFF",
-  paypal: "#003087",
-  facebook: "#1877F2",
-  email: "#78716c",
-  notion: "#111111",
-  // Microsoft 365 — keep aligned with MCP_LOGO_COLOR in Integrations.tsx
-  outlook: "#0078D4",
-  onedrive: "#0364B8",
-  ms_calendar: "#0078D4",
-  ms_teams: "#6264A7",
-  ms_excel: "#107C41",
-};
-
-const COMPOSER_INTEGRATION_ICON: Record<
-  string,
-  (props: IconProps) => JSX.Element
-> = {
-  gmail: IconEmail,
-  email: IconEmail,
-  google_calendar: IconCalendar,
-  google_drive: IconFolder,
-  notion: IconDocument,
-  slack: IconSlack,
-  discord: IconChat,
-  telegram: IconTelegram,
-  wechat_personal: IconWeChat,
-  wechat_official: IconWeChat,
-  whatsapp: IconWhatsApp,
-  twilio: IconTwilio,
-  linkedin: IconLinkedIn,
-  twitter_x: IconTwitter,
-  github: IconGitHub,
-  webhook: IconWebhook,
-  quickbooks: IconDollar,
-  stripe: IconStripe,
-  paypal: IconPayPal,
-  facebook: IconFacebook,
-  youtube: IconYouTube,
-  tiktok: IconTikTok,
-  shopify: IconShoppingCart,
-  woocommerce: IconStore,
-  square: IconBox,
-  tiktok_shop: IconShoppingCart,
-  amazon: IconStore,
-  outlook: IconEmail,
-  onedrive: IconCloud,
-  ms_calendar: IconCalendar,
-  ms_teams: IconChat,
-  ms_excel: IconExcelGrid,
-};
-
-function getComposerIntegrationColor(serverKey?: string | null) {
-  return serverKey
-    ? COMPOSER_INTEGRATION_LOGO_COLOR[serverKey] || "#78716c"
-    : "#78716c";
-}
+// Preserve composer eligibility independently of artwork. Adding a logo must
+// not expose internal providers or change connection/authorization behavior.
+const COMPOSER_INTEGRATION_PROVIDERS = new Set([
+  "gmail",
+  "email",
+  "google_calendar",
+  "google_drive",
+  "notion",
+  "slack",
+  "discord",
+  "telegram",
+  "wechat_personal",
+  "wechat_official",
+  "whatsapp",
+  "twilio",
+  "linkedin",
+  "twitter_x",
+  "github",
+  "webhook",
+  "quickbooks",
+  "stripe",
+  "paypal",
+  "facebook",
+  "youtube",
+  "tiktok",
+  "shopify",
+  "woocommerce",
+  "square",
+  "tiktok_shop",
+  "amazon",
+  "outlook",
+  "onedrive",
+  "ms_calendar",
+  "ms_teams",
+  "ms_excel",
+]);
 
 function ComposerIntegrationLogo({ server }: { server: any }) {
-  const Icon = COMPOSER_INTEGRATION_ICON[server.server_key];
-  const color = getComposerIntegrationColor(server.server_key);
   return (
-    <span className="chat-composer-connector-icon" style={{ color }}>
-      {Icon ? <Icon size={16} /> : <IconConnection size={15} />}
+    <span className="chat-composer-connector-icon">
+      <IntegrationLogo provider={server.server_key} size={16} />
     </span>
   );
 }
 
 interface ChatInputFooterProps {
+  voiceScope?: ChatVoiceScope;
+  onVoiceConversation?: (id: string) => void;
   value: string;
   onChange: (v: string) => void;
   /** Called for every keydown before the footer's own handler. Call
@@ -471,25 +530,6 @@ interface ChatInputFooterProps {
   attachmentButtonIcon?: "plus" | "paperclip";
   /** Optional className for the outer footer wrapper. */
   className?: string;
-}
-
-/* ── SpeechRecognition shim ── */
-type SpeechRecognitionInstance = {
-  continuous: boolean;
-  interimResults: boolean;
-  lang: string;
-  start: () => void;
-  stop: () => void;
-  onresult: ((e: any) => void) | null;
-  onerror: ((e: any) => void) | null;
-  onend: (() => void) | null;
-};
-function getSpeechRecognition(): SpeechRecognitionInstance | null {
-  const SR =
-    (window as any).SpeechRecognition ||
-    (window as any).webkitSpeechRecognition;
-  if (!SR) return null;
-  return new SR() as SpeechRecognitionInstance;
 }
 
 function getTokenText(node: Node): string {
@@ -810,6 +850,8 @@ function normalizePastedFile(file: File, index: number) {
 }
 
 export default function ChatInputFooter({
+  voiceScope,
+  onVoiceConversation,
   value,
   onChange,
   onKeyDown,
@@ -837,7 +879,7 @@ export default function ChatInputFooter({
   attachmentButtonIcon = "plus",
   className,
 }: ChatInputFooterProps) {
-  const queryClient = useQueryClient();
+  const navigate = useNavigate();
   const flowsAccess = usePreviewFeatureAccess("flows");
   const flowsAvailable = flowsAccess.enabled;
   const flowsComingSoon = flowsAccess.loaded && !flowsAccess.released;
@@ -858,7 +900,6 @@ export default function ChatInputFooter({
   const sendLockedRef = useRef(false);
   const streamingRef = useRef(streaming);
   const syncingEditorRef = useRef(false);
-  const selectedKnowledgeNamesRef = useRef<Set<string>>(new Set());
   const inlineThumbnailUrlsRef = useRef<string[]>([]);
   const inlineAvatarRootsRef = useRef<Root[]>([]);
   const [selectedManualSkills, setSelectedManualSkills] = useState<
@@ -870,11 +911,14 @@ export default function ChatInputFooter({
   const [attachedFiles, setAttachedFilesState] = useState<AttachedItem[]>([]);
   const [attachMenuOpen, setAttachMenuOpen] = useState(false);
   const [integrationsMenuOpen, setIntegrationsMenuOpen] = useState(false);
-  const [selectedConnector, setSelectedConnector] = useState<any | null>(null);
-  const [connectorConnecting, setConnectorConnecting] = useState(false);
-  const [connectorError, setConnectorError] = useState("");
+  const [nangoConnector, setNangoConnector] = useState<IntegrationMCPServer | null>(null);
   const [kbPickerOpen, setKbPickerOpen] = useState(false);
   const [kbSearch, setKbSearch] = useState("");
+  const closeAttachmentPickers = useCallback(() => {
+    setAttachMenuOpen(false);
+    setKbPickerOpen(false);
+    setKbSearch("");
+  }, []);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const attachMenuRef = useRef<HTMLDivElement>(null);
   const integrationsMenuRef = useRef<HTMLDivElement>(null);
@@ -921,7 +965,13 @@ export default function ChatInputFooter({
   const workflowReplaceEndRef = useRef(-1);
   const [workflowActiveIdx, setWorkflowActiveIdx] = useState(0);
 
-  const [listening, setListening] = useState(false);
+  const voice = useChatVoiceInput({
+    scope: voiceScope, disabled: streaming || disabled,
+    onTranscript: (text) => {
+      onChange(value ? `${value.trimEnd()} ${text}` : text);
+      editorRef.current?.focus();
+    },
+  });
   const [focused, setFocused] = useState(false);
 
   useEffect(() => {
@@ -941,7 +991,6 @@ export default function ChatInputFooter({
       );
     };
   }, []);
-  const recognitionRef = useRef<SpeechRecognitionInstance | null>(null);
 
   const setAttachedFiles = useCallback(
     (next: AttachedItem[] | ((prev: AttachedItem[]) => AttachedItem[])) => {
@@ -1060,17 +1109,6 @@ export default function ChatInputFooter({
     }),
     [],
   );
-
-  useEffect(() => {
-    selectedKnowledgeNamesRef.current = new Set(
-      attachedFiles
-        .filter(
-          (item) =>
-            item.type === "knowledge" && hasInlineToken(value, `#${item.name}`),
-        )
-        .map((item) => item.name),
-    );
-  }, [attachedFiles, value]);
 
   useEffect(() => {
     setSelectedManualSkills((prev) =>
@@ -1225,30 +1263,27 @@ export default function ChatInputFooter({
     enabled: kbPickerOpen,
   });
 
-  const { data: integrationServers, isLoading: integrationsLoading } = useQuery(
-    {
-      queryKey: ["composer-integrations"],
-      queryFn: () => api.integrations.mcpServers(),
-      enabled: privateApiEnabled && integrationsMenuOpen,
-    },
+  const {
+    data: integrationServers,
+    isLoading: integrationsLoading,
+    isError: integrationsError,
+    refetch: refetchIntegrations,
+  } = useQuery(
+    integrationCatalogQueryOptions(privateApiEnabled && integrationsMenuOpen),
   );
-  const readyAuthIntegrationServers = useMemo(() => {
+  const composerIntegrationServers = useMemo(() => {
     return (integrationServers || []).filter((server: any) => {
-      const connected = Boolean(
-        server.user_connected ||
-        server.entity_connected ||
-        server.agent_can_use ||
-        server.connections?.length ||
-        server.entity_accounts?.length,
-      );
+      const accessState = connectorAccessState(server);
       const readyToAuth = Boolean(
         server.nango_provider_config_key ||
         (server.auth_type === "oauth2" && server.oauth_configured),
       );
-      const hasKnownLogo = Boolean(
-        COMPOSER_INTEGRATION_ICON[server.server_key],
+      const supportedInComposer = COMPOSER_INTEGRATION_PROVIDERS.has(server.server_key);
+      return (
+        (accessState !== "connect" || readyToAuth) &&
+        !server.coming_soon &&
+        supportedInComposer
       );
-      return !connected && readyToAuth && !server.coming_soon && hasKnownLogo;
     });
   }, [integrationServers]);
 
@@ -1271,9 +1306,6 @@ export default function ChatInputFooter({
       };
       const protectedTokens = [
         ...selectedMentions.map((mention) => `@${mention.name}`),
-        ...Array.from(selectedKnowledgeNamesRef.current).map(
-          (name) => `#${name}`,
-        ),
         ...selectedManualSkills.map((skill) => manualSkillToken(skill)),
         ...(selectedWorkflow
           ? [workflowInvokeToken(selectedWorkflow)]
@@ -1455,6 +1487,7 @@ export default function ChatInputFooter({
       }
     },
     [
+      attachedFiles,
       mentions.length,
       onChange,
       selectedManualSkills,
@@ -1532,16 +1565,23 @@ export default function ChatInputFooter({
 
   const selectMention = useCallback(
     (mention: MentionOption) => {
-      const before = value.substring(0, mentionTriggerPos);
+      const editorValue = getEditorText(editorRef.current) || value;
+      const editorCursor = getPlainOffset(editorRef.current);
+      const start = mentionTriggerPos >= 0 ? mentionTriggerPos : editorCursor;
       const replaceEnd =
-        mentionReplaceEndRef.current > mentionTriggerPos
+        mentionReplaceEndRef.current >= start
           ? mentionReplaceEndRef.current
-          : Math.max(mentionTriggerPos + 1, getPlainOffset(editorRef.current));
-      const after = value.substring(replaceEnd);
+          : Math.max(start, editorCursor);
       const token = `@${mention.name}`;
-      const spacer = after.startsWith(" ") || after.startsWith("\n") ? "" : " ";
-      onChange(`${before}${token}${spacer}${after}`);
-      const nextCursor = before.length + token.length + spacer.length;
+      const replacement = replaceMentionTriggerRange(
+        editorValue,
+        start,
+        replaceEnd,
+        token,
+        editorCursor,
+      );
+      onChange(replacement.text);
+      const nextCursor = replacement.cursor;
       pendingCursorRef.current = nextCursor;
       onMentionSelect?.(mention);
       setMentionDropdownOpen(false);
@@ -1556,57 +1596,12 @@ export default function ChatInputFooter({
     [mentionTriggerPos, onChange, onMentionSelect, value],
   );
 
-  const selectHashDoc = useCallback(
-    (doc: {
-      id: string;
-      name: string;
-      file_type?: string;
-      mime_type?: string;
-    }) => {
-      const before = value.substring(0, hashTriggerPos);
-      const replaceEnd =
-        hashReplaceEndRef.current > hashTriggerPos
-          ? hashReplaceEndRef.current
-          : Math.max(hashTriggerPos + 1, getPlainOffset(editorRef.current));
-      const after = value.substring(replaceEnd);
-      const token = `#${doc.name}`;
-      const spacer = after.startsWith(" ") || after.startsWith("\n") ? "" : " ";
-      onChange(`${before}${token}${spacer}${after}`);
-      const nextCursor = before.length + token.length + spacer.length;
-      pendingCursorRef.current = nextCursor;
-      selectedKnowledgeNamesRef.current.add(doc.name);
-      setAttachedFiles((prev) =>
-        prev.some((f) => f.id === doc.id)
-          ? prev
-          : [
-              ...prev,
-              {
-                name: doc.name,
-                id: doc.id,
-                type: "knowledge",
-                fileType: (doc as any).file_type,
-                mimeType: (doc as any).mime_type,
-              },
-            ],
-      );
-      setHashDropdownOpen(false);
-      setHashQuery("");
-      setHashTriggerPos(-1);
-      hashReplaceEndRef.current = -1;
-      setHashActiveIdx(0);
-      setTimeout(() => {
-        editorRef.current?.focus();
-        setPlainOffset(editorRef.current, nextCursor);
-      }, 0);
-    },
-    [value, hashTriggerPos, onChange],
-  );
-
   const selectManualSkill = useCallback(
     (rawSkill: any) => {
       const skill: ManualSkillItem = {
         id: rawSkill.id,
         name: rawSkill.name || rawSkill.slug || t("component.chat_input_footer.skill"),
+        reference: { kind: "id", value: rawSkill.id },
         slug: rawSkill.slug,
         displayName: rawSkill.displayName || rawSkill.display_name,
         display_name: rawSkill.display_name,
@@ -1651,23 +1646,29 @@ export default function ChatInputFooter({
   const selectWorkflow = useCallback(
     (workflow: WorkflowInvokeItem) => {
       if (!flowsAvailable) return;
+      // `value` may still be one input event behind when a pointer click picks
+      // a Flow. Use the contenteditable value so the typed `%` is in the
+      // replacement source instead of being left behind as plain text.
+      const editorValue = getEditorText(editorRef.current) || value;
+      const editorCursor = getPlainOffset(editorRef.current);
       const start =
         workflowTriggerPos >= 0
           ? workflowTriggerPos
-          : getPlainOffset(editorRef.current);
-      const before = value.substring(0, start);
+          : editorCursor;
       const replaceEnd =
         workflowReplaceEndRef.current >= start
           ? workflowReplaceEndRef.current
-          : Math.max(start, getPlainOffset(editorRef.current));
-      const after = value.substring(replaceEnd);
+          : Math.max(start, editorCursor);
       const token = workflowInvokeToken(workflow);
-      const prefixSpacer =
-        before && !before.endsWith(" ") && !before.endsWith("\n") ? " " : "";
-      const spacer = after.startsWith(" ") || after.startsWith("\n") ? "" : " ";
-      onChange(`${before}${prefixSpacer}${token}${spacer}${after}`);
-      const nextCursor =
-        before.length + prefixSpacer.length + token.length + spacer.length;
+      const replacement = replaceWorkflowTriggerRange(
+        editorValue,
+        start,
+        replaceEnd,
+        token,
+        editorCursor,
+      );
+      onChange(replacement.text);
+      const nextCursor = replacement.cursor;
       pendingCursorRef.current = nextCursor;
       setSelectedWorkflow(workflow);
       setWorkflowDropdownOpen(false);
@@ -1708,7 +1709,7 @@ export default function ChatInputFooter({
 
   const removeAutocompleteTriggerRange = useCallback(
     (
-      trigger: "@" | "/" | "%",
+      trigger: ComposerTrigger,
       start: number,
       replaceEnd: number,
       refocus: boolean,
@@ -1785,6 +1786,34 @@ export default function ChatInputFooter({
     [removeAutocompleteTriggerRange, workflowTriggerPos],
   );
 
+  const dismissHashAutocomplete = useCallback(
+    (removeTrigger = false, refocus = true) => {
+      const start = hashTriggerPos;
+      const replaceEnd = hashReplaceEndRef.current;
+      setHashDropdownOpen(false);
+      setHashQuery("");
+      setHashTriggerPos(-1);
+      hashReplaceEndRef.current = -1;
+      pendingHashTriggerPosRef.current = null;
+      setHashActiveIdx(0);
+      if (removeTrigger)
+        removeAutocompleteTriggerRange("#", start, replaceEnd, refocus);
+    },
+    [hashTriggerPos, removeAutocompleteTriggerRange],
+  );
+
+  const selectHashDoc = useCallback(
+    (doc: ComposerDocumentOption) => {
+      dismissHashAutocomplete(true);
+      setAttachedFiles((prev) =>
+        prev.some((f) => f.id === doc.id)
+          ? prev
+          : [...prev, composerPreviewItemFromDoc(doc)],
+      );
+    },
+    [dismissHashAutocomplete],
+  );
+
   const removeTokenText = useCallback(
     (token: string) => {
       const escaped = token.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -1809,6 +1838,7 @@ export default function ChatInputFooter({
 
   const handleFileSelect = useCallback(
     (e: React.ChangeEvent<HTMLInputElement>) => {
+      closeAttachmentPickers();
       const files = e.target.files;
       if (files) {
         Array.from(files).forEach((file) => {
@@ -1826,7 +1856,7 @@ export default function ChatInputFooter({
       }
       e.target.value = "";
     },
-    [],
+    [closeAttachmentPickers],
   );
 
   const attachLocalFiles = useCallback((files: File[]) => {
@@ -1870,27 +1900,14 @@ export default function ChatInputFooter({
   );
 
   const addKbDoc = (doc: ComposerDocumentOption) => {
+    closeAttachmentPickers();
+    dismissHashAutocomplete(true, false);
     if (attachedFiles.some((f) => f.id === doc.id)) return;
     setAttachedFiles((prev) => [...prev, composerPreviewItemFromDoc(doc)]);
-    // The inline `#name` token is the composer's only visible, removable
-    // representation of a knowledge attachment (the chip row skips
-    // type === "knowledge", and triggerSend drops items without a token),
-    // so insert it just like the `#` autocomplete path does.
-    const token = `#${doc.name}`;
-    if (!hasInlineToken(value, token)) {
-      const spacer =
-        value && !value.endsWith(" ") && !value.endsWith("\n") ? " " : "";
-      const next = `${value}${spacer}${token} `;
-      selectedKnowledgeNamesRef.current.add(doc.name);
-      onChange(next);
-      pendingCursorRef.current = next.length;
-      setTimeout(() => {
-        editorRef.current?.focus();
-        setPlainOffset(editorRef.current, next.length);
-      }, 0);
-    }
-    setKbPickerOpen(false);
-    setKbSearch("");
+    setTimeout(() => {
+      editorRef.current?.focus();
+      setPlainOffset(editorRef.current, getEditorText(editorRef.current).length);
+    }, 0);
   };
 
   const insertComposerHint = useCallback(
@@ -1910,127 +1927,30 @@ export default function ChatInputFooter({
     [value, onChange],
   );
 
-  const startConnectorAuth = useCallback(
-    async (connectorOverride?: any) => {
-      const connector = connectorOverride || selectedConnector;
-      if (!connector || connectorConnecting) return;
-      setConnectorConnecting(true);
-      setConnectorError("");
-      try {
-        if (connector.nango_provider_config_key) {
-          const { nango_connect_url } =
-            await api.integrations.nango.startConnect([
-              connector.nango_provider_config_key,
-            ]);
-          const popup = window.open(
-            nango_connect_url,
-            "nango_connect",
-            "popup=yes,width=560,height=720,scrollbars=yes",
-          );
-          if (!popup)
-            throw new Error(
-              t("component.chat_input_footer.popup_blocked"),
-            );
-          const tick = window.setInterval(async () => {
-            if (!popup.closed) return;
-            window.clearInterval(tick);
-            try {
-              await api.integrations.nango.sync();
-              queryClient.invalidateQueries({
-                queryKey: ["composer-integrations"],
-              });
-              // Refresh the Integrations page too in case the user has
-              // it open in another tab — the page query key is
-              // ``["mcp-servers"]`` (the older ``["integrations"]`` key
-              // was renamed and is no longer registered).
-              queryClient.invalidateQueries({ queryKey: ["mcp-servers"] });
-              setSelectedConnector(null);
-            } catch (err: any) {
-              setSelectedConnector(connector);
-              setConnectorError(err?.message || t("component.chat_input_footer.could_not_sync_connection"));
-            } finally {
-              setConnectorConnecting(false);
-            }
-          }, 600);
-          return;
-        }
-
-        if (connector.auth_type === "oauth2" && connector.oauth_configured) {
-          const { authorize_url } = await api.integrations.oauthStart(
-            connector.server_key,
-          );
-          window.location.href = authorize_url;
-          return;
-        }
-
-        window.location.href = "/integrations";
-      } catch (err: any) {
-        setSelectedConnector(connector);
-        setConnectorError(err?.message || t("component.chat_input_footer.could_not_start_connection"));
-        setConnectorConnecting(false);
-      }
-    },
-    [connectorConnecting, queryClient, selectedConnector],
-  );
-
   const handleConnectorClick = useCallback(
     (server: any) => {
-      const connected = Boolean(
-        server.user_connected ||
-        server.entity_connected ||
-        server.agent_can_use ||
-        server.connections?.length ||
-        server.entity_accounts?.length,
-      );
-      if (connected) {
+      const accessState = connectorAccessState(server);
+      if (accessState === "usable") {
         insertComposerHint(`Use ${server.name} to `);
         return;
       }
       setIntegrationsMenuOpen(false);
-      startConnectorAuth(server);
+      // Popup authorization must not unmount the composer and discard its draft/files.
+      // Reuse Integrations' authorization controller, including sync and WhatsApp setup.
+      if (accessState === "connect" && server.nango_provider_config_key) {
+        integrationsMenuButtonRef.current?.focus();
+        setNangoConnector(server);
+        return;
+      }
+      // Account repair and non-popup setup still use the full settings surface.
+      navigate(integrationSetupHref(server.server_key));
     },
-    [insertComposerHint, startConnectorAuth],
+    [insertComposerHint, navigate],
   );
 
   const removeAttachment = (idx: number) => {
     setAttachedFiles((prev) => prev.filter((_, i) => i !== idx));
   };
-
-  const toggleVoice = useCallback(() => {
-    if (listening) {
-      recognitionRef.current?.stop();
-      setListening(false);
-      return;
-    }
-    const recognition = getSpeechRecognition();
-    if (!recognition) {
-      onChange(value || t("component.chat_input_footer.voice_input_not_supported"));
-      return;
-    }
-    recognition.continuous = true;
-    recognition.interimResults = true;
-    recognition.lang = navigator.language || "en-US";
-
-    let finalTranscript = "";
-    recognition.onresult = (e: any) => {
-      let interim = "";
-      for (let i = e.resultIndex; i < e.results.length; i++) {
-        const transcript = e.results[i][0].transcript;
-        if (e.results[i].isFinal) finalTranscript += transcript;
-        else interim += transcript;
-      }
-      // Replace stale interim + append final + new interim
-      onChange(finalTranscript + interim || value);
-    };
-    recognition.onerror = () => setListening(false);
-    recognition.onend = () => {
-      setListening(false);
-      if (finalTranscript) onChange(finalTranscript);
-    };
-    recognitionRef.current = recognition;
-    recognition.start();
-    setListening(true);
-  }, [listening, value, onChange]);
 
   const triggerSend = useCallback(() => {
     const text = value.trim();
@@ -2051,18 +1971,13 @@ export default function ChatInputFooter({
         !workflowSnapshot) ||
       streaming ||
       disabled ||
-      sendLockedRef.current
+      sendLockedRef.current ||
+      voice.busy
     )
       return;
     sendLockedRef.current = true;
-    if (listening) {
-      recognitionRef.current?.stop();
-      setListening(false);
-    }
-    const snapshot = currentAttachments.filter(
-      (item) =>
-        item.type !== "knowledge" || hasInlineToken(value, `#${item.name}`),
-    );
+    dismissHashAutocomplete(false, false);
+    const snapshot = currentAttachments;
     setAttachedFiles([]);
     setSelectedManualSkills([]);
     setSelectedWorkflow(null);
@@ -2082,15 +1997,17 @@ export default function ChatInputFooter({
     selectedManualSkills,
     selectedWorkflow,
     flowsAvailable,
-    listening,
+    voice.busy,
     onSend,
     onSendWorkflow,
     disabled,
     setAttachedFiles,
+    dismissHashAutocomplete,
   ]);
 
   const handleKeyDown = useCallback(
     (e: React.KeyboardEvent<HTMLDivElement>) => {
+      if (voice.busy && e.key === "Enter") { e.preventDefault(); return; }
       if (onKeyDown) onKeyDown(e);
       if (e.defaultPrevented) return;
 
@@ -2199,26 +2116,25 @@ export default function ChatInputFooter({
         }
       }
 
-      if (hashDropdownOpen && hashFiltered.length > 0) {
-        if (e.key === "ArrowDown") {
+      if (hashDropdownOpen) {
+        if (e.key === "ArrowDown" && hashFiltered.length > 0) {
           e.preventDefault();
           setHashActiveIdx((i) => Math.min(i + 1, hashFiltered.length - 1));
           return;
         }
-        if (e.key === "ArrowUp") {
+        if (e.key === "ArrowUp" && hashFiltered.length > 0) {
           e.preventDefault();
           setHashActiveIdx((i) => Math.max(i - 1, 0));
           return;
         }
-        if (e.key === "Enter" || e.key === "Tab") {
+        if ((e.key === "Enter" || e.key === "Tab") && hashFiltered.length > 0) {
           e.preventDefault();
           selectHashDoc(hashFiltered[hashActiveIdx]);
           return;
         }
         if (e.key === "Escape") {
           e.preventDefault();
-          setHashDropdownOpen(false);
-          hashReplaceEndRef.current = -1;
+          dismissHashAutocomplete(true);
           return;
         }
       }
@@ -2240,6 +2156,7 @@ export default function ChatInputFooter({
       }
     },
     [
+      voice.busy,
       onKeyDown,
       removeMentionToken,
       selectedMentions,
@@ -2263,6 +2180,7 @@ export default function ChatInputFooter({
       hashFiltered,
       hashActiveIdx,
       selectHashDoc,
+      dismissHashAutocomplete,
       enterToSend,
       insertPlainTextAtCursor,
       triggerSend,
@@ -2274,9 +2192,12 @@ export default function ChatInputFooter({
     if (mentionDropdownOpen) dismissMentionAutocomplete(true, false);
     if (skillDropdownOpen) dismissSkillAutocomplete(true, false);
     if (workflowDropdownOpen) dismissWorkflowAutocomplete(true, false);
+    if (hashDropdownOpen) dismissHashAutocomplete(true, false);
   }, [
     dismissMentionAutocomplete,
     dismissSkillAutocomplete,
+    dismissHashAutocomplete,
+    hashDropdownOpen,
     mentionDropdownOpen,
     skillDropdownOpen,
     workflowDropdownOpen,
@@ -2445,7 +2366,7 @@ export default function ChatInputFooter({
             name={part.mention.name}
             avatarUrl={part.mention.avatarUrl}
             type={part.mention.type}
-            seed={part.mention.id}
+            seed={part.mention.avatarSeed || part.mention.id}
             size={18}
           />,
         );
@@ -2568,7 +2489,7 @@ export default function ChatInputFooter({
             <button
               onClick={() => {
                 setIntegrationsMenuOpen(false);
-                window.location.href = "/integrations";
+                navigate("/integrations");
               }}
               className="chat-composer-menu-item chat-composer-menu-item--header"
               type="button"
@@ -2582,8 +2503,17 @@ export default function ChatInputFooter({
                 <InlineRowsSkeleton rows={3} dense />
               </div>
             )}
+            {integrationsError && (
+              <button
+                type="button"
+                className="chat-composer-menu-item"
+                onClick={() => void refetchIntegrations()}
+              >
+                {t("page.integrations.failed_to_load_integrations")} · {t("page.dashboard.retry")}
+              </button>
+            )}
             {!integrationsLoading &&
-              readyAuthIntegrationServers.slice(0, 8).map((server: any) => (
+              composerIntegrationServers.slice(0, 8).map((server: any) => (
                 <button
                   key={server.server_key}
                   onClick={() => handleConnectorClick(server)}
@@ -2598,11 +2528,16 @@ export default function ChatInputFooter({
                     ) : null}
                   </span>
                   <span className="chat-composer-connector-action">
-                    {t("page.apps.connect")}</span>
+                    {connectorAccessState(server) === "usable"
+                      ? t("component.chat_input_footer.use_connector")
+                      : connectorAccessState(server) === "repair"
+                      ? t("page.integrations.needs_attention")
+                      : t("page.apps.connect")}
+                  </span>
                 </button>
               ))}
-            {!integrationsLoading &&
-              readyAuthIntegrationServers.length === 0 && (
+            {!integrationsLoading && !integrationsError &&
+              composerIntegrationServers.length === 0 && (
                 <div className="chat-composer-menu-empty">
                   {t("component.chat_input_footer.no_ready_auth_connectors")}</div>
               )}
@@ -2734,56 +2669,52 @@ export default function ChatInputFooter({
           ref={composerRef}
           className={`chat-composer ${focused ? "chat-composer--focused" : ""} ${streaming ? "chat-composer--streaming" : ""}`}
         >
-          {attachedFiles.some((file) => file.type !== "knowledge") && (
+          {attachedFiles.length > 0 && (
             <div className="chat-composer-attachments">
-              {attachedFiles.map((f, i) =>
-                f.type === "knowledge" ? null : (
-                  <span
-                    key={i}
-                    className="chat-composer-chip chat-composer-chip--file"
+              {attachedFiles.map((f, i) => (
+                <span
+                  key={i}
+                  className="chat-composer-chip chat-composer-chip--file"
+                >
+                  <svg
+                    width="12"
+                    height="12"
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    strokeWidth={1.8}
+                  >
+                    <path
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                      d="M18.375 12.739l-7.693 7.693a4.5 4.5 0 01-6.364-6.364l10.94-10.94A3 3 0 1119.5 7.372L8.552 18.32m.009-.01l-.01.01m5.699-9.941l-7.81 7.81a1.5 1.5 0 002.112 2.13"
+                    />
+                  </svg>
+                  <span>
+                    {f.name.length > 32 ? f.name.slice(0, 30) + "..." : f.name}
+                  </span>
+                  <button
+                    onClick={() => removeAttachment(i)}
+                    type="button"
+                    aria-label={`Remove ${f.name}`}
                   >
                     <svg
-                      width="12"
-                      height="12"
+                      width="8"
+                      height="8"
                       viewBox="0 0 24 24"
                       fill="none"
                       stroke="currentColor"
-                      strokeWidth={1.8}
+                      strokeWidth={3}
                     >
                       <path
                         strokeLinecap="round"
                         strokeLinejoin="round"
-                        d="M18.375 12.739l-7.693 7.693a4.5 4.5 0 01-6.364-6.364l10.94-10.94A3 3 0 1119.5 7.372L8.552 18.32m.009-.01l-.01.01m5.699-9.941l-7.81 7.81a1.5 1.5 0 002.112 2.13"
+                        d="M6 18L18 6M6 6l12 12"
                       />
                     </svg>
-                    <span>
-                      {f.name.length > 32
-                        ? f.name.slice(0, 30) + "..."
-                        : f.name}
-                    </span>
-                    <button
-                      onClick={() => removeAttachment(i)}
-                      type="button"
-                      aria-label={`Remove ${f.name}`}
-                    >
-                      <svg
-                        width="8"
-                        height="8"
-                        viewBox="0 0 24 24"
-                        fill="none"
-                        stroke="currentColor"
-                        strokeWidth={3}
-                      >
-                        <path
-                          strokeLinecap="round"
-                          strokeLinejoin="round"
-                          d="M6 18L18 6M6 6l12 12"
-                        />
-                      </svg>
-                    </button>
-                  </span>
-                ),
-              )}
+                  </button>
+                </span>
+              ))}
             </div>
           )}
 
@@ -2825,7 +2756,7 @@ export default function ChatInputFooter({
                             name={mention.name}
                             avatarUrl={mention.avatarUrl}
                             type="agent"
-                            seed={mention.id}
+                            seed={mention.avatarSeed || mention.id}
                             size={28}
                           />
                         ) : mention.avatarUrl ? (
@@ -2977,7 +2908,18 @@ export default function ChatInputFooter({
             {hashDropdownOpen && (
               <div className="chat-composer-hash-menu">
                 <div className="chat-composer-hash-title">
-                  {t("component.chat_input_footer.files_and_documents")}</div>
+                  <span>{t("component.chat_input_footer.files_and_documents")}</span>
+                  <button
+                    type="button"
+                    className="chat-composer-autocomplete-close"
+                    aria-label={t("action.close")}
+                    title={t("action.close")}
+                    onMouseDown={(e) => e.preventDefault()}
+                    onClick={() => dismissHashAutocomplete(true)}
+                  >
+                    <IconClose size={12} />
+                  </button>
+                </div>
                 {hashFiltered.length === 0 ? (
                   <div className="chat-composer-hash-empty">
                     {hashQuery
@@ -3021,7 +2963,7 @@ export default function ChatInputFooter({
               aria-disabled={disabled || streaming}
               suppressContentEditableWarning
               data-placeholder={
-                listening
+                voice.phase === "recording"
                   ? t("component.chat_input_footer.speak_now")
                   : placeholder || t("component.chat_input_footer.message_placeholder")
               }
@@ -3035,6 +2977,7 @@ export default function ChatInputFooter({
             />
           </div>
 
+          <VoiceInputStatus voice={voice} />
           <div
             className={`chat-composer-row ${modeSlot ? "chat-composer-row--mode-aware" : ""}`}
           >
@@ -3121,41 +3064,8 @@ export default function ChatInputFooter({
               <IconSkill size={17} />
             </button>
 
-            {/* Voice */}
-            <button
-              onClick={toggleVoice}
-              disabled={streaming || disabled}
-              title={listening ? t("component.chat_input_footer.stop_listening") : t("component.chat_input_footer.voice_input")}
-              className={`chat-composer-icon-btn ${listening ? "chat-composer-icon-btn--recording" : ""}`}
-              type="button"
-            >
-              {listening ? (
-                <svg
-                  width="16"
-                  height="16"
-                  viewBox="0 0 24 24"
-                  fill="currentColor"
-                >
-                  <rect x="6" y="6" width="12" height="12" rx="2" />
-                </svg>
-              ) : (
-                <svg
-                  width="16"
-                  height="16"
-                  viewBox="0 0 24 24"
-                  fill="none"
-                  stroke="currentColor"
-                  strokeWidth={1.8}
-                  strokeLinecap="round"
-                  strokeLinejoin="round"
-                >
-                  <path d="M12 1a3 3 0 00-3 3v8a3 3 0 006 0V4a3 3 0 00-3-3z" />
-                  <path d="M19 10v2a7 7 0 01-14 0v-2" />
-                  <line x1="12" y1="19" x2="12" y2="23" />
-                  <line x1="8" y1="23" x2="16" y2="23" />
-                </svg>
-              )}
-            </button>
+            <VoiceInputButton voice={voice} disabled={streaming || disabled} />
+            {voiceScope && <LiveChatCallButton scope={voiceScope} disabled={streaming || disabled || voice.busy} onConversation={onVoiceConversation} />}
               </>
             ) : null}
 
@@ -3182,7 +3092,7 @@ export default function ChatInputFooter({
             ) : (
               <button
                 onClick={triggerSend}
-                disabled={disabled || streaming || !canSend}
+                disabled={disabled || streaming || voice.busy || !canSend}
                 className="chat-composer-send"
                 type="button"
               >
@@ -3205,62 +3115,27 @@ export default function ChatInputFooter({
         </div>
       </div>
 
-      {selectedConnector && (
-        <div
-          className="chat-connector-modal-backdrop"
-          role="presentation"
-          onMouseDown={() => setSelectedConnector(null)}
+      {nangoConnector?.nango_provider_config_key && (
+        <Modal
+          open
+          onClose={() => setNangoConnector(null)}
+          title={nangoConnector.name}
+          restoreFocusFallback={() => integrationsMenuButtonRef.current?.focus()}
         >
-          <div
-            className="chat-connector-modal"
-            role="dialog"
-            aria-modal="true"
-            aria-label={`${selectedConnector.name} connector`}
-            onMouseDown={(e) => e.stopPropagation()}
-          >
-            <button
-              className="chat-connector-modal-close"
-              onClick={() => setSelectedConnector(null)}
-              type="button"
-              aria-label={t("component.chat_input_footer.close_connector_details")}
-            >
-              ×
-            </button>
-            <div className="chat-connector-logo">
-              {selectedConnector.name?.charAt(0) || "C"}
+          <div className="flex flex-col gap-4">
+            <div className="flex items-center gap-3">
+              <IntegrationLogo provider={nangoConnector.server_key} size={32} />
+              <p className="m-0 text-sm text-stone-600">
+                {nangoConnector.description || nangoConnector.tagline || nangoConnector.setup_hint}
+              </p>
             </div>
-            <h3>{selectedConnector.name}</h3>
-            <p>
-              {selectedConnector.description ||
-                selectedConnector.tagline ||
-                selectedConnector.setup_hint ||
-                t("component.chat_input_footer.connect_this_integration_then_use_it_directly_from_cha")}
-            </p>
-            {connectorError && (
-              <div className="chat-connector-error">{connectorError}</div>
-            )}
-            <button
-              className="chat-connector-connect"
-              onClick={startConnectorAuth}
-              disabled={connectorConnecting}
-              type="button"
-            >
-              {connectorConnecting
-                ? t("component.chat_input_footer.connecting")
-                : selectedConnector.auth_type === "browser_session"
-                  ? t("component.chat_input_footer.install")
-                  : t("component.chat_input_footer.connect")}
-            </button>
-            <button
-              className="chat-connector-details"
-              onClick={() => {
-                window.location.href = "/integrations";
-              }}
-              type="button"
-            >
-              {t("component.chat_input_footer.show_details")}</button>
+            <NangoConnectButton
+              providerConfigKeys={[nangoConnector.nango_provider_config_key]}
+              label={t("page.apps.connect")}
+              onConnected={() => setNangoConnector(null)}
+            />
           </div>
-        </div>
+        </Modal>
       )}
     </>
   );

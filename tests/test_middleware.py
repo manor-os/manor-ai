@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import logging
+from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from fastapi import FastAPI
@@ -160,15 +162,12 @@ async def test_redis_rate_limiter_enforces_shared_bucket():
             self.values: dict[str, int] = {}
             self.expires: dict[str, int] = {}
 
-        async def incr(self, key: str) -> int:
+        async def eval(self, _script: str, key_count: int, key: str, seconds: int):
+            assert key_count == 1
             self.values[key] = self.values.get(key, 0) + 1
-            return self.values[key]
-
-        async def expire(self, key: str, seconds: int) -> None:
-            self.expires[key] = seconds
-
-        async def ttl(self, key: str) -> int:
-            return self.expires.get(key, -1)
+            if self.expires.get(key, -1) < 0:
+                self.expires[key] = int(seconds)
+            return [self.values[key], self.expires[key]]
 
     limiter = RateLimiter(redis_client=FakeRedis(), redis_enabled=True)
 
@@ -182,6 +181,34 @@ async def test_redis_rate_limiter_enforces_shared_bucket():
     assert third.retry_after == 60
 
 
+@pytest.mark.anyio
+async def test_redis_rate_limiter_sets_ttl_before_a_lost_response():
+    from apps.api.middleware.rate_limit import RateLimiter
+
+    class LostReplyRedis:
+        def __init__(self):
+            self.values: dict[str, int] = {}
+            self.expires: dict[str, int] = {}
+            self.lose_reply = True
+
+        async def eval(self, _script: str, key_count: int, key: str, seconds: int):
+            assert key_count == 1
+            self.values[key] = self.values.get(key, 0) + 1
+            if self.expires.get(key, -1) < 0:
+                self.expires[key] = int(seconds)
+            if self.lose_reply:
+                self.lose_reply = False
+                raise RuntimeError("connection lost after script execution")
+            return [self.values[key], self.expires[key]]
+
+    redis = LostReplyRedis()
+    limiter = RateLimiter(redis_client=redis, redis_enabled=True)
+
+    assert (await limiter.check("ip:127.0.0.1:api", 2, 60)).allowed is True
+    assert (await limiter.check("ip:127.0.0.1:api", 2, 60)).allowed is True
+    assert list(redis.expires.values()) == [60]
+
+
 def test_rate_limiter_keeps_sync_memory_api_for_non_middleware_callers():
     from apps.api.middleware.rate_limit import RateLimiter
 
@@ -193,13 +220,239 @@ def test_rate_limiter_keeps_sync_memory_api_for_non_middleware_callers():
     assert result.retry_after > 0
 
 
+def test_rate_limiter_bounds_and_expires_memory_buckets(monkeypatch):
+    from apps.api.middleware import rate_limit
+    from apps.api.middleware.rate_limit import RateLimiter
+
+    now = [100.0]
+    monkeypatch.setattr(rate_limit.time, "time", lambda: now[0])
+    limiter = RateLimiter(max_memory_buckets=2, memory_cleanup_interval=1)
+
+    assert limiter.check_sync("first", 1, 1).allowed is True
+    assert limiter.check_sync("second", 1, 60).allowed is True
+    assert limiter.check_sync("third", 1, 60).allowed is True
+    assert list(limiter._windows) == ["second", "third"]
+
+    expiring_limiter = RateLimiter(
+        max_memory_buckets=3,
+        memory_cleanup_interval=1,
+    )
+    assert expiring_limiter.check_sync("expiring", 1, 1).allowed is True
+    assert expiring_limiter.check_sync("active", 1, 60).allowed is True
+    now[0] = 102.0
+    assert expiring_limiter.check_sync("next", 1, 60).allowed is True
+    assert "expiring" not in expiring_limiter._windows
+    assert "active" in expiring_limiter._windows
+
+
+def test_client_ip_ignores_raw_forwarded_headers():
+    from apps.api.middleware.rate_limit import client_ip
+
+    direct_request = SimpleNamespace(
+        headers={
+            "x-forwarded-for": "198.51.100.10",
+            "x-real-ip": "198.51.100.11",
+        },
+        client=SimpleNamespace(host="8.8.8.8"),
+    )
+    proxied_request = SimpleNamespace(
+        headers={
+            "x-forwarded-for": "198.51.100.12, 198.51.100.13",
+            "x-real-ip": "198.51.100.99",
+        },
+        client=SimpleNamespace(host="198.51.100.14"),
+    )
+
+    assert client_ip(direct_request) == "8.8.8.8"
+    assert client_ip(proxied_request) == "198.51.100.14"
+
+
+def test_core_rate_limiter_uses_uvicorn_resolved_client_ip():
+    request = SimpleNamespace(
+        headers={"x-forwarded-for": "198.51.100.77, 203.0.113.9"},
+        client=SimpleNamespace(host="203.0.113.9"),
+    )
+
+    assert mw._client_ip(request) == "203.0.113.9"
+
+
+@pytest.mark.anyio
+async def test_client_ip_rejects_spoofed_forwarded_ip_through_uvicorn():
+    from starlette.requests import Request
+    from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
+
+    from apps.api.middleware.rate_limit import client_ip
+
+    captured = {}
+
+    async def app(scope, _receive, _send):
+        request = Request(scope)
+        captured["request_client"] = request.client.host
+        captured["resolved_client"] = client_ip(request)
+
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0"},
+        "http_version": "1.1",
+        "method": "GET",
+        "scheme": "http",
+        "path": "/",
+        "raw_path": b"/",
+        "query_string": b"",
+        "root_path": "",
+        "headers": [
+            (b"x-forwarded-for", b"198.51.100.77, 203.0.113.9"),
+            (b"x-real-ip", b"203.0.113.9"),
+        ],
+        "client": ("172.18.0.2", 43123),
+        "server": ("127.0.0.1", 8000),
+    }
+
+    async def receive():
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def send(_message):
+        return None
+
+    middleware = ProxyHeadersMiddleware(
+        app,
+        trusted_hosts="127.0.0.1,172.16.0.0/12",
+    )
+    await middleware(scope, receive, send)
+
+    assert captured == {
+        "request_client": "203.0.113.9",
+        "resolved_client": "203.0.113.9",
+    }
+
+
+@pytest.mark.anyio
+async def test_client_ip_keeps_private_client_outside_proxy_pod_cidr():
+    from starlette.requests import Request
+    from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
+
+    from apps.api.middleware.rate_limit import client_ip
+
+    captured = {}
+
+    async def app(scope, _receive, _send):
+        request = Request(scope)
+        captured["resolved_client"] = client_ip(request)
+
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0"},
+        "http_version": "1.1",
+        "method": "GET",
+        "scheme": "http",
+        "path": "/",
+        "raw_path": b"/",
+        "query_string": b"",
+        "root_path": "",
+        "headers": [
+            (b"x-forwarded-for", b"198.51.100.77, 10.23.4.5"),
+        ],
+        "client": ("10.244.1.5", 43123),
+        "server": ("127.0.0.1", 8000),
+    }
+
+    async def receive():
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def send(_message):
+        return None
+
+    middleware = ProxyHeadersMiddleware(
+        app,
+        trusted_hosts="127.0.0.1,10.244.0.0/16",
+    )
+    await middleware(scope, receive, send)
+
+    assert captured == {"resolved_client": "10.23.4.5"}
+
+
+@pytest.mark.anyio
+async def test_compose_sidecar_is_not_a_trusted_proxy():
+    from starlette.requests import Request
+    from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
+
+    from apps.api.middleware.rate_limit import client_ip
+
+    captured = {}
+
+    async def app(scope, _receive, _send):
+        captured["resolved_client"] = client_ip(Request(scope))
+
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0"},
+        "http_version": "1.1",
+        "method": "GET",
+        "scheme": "http",
+        "path": "/",
+        "raw_path": b"/",
+        "query_string": b"",
+        "root_path": "",
+        "headers": [(b"x-forwarded-for", b"198.51.100.77")],
+        "client": ("172.30.0.50", 43123),
+        "server": ("172.30.0.10", 8000),
+    }
+
+    async def receive():
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def send(_message):
+        return None
+
+    middleware = ProxyHeadersMiddleware(
+        app,
+        trusted_hosts="127.0.0.1,172.30.0.2,172.30.0.3",
+    )
+    await middleware(scope, receive, send)
+
+    assert captured == {"resolved_client": "172.30.0.50"}
+
+
+@pytest.mark.parametrize(
+    "compose_path",
+    [
+        "docker-compose.yml",
+        "docker-compose.dev.yml",
+        "docker-compose.cloud.yml",
+    ],
+)
+def test_uvicorn_proxy_allowlist_never_trusts_every_source(compose_path):
+    compose = (Path(__file__).parents[1] / compose_path).read_text()
+
+    assert "--forwarded-allow-ips=*" not in compose
+    assert "10.0.0.0/8" not in compose
+    assert "172.16.0.0/12" not in compose
+    assert compose.count("MANOR_DOCKER_NETWORK_PREFIX:-172.30.0") >= 2
+    assert "MANOR_CADDY_PROXY_IP" not in compose
+    assert "MANOR_WEB_PROXY_IP" not in compose
+    assert "MANOR_DOCKER_NETWORK_CIDR" not in compose
+
+
+def test_direct_api_ports_are_loopback_only():
+    compose = (Path(__file__).parents[1] / "docker-compose.yml").read_text()
+
+    assert '"127.0.0.1:8010:8000"' in compose
+    assert '"127.0.0.1:8011:8000"' in compose
+
+
+def test_cloud_multiworker_rate_limits_use_redis():
+    compose = (Path(__file__).parents[1] / "docker-compose.cloud.yml").read_text()
+
+    assert "REDIS_RATE_LIMIT_ENABLED: ${REDIS_RATE_LIMIT_ENABLED:-true}" in compose
+
+
 @pytest.mark.anyio
 async def test_redis_rate_limiter_fails_open(caplog):
     """Redis outages should warn and allow traffic instead of taking API down."""
     from apps.api.middleware.rate_limit import RateLimiter
 
     class BrokenRedis:
-        async def incr(self, key: str) -> int:
+        async def eval(self, _script: str, _key_count: int, _key: str, _seconds: int):
             raise RuntimeError("redis down")
 
     limiter = RateLimiter(redis_client=BrokenRedis(), redis_enabled=True)
@@ -253,3 +506,25 @@ async def test_degraded_mode_blocks_high_cost_paths_and_spares_health(monkeypatc
     assert chat_resp.headers["retry-after"] == "60"
     assert upload_resp.status_code == 503
     assert upload_resp.json()["code"] == "degraded_mode"
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/api/v1/chat/stream",
+        "/api/v1/public/chat/public-token/message/stream",
+        "/api/v1/workspace-drafts/stream",
+        "/api/v1/workspace-drafts/draft-123/messages/stream",
+        "/api/v1/workspace-drafts/draft-123/finalize/stream",
+        "/api/v1/agents/generate-stream",
+        "/api/v1/agents/generate-draft-stream",
+        "/api/v1/skills/generate-stream",
+    ],
+)
+def test_degraded_mode_chat_stream_classification_matches_gateway_routes(monkeypatch, path):
+    from apps.api.middleware.degraded import degraded_reason
+
+    monkeypatch.setenv("DEGRADED_DISABLE_CHAT_STREAM", "true")
+    monkeypatch.setenv("DEGRADED_DISABLE_MEDIA_GENERATION", "false")
+
+    assert degraded_reason(path, "POST") == "chat_stream"

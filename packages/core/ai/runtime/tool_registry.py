@@ -32,12 +32,34 @@ def runtime_tool_schema(name: str) -> dict | None:
     return runtime_ensure_tool_registry_initialized().get_schema(name)
 
 
+async def runtime_tool_schema_for_actor(
+    name: str,
+    *,
+    entity_id: str,
+    user_id: str,
+) -> dict | None:
+    """Return the current static or actor-scoped dynamic schema for execution."""
+
+    return await runtime_ensure_tool_registry_initialized().get_schema_for_actor(
+        name,
+        entity_id=entity_id,
+        user_id=user_id,
+    )
+
+
 def runtime_tool_schemas_for_names(names: Iterable[str]) -> list[dict]:
     return runtime_ensure_tool_registry_initialized().get_schemas_for_names(names)
 
 
-def runtime_registered_tool_names(*, prefix: str | None = None) -> tuple[str, ...]:
-    return runtime_ensure_tool_registry_initialized().registered_tool_names(prefix=prefix)
+def runtime_registered_tool_names(
+    *,
+    prefix: str | None = None,
+    include_undiscoverable: bool = False,
+) -> tuple[str, ...]:
+    return runtime_ensure_tool_registry_initialized().registered_tool_names(
+        prefix=prefix,
+        include_undiscoverable=include_undiscoverable,
+    )
 
 
 def runtime_registered_tool_schemas() -> tuple[tuple[str, dict], ...]:
@@ -103,9 +125,13 @@ async def runtime_execute_tool(
     name: str,
     args: dict,
     **kwargs: Any,
-) -> str:
+) -> Any:
     registry = runtime_ensure_tool_registry_initialized()
     result = await registry.execute(name, args, **kwargs)
+    from packages.core.ai.runtime.control import is_runtime_tool_suspension
+
+    if is_runtime_tool_suspension(result):
+        return result
 
     # A provider can demand its own per-action confirmation. When the operator
     # has already said "Always approve" for that provider action, answer the
@@ -138,5 +164,12 @@ async def runtime_execute_tool(
             if kwargs.get("runtime_envelope") is not None
             else None
         ),
-        step_id=kwargs.get("step_id"),
+        workflow_run_id=kwargs.get("_workflow_run_id_from_context"),
+        workflow_lineage_root_run_id=kwargs.get(
+            "_workflow_lineage_root_run_id_from_context"
+        ),
+        workflow_action_grant_id=kwargs.get(
+            "_workflow_action_grant_id_from_context"
+        ),
+        workflow_step_id=kwargs.get("_workflow_step_id_from_context"),
     )

@@ -1,8 +1,7 @@
 """End-user channel binding — generate + redeem one-time claim tokens.
 
-Telegram is the only flow fully wired today; the schema and service are
-channel-agnostic so adding email / WhatsApp is a matter of plugging the
-provider-side deep-link / verification path in.
+Telegram and Discord use the same explicit claim flow. Other channels remain
+unsupported until their provider-specific verification path is implemented.
 
 Why a separate service:
   - keeps the secret-token plumbing out of channel_gateway (which is
@@ -19,10 +18,10 @@ Token semantics:
     hit /start, not long enough for casual interception to be useful
   - single use: ``claimed_at`` is stamped on success and ``claim_token``
     refuses to mutate a row that's already claimed or expired
-  - pinned to user_id + entity_id at generation, so even if the token
-    leaks the worst case is binding the leaker's Telegram to the
-    intended Manor account (still wrong, but bounded — we never
-    elevate the leaker's identity)
+  - pinned to user_id + entity_id at generation, so even if the token leaks
+    the worst case is binding the leaker's channel identity to the intended
+    Manor account (still wrong, but bounded — we never elevate the leaker's
+    identity)
 """
 from __future__ import annotations
 
@@ -41,6 +40,7 @@ from packages.core.models.channel import (
     ChannelContact,
     ChannelLinkToken,
 )
+from packages.core.services.channel_credentials import lease_channel_credentials
 
 logger = logging.getLogger(__name__)
 
@@ -56,7 +56,7 @@ class StartLinkResult:
     token: str
     expires_at: datetime
     channel_type: str
-    deep_link: Optional[str]                # t.me/<bot>?start=<token>
+    deep_link: Optional[str]                # provider-specific deep link
     instructions: str
     bot_username: Optional[str] = None
 
@@ -88,15 +88,16 @@ async def start_link(
 ) -> StartLinkResult:
     """Mint a fresh claim token and return everything the UI needs to
     walk the user to the right place. Caller commits."""
-    if channel_type != "telegram":
+    if channel_type not in {"telegram", "discord"}:
         # Future channels plug in here. We refuse upfront rather than
-        # invent a deep-link template the producer can't honour.
+        # invent a verification flow the provider can't honour.
         raise ValueError(f"channel_type={channel_type!r} linking not supported yet")
 
     # Look up an active ChannelConfig so we can build a deep link.
     cc = (await db.execute(
         select(ChannelConfig).where(
             ChannelConfig.entity_id == entity_id,
+            ChannelConfig.owner_user_id == user_id,
             ChannelConfig.channel_type == channel_type,
             ChannelConfig.status == "active",
         ).order_by(ChannelConfig.updated_at.desc()).limit(1)
@@ -108,8 +109,19 @@ async def start_link(
         )
 
     bot_username = (cc.config or {}).get("bot_username") if isinstance(cc.config, dict) else None
-    if not bot_username and isinstance(cc.credentials, dict):
-        bot_username = cc.credentials.get("bot_username")
+    if channel_type == "telegram" and not bot_username:
+        try:
+            credentials = await lease_channel_credentials(
+                db,
+                cc,
+                reason="notification_channel_linking.telegram_bot_username",
+            )
+            bot_username = credentials.get("bot_username")
+        except ValueError:
+            logger.info(
+                "Telegram bot username source unavailable for channel_config=%s",
+                cc.id,
+            )
 
     token = _generate_token()
     expires_at = datetime.now(timezone.utc) + TOKEN_TTL
@@ -125,11 +137,18 @@ async def start_link(
     await db.flush()
 
     deep_link = None
-    if isinstance(bot_username, str) and bot_username:
+    if channel_type == "telegram" and isinstance(bot_username, str) and bot_username:
         deep_link = f"https://t.me/{bot_username.lstrip('@')}?start={token}"
         instructions = (
             "Open the link, tap Start, and we'll bind this Telegram "
             "account to your Manor profile."
+        )
+    elif channel_type == "discord":
+        instructions = (
+            "In your connected Discord server, mention the Manor bot and send "
+            "this command:\n"
+            f"  /start {token}\n"
+            "We'll bind this Discord account to your Manor profile."
         )
     else:
         instructions = (
@@ -205,8 +224,19 @@ async def claim_token(
     if user is None:
         return ClaimOutcome(ok=False, reason="user_inactive")
 
+    # User.role is only the compatibility role for the user's primary
+    # entity. A channel claim is entity-scoped, so resolve the authoritative
+    # membership/staff role for the target entity before entering the runtime.
+    from packages.core.permissions import resolve_effective_user_role_name
+
+    effective_role = await resolve_effective_user_role_name(
+        db,
+        user_id=user.id,
+        entity_id=row.entity_id,
+        legacy_role=user.role,
+    )
     contact.user_id = user.id
-    contact.role = user.role or contact.role or "member"
+    contact.role = effective_role or contact.role or "external"
     row.claimed_at = datetime.now(timezone.utc)
     row.claimed_contact_id = contact.id
     await db.flush()

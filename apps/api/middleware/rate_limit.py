@@ -4,7 +4,8 @@ from __future__ import annotations
 import os
 import time
 import logging
-from collections import defaultdict
+import ipaddress
+from collections import OrderedDict
 from dataclasses import dataclass
 
 from fastapi import Request
@@ -22,6 +23,8 @@ API_RATE_LIMIT_WINDOW = int(os.getenv("API_RATE_LIMIT_WINDOW_SECONDS", "60"))
 REDIS_RATE_LIMIT_ENABLED = os.getenv("REDIS_RATE_LIMIT_ENABLED", "false").lower() in ("1", "true", "yes", "on")
 
 _HEALTH_PATHS = {"/health", "/health/"}
+_DEFAULT_MEMORY_MAX_BUCKETS = 10_000
+_DEFAULT_MEMORY_CLEANUP_INTERVAL = 60.0
 
 
 @dataclass(frozen=True)
@@ -30,13 +33,29 @@ class RateLimitResult:
     retry_after: int = 0
 
 
+@dataclass
+class _MemoryWindow:
+    entries: list[float]
+    window_seconds: int
+
+
 class RateLimiter:
     """Rate limiter with in-memory defaults and optional Redis shared buckets."""
 
-    def __init__(self, *, redis_client=None, redis_enabled: bool | None = None):
-        self._windows: dict[str, list[float]] = defaultdict(list)
+    def __init__(
+        self,
+        *,
+        redis_client=None,
+        redis_enabled: bool | None = None,
+        max_memory_buckets: int = _DEFAULT_MEMORY_MAX_BUCKETS,
+        memory_cleanup_interval: float = _DEFAULT_MEMORY_CLEANUP_INTERVAL,
+    ):
+        self._windows: OrderedDict[str, _MemoryWindow] = OrderedDict()
         self._redis_client = redis_client
         self._redis_enabled = REDIS_RATE_LIMIT_ENABLED if redis_enabled is None else redis_enabled
+        self._max_memory_buckets = max(1, max_memory_buckets)
+        self._memory_cleanup_interval = max(0.0, memory_cleanup_interval)
+        self._last_memory_cleanup = 0.0
 
     async def check(self, key: str, max_requests: int, window_seconds: int) -> RateLimitResult:
         """Check if request is allowed."""
@@ -50,30 +69,54 @@ class RateLimiter:
 
     def _check_memory(self, key: str, max_requests: int, window_seconds: int) -> RateLimitResult:
         now = time.time()
+        self._cleanup_memory(now)
         cutoff = now - window_seconds
-        entries = [t for t in self._windows[key] if t > cutoff]
-        if not entries:
-            self._windows.pop(key, None)
-            self._windows[key] = [now]
-            return RateLimitResult(True)
+        bucket = self._windows.get(key)
+        entries = [t for t in (bucket.entries if bucket else []) if t > cutoff]
         if len(entries) >= max_requests:
-            self._windows[key] = entries
+            self._store_memory(key, entries, window_seconds)
             retry_after = max(1, int(window_seconds - (now - min(entries))) + 1)
             return RateLimitResult(False, retry_after)
         entries.append(now)
-        self._windows[key] = entries
+        self._store_memory(key, entries, window_seconds)
         return RateLimitResult(True)
+
+    def _cleanup_memory(self, now: float) -> None:
+        if now - self._last_memory_cleanup < self._memory_cleanup_interval:
+            return
+        for key, bucket in list(self._windows.items()):
+            cutoff = now - bucket.window_seconds
+            entries = [stamp for stamp in bucket.entries if stamp > cutoff]
+            if entries:
+                self._windows[key] = _MemoryWindow(entries, bucket.window_seconds)
+            else:
+                self._windows.pop(key, None)
+        self._last_memory_cleanup = now
+
+    def _store_memory(
+        self,
+        key: str,
+        entries: list[float],
+        window_seconds: int,
+    ) -> None:
+        self._windows[key] = _MemoryWindow(entries, window_seconds)
+        self._windows.move_to_end(key)
+        while len(self._windows) > self._max_memory_buckets:
+            self._windows.popitem(last=False)
 
     async def _check_redis(self, key: str, max_requests: int, window_seconds: int) -> RateLimitResult:
         try:
+            from packages.core.cache import redis_increment_with_ttl
+
             client = self._redis_client or await self._get_redis_client()
             redis_key = f"rate:{key}:{int(time.time() // window_seconds)}"
-            count = int(await client.incr(redis_key))
-            if count == 1:
-                await client.expire(redis_key, window_seconds)
+            count, ttl = await redis_increment_with_ttl(
+                client,
+                redis_key,
+                window_seconds,
+            )
             if count <= max_requests:
                 return RateLimitResult(True)
-            ttl = int(await client.ttl(redis_key))
             retry_after = ttl if ttl > 0 else window_seconds
             return RateLimitResult(False, retry_after)
         except Exception as exc:
@@ -99,11 +142,21 @@ def _path_group(path: str) -> str:
     return "other"
 
 
-def _client_ip(request: Request) -> str:
-    forwarded = request.headers.get("x-forwarded-for")
-    if forwarded:
-        return forwarded.split(",")[0].strip()
-    return request.client.host if request.client else "unknown"
+def _normalized_ip(value: str | None) -> str | None:
+    if not value:
+        return None
+    try:
+        return str(ipaddress.ip_address(value.strip()))
+    except ValueError:
+        return None
+
+
+def client_ip(request: Request) -> str:
+    """Return the client address already resolved by Uvicorn's proxy allowlist."""
+    peer = _normalized_ip(request.client.host if request.client else None)
+    if peer:
+        return peer
+    return request.client.host if request.client and request.client.host else "unknown"
 
 
 class ChatRateLimitMiddleware(BaseHTTPMiddleware):
@@ -120,7 +173,7 @@ class ChatRateLimitMiddleware(BaseHTTPMiddleware):
 
         # Build key from authenticated user or client IP
         user_id = getattr(request.state, "user_id", None)
-        ip = _client_ip(request)
+        ip = client_ip(request)
         key = f"user:{user_id}" if user_id else f"ip:{ip}"
 
         # Chat endpoints get stricter limits

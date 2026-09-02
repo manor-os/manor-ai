@@ -10,6 +10,7 @@ Schema that the model-provider enforces:
   * ``ws_commit_basics``           name + kind + context + primary_work
   * ``ws_propose_service``         service decomposition (1-5x)
   * ``ws_propose_goal``            target/cadence required, no defaults
+  * ``ws_confirm_creation_preferences`` confirmed Goal choice
   * ``ws_propose_agent_mapping``   ULID-checked + entity-scoped
   * ``ws_request_custom_agent``    fallback when no entity agent fits
   * ``ws_propose_channel``         primary external / internal / etc.
@@ -33,7 +34,9 @@ across surfaces.
 from __future__ import annotations
 
 import inspect
+import json
 import logging
+from packages.core.constants.workspace_drafts import uses_ui_runtime_mode
 import time
 from typing import Any, Awaitable, Callable, List, Optional
 
@@ -84,10 +87,23 @@ HARD RULES
    first to get the real list, then use those exact ids in
    ``ws_propose_agent_mapping``. If no good match exists, call
    ``ws_request_custom_agent`` instead.
-3. Goals must always have ``target`` and ``cadence``. Create a goal only
-   when the user supplied or confirmed a measurable target. Never invent
-   a KPI merely to make the draft look complete; ask one concise follow-up
-   when a measurable target is essential.
+3. Goals are optional. Before readiness, explicitly confirm in the conversation
+   whether the user wants to configure a Goal. If they want
+   a Goal, propose and confirm its title, target, cadence AND measurement:
+   the metric definition/formula, evidence source, and manual or automatic
+   recording mode. Then call ``ws_propose_goal`` with ``measurement``.
+   After any new Goal tool call has completed, call
+   ``ws_confirm_creation_preferences`` with the Goal answer and omit
+   ``autonomous_enabled`` for new drafts. Use
+   ``goal_choice=none`` when they decline a Goal, or ``configured`` when they
+   want to keep the Goal(s) already in the draft.
+   Never describe this as choosing a "with-Goal" or "without-Goal" runtime:
+   Goal configuration and autonomous operation are independent. New drafts
+   default to automatic operation after creation. The creation panel's
+   Automatic/Manual switch owns this choice; never change it or invent a
+   previous user confirmation. If they want manual mode, direct them to that
+   switch. Preserve an existing draft or Blueprint's configured mode.
+   If the user already stated their Goal choice, record it without asking again.
 4. Service / goal / rule / automation keys are snake_case
    (``content_creation``, ``follower_growth``).
 5. Do NOT claim the workspace is created. You are drafting -- the user
@@ -95,7 +111,7 @@ HARD RULES
    "operational".
 6. Do NOT ask the user to author rules / automations / scorecards
    field-by-field. Infer reasonable operational defaults from what they've
-   said, except measurable goal targets and cadences, which require user
+   said, except measurable goal targets, cadences and measurement contracts, which require user
    confirmation.
 7. When ``ws_lint_draft`` returns no P0 issues, call ``ws_mark_ready``
    and tell the user "The draft is ready -- click **Create Workspace**
@@ -104,29 +120,15 @@ HARD RULES
    mentions budget, spend, cap, limits, or credits, call
    ``ws_set_budget`` with ``monthly_budget_credits``. If they do not
    mention a budget, leave it uncapped; the draft UI lets them fill it.
-9. **MCP server preference.** When binding ``mcp_bindings`` for a
-   custom agent, ALWAYS prefer the per-platform MCP server over the
-   generic ``nango`` aggregator. Examples:
-   - For Twitter posting → bind ``twitter_x`` (NOT ``nango`` with
-     ``nango_proxy``).
-   - For Slack messaging → bind ``slack`` (NOT ``nango``).
-   - For Linear / Notion / GitHub → bind ``linear`` / ``notion`` /
-     ``github`` directly.
-   Only bind the ``nango`` server when (a) the platform has no
-   first-class MCP entry in ``ws_search_capabilities.integrations``
-   AND (b) the entity has authorized that provider via Nango (visible
-   under ``providers_connected`` in the nango integration row).
-   Per-platform servers expose typed tools that agents can call directly.
-   Binding the server is enough; tool-level allowlists are only needed for
-   deliberately narrowed scopes. ``nango_proxy`` is a generic HTTP passthrough
-   and should be a last resort.
-   MCP binding records capability intent, not current credential readiness.
-   Bind a supported MCP server whenever the agent needs that capability even
-   when ``active_integration`` is false. The draft runtime automatically records
-   the disconnected server as a missing integration so the user can connect it
-   later without recreating or rebinding the agent. This is especially important
-   for ``chrome``: bind it when browser work is required, then surface the Manor
-   CLI / Native Host / Chrome extension setup requirement separately.
+9. **Factory-owned MCP selection.** Never author ``mcp_bindings`` or MCP
+   action ids in ``ws_request_custom_agent``. The semantic Factory behind
+   ``ws_search_capabilities`` selects exact per-platform servers and action
+   allowlists; the request call only supplies the Agent design. The generic
+   ``nango`` aggregator is Workspace setup metadata and is intentionally not
+   a bindable Agent catalog candidate. Credential readiness is separate from
+   capability intent, so disconnected selections remain valid and surface a
+   setup warning. ``mcp:chrome`` represents the complete available Chrome
+   action surface and similarly keeps its extension setup state separate.
 
 ═══════════════════════════════════════════════════════════════════════
 TURN-BY-TURN FLOW
@@ -153,15 +155,20 @@ ALL of the following in this turn before replying to the user:
   STEP B. Decompose into 1-5 services with ``ws_propose_service``,
           one call per service. Always set both ``service_key`` and
           ``name`` (Title Case).
-  STEP C. ``ws_search_entity_agents`` once to load real agent ids.
-          ``ws_search_capabilities`` once to load the available tools,
-          skills, and integrations (with their backing MCP server keys).
-          These tools return complete inventories and do not match by keyword.
-          You are the semantic matcher: compare each service's actual work,
-          inputs, outputs, operating constraints, and required actions against
-          every candidate's description, instructions, and declared tools.
-          Never select or reject a candidate merely because words in its name,
-          slug, category, or description overlap with the user's wording.
+  STEP C. Before matching capabilities, persist every policy, guardrail,
+          allowed/denied action, and approval constraint the user described
+          with ``ws_propose_rule``. Wait for those calls to finish. Then call
+          ``ws_search_entity_agents`` once to load real agent ids.
+          For every service that needs a custom Agent, call
+          ``ws_search_capabilities(draft_id, service_key)``. Its shared Factory
+          scans the complete actor catalog in bounded semantic rounds and
+          returns and stores a compact least-privilege
+          ``agent_capability_plan``; it does not keyword-match. Then call
+          ``ws_request_custom_agent`` with the same ``service_key`` and omit
+          ``capability_ids``: the server reuses the stored validated plan.
+          Never reconstruct capability ids from MCP server names. A
+          ``setup_required`` candidate remains valid binding intent and must
+          surface as a connection prerequisite.
   STEP D. For each service, decide:
             (a) best entity-agent match → ``ws_propose_agent_mapping``,
                 or
@@ -180,22 +187,13 @@ ALL of the following in this turn before replying to the user:
                     the agent's name, list its core skills, end with a
                     scope guard ("Stay in this capability; defer
                     cross-capability requests").
-                  - ``tool_bindings`` -- pick from
-                    ws_search_capabilities.tools that the service truly
-                    needs (don't over-bind; no shotgun).
-                  - ``business_capabilities`` -- for workspace operation
-                    scope changes, prefer these ids over raw tool names
-                    so runtime can expand and audit the capability.
-                  - ``skill_bindings`` -- if an existing skill matches a
-                    sub-task (e.g. "twitter_post"), bind it. Browser-extension
-                    operation is represented by the existing ``chrome`` skill:
-                    bind that skill even when the extension is not connected.
-                  - ``mcp_bindings`` -- bind supported servers the agent needs,
-                    whether or not ``active_integration`` is currently true.
-                    Connection readiness is tracked separately and missing
-                    integrations are surfaced to the user automatically. Do NOT
-                    put Chrome/browser-extension operation here; the ``chrome``
-                    skill owns its underlying MCP tools and setup dependency.
+                  - omit ``capability_ids`` and legacy tool / business / skill /
+                    MCP fields after the Factory search; the same service_key
+                    deterministically reuses its stored validated plan.
+                  - Chrome/browser operation is represented by the server-level
+                    ``mcp:chrome`` capability, which covers all available Chrome
+                    actions. Keep it when selected even if setup is required;
+                    setup readiness is tracked separately from binding intent.
                   - ``missing_skill_specs`` -- if the service needs a
                     capability NOT covered by any existing tool/skill,
                     request a brand-new skill (the platform creates it
@@ -209,11 +207,21 @@ ALL of the following in this turn before replying to the user:
                     warning.
           IMPORTANT: a custom agent without any tool / skill / mcp
           binding cannot do real work. Always bind something.
-  STEP E. Extract goals -- ``ws_propose_goal``, one per explicit,
-          measurable target the user supplied or confirmed. Always supply
-          target + cadence. Do not create a guessed target. If the user has
-          not supplied one, complete the other draft sections, then ask one
-          focused question for the target and cadence; do not mark ready yet.
+  STEP E. Extract goals only when the user supplied or asked to track an
+          explicit measurable target -- ``ws_propose_goal``, one per target.
+          Always supply target + cadence + measurement. The provided
+          ``goal_measurement_library`` lists supported automatic internal metrics.
+          Use one only when its definition actually measures the requested outcome.
+          Otherwise propose a manual metric with key, name, description (formula
+          and pass criteria), source (who records it and evidence used), unit,
+          value_type and window. Explain manual recording and get confirmation;
+          do not claim that a formula or Knowledge document creates a collector.
+          For readiness/quality/rates, define the population, numerator/denominator
+          or scoring rubric, and handling of missing evidence. Unmeasured is not zero.
+          Never replace readiness, revenue or quality with completed-task impact.
+          Never invent an initial score. If the user did not ask for a Goal,
+          leave goals empty for now; do not assume that silence means they
+          declined one.
   STEP F. Add an internal channel with ``ws_propose_channel``
           role=internal channel_type=internal_chat. Add a primary external
           channel ONLY when the user explicitly needs inbound/outbound
@@ -237,9 +245,10 @@ ALL of the following in this turn before replying to the user:
           clearly fits, in which case mode='clone_template'. Use
           generate_starter_doc=true when the workspace needs a fresh
           generated markdown doc in addition to any template files.
-  STEP I. If the user described policies → ``ws_propose_rule``;
-          schedules → ``ws_propose_automation``. Skip if absent.
-          For external-action guardrails, set enforceable fields:
+  STEP I. If the user described schedules → ``ws_propose_automation``.
+          Skip if absent. Policy rules were already persisted before the
+          Factory search in STEP C. For external-action guardrails, their
+          earlier ``ws_propose_rule`` calls must set enforceable fields:
           - "approval before posting/sending" →
             rule_type="approval_required",
             action_patterns=["social_post.publish"] / ["email.send"] /
@@ -256,10 +265,22 @@ ALL of the following in this turn before replying to the user:
   STEP K. If the user gave a monthly credit budget or asked to control
           spend → ``ws_set_budget``. Use credits. Do not invent a cap
           from nothing.
+  STEP K2. Before linting, verify that the user decided whether to configure
+           a Goal. If that choice is still unknown, ask one concise question
+           and STOP this turn before
+           ``ws_lint_draft`` or ``ws_mark_ready``. When the user replies, call
+           ``ws_propose_goal`` for a new confirmed Goal and WAIT for that tool
+           result. Then call ``ws_confirm_creation_preferences`` with the Goal
+           choice, preserving the creation panel's runtime mode. New drafts
+           default to automatic; do not require another autonomy confirmation
+           or turn automation off because a Goal answer omitted it. The user
+           may switch to Manual in the creation panel before creating.
+           Legacy drafts that request autonomy confirmation retain their
+           existing choice; do not silently upgrade their runtime mode.
   STEP L. ``ws_lint_draft`` and inspect issues.
           - If P0 issues exist, fix them via more tool calls then
-            re-lint. If the only unfixable P0 needs user input (especially a
-            confirmed goal), ask that one question and stop before mark_ready.
+            re-lint. If an unfixable P0 needs user input, ask that one question
+            and stop before mark_ready.
           - When P0=0, ``ws_mark_ready``.
   STEP M. Reply to the user with: a one-paragraph summary of what
           you drafted (services + agents + key goals + staff assigned
@@ -287,8 +308,9 @@ QUALITY BAR
 
 * Every service has a real ``name`` (not just service_key).
 * Every service has an agent_mapping (real or custom).
-* At least one measurable goal was supplied or confirmed by the user.
-* Every goal has target + cadence.
+* The user explicitly confirmed whether to configure a Goal; no Goal is valid.
+* Every configured Goal has a user-confirmed target + cadence + measurement definition.
+* The creation panel's runtime mode is preserved; new drafts default to automatic.
 * Any explicitly requested external channel has channel_type and purpose.
 * The visible reply is short, plain, and human -- no JSON, no XML,
   no enumerated tool names.
@@ -336,11 +358,17 @@ async def architect_run_turn(
     # before making targeted edits. Without this, it would have to
     # call ws_lint_draft just to see the current configuration.
     draft_snapshot = ""
-    try:
-        from packages.core.services.workspace_draft_service import get_draft
+    from packages.core.services.workspace_draft_service import get_draft
 
-        _draft = await get_draft(db, draft_id, entity_id)
-        if _draft and _draft.fields:
+    _draft = await get_draft(
+        db, draft_id, entity_id, user_id, for_update=True,
+    )
+    if _draft is None:
+        raise ValueError("Draft not found")
+    if _draft.status not in {"active", "ready"}:
+        raise ValueError(f"Draft is {_draft.status} and cannot be changed")
+    try:
+        if _draft.fields:
             f = _draft.fields
             summary_parts = []
             if f.get("name"):
@@ -359,6 +387,19 @@ async def architect_run_turn(
             if goals:
                 goal_strs = [g.get("title") or g.get("goal_key", "?") for g in goals]
                 summary_parts.append(f"goals: {', '.join(goal_strs)}")
+            creation_preferences = f.get("_creation_preferences")
+            if isinstance(creation_preferences, dict):
+                summary_parts.append(
+                    f"Goal choice confirmed: {bool(creation_preferences.get('goal_confirmed'))}"
+                )
+                if not uses_ui_runtime_mode(f):
+                    summary_parts.append(
+                        f"legacy autonomy confirmed: {bool(creation_preferences.get('autonomy_confirmed'))}"
+                    )
+            mode = "Automatic" if f.get("heartbeat_enabled") else "Manual"
+            summary_parts.append(f"runtime mode after creation: {mode}")
+            if uses_ui_runtime_mode(f):
+                summary_parts.append("Runtime mode belongs to the creation panel; preserve it without another confirmation.")
             channels = (f.get("channel_config") or {}).get("channels") or []
             if channels:
                 ch_strs = [c.get("channel_type", "?") for c in channels]
@@ -372,11 +413,14 @@ async def architect_run_turn(
     except Exception:
         pass
 
+    from packages.core.services.workspace_goal_measurements import draft_measurement_library
+
     framed_user_message = (
         f"<draft_id>{draft_id}</draft_id>\n"
         f"<entity_id>{entity_id}</entity_id>\n"
         "Pass the draft_id above to every tool call.\n\n"
         f"{draft_snapshot}"
+        f"<goal_measurement_library>{json.dumps(draft_measurement_library())}</goal_measurement_library>\n"
         f"{user_message}"
     )
 

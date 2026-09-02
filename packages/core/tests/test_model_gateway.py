@@ -1,3 +1,6 @@
+from contextlib import asynccontextmanager
+from types import SimpleNamespace
+
 import pytest
 
 from packages.core.services.model_gateway import (
@@ -175,3 +178,52 @@ async def test_openrouter_env_base_url_is_used_when_db_key_is_missing(monkeypatc
     assert credential is not None
     assert credential.source_detail == "OPENROUTER_API_KEY"
     assert credential.base_url == "https://router.example/v1"
+
+
+@pytest.mark.asyncio
+async def test_legacy_encrypted_admin_key_is_leased_before_env(monkeypatch):
+    import packages.core.credentials as credential_pkg
+    import packages.core.database as database
+    import packages.core.services.platform_model_provider_keys as provider_keys
+
+    row = SimpleNamespace(
+        provider="vercel",
+        status="active",
+        credential_ref="vault:v1:ciphertext",
+        credential_scheme="vault_transit",
+        config={"base_url": "https://ai-gateway.vercel.sh/v1"},
+    )
+
+    @asynccontextmanager
+    async def fake_session():
+        yield object()
+
+    async def fake_get_row(_db, provider):
+        assert provider == "vercel"
+        return row
+
+    class CredentialService:
+        def lease_model_provider_key(self, leased_row, *, requester, reason):
+            assert leased_row is row
+            assert requester.kind == "system"
+            assert requester.id == "model_provider:vercel"
+            assert reason == "test.legacy.admin.key"
+            return {"api_key": "vck-legacy-admin-key-1234567890"}
+
+    monkeypatch.setenv("AI_GATEWAY_API_KEY", "vck-env-key-1234567890")
+    monkeypatch.setattr(database, "async_session", fake_session)
+    monkeypatch.setattr(provider_keys, "_get_row", fake_get_row)
+    monkeypatch.setattr(
+        credential_pkg,
+        "get_credential_service",
+        lambda: CredentialService(),
+    )
+
+    credential = await provider_keys.resolve_official_provider_credential(
+        "vercel",
+        reason="test.legacy.admin.key",
+    )
+
+    assert credential is not None
+    assert credential.api_key == "vck-legacy-admin-key-1234567890"
+    assert credential.source_detail == "db"

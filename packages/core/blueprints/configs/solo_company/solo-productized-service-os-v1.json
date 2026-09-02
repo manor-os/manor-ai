@@ -72,7 +72,12 @@
     ],
     "requires": {
       "manor_min_version": "1.0",
-      "tools": [],
+      "tools": [
+        "read_finance_ledger",
+        "record_finance_ledger",
+        "read_relationship_ledger",
+        "record_relationship_ledger"
+      ],
       "mcp_servers": [],
       "skills": [],
       "agents": []
@@ -85,8 +90,13 @@
         "name": "Productized Service Playbook",
         "display_name": "Productized Service Playbook",
         "description": "Operating playbook for Productized Service OS.",
-        "system_prompt": "Help a service provider convert expertise into a fixed-scope offer. Prioritize narrow ICP, proof, weekly outbound, fast follow-up, deposits, scope control, and simple cash-flow visibility.",
-        "tools": [],
+        "system_prompt": "Help a service provider convert expertise into a fixed-scope offer. Read the relationship ledger before prospect follow-up and append confirmed calls, proposals, and next actions with stable identity keys and evidence references. Use the finance ledger for validated invoices, deposits, payments, and overdue balances, citing Knowledge evidence. Prioritize narrow ICP, proof, weekly outbound, fast follow-up, deposits, scope control, and simple cash-flow visibility.",
+        "tools": [
+          "read_finance_ledger",
+          "record_finance_ledger",
+          "read_relationship_ledger",
+          "record_relationship_ledger"
+        ],
         "input_schema": {
           "type": "object",
           "properties": {
@@ -149,15 +159,26 @@
         "slug": "solo-productized-service-ops",
         "title": "Productized Service Ops",
         "purpose": "Store ICP, offer, proof, outreach, proposal, and cash-flow review docs.",
-        "mode": "skeleton",
+        "mode": "inline_text",
         "folder_structure": [
           "offer/",
           "proof/",
           "prospects/",
           "proposals/",
-          "cash-flow/"
+          "cash-flow/",
+          "relationship-ledger/",
+          "finance-ledger/"
         ],
-        "starter_documents": [],
+        "starter_documents": [
+          {
+            "path": "relationship-ledger/README.md",
+            "body_md": "# Relationship Ledger\n\nUse `read_relationship_ledger` before prospecting or follow-up. Record confirmed calls, proposals, approvals, and next actions with `record_relationship_ledger`, using a stable identity key and evidence references. Never invent a contact status.\n"
+          },
+          {
+            "path": "finance-ledger/README.md",
+            "body_md": "# Finance Ledger\n\nUse `read_finance_ledger` for invoices, deposits, payments, refunds, and overdue balances. Record validated entries with `record_finance_ledger`, attaching Knowledge receipts, bills, or agreements as evidence.\n"
+          }
+        ],
         "external_source": null
       }
     ]
@@ -171,7 +192,22 @@
         "timezone": "America/Los_Angeles",
         "blueprint_frozen": true,
         "frozen_at": "2026-06-03",
-        "install_expectation": "simulate_first_then_promote"
+        "install_expectation": "simulate_first_then_promote",
+        "ledger_contracts": [
+          {
+            "contract_id": "manor.relationship_ledger/v1",
+            "schema_version": 1,
+            "directory": "relationship-ledger",
+            "knowledge_path": "relationship-ledger/README.md",
+            "subject_types": ["person", "organization", "customer", "prospect", "lead"]
+          },
+          {
+            "contract_id": "manor.finance_ledger/v1",
+            "schema_version": 1,
+            "directory": "finance-ledger",
+            "knowledge_path": "finance-ledger/README.md"
+          }
+        ]
       },
       "services": [
         {

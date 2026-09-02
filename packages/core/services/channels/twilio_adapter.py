@@ -8,7 +8,7 @@ Handles:
 - Phone number listing and usage reporting
 
 Configuration:
-  Credentials are stored in ChannelConfig.credentials:
+  Credentials are leased from the ChannelConfig's source Integration:
     account_sid  — Twilio Account SID
     auth_token   — Twilio Auth Token
     from_number  — Default outbound phone number (E.164 format)
@@ -19,8 +19,17 @@ import base64
 import hashlib
 import hmac
 import logging
-from typing import Any
-from urllib.parse import urlencode
+from typing import Any, Optional as _Optional
+
+from packages.core.models.channel import ChannelConfig as _CC
+from packages.core.services.channels.base import (
+    ChannelAdapter,
+    ChannelTextSendError,
+    ChannelTextSendResultStatus,
+    NormalizedInbound,
+    channel_text_send_result,
+    register_adapter,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -73,7 +82,14 @@ class TwilioAdapter:
             }
         """
         if httpx is None:
-            raise RuntimeError("httpx is not installed. Run: pip install httpx")
+            raise ChannelTextSendError.determinate(
+                "httpx is not installed. Run: pip install httpx"
+            )
+        to = str(to or "").strip()
+        if not to:
+            raise ValueError("Twilio SMS recipient must not be blank")
+        if not str(body or "").strip():
+            raise ValueError("Twilio SMS body must not be blank")
 
         url = f"{TWILIO_API_BASE}/Accounts/{self.account_sid}/Messages.json"
         payload = {
@@ -93,21 +109,37 @@ class TwilioAdapter:
         if resp.status_code >= 400:
             error_msg = data.get("message", resp.text)
             logger.error("Twilio send_sms failed: status=%s error=%s", resp.status_code, error_msg)
-            raise RuntimeError(f"Twilio API error {resp.status_code}: {error_msg}")
+            raise ChannelTextSendError.from_http_status(
+                f"Twilio API error {resp.status_code}: {error_msg}",
+                status_code=resp.status_code,
+            )
 
-        return {
-            "external_id": data.get("sid", ""),
-            "status": data.get("status", ""),
-            "from_address": data.get("from", self.from_number),
-            "to_address": data.get("to", to),
-            "raw": data,
-        }
+        return channel_text_send_result(
+            ChannelTextSendResultStatus.QUEUED,
+            external_id=data.get("sid", ""),
+            provider_status=data.get("status", ""),
+            from_address=data.get("from", self.from_number),
+            to_address=data.get("to", to),
+            raw=data,
+        )
 
     # ------------------------------------------------------------------
     # Outbound voice call
     # ------------------------------------------------------------------
 
-    async def make_call(self, to: str, twiml_url: str) -> dict[str, Any]:
+    async def make_call(
+        self,
+        to: str,
+        twiml_url: str,
+        *,
+        status_callback_url: str | None = None,
+        status_callback_events: tuple[str, ...] = (
+            "initiated",
+            "ringing",
+            "answered",
+            "completed",
+        ),
+    ) -> dict[str, Any]:
         """Initiate voice call via Twilio REST API.
 
         POST https://api.twilio.com/2010-04-01/Accounts/{sid}/Calls.json
@@ -122,14 +154,30 @@ class TwilioAdapter:
             }
         """
         if httpx is None:
-            raise RuntimeError("httpx is not installed. Run: pip install httpx")
+            raise ChannelTextSendError.determinate(
+                "httpx is not installed. Run: pip install httpx"
+            )
+        to = str(to or "").strip()
+        twiml_url = str(twiml_url or "").strip()
+        if not to:
+            raise ValueError("Twilio call recipient must not be blank")
+        if not twiml_url:
+            raise ValueError("Twilio TwiML URL must not be blank")
 
         url = f"{TWILIO_API_BASE}/Accounts/{self.account_sid}/Calls.json"
-        payload = {
+        payload: dict[str, Any] = {
             "To": to,
             "From": self.from_number,
             "Url": twiml_url,
         }
+        if status_callback_url:
+            payload["StatusCallback"] = str(status_callback_url).strip()
+            payload["StatusCallbackMethod"] = "POST"
+            payload["StatusCallbackEvent"] = [
+                event
+                for raw_event in status_callback_events
+                if (event := str(raw_event).strip())
+            ]
 
         async with httpx.AsyncClient(timeout=30) as client:
             resp = await client.post(
@@ -142,15 +190,19 @@ class TwilioAdapter:
         if resp.status_code >= 400:
             error_msg = data.get("message", resp.text)
             logger.error("Twilio make_call failed: status=%s error=%s", resp.status_code, error_msg)
-            raise RuntimeError(f"Twilio API error {resp.status_code}: {error_msg}")
+            raise ChannelTextSendError.from_http_status(
+                f"Twilio API error {resp.status_code}: {error_msg}",
+                status_code=resp.status_code,
+            )
 
-        return {
-            "external_id": data.get("sid", ""),
-            "status": data.get("status", ""),
-            "from_address": data.get("from", self.from_number),
-            "to_address": data.get("to", to),
-            "raw": data,
-        }
+        return channel_text_send_result(
+            ChannelTextSendResultStatus.QUEUED,
+            external_id=data.get("sid", ""),
+            provider_status=data.get("status", ""),
+            from_address=data.get("from", self.from_number),
+            to_address=data.get("to", to),
+            raw=data,
+        )
 
     # ------------------------------------------------------------------
     # Inbound webhook handling
@@ -356,22 +408,23 @@ class TwilioAdapter:
 
 # ── Polymorphic ChannelAdapter wrappers ─────────────────────────────────────
 
-import json as _json
-from typing import Optional as _Optional
 
-from packages.core.models.channel import ChannelConfig as _CC
-from packages.core.services.channels.base import (
-    ChannelAdapter, NormalizedInbound, register_adapter,
-)
+async def _twilio(cc: _CC, *, reason: str) -> TwilioAdapter:
+    from packages.core.services.channel_credentials import (
+        lease_channel_config_credentials,
+    )
 
-
-def _twilio(cc: _CC) -> TwilioAdapter:
-    creds = cc.credentials or {}
+    try:
+        creds = await lease_channel_config_credentials(cc, reason=reason)
+    except ValueError as exc:
+        raise ChannelTextSendError.determinate(str(exc)) from exc
     sid = creds.get("account_sid")
     auth = creds.get("auth_token")
     from_num = creds.get("phone_number") or creds.get("from_number")
     if not (sid and auth):
-        raise RuntimeError("Twilio ChannelConfig missing account_sid / auth_token")
+        raise ChannelTextSendError.determinate(
+            "Twilio credential source is missing account_sid / auth_token"
+        )
     return TwilioAdapter(account_sid=sid, auth_token=auth, from_number=from_num or "")
 
 
@@ -387,8 +440,15 @@ def _parse_form(body: bytes) -> dict[str, str]:
 class TwilioSMSChannelAdapter(ChannelAdapter):
     channel_type = "twilio_sms"
 
+    def webhook_path(self, cc: _CC) -> str:
+        return f"/api/v1/channels/twilio/sms?config_id={cc.id}"
+
     async def send_text(self, cc: _CC, to: str, text: str, **kwargs: Any) -> dict[str, Any]:
-        return await _twilio(cc).send_sms(to, text)
+        adapter = await _twilio(cc, reason="channel.twilio_sms.send_text")
+        try:
+            return await adapter.send_sms(to, text)
+        except ValueError as exc:
+            raise ChannelTextSendError.determinate(str(exc)) from exc
 
     async def parse_inbound(self, cc: _CC, *, headers, query, body) -> _Optional[NormalizedInbound]:
         form = _parse_form(body)
@@ -409,23 +469,33 @@ class TwilioSMSChannelAdapter(ChannelAdapter):
 
 
 class TwilioVoiceChannelAdapter(ChannelAdapter):
-    """Voice works differently from text channels — each inbound call
-    produces one TwiML response per leg, not a background reply. For
-    now the adapter only supports initiating outbound calls that ring a
-    TwiML URL we host; inbound with ``<Gather>``-based turn-taking is a
-    follow-up. ``send_text`` here is a no-op that returns a pointer the
-    router can use to build a ``<Say>`` response.
+    """Twilio Voice registration and compatibility adapter.
+
+    Live speech is delivered by the Media Streams websocket and therefore
+    bypasses ``send_text``. Outbound calls should use the Twilio MCP
+    ``make_call`` operation, which creates the authenticated call session and
+    Manor-owned TwiML URL before calling Twilio.
     """
     channel_type = "twilio_voice"
 
+    def webhook_path(self, cc: _CC) -> str:
+        return f"/api/v1/channels/twilio/voice?config_id={cc.id}"
+
     async def send_text(self, cc: _CC, to: str, text: str, **kwargs: Any) -> dict[str, Any]:
-        # A voice "send" places a call that plays the text via TTS. The
-        # router serving /twiml/{token}.xml must synthesise <Say>text</Say>.
+        # Kept for legacy callers that explicitly provide their own TwiML
+        # URL. The Agent-facing path is MCP ``make_call`` above.
         twiml_url = kwargs.get("twiml_url")
         if not twiml_url:
-            return {"status": "deferred", "reason": "no twiml_url — supply to place call",
-                    "text": text}
-        return await _twilio(cc).make_call(to, twiml_url)
+            return channel_text_send_result(
+                ChannelTextSendResultStatus.DEFERRED,
+                reason="no twiml_url — supply to place call",
+                text=text,
+            )
+        adapter = await _twilio(cc, reason="channel.twilio_voice.send_text")
+        try:
+            return await adapter.make_call(to, twiml_url)
+        except ValueError as exc:
+            raise ChannelTextSendError.determinate(str(exc)) from exc
 
     async def parse_inbound(self, cc: _CC, *, headers, query, body) -> _Optional[NormalizedInbound]:
         form = _parse_form(body)

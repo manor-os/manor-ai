@@ -11,6 +11,7 @@ from typing import Optional
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from packages.core.constants.review import ConsolidationReportStatus
 from packages.core.consolidators.base import SnapshotContext, evidence_ids
 from packages.core.consolidators.contract import (
     ConsolidationReportModel,
@@ -82,7 +83,7 @@ class CapacityCostConsolidator:
         }
         return ConsolidationReportModel(
             domain=self.domain,
-            status="complete",
+            status=ConsolidationReportStatus.COMPLETE,
             summary=(
                 f"{len(activity_events)} activity event(s); spent {spent:.2f} USD "
                 f"of {'uncapped' if budget is None else f'{budget:.2f} USD'} budget"

@@ -58,8 +58,8 @@ def test_wiki_links_resolve_visible_markdown_and_lint_broken_links(tmp_path):
         scoped_graph = build_wiki_graph(entity_id, allowed_paths={"Knowledge/Lease Playbook.md"})
         assert scoped_graph["page_count"] == 1
         assert scoped_graph["pages"][0]["path"] == "Knowledge/Lease Playbook.md"
-        assert scoped_graph["pages"][0]["links"][0]["exists"] is True
-        assert scoped_graph["pages"][0]["links"][0]["resolved_path"] == "Knowledge/Client FAQ.md"
+        assert scoped_graph["pages"][0]["links"][0]["exists"] is False
+        assert scoped_graph["pages"][0]["links"][0]["resolved_path"] is None
     finally:
         settings.MANOR_FS_ROOT = old_root
         settings.MANOR_FS_ENABLED = old_enabled

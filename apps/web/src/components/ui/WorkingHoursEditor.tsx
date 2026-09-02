@@ -37,15 +37,15 @@ function formatTimeLabel(value: string): string {
   return `${pad(hour12)}:${pad(minute)} ${suffix}`;
 }
 
-const TIME_OPTIONS = Array.from({ length: 24 * 4 }, (_, index) => {
+export const WORKING_HOURS_TIME_OPTIONS = Array.from({ length: 24 * 4 }, (_, index) => {
   const total = index * 15;
   const value = `${pad(Math.floor(total / 60))}:${pad(total % 60)}`;
   return { value, label: formatTimeLabel(value) };
 });
 
 function timeOptionsWithValue(value: string) {
-  if (!value || TIME_OPTIONS.some((option) => option.value === value)) return TIME_OPTIONS;
-  return [...TIME_OPTIONS, { value, label: formatTimeLabel(value) }]
+  if (!value || WORKING_HOURS_TIME_OPTIONS.some((option) => option.value === value)) return WORKING_HOURS_TIME_OPTIONS;
+  return [...WORKING_HOURS_TIME_OPTIONS, { value, label: formatTimeLabel(value) }]
     .sort((a, b) => minutesFromTime(a.value) - minutesFromTime(b.value));
 }
 
@@ -79,6 +79,7 @@ export default function WorkingHoursEditor({
         {rows.map((row) => (
           <div
             key={row.day_of_week}
+            data-day-of-week={row.day_of_week}
             className={`working-hours-row${row.enabled ? "" : " is-disabled"}`}
             style={{
               display: "grid",

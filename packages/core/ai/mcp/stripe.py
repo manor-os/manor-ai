@@ -11,7 +11,7 @@ from __future__ import annotations
 import json
 import logging
 from typing import Any, Dict, List, Optional
-from urllib.parse import urlencode
+from urllib.parse import quote
 
 import httpx
 
@@ -19,6 +19,11 @@ logger = logging.getLogger(__name__)
 
 _API = "https://api.stripe.com/v1"
 _MAX_CHARS = 12_000
+
+
+def _path_segment(value: Any) -> str:
+    """Encode an opaque Stripe resource ID as one URL path segment."""
+    return quote(str(value), safe="")
 
 
 # ── MCP Protocol ─────────────────────────────────────────────────────────────
@@ -33,18 +38,45 @@ async def call_tool(
     arguments: Dict[str, Any],
     bearer_token: str,
 ) -> Dict[str, Any]:
+    key = bearer_token.strip() if isinstance(bearer_token, str) else ""
+    if not key:
+        return _error("Stripe needs a secret API key.")
+
     handler = _HANDLERS.get(name)
     if not handler:
         return _error(f"Unknown tool: {name}")
+    if not isinstance(arguments, dict):
+        return _error("arguments must be an object")
+    arguments = dict(arguments)
 
     spec = _TOOLS.get(name, {})
-    missing = [p for p in spec.get("required", []) if arguments.get(p) in (None, "")]
+    missing = [p for p in spec.get("required", []) if _is_blank(arguments.get(p))]
     if missing:
         return _error(f"Missing required params: {', '.join(missing)}")
+    for field, property_spec in (spec.get("properties") or {}).items():
+        value = arguments.get(field)
+        if value is None:
+            continue
+        property_type = property_spec.get("type")
+        if property_type == "string" and not isinstance(value, str):
+            return _error(f"{field} must be a string")
+        if property_type == "boolean" and not isinstance(value, bool):
+            return _error(f"{field} must be a boolean")
+        if property_type == "integer":
+            if isinstance(value, bool):
+                return _error(f"{field} must be an integer")
+            try:
+                parsed = int(value)
+            except (TypeError, ValueError, OverflowError):
+                return _error(f"{field} must be an integer")
+            if isinstance(value, float) and value != parsed:
+                return _error(f"{field} must be an integer")
 
     try:
-        text = await handler(bearer_token, arguments)
+        text = await handler(key, arguments)
         return {"content": [{"type": "text", "text": text}], "isError": False}
+    except _StripeError as e:
+        return _error(str(e))
     except Exception as e:
         logger.exception("Stripe MCP tool %s failed", name)
         return _error(str(e))
@@ -52,6 +84,14 @@ async def call_tool(
 
 def _error(msg: str) -> Dict[str, Any]:
     return {"content": [{"type": "text", "text": msg}], "isError": True}
+
+
+def _is_blank(value: Any) -> bool:
+    return value is None or (isinstance(value, str) and not value.strip())
+
+
+class _StripeError(RuntimeError):
+    pass
 
 
 # ── Stripe API client ────────────────────────────────────────────────────────
@@ -79,20 +119,20 @@ async def _api(
             resp = await client.request(method, url, headers=headers, data=form_data, auth=auth)
 
     if resp.status_code == 401:
-        return "Stripe authentication failed. Check your API key on the Integration page."
+        raise _StripeError("Stripe authentication failed. Check your API key on the Integration page.")
     if resp.status_code == 403:
-        return f"Stripe forbidden: {resp.text[:300]}"
+        raise _StripeError(f"Stripe forbidden: {resp.text[:300]}")
     if resp.status_code == 404:
-        return "Not found."
+        raise _StripeError("Not found.")
     if resp.status_code == 429:
-        return "Stripe rate limit exceeded. Please wait a moment and try again."
+        raise _StripeError("Stripe rate limit exceeded. Please wait a moment and try again.")
     if not resp.is_success:
         try:
             err = resp.json()
             msg = err.get("error", {}).get("message", resp.text[:300])
-            return f"Stripe API error ({resp.status_code}): {msg}"
         except Exception:
-            return f"Stripe API error ({resp.status_code}): {resp.text[:300]}"
+            msg = resp.text[:300]
+        raise _StripeError(f"Stripe API error ({resp.status_code}): {msg}")
 
     try:
         data = resp.json()
@@ -125,7 +165,7 @@ async def _list_customers(key: str, args: Dict) -> str:
 
 
 async def _get_customer(key: str, args: Dict) -> str:
-    return await _api(key, "GET", f"customers/{args['customer_id']}")
+    return await _api(key, "GET", f"customers/{_path_segment(args['customer_id'])}")
 
 
 async def _create_customer(key: str, args: Dict) -> str:
@@ -158,12 +198,12 @@ async def _list_payment_intents(key: str, args: Dict) -> str:
 
 
 async def _get_payment_intent(key: str, args: Dict) -> str:
-    return await _api(key, "GET", f"payment_intents/{args['payment_intent_id']}")
+    return await _api(key, "GET", f"payment_intents/{_path_segment(args['payment_intent_id'])}")
 
 
 async def _create_payment_intent(key: str, args: Dict) -> str:
     data: Dict[str, Any] = {
-        "amount": int(args["amount"]),
+        "amount": _integer(args["amount"], "amount", minimum=1),
         "currency": args.get("currency", "usd"),
     }
     if args.get("customer"):
@@ -192,7 +232,7 @@ async def _list_invoices(key: str, args: Dict) -> str:
 
 
 async def _get_invoice(key: str, args: Dict) -> str:
-    return await _api(key, "GET", f"invoices/{args['invoice_id']}")
+    return await _api(key, "GET", f"invoices/{_path_segment(args['invoice_id'])}")
 
 
 async def _create_invoice(key: str, args: Dict) -> str:
@@ -207,11 +247,11 @@ async def _create_invoice(key: str, args: Dict) -> str:
 
 
 async def _send_invoice(key: str, args: Dict) -> str:
-    return await _api(key, "POST", f"invoices/{args['invoice_id']}/send")
+    return await _api(key, "POST", f"invoices/{_path_segment(args['invoice_id'])}/send")
 
 
 async def _void_invoice(key: str, args: Dict) -> str:
-    return await _api(key, "POST", f"invoices/{args['invoice_id']}/void")
+    return await _api(key, "POST", f"invoices/{_path_segment(args['invoice_id'])}/void")
 
 
 # -- Invoice Items --
@@ -221,7 +261,7 @@ async def _create_invoice_item(key: str, args: Dict) -> str:
     if args.get("invoice"):
         data["invoice"] = args["invoice"]
     if args.get("amount"):
-        data["amount"] = int(args["amount"])
+        data["amount"] = _integer(args["amount"], "amount")
     if args.get("currency"):
         data["currency"] = args["currency"]
     if args.get("description"):
@@ -239,7 +279,7 @@ async def _list_products(key: str, args: Dict) -> str:
 
 
 async def _get_product(key: str, args: Dict) -> str:
-    return await _api(key, "GET", f"products/{args['product_id']}")
+    return await _api(key, "GET", f"products/{_path_segment(args['product_id'])}")
 
 
 async def _list_prices(key: str, args: Dict) -> str:
@@ -263,7 +303,7 @@ async def _list_charges(key: str, args: Dict) -> str:
 
 
 async def _get_charge(key: str, args: Dict) -> str:
-    return await _api(key, "GET", f"charges/{args['charge_id']}")
+    return await _api(key, "GET", f"charges/{_path_segment(args['charge_id'])}")
 
 
 # -- Refunds --
@@ -275,7 +315,7 @@ async def _create_refund(key: str, args: Dict) -> str:
     if args.get("charge"):
         data["charge"] = args["charge"]
     if args.get("amount"):
-        data["amount"] = int(args["amount"])
+        data["amount"] = _integer(args["amount"], "amount", minimum=1)
     if args.get("reason"):
         data["reason"] = args["reason"]
     return await _api(key, "POST", "refunds", form_data=data)
@@ -302,16 +342,37 @@ async def _list_subscriptions(key: str, args: Dict) -> str:
 
 
 async def _get_subscription(key: str, args: Dict) -> str:
-    return await _api(key, "GET", f"subscriptions/{args['subscription_id']}")
+    return await _api(key, "GET", f"subscriptions/{_path_segment(args['subscription_id'])}")
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
 def _clamp(value, lo, hi):
+    if isinstance(value, bool):
+        raise _StripeError(f"limit must be an integer between {lo} and {hi}.")
     try:
-        return max(lo, min(hi, int(value)))
+        parsed = int(value)
     except (TypeError, ValueError):
-        return lo
+        raise _StripeError(f"limit must be an integer between {lo} and {hi}.") from None
+    if isinstance(value, float) and value != parsed:
+        raise _StripeError(f"limit must be an integer between {lo} and {hi}.")
+    if parsed < lo or parsed > hi:
+        raise _StripeError(f"limit must be an integer between {lo} and {hi}.")
+    return parsed
+
+
+def _integer(value: Any, field: str, *, minimum: int | None = None) -> int:
+    if isinstance(value, bool):
+        raise _StripeError(f"{field} must be an integer")
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise _StripeError(f"{field} must be an integer") from exc
+    if isinstance(value, float) and value != parsed:
+        raise _StripeError(f"{field} must be an integer")
+    if minimum is not None and parsed < minimum:
+        raise _StripeError(f"{field} must be at least {minimum}")
+    return parsed
 
 
 # ── Tool definitions ──────────────────────────────────────────────────────────

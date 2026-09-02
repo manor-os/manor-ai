@@ -1,8 +1,8 @@
-import { useState, useRef, useEffect } from "react";
-import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { useState, useRef, useEffect, useMemo } from "react";
+import { useQueries, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import { api, ApiError } from "../lib/api";
-import type { BookingLink, CalendarConnectionOption, CalendarSettings, CalendarWorkingHourWindow, PeopleContext, PeopleContextActionResponse } from "../lib/types";
+import type { BookingLink, BookingTimeExclusion, CalendarConflictSource, CalendarConnectionOption, CalendarSettings, CalendarWorkingHourWindow, PeopleContext, PeopleContextActionResponse } from "../lib/types";
 import { useToastStore } from "../stores/toast";
 import StatusBadge from "../components/ui/StatusBadge";
 import LoadingSpinner from "../components/ui/LoadingSpinner";
@@ -10,9 +10,11 @@ import Modal from "../components/ui/Modal";
 import PageHeader from "../components/ui/PageHeader";
 import Button from "../components/ui/Button";
 import Select from "../components/ui/Select";
-import WorkingHoursEditor from "../components/ui/WorkingHoursEditor";
-import { IconBuilding, IconCalendar, IconCopy, IconExternalLink, IconLink, IconPalette, IconPlus, IconTrash } from "../components/icons";
+import Checkbox from "../components/ui/Checkbox";
+import WorkingHoursEditor, { WORKING_HOURS_TIME_OPTIONS } from "../components/ui/WorkingHoursEditor";
+import { IconBuilding, IconCalendar, IconCopy, IconEdit, IconExternalLink, IconLink, IconPalette, IconPlus, IconTrash } from "../components/icons";
 import NangoConnectButton from "../components/integrations/NangoConnectButton";
+import { clearAuthBrowserState } from "../lib/authToken";
 import { setPreferredTimeZone } from "../lib/format";
 import { useAuthStore } from "../stores/auth";
 import {
@@ -21,6 +23,12 @@ import {
   getStoredThemePreference,
   type ThemePreference,
 } from "../lib/theme";
+import {
+  AI_EDIT_DISPLAY_PREFERENCE_KEY,
+  AiEditDisplayMode,
+  mergeAiEditDisplayPreference,
+  resolveAiEditDisplayMode,
+} from "../lib/aiEditPreferences";
 
 import { t } from "../lib/i18n";
 
@@ -94,10 +102,37 @@ const APPEARANCE_OPTIONS: ThemeOption[] = [
   },
 ];
 
+type AiEditDisplayOption = {
+  value: AiEditDisplayMode;
+  labelKey: string;
+  descriptionKey: string;
+};
+
+const AI_EDIT_DISPLAY_OPTIONS: AiEditDisplayOption[] = [
+  {
+    value: AiEditDisplayMode.Live,
+    labelKey: "page.account.ai_edit_live_label",
+    descriptionKey: "page.account.ai_edit_live_description",
+  },
+  {
+    value: AiEditDisplayMode.InstantPreview,
+    labelKey: "page.account.ai_edit_instant_label",
+    descriptionKey: "page.account.ai_edit_instant_description",
+  },
+];
+
 export function AppearanceSection({ embedded = false }: { embedded?: boolean }) {
+  const queryClient = useQueryClient();
+  const toast = useToastStore();
   const [themePreference, setThemePreference] = useState<ThemePreference>(
     getStoredThemePreference,
   );
+  const [savingAiEditMode, setSavingAiEditMode] = useState<AiEditDisplayMode | null>(null);
+  const { data: preferences, isLoading: preferencesLoading } = useQuery({
+    queryKey: ["preferences"],
+    queryFn: () => api.admin.getPreferences(),
+  });
+  const aiEditDisplayMode = resolveAiEditDisplayMode(preferences);
 
   useEffect(() => {
     applyThemePreference(themePreference);
@@ -108,6 +143,30 @@ export function AppearanceSection({ embedded = false }: { embedded?: boolean }) 
     media.addEventListener?.("change", handleSystemThemeChange);
     return () => media.removeEventListener?.("change", handleSystemThemeChange);
   }, [themePreference]);
+
+  const selectAiEditDisplayMode = async (mode: AiEditDisplayMode) => {
+    if (mode === aiEditDisplayMode || savingAiEditMode) return;
+    const previous = queryClient.getQueryData(["preferences"]);
+    setSavingAiEditMode(mode);
+    queryClient.setQueryData(
+      ["preferences"],
+      (current: unknown) => mergeAiEditDisplayPreference(current, mode),
+    );
+    try {
+      const updated = await api.admin.updatePreferences({
+        [AI_EDIT_DISPLAY_PREFERENCE_KEY]: mode,
+      });
+      queryClient.setQueryData(["preferences"], updated);
+    } catch (error) {
+      queryClient.setQueryData(["preferences"], previous);
+      toast.error(
+        t("page.account.ai_edit_preference_failed"),
+        error instanceof Error ? error.message : undefined,
+      );
+    } finally {
+      setSavingAiEditMode(null);
+    }
+  };
 
   return (
     <section
@@ -154,6 +213,68 @@ export function AppearanceSection({ embedded = false }: { embedded?: boolean }) 
             </button>
           );
         })}
+      </div>
+
+      <div className="account-ai-edit-section">
+        <div className="account-ai-edit-heading">
+          <div className="account-appearance-icon" aria-hidden="true">
+            <IconEdit size={18} />
+          </div>
+          <div>
+            <h3>{t("page.account.ai_edit_display")}</h3>
+            <p>{t("page.account.ai_edit_display_description")}</p>
+          </div>
+          {savingAiEditMode && (
+            <span className="account-ai-edit-saving" role="status">
+              {t("page.task_collections.saving")}
+            </span>
+          )}
+        </div>
+
+        <div
+          className="account-ai-edit-grid"
+          role="radiogroup"
+          aria-label={t("page.account.ai_edit_display")}
+        >
+          {AI_EDIT_DISPLAY_OPTIONS.map((option) => {
+            const active = aiEditDisplayMode === option.value;
+            return (
+              <button
+                key={option.value}
+                type="button"
+                className={`account-theme-card account-ai-edit-card${active ? " is-active" : ""}`}
+                role="radio"
+                aria-checked={active}
+                disabled={preferencesLoading || Boolean(savingAiEditMode)}
+                onClick={() => void selectAiEditDisplayMode(option.value)}
+              >
+                <span
+                  className="account-ai-edit-preview"
+                  data-ai-edit-preview={option.value}
+                  aria-hidden="true"
+                >
+                  <span className="account-ai-edit-preview__chrome">
+                    <i /><i /><i />
+                  </span>
+                  <span className="account-ai-edit-preview__line is-short" />
+                  <span className="account-ai-edit-preview__line is-change" />
+                  <span className="account-ai-edit-preview__line is-long" />
+                  <span className="account-ai-edit-preview__footer">
+                    <i />
+                    <i />
+                  </span>
+                </span>
+                <span className="account-theme-copy">
+                  <strong>{t(option.labelKey)}</strong>
+                  <span>{t(option.descriptionKey)}</span>
+                </span>
+                <span className="account-theme-check" aria-hidden="true">
+                  {active ? "✓" : ""}
+                </span>
+              </button>
+            );
+          })}
+        </div>
       </div>
     </section>
   );
@@ -2465,6 +2586,34 @@ function defaultWorkingHours(): CalendarWorkingHourWindow[] {
   }));
 }
 
+function cloneWorkingHours(value: CalendarWorkingHourWindow[]): CalendarWorkingHourWindow[] {
+  return value.map((row) => ({ ...row }));
+}
+
+function workingHoursValidationError(value: CalendarWorkingHourWindow[]): string {
+  const enabled = value.filter((row) => row.enabled);
+  if (enabled.length === 0) return "Enable at least one day.";
+  if (enabled.some((row) => row.start >= row.end)) {
+    return "Make every end time later than its start time.";
+  }
+  return "";
+}
+
+function sortTimeExclusions(value: BookingTimeExclusion[]): BookingTimeExclusion[] {
+  return [...value].sort((a, b) =>
+    `${a.date}-${a.start}-${a.end}`.localeCompare(`${b.date}-${b.start}-${b.end}`),
+  );
+}
+
+function exclusionTimeLabel(value: string): string {
+  return WORKING_HOURS_TIME_OPTIONS.find((option) => option.value === value)?.label || value;
+}
+
+function bookingLinkExclusionSummary(link: BookingLink): string {
+  const count = (link.unavailable_dates?.length || 0) + (link.unavailable_times?.length || 0);
+  return count > 0 ? ` · ${count} ${count === 1 ? "exclusion" : "exclusions"}` : "";
+}
+
 function looksLikeEmail(value?: string | null): boolean {
   return Boolean(value && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value.trim()));
 }
@@ -2480,6 +2629,58 @@ function calendarConnectionLabel(conn: CalendarConnectionOption): string {
   return conn.is_default ? `${label} (default)` : label;
 }
 
+function persistedCalendarConnectionId(
+  settings: CalendarSettings | undefined,
+  connections: CalendarConnectionOption[],
+): string {
+  const savedConnectionId = settings?.connection_id || "";
+  const savedProvider = settings?.provider || "";
+  const matched = connections.find((connection) =>
+    connection.provider === savedProvider
+    && (connection.id === savedConnectionId || connection.provider_user_id === savedConnectionId),
+  );
+  return matched?.id || savedConnectionId;
+}
+
+function initialCalendarConflictSources(
+  settings: CalendarSettings,
+  connections: CalendarConnectionOption[],
+): CalendarConflictSource[] {
+  const configuredSources = settings.conflict_sources?.length
+    ? settings.conflict_sources
+    : settings.provider
+      ? [{
+          provider: settings.provider as CalendarConflictSource["provider"],
+          connection_id: settings.connection_id,
+          calendar_ids: settings.conflict_calendar_ids?.length
+            ? settings.conflict_calendar_ids
+            : [settings.default_calendar_id || "primary"],
+        }]
+      : [];
+
+  return connections.map((connection) => {
+    const providerConnections = connections.filter((item) => item.provider === connection.provider);
+    const configured = configuredSources.find((source) =>
+      source.provider === connection.provider
+      && (
+        source.connection_id === connection.id
+        || source.connection_id === connection.provider_user_id
+        || (
+          !source.connection_id
+          && (connection.is_default || providerConnections.length === 1)
+        )
+      ),
+    );
+    return {
+      provider: connection.provider as CalendarConflictSource["provider"],
+      connection_id: connection.id,
+      calendar_ids: configured?.calendar_ids?.length
+        ? Array.from(new Set(configured.calendar_ids))
+        : ["primary"],
+    };
+  });
+}
+
 export function CalendarBookingSection({ user }: { user: any }) {
   const queryClient = useQueryClient();
   const toast = useToastStore();
@@ -2491,6 +2692,7 @@ export function CalendarBookingSection({ user }: { user: any }) {
   const [provider, setProvider] = useState("");
   const [connectionId, setConnectionId] = useState("");
   const [defaultCalendarId, setDefaultCalendarId] = useState("primary");
+  const [conflictSources, setConflictSources] = useState<CalendarConflictSource[]>([]);
   const [durationMinutes, setDurationMinutes] = useState(30);
   const [bufferAfterMinutes, setBufferAfterMinutes] = useState(10);
   const [minNoticeMinutes, setMinNoticeMinutes] = useState(120);
@@ -2506,17 +2708,20 @@ export function CalendarBookingSection({ user }: { user: any }) {
   const [linkBusy, setLinkBusy] = useState(false);
   const [showLinkForm, setShowLinkForm] = useState(false);
   const [connectingProvider, setConnectingProvider] = useState<string | null>(null);
+  const [editingLink, setEditingLink] = useState<BookingLink | null>(null);
+  const [linkDraft, setLinkDraft] = useState<BookingLink | null>(null);
+  const [unavailableDate, setUnavailableDate] = useState("");
+  const [unavailableStart, setUnavailableStart] = useState("09:00");
+  const [unavailableEnd, setUnavailableEnd] = useState("10:00");
+  const [savingLink, setSavingLink] = useState(false);
 
   useEffect(() => {
     const settings = data?.settings;
     if (!settings) return;
-    const savedConnectionId = settings.connection_id || "";
-    const matchedConnection = (data?.connections || []).find((conn) =>
-      conn.id === savedConnectionId || conn.provider_user_id === savedConnectionId,
-    );
     setProvider(settings.provider || "");
-    setConnectionId(matchedConnection?.id || savedConnectionId);
+    setConnectionId(persistedCalendarConnectionId(settings, data?.connections || []));
     setDefaultCalendarId(settings.default_calendar_id || "primary");
+    setConflictSources(initialCalendarConflictSources(settings, data?.connections || []));
     setDurationMinutes(settings.booking_defaults?.duration_minutes || 30);
     setBufferAfterMinutes(settings.booking_defaults?.buffer_after_minutes || 10);
     setMinNoticeMinutes(settings.booking_defaults?.min_notice_minutes || 120);
@@ -2531,19 +2736,155 @@ export function CalendarBookingSection({ user }: { user: any }) {
   const providerConnections = (data?.connections || []).filter((conn) =>
     provider ? conn.provider === provider : true,
   );
+  const calendarAccountSelectionSaved = Boolean(
+    data?.settings
+    && provider === (data.settings.provider || "")
+    && connectionId === persistedCalendarConnectionId(data.settings, data.connections || []),
+  );
+  const calendarAccountReady = calendarAccountSelectionSaved && (
+    !provider
+    || (
+      providerConnections.length > 0
+      && (!connectionId || providerConnections.some((connection) => connection.id === connectionId))
+    )
+  );
+  const bookingLinkAccountHint = !calendarAccountSelectionSaved
+    ? "Save calendar settings before creating a booking link."
+    : !calendarAccountReady
+      ? "Connect a calendar account before creating a booking link."
+      : "";
+  const calendarOptionsQuery = useQuery({
+    queryKey: ["calendar-options", provider, connectionId],
+    queryFn: () => api.calendarSettings.calendars(provider, connectionId),
+    enabled: Boolean(provider && providerConnections.length > 0),
+  });
+  const calendarOptions = calendarOptionsQuery.data?.calendars || [];
+  const writableCalendarOptions = useMemo(
+    () => calendarOptions.filter((calendar) => !calendar.read_only),
+    [calendarOptions],
+  );
+  const conflictAccounts = useMemo(
+    () => (data?.connections || []).map((account) => ({
+      provider: account.provider,
+      connectionId: account.id,
+      label: calendarConnectionLabel(account),
+    })),
+    [data?.connections],
+  );
+  const conflictCalendarQueries = useQueries({
+    queries: conflictAccounts.map((account) => ({
+      queryKey: ["calendar-options", account.provider, account.connectionId],
+      queryFn: () => api.calendarSettings.calendars(account.provider, account.connectionId),
+    })),
+  });
+  const conflictCalendarsReady = conflictCalendarQueries.every((query) =>
+    query.isSuccess && Boolean(query.data?.calendars.length),
+  );
+  const conflictCalendarSignature = conflictAccounts.map((account, index) => {
+    const query = conflictCalendarQueries[index];
+    const calendars = query.data?.calendars || [];
+    return `${account.provider}:${account.connectionId}:${query.status}:${calendars
+      .map((calendar) => `${calendar.id}:${calendar.is_primary}`)
+      .join(",")}`;
+  }).join("|");
   const bookingLinks = data?.settings?.booking_links || [];
   const selectedProviderLabel = CALENDAR_PROVIDER_LABELS[provider] || "Calendar";
   const parsedLinkDuration = Number.parseInt(linkDuration, 10);
   const linkDurationValid = Number.isFinite(parsedLinkDuration) && parsedLinkDuration >= 5 && parsedLinkDuration <= 480;
+  const linkDraftCustomHoursError = linkDraft
+    ? workingHoursValidationError(linkDraft.working_hours)
+    : "";
+  const linkDraftCustomHoursValid = Boolean(linkDraft && !linkDraftCustomHoursError);
+  const linkDraftValid = Boolean(
+    linkDraft
+    && linkDraft.name.trim()
+    && Number.isFinite(linkDraft.duration_minutes)
+    && linkDraft.duration_minutes >= 5
+    && linkDraft.duration_minutes <= 480
+    && (
+      linkDraft.availability_mode === "default"
+      || linkDraftCustomHoursValid
+    ),
+  );
+  const exclusionTimeValid = Boolean(
+    linkDraft
+    && unavailableDate
+    && unavailableStart < unavailableEnd
+    && !linkDraft.unavailable_times.some((item) =>
+      item.date === unavailableDate
+      && item.start === unavailableStart
+      && item.end === unavailableEnd,
+    ),
+  );
+
+  useEffect(() => {
+    if (!calendarOptions.length) return;
+    const availableIds = new Set(calendarOptions.map((calendar) => calendar.id));
+    if (!availableIds.has(defaultCalendarId)) {
+      setDefaultCalendarId((writableCalendarOptions[0] || calendarOptions[0]).id);
+    }
+  }, [calendarOptions, defaultCalendarId, writableCalendarOptions]);
+
+  useEffect(() => {
+    if (!conflictAccounts.length) return;
+    setConflictSources((current) => {
+      const next = conflictAccounts.map((account, index) => {
+        const existing = current.find((source) =>
+          source.provider === account.provider
+          && source.connection_id === account.connectionId,
+        );
+        const calendars = conflictCalendarQueries[index].data?.calendars || [];
+        if (!calendars.length) {
+          return existing || {
+            provider: account.provider as CalendarConflictSource["provider"],
+            connection_id: account.connectionId,
+            calendar_ids: ["primary"],
+          };
+        }
+        const primaryCalendar = calendars.find((calendar) => calendar.is_primary);
+        const availableIds = new Set(calendars.map((calendar) => calendar.id));
+        const selectedIds = (existing?.calendar_ids || ["primary"])
+          .map((calendarId) =>
+            calendarId === "primary" && primaryCalendar ? primaryCalendar.id : calendarId,
+          )
+          .filter((calendarId) => availableIds.has(calendarId));
+        return {
+          provider: account.provider as CalendarConflictSource["provider"],
+          connection_id: account.connectionId,
+          calendar_ids: selectedIds.length
+            ? Array.from(new Set(selectedIds))
+            : [primaryCalendar?.id || calendars[0].id],
+        };
+      });
+      return JSON.stringify(next) === JSON.stringify(current) ? current : next;
+    });
+  }, [conflictAccounts, conflictCalendarSignature]);
 
   const saveSettings = async () => {
+    if (!conflictCalendarsReady) {
+      toast.error(
+        "Calendar settings cannot be saved",
+        "Wait for every calendar account to load, or reconnect accounts that failed.",
+      );
+      return;
+    }
     setSavingSettings(true);
     try {
+      const selectedBookingConnection = providerConnections.find((connection) =>
+        connection.id === connectionId,
+      ) || providerConnections.find((connection) => connection.is_default) || providerConnections[0];
+      const selectedBookingSource = conflictSources.find((source) =>
+        source.provider === provider
+        && source.connection_id === selectedBookingConnection?.id,
+      );
       await api.calendarSettings.update({
         provider,
         connection_id: connectionId || null,
         default_calendar_id: defaultCalendarId || "primary",
-        conflict_calendar_ids: [defaultCalendarId || "primary"],
+        conflict_calendar_ids: selectedBookingSource?.calendar_ids.length
+          ? selectedBookingSource.calendar_ids
+          : [defaultCalendarId || "primary"],
+        conflict_sources: conflictSources,
         timezone: user?.timezone || data?.settings?.timezone || "UTC",
         working_hours: workingHours,
         booking_defaults: {
@@ -2559,6 +2900,7 @@ export function CalendarBookingSection({ user }: { user: any }) {
       } as Partial<CalendarSettings>);
       await queryClient.invalidateQueries({ queryKey: ["calendar-settings"] });
       await queryClient.invalidateQueries({ queryKey: ["calendar-agenda"] });
+      await queryClient.invalidateQueries({ queryKey: ["calendar-settings-events"] });
       toast.success("Calendar settings saved");
     } catch (err) {
       toast.error("Failed to save calendar settings", err instanceof Error ? err.message : undefined);
@@ -2568,7 +2910,7 @@ export function CalendarBookingSection({ user }: { user: any }) {
   };
 
   const createLink = async () => {
-    if (!linkName.trim() || !linkDurationValid) return;
+    if (!linkName.trim() || !linkDurationValid || !calendarAccountReady) return;
     setLinkBusy(true);
     try {
       await api.calendarSettings.createBookingLink({
@@ -2577,8 +2919,7 @@ export function CalendarBookingSection({ user }: { user: any }) {
         location_type: linkLocationType,
         calendar_id: defaultCalendarId || "primary",
       });
-      setLinkName("");
-      setShowLinkForm(false);
+      resetLinkForm();
       await queryClient.invalidateQueries({ queryKey: ["calendar-settings"] });
       toast.success("Booking link created");
     } catch (err) {
@@ -2588,12 +2929,95 @@ export function CalendarBookingSection({ user }: { user: any }) {
     }
   };
 
+  const resetLinkForm = () => {
+    setLinkName("");
+    setLinkDuration(String(durationMinutes || 30));
+    setLinkLocationType("video");
+    setShowLinkForm(false);
+  };
+
   const toggleLink = async (link: BookingLink) => {
     await api.calendarSettings.updateBookingLink(link.id, {
       name: link.name,
       enabled: !link.enabled,
     });
     await queryClient.invalidateQueries({ queryKey: ["calendar-settings"] });
+  };
+
+  const openLinkEditor = (link: BookingLink) => {
+    const effectiveWorkingHours = link.working_hours?.length
+      ? link.working_hours
+      : (workingHours.length ? workingHours : defaultWorkingHours());
+    setEditingLink(link);
+    setLinkDraft({
+      ...link,
+      availability_mode: link.availability_mode || "default",
+      working_hours: cloneWorkingHours(effectiveWorkingHours),
+      unavailable_dates: [...(link.unavailable_dates || [])].sort(),
+      unavailable_times: sortTimeExclusions(link.unavailable_times || []),
+    });
+    setUnavailableDate("");
+    setUnavailableStart("09:00");
+    setUnavailableEnd("10:00");
+  };
+
+  const closeLinkEditor = () => {
+    if (savingLink) return;
+    setEditingLink(null);
+    setLinkDraft(null);
+    setUnavailableDate("");
+    setUnavailableStart("09:00");
+    setUnavailableEnd("10:00");
+  };
+
+  const saveLink = async () => {
+    if (!editingLink || !linkDraft) return;
+    setSavingLink(true);
+    try {
+      await api.calendarSettings.updateBookingLink(editingLink.id, {
+        name: linkDraft.name.trim(),
+        duration_minutes: linkDraft.duration_minutes,
+        location_type: linkDraft.location_type,
+        ...(calendarAccountSelectionSaved
+          ? { calendar_id: linkDraft.calendar_id || defaultCalendarId || "primary" }
+          : {}),
+        availability_mode: linkDraft.availability_mode,
+        working_hours: linkDraft.availability_mode === "custom"
+          ? linkDraft.working_hours
+          : [],
+        unavailable_dates: [...linkDraft.unavailable_dates].sort(),
+        unavailable_times: sortTimeExclusions(linkDraft.unavailable_times),
+      });
+      await queryClient.invalidateQueries({ queryKey: ["calendar-settings"] });
+      toast.success("Booking link updated");
+      setEditingLink(null);
+      setLinkDraft(null);
+      setUnavailableDate("");
+      setUnavailableStart("09:00");
+      setUnavailableEnd("10:00");
+    } catch (err) {
+      toast.error("Failed to update booking link", err instanceof Error ? err.message : undefined);
+    } finally {
+      setSavingLink(false);
+    }
+  };
+
+  const addUnavailableTime = () => {
+    if (!linkDraft || !unavailableDate || unavailableStart >= unavailableEnd) return;
+    const duplicate = linkDraft.unavailable_times.some((item) =>
+      item.date === unavailableDate
+      && item.start === unavailableStart
+      && item.end === unavailableEnd,
+    );
+    if (duplicate) return;
+    setLinkDraft({
+      ...linkDraft,
+      unavailable_times: sortTimeExclusions([
+        ...linkDraft.unavailable_times,
+        { date: unavailableDate, start: unavailableStart, end: unavailableEnd },
+      ]),
+    });
+    setUnavailableDate("");
   };
 
   const deleteLink = async (link: BookingLink) => {
@@ -2638,6 +3062,31 @@ export function CalendarBookingSection({ user }: { user: any }) {
     }
   };
 
+  const calendarConnectButton = (label: string, size: "sm" | "md" = "md") => (
+    provider === "google_calendar" ? (
+      <Button
+        variant="outline"
+        size={size}
+        loading={connectingProvider === provider}
+        disabled={Boolean(connectingProvider)}
+        onClick={connectCalendarProvider}
+        style={{ justifyContent: "center" }}
+      >
+        {label}
+      </Button>
+    ) : (
+      <NangoConnectButton
+        providerConfigKeys={[provider]}
+        label={label}
+        variant="outline"
+        size={size}
+        onConnected={() => {
+          queryClient.invalidateQueries({ queryKey: ["calendar-settings"] });
+        }}
+      />
+    )
+  );
+
   return (
     <div
       className="calendar-booking-section"
@@ -2645,7 +3094,7 @@ export function CalendarBookingSection({ user }: { user: any }) {
         marginTop: 0,
       }}
     >
-      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 16, marginBottom: 12 }}>
+      <div className="calendar-booking-header" style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 16, marginBottom: 12 }}>
         <div>
           <h3 className="manor-section-title" style={{ display: "flex", alignItems: "center", gap: 8 }}>
             <IconCalendar size={18} /> Calendar & booking
@@ -2653,17 +3102,19 @@ export function CalendarBookingSection({ user }: { user: any }) {
           <p className="manor-section-subtitle">Calendar connection, availability, and booking links.</p>
         </div>
         <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
-          <button
-            className="btn-manor-ghost"
-            type="button"
-            onClick={() => setShowLinkForm((value) => !value)}
+          <Button
+            variant="ghost"
+            onClick={() => (showLinkForm ? resetLinkForm() : setShowLinkForm(true))}
             style={{ display: "inline-flex", alignItems: "center", gap: 6, whiteSpace: "nowrap" }}
           >
-            <IconPlus size={14} /> New booking link
-          </button>
-          <button className="btn-manor" disabled={savingSettings || isLoading} onClick={saveSettings}>
+            {showLinkForm ? "Cancel" : <><IconPlus size={14} /> New booking link</>}
+          </Button>
+          <Button
+            disabled={savingSettings || isLoading || !conflictCalendarsReady}
+            onClick={saveSettings}
+          >
             {savingSettings ? "Saving..." : "Save"}
-          </button>
+          </Button>
         </div>
       </div>
 
@@ -2688,16 +3139,23 @@ export function CalendarBookingSection({ user }: { user: any }) {
                 onChange={(nextProvider) => {
                   setProvider(nextProvider);
                   setConnectionId("");
+                  setDefaultCalendarId("primary");
                 }}
                 options={CALENDAR_PROVIDER_OPTIONS}
               />
             </div>
             {provider && providerConnections.length > 0 && (
               <div>
-                <label className="manor-label">Connected account</label>
+                <div style={{ minHeight: 24, display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8 }}>
+                  <label className="manor-label" style={{ marginBottom: 0 }}>Connected account</label>
+                  {calendarConnectButton("Add account", "sm")}
+                </div>
                 <Select
                   value={connectionId}
-                  onChange={setConnectionId}
+                  onChange={(nextConnectionId) => {
+                    setConnectionId(nextConnectionId);
+                    setDefaultCalendarId("primary");
+                  }}
                   selectedOptionColor="#292524"
                   selectedOptionCheckColor="#5f928a"
                   options={[
@@ -2720,34 +3178,122 @@ export function CalendarBookingSection({ user }: { user: any }) {
                   minHeight: 68,
                 }}
               >
-                {provider === "google_calendar" ? (
-                  <Button
-                    variant="outline"
-                    size="md"
-                    loading={connectingProvider === provider}
-                    disabled={Boolean(connectingProvider)}
-                    onClick={connectCalendarProvider}
-                    style={{ justifyContent: "center" }}
-                  >
-                    Connect {selectedProviderLabel}
-                  </Button>
-                ) : (
-                  <NangoConnectButton
-                    providerConfigKeys={[provider]}
-                    label={`Connect ${selectedProviderLabel}`}
-                    variant="outline"
-                    size="md"
-                    onConnected={() => {
-                      queryClient.invalidateQueries({ queryKey: ["calendar-settings"] });
-                    }}
-                  />
-                )}
+                {calendarConnectButton(`Connect ${selectedProviderLabel}`)}
                 <span style={{ fontSize: 12, color: "#a8a29e", fontWeight: 650 }}>
                   Connect an account to check availability and create booking events.
                 </span>
               </div>
             )}
           </div>
+
+          {provider && providerConnections.length > 0 && (
+            <div
+              style={{
+                maxWidth: 340,
+                padding: 12,
+                borderRadius: "var(--radius-card)",
+                background: "var(--surface-muted)",
+              }}
+            >
+              <div>
+                <label className="manor-label">Default booking calendar</label>
+                <Select
+                  value={defaultCalendarId}
+                  disabled={calendarOptionsQuery.isLoading || writableCalendarOptions.length === 0}
+                  onChange={setDefaultCalendarId}
+                  options={writableCalendarOptions.map((calendar) => ({
+                    value: calendar.id,
+                    label: `${calendar.name}${calendar.is_primary ? " (primary)" : ""}`,
+                  }))}
+                />
+              </div>
+            </div>
+          )}
+
+          {conflictAccounts.length > 0 && (
+            <fieldset
+              style={{
+                minWidth: 0,
+                maxWidth: 700,
+                margin: 0,
+                padding: 12,
+                border: 0,
+                borderRadius: "var(--radius-card)",
+                background: "var(--surface-muted)",
+              }}
+            >
+              <legend className="manor-label" style={{ padding: 0 }}>
+                Check conflicts across accounts
+              </legend>
+              <p style={{ margin: "2px 0 12px", color: "var(--text-muted)", fontSize: 12, lineHeight: 1.5 }}>
+                Selected busy times are combined before booking slots are shown.
+              </p>
+              <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+                {conflictAccounts.map((account, index) => {
+                  const query = conflictCalendarQueries[index];
+                  const calendars = query.data?.calendars || [];
+                  const source = conflictSources.find((item) =>
+                    item.provider === account.provider
+                    && item.connection_id === account.connectionId,
+                  );
+                  return (
+                    <div key={`${account.provider}:${account.connectionId}`}>
+                      <div style={{ display: "flex", flexWrap: "wrap", alignItems: "baseline", gap: 6, marginBottom: 7 }}>
+                        <strong style={{ color: "var(--text-strong)", fontSize: 12 }}>
+                          {account.label}
+                        </strong>
+                        <span style={{ color: "var(--text-muted)", fontSize: 11 }}>
+                          {CALENDAR_PROVIDER_LABELS[account.provider] || "Calendar"}
+                        </span>
+                      </div>
+                      {query.isLoading ? (
+                        <div style={{ minHeight: 28, display: "flex", alignItems: "center", gap: 8, color: "var(--text-muted)", fontSize: 12 }}>
+                          <LoadingSpinner size={14} /> Loading calendars
+                        </div>
+                      ) : query.isError || calendars.length === 0 ? (
+                        <p style={{ margin: 0, color: "var(--text-muted)", fontSize: 12, lineHeight: 1.5 }}>
+                          Calendars could not be loaded. Reconnect this account and try again.
+                        </p>
+                      ) : (
+                        <div style={{ display: "flex", flexWrap: "wrap", gap: "9px 14px", minHeight: 28, alignItems: "center" }}>
+                          {calendars.map((calendar) => {
+                            const checked = Boolean(source?.calendar_ids.includes(calendar.id));
+                            return (
+                              <Checkbox
+                                key={calendar.id}
+                                checked={checked}
+                                size="sm"
+                                label={`${calendar.name}${calendar.is_primary ? " (primary)" : ""}`}
+                                aria-label={`${account.label}: ${calendar.name}${calendar.is_primary ? " (primary)" : ""}`}
+                                onChange={(nextChecked) => {
+                                  setConflictSources((current) => {
+                                    return current.map((item) => {
+                                      if (
+                                        item.provider !== account.provider
+                                        || item.connection_id !== account.connectionId
+                                      ) return item;
+                                      if (!nextChecked && item.calendar_ids.length === 1) return item;
+                                      return {
+                                        ...item,
+                                        calendar_ids: nextChecked
+                                          ? Array.from(new Set([...item.calendar_ids, calendar.id]))
+                                          : item.calendar_ids.filter((calendarId) => calendarId !== calendar.id),
+                                      };
+                                    });
+                                  });
+                                }}
+                                style={{ fontSize: 12, fontWeight: 650 }}
+                              />
+                            );
+                          })}
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            </fieldset>
+          )}
 
           {showLinkForm && (
             <div
@@ -2783,14 +3329,28 @@ export function CalendarBookingSection({ user }: { user: any }) {
                 <label className="manor-label">Location</label>
                 <Select value={linkLocationType} onChange={(v) => setLinkLocationType(v as BookingLink["location_type"])} options={BOOKING_LOCATION_OPTIONS} />
               </div>
-              <button
-                className="btn-manor"
-                disabled={!linkName.trim() || !linkDurationValid || linkBusy}
+              <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                <Button
+                disabled={!linkName.trim() || !linkDurationValid || linkBusy || !calendarAccountReady}
+                ariaDescribedBy={bookingLinkAccountHint ? "booking-link-account-hint" : undefined}
                 onClick={createLink}
-                style={{ height: 40, display: "inline-flex", alignItems: "center", justifyContent: "center", gap: 6, whiteSpace: "nowrap" }}
+                style={{ flex: 1, height: 40, justifyContent: "center", whiteSpace: "nowrap" }}
               >
                 <IconPlus size={14} /> Create
-              </button>
+                </Button>
+                <Button variant="ghost" onClick={resetLinkForm} style={{ height: 40 }}>
+                  Cancel
+                </Button>
+              </div>
+              {bookingLinkAccountHint && (
+                <p
+                  id="booking-link-account-hint"
+                  role="status"
+                  style={{ gridColumn: "1 / -1", margin: 0, color: "var(--text-muted)", fontSize: 12, lineHeight: 1.5 }}
+                >
+                  {bookingLinkAccountHint}
+                </p>
+              )}
             </div>
           )}
 
@@ -2834,7 +3394,11 @@ export function CalendarBookingSection({ user }: { user: any }) {
                       <span style={{ width: 8, height: 8, borderRadius: 99, background: link.enabled ? "#4f9c84" : "#a8a29e", flexShrink: 0 }} />
                       <span style={{ fontSize: 13, fontWeight: 800, color: "#292524", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{link.name}</span>
                     </div>
-                    <span style={{ fontSize: 11, fontWeight: 600, color: "#a8a29e" }}>{link.duration_minutes} min · {link.location_type.replace("_", " ")}</span>
+                    <span style={{ fontSize: 11, fontWeight: 600, color: "#a8a29e" }}>
+                      {link.duration_minutes} min · {link.location_type.replace("_", " ")}
+                      {link.availability_mode === "custom" ? " · custom hours" : ""}
+                      {bookingLinkExclusionSummary(link)}
+                    </span>
                   </div>
                   <div style={{ minWidth: 0, flex: "2 1 220px", display: "flex", alignItems: "center", gap: 8 }}>
                     <code className="booking-link-url" style={{ flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontSize: 11, color: "#57534e", background: "#f5f5f4", padding: "6px 8px", borderRadius: 8 }}>
@@ -2842,6 +3406,9 @@ export function CalendarBookingSection({ user }: { user: any }) {
                     </code>
                   </div>
                   <div style={{ display: "flex", alignItems: "center", gap: 6, flex: "0 0 auto" }}>
+                    <button className="btn-manor-ghost" title="Edit" aria-label={`Edit ${link.name}`} onClick={() => openLinkEditor(link)} style={{ width: 30, height: 30, padding: 0, display: "inline-flex", alignItems: "center", justifyContent: "center" }}>
+                      <IconEdit size={13} />
+                    </button>
                     <button className="btn-manor-ghost" title="Copy" onClick={() => copyLink(link)} style={{ width: 30, height: 30, padding: 0, display: "inline-flex", alignItems: "center", justifyContent: "center" }}>
                       <IconCopy size={13} />
                     </button>
@@ -2861,6 +3428,224 @@ export function CalendarBookingSection({ user }: { user: any }) {
           </div>
         </div>
       )}
+
+      <Modal
+        open={Boolean(editingLink && linkDraft)}
+        onClose={closeLinkEditor}
+        title="Edit booking link"
+        maxWidth="880px"
+        className="booking-link-editor-dialog"
+        bodyClassName="booking-link-editor-body"
+        footer={
+          <>
+            <Button variant="ghost" disabled={savingLink} onClick={closeLinkEditor}>
+              Cancel
+            </Button>
+            <Button loading={savingLink} disabled={!linkDraftValid} onClick={saveLink}>
+              Save link
+            </Button>
+          </>
+        }
+      >
+        {linkDraft && (
+          <div className="booking-link-editor-content">
+            <div className="booking-link-editor-details">
+              <div>
+                <label className="manor-label" htmlFor="booking-link-edit-name">Name</label>
+                <input
+                  id="booking-link-edit-name"
+                  className="manor-input"
+                  value={linkDraft.name}
+                  onChange={(event) => setLinkDraft({ ...linkDraft, name: event.target.value })}
+                />
+              </div>
+              <div>
+                <label className="manor-label" htmlFor="booking-link-edit-duration">Duration</label>
+                <input
+                  id="booking-link-edit-duration"
+                  className="manor-input"
+                  type="number"
+                  min={5}
+                  max={480}
+                  value={linkDraft.duration_minutes}
+                  onChange={(event) => setLinkDraft({
+                    ...linkDraft,
+                    duration_minutes: Number(event.target.value),
+                  })}
+                />
+              </div>
+              <div>
+                <label className="manor-label">Location</label>
+                <Select
+                  value={linkDraft.location_type}
+                  onChange={(value) => setLinkDraft({
+                    ...linkDraft,
+                    location_type: value as BookingLink["location_type"],
+                  })}
+                  options={BOOKING_LOCATION_OPTIONS}
+                />
+              </div>
+              {writableCalendarOptions.length > 0 && (
+                <div>
+                  <label className="manor-label">Add bookings to</label>
+                  <Select
+                    value={linkDraft.calendar_id || defaultCalendarId || "primary"}
+                    disabled={!calendarAccountSelectionSaved}
+                    onChange={(value) => setLinkDraft({ ...linkDraft, calendar_id: value })}
+                    options={writableCalendarOptions.map((calendar) => ({
+                      value: calendar.id,
+                      label: `${calendar.name}${calendar.is_primary ? " (primary)" : ""}`,
+                    }))}
+                  />
+                  {!calendarAccountSelectionSaved && (
+                    <p role="status" style={{ margin: "7px 0 0", color: "var(--text-muted)", fontSize: 12, lineHeight: 1.5 }}>
+                      Save calendar settings before changing this link&apos;s booking calendar.
+                    </p>
+                  )}
+                </div>
+              )}
+            </div>
+
+            <div className="booking-link-editor-availability">
+              <label className="manor-label">Availability</label>
+              <Select
+                value={linkDraft.availability_mode}
+                onChange={(value) => setLinkDraft({
+                  ...linkDraft,
+                  availability_mode: value as BookingLink["availability_mode"],
+                  working_hours: linkDraft.working_hours.length
+                    ? linkDraft.working_hours
+                    : cloneWorkingHours(workingHours.length ? workingHours : defaultWorkingHours()),
+                })}
+                options={[
+                  { value: "default", label: "Use default working hours" },
+                  { value: "custom", label: "Custom hours for this link" },
+                ]}
+              />
+            </div>
+
+            {linkDraft.availability_mode === "custom" && (
+              <section className="booking-link-editor-panel booking-link-editor-hours" aria-label="Weekly hours for this booking link">
+                <WorkingHoursEditor
+                  title="Weekly hours"
+                  value={linkDraft.working_hours}
+                  onChange={(nextWorkingHours) => setLinkDraft({
+                    ...linkDraft,
+                    working_hours: nextWorkingHours,
+                  })}
+                />
+                {!linkDraftCustomHoursValid && (
+                  <p role="alert" style={{ margin: "8px 0 0", color: "var(--editor-danger-text)", fontSize: 12, lineHeight: 1.5 }}>
+                    {linkDraftCustomHoursError}
+                  </p>
+                )}
+              </section>
+            )}
+
+            <section className="booking-link-editor-panel booking-link-editor-exclusions" aria-labelledby="booking-link-time-exclusions-title">
+              <div className="booking-link-editor-section-heading">
+                <h3 id="booking-link-time-exclusions-title">
+                  Time exclusions
+                </h3>
+                <p id="booking-link-time-exclusions-hint">
+                  Remove a one-time range in your calendar timezone.
+                </p>
+              </div>
+              <div className="booking-link-exclusion-controls">
+                <div>
+                  <label className="manor-label" htmlFor="booking-link-exclusion-date">Date</label>
+                  <input
+                    id="booking-link-exclusion-date"
+                    className="manor-input"
+                    type="date"
+                    value={unavailableDate}
+                    onChange={(event) => setUnavailableDate(event.target.value)}
+                  />
+                </div>
+                <div>
+                  <label className="manor-label">From</label>
+                  <Select
+                    value={unavailableStart}
+                    onChange={setUnavailableStart}
+                    options={WORKING_HOURS_TIME_OPTIONS}
+                    ariaLabel="Exclusion start time"
+                    dropdownMinWidth={150}
+                    dropdownStyle={{ maxHeight: 220 }}
+                  />
+                </div>
+                <div>
+                  <label className="manor-label">To</label>
+                  <Select
+                    value={unavailableEnd}
+                    onChange={setUnavailableEnd}
+                    options={WORKING_HOURS_TIME_OPTIONS}
+                    ariaLabel="Exclusion end time"
+                    dropdownMinWidth={150}
+                    dropdownStyle={{ maxHeight: 220 }}
+                  />
+                </div>
+                <Button
+                  variant="outline"
+                  disabled={!exclusionTimeValid}
+                  onClick={addUnavailableTime}
+                  ariaDescribedBy="booking-link-time-exclusions-hint"
+                  style={{ minHeight: 40 }}
+                >
+                  <IconPlus size={14} /> Exclude time
+                </Button>
+              </div>
+              {linkDraft.unavailable_dates.length === 0 && linkDraft.unavailable_times.length === 0 ? (
+                <p className="booking-link-exclusions-empty">No exclusions for this link.</p>
+              ) : (
+                <div className="booking-link-exclusion-list">
+                  {linkDraft.unavailable_dates.map((excludedDate) => (
+                    <div
+                      key={excludedDate}
+                      className="booking-link-exclusion-chip"
+                    >
+                      <span>{excludedDate} · All day</span>
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        ariaLabel={`Remove ${excludedDate} exclusion`}
+                        onClick={() => setLinkDraft({
+                          ...linkDraft,
+                          unavailable_dates: linkDraft.unavailable_dates.filter((value) => value !== excludedDate),
+                        })}
+                        style={{ width: 24, height: 24, minHeight: 24, padding: 0, color: "var(--text-muted)" }}
+                      >
+                        <IconTrash size={12} />
+                      </Button>
+                    </div>
+                  ))}
+                  {linkDraft.unavailable_times.map((excludedTime) => (
+                    <div
+                      key={`${excludedTime.date}-${excludedTime.start}-${excludedTime.end}`}
+                      className="booking-link-exclusion-chip"
+                    >
+                      <span>
+                        {excludedTime.date} · {exclusionTimeLabel(excludedTime.start)}–{exclusionTimeLabel(excludedTime.end)}
+                      </span>
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        ariaLabel={`Remove ${excludedTime.date} ${excludedTime.start} to ${excludedTime.end} exclusion`}
+                        onClick={() => setLinkDraft({
+                          ...linkDraft,
+                          unavailable_times: linkDraft.unavailable_times.filter((value) => value !== excludedTime),
+                        })}
+                        style={{ width: 24, height: 24, minHeight: 24, padding: 0, color: "var(--text-muted)" }}
+                      >
+                        <IconTrash size={12} />
+                      </Button>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </section>
+          </div>
+        )}
+      </Modal>
     </div>
   );
 }

@@ -15,6 +15,11 @@ from types import SimpleNamespace
 import pytest
 
 import packages.core.workers.internal as internal
+from packages.core.contracts.task_output import (
+    TaskOutputValueKind,
+    plan_output_contract_schema,
+    task_output_envelope_schema,
+)
 from packages.core.workers.submit_result import (
     SUBMIT_RESULT_TERMINAL_POLICY,
     SUBMIT_RESULT_TOOL_NAME,
@@ -80,6 +85,30 @@ def test_step_result_from_submit_normalizes():
     # as the raw word is what let the envelope's unknown-status branch infer
     # "partial" downstream — a finished step rendered as unfinished.
     assert out["status"] == "succeeded"
+
+
+def test_submit_result_exposes_and_preserves_non_retryable_failure():
+    tool = build_submit_result_tool(None)
+    failure_schema = tool["function"]["parameters"]["properties"]["failure"]
+    assert failure_schema["properties"]["retryable"]["type"] == "boolean"
+
+    out = step_result_from_submit({
+        "summary": "cannot write the required artifact",
+        "status": "failed",
+        "failure": {
+            "reason": "docs.upload is blocked for this run",
+            "blockers": ["docs.upload"],
+            "retryable": False,
+            "requires_human": True,
+        },
+    })
+    assert out["status"] == "failed"
+    assert out["failure"] == {
+        "reason": "docs.upload is blocked for this run",
+        "blockers": ["docs.upload"],
+        "retryable": False,
+        "requires_human": True,
+    }
 
     # summary-only payload degrades to a text result
     out = step_result_from_submit({"summary": "blocked on login"})
@@ -267,6 +296,35 @@ def test_no_submit_anywhere_falls_back_to_text_coercion(monkeypatch):
     assert out["result"] == {"text": "plain answer"}
 
 
+def test_explicit_contract_does_not_fall_back_to_plain_text_after_missing_submit(monkeypatch):
+    """A hard bare-payload contract must receive an explicit result member."""
+    _wire_common(monkeypatch)
+
+    async def fake_worker_loop(**kwargs):
+        return SimpleNamespace(result=_loop_result(content="plain answer"), run=None)
+
+    async def fake_fallback(**kwargs):
+        return _loop_result(rounds=1)  # follow-up also omitted submit_result
+
+    monkeypatch.setattr(internal, "runtime_execute_worker_subagent_loop", fake_worker_loop)
+    monkeypatch.setattr(
+        "packages.core.ai.runtime.runtime_execute_worker_subagent_followup", fake_fallback,
+    )
+
+    from packages.core.contracts.task_output import plan_output_contract_schema
+
+    with pytest.raises(ValueError, match="requires submit_result.result"):
+        asyncio.run(internal._exec_subagent(_step(
+            plan_output_contract_schema(
+                {
+                    "type": "object",
+                    "required": ["text"],
+                    "properties": {"text": {"type": "string"}},
+                }
+            )
+        )))
+
+
 def test_fallback_round_failure_is_swallowed(monkeypatch):
     """A crashing forced round must never fail the step."""
     _wire_common(monkeypatch)
@@ -339,6 +397,40 @@ def test_submit_result_stop_reason_is_not_a_failure(monkeypatch):
     assert out["result"]["post_url"] == "https://x.com/p/11"
 
 
+@pytest.mark.parametrize(
+    ("submit", "expected_kind"),
+    [
+        (
+            {"summary": "done", "result": {"value": "report"}},
+            TaskOutputValueKind.STEP_RESULT_ENVELOPE,
+        ),
+        (
+            {
+                "summary": "blocked",
+                "status": "failed",
+                "failure": {"reason": "permission denied", "retryable": False},
+            },
+            TaskOutputValueKind.STEP_RESULT_FAILURE,
+        ),
+    ],
+)
+def test_task_submit_result_carries_explicit_output_kind(
+    monkeypatch,
+    submit,
+    expected_kind,
+):
+    _wire_common(monkeypatch)
+
+    out = _run_with_loop(
+        monkeypatch,
+        _submitted_loop_result(),
+        submit=submit,
+        schema=task_output_envelope_schema({"type": "object"}),
+    )
+
+    assert out["task_output_value_kind"] is expected_kind
+
+
 def test_submit_result_step_carries_payload_not_the_terminal_notice(monkeypatch):
     """The deliverable is the submitted payload; "Result submitted." is
     bookkeeping and must never become the step's content."""
@@ -355,6 +447,67 @@ def test_submit_result_step_carries_payload_not_the_terminal_notice(monkeypatch)
     assert out["result"]["headline"] == "H"
     assert out["result"]["status"] == "succeeded"
     assert "Result submitted." not in json.dumps(out["result"])
+
+
+def test_bare_payload_does_not_receive_legacy_enrichment_fields(monkeypatch):
+    """Strict PlanStep payloads stay exact after artifact/tool enrichment.
+
+    The subagent runtime still mines evidence for the task ledger, but those
+    envelope-era fields must not leak into an ``additionalProperties: false``
+    bare payload and turn a valid submission into OutputSchemaError.
+    """
+    _wire_common(monkeypatch)
+
+    schema = {
+        "type": "object",
+        "required": ["packet"],
+        "additionalProperties": False,
+        "properties": {"packet": {"type": "string"}},
+    }
+    loop = _submitted_loop_result(
+        messages=[
+            {
+                "role": "tool",
+                "content": json.dumps(
+                    {
+                        "fs_path": "workspace/artifacts/packet.txt",
+                        "artifact_materialized": True,
+                    }
+                ),
+            }
+        ]
+    )
+    out = _run_with_loop(
+        monkeypatch,
+        loop,
+        submit={"summary": "packet ready", "result": {"packet": "ok"}},
+        schema=plan_output_contract_schema(schema),
+    )
+
+    assert out["result"] == {"packet": "ok"}
+
+
+def test_bare_scalar_payload_keeps_its_json_type_after_evidence_mining(monkeypatch):
+    """Array/string/null contracts must not be wrapped as ``{"value": ...}``."""
+    _wire_common(monkeypatch)
+    schema = plan_output_contract_schema({"type": "array", "items": {}})
+
+    loop = _submitted_loop_result(
+        messages=[
+            {
+                "role": "tool",
+                "content": json.dumps({"fs_path": "workspace/artifacts/list.json"}),
+            }
+        ]
+    )
+    out = _run_with_loop(
+        monkeypatch,
+        loop,
+        submit={"summary": "list ready", "result": [1, 2]},
+        schema=schema,
+    )
+
+    assert out["result"] == [1, 2]
 
 
 def test_captured_payload_survives_any_non_success_stop_reason(monkeypatch):
@@ -442,6 +595,12 @@ def test_terminal_success_stop_reasons_are_registry_driven():
     # stop_reason nobody registered.
     assert is_terminal_tool_success(
         SimpleNamespace(stop_reason="custom_skill_stop", control={"terminal": True})
+    )
+    assert not is_terminal_tool_success(
+        SimpleNamespace(
+            stop_reason="chrome_cli_worker_not_paired",
+            control={"terminal": True, "terminal_failure": True},
+        )
     )
     assert not is_terminal_tool_success(
         SimpleNamespace(stop_reason="error", control=None)

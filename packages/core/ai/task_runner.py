@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, Optional
 
 from packages.core.ai.runtime import (
     ChatSurface,
@@ -23,6 +23,7 @@ from packages.core.ai.runtime import (
     RUNTIME_TASK_VERDICT_FAILED as VERDICT_FAILED,
     RUNTIME_TASK_VERDICT_NEEDS_HITL as VERDICT_NEEDS_HITL,
     RUNTIME_TASK_VERDICT_NEEDS_REPLAN as VERDICT_NEEDS_REPLAN,
+    RuntimeTaskProviderError,
     runtime_assemble_prompt_for_turn,
     runtime_classify_task_complexity,
     runtime_configure_task_engine_model,
@@ -31,6 +32,7 @@ from packages.core.ai.runtime import (
     runtime_execute_task_final_response,
     runtime_execution_metadata,
     runtime_merge_prompt_appendix,
+    runtime_manual_skill_forced_tool_calls,
     runtime_parse_task_supervisor_json,
     runtime_prepare_context_appendix_for_turn,
     runtime_prepare_prompt_appendix_for_turn,
@@ -42,22 +44,40 @@ from packages.core.ai.runtime import (
     runtime_task_engine_model,
     runtime_task_initial_messages,
     runtime_task_llm_billing_context,
-    runtime_task_billable_user_id,
+    runtime_resolve_task_billable_user_id,
+    runtime_skill_ref_dict,
     runtime_task_supervisor_feedback_message,
     runtime_task_system_prompt,
     runtime_task_ticket_prompt,
     runtime_task_user_prompt,
 )
+from packages.core.services.workflow_run_execution_claim import (
+    WorkflowRunExecutionClaim,
+    commit_fenced_execution_boundary,
+)
+from packages.core.ai.llm_client import CreditExhaustedError, LLMRateLimited
 from packages.core.database import async_session
 from packages.core.services.agent_service import get_agent
 from packages.core.services.task_state_machine import (
     TaskStatusTransitionError,
     apply_task_status_transition,
 )
+from packages.core.services.task_requester_identity import TaskRequesterIdentityError
 from packages.core.services.task_service import add_task_log, update_task
 from packages.core.constants.execution import DEFAULT_AGENT_MAX_TURNS
 
 logger = logging.getLogger(__name__)
+
+
+async def _close_task_billing_context_for_error(
+    billing_context,
+    exc: BaseException,
+) -> None:
+    """Restore billing context before a task attempt is handed back for retry."""
+    try:
+        await billing_context.__aexit__(type(exc), exc, exc.__traceback__)
+    except Exception:
+        logger.debug("TaskRunner: billing context cleanup failed", exc_info=True)
 
 
 async def _finalize_with_terminal_guard(
@@ -115,9 +135,20 @@ class TaskRunner:
     5. Update task status and log all activity
     """
 
-    def __init__(self, engine: Any | None = None, session_factory=None):
+    def __init__(
+        self,
+        engine: Any | None = None,
+        session_factory=None,
+        *,
+        before_terminal_commit: Callable[[], None] | None = None,
+        after_terminal_commit: Callable[[], None] | None = None,
+        execution_claim: WorkflowRunExecutionClaim | None = None,
+    ):
         self._engine = engine
         self._session_factory = session_factory
+        self._before_terminal_commit = before_terminal_commit
+        self._after_terminal_commit = after_terminal_commit
+        self._execution_claim = execution_claim
 
     def _get_session(self):
         """Return a context-managed session — uses worker factory if provided, else global."""
@@ -135,6 +166,7 @@ class TaskRunner:
         runtime: Any,
         active_user_message: str | None = None,
         metadata: dict[str, Any] | None = None,
+        skill_refs: list[dict] | None = None,
     ):
         """Build the same workspace-aware prompt and tool surface used by chat."""
         async with self._get_session() as prompt_db:
@@ -160,8 +192,14 @@ class TaskRunner:
                 bound_tool_names=runtime.bound_tool_names,
                 is_master=runtime.is_master,
                 mcp_allowed_names=runtime.mcp_allowed_names,
+                mcp_provider_scopes=getattr(runtime, "mcp_provider_scopes", ()),
+                mcp_scope_unrestricted=bool(
+                    getattr(runtime, "mcp_scope_unrestricted", False)
+                ),
                 active_user_message=active_user_message,
                 legacy_extra_context=runtime.extra_context,
+                manual_skill_selected=bool(skill_refs),
+                skill_refs=skill_refs,
             )
             return assembled
 
@@ -170,7 +208,7 @@ class TaskRunner:
         task_start = time.monotonic()
 
         async with self._get_session() as db:
-            from sqlalchemy import select
+            from sqlalchemy import or_, select
             from packages.core.models.task import Task
             result = await db.execute(select(Task).where(Task.id == task_id))
             task = result.scalar_one_or_none()
@@ -179,8 +217,33 @@ class TaskRunner:
                 return {"task_id": task_id, "status": "failed", "error": "task not found"}
 
             entity_id = task.entity_id
-            task_user_id = runtime_task_billable_user_id(task)
+            task_user_id = await runtime_resolve_task_billable_user_id(db, task)
             task_runtime_metadata = _task_runtime_metadata(task)
+            scheduled_skill_refs: list[dict] = []
+            scheduled_skill_id = str(
+                (task.details or {}).get("scheduled_skill_id") or ""
+            ).strip()
+            if scheduled_skill_id:
+                from packages.core.models.skill import Skill
+
+                scheduled_skill = (await db.execute(select(Skill).where(
+                    Skill.id == scheduled_skill_id,
+                    Skill.status == "active",
+                    or_(Skill.entity_id == entity_id, Skill.entity_id.is_(None)),
+                ))).scalar_one_or_none()
+                if scheduled_skill is None:
+                    if task.status not in _TERMINAL_STATUSES:
+                        failure_details = dict(task.details or {})
+                        failure_details["failure_reason"] = "scheduled skill not found"
+                        task.details = failure_details
+                        await apply_task_status_transition(task, "failed", db=db)
+                        await db.commit()
+                    return {
+                        "task_id": task_id,
+                        "status": "failed",
+                        "error": "scheduled skill not found",
+                    }
+                scheduled_skill_refs = [runtime_skill_ref_dict(scheduled_skill)]
 
             # Decide which catalog role to use:
             #   worker model (cheap) vs primary model (capable)
@@ -257,6 +320,7 @@ class TaskRunner:
                         runtime=runtime,
                         active_user_message=active_task_text,
                         metadata=task_runtime_metadata,
+                        skill_refs=scheduled_skill_refs,
                     )
                     system_prompt = runtime_prompt_result.prompt
                 except Exception as exc:
@@ -289,6 +353,7 @@ class TaskRunner:
                             runtime=runtime,
                             active_user_message=active_task_text,
                             metadata=task_runtime_metadata,
+                            skill_refs=scheduled_skill_refs,
                         )
                         system_prompt = runtime_prompt_result.prompt
                     except Exception as exc:
@@ -317,6 +382,7 @@ class TaskRunner:
                                     request=fallback_request,
                                     tool_profile=runtime.tool_profile,
                                     legacy_extra_context=runtime.extra_context,
+                                    skill_refs=scheduled_skill_refs,
                                 )
                                 system_prompt = runtime_merge_prompt_appendix(
                                     system_prompt,
@@ -385,8 +451,14 @@ class TaskRunner:
                     bound_tool_names=runtime.bound_tool_names,
                     is_master=runtime.is_master,
                     mcp_allowed_names=runtime.mcp_allowed_names,
+                    mcp_provider_scopes=getattr(runtime, "mcp_provider_scopes", ()),
+                    mcp_scope_unrestricted=bool(
+                        getattr(runtime, "mcp_scope_unrestricted", False)
+                    ),
                     active_user_message=user_prompt,
                     legacy_extra_context=runtime.extra_context,
+                    manual_skill_selected=bool(scheduled_skill_refs),
+                    skill_refs=scheduled_skill_refs,
                 )
         tools = list(runtime_prompt_result.tool_schemas)
         allowed_tool_names = set(runtime_prompt_result.allowed_tool_names)
@@ -428,6 +500,10 @@ class TaskRunner:
         await _billing_cm.__aenter__()
 
         messages = runtime_task_initial_messages(user_prompt)
+        scheduled_forced_tool_calls = runtime_manual_skill_forced_tool_calls(
+            scheduled_skill_refs,
+            user_prompt,
+        )
         agent_response = ""
         turns_used = 0
         final_status = "failed"
@@ -466,6 +542,9 @@ class TaskRunner:
                     metadata=getattr(self, "_agent_llm_metadata", None),
                     temperature=getattr(self, "_agent_temperature", None),
                     max_tokens=getattr(self, "_agent_max_tokens", None),
+                    forced_tool_calls=(
+                        scheduled_forced_tool_calls if turn == 0 else None
+                    ),
                 )
                 messages = turn_result.messages
                 tools = turn_result.tools
@@ -487,6 +566,28 @@ class TaskRunner:
                 await self._log(task_id, "ai_agent_turn",
                     f"[AI] Turn {turns_used}/{max_turns} — response ({len(agent_response)} chars)")
 
+            except (
+                CreditExhaustedError,
+                LLMRateLimited,
+                TaskRequesterIdentityError,
+            ) as e:
+                await _close_task_billing_context_for_error(_billing_cm, e)
+                raise
+            except RuntimeTaskProviderError as e:
+                if e.retryable:
+                    await _close_task_billing_context_for_error(_billing_cm, e)
+                    raise
+                agent_response = f"Agent execution failed: {e}"
+                logger.error(
+                    "TaskRunner: terminal provider error on turn %d: %s",
+                    turns_used,
+                    e,
+                )
+                await self._log(
+                    task_id,
+                    "ai_agent_turn",
+                    f"[AI] Turn {turns_used}/{max_turns} FAILED — {e}",
+                )
             except Exception as e:
                 agent_response = f"Agent execution failed: {e}"
                 logger.error("TaskRunner: turn %d failed: %s", turns_used, e, exc_info=True)
@@ -499,16 +600,25 @@ class TaskRunner:
                 supervisor_verdict = {"verdict": VERDICT_FAILED, "reason": f"Agent returned error: {agent_response[:200]}", "retry_strategy": "retry_same"}
             else:
                 # ── Supervisor review ──
-                supervisor_verdict = await self._supervise(
-                    task_id=task_id,
-                    task_title=task_dict["title"],
-                    agent_response=agent_response,
-                    done_when=done_when,
-                    turns_used=turns_used,
-                    max_turns=max_turns,
-                    tools_called=tools_called_session,
-                    tool_evidence=tool_evidence_session,
-                )
+                try:
+                    supervisor_verdict = await self._supervise(
+                        task_id=task_id,
+                        task_title=task_dict["title"],
+                        agent_response=agent_response,
+                        done_when=done_when,
+                        turns_used=turns_used,
+                        max_turns=max_turns,
+                        tools_called=tools_called_session,
+                        tool_evidence=tool_evidence_session,
+                    )
+                except (
+                    CreditExhaustedError,
+                    LLMRateLimited,
+                    RuntimeTaskProviderError,
+                    TaskRequesterIdentityError,
+                ) as exc:
+                    await _close_task_billing_context_for_error(_billing_cm, exc)
+                    raise
 
             verdict = supervisor_verdict.get("verdict", VERDICT_DONE)
             await self._log(task_id, "ai_supervisor_verdict",
@@ -562,6 +672,21 @@ class TaskRunner:
                         "ai_agent_turn",
                         f"[AI] Finalized after max tool turns — response ({len(agent_response)} chars)",
                     )
+            except (
+                CreditExhaustedError,
+                LLMRateLimited,
+                TaskRequesterIdentityError,
+            ) as exc:
+                await _close_task_billing_context_for_error(_billing_cm, exc)
+                raise
+            except RuntimeTaskProviderError as exc:
+                if exc.retryable:
+                    await _close_task_billing_context_for_error(_billing_cm, exc)
+                    raise
+                logger.warning(
+                    "TaskRunner: terminal provider error while finalizing after max turns: %s",
+                    exc,
+                )
             except Exception as exc:
                 logger.warning("TaskRunner: final response after max turns failed: %s", exc)
 
@@ -592,6 +717,14 @@ class TaskRunner:
                     tools_called=tools_called_session,
                     tool_evidence=tool_evidence_session,
                 )
+            except (
+                CreditExhaustedError,
+                LLMRateLimited,
+                RuntimeTaskProviderError,
+                TaskRequesterIdentityError,
+            ) as exc:
+                await _close_task_billing_context_for_error(_billing_cm, exc)
+                raise
             except Exception as exc:
                 logger.warning("Supervisor at exhaustion failed: %s", exc)
                 supervisor_verdict = {
@@ -678,7 +811,13 @@ class TaskRunner:
                 )
             except Exception:
                 logger.debug("TaskRunner: runtime evidence recording skipped for task %s", task_id, exc_info=True)
-            await db.commit()
+            await commit_fenced_execution_boundary(
+                db.commit,
+                before_commit=self._before_terminal_commit,
+                after_commit=self._after_terminal_commit,
+                execution_claim=self._execution_claim,
+                session=db,
+            )
         await runtime_persist_task_runner_runtime_events(
             getattr(self, "_runtime_envelope", None),
         )

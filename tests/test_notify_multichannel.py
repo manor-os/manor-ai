@@ -13,6 +13,8 @@ but still go through the registry lookup the production code uses.
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -20,19 +22,49 @@ from httpx import AsyncClient
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from packages.core.constants.notification_types import NotificationChannel
 from packages.core.models.channel import (
     ChannelConfig,
     ChannelContact,
     MessageLog,
 )
-from packages.core.models.notification import Notification
+from packages.core.models.notification import Notification, NotificationOutboxEvent
 from packages.core.models.user import User
+from packages.core.services import notification_scheduler
 from packages.core.services import notify as notify_module
 from packages.core.services.channels import ADAPTERS
 from packages.core.services.channels.base import ChannelAdapter
+from packages.core.services.notification_targets import (
+    NotificationDeliveryTargetFactory,
+    NotificationTargetKind,
+)
 
 
 # ── Helpers ─────────────────────────────────────────────────────────────────
+
+
+def test_notification_delivery_target_factory_uses_canonical_keys() -> None:
+    contact = NotificationDeliveryTargetFactory.external(
+        channel_type=NotificationChannel.TELEGRAM.value,
+        contact_id="contact-1",
+    )
+    address = NotificationDeliveryTargetFactory.external(
+        channel_type=NotificationChannel.EMAIL.value,
+        address=" User@Example.COM ",
+    )
+    broadcast = NotificationDeliveryTargetFactory.broadcast("entity-1")
+    workspace_broadcast = NotificationDeliveryTargetFactory.broadcast(
+        "entity-1",
+        workspace_id="workspace-1",
+    )
+
+    assert contact.kind is NotificationTargetKind.CONTACT
+    assert contact.key == "telegram:contact:contact-1"
+    assert address.key == "email:address:user@example.com"
+    assert broadcast.key == "broadcast:entity:entity-1"
+    assert workspace_broadcast.key == "broadcast:workspace:workspace-1"
+    assert NotificationDeliveryTargetFactory.parse(address.key) == address
+
 
 
 async def _register(client: AsyncClient, username: str = "notify_user") -> dict:
@@ -134,12 +166,16 @@ class _FakeAdapter(ChannelAdapter):
         self.channel_type = channel_type
         self.sent: list[dict[str, Any]] = []
         self.fail_with: Exception | None = None
+        self.result_status = "sent"
 
     async def send_text(self, cc, to, text, **kwargs):
         if self.fail_with:
             raise self.fail_with
         self.sent.append({"cc_id": cc.id, "to": to, "text": text})
-        return {"status": "sent", "external_id": f"ext-{len(self.sent)}"}
+        return {
+            "status": self.result_status,
+            "external_id": f"ext-{len(self.sent)}",
+        }
 
     async def parse_inbound(self, *args, **kwargs):
         return None
@@ -262,6 +298,79 @@ async def test_notify_sends_email_to_registered_address_by_default(
 
 
 @pytest.mark.asyncio
+async def test_actionable_notification_skips_registered_email_fallback(
+    client: AsyncClient,
+    db_session: AsyncSession,
+    monkeypatch,
+):
+    ctx = await _register(client, "actionable_email_fallback_user")
+    sent: list[str] = []
+
+    async def fake_send_notification_email(to: str, _title: str, _body: str) -> bool:
+        sent.append(to)
+        return True
+
+    monkeypatch.setattr(
+        "packages.core.services.email_service.send_notification_email",
+        fake_send_notification_email,
+    )
+    response = await client.put(
+        "/api/v1/notifications/preferences",
+        headers=ctx["headers"],
+        json={"default_channels": ["email"]},
+    )
+    assert response.status_code == 200
+
+    await notify_module.notify(
+        entity_id=ctx["entity_id"],
+        user_id=ctx["user_id"],
+        type="task_hitl_requested",
+        title="Approve this request",
+        actions=[{"key": "approve", "label": "Approve"}],
+        callback_kind="workspace.hitl.resolve_message",
+    )
+
+    assert sent == []
+    assert (await db_session.execute(select(MessageLog))).scalars().all() == []
+    outbox = (await db_session.execute(select(NotificationOutboxEvent))).scalar_one()
+    assert outbox.status == "delivered"
+
+
+@pytest.mark.asyncio
+async def test_explicit_actionable_email_requires_linked_contact(
+    client: AsyncClient,
+    db_session: AsyncSession,
+    monkeypatch,
+):
+    ctx = await _register(client, "explicit_actionable_email_user")
+    sent: list[str] = []
+
+    async def fake_send_notification_email(to: str, _title: str, _body: str) -> bool:
+        sent.append(to)
+        return True
+
+    monkeypatch.setattr(
+        "packages.core.services.email_service.send_notification_email",
+        fake_send_notification_email,
+    )
+
+    await notify_module.notify(
+        entity_id=ctx["entity_id"],
+        user_id=ctx["user_id"],
+        type="task_hitl_requested",
+        title="Approve this request",
+        channels=["email"],
+        actions=[{"key": "approve", "label": "Approve"}],
+        callback_kind="workspace.hitl.resolve_message",
+    )
+
+    assert sent == []
+    outbox = (await db_session.execute(select(NotificationOutboxEvent))).scalar_one()
+    assert outbox.status == "pending"
+    assert "no active target" in str(outbox.last_error)
+
+
+@pytest.mark.asyncio
 async def test_notify_fans_out_to_telegram_when_linked(
     client: AsyncClient,
     db_session: AsyncSession,
@@ -323,6 +432,415 @@ async def test_notify_fans_out_to_telegram_when_linked(
     assert logs[0].to_address == contact.source_id
     assert logs[0].status == "sent"
     assert logs[0].external_id == "ext-1"
+
+
+@pytest.mark.asyncio
+async def test_notify_idempotency_key_deduplicates_row_and_external_send(
+    client: AsyncClient,
+    db_session: AsyncSession,
+    fake_telegram: _FakeAdapter,
+):
+    ctx = await _register(client, "idempotent_notify_user")
+    await _link_telegram_contact(
+        db_session,
+        entity_id=ctx["entity_id"],
+        user_id=ctx["user_id"],
+    )
+    await client.put(
+        "/api/v1/notifications/preferences",
+        headers=ctx["headers"],
+        json={"default_channels": ["telegram"]},
+    )
+
+    kwargs = {
+        "entity_id": ctx["entity_id"],
+        "user_id": ctx["user_id"],
+        "type": "task_succeeded",
+        "title": "Exactly one logical notification",
+        "idempotency_key": "task:example:completed",
+    }
+    await notify_module.notify(**kwargs)
+    await notify_module.notify(**kwargs)
+
+    rows = (
+        await db_session.execute(
+            select(Notification).where(Notification.user_id == ctx["user_id"])
+        )
+    ).scalars().all()
+    assert len(rows) == 1
+    assert len(fake_telegram.sent) == 1
+
+
+@pytest.mark.asyncio
+async def test_notify_idempotency_rejects_different_delivery_time(
+    client: AsyncClient,
+    db_session: AsyncSession,
+):
+    ctx = await _register(client, "idempotent_delivery_time_user")
+    first_time = datetime.now(timezone.utc) + timedelta(hours=1)
+    kwargs = {
+        "entity_id": ctx["entity_id"],
+        "user_id": ctx["user_id"],
+        "type": "task_succeeded",
+        "title": "One delivery intent",
+        "idempotency_key": "task:delivery-time",
+    }
+    await notify_module.notify(**kwargs, deliver_at=first_time)
+
+    with pytest.raises(ValueError, match="different content"):
+        await notify_module.notify(
+            **kwargs,
+            deliver_at=first_time + timedelta(minutes=5),
+        )
+
+    assert (await db_session.execute(select(Notification))).scalars().all()
+    assert len((await db_session.execute(select(NotificationOutboxEvent))).scalars().all()) == 1
+
+
+@pytest.mark.asyncio
+async def test_notify_idempotency_rejects_different_callback_payload(
+    client: AsyncClient,
+):
+    ctx = await _register(client, "idempotent_callback_user")
+    future = datetime.now(timezone.utc) + timedelta(hours=1)
+    kwargs = {
+        "entity_id": ctx["entity_id"],
+        "user_id": ctx["user_id"],
+        "type": "task_hitl_requested",
+        "title": "Approve once",
+        "actions": [{"key": "approve", "label": "Approve"}],
+        "callback_kind": "workspace_hitl",
+        "deliver_at": future,
+        "idempotency_key": "hitl:delivery-intent",
+    }
+    await notify_module.notify(**kwargs, callback_payload={"request_id": "first"})
+
+    with pytest.raises(ValueError, match="delivery intent"):
+        await notify_module.notify(
+            **kwargs,
+            callback_payload={"request_id": "second"},
+        )
+
+
+@pytest.mark.asyncio
+async def test_legacy_idempotency_conflict_stops_broadcast(
+    client: AsyncClient,
+    db_session: AsyncSession,
+    monkeypatch,
+):
+    from packages.core.services import realtime
+
+    ctx = await _register(client, "legacy_idempotency_conflict_user")
+    broadcasts: list[dict[str, Any]] = []
+
+    async def fake_broadcast(entity_id: str, event: str, data: dict) -> None:
+        broadcasts.append({"entity_id": entity_id, "event": event, "data": data})
+
+    monkeypatch.setattr(realtime, "_broadcast", fake_broadcast)
+
+    kwargs = {
+        "entity_id": ctx["entity_id"],
+        "user_id": ctx["user_id"],
+        "type": "system",
+        "channels": ["db", "broadcast"],
+        "idempotency_key": "legacy:one-logical-notification",
+    }
+    await notify_module.notify(**kwargs, title="First payload")
+
+    with pytest.raises(ValueError, match="different content"):
+        await notify_module.notify(**kwargs, title="Conflicting payload")
+
+    rows = (await db_session.execute(select(Notification))).scalars().all()
+    assert [row.title for row in rows] == ["First payload"]
+    assert [item["data"]["title"] for item in broadcasts] == ["First payload"]
+
+
+@pytest.mark.asyncio
+async def test_workspace_legacy_broadcast_uses_workspace_scope(
+    client: AsyncClient,
+    monkeypatch,
+):
+    from packages.core.services import realtime
+
+    ctx = await _register(client, "workspace_legacy_broadcast_user")
+    created = await client.post(
+        "/api/v1/workspaces",
+        headers=ctx["headers"],
+        json={"name": "Private Broadcast"},
+    )
+    assert created.status_code == 201, created.text
+    workspace_id = created.json()["id"]
+    entity_broadcasts: list[dict[str, Any]] = []
+    workspace_broadcasts: list[dict[str, Any]] = []
+
+    async def fake_entity_broadcast(entity_id: str, event: str, data: dict) -> None:
+        entity_broadcasts.append({"entity_id": entity_id, "event": event, "data": data})
+
+    async def fake_workspace_broadcast(
+        entity_id: str,
+        target_workspace_id: str,
+        event: str,
+        data: dict,
+    ) -> None:
+        workspace_broadcasts.append({
+            "entity_id": entity_id,
+            "workspace_id": target_workspace_id,
+            "event": event,
+            "data": data,
+        })
+
+    monkeypatch.setattr(realtime, "_broadcast", fake_entity_broadcast)
+    monkeypatch.setattr(realtime, "_broadcast_workspace", fake_workspace_broadcast)
+
+    await notify_module.notify(
+        entity_id=ctx["entity_id"],
+        user_id=ctx["user_id"],
+        type="system",
+        title="Private Workspace event",
+        channels=["broadcast"],
+        workspace_id=workspace_id,
+    )
+
+    assert entity_broadcasts == []
+    assert workspace_broadcasts == [{
+        "entity_id": ctx["entity_id"],
+        "workspace_id": workspace_id,
+        "event": "system",
+        "data": {
+            "title": "Private Workspace event",
+            "body": None,
+            "link": None,
+            "workspace_id": workspace_id,
+        },
+    }]
+
+
+@pytest.mark.asyncio
+async def test_notify_honors_explicit_external_channel(
+    client: AsyncClient,
+    db_session: AsyncSession,
+    fake_telegram: _FakeAdapter,
+):
+    ctx = await _register(client, "explicit_channel_user")
+    await _link_telegram_contact(
+        db_session,
+        entity_id=ctx["entity_id"],
+        user_id=ctx["user_id"],
+    )
+
+    await notify_module.notify(
+        entity_id=ctx["entity_id"],
+        user_id=ctx["user_id"],
+        type="system",
+        title="Explicit Telegram",
+        channels=["telegram"],
+    )
+
+    assert len(fake_telegram.sent) == 1
+    assert "Explicit Telegram" in fake_telegram.sent[0]["text"]
+
+
+@pytest.mark.asyncio
+async def test_notify_rejects_empty_user_visible_payload(
+    client: AsyncClient,
+    db_session: AsyncSession,
+):
+    ctx = await _register(client, "empty_notification_payload_user")
+
+    with pytest.raises(ValueError, match="user-visible content"):
+        await notify_module.notify(
+            entity_id=ctx["entity_id"],
+            user_id=ctx["user_id"],
+            type="system",
+            title="  ",
+            channels=["telegram"],
+        )
+
+    assert (await db_session.execute(select(Notification))).scalars().all() == []
+    assert (
+        await db_session.execute(select(NotificationOutboxEvent))
+    ).scalars().all() == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("link_target", [True, False])
+async def test_dispatch_rejects_persisted_empty_external_payload(
+    client: AsyncClient,
+    db_session: AsyncSession,
+    fake_telegram: _FakeAdapter,
+    link_target: bool,
+):
+    ctx = await _register(client, "persisted_empty_notification_user")
+    if link_target:
+        await _link_telegram_contact(
+            db_session,
+            entity_id=ctx["entity_id"],
+            user_id=ctx["user_id"],
+        )
+
+    error_match = "no user-visible content" if link_target else "no active target"
+    with pytest.raises(RuntimeError, match=error_match):
+        await notify_module.dispatch_persisted_notification(
+            notification_id="persisted_notification",
+            entity_id=ctx["entity_id"],
+            user_id=ctx["user_id"],
+            type="system",
+            title="",
+            body=None,
+            meta={},
+            workspace_id=None,
+            payload={"channels": ["telegram"]},
+        )
+
+    assert fake_telegram.sent == []
+
+
+@pytest.mark.asyncio
+async def test_dispatch_rechecks_authorization_before_every_external_target(
+    client: AsyncClient,
+    db_session: AsyncSession,
+    monkeypatch,
+):
+    ctx = await _register(client, "notification_target_fence_user")
+    await _link_telegram_contact(
+        db_session,
+        entity_id=ctx["entity_id"],
+        user_id=ctx["user_id"],
+    )
+    events: list[str] = []
+    guard_calls = 0
+
+    async def guard() -> bool:
+        nonlocal guard_calls
+        guard_calls += 1
+        events.append(f"guard:{guard_calls}")
+        return guard_calls == 1
+
+    async def deliver_channel(**_kwargs) -> bool:
+        events.append("send:telegram")
+        return True
+
+    async def deliver_email(**_kwargs) -> bool:
+        events.append("send:email")
+        return True
+
+    async def delivered(target_key: str) -> None:
+        events.append(f"delivered:{target_key.split(':', 1)[0]}")
+
+    monkeypatch.setattr(
+        notify_module,
+        "_deliver_via_channel_gateway",
+        deliver_channel,
+    )
+    monkeypatch.setattr(
+        notify_module,
+        "_deliver_via_registered_email",
+        deliver_email,
+    )
+
+    await notify_module.dispatch_persisted_notification(
+        notification_id="persisted-notification",
+        entity_id=ctx["entity_id"],
+        user_id=ctx["user_id"],
+        type="system",
+        title="Recheck each target",
+        body=None,
+        meta={},
+        workspace_id=None,
+        payload={"channels": ["telegram", "email"]},
+        before_external_target=guard,
+        on_target_delivered=delivered,
+    )
+
+    assert events == [
+        "guard:1",
+        "send:telegram",
+        "delivered:telegram",
+        "guard:2",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_notify_retries_explicit_external_channel_without_target(
+    client: AsyncClient,
+    db_session: AsyncSession,
+):
+    ctx = await _register(client, "explicit_channel_missing_target_user")
+
+    await notify_module.notify(
+        entity_id=ctx["entity_id"],
+        user_id=ctx["user_id"],
+        type="system",
+        title="Explicit Telegram needs a target",
+        channels=["telegram"],
+    )
+
+    outbox = (
+        await db_session.execute(select(NotificationOutboxEvent))
+    ).scalar_one()
+    assert outbox.status == "pending"
+    assert outbox.attempt_count == 1
+    assert "no active target" in str(outbox.last_error)
+    assert (
+        await db_session.execute(select(MessageLog))
+    ).scalars().all() == []
+
+
+@pytest.mark.asyncio
+async def test_notify_retries_when_explicit_channel_config_is_inactive(
+    client: AsyncClient,
+    db_session: AsyncSession,
+    fake_telegram: _FakeAdapter,
+):
+    ctx = await _register(client, "inactive_channel_config_user")
+    config, _contact = await _link_telegram_contact(
+        db_session,
+        entity_id=ctx["entity_id"],
+        user_id=ctx["user_id"],
+    )
+    config.status = "inactive"
+    await db_session.commit()
+
+    await notify_module.notify(
+        entity_id=ctx["entity_id"],
+        user_id=ctx["user_id"],
+        type="system",
+        title="Inactive Telegram must not receive",
+        channels=["telegram"],
+    )
+
+    outbox = (await db_session.execute(select(NotificationOutboxEvent))).scalar_one()
+    assert outbox.status == "pending"
+    assert outbox.attempt_count == 1
+    assert "no active target" in str(outbox.last_error)
+    assert fake_telegram.sent == []
+
+
+@pytest.mark.asyncio
+async def test_channel_delivery_revalidates_contact_before_send(
+    client: AsyncClient,
+    db_session: AsyncSession,
+    fake_telegram: _FakeAdapter,
+):
+    ctx = await _register(client, "blocked_channel_contact_user")
+    _config, contact = await _link_telegram_contact(
+        db_session,
+        entity_id=ctx["entity_id"],
+        user_id=ctx["user_id"],
+    )
+    contact.status = "blocked"
+    await db_session.commit()
+
+    delivered = await notify_module._deliver_via_channel_gateway(
+        channel_contact_id=contact.id,
+        text="Must not be sent",
+        notification_id=None,
+        entity_id=ctx["entity_id"],
+        user_id=ctx["user_id"],
+    )
+
+    assert delivered is False
+    assert fake_telegram.sent == []
 
 
 @pytest.mark.asyncio
@@ -413,6 +931,188 @@ async def test_adapter_failure_does_not_block_inapp(
     assert len(logs) == 1
     assert logs[0].status == "failed"
     assert logs[0].error_message and "boom" in logs[0].error_message
+
+
+@pytest.mark.asyncio
+async def test_adapter_failed_status_retries_outbox(
+    client: AsyncClient,
+    db_session: AsyncSession,
+    fake_telegram: _FakeAdapter,
+):
+    ctx = await _register(client, "adapter_failed_status_user")
+    await _link_telegram_contact(
+        db_session,
+        entity_id=ctx["entity_id"],
+        user_id=ctx["user_id"],
+    )
+    fake_telegram.result_status = "failed"
+
+    await notify_module.notify(
+        entity_id=ctx["entity_id"],
+        user_id=ctx["user_id"],
+        type="system",
+        title="Provider rejected this message",
+        channels=["telegram"],
+    )
+
+    outbox = (await db_session.execute(select(NotificationOutboxEvent))).scalar_one()
+    assert outbox.status == "pending"
+    assert outbox.attempt_count == 1
+    assert "channel delivery failed" in str(outbox.last_error)
+
+    log = (await db_session.execute(select(MessageLog))).scalar_one()
+    assert log.status == "failed"
+    assert log.error_message == "adapter_status_failed"
+
+
+@pytest.mark.asyncio
+async def test_outbox_retry_skips_external_targets_that_already_succeeded(
+    client: AsyncClient,
+    db_session: AsyncSession,
+    fake_telegram: _FakeAdapter,
+    monkeypatch,
+):
+    ctx = await _register(client, "partial_external_retry_user")
+    await _link_telegram_contact(
+        db_session,
+        entity_id=ctx["entity_id"],
+        user_id=ctx["user_id"],
+    )
+    sent_email: list[str] = []
+
+    async def fake_send_notification_email(to: str, _title: str, _body: str) -> bool:
+        sent_email.append(to)
+        return True
+
+    monkeypatch.setattr(
+        "packages.core.services.email_service.send_notification_email",
+        fake_send_notification_email,
+    )
+    fake_telegram.result_status = "failed"
+
+    await notify_module.notify(
+        entity_id=ctx["entity_id"],
+        user_id=ctx["user_id"],
+        type="system",
+        title="Retry only the failed target",
+        channels=["telegram", "email"],
+    )
+
+    outbox = (await db_session.execute(select(NotificationOutboxEvent))).scalar_one()
+    assert outbox.status == "pending"
+    assert sent_email == ["partial_external_retry_user@test.com"]
+    assert len(fake_telegram.sent) == 1
+
+    fake_telegram.result_status = "sent"
+    result = await notification_scheduler.dispatch_due_notifications(
+        db_session,
+        now=outbox.available_at + timedelta(seconds=1),
+    )
+
+    assert result["dispatched"] == 1
+    assert sent_email == ["partial_external_retry_user@test.com"]
+    assert len(fake_telegram.sent) == 2
+
+
+@pytest.mark.asyncio
+async def test_workspace_broadcast_is_scoped_and_not_repeated_on_external_retry(
+    client: AsyncClient,
+    db_session: AsyncSession,
+    fake_telegram: _FakeAdapter,
+    monkeypatch,
+):
+    from packages.core.services import realtime
+
+    ctx = await _register(client, "workspace_broadcast_retry_user")
+    created = await client.post(
+        "/api/v1/workspaces",
+        headers=ctx["headers"],
+        json={"name": "Retry Broadcast"},
+    )
+    assert created.status_code == 201, created.text
+    workspace_id = created.json()["id"]
+    await _link_telegram_contact(
+        db_session,
+        entity_id=ctx["entity_id"],
+        user_id=ctx["user_id"],
+    )
+    entity_broadcasts: list[dict[str, Any]] = []
+    workspace_broadcasts: list[dict[str, Any]] = []
+
+    async def fake_entity_broadcast(entity_id: str, event: str, data: dict) -> None:
+        entity_broadcasts.append({"entity_id": entity_id, "event": event, "data": data})
+
+    async def fake_workspace_broadcast(
+        entity_id: str,
+        target_workspace_id: str,
+        event: str,
+        data: dict,
+    ) -> None:
+        workspace_broadcasts.append({
+            "entity_id": entity_id,
+            "workspace_id": target_workspace_id,
+            "event": event,
+            "data": data,
+        })
+
+    monkeypatch.setattr(realtime, "_broadcast", fake_entity_broadcast)
+    monkeypatch.setattr(realtime, "_broadcast_workspace", fake_workspace_broadcast)
+    fake_telegram.result_status = "failed"
+
+    await notify_module.notify(
+        entity_id=ctx["entity_id"],
+        user_id=ctx["user_id"],
+        type="system",
+        title="Scoped retry",
+        channels=["broadcast", "telegram"],
+        workspace_id=workspace_id,
+    )
+    outbox = (await db_session.execute(select(NotificationOutboxEvent))).scalar_one()
+    assert outbox.status == "pending"
+
+    result = await notification_scheduler.dispatch_due_notifications(
+        db_session,
+        now=outbox.available_at + timedelta(seconds=1),
+    )
+
+    assert result["retried"] == 1
+    assert entity_broadcasts == []
+    assert len(workspace_broadcasts) == 1
+    assert workspace_broadcasts[0]["workspace_id"] == workspace_id
+
+
+@pytest.mark.asyncio
+async def test_media_job_notification_propagates_workspace_scope(monkeypatch) -> None:
+    from packages.core.models.media_job import MediaJobStatus
+    from packages.core.tasks import media_tasks
+
+    captured: dict[str, Any] = {}
+
+    async def fake_notify(**kwargs: Any) -> None:
+        captured.update(kwargs)
+
+    monkeypatch.setattr("packages.core.services.notify.notify", fake_notify)
+    job = SimpleNamespace(
+        id="media-job-1",
+        entity_id="entity-1",
+        user_id="user-1",
+        conversation_id="conversation-1",
+        prompt="Private launch video",
+        status=MediaJobStatus.COMPLETED,
+        error=None,
+        result_url="/files/private.mp4",
+        duration_seconds=5,
+        model="bytedance/seedance-2.0",
+        params={
+            "workspace_id": "workspace-1",
+            "result_document_id": "document-1",
+            "resolution": "720p",
+        },
+    )
+
+    await media_tasks._push_notification(job)
+
+    assert captured["workspace_id"] == "workspace-1"
 
 
 @pytest.mark.asyncio

@@ -32,6 +32,7 @@ def test_api_image_installs_same_office_fonts_used_by_generated_artifacts():
         "fonts-crosextra-carlito",
         "fonts-lato",
         "fonts-liberation",
+        "fonts-noto-core",
         "fonts-noto-cjk",
         "fonts-roboto",
     }

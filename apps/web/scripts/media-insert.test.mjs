@@ -14,6 +14,10 @@ test("shared media insertion reuses Manor Chat and Knowledge APIs", async () => 
   assert.match(source, /api\.documents\.list\(/);
   assert.match(source, /api\.documents\.upload\(/);
   assert.match(source, /api\.documents\.createFromUrl\(/);
+  assert.match(source, /firstString\(record, \["document_id"\]\)/);
+  for (const alias of ["result_document_id", "doc_id"]) {
+    assert.doesNotMatch(source, new RegExp(`"${alias}"`));
+  }
 });
 
 test("shared media dialog exposes upload, Knowledge, online, and generation sources", async () => {
@@ -21,7 +25,16 @@ test("shared media dialog exposes upload, Knowledge, online, and generation sour
   for (const key of ["knowledge", "upload", "online", "generate"]) {
     assert.match(source, new RegExp(`key: "${key}"`));
   }
-  assert.match(source, /allowedKinds = \["image", "video"\]/);
+  assert.match(source, /const DEFAULT_ALLOWED_KINDS:[^=]+ = \["image", "video"\]/);
+  assert.match(source, /allowedKinds = DEFAULT_ALLOWED_KINDS/);
+});
+
+test("closing the shared media dialog resets transient state only when open changes", async () => {
+  const source = await read("src/components/MediaInsertDialog.tsx");
+  assert.match(
+    source,
+    /useEffect\(\(\) => \{\s*if \(open\) return;[\s\S]*?setBusy\(null\);[\s\S]*?setError\(""\);\s*\}, \[open\]\);/,
+  );
 });
 
 test("presentation, document, PDF, website, and video editors share the media dialog", async () => {

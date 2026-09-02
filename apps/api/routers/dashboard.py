@@ -20,6 +20,7 @@ from packages.core.ai.runtime.dashboard_module_validation import (
 )
 from packages.core import database as core_database
 from packages.core.cache import cache
+from packages.core.constants.conversation import ConversationSurfaceKind
 from packages.core.database import get_db
 from packages.core.models.user import User
 from packages.core.services.analytics_service import (
@@ -750,6 +751,7 @@ async def update_dashboard_layout(
                 user.entity_id,
                 user.id,
                 conversation_id=conversation_id,
+                conversation_surface=ConversationSurfaceKind.DASHBOARD_MODULE,
             )
         except (LookupError, PermissionError) as exc:
             raise HTTPException(
@@ -782,6 +784,7 @@ async def update_dashboard_layout(
                 user.entity_id,
                 user.id,
                 conversation_id=conversation_id,
+                conversation_surface=ConversationSurfaceKind.DASHBOARD_MODULE,
             )
         except (LookupError, PermissionError):
             continue
@@ -1089,6 +1092,7 @@ async def dashboard_module_conversation(
             user.entity_id,
             user.id,
             conversation_id=conversation_id,
+            conversation_surface=ConversationSurfaceKind.DASHBOARD_MODULE,
         )
     except (LookupError, PermissionError) as exc:
         raise HTTPException(404, "Dashboard conversation not found") from exc
@@ -1135,6 +1139,7 @@ async def dashboard_tool_data(
                 user.entity_id,
                 user.id,
                 conversation_id=req.conversation_id,
+                conversation_surface=ConversationSurfaceKind.DASHBOARD_MODULE,
             )
         except (LookupError, PermissionError) as exc:
             raise HTTPException(404, "Dashboard conversation not found") from exc

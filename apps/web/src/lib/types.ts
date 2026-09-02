@@ -149,6 +149,13 @@ export interface Task {
   agent_type?: string;
   owner_service_key?: string | null;
   owner_subscription_id?: string | null;
+  session_host_agent_id?: string | null;
+  session_host_subscription_id?: string | null;
+  session_host_name?: string | null;
+  session_host_avatar?: string | null;
+  session_host_role_label?: string | null;
+  session_host_available?: boolean | null;
+  session_host_error?: string | null;
   category_id?: string;
   workspace_id?: string;
   workspace_name?: string | null;
@@ -169,6 +176,10 @@ export interface Task {
   started_at?: string;
   completed_at?: string;
   created_at?: string;
+  updated_at?: string;
+  status_changed_at?: string;
+  /** True only while a materialized execution step is actively running. */
+  execution_active?: boolean;
   actual_output?: Record<string, any> | null;
   // Resolved display fields from API
   assignee_name?: string;
@@ -177,6 +188,9 @@ export interface Task {
   agent_avatar?: string;
   creator_name?: string;
   creator_avatar?: string;
+  author_agent_id?: string | null;
+  author_agent_name?: string | null;
+  author_agent_avatar?: string | null;
   // ── Permission-v1 fields ──
   visibility?: Visibility;
   owner_id?: string;
@@ -216,6 +230,12 @@ export interface CalendarBookingDefaults {
   rolling_window_days: number;
 }
 
+export interface BookingTimeExclusion {
+  date: string;
+  start: string;
+  end: string;
+}
+
 export interface BookingLink {
   id: string;
   slug: string;
@@ -231,6 +251,10 @@ export interface BookingLink {
   buffer_after_minutes: number;
   min_notice_minutes: number;
   rolling_window_days: number;
+  availability_mode: "default" | "custom";
+  working_hours: CalendarWorkingHourWindow[];
+  unavailable_dates: string[];
+  unavailable_times: BookingTimeExclusion[];
   created_at?: string | null;
   updated_at?: string | null;
   url?: string | null;
@@ -246,15 +270,36 @@ export interface BookingRecord {
   starts_at: string;
   ends_at: string;
   timezone: string;
+  guest_timezone?: string | null;
+  buffer_before_minutes?: number | null;
+  buffer_after_minutes?: number | null;
   status: "confirmed" | "cancelled";
   calendar_provider?: string | null;
   calendar_account_id?: string | null;
+  calendar_event_intent?: {
+    provider: "google_calendar" | "ms_calendar";
+    account_id?: string | null;
+    calendar_id: string;
+    summary: string;
+    description: string;
+    location?: string | null;
+    create_online_meeting: boolean;
+    timezone: string;
+  } | null;
+  host_email?: string | null;
   calendar_event_id?: string | null;
   calendar_event_url?: string | null;
   meeting_url?: string | null;
   calendar_event_created: boolean;
+  calendar_metadata_sync_pending?: boolean;
   email_sent: boolean;
   created_at?: string | null;
+}
+
+export interface CalendarConflictSource {
+  provider: "google_calendar" | "ms_calendar";
+  connection_id?: string | null;
+  calendar_ids: string[];
 }
 
 export interface CalendarSettings {
@@ -262,6 +307,7 @@ export interface CalendarSettings {
   connection_id?: string | null;
   default_calendar_id: string;
   conflict_calendar_ids: string[];
+  conflict_sources: CalendarConflictSource[];
   visible_calendar_ids: string[];
   timezone: string;
   working_hours: CalendarWorkingHourWindow[];
@@ -280,6 +326,19 @@ export interface CalendarConnectionOption {
   provider_user_id: string;
   is_default: boolean;
   expires_at?: string | null;
+}
+
+export interface CalendarOption {
+  id: string;
+  name: string;
+  is_primary: boolean;
+  read_only: boolean;
+}
+
+export interface CalendarOptionsResponse {
+  provider: string;
+  connection_id?: string | null;
+  calendars: CalendarOption[];
 }
 
 export interface CalendarSettingsResponse {
@@ -301,6 +360,10 @@ export interface BookingLinkWrite {
   buffer_after_minutes?: number | null;
   min_notice_minutes?: number | null;
   rolling_window_days?: number | null;
+  availability_mode?: BookingLink["availability_mode"] | null;
+  working_hours?: CalendarWorkingHourWindow[] | null;
+  unavailable_dates?: string[] | null;
+  unavailable_times?: BookingTimeExclusion[] | null;
 }
 
 export interface DailyAgendaItem {
@@ -367,6 +430,8 @@ export interface PublicBookingLink {
   owner_name?: string | null;
   timezone: string;
   working_hours: CalendarWorkingHourWindow[];
+  availability_range_start: string;
+  availability_range_end: string;
   available_slots: BookingAvailableSlot[];
 }
 
@@ -381,6 +446,7 @@ export interface PublicBookingRequest {
   guest_name: string;
   guest_email: string;
   note?: string | null;
+  timezone?: string | null;
 }
 
 export interface BookingConfirmation {
@@ -393,6 +459,7 @@ export interface BookingConfirmation {
   ends_at: string;
   timezone: string;
   calendar_event_created: boolean;
+  host_email?: string | null;
   calendar_event_url?: string | null;
   meeting_url?: string | null;
   email_sent: boolean;
@@ -403,6 +470,8 @@ export interface ExecutionPlan {
   entity_id: string;
   workspace_id?: string | null;
   task_id?: string | null;
+  task_status?: string | null;
+  task_title?: string | null;
   agent_subscription_id?: string | null;
   status: string;
   execution_mode: string;
@@ -616,6 +685,14 @@ export interface Agent {
   status: string;
   tool_count?: number;
   skill_count?: number;
+  capability_ids?: string[];
+  capability_plan_status?: "ready" | "setup_required";
+  capability_setup_required?: Array<{
+    catalog_id?: string;
+    provider?: string;
+    reason?: string;
+    setup_kind?: string | null;
+  }>;
 }
 
 // Notifications
@@ -728,6 +805,7 @@ export interface Workspace {
   created_by_name?: string;
   created_by_email?: string;
   created_by_avatar_url?: string;
+  can_manage?: boolean;
   deleted_at?: string | null;
 }
 
@@ -736,6 +814,8 @@ export interface WorkspaceStaff {
   workspace_id: string;
   staff_id?: string;
   user_id?: string;
+  display_name?: string;
+  email?: string;
   /** Workspace-level role (Permission-v1, see RFC §5.2). */
   role?: WorkspaceRole | string;
   added_by?: string;
@@ -918,6 +998,7 @@ export interface CommentAnchor {
   start?: number;
   end?: number;
   quote?: string;
+  quote_occurrence?: number;
   [key: string]: any;
 }
 
@@ -1345,7 +1426,7 @@ export interface ShareApproval {
     audience_type?: "anonymous" | "email" | "domain";
     audience_value?: string;
     capabilities?: string[];
-    expires_in_days?: number;
+    expires_in_days?: number | null;
     watermark?: boolean;
     require_otp?: boolean;
     allow_download?: boolean;

@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Literal, Optional
 
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -87,6 +87,7 @@ async def find_claimed_webchat_contact_for_user(
     *,
     cc: ChannelConfig,
     user: User | None,
+    status: Literal["active", "blocked"] = "active",
 ) -> ChannelContact | None:
     """Find a previously claimed webchat contact for this signed-in visitor."""
     if not user:
@@ -95,12 +96,12 @@ async def find_claimed_webchat_contact_for_user(
     filters = [
         ChannelContact.entity_id == cc.entity_id,
         ChannelContact.channel_config_id == cc.id,
-        ChannelContact.status == "active",
+        ChannelContact.status == status,
+        or_(
+            ChannelContact.user_id == user.id,
+            ChannelContact.profile["verified_customer_user_id"].astext == user.id,
+        ),
     ]
-    if user.entity_id == cc.entity_id:
-        filters.append(ChannelContact.user_id == user.id)
-    else:
-        filters.append(ChannelContact.profile["verified_customer_user_id"].astext == user.id)
 
     return (await db.execute(
         select(ChannelContact)

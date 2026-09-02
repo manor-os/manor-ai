@@ -68,3 +68,21 @@ class IntegrationSession(Base):
     updated_at: Mapped[Optional[datetime]] = mapped_column(
         DateTime(timezone=True), onupdate=func.now(),
     )
+
+
+class WechatPersonalSession(Base):
+    """Owner-scoped runner session used during WeChat personal pairing."""
+
+    __tablename__ = "wechat_personal_sessions"
+
+    session_id: Mapped[str] = mapped_column(String(255), primary_key=True)
+    entity_id: Mapped[str] = mapped_column(String(26), nullable=False)
+    owner_user_id: Mapped[str] = mapped_column(String(26), nullable=False)
+    integration_id: Mapped[Optional[str]] = mapped_column(String(26), unique=True)
+    status: Mapped[str] = mapped_column(String(20), nullable=False, server_default="pending")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(),
+    )
+    updated_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), onupdate=func.now(),
+    )

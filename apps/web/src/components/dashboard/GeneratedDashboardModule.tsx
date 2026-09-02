@@ -3,6 +3,8 @@ import { useQueries } from "@tanstack/react-query";
 import { api } from "../../lib/api";
 import { t } from "../../lib/i18n";
 import type { Task, Workspace } from "../../lib/types";
+import { useIsolatedHtmlPreview } from "../../lib/useIsolatedHtmlPreview";
+import IsolatedHtmlPreviewFrame from "../ui/IsolatedHtmlPreviewFrame";
 import LoadingSpinner from "../ui/LoadingSpinner";
 import {
   IconAspectRatio,
@@ -772,13 +774,14 @@ export default function GeneratedDashboardModule({
   }, [httpQueries, newsQueries, toolQueries]);
   const allowedUrlSignature = Array.from(allowedUrls).sort().join("\n");
   const sourceDocument = useMemo(() => buildModuleDocument(module), [module]);
+  const htmlPreview = useIsolatedHtmlPreview(sourceDocument);
   const dataLoading = [...newsQueries, ...stockQueries, ...httpQueries, ...toolQueries].some(
     (query) => query.isLoading,
   );
   const dataFailed = [...newsQueries, ...stockQueries, ...httpQueries, ...toolQueries].some(
     (query) => query.isError,
   );
-  const previewFailed = dataFailed || Boolean(runtimeError);
+  const previewFailed = dataFailed || Boolean(runtimeError) || Boolean(htmlPreview.previewError);
   const previewReady = frameReady && !dataLoading && !previewFailed;
 
   useLayoutEffect(() => {
@@ -933,16 +936,13 @@ export default function GeneratedDashboardModule({
       </header>
 
       <div className="dashboard-generated-runtime" aria-busy={dataLoading}>
-        <iframe
+        <IsolatedHtmlPreviewFrame
           ref={iframeRef}
           title={module.title}
-          sandbox="allow-scripts"
-          referrerPolicy="no-referrer"
-          srcDoc={sourceDocument}
+          preview={htmlPreview}
           style={{ height: frameHeight }}
-          onLoad={() => setFrameReady(true)}
         />
-        {(dataLoading || !frameReady) && (
+        {(dataLoading || !frameReady) && !htmlPreview.previewError && (
           <div className="dashboard-generated-runtime-status">
             {t("page.dashboard.module_loading")}
           </div>

@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<title>Voice audio diagnostics</title>
+<body>
+  <h1>Voice audio diagnostics</h1>
+  <p>Uses a synthetic Mandarin WAV. No microphone access and no provider requests.</p>
+  <button id="run">Test capture and playback</button>
+  <p id="result" role="status">Ready</p>
+  <script type="module">
+    import { LiveChatAudio } from '../../src/lib/liveChatAudio.ts';
+    import speechUrl from '../../../../tests/fixtures/voice/zh-call.wav?url';
+    import replyUrl from '../../../../tests/fixtures/voice/zh-reply.mp3?url';
+    const result = document.querySelector('#result');
+    document.querySelector('#run').onclick = async () => {
+      const input = new AudioContext();
+      const destination = input.createMediaStreamDestination();
+      const audio = new LiveChatAudio();
+      const original = navigator.mediaDevices.getUserMedia;
+      let captured = false;
+      let outputPeak = 0;
+      let ended = 0;
+      let interval;
+      try {
+        result.textContent = 'Testing synthetic speech…';
+        const data = await (await fetch(speechUrl)).arrayBuffer();
+        const source = input.createBufferSource();
+        source.buffer = await input.decodeAudioData(data.slice(0));
+        source.connect(destination);
+        // This isolated diagnostic substitutes only its own microphone input.
+        navigator.mediaDevices.getUserMedia = async () => destination.stream;
+        await audio.start(() => {}, () => { ended++; }, () => {}, level => { captured ||= level > 0.02; });
+        await input.resume();
+        source.start();
+        const connect = AudioNode.prototype.connect;
+        const meters = [];
+        AudioNode.prototype.connect = function (target, ...args) {
+          if (target instanceof AudioDestinationNode) {
+            const meter = this.context.createAnalyser();
+            meter.fftSize = 256;
+            connect.call(this, meter);
+            meters.push(meter);
+          }
+          return connect.call(this, target, ...args);
+        };
+        try {
+          interval = setInterval(() => {
+            for (const meter of meters) {
+              const samples = new Float32Array(meter.fftSize);
+              meter.getFloatTimeDomainData(samples);
+              outputPeak = Math.max(outputPeak, ...samples.map(Math.abs));
+            }
+            result.textContent = `Captured speech: ${captured}; output signal: ${outputPeak.toFixed(3)}`;
+          }, 100);
+          const reply = await (await fetch(replyUrl)).arrayBuffer();
+          const encoded = btoa(Array.from(new Uint8Array(reply), byte => String.fromCharCode(byte)).join(''));
+          await audio.playClip(encoded, 'diagnostic');
+          await new Promise(resolve => setTimeout(resolve, 500));
+          audio.pause();
+          await new Promise(resolve => setTimeout(resolve, 1000));
+          if (ended !== 0) throw new Error('Paused audio was incorrectly acknowledged');
+          outputPeak = 0;
+          if (!audio.resume()) throw new Error('No audio remained to resume');
+          await new Promise(resolve => setTimeout(resolve, 8000));
+          result.textContent = captured && outputPeak > 0.02 && ended === 1
+            ? 'PASS: captured Mandarin, resumed audible output, acknowledged once'
+            : 'FAIL: missing capture, resumed output, or playback acknowledgement';
+        } finally { AudioNode.prototype.connect = connect; }
+      } catch (error) { result.textContent = `FAIL: ${error.message}`; }
+      finally {
+        navigator.mediaDevices.getUserMedia = original;
+        clearInterval(interval);
+        audio.close();
+        await input.close();
+      }
+    };
+  </script>
+</body>
+</html>

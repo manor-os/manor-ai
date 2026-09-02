@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useMemo, useRef, type ReactNode } from "react";
+import { lazy, Suspense, useState, useEffect, useCallback, useMemo, useRef, type ReactNode } from "react";
 import { useLocation, useParams, useNavigate, Link } from "react-router-dom";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import ReactMarkdown from "react-markdown";
@@ -8,10 +8,12 @@ import pdfWorkerUrl from "pdfjs-dist/build/pdf.worker.min.mjs?url";
 import { api } from "../lib/api";
 import type { Comment, CommentAnchor, Document, DocumentGrant, DocumentShare, UserSummary } from "../lib/types";
 import LoadingSpinner from "../components/ui/LoadingSpinner";
+import IsolatedHtmlPreviewFrame from "../components/ui/IsolatedHtmlPreviewFrame";
 import EmptyState from "../components/ui/EmptyState";
 import StatusBadge from "../components/ui/StatusBadge";
 import Button from "../components/ui/Button";
 import AiEditButton from "../components/ui/AiEditButton";
+import AiEditPreviewControls, { AiEditPreviewInteractionShield } from "../components/ui/AiEditPreviewControls";
 import MediaInsertDialog from "../components/MediaInsertDialog";
 import MarkdownTable from "../components/MarkdownTable";
 import { PageHeaderTitle } from "../components/ui/PageHeader";
@@ -19,6 +21,8 @@ import { IconArrowLeft, IconEdit, IconDownload, IconClose, IconDocument, IconPlu
 import CommentThread from "../components/CommentThread";
 import SitePublishAction from "../components/SitePublishAction";
 import SpreadsheetChartPreview from "../components/SpreadsheetChartPreview";
+import SpreadsheetImageLayer from "../components/SpreadsheetImageLayer";
+import PresentationShapeOutline from "../components/PresentationShapeOutline";
 import {
   ClassificationBadge,
   VisibilityIcon,
@@ -30,40 +34,97 @@ import type { NewExternalShareConfig } from "../components/permissions";
 import { useAuthStore } from "../stores/auth";
 import { canCommentDocument, canEditDocument, canShareDocument } from "../lib/permissions";
 import {
+  AiEditPreviewStatus,
+  AiEditTargetKind,
+  aiEditInteractionLockProps,
+  cancelActiveEditorInteractions,
+  createAiEditCommitCoordinator,
+  createEditorLiveAdapter,
+  nextEditorLiveChangeCount,
   openEditorLiveChat,
+  updateEditorLiveChat,
+  type AiEditCommitCoordinator,
   type EditorLiveApplyMeta,
+  type EditorLiveAdapter,
   type EditorLiveChatDetail,
+  type EditorLiveChatMetadata,
 } from "../lib/editorLiveChat";
 import { getAuthToken } from "../lib/authToken";
 import { isCodeLikeFile } from "../lib/codeFiles";
+import { getFilePreviewKind, type FilePreviewKind } from "../lib/filePreviewKind";
 import { useHtmlPreviewDocument } from "../lib/useHtmlPreviewDocument";
 import {
+  presentationColorWithAlpha,
   presentationMediaMime,
   presentationRelationshipsPart,
   presentationShapeFillScope,
   presentationVideoSource,
   resolvePresentationPartTarget,
 } from "../lib/presentationOoxml";
+import { presentationPointsToCqh } from "../lib/presentationStyleInheritance";
+import { presentationRoundRectRadius, presentationStrokeDash } from "../lib/presentationShapeStyle";
+import {
+  presentationPresetClipPath,
+  presentationPresetPointsAttribute,
+} from "../lib/presentationPresetGeometry";
 import { offsetPdfPlacement, pdfOverlayPlacement, pdfOverlayPoint } from "../lib/pdfOverlayGeometry";
 import { imageCanvasPoint, imageOutputSize, normalizeImageQuarterTurn } from "../lib/imageEditorGeometry";
 import { parseDelimitedText } from "../lib/delimitedText";
 import { decodeTextFile } from "../lib/textFilePreservation";
-import { isLegacyOfficeFile } from "../lib/legacyOfficeFiles";
 import type { InsertableMediaAsset } from "../lib/mediaInsertion";
-import { fileNameFromReference, generatedFileFsPath } from "../lib/fileReferences";
-import { sanitizeDocumentHtml } from "../lib/sanitizeDocumentHtml";
+import {
+  fileReferenceKind,
+  isEditableDiagramReference,
+} from "../lib/fileReferences";
+import { sanitizeDocumentHtml, sanitizeManorDocumentRender } from "../lib/sanitizeDocumentHtml";
+import {
+  commentActionLabel,
+  commentSearchKey,
+  layoutCommentRanges,
+  markdownCommentMarkerPlugin,
+  searchableCommentQuote,
+  updateCommentMarkActiveState,
+} from "../lib/markdownCommentMarkers.mjs";
+import {
+  paginateManorDocument,
+  renderManorDocument,
+  type ManorDocumentRender,
+} from "../lib/manorDocumentEngine";
+import {
+  assertDiagramPreviewFileSize,
+  diagramPreviewTextFromFsRead,
+  readDiagramPreviewText,
+} from "../lib/diagram/previewLimits";
 import {
   spreadsheetMergeAt,
-  spreadsheetChartsFromFile,
-  spreadsheetSheetsFromWorkbook,
+  spreadsheetSheetsFromFile,
+  spreadsheetCellVisualStyle,
   type SpreadsheetSheetModel,
 } from "../lib/spreadsheetOoxml";
 
 import { t } from "../lib/i18n";
 
-type FileCategory = "text" | "markdown" | "code" | "html" | "image" | "video" | "audio" | "pdf" | "csv" | "json" | "docx" | "xlsx" | "pptx" | "unsupported";
+const LazyDiagramArtifactViewer = lazy(
+  () => import("../components/diagram/DiagramArtifactViewer"),
+);
+
+type FileCategory = FilePreviewKind;
+type DocumentPagePreview = {
+  index: number;
+  url: string;
+  width: number | null;
+  height: number | null;
+};
+const DOCUMENT_PAGE_FETCH_CONCURRENCY = 3;
 type ImageStroke = { id: string; color: string; size: number; points: Array<{ x: number; y: number }> };
-type CommentTextRange = { id: string; start: number; end: number; quote?: string };
+type CommentTextRange = {
+  id: string;
+  start: number;
+  end: number;
+  quote?: string;
+  actionOffset?: number;
+  accessibleLabel: string;
+};
 type TaskOutputPreviewState = {
   id?: string;
   name?: string;
@@ -74,7 +135,7 @@ type TaskOutputPreviewState = {
   content: string;
 };
 
-function getKnowledgeReturnTo(state: unknown): string | null {
+function getViewerReturnTo(state: unknown): string | null {
   if (!state || typeof state !== "object") return null;
   const value = (state as { knowledgeReturnTo?: unknown; returnTo?: unknown }).knowledgeReturnTo
     ?? (state as { returnTo?: unknown }).returnTo;
@@ -124,12 +185,23 @@ function inferTaskOutputPreviewMetadata(preview: TaskOutputPreviewState): { file
 function taskOutputPreviewDocument(docId: string | undefined, preview: TaskOutputPreviewState): Document {
   const name = preview.name || preview.fs_path?.split(/[\\/]/).filter(Boolean).pop() || docId || "Generated output";
   const metadata = inferTaskOutputPreviewMetadata(preview);
+  const normalizedBase64 = preview.encoding === "base64"
+    ? preview.content.replace(/\s+/g, "")
+    : "";
+  const base64Padding = normalizedBase64.endsWith("==")
+    ? 2
+    : normalizedBase64.endsWith("=")
+      ? 1
+      : 0;
+  const fileSize = preview.encoding === "base64"
+    ? Math.max(0, Math.floor(normalizedBase64.length * 3 / 4) - base64Padding)
+    : new Blob([preview.content]).size;
   return {
     id: docId || preview.id || "task-output-preview",
     entity_id: "",
     name,
     fs_path: preview.fs_path,
-    file_size: new Blob([preview.content]).size,
+    file_size: fileSize,
     file_type: metadata.file_type,
     mime_type: metadata.mime_type,
     source: "task_output_preview",
@@ -137,34 +209,11 @@ function taskOutputPreviewDocument(docId: string | undefined, preview: TaskOutpu
   };
 }
 
-function detectCategory(doc: Document): FileCategory {
-  const ext = (doc.name || "").split(".").pop()?.toLowerCase() || "";
-  const mime = (doc.mime_type || "").split(";")[0].trim().toLowerCase();
-  const fileType = (doc.file_type || "").toLowerCase();
-
-  if (["docx", "doc", "wps"].includes(ext) || ["docx", "doc"].includes(fileType) || mime === "application/vnd.openxmlformats-officedocument.wordprocessingml.document") return "docx";
-  if (["xlsx", "xls", "et"].includes(ext) || ["xlsx", "xls"].includes(fileType) || mime === "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet") return "xlsx";
-  if (["pptx", "ppt", "dps"].includes(ext) || ["pptx", "ppt"].includes(fileType) || mime === "application/vnd.openxmlformats-officedocument.presentationml.presentation") return "pptx";
-  if (["pdf"].includes(ext) || fileType === "pdf" || mime === "application/pdf") return "pdf";
-
-  if (["md", "markdown"].includes(ext)) return "markdown";
-  if (["html", "htm"].includes(ext) || mime === "text/html") return "html";
-  if (["json"].includes(ext) || mime === "application/json") return "json";
-  if (["csv"].includes(ext) || mime === "text/csv") return "csv";
-  if (["png", "jpg", "jpeg", "gif", "svg", "webp", "bmp", "ico"].includes(ext) || fileType === "image" || mime.startsWith("image/")) return "image";
-  if (["mp4", "webm", "mov", "avi", "mkv"].includes(ext) || fileType === "video" || mime.startsWith("video/")) return "video";
-  if (["mp3", "wav", "ogg", "aac", "flac", "m4a"].includes(ext) || fileType === "audio" || mime.startsWith("audio/")) return "audio";
-  if (isCodeLikeFile(doc)) return "code";
-  if (["txt", "log", "env", "gitignore", "dockerignore", "editorconfig"].includes(ext) || mime.startsWith("text/")) return "text";
-
-  return "unsupported";
-}
-
 function categoryLabel(cat: FileCategory): string {
   const labels: Record<FileCategory, string> = {
     text: "Text", markdown: "Markdown", code: "Code", html: "HTML", image: "Image",
     video: "Video", audio: "Audio",
-    pdf: "PDF", csv: "CSV", json: "JSON", docx: "Word", xlsx: "Spreadsheet", pptx: "Presentation", unsupported: "File",
+    pdf: "PDF", csv: "CSV", json: "JSON", diagram: "Diagram", docx: "Word", xlsx: "Spreadsheet", pptx: "Presentation", unsupported: "File",
   };
   return labels[cat];
 }
@@ -173,12 +222,24 @@ function categoryBadgeType(cat: FileCategory): string {
   const types: Record<FileCategory, string> = {
     text: "gray", markdown: "purple", code: "orange", html: "blue", image: "red",
     video: "pink", audio: "cyan",
-    pdf: "red", csv: "green", json: "blue", docx: "blue", xlsx: "green", pptx: "orange", unsupported: "gray",
+    pdf: "red", csv: "green", json: "blue", diagram: "purple", docx: "blue", xlsx: "green", pptx: "orange", unsupported: "gray",
   };
   return types[cat];
 }
 
-function isEditable(cat: FileCategory): boolean {
+function isEditable(
+  cat: FileCategory,
+  doc?: Pick<Document, "name" | "file_type"> | null,
+): boolean {
+  if (cat === "diagram") {
+    return Boolean(
+      doc
+      && (
+        isEditableDiagramReference(doc.name, doc.file_type)
+        || isCodeLikeFile(doc)
+      )
+    );
+  }
   return ["text", "markdown", "code", "html", "json", "csv", "docx", "xlsx", "pptx"].includes(cat);
 }
 
@@ -195,11 +256,20 @@ function documentCommentAnchor(doc: Document | null): CommentAnchor {
   return { type: "document", label: doc?.name || t("component.comment_thread.document") };
 }
 
-function contentTextAnchor(content: string, selectedText: string, mode: string): CommentAnchor | null {
+function contentTextAnchor(
+  content: string,
+  selectedText: string,
+  mode: string,
+  preferredRange?: { start: number; end: number } | null,
+): CommentAnchor | null {
   if (!content || !selectedText) return null;
-  const start = content.indexOf(selectedText);
-  if (start < 0) return null;
-  const end = start + selectedText.length;
+  let start = preferredRange?.start ?? -1;
+  let end = preferredRange?.end ?? -1;
+  if (start < 0 || end <= start || content.slice(start, end) !== selectedText) {
+    start = content.indexOf(selectedText);
+    if (start < 0 || start !== content.lastIndexOf(selectedText)) return null;
+    end = start + selectedText.length;
+  }
   return {
     type: "text_range",
     mode,
@@ -221,6 +291,11 @@ function viewerSelectionRange(surface: HTMLElement): Range | null {
     if ((anchorNode && !surface.contains(anchorNode)) || (focusNode && !surface.contains(focusNode))) {
       return null;
     }
+    const selectionIsIgnored = (node: Node | null) => {
+      const element = node instanceof Element ? node : node?.parentElement;
+      return Boolean(element?.closest('[data-comment-selection-ignore="true"]'));
+    };
+    if (selectionIsIgnored(anchorNode) || selectionIsIgnored(focusNode)) return null;
 
     const range = selection.getRangeAt(0);
     if (range.collapsed || !surface.contains(range.commonAncestorContainer)) return null;
@@ -229,6 +304,77 @@ function viewerSelectionRange(surface: HTMLElement): Range | null {
     // Browser selections can briefly point at detached nodes while React rerenders.
     return null;
   }
+}
+
+function viewerSourceSelectionOffsets(
+  surface: HTMLElement,
+  range: Range,
+  mode: string,
+  content: string,
+): { start: number; end: number } | null {
+  const sourceSelector = `[data-comment-source-mode="${mode}"]`;
+  const sourceForNode = (node: Node) => {
+    const element = node instanceof Element ? node : node.parentElement;
+    return element?.closest<HTMLElement>(sourceSelector) || null;
+  };
+  const startSource = sourceForNode(range.startContainer);
+  const endSource = sourceForNode(range.endContainer);
+  if (!startSource || startSource !== endSource || !surface.contains(startSource)) return null;
+
+  try {
+    const beforeStart = document.createRange();
+    beforeStart.selectNodeContents(startSource);
+    beforeStart.setEnd(range.startContainer, range.startOffset);
+    const beforeEnd = document.createRange();
+    beforeEnd.selectNodeContents(startSource);
+    beforeEnd.setEnd(range.endContainer, range.endOffset);
+    const start = beforeStart.toString().length;
+    const end = beforeEnd.toString().length;
+    return end > start && content.slice(start, end) === range.toString()
+      ? { start, end }
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+function viewerSelectionQuoteOccurrence(
+  surface: HTMLElement,
+  range: Range,
+  quote: string,
+): number | null {
+  const quoteKey = commentSearchKey(searchableCommentQuote(quote));
+  if (!quoteKey) return null;
+
+  try {
+    const startElement = range.startContainer instanceof Element
+      ? range.startContainer
+      : range.startContainer.parentElement;
+    const endElement = range.endContainer instanceof Element
+      ? range.endContainer
+      : range.endContainer.parentElement;
+    const contentSurface = startElement?.closest<HTMLElement>("[data-comment-content-surface]") || surface;
+    if (!endElement || !contentSurface.contains(endElement)) return null;
+    const beforeSelection = document.createRange();
+    beforeSelection.selectNodeContents(contentSurface);
+    beforeSelection.setEnd(range.startContainer, range.startOffset);
+    const selectionStart = commentSearchKey(beforeSelection.toString()).length;
+    const surfaceKey = commentSearchKey(contentSurface.textContent || "");
+    if (surfaceKey.slice(selectionStart, selectionStart + quoteKey.length) !== quoteKey) return null;
+
+    let occurrence = 0;
+    let searchFrom = 0;
+    while (searchFrom <= selectionStart) {
+      const match = surfaceKey.indexOf(quoteKey, searchFrom);
+      if (match < 0 || match > selectionStart) return null;
+      if (match === selectionStart) return occurrence;
+      occurrence += 1;
+      searchFrom = match + 1;
+    }
+  } catch {
+    return null;
+  }
+  return null;
 }
 
 function viewerSelectionAnchor(
@@ -245,12 +391,13 @@ function viewerSelectionAnchor(
     const rawText = range.toString();
     const quote = trimCommentQuote(rawText);
     if (!quote) return null;
+    const quoteOccurrence = viewerSelectionQuoteOccurrence(surface, range, quote);
 
-    if (["text", "code", "json", "csv"].includes(category)) {
-      return contentTextAnchor(content, rawText, category) || {
+    const sourceOffsets = viewerSourceSelectionOffsets(surface, range, category, content);
+    if (sourceOffsets || ["text", "code", "json"].includes(category)) {
+      return contentTextAnchor(content, rawText, category, sourceOffsets) || {
         type: "text_selection",
         mode: category,
-        label: t("component.comment_thread.selected_text"),
         quote,
       };
     }
@@ -259,8 +406,8 @@ function viewerSelectionAnchor(
       type: "viewer_selection",
       mode: category,
       source: doc?.name,
-      label: t("component.comment_thread.selected_text"),
       quote,
+      quote_occurrence: quoteOccurrence ?? undefined,
     };
   } catch {
     return null;
@@ -293,43 +440,75 @@ function anchorBelongsToTextCategory(anchor: CommentAnchor | null | undefined, c
   return category === "text" && (anchor.type === "text_range" || anchor.type === "text_selection");
 }
 
+function normalizedCommentQuoteRange(content: string, quote: string): { start: number; end: number } | null {
+  const quoteKey = commentSearchKey(searchableCommentQuote(quote));
+  if (!quoteKey) return null;
+
+  const searchParts: string[] = [];
+  const positions: Array<{ start: number; end: number }> = [];
+  for (let offset = 0; offset < content.length;) {
+    const codePoint = content.codePointAt(offset);
+    if (codePoint === undefined) break;
+    const rawChar = String.fromCodePoint(codePoint);
+    const endOffset = offset + rawChar.length;
+    const normalized = rawChar.normalize("NFKC").toLocaleLowerCase();
+    if (normalized.trim()) {
+      for (const char of normalized) {
+        if (!char.trim()) continue;
+        searchParts.push(char);
+        positions.push({ start: offset, end: endOffset });
+      }
+    }
+    offset = endOffset;
+  }
+
+  const searchText = searchParts.join("");
+  const matchStart = searchText.indexOf(quoteKey);
+  if (matchStart < 0 || matchStart !== searchText.lastIndexOf(quoteKey)) return null;
+  const matchEnd = matchStart + quoteKey.length - 1;
+  return {
+    start: positions[matchStart].start,
+    end: positions[matchEnd].end,
+  };
+}
+
+function contentRangeMatchesCommentQuote(content: string, start: number, end: number, quote: string): boolean {
+  const quoteKey = commentSearchKey(searchableCommentQuote(quote));
+  if (!quoteKey) return false;
+  const contentKey = commentSearchKey(content.slice(start, end));
+  return quote.trim().endsWith("...")
+    ? contentKey.startsWith(quoteKey)
+    : contentKey === quoteKey;
+}
+
 function commentRangesForContent(comments: Comment[], category: FileCategory, content: string): CommentTextRange[] {
   if (!content) return [];
   const ranges: CommentTextRange[] = [];
-  for (const comment of comments) {
+  const commentLabel = t("page.tasks.comments");
+  for (const [commentIndex, comment] of comments.entries()) {
     const anchor = comment.anchor;
     if (!anchorBelongsToTextCategory(anchor, category)) continue;
 
+    const quote = trimCommentQuote(anchor?.quote || "");
+    const accessibleLabel = commentActionLabel(comment, quote, commentLabel, commentIndex + 1);
     const rawStart = Number(anchor?.start);
     const rawEnd = Number(anchor?.end);
     if (Number.isFinite(rawStart) && Number.isFinite(rawEnd) && rawEnd > rawStart) {
       const start = Math.max(0, Math.min(content.length, rawStart));
       const end = Math.max(start, Math.min(content.length, rawEnd));
-      if (end > start) {
-        ranges.push({ id: comment.id, start, end, quote: anchor?.quote });
+      if (end > start && quote && contentRangeMatchesCommentQuote(content, start, end, quote)) {
+        ranges.push({ id: comment.id, start, end, quote: anchor?.quote, accessibleLabel });
         continue;
       }
     }
 
-    const quote = trimCommentQuote(anchor?.quote || "");
     if (quote) {
-      const start = content.indexOf(quote);
-      if (start >= 0) ranges.push({ id: comment.id, start, end: start + quote.length, quote });
+      const relocated = normalizedCommentQuoteRange(content, quote);
+      if (relocated) ranges.push({ id: comment.id, ...relocated, quote, accessibleLabel });
     }
   }
 
-  const sorted = ranges
-    .filter((range) => range.end > range.start)
-    .sort((a, b) => a.start - b.start || b.end - a.end);
-
-  const nonOverlapping: CommentTextRange[] = [];
-  let cursor = -1;
-  for (const range of sorted) {
-    if (range.start < cursor) continue;
-    nonOverlapping.push(range);
-    cursor = range.end;
-  }
-  return nonOverlapping;
+  return layoutCommentRanges(ranges);
 }
 
 function renderCommentMarkedText(
@@ -341,14 +520,41 @@ function renderCommentMarkedText(
   if (!ranges.length) return content || "\u00a0";
   const nodes: ReactNode[] = [];
   let cursor = 0;
-  ranges.forEach((range) => {
+  const presentationRanges = [...ranges].sort((a, b) => (
+    (a.actionOffset ?? a.start) - (b.actionOffset ?? b.start)
+  ));
+  presentationRanges.forEach((range) => {
+    if (range.actionOffset !== undefined) {
+      const actionOffset = Math.max(cursor, Math.min(content.length, range.actionOffset));
+      if (actionOffset > cursor) nodes.push(content.slice(cursor, actionOffset));
+      nodes.push(
+        <button
+          type="button"
+          key={`${range.id}-${range.start}-${range.end}-action`}
+          className={`document-comment-mark document-comment-anchor-action${activeCommentId === range.id ? " is-active" : ""}`}
+          data-comment-id={range.id}
+          aria-label={range.accessibleLabel}
+          aria-pressed={activeCommentId === range.id}
+          title={range.quote || t("page.tasks.comments")}
+          onClick={(event) => {
+            event.stopPropagation();
+            onSelectCommentId(range.id);
+          }}
+        />,
+      );
+      cursor = actionOffset;
+      return;
+    }
     if (range.start > cursor) nodes.push(content.slice(cursor, range.start));
     const text = content.slice(range.start, range.end);
     nodes.push(
-      <span
+      <button
+        type="button"
         key={`${range.id}-${range.start}-${range.end}`}
         className={`document-comment-mark${activeCommentId === range.id ? " is-active" : ""}`}
         data-comment-id={range.id}
+        aria-label={range.accessibleLabel}
+        aria-pressed={activeCommentId === range.id}
         title={range.quote || t("page.tasks.comments")}
         onClick={(event) => {
           event.stopPropagation();
@@ -356,7 +562,7 @@ function renderCommentMarkedText(
         }}
       >
         {text}
-      </span>,
+      </button>,
     );
     cursor = range.end;
   });
@@ -397,32 +603,6 @@ function unwrapDocumentCommentMarks(root: HTMLElement) {
   }
 }
 
-function commentSearchParts(value: string): string[] {
-  const parts: string[] = [];
-  for (let offset = 0; offset < value.length;) {
-    const codePoint = value.codePointAt(offset);
-    if (codePoint === undefined) break;
-    const rawChar = String.fromCodePoint(codePoint);
-    const endOffset = offset + rawChar.length;
-    const normalized = rawChar.normalize("NFKC").toLocaleLowerCase();
-    if (normalized.trim()) {
-      for (const char of normalized) {
-        if (char.trim()) parts.push(char);
-      }
-    }
-    offset = endOffset;
-  }
-  return parts;
-}
-
-function commentSearchKey(value: string): string {
-  return commentSearchParts(value).join("");
-}
-
-function searchableCommentQuote(value: string): string {
-  return trimCommentQuote(value).replace(/\.{3}$/, "");
-}
-
 function collectCommentTextNodes(root: HTMLElement): Text[] {
   const nodes: Text[] = [];
   const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
@@ -442,7 +622,15 @@ function collectCommentTextNodes(root: HTMLElement): Text[] {
 
 function markQuoteCommentsInElement(root: HTMLElement, comments: Comment[], activeCommentId?: string | null) {
   type IndexedPosition = { node: Text; offset: number; endOffset: number };
-  type MarkSegment = { node: Text; start: number; end: number; commentId: string; quote: string; active: boolean };
+  type MarkSegment = {
+    node: Text;
+    start: number;
+    end: number;
+    commentId: string;
+    quote: string;
+    active: boolean;
+    accessibleLabel: string;
+  };
 
   const textNodes = collectCommentTextNodes(root);
   const positions: IndexedPosition[] = [];
@@ -472,14 +660,30 @@ function markQuoteCommentsInElement(root: HTMLElement, comments: Comment[], acti
   textNodes.forEach((node, index) => nodeOrder.set(node, index));
   const occupied = new WeakMap<Text, Array<{ start: number; end: number }>>();
   const segments: MarkSegment[] = [];
+  const overlapActions: MarkSegment[] = [];
 
-  for (const comment of comments) {
+  const commentLabel = t("page.tasks.comments");
+  for (const [commentIndex, comment] of comments.entries()) {
     const quote = searchableCommentQuote(comment.anchor?.quote || "");
     if (!quote) continue;
     const key = commentSearchKey(quote);
     if (!key) continue;
 
-    const searchIndex = searchableText.indexOf(key);
+    const requestedOccurrence = Number(comment.anchor?.quote_occurrence);
+    let searchIndex = -1;
+    if (Number.isInteger(requestedOccurrence) && requestedOccurrence >= 0) {
+      let searchFrom = 0;
+      for (let occurrence = 0; occurrence <= requestedOccurrence; occurrence += 1) {
+        searchIndex = searchableText.indexOf(key, searchFrom);
+        if (searchIndex < 0) break;
+        searchFrom = searchIndex + 1;
+      }
+    } else {
+      const firstMatch = searchableText.indexOf(key);
+      searchIndex = firstMatch >= 0 && firstMatch === searchableText.lastIndexOf(key)
+        ? firstMatch
+        : -1;
+    }
     if (searchIndex < 0) continue;
     const startPosition = positions[searchIndex];
     const endPosition = positions[searchIndex + key.length - 1];
@@ -496,19 +700,22 @@ function markQuoteCommentsInElement(root: HTMLElement, comments: Comment[], acti
       const start = node === startPosition.node ? startPosition.offset : 0;
       const end = node === endPosition.node ? endPosition.endOffset : text.length;
       if (end <= start) continue;
-      const ranges = occupied.get(node) || [];
-      if (ranges.some((range) => start < range.end && end > range.start)) {
-        candidateSegments.length = 0;
-        break;
-      }
-      candidateSegments.push({
+      const segment = {
         node,
         start,
         end,
         commentId: comment.id,
         quote,
         active: activeCommentId === comment.id,
-      });
+        accessibleLabel: commentActionLabel(comment, quote, commentLabel, commentIndex + 1),
+      };
+      const ranges = occupied.get(node) || [];
+      if (ranges.some((range) => start < range.end && end > range.start)) {
+        overlapActions.push(segment);
+        candidateSegments.length = 0;
+        break;
+      }
+      candidateSegments.push(segment);
     }
 
     candidateSegments.forEach((segment) => {
@@ -525,10 +732,28 @@ function markQuoteCommentsInElement(root: HTMLElement, comments: Comment[], acti
     nodeSegments.push(segment);
     segmentsByNode.set(segment.node, nodeSegments);
   });
+  const overlapActionsByNode = new WeakMap<Text, MarkSegment[]>();
+  overlapActions.forEach((segment) => {
+    const nodeActions = overlapActionsByNode.get(segment.node) || [];
+    nodeActions.push(segment);
+    overlapActionsByNode.set(segment.node, nodeActions);
+  });
+  const linkActionTail = new WeakMap<HTMLAnchorElement, HTMLElement>();
+  const createCommentAction = (segment: MarkSegment) => {
+    const action = document.createElement("button");
+    action.type = "button";
+    action.className = `document-comment-mark document-comment-anchor-action${segment.active ? " is-active" : ""}`;
+    action.dataset.commentId = segment.commentId;
+    action.setAttribute("aria-label", segment.accessibleLabel);
+    action.setAttribute("aria-pressed", String(segment.active));
+    action.title = segment.quote;
+    return action;
+  };
 
   segmentsByNode.forEach((nodeSegments, node) => {
     const parent = node.parentNode;
     if (!parent || !root.contains(node)) return;
+    const linkAncestor = node.parentElement?.closest("a") || null;
     const text = node.textContent || "";
     const fragment = document.createDocumentFragment();
     let cursor = 0;
@@ -545,9 +770,21 @@ function markQuoteCommentsInElement(root: HTMLElement, comments: Comment[], acti
         cursor = segment.end;
       });
     if (cursor < text.length) fragment.append(document.createTextNode(text.slice(cursor)));
+    const nodeActions = overlapActionsByNode.get(node) || [];
+    if (!linkAncestor) {
+      nodeActions.forEach((segment) => fragment.append(createCommentAction(segment)));
+    }
     try {
       if (node.parentNode === parent && root.contains(node)) {
         parent.replaceChild(fragment, node);
+        if (linkAncestor && root.contains(linkAncestor)) {
+          nodeActions.forEach((segment) => {
+            const action = createCommentAction(segment);
+            const tail = linkActionTail.get(linkAncestor) || linkAncestor;
+            tail.parentNode?.insertBefore(action, tail.nextSibling);
+            linkActionTail.set(linkAncestor, action);
+          });
+        }
       }
     } catch {
       // Quote highlighting is decorative. Stale TextNodes can appear while the
@@ -557,28 +794,35 @@ function markQuoteCommentsInElement(root: HTMLElement, comments: Comment[], acti
 }
 
 async function readDocumentTextViaDownload(docId: string): Promise<string> {
-  const url = await api.documents.download(docId);
-  try {
-    const response = await fetch(url);
-    return decodeTextFile(await response.arrayBuffer()).text;
-  } finally {
-    URL.revokeObjectURL(url);
-  }
+  const blob = await api.documents.previewBlob(docId);
+  return decodeTextFile(await blob.arrayBuffer()).text;
 }
 
 function HtmlViewer({ content, doc }: { content: string; doc: Document | null }) {
-  const { srcDoc, isResolvingAssets, failedAssetCount } = useHtmlPreviewDocument(content, doc?.fs_path);
+  const {
+    previewUrl,
+    isResolvingAssets,
+    isPreparingPreview,
+    failedAssetCount,
+    previewError,
+    retryPreview,
+  } = useHtmlPreviewDocument(content, doc?.fs_path);
   return (
     <div
       className="html-viewer-stage"
-      aria-busy={isResolvingAssets}
+      aria-busy={isResolvingAssets || isPreparingPreview}
       data-missing-preview-assets={failedAssetCount || undefined}
+      data-preview-error={previewError || undefined}
     >
-      <iframe
+      <IsolatedHtmlPreviewFrame
         title={doc?.name || "HTML preview"}
         className="html-viewer-frame"
-        srcDoc={srcDoc}
-        sandbox="allow-forms allow-modals allow-popups allow-popups-to-escape-sandbox allow-scripts"
+        preview={{
+          previewUrl,
+          isPreparingPreview: isResolvingAssets || isPreparingPreview,
+          previewError,
+          retryPreview,
+        }}
       />
     </div>
   );
@@ -601,16 +845,47 @@ function imageEditFileName(name?: string, extension = "png") {
   return `${base}.${extension}`;
 }
 
-async function imageUrlToObjectUrl(imageUrl: string): Promise<string> {
+async function imageUrlToObjectUrl(imageUrl: string, signal?: AbortSignal): Promise<string> {
   if (imageUrl.startsWith("blob:") || imageUrl.startsWith("data:")) return imageUrl;
   const token = getAuthToken();
   const response = await fetch(imageUrl, {
     headers: token ? { Authorization: `Bearer ${token}` } : undefined,
+    signal,
   });
   if (!response.ok) {
     throw new Error(`Generated image could not be loaded (${response.status}).`);
   }
   return URL.createObjectURL(await response.blob());
+}
+
+function loadImageElement(sourceUrl: string, signal?: AbortSignal): Promise<HTMLImageElement> {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(new DOMException("Image load aborted", "AbortError"));
+      return;
+    }
+    const image = new Image();
+    const cleanup = () => {
+      image.onload = null;
+      image.onerror = null;
+      signal?.removeEventListener("abort", abort);
+    };
+    const abort = () => {
+      cleanup();
+      image.src = "";
+      reject(new DOMException("Image load aborted", "AbortError"));
+    };
+    image.onload = () => {
+      cleanup();
+      resolve(image);
+    };
+    image.onerror = () => {
+      cleanup();
+      reject(new Error("Image could not be loaded."));
+    };
+    signal?.addEventListener("abort", abort, { once: true });
+    image.src = sourceUrl;
+  });
 }
 
 function extractReplacementImageUrl(raw: unknown): string | null {
@@ -665,58 +940,362 @@ function colorizeJSON(text: string): string {
 // ── DOCX viewer ──
 function DocxViewer({
   url,
+  blob,
+  docId,
+  docName,
+  onDownload,
   commentAnchors = [],
   activeCommentId,
   onSelectCommentId,
+  preferSelectablePreview = false,
 }: {
   url: string;
+  blob?: Blob | null;
+  docId?: string;
+  docName?: string;
+  onDownload: () => void;
   commentAnchors?: Comment[];
   activeCommentId?: string | null;
   onSelectCommentId?: (commentId: string) => void;
+  preferSelectablePreview?: boolean;
 }) {
   const [html, setHtml] = useState("");
+  const [render, setRender] = useState<ManorDocumentRender | null>(null);
+  const [legacyHtml, setLegacyHtml] = useState("");
+  const [serverPages, setServerPages] = useState<DocumentPagePreview[]>([]);
+  const [serverPageUrls, setServerPageUrls] = useState<Record<number, string>>({});
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
+  const [retryGeneration, setRetryGeneration] = useState(0);
+  const [serverFallbackKey, setServerFallbackKey] = useState("");
   const previewRef = useRef<HTMLDivElement | null>(null);
+  const legacyPreviewRef = useRef<HTMLDivElement | null>(null);
+  const serverPagesRef = useRef<HTMLDivElement | null>(null);
+  const previewKey = `${docId || ""}:${url}`;
+  const useClientFallback = serverFallbackKey === previewKey;
+  const visibleCommentAnchors = useMemo(
+    () => quoteAnchoredComments(commentAnchors),
+    [commentAnchors],
+  );
 
   useEffect(() => {
+    let cancelled = false;
+    const abortController = new AbortController();
+
+    setLoading(true);
+    setError("");
+    setHtml("");
+    setRender(null);
+    setLegacyHtml("");
+    setServerPages([]);
+
     (async () => {
+      if (docId && !preferSelectablePreview && !useClientFallback) {
+        try {
+          const pageData = await api.documents.getPages(
+            docId,
+            abortController.signal,
+          );
+          if (cancelled) return;
+          if (!pageData.pages?.length) throw new Error("No rendered Word pages");
+          setServerPages(pageData.pages);
+          return;
+        } catch (e: any) {
+          if (cancelled || e?.name === "AbortError") return;
+          // Keep older and transiently unrenderable files usable below.
+        }
+      }
+
       try {
-        const res = await fetch(url);
-        const buf = await res.arrayBuffer();
+        const buf = blob
+          ? await blob.arrayBuffer()
+          : await (await fetch(url, { signal: abortController.signal })).arrayBuffer();
+        if (cancelled) return;
         const bytes = new Uint8Array(buf);
         // Real DOCX starts with PK zip signature (0x50 0x4B)
         if (bytes.length >= 2 && bytes[0] === 0x50 && bytes[1] === 0x4B) {
-          const mammoth = await import("mammoth");
-          const result = await mammoth.convertToHtml({ arrayBuffer: buf });
-          setHtml(sanitizeDocumentHtml(result.value));
+          const rendered = await renderManorDocument(buf);
+          if (cancelled) return;
+          const sanitizeOptions = { allowDocxEditorAttributes: true, allowDocxLayoutStyles: true };
+          const safeRender = sanitizeManorDocumentRender(rendered, sanitizeOptions);
+          setRender(safeRender);
+          setHtml(safeRender.html);
         } else {
-          // Previously saved as HTML text
-          setHtml(sanitizeDocumentHtml(new TextDecoder().decode(buf)));
+          // Preserve support for legacy records that were saved as HTML text
+          // before the editor began writing real OOXML files.
+          setLegacyHtml(sanitizeDocumentHtml(new TextDecoder().decode(buf)));
         }
       } catch (e: any) {
-        setError(e.message || "Failed to render DOCX");
+        if (!cancelled && e?.name !== "AbortError") {
+          setError(t("page.file_viewer.word_layout_preview_failed"));
+        }
       } finally {
-        setLoading(false);
+        if (!cancelled) setLoading(false);
       }
     })();
-  }, [url]);
+
+    return () => {
+      cancelled = true;
+      abortController.abort();
+    };
+  }, [blob, docId, preferSelectablePreview, retryGeneration, url, useClientFallback]);
+
+  useEffect(() => {
+    const root = serverPagesRef.current;
+    if (!root || serverPages.length === 0) return;
+
+    let cancelled = false;
+    let activeFetches = 0;
+    const abortController = new AbortController();
+    const queued = new Set<number>();
+    const loaded = new Set<number>();
+    const queue: number[] = [];
+    const objectUrls = new Set<string>();
+    const pagesByIndex = new Map(serverPages.map((page) => [page.index, page]));
+    let observer: IntersectionObserver | null = null;
+
+    setServerPageUrls({});
+
+    const pump = () => {
+      if (cancelled) return;
+      while (activeFetches < DOCUMENT_PAGE_FETCH_CONCURRENCY && queue.length > 0) {
+        const pageIndex = queue.shift();
+        if (pageIndex === undefined) break;
+        queued.delete(pageIndex);
+        if (loaded.has(pageIndex)) continue;
+        const page = pagesByIndex.get(pageIndex);
+        if (!page) continue;
+        activeFetches += 1;
+        void (async () => {
+          try {
+            const token = getAuthToken();
+            const headers: Record<string, string> = {};
+            if (token) headers.Authorization = `Bearer ${token}`;
+            const response = await withPreviewTimeout(
+              fetch(`/api/v1${page.url}`, {
+                headers,
+                signal: abortController.signal,
+              }),
+              15_000,
+              "Word preview timed out",
+            );
+            if (!response.ok) throw new Error("Word page fetch failed");
+            const imageUrl = URL.createObjectURL(await response.blob());
+            if (cancelled) {
+              URL.revokeObjectURL(imageUrl);
+              return;
+            }
+            objectUrls.add(imageUrl);
+            loaded.add(pageIndex);
+            setServerPageUrls((current) => ({ ...current, [pageIndex]: imageUrl }));
+          } catch (e: any) {
+            if (!cancelled && e?.name !== "AbortError") {
+              setServerFallbackKey(previewKey);
+            }
+          } finally {
+            activeFetches -= 1;
+            pump();
+          }
+        })();
+      }
+    };
+
+    const enqueue = (pageIndex: number) => {
+      if (cancelled || loaded.has(pageIndex) || queued.has(pageIndex)) return;
+      queued.add(pageIndex);
+      queue.push(pageIndex);
+      pump();
+    };
+
+    const pageElements = Array.from(
+      root.querySelectorAll<HTMLElement>("[data-docx-page-index]"),
+    );
+    if (typeof IntersectionObserver === "undefined") {
+      serverPages.forEach((page) => enqueue(page.index));
+    } else {
+      observer = new IntersectionObserver(
+        (entries) => {
+          entries.forEach((entry) => {
+            if (!entry.isIntersecting) return;
+            const pageIndex = Number(
+              (entry.target as HTMLElement).dataset.docxPageIndex,
+            );
+            if (Number.isInteger(pageIndex)) enqueue(pageIndex);
+          });
+        },
+        { root, rootMargin: "900px 0px" },
+      );
+      pageElements.forEach((element) => observer?.observe(element));
+    }
+
+    return () => {
+      cancelled = true;
+      observer?.disconnect();
+      abortController.abort();
+      objectUrls.forEach((url) => URL.revokeObjectURL(url));
+    };
+  }, [previewKey, serverPages]);
 
   useEffect(() => {
     const root = previewRef.current;
-    if (!root || !html) return;
-    root.innerHTML = html;
-    markQuoteCommentsInElement(root, quoteAnchoredComments(commentAnchors), activeCommentId);
-  }, [activeCommentId, commentAnchors, html]);
+    if (root && html) {
+      root.innerHTML = html;
+      if (render) paginateManorDocument(root, render);
+    }
+    const roots = [root, legacyPreviewRef.current];
+    roots.forEach((root) => {
+      if (!root) return;
+      unwrapDocumentCommentMarks(root);
+      markQuoteCommentsInElement(root, visibleCommentAnchors);
+    });
+  }, [html, legacyHtml, render, visibleCommentAnchors]);
+
+  useEffect(() => {
+    const roots = [previewRef.current, legacyPreviewRef.current];
+    roots.forEach((root) => {
+      if (root) updateCommentMarkActiveState(root, activeCommentId);
+    });
+    if (!activeCommentId) return;
+    const mark = roots
+      .flatMap((root) =>
+        root
+          ? Array.from(root.querySelectorAll<HTMLElement>(".document-comment-mark"))
+          : [],
+      )
+      .find((element) => element.dataset.commentId === activeCommentId);
+    mark?.scrollIntoView({ block: "center", behavior: "smooth" });
+  }, [activeCommentId, html, legacyHtml, render, visibleCommentAnchors]);
 
   if (loading) return <div style={{ display: "flex", justifyContent: "center", padding: 64 }}><LoadingSpinner size={28} /></div>;
-  if (error) return <p style={{ color: "#c14a44", textAlign: "center", padding: 32 }}>{error}</p>;
+  if (error) {
+    return (
+      <PreviewDownloadFallback
+        message={error}
+        onDownload={onDownload}
+        onRetry={() => {
+          setServerFallbackKey("");
+          setRetryGeneration((generation) => generation + 1);
+        }}
+      />
+    );
+  }
+
+  const commentAnchorBar = visibleCommentAnchors.length > 0 && (
+    <aside
+      className="docx-comment-anchor-bar"
+      aria-label={t("page.tasks.comments")}
+      data-comment-selection-ignore="true"
+    >
+      <div className="docx-comment-anchor-heading">
+        <IconComment size={15} />
+        <span>{t("page.tasks.comments")}</span>
+      </div>
+      <div className="docx-comment-anchor-list">
+        {visibleCommentAnchors.map((comment, commentIndex) => (
+          <button
+            key={comment.id}
+            type="button"
+            className={`docx-comment-anchor${activeCommentId === comment.id ? " is-active" : ""}`}
+            aria-label={commentActionLabel(
+              comment,
+              comment.anchor?.quote || "",
+              t("page.tasks.comments"),
+              commentIndex + 1,
+            )}
+            aria-pressed={activeCommentId === comment.id}
+            title={comment.anchor?.quote}
+            onClick={() => onSelectCommentId?.(comment.id)}
+          >
+            <span className="docx-comment-anchor-quote">“{comment.anchor?.quote}”</span>
+            <span className="docx-comment-anchor-body">
+              {comment.status === "deleted" ? t("component.comment_thread.deleted") : comment.content}
+            </span>
+          </button>
+        ))}
+      </div>
+    </aside>
+  );
+
+  if (serverPages.length > 0) {
+    return (
+      <div
+        ref={serverPagesRef}
+        className="docx-viewer-stage"
+        aria-label={docName || "Word document"}
+      >
+        {commentAnchorBar}
+        <div className="docx-server-pages" data-comment-selection-ignore="true">
+          {serverPages.map((page) => {
+            const imageUrl = serverPageUrls[page.index];
+            return (
+              <figure
+                aria-busy={!imageUrl}
+                className="docx-server-page"
+                data-docx-page-index={page.index}
+                key={`${page.index}:${page.url}`}
+                style={{
+                  aspectRatio: page.width && page.height
+                    ? `${page.width} / ${page.height}`
+                    : "8.5 / 11",
+                }}
+              >
+                {imageUrl ? (
+                  <img
+                    src={imageUrl}
+                    alt={`${docName || "Word document"} — page ${page.index + 1}`}
+                    draggable={false}
+                  />
+                ) : (
+                  <div className="docx-server-page-loading" aria-hidden="true">
+                    <LoadingSpinner size={24} />
+                  </div>
+                )}
+              </figure>
+            );
+          })}
+        </div>
+      </div>
+    );
+  }
+
+  if (legacyHtml) {
+    return (
+      <div className="docx-viewer-stage" aria-label={docName || "Word document"}>
+        {commentAnchorBar}
+        <div
+          ref={legacyPreviewRef}
+          className="docx-preview docx-viewer-page docx-viewer-legacy-page"
+          data-comment-content-surface
+          onClick={(event) => {
+            const target = event.target instanceof HTMLElement
+              ? event.target.closest<HTMLElement>(".document-comment-mark")
+              : null;
+            const commentId = target?.dataset.commentId;
+            if (commentId) onSelectCommentId?.(commentId);
+          }}
+          dangerouslySetInnerHTML={{ __html: legacyHtml }}
+        />
+      </div>
+    );
+  }
 
   return (
-    <div className="docx-viewer-stage">
+    <div className="docx-viewer-stage" aria-label={docName || "Word document"}>
+      {commentAnchorBar}
       <div
         ref={previewRef}
-        className="docx-preview docx-viewer-page"
+        className={render ? "docx-viewer-page manor-docx-native manor-docx-readonly" : "docx-preview docx-viewer-page"}
+        data-comment-content-surface
+        style={render ? {
+          "--docx-page-width": `${render.layout.pageWidthPx}px`,
+          "--docx-page-height": `${render.layout.pageHeightPx}px`,
+          "--docx-margin-top": `${render.layout.marginTopPx}px`,
+          "--docx-margin-right": `${render.layout.marginRightPx}px`,
+          "--docx-margin-bottom": `${render.layout.marginBottomPx}px`,
+          "--docx-margin-left": `${render.layout.marginLeftPx}px`,
+          "--docx-header-distance": `${render.layout.headerDistancePx}px`,
+          "--docx-footer-distance": `${render.layout.footerDistancePx}px`,
+        } as React.CSSProperties : undefined}
         onClick={(event) => {
           const target = event.target instanceof HTMLElement
             ? event.target.closest<HTMLElement>(".document-comment-mark")
@@ -724,28 +1303,39 @@ function DocxViewer({
           const commentId = target?.dataset.commentId;
           if (commentId) onSelectCommentId?.(commentId);
         }}
-        dangerouslySetInnerHTML={{ __html: html }}
       />
     </div>
   );
 }
 
 // ── XLSX viewer ──
-function XlsxViewer({ url }: { url: string }) {
+export function XlsxViewer({ url, blob }: { url: string; blob?: Blob | null }) {
   const [sheets, setSheets] = useState<SpreadsheetSheetModel[]>([]);
   const [activeSheet, setActiveSheet] = useState(0);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
 
   useEffect(() => {
+    let cancelled = false;
+    setLoading(true);
+    setError("");
+    setSheets([]);
+    setActiveSheet(0);
+
     (async () => {
       try {
-        const res = await fetch(url);
-        const buf = await res.arrayBuffer();
+        // Safari can download the protected file successfully but reject a
+        // second fetch of the generated `blob:` URL. Keep the original Blob
+        // and parse it directly when FileViewer provides one.
+        const buf = blob
+          ? await blob.arrayBuffer()
+          : await (await fetch(url)).arrayBuffer();
+        if (cancelled) return;
         const bytes = new Uint8Array(buf);
         // Real XLSX starts with PK zip signature (0x50 0x4B)
         if (bytes.length >= 2 && bytes[0] === 0x50 && bytes[1] === 0x4B) {
           const XLSX = await import("xlsx");
+          if (cancelled) return;
           const wb = XLSX.read(buf, {
             type: "array",
             cellFormula: true,
@@ -753,35 +1343,39 @@ function XlsxViewer({ url }: { url: string }) {
             cellStyles: true,
             cellText: true,
           });
-          const chartsBySheet = await spreadsheetChartsFromFile(buf, XLSX, wb);
-          const parsed = spreadsheetSheetsFromWorkbook(XLSX, wb)
-            .map((sheet) => ({ ...sheet, charts: chartsBySheet.get(sheet.name) || [] }))
+          const parsedSheets = await spreadsheetSheetsFromFile(XLSX, wb, buf);
+          if (cancelled) return;
+          const parsed = parsedSheets
             .filter((sheet) => !sheet.hidden && sheet.name !== "_manor_charts");
-          setSheets(parsed);
+          if (!cancelled) setSheets(parsed);
         } else {
           // Previously saved as CSV text — parse manually
           const text = new TextDecoder().decode(buf);
           const rows = text.split("\n").map(line => line.split(","));
           const columns = Math.max(1, ...rows.map((row) => row.length));
-          setSheets([{
+          if (!cancelled) setSheets([{
             name: "Sheet1",
             data: rows,
             displayData: rows.map((row) => Array.from({ length: columns }, (_, column) => String(row[column] ?? ""))),
+            numberFormats: {},
             styles: {},
             columnWidths: Array(columns).fill(112),
             rowHeights: Array(rows.length).fill(32),
             merges: [],
             charts: [],
+            images: [],
             hidden: false,
           }]);
         }
       } catch (e: any) {
-        setError(e.message || "Failed to render spreadsheet");
+        if (!cancelled) setError(e.message || "Failed to render spreadsheet");
       } finally {
-        setLoading(false);
+        if (!cancelled) setLoading(false);
       }
     })();
-  }, [url]);
+
+    return () => { cancelled = true; };
+  }, [blob, url]);
 
   if (loading) return <div style={{ display: "flex", justifyContent: "center", padding: 64 }}><LoadingSpinner size={28} /></div>;
   if (error) return <p style={{ color: "#c14a44", textAlign: "center", padding: 32 }}>{error}</p>;
@@ -818,6 +1412,7 @@ function XlsxViewer({ url }: { url: string }) {
 
       {/* Table */}
       <div style={{ overflow: "auto", maxHeight: 600, borderRadius: 12, border: "1px solid rgba(28,25,23,0.06)" }}>
+        <div style={{ position: "relative", width: "max-content", minWidth: "100%" }}>
         <table style={{ width: "max-content", minWidth: "100%", tableLayout: "fixed", borderCollapse: "collapse", fontSize: 13 }}>
           <colgroup>
             <col style={{ width: 48 }} />
@@ -851,14 +1446,9 @@ function XlsxViewer({ url }: { url: string }) {
                       title={typeof raw === "string" && raw.startsWith("=") ? raw : undefined}
                       style={{
                         ...tdStyle,
-                        color: cellStyle.color,
+                        ...(sheet.showGridlines === false ? { borderTop: "1px solid transparent", borderBottom: "1px solid transparent", borderLeft: "1px solid transparent", borderRight: "1px solid transparent" } : {}),
+                        ...spreadsheetCellVisualStyle(cellStyle),
                         background: cellStyle.fill,
-                        fontWeight: cellStyle.bold ? 700 : undefined,
-                        fontStyle: cellStyle.italic ? "italic" : undefined,
-                        fontFamily: cellStyle.fontFamily,
-                        fontSize: cellStyle.fontSize,
-                        textAlign: cellStyle.align,
-                        whiteSpace: "nowrap",
                         overflow: "hidden",
                         textOverflow: "ellipsis",
                       }}
@@ -871,6 +1461,13 @@ function XlsxViewer({ url }: { url: string }) {
             ))}
           </tbody>
         </table>
+        <SpreadsheetImageLayer
+          images={sheet.images}
+          columnWidths={sheet.columnWidths}
+          rowHeights={sheet.rowHeights}
+          columnHeaderHeight={34}
+        />
+        </div>
       </div>
       {sheet.charts.length > 0 && (
         <div style={{ marginTop: 16 }}>
@@ -943,7 +1540,7 @@ interface PptxParagraph {
   text: string; // concatenated plain text (backward compat)
   bold?: boolean; italic?: boolean; underline?: boolean;
   fontSize?: number; color?: string; align?: string; fontFamily?: string;
-  bullet?: string; indent?: number;
+  bullet?: string; indent?: number; indentRight?: number; hanging?: number;
   lineSpacing?: number; // multiplier (1.0 = single)
   spaceBefore?: number; // pt
   spaceAfter?: number; // pt
@@ -961,14 +1558,17 @@ interface PptxShape {
   flipV?: boolean;
   stroke?: string;
   strokeWidth?: number;
+  strokeDash?: string;
   presetGeom?: string;
   texts: PptxParagraph[];
   imgUrl?: string;
+  altText?: string;
   videoUrl?: string;
   imgCrop?: { l: number; t: number; r: number; b: number }; // percentages
   opacity?: number;
   shadow?: { blur: number; dist: number; angle: number; color: string; alpha: number };
   vAlign?: "top" | "middle" | "bottom"; // text vertical alignment
+  wordWrap?: boolean;
   padding?: { l: number; t: number; r: number; b: number }; // text insets in %
   tableRows?: { text: string; bold?: boolean; color?: string; fill?: string }[][];
   tableColWidths?: number[]; // column widths in EMU
@@ -981,6 +1581,19 @@ interface PptxSlide {
   bgImgUrl?: string;
   shapes: PptxShape[];
   aspectRatio?: string;
+  heightPoints?: number;
+  theme?: PptxThemeSnapshot;
+}
+
+interface PptxParseOptions {
+  isCancelled?: () => boolean;
+  onObjectUrl?: (url: string) => void;
+}
+
+interface PptxThemeSnapshot {
+  colors: Record<string, string>;
+  majorFont?: string;
+  minorFont?: string;
 }
 
 function decodePptxText(value: string): string {
@@ -1258,7 +1871,11 @@ function parseTextRuns(spXml: string): PptxShape["texts"] {
     const align = pPr ? (xmlAttr(pPr, "algn") || undefined) : undefined;
     const lvl = pPr ? parseInt(xmlAttr(pPr, "lvl") || "0", 10) : 0;
     const marL = pPr ? xmlAttr(pPr, "marL") : null;
-    const indent = marL ? parseInt(marL, 10) / 12700 : lvl * 18;
+    const indent = marL != null ? parseInt(marL, 10) / 12700 : lvl > 0 ? lvl * 18 : undefined;
+    const marR = pPr ? xmlAttr(pPr, "marR") : null;
+    const indentRight = marR != null ? parseInt(marR, 10) / 12700 : undefined;
+    const firstLineIndent = pPr ? xmlAttr(pPr, "indent") : null;
+    const hanging = firstLineIndent != null ? parseInt(firstLineIndent, 10) / 12700 : undefined;
 
     let bullet: string | undefined;
     if (pPr) {
@@ -1385,24 +2002,30 @@ function parseTextRuns(spXml: string): PptxShape["texts"] {
         bold: firstBold, italic: firstItalic, underline: firstUnderline,
         fontSize: firstFontSize, color: firstColor, fontFamily: firstFontFamily,
         align: align === "ctr" ? "center" : align === "r" ? "right" : align === "just" ? "justify" : undefined,
-        bullet, indent: indent > 0 ? indent : undefined,
+        bullet, indent, indentRight, hanging,
         lineSpacing, spaceBefore, spaceAfter,
         runs: runs.length > 1 ? runs : undefined, // only include runs if mixed formatting
       });
     } else {
-      texts.push({ text: "", fontSize: firstFontSize || defFontSize || 12 });
+      texts.push({
+        text: "", fontSize: firstFontSize || defFontSize || 12,
+        bold: firstBold, italic: firstItalic, underline: firstUnderline,
+        color: firstColor, fontFamily: firstFontFamily,
+        align: align === "ctr" ? "center" : align === "r" ? "right" : align === "just" ? "justify" : undefined,
+        bullet, indent, indentRight, hanging, lineSpacing, spaceBefore, spaceAfter,
+      });
     }
   }
   return texts;
 }
 
-function viewerParseStroke(xml: string): { color?: string; width?: number } {
+function viewerParseStroke(xml: string): { color?: string; width?: number; dash?: string } {
   const ln = xmlInner(xml, "a:ln");
   if (!ln || ln.includes("<a:noFill")) return {};
   const color = parseColor(ln);
   const wAttr = xmlAttr(ln, "w");
   const width = wAttr ? parseInt(wAttr, 10) / 12700 : 1;
-  return { color: color || undefined, width: color ? width : undefined };
+  return { color: color ? presentationColorWithAlpha(color, ln) : undefined, width: color ? width : undefined, dash: presentationStrokeDash(ln) };
 }
 
 function viewerParseTable(xml: string): { rows: { text: string; bold?: boolean; color?: string; fill?: string; gridSpan?: number; vMerge?: boolean }[][]; cols: number; colWidths?: number[] } | null {
@@ -1482,6 +2105,9 @@ function parseShape(spXml: string, relsMap: Map<string, string>, phMap?: Map<str
   if (!pos) return null;
 
   const shape: PptxShape = { ...pos, type: "shape", texts: [] };
+  const nonVisualProperties = spXml.match(/<p:cNvPr\b[^>]*\/?\s*>/);
+  const altText = nonVisualProperties ? xmlAttr(nonVisualProperties[0], "descr") : null;
+  if (altText != null) shape.altText = decodePptxText(altText);
 
   // Rotation + flip
   const xfrm = xmlInner(spXml, "a:xfrm");
@@ -1501,7 +2127,10 @@ function parseShape(spXml: string, relsMap: Map<string, string>, phMap?: Map<str
   const shapeFillScope = spPr ? presentationShapeFillScope(spPr) : "";
   if (spPr && !shapeFillScope.includes("<a:noFill")) {
     const solidFill = xmlInner(shapeFillScope, "a:solidFill");
-    if (solidFill) shape.fill = parseColor(solidFill) || undefined;
+    if (solidFill) {
+      const color = parseColor(solidFill);
+      if (color) shape.fill = presentationColorWithAlpha(color, solidFill);
+    }
     shape.gradFill = parseGradient(shapeFillScope);
 
     // Blip fill (texture/image fill on shapes)
@@ -1516,10 +2145,10 @@ function parseShape(spXml: string, relsMap: Map<string, string>, phMap?: Map<str
 
   // Stroke/border — scope to spPr
   const stroke = viewerParseStroke(spPr || spXml);
-  if (stroke.color) { shape.stroke = stroke.color; shape.strokeWidth = stroke.width; }
+  if (stroke.color) { shape.stroke = stroke.color; shape.strokeWidth = stroke.width; shape.strokeDash = stroke.dash; }
 
-  // Alpha
-  const alphaM = spXml.match(/<a:alpha val="(\d+)"/);
+  // Fill, stroke and shadow alpha belong to their own colors, never the text.
+  const alphaM = spXml.match(/<a:alphaModFix\b[^>]*\bamt="(\d+)"/);
   if (alphaM) shape.opacity = parseInt(alphaM[1], 10) / 100000;
 
   // Shadow (outer shadow)
@@ -1536,13 +2165,15 @@ function parseShape(spXml: string, relsMap: Map<string, string>, phMap?: Map<str
   // Border radius (roundRect preset)
   if (spXml.includes('prst="roundRect"')) {
     const adjM = spXml.match(/name="adj" fmla="val (\d+)"/);
-    shape.borderRadius = adjM ? Math.min(50, parseInt(adjM[1], 10) / 1000) : 8;
+    shape.borderRadius = adjM ? Math.min(50, parseInt(adjM[1], 10) / 1000) : 16.667;
   }
 
   // Text body properties (vertical alignment + insets)
   const bodyPr = xmlInner(spXml, "a:bodyPr");
   if (bodyPr) {
     const anchor = xmlAttr(bodyPr, "anchor");
+    const wrap = xmlAttr(bodyPr, "wrap");
+    if (wrap === "none" || wrap === "square") shape.wordWrap = wrap === "square";
     if (anchor === "t") shape.vAlign = "top";
     else if (anchor === "b") shape.vAlign = "bottom";
     else if (anchor === "ctr") shape.vAlign = "middle";
@@ -1577,6 +2208,7 @@ function parseShape(spXml: string, relsMap: Map<string, string>, phMap?: Map<str
       if (imgUrl) { shape.imgUrl = imgUrl; shape.type = "image"; }
     }
   }
+  if (shape.imgUrl && /^\s*<p:pic\b/.test(spXml)) shape.type = "image";
   shape.videoUrl = presentationVideoSource(spXml, relsMap);
   // Image cropping (srcRect)
   if (shape.imgUrl) {
@@ -1594,11 +2226,39 @@ function parseShape(spXml: string, relsMap: Map<string, string>, phMap?: Map<str
   return shape;
 }
 
-async function parsePptx(buf: ArrayBuffer): Promise<{ slides: PptxSlide[]; objectUrls: string[] }> {
+// The PPTX parser helpers keep slide dimensions and theme data in module
+// state. Serialize parses so navigating between presentations cannot mix the
+// state of an older, still-awaiting parse into the current one.
+let pptxParseQueue: Promise<void> = Promise.resolve();
+
+async function parsePptx(buf: ArrayBuffer, options?: PptxParseOptions): Promise<PptxSlide[]> {
+  const previousParse = pptxParseQueue;
+  let releaseParse!: () => void;
+  pptxParseQueue = new Promise<void>((resolve) => { releaseParse = resolve; });
+  await previousParse;
+  try {
+    if (options?.isCancelled?.()) return [];
+    return await parsePptxUnlocked(buf, options);
+  } finally {
+    releaseParse();
+  }
+}
+
+async function parsePptxUnlocked(buf: ArrayBuffer, options?: PptxParseOptions): Promise<PptxSlide[]> {
+  // Every parse owns a fresh set of module-scoped parser defaults. The queue
+  // prevents concurrent mutation; this reset prevents a theme-less file from
+  // inheriting slide size, colors, fonts, or fill styles from the prior file.
+  SLIDE_W = 12192000;
+  SLIDE_H = 6858000;
+  _viewerTheme = { ..._viewerDefaultScheme };
+  _viewerMajorFont = "";
+  _viewerMinorFont = "";
+  _viewerBgFillStyles = [];
+  _viewerFillStyles = [];
+
   const JSZip = (await import("jszip")).default;
   const zip = await JSZip.loadAsync(buf);
   const slides: PptxSlide[] = [];
-  const objectUrls: string[] = [];
 
   // Read slide size and slide order from presentation.xml
   let orderedSlideRIds: string[] = [];
@@ -1666,8 +2326,12 @@ async function parsePptx(buf: ArrayBuffer): Promise<{ slides: PptxSlide[]; objec
         if (!entry) continue;
         const data = await entry.async("blob");
         const mediaUrl = URL.createObjectURL(new Blob([data], { type: presentationMediaMime(name) }));
-        objectUrls.push(mediaUrl);
-        mediaCache.set(name, mediaUrl);
+        if (options?.isCancelled?.()) {
+          URL.revokeObjectURL(mediaUrl);
+        } else {
+          mediaCache.set(name, mediaUrl);
+          options?.onObjectUrl?.(mediaUrl);
+        }
       } catch { /* skip bad media */ }
     }
   }
@@ -1936,6 +2600,12 @@ async function parsePptx(buf: ArrayBuffer): Promise<{ slides: PptxSlide[]; objec
       } catch { /* master shapes non-fatal */ }
 
       slide.aspectRatio = `${SLIDE_W}/${SLIDE_H}`;
+      slide.heightPoints = SLIDE_H / 12700;
+      slide.theme = {
+        colors: { ..._viewerTheme },
+        majorFont: _viewerMajorFont || undefined,
+        minorFont: _viewerMinorFont || undefined,
+      };
       slides.push(slide);
     } catch {
       // If a single slide fails, add empty slide placeholder and continue
@@ -1943,7 +2613,7 @@ async function parsePptx(buf: ArrayBuffer): Promise<{ slides: PptxSlide[]; objec
     }
   }
 
-  return { slides, objectUrls };
+  return slides;
 }
 
 // Slide accent colors for text-based slides
@@ -2065,28 +2735,15 @@ function parseTextSlides(text: string): PptxSlide[] {
   return slides;
 }
 
-/** Map preset geometry names to CSS clip-path polygons */
-function _presetClipPath(geom?: string): string | undefined {
-  switch (geom) {
-    case "triangle": return "polygon(50% 0%, 0% 100%, 100% 100%)";
-    case "rtTriangle": return "polygon(0% 0%, 0% 100%, 100% 100%)";
-    case "diamond": return "polygon(50% 0%, 100% 50%, 50% 100%, 0% 50%)";
-    case "pentagon": return "polygon(50% 0%, 100% 38%, 82% 100%, 18% 100%, 0% 38%)";
-    case "hexagon": return "polygon(25% 0%, 75% 0%, 100% 50%, 75% 100%, 25% 100%, 0% 50%)";
-    case "parallelogram": return "polygon(15% 0%, 100% 0%, 85% 100%, 0% 100%)";
-    case "trapezoid": return "polygon(20% 0%, 80% 0%, 100% 100%, 0% 100%)";
-    case "chevron": return "polygon(0% 0%, 85% 0%, 100% 50%, 85% 100%, 0% 100%, 15% 50%)";
-    case "rightArrow": return "polygon(0% 20%, 70% 20%, 70% 0%, 100% 50%, 70% 100%, 70% 80%, 0% 80%)";
-    case "leftArrow": return "polygon(30% 0%, 30% 20%, 100% 20%, 100% 80%, 30% 80%, 30% 100%, 0% 50%)";
-    case "upArrow": return "polygon(50% 0%, 100% 30%, 80% 30%, 80% 100%, 20% 100%, 20% 30%, 0% 30%)";
-    case "downArrow": return "polygon(20% 0%, 80% 0%, 80% 70%, 100% 70%, 50% 100%, 0% 70%, 20% 70%)";
-    case "star5": return "polygon(50% 0%, 61% 35%, 98% 35%, 68% 57%, 79% 91%, 50% 70%, 21% 91%, 32% 57%, 2% 35%, 39% 35%)";
-    case "ribbon": case "ribbon2": return undefined; // too complex for simple clip-path
-    default: return undefined;
-  }
-}
-
-function PreviewDownloadFallback({ message, onDownload }: { message: string; onDownload: () => void }) {
+function PreviewDownloadFallback({
+  message,
+  onDownload,
+  onRetry,
+}: {
+  message: string;
+  onDownload?: () => void;
+  onRetry?: () => void;
+}) {
   return (
     <div style={{
       textAlign: "center", padding: "64px 24px", borderRadius: 12,
@@ -2094,10 +2751,20 @@ function PreviewDownloadFallback({ message, onDownload }: { message: string; onD
     }}>
       <IconDocument size={32} className="text-stone-400" />
       <p style={{ color: "#78716c", margin: "16px 0" }}>{message}</p>
-      <Button variant="primary" onClick={onDownload} style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
-        <IconDownload size={16} />
-        {t("page.file_viewer.download_to_view")}
-      </Button>
+      <div style={{ display: "flex", justifyContent: "center", flexWrap: "wrap", gap: 8 }}>
+        {onRetry && (
+          <Button variant="outline" onClick={onRetry} style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
+            <IconRefresh size={16} />
+            {t("component.chat_message_actions.retry")}
+          </Button>
+        )}
+        {onDownload && (
+          <Button variant="primary" onClick={onDownload} style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
+            <IconDownload size={16} />
+            {t("page.file_viewer.download_to_view")}
+          </Button>
+        )}
+      </div>
     </div>
   );
 }
@@ -2187,19 +2854,47 @@ interface PdfRectDraft {
 }
 
 interface PdfLiveEditBridge {
+  commitCoordinator: AiEditCommitCoordinator;
   getContent: () => string;
-  applyContent: NonNullable<EditorLiveChatDetail["applyContent"]>;
-  localEditContent: NonNullable<EditorLiveChatDetail["localEditContent"]>;
+  getTurnPreviewState: EditorLiveAdapter["getTurnPreviewState"];
+  beginTurn: EditorLiveAdapter["beginTurn"];
+  applyContent: EditorLiveAdapter["preview"];
+  complete: EditorLiveAdapter["complete"];
+  rollback: EditorLiveAdapter["rollback"];
 }
 
 interface ImageLiveEditBridge {
+  commitCoordinator: AiEditCommitCoordinator;
   getContent: () => string;
-  applyContent: NonNullable<EditorLiveChatDetail["applyContent"]>;
-  localEditContent: NonNullable<EditorLiveChatDetail["localEditContent"]>;
-  getAttachmentFiles: NonNullable<EditorLiveChatDetail["getAttachmentFiles"]>;
-  applyGeneratedImage: NonNullable<EditorLiveChatDetail["applyGeneratedImage"]>;
+  getTurnPreviewState: EditorLiveAdapter["getTurnPreviewState"];
+  beginTurn: EditorLiveAdapter["beginTurn"];
+  applyContent: EditorLiveAdapter["preview"];
+  complete: EditorLiveAdapter["complete"];
+  restore: EditorLiveAdapter["restore"];
+  rollback: EditorLiveAdapter["rollback"];
+  getAttachmentFiles: NonNullable<EditorLiveChatMetadata["getAttachmentFiles"]>;
+  applyGeneratedImage: NonNullable<EditorLiveChatMetadata["applyGeneratedImage"]>;
   supportsImageGeneration: true;
 }
+
+interface AudioLiveEditBridge {
+  commitCoordinator: AiEditCommitCoordinator;
+  getContent: () => string;
+  getTurnPreviewState: EditorLiveAdapter["getTurnPreviewState"];
+  beginTurn: EditorLiveAdapter["beginTurn"];
+  applyContent: EditorLiveAdapter["preview"];
+  complete: EditorLiveAdapter["complete"];
+  rollback: EditorLiveAdapter["rollback"];
+}
+
+type PdfAiPreview = {
+  baseline: PdfAnnotation[];
+  current: PdfAnnotation[];
+  past: PdfAnnotation[][];
+  future: PdfAnnotation[][];
+  status: AiEditPreviewStatus;
+  changeCount: number;
+};
 
 function normalizeImageLiveEditState(raw: unknown) {
   const source = raw && typeof raw === "object" && "edits" in raw
@@ -2228,6 +2923,23 @@ function normalizeImageLiveEditState(raw: unknown) {
     }) : [] as ImageStroke[],
   };
 }
+
+type ImageLiveEditState = ReturnType<typeof normalizeImageLiveEditState>;
+
+type ImageAiPreview = {
+  baseline: ImageLiveEditState;
+  baselineSourceUrl: string;
+  current: ImageLiveEditState;
+  currentSourceUrl: string;
+  status: AiEditPreviewStatus;
+  changeCount: number;
+};
+
+type ImageAiTurnCheckpoint = {
+  sourceUrl: string;
+  state: ImageLiveEditState;
+  preview: ImageAiPreview | null;
+};
 
 const PDF_EDITOR_COPY = {
   select: t("page.file_viewer.pdf_editor.select"),
@@ -2858,6 +3570,7 @@ function PdfSignatureDialog({
 
 function PdfJsViewer({
   url,
+  blob,
   docId,
   docName,
   onDownload,
@@ -2866,6 +3579,7 @@ function PdfJsViewer({
   canEdit = true,
 }: {
   url: string;
+  blob?: Blob | null;
   docId?: string;
   docName?: string;
   onDownload: () => void;
@@ -2883,6 +3597,10 @@ function PdfJsViewer({
   const [annotations, setAnnotationsRaw] = useState<PdfAnnotation[]>([]);
   const [annotationPast, setAnnotationPast] = useState<PdfAnnotation[][]>([]);
   const [annotationFuture, setAnnotationFuture] = useState<PdfAnnotation[][]>([]);
+  const annotationPastRef = useRef(annotationPast);
+  const annotationFutureRef = useRef(annotationFuture);
+  annotationPastRef.current = annotationPast;
+  annotationFutureRef.current = annotationFuture;
   const [activeTool, setActiveTool] = useState<PdfEditorTool>("select");
   const [selectedAnnotationId, setSelectedAnnotationId] = useState<string | null>(null);
   const [signatureDataUrl, setSignatureDataUrl] = useState<string | null>(null);
@@ -2890,6 +3608,9 @@ function PdfJsViewer({
   const [mediaInsertOpen, setMediaInsertOpen] = useState(false);
   const [exporting, setExporting] = useState<"download" | "save" | null>(null);
   const [editorMessage, setEditorMessage] = useState("");
+  const [pdfAiPreview, setPdfAiPreview] = useState<PdfAiPreview | null>(null);
+  const pdfAiPreviewRef = useRef<PdfAiPreview | null>(null);
+  const pdfAiCommitCoordinator = useRef(createAiEditCommitCoordinator()).current;
   const [drawingDraft, setDrawingDraft] = useState<{ page: number; points: PdfPoint[]; color: string; strokeWidth: number } | null>(null);
     const [rectDraft, setRectDraft] = useState<PdfRectDraft | null>(null);
     const annotationsRef = useRef<PdfAnnotation[]>([]);
@@ -2972,14 +3693,7 @@ function PdfJsViewer({
   const handlePdfMediaInsert = useCallback(async (asset: InsertableMediaAsset) => {
     let image: { dataUrl: string; width: number; height: number };
     if (asset.kind === "image") {
-      const url = await api.documents.download(asset.document.id);
-      try {
-        const response = await fetch(url);
-        if (!response.ok) throw new Error("Unable to read the selected image.");
-        image = await blobToPdfImage(await response.blob());
-      } finally {
-        if (url.startsWith("blob:")) URL.revokeObjectURL(url);
-      }
+      image = await blobToPdfImage(await api.documents.downloadBlob(asset.document.id));
     } else {
       try {
         const thumbnailUrl = await api.documents.videoThumbnail(asset.document.id);
@@ -3062,8 +3776,10 @@ function PdfJsViewer({
         const pdfjs = await import("pdfjs-dist");
         if (cancelled) return;
         pdfjs.GlobalWorkerOptions.workerSrc = pdfWorkerUrl;
+        const data = blob ? await blob.arrayBuffer() : undefined;
+        if (cancelled) return;
         loadingTask = pdfjs.getDocument({
-          url,
+          ...(data ? { data } : { url }),
           cMapUrl: `${import.meta.env.BASE_URL}pdfjs/cmaps/`,
           cMapPacked: true,
           standardFontDataUrl: `${import.meta.env.BASE_URL}pdfjs/standard_fonts/`,
@@ -3087,7 +3803,7 @@ function PdfJsViewer({
       cancelled = true;
       loadingTask?.destroy?.();
     };
-  }, [url]);
+  }, [blob, url]);
 
   useEffect(() => {
     annotationsRef.current = [];
@@ -3293,6 +4009,7 @@ function PdfJsViewer({
     useEffect(() => {
       const handler = (event: KeyboardEvent) => {
         if (!canEdit) return;
+        if (pdfAiPreviewRef.current) return;
         const target = event.target instanceof HTMLElement ? event.target : null;
         if (target?.closest("input, textarea, select, [contenteditable='true']")) return;
 
@@ -3775,6 +4492,7 @@ function PdfJsViewer({
   }, [annotations, pdfDoc, url]);
 
   const handleDownloadEdited = useCallback(async () => {
+    if (pdfAiPreviewRef.current) return;
     setExporting("download");
     setEditorMessage("");
     try {
@@ -3793,8 +4511,11 @@ function PdfJsViewer({
     }
   }, [buildEditedPdfBlob, docName]);
 
-	  const handleSaveEdited = useCallback(async () => {
-	    if (!docId || !canEdit) return;
+	  const handleSaveEdited = useCallback(async (
+      options: { acceptAiPreview?: boolean } = {},
+    ): Promise<boolean> => {
+	    if (pdfAiPreviewRef.current && !options.acceptAiPreview) return false;
+	    if (!docId || !canEdit) return false;
 	    setExporting("save");
 	    setEditorMessage("");
 	    try {
@@ -3809,12 +4530,63 @@ function PdfJsViewer({
 	      setActiveTool("select");
 	      setEditorMessage(PDF_EDITOR_COPY.saved);
 	      await onSaved?.(savedDoc, blob);
+	      return true;
 	    } catch (e: any) {
 	      setEditorMessage(e?.message || PDF_EDITOR_COPY.saveFailed);
+	      return false;
 	    } finally {
 	      setExporting(null);
 	    }
 	  }, [buildEditedPdfBlob, canEdit, docId, docName, onSaved]);
+
+  const rollbackPdfAiPreview = useCallback(() => {
+    if (pdfAiCommitCoordinator.isCommitting()) return;
+    const preview = pdfAiPreviewRef.current;
+    if (!preview) return;
+    const baseline = structuredClone(preview.baseline);
+    annotationsRef.current = baseline;
+    setAnnotationsRaw(baseline);
+    setAnnotationPast(preview.past.map((item) => structuredClone(item)));
+    setAnnotationFuture(preview.future.map((item) => structuredClone(item)));
+    annotationPastRef.current = preview.past.map((item) => structuredClone(item));
+    annotationFutureRef.current = preview.future.map((item) => structuredClone(item));
+    setSelectedAnnotationId(null);
+    setActiveTool("select");
+    pdfAiPreviewRef.current = null;
+    setPdfAiPreview(null);
+    setEditorMessage("AI preview discarded.");
+  }, [pdfAiCommitCoordinator]);
+
+  const completePdfAiPreview = useCallback((_content: string, meta: EditorLiveApplyMeta) => {
+    if (meta.signal?.aborted) return false;
+    const preview = pdfAiPreviewRef.current;
+    if (!preview) return false;
+    const ready = { ...preview, status: AiEditPreviewStatus.Ready };
+    pdfAiPreviewRef.current = ready;
+    setPdfAiPreview(ready);
+    return true;
+  }, []);
+
+  const beginPdfAiTurn = useCallback((meta: EditorLiveApplyMeta) => {
+    if (meta.signal?.aborted) return false;
+    const preview = pdfAiPreviewRef.current;
+    if (!preview) return true;
+    const pending = { ...preview, status: AiEditPreviewStatus.Animating };
+    pdfAiPreviewRef.current = pending;
+    setPdfAiPreview(pending);
+    return true;
+  }, []);
+
+  const acceptPdfAiPreview = useCallback(async () => {
+    if (pdfAiCommitCoordinator.isCommitting()) return;
+    const preview = pdfAiPreviewRef.current;
+    if (!preview || preview.status !== AiEditPreviewStatus.Ready) return;
+    await pdfAiCommitCoordinator.run(async () => {
+      if (!await handleSaveEdited({ acceptAiPreview: true })) return;
+      pdfAiPreviewRef.current = null;
+      setPdfAiPreview(null);
+    });
+  }, [handleSaveEdited, pdfAiCommitCoordinator]);
 
   const buildPdfLiveEditContent = useCallback(() => {
     return JSON.stringify({
@@ -3827,108 +4599,43 @@ function PdfJsViewer({
     }, null, 2);
   }, [docName, pageCount, pageTextHints]);
 
-  const localPdfEditContent = useCallback((userRequest: string) => {
-    const request = userRequest.trim();
-    if (!request) return null;
-    const lower = request.toLowerCase();
-    const currentAnnotations = annotationsRef.current.map(serializePdfAnnotationForLiveEdit);
-    const base = {
-      format: "manor-pdf-overlay-v1",
-      documentName: docName || "document.pdf",
-      annotations: currentAnnotations,
-    };
-    const serialize = (annotations: unknown[]) => JSON.stringify({
-      ...base,
-      annotations,
-    }, null, 2);
-
-    if (
-      /(clear|remove|delete|reset|清除|删除|移除|重置)/.test(lower) &&
-      /(annotation|overlay|edit|mark|批注|标注|编辑|全部|所有|all)/.test(lower)
-    ) {
-      return serialize([]);
-    }
-
-    const quoted = request.match(/["'“”‘’]([^"'“”‘’]{1,180})["'“”‘’]/)?.[1]?.trim();
-    const afterAdd = request.match(/(?:add|insert|write|type|label|添加|加入|写上|输入|标注)\s*[:：]?\s*(.{1,120})/i)?.[1]?.trim();
-    const requestedText = (quoted || afterAdd || "").replace(/[。.!?？]+$/, "").trim();
-
-    const findHint = (needle: string) => {
-      const normalized = needle.trim().toLowerCase();
-      if (!normalized) return null;
-      for (const page of pageTextHints) {
-        const item = page.items.find((candidate) =>
-          candidate.text.toLowerCase().includes(normalized) ||
-          normalized.includes(candidate.text.toLowerCase()),
-        );
-        if (item) return { page: page.page, item };
-      }
-      return null;
-    };
-
-    if (/(highlight|mark|高亮|标记)/.test(lower)) {
-      const hint = findHint(quoted || requestedText);
-      const annotation = {
-        id: createPdfAnnotationId(),
-        kind: "highlight",
-        page: hint?.page || 1,
-        x: hint?.item.x ?? 0.1,
-        y: hint?.item.y ?? 0.12,
-        width: Math.max(hint?.item.width ?? 0.34, 0.08),
-        height: Math.max(hint?.item.height ?? 0.035, 0.025),
-        color: "#fde047",
-        opacity: 0.45,
-      };
-      return serialize([...currentAnnotations, annotation]);
-    }
-
-    if (/(whiteout|white out|cover|redact|遮盖|涂白|抹掉|打码)/.test(lower)) {
-      const hint = findHint(quoted || requestedText);
-      const annotation = {
-        id: createPdfAnnotationId(),
-        kind: "whiteout",
-        page: hint?.page || 1,
-        x: hint?.item.x ?? 0.1,
-        y: hint?.item.y ?? 0.12,
-        width: Math.max(hint?.item.width ?? 0.34, 0.1),
-        height: Math.max(hint?.item.height ?? 0.05, 0.035),
-      };
-      return serialize([...currentAnnotations, annotation]);
-    }
-
-    if (requestedText && /(add|insert|write|type|text|label|添加|加入|写上|输入|文字|文本|标注)/.test(lower)) {
-      const annotation = {
-        id: createPdfAnnotationId(),
-        kind: "text",
-        page: 1,
-        x: 0.1,
-        y: 0.1 + Math.min(0.6, currentAnnotations.length * 0.075),
-        width: 0.72,
-        height: 0.06,
-        text: requestedText,
-        fontSize: 14,
-        color: "#1c1917",
-      };
-      return serialize([...currentAnnotations, annotation]);
-    }
-
-    return null;
-  }, [docName, pageTextHints]);
-
   useEffect(() => {
     if (!onLiveEditBridgeChange || !canEdit || pageCount === 0) return;
     onLiveEditBridgeChange({
+      commitCoordinator: pdfAiCommitCoordinator,
       getContent: buildPdfLiveEditContent,
+      getTurnPreviewState: () => ({
+        changeCount: pdfAiPreviewRef.current?.changeCount || 0,
+      }),
+      beginTurn: beginPdfAiTurn,
       applyContent: (next, meta) => {
-        if (!meta.complete) return;
+        if (meta.signal?.aborted) return false;
         try {
+          cancelActiveEditorInteractions();
+          dragRef.current = null;
+          drawingDraftRef.current = null;
+          rectDraftRef.current = null;
+          setDrawingDraft(null);
+          setRectDraft(null);
           const parsedAnnotations = parsePdfLiveEditAnnotations(
             next,
             pageCount,
             annotationsRef.current,
             signatureDataUrl,
           );
-          commitAnnotations(parsedAnnotations);
+          const previousPreview = pdfAiPreviewRef.current;
+          const preview: PdfAiPreview = {
+            baseline: previousPreview?.baseline ?? structuredClone(annotationsRef.current),
+            current: structuredClone(parsedAnnotations),
+            past: previousPreview?.past ?? annotationPastRef.current.map((item) => structuredClone(item)),
+            future: previousPreview?.future ?? annotationFutureRef.current.map((item) => structuredClone(item)),
+            status: AiEditPreviewStatus.Animating,
+            changeCount: nextEditorLiveChangeCount(previousPreview, meta),
+          };
+          pdfAiPreviewRef.current = preview;
+          setPdfAiPreview(preview);
+          annotationsRef.current = parsedAnnotations;
+          setAnnotationsRaw(parsedAnnotations);
           const last = parsedAnnotations[parsedAnnotations.length - 1];
           setSelectedAnnotationId(last?.id || null);
           setActiveTool("select");
@@ -3939,15 +4646,17 @@ function PdfJsViewer({
           throw error;
         }
       },
-      localEditContent: localPdfEditContent,
+      complete: completePdfAiPreview,
+      rollback: rollbackPdfAiPreview,
     });
     return () => onLiveEditBridgeChange(null);
-  }, [buildPdfLiveEditContent, canEdit, commitAnnotations, localPdfEditContent, onLiveEditBridgeChange, pageCount, signatureDataUrl]);
+  }, [beginPdfAiTurn, buildPdfLiveEditContent, canEdit, completePdfAiPreview, onLiveEditBridgeChange, pageCount, pdfAiCommitCoordinator, rollbackPdfAiPreview, signatureDataUrl]);
 
     useEffect(() => {
       const handler = (event: KeyboardEvent) => {
         if (!(event.metaKey || event.ctrlKey) || event.key.toLowerCase() !== "s") return;
         event.preventDefault();
+        if (pdfAiPreviewRef.current) return;
         if (!canEdit || !hasAnnotations || busy) return;
         if (event.shiftKey) void handleDownloadEdited();
         else if (docId) void handleSaveEdited();
@@ -4147,7 +4856,21 @@ function PdfJsViewer({
 
   return (
     <div className="pdf-editor-shell">
-      <div className="manor-editor-toolbar pdf-editor-toolbar">
+      {pdfAiPreview && (
+        <AiEditPreviewControls
+          className="pdf-ai-edit-controls"
+          status={pdfAiPreview.status}
+          changeCount={pdfAiPreview.changeCount}
+          accepting={exporting === "save"}
+          onAccept={acceptPdfAiPreview}
+          onDiscard={rollbackPdfAiPreview}
+        />
+      )}
+      {pdfAiPreview && <AiEditPreviewInteractionShield />}
+      <div
+        className="manor-editor-toolbar pdf-editor-toolbar"
+        {...aiEditInteractionLockProps(Boolean(pdfAiPreview))}
+      >
         <button onClick={() => setZoom(Math.max(50, zoom - 25))} className={editorToolButtonClass({ icon: true })}>
           <svg style={{ width: 16, height: 16 }} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}><path strokeLinecap="round" strokeLinejoin="round" d="M19.5 12h-15" /></svg>
         </button>
@@ -4257,7 +4980,7 @@ function PdfJsViewer({
             <button
               type="button"
               title={PDF_EDITOR_COPY.save}
-              onClick={handleSaveEdited}
+              onClick={() => { void handleSaveEdited(); }}
               disabled={!hasAnnotations || busy || !docId}
               className={editorToolButtonClass({ primary: true })}
             >
@@ -4288,7 +5011,10 @@ function PdfJsViewer({
           </span>
         )}
       </div>
-      <div className={`pdf-editor-body${showInspector ? " pdf-editor-body--inspector-open" : ""}`}>
+      <div
+        className={`pdf-editor-body${showInspector ? " pdf-editor-body--inspector-open" : ""}`}
+        {...aiEditInteractionLockProps(Boolean(pdfAiPreview))}
+      >
         {showInspector && (
         <aside className="pdf-editor-inspector">
           <div className="pdf-editor-inspector-title">
@@ -4525,7 +5251,7 @@ function PdfJsViewer({
   );
 }
 
-function PptxViewJsViewer({ url, onDownload }: { url: string; onDownload: () => void }) {
+function PptxViewJsViewer({ url, blob, onDownload }: { url: string; blob?: Blob | null; onDownload: () => void }) {
   const stageRef = useRef<HTMLDivElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const viewerRef = useRef<any>(null);
@@ -4575,9 +5301,13 @@ function PptxViewJsViewer({ url, onDownload }: { url: string; onDownload: () => 
       prepareCanvas(16 / 9);
 
       try {
-        const res = await fetch(url);
-        if (!res.ok) throw new Error("Presentation fetch failed");
-        const buf = await res.arrayBuffer();
+        const buf = blob
+          ? await blob.arrayBuffer()
+          : await (async () => {
+              const res = await fetch(url);
+              if (!res.ok) throw new Error("Presentation fetch failed");
+              return res.arrayBuffer();
+            })();
         if (cancelled || !canvasRef.current) return;
 
         const { PPTXViewer } = await import("pptxviewjs");
@@ -4618,7 +5348,7 @@ function PptxViewJsViewer({ url, onDownload }: { url: string; onDownload: () => 
       viewerRef.current?.destroy();
       viewerRef.current = null;
     };
-  }, [getViewerAspect, prepareCanvas, url]);
+  }, [blob, getViewerAspect, prepareCanvas, url]);
 
   const renderSlide = useCallback(async (slideIndex: number) => {
     const renderCanvas = prepareCanvas();
@@ -4732,8 +5462,265 @@ function PptxViewerNavigation({
   );
 }
 
+const PPTX_THUMBNAIL_FRAME_ASPECT = 16 / 9;
+
+function pptxSlideAspectValue(aspectRatio?: string): number {
+  const [width, height] = (aspectRatio || "16/9").split("/").map(Number);
+  return width > 0 && height > 0 ? width / height : PPTX_THUMBNAIL_FRAME_ASPECT;
+}
+
+function pptxThumbnailFitStyle(aspectRatio?: string): React.CSSProperties {
+  const slideAspect = pptxSlideAspectValue(aspectRatio);
+  return slideAspect >= PPTX_THUMBNAIL_FRAME_ASPECT
+    ? { width: "100%", height: `${(PPTX_THUMBNAIL_FRAME_ASPECT / slideAspect) * 100}%` }
+    : { width: `${(slideAspect / PPTX_THUMBNAIL_FRAME_ASPECT) * 100}%`, height: "100%" };
+}
+
+function PptxCssSlidePreview({
+  slide,
+  slideIndex,
+  thumbnail = false,
+}: {
+  slide: PptxSlide;
+  slideIndex: number;
+  thumbnail?: boolean;
+}) {
+  const slideTheme = slide.theme;
+  const slideBg: React.CSSProperties = { backgroundColor: slide.bg || "#ffffff" };
+  if (slide.bgGrad) slideBg.backgroundImage = gradientToCss(slide.bgGrad);
+  if (slide.bgImgUrl) {
+    slideBg.backgroundImage = `url(${slide.bgImgUrl})`;
+    slideBg.backgroundSize = "cover";
+    slideBg.backgroundPosition = "center";
+    slideBg.backgroundRepeat = "no-repeat";
+  }
+
+  return (
+    <div
+      className={thumbnail ? "pptx-document-thumbnail-preview" : "pptx-document-css-slide"}
+      style={{
+        aspectRatio: slide.aspectRatio || "16/9",
+        ...slideBg,
+        ...(thumbnail ? pptxThumbnailFitStyle(slide.aspectRatio) : undefined),
+        "--pptx-point-scale": slide.heightPoints ? 540 / slide.heightPoints : 1,
+      } as React.CSSProperties}
+      aria-hidden={thumbnail || undefined}
+    >
+      {slide.shapes.map((shape, shapeIndex) => {
+        let borderRadius: string | number | undefined;
+        if (shape.presetGeom === "ellipse" || shape.presetGeom === "oval") borderRadius = "50%";
+        else if (shape.presetGeom === "roundRect") borderRadius = presentationRoundRectRadius(shape.w, shape.h, shape.borderRadius);
+        else if (shape.presetGeom === "flowChartTerminator") borderRadius = "999px";
+        else if (shape.presetGeom === "wedgeRoundRectCallout") borderRadius = "8%";
+
+        if (shape.type === "table" && shape.tableRows) {
+          const totalColWidth = shape.tableColWidths?.reduce((sum, width) => sum + width, 0) || 1;
+          return (
+            <div key={shapeIndex} style={{
+              position: "absolute", left: `${shape.x}%`, top: `${shape.y}%`,
+              width: `${shape.w}%`, height: `${shape.h}%`, overflow: thumbnail ? "hidden" : "auto",
+            }}>
+              <table style={{
+                width: "100%", height: "100%", borderCollapse: "collapse",
+                fontSize: "1.75cqh", tableLayout: "fixed",
+              }}>
+                {shape.tableColWidths && (
+                  <colgroup>
+                    {shape.tableColWidths.map((width, columnIndex) => (
+                      <col key={columnIndex} style={{ width: `${(width / totalColWidth) * 100}%` }} />
+                    ))}
+                  </colgroup>
+                )}
+                <tbody>
+                  {shape.tableRows.map((row, rowIndex) => (
+                    <tr key={rowIndex}>
+                      {row.map((cell, columnIndex) => {
+                        if ((cell as any).vMerge) return null;
+                        return (
+                          <td key={columnIndex} colSpan={(cell as any).gridSpan || undefined} style={{
+                            border: `${presentationPointsToCqh(0.75)} solid rgba(28,25,23,0.06)`,
+                            padding: "0.4cqh 0.6cqw",
+                            background: cell.fill || (rowIndex === 0 ? "#f5f5f4" : "white"),
+                            color: cell.color || "#292524",
+                            fontWeight: cell.bold || rowIndex === 0 ? 700 : 400,
+                            overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", lineHeight: 1.3,
+                          }}>{cell.text}</td>
+                        );
+                      })}
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          );
+        }
+
+        if (shape.type === "line") {
+          return (
+            <div key={shapeIndex} style={{
+              position: "absolute", left: `${shape.x}%`, top: `${shape.y}%`,
+              width: `${Math.max(0.5, shape.w)}%`, height: `${Math.max(0.5, shape.h)}%`, overflow: "visible", opacity: shape.opacity,
+              transform: [shape.rotation ? `rotate(${shape.rotation}deg)` : "", shape.flipH ? "scaleX(-1)" : "", shape.flipV ? "scaleY(-1)" : ""].filter(Boolean).join(" ") || undefined,
+            }}>
+              <PresentationShapeOutline {...shape} presetGeom="line" />
+            </div>
+          );
+        }
+
+        const clipPath = presentationPresetClipPath(shape.presetGeom);
+        const polygonPoints = presentationPresetPointsAttribute(shape.presetGeom);
+        const verticalJustify = shape.vAlign === "top"
+          ? "flex-start"
+          : shape.vAlign === "bottom"
+            ? "flex-end"
+            : shape.texts.length > 0 ? "center" : undefined;
+        const padding = shape.padding;
+        const paddingStyle = padding
+          ? `${presentationPointsToCqh(padding.t)} ${presentationPointsToCqh(padding.r)} ${presentationPointsToCqh(padding.b)} ${presentationPointsToCqh(padding.l)}`
+          : shape.texts.length > 0 ? "2% 3%" : undefined;
+        const transforms: string[] = [];
+        if (shape.rotation) transforms.push(`rotate(${shape.rotation}deg)`);
+        if (shape.flipH) transforms.push("scaleX(-1)");
+        if (shape.flipV) transforms.push("scaleY(-1)");
+
+        let boxShadow: string | undefined;
+        if (shape.shadow) {
+          const shadow = shape.shadow;
+          const radians = (shadow.angle * Math.PI) / 180;
+          const dx = shadow.dist * Math.cos(radians);
+          const dy = shadow.dist * Math.sin(radians);
+          const red = parseInt(shadow.color.slice(1, 3), 16);
+          const green = parseInt(shadow.color.slice(3, 5), 16);
+          const blue = parseInt(shadow.color.slice(5, 7), 16);
+          boxShadow = `${presentationPointsToCqh(dx)} ${presentationPointsToCqh(dy)} ${presentationPointsToCqh(shadow.blur)} rgba(${red},${green},${blue},${shadow.alpha})`;
+        }
+
+        let imageStyle: React.CSSProperties = {
+          position: "absolute", top: 0, left: 0, width: "100%", height: "100%",
+          objectFit: "fill", borderRadius, zIndex: 0,
+        };
+        if (shape.imgCrop) {
+          const crop = shape.imgCrop;
+          const scaleX = 100 / Math.max(0.01, 100 - crop.l - crop.r);
+          const scaleY = 100 / Math.max(0.01, 100 - crop.t - crop.b);
+          imageStyle = {
+            position: "absolute",
+            top: `-${crop.t * scaleY}%`, left: `-${crop.l * scaleX}%`,
+            width: `${100 * scaleX}%`, height: `${100 * scaleY}%`,
+            objectFit: "fill", borderRadius, zIndex: 0,
+          };
+        }
+
+        return (
+          <div
+            key={shapeIndex}
+            style={{
+              position: "absolute",
+              left: `${shape.x}%`,
+              top: `${shape.y}%`,
+              width: `${shape.w}%`,
+              height: `${shape.h}%`,
+              background: shape.gradFill ? gradientToCss(shape.gradFill) : shape.fill || undefined,
+              borderRadius,
+              opacity: shape.opacity,
+              overflow: "hidden",
+              display: "flex",
+              flexDirection: "column",
+              justifyContent: verticalJustify,
+              padding: paddingStyle,
+              transform: transforms.length > 0 ? transforms.join(" ") : undefined,
+              boxSizing: "border-box",
+              clipPath,
+              boxShadow,
+            }}
+          >
+            <PresentationShapeOutline {...shape} points={polygonPoints} />
+            {shape.videoUrl && !thumbnail ? (
+              <video
+                className="pptx-native-video pptx-native-video--css"
+                src={shape.videoUrl}
+                poster={shape.imgUrl}
+                controls
+                playsInline
+                preload="metadata"
+                aria-label={`Video on ${t("page.file_viewer.slide")} ${slideIndex + 1}`}
+              />
+            ) : shape.imgUrl ? <img src={shape.imgUrl} alt={shape.altText || ""} style={imageStyle} /> : null}
+            {(() => {
+              let autoNumberCounter = 0;
+              return shape.texts.map((paragraph, paragraphIndex) => {
+                let displayBullet = paragraph.bullet;
+                if (paragraph.bullet === "#.") {
+                  autoNumberCounter++;
+                  displayBullet = `${autoNumberCounter}.`;
+                } else if (paragraph.bullet === "a.") {
+                  autoNumberCounter++;
+                  displayBullet = `${String.fromCharCode(96 + autoNumberCounter)}.`;
+                } else if (paragraph.bullet === "i.") {
+                  autoNumberCounter++;
+                  const romans = ["i", "ii", "iii", "iv", "v", "vi", "vii", "viii", "ix", "x"];
+                  displayBullet = `${romans[autoNumberCounter - 1] || autoNumberCounter}.`;
+                } else if (!paragraph.bullet) {
+                  autoNumberCounter = 0;
+                }
+                return (
+                  <p
+                    key={paragraphIndex}
+                    style={{
+                      position: "relative",
+                      margin: 0,
+                      marginTop: paragraph.spaceBefore != null ? presentationPointsToCqh(paragraph.spaceBefore) : paragraph.text === "" ? "0.3em" : "0.05em",
+                      marginBottom: paragraph.spaceAfter != null ? presentationPointsToCqh(paragraph.spaceAfter) : "0.05em",
+                      minHeight: paragraph.text === "" ? "0.5em" : undefined,
+                      paddingLeft: paragraph.indent != null ? presentationPointsToCqh(paragraph.indent) : displayBullet ? presentationPointsToCqh(18) : undefined,
+                      paddingRight: paragraph.indentRight != null ? presentationPointsToCqh(paragraph.indentRight) : undefined,
+                      textIndent: !displayBullet && paragraph.hanging != null ? presentationPointsToCqh(paragraph.hanging) : undefined,
+                      fontSize: paragraph.fontSize ? presentationPointsToCqh(paragraph.fontSize) : "2.6cqh",
+                      fontWeight: paragraph.bold ? 700 : 400,
+                      fontStyle: paragraph.italic ? "italic" : undefined,
+                      textDecoration: paragraph.underline ? "underline" : undefined,
+                      color: paragraph.color || slideTheme?.colors.tx1 || "#000000",
+                      textAlign: (paragraph.align as any) || undefined,
+                      lineHeight: paragraph.lineSpacing || 1.35,
+                      wordBreak: "normal",
+                      overflowWrap: "break-word",
+                      whiteSpace: shape.wordWrap === false ? "pre" : "pre-wrap",
+                      zIndex: 1,
+                      fontFamily: paragraph.fontFamily
+                        ? `"${paragraph.fontFamily}", sans-serif`
+                        : slideTheme?.minorFont ? `"${slideTheme.minorFont}", sans-serif` : undefined,
+                    }}
+                  >
+                    {displayBullet && (
+                      <span style={{ position: "absolute", left: presentationPointsToCqh(paragraph.indent != null ? paragraph.indent + (paragraph.hanging ?? (paragraph.indent === 0 ? 0 : -14)) : 2) }}>
+                        {displayBullet}
+                      </span>
+                    )}
+                    {paragraph.runs ? paragraph.runs.map((run, runIndex) => (
+                      <span key={runIndex} style={{
+                        fontWeight: run.bold ? 700 : undefined,
+                        fontStyle: run.italic ? "italic" : undefined,
+                        textDecoration: [run.underline ? "underline" : "", run.strikethrough ? "line-through" : ""].filter(Boolean).join(" ") || undefined,
+                        fontSize: run.fontSize && run.fontSize !== paragraph.fontSize ? presentationPointsToCqh(run.fontSize) : undefined,
+                        color: run.color && run.color !== paragraph.color ? run.color : undefined,
+                        fontFamily: run.fontFamily && run.fontFamily !== paragraph.fontFamily ? `"${run.fontFamily}", sans-serif` : undefined,
+                        verticalAlign: run.baseline ? (run.baseline > 0 ? "super" : "sub") : undefined,
+                        letterSpacing: run.spacing ? presentationPointsToCqh(run.spacing) : undefined,
+                      }}>{run.text}</span>
+                    )) : paragraph.text}
+                  </p>
+                );
+              });
+            })()}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
 // ── PPTX viewer ──
-function PptxViewer({ url, docId, onDownload }: { url: string; docId?: string; onDownload: () => void }) {
+export function PptxViewer({ url, blob, docId, onDownload }: { url: string; blob?: Blob | null; docId?: string; onDownload?: () => void }) {
   const [slides, setSlides] = useState<PptxSlide[]>([]);
   const [slideImageUrls, setSlideImageUrls] = useState<string[]>([]);
   const [activeSlide, setActiveSlide] = useState(0);
@@ -4741,79 +5728,155 @@ function PptxViewer({ url, docId, onDownload }: { url: string; docId?: string; o
   const [error, setError] = useState("");
   const [renderMode, setRenderMode] = useState<"server" | "css">("css");
   const [stageSize, setStageSize] = useState({ width: 0, height: 0 });
+  const [visibleCssThumbnailIndexes, setVisibleCssThumbnailIndexes] = useState<Set<number>>(
+    () => new Set([0]),
+  );
   const thumbnailRefs = useRef<Array<HTMLButtonElement | null>>([]);
+  const cssThumbnailStripRef = useRef<HTMLDivElement | null>(null);
   const stageRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
     let cancelled = false;
-    let createdBlobUrls: string[] = [];
+    let serverRenderActive = true;
+    const serverRenderAbortController = new AbortController();
+    const serverRenderTimeoutId = window.setTimeout(
+      () => serverRenderAbortController.abort(),
+      8000,
+    );
+    const createdBlobUrls: string[] = [];
+    const serverBlobUrls: string[] = [];
+    const parserBlobUrls: string[] = [];
+    const revokeTrackedBlobUrls = (blobUrls: string[]) => {
+      blobUrls.splice(0).forEach((blobUrl) => {
+        const trackedIndex = createdBlobUrls.indexOf(blobUrl);
+        if (trackedIndex >= 0) createdBlobUrls.splice(trackedIndex, 1);
+        URL.revokeObjectURL(blobUrl);
+      });
+    };
+    const revokeCreatedBlobUrls = () => {
+      createdBlobUrls.splice(0).forEach((blobUrl) => URL.revokeObjectURL(blobUrl));
+      serverBlobUrls.splice(0);
+      parserBlobUrls.splice(0);
+    };
+    const trackServerBlobUrl = (blobUrl: string) => {
+      if (cancelled || !serverRenderActive) {
+        URL.revokeObjectURL(blobUrl);
+        return false;
+      }
+      serverBlobUrls.push(blobUrl);
+      createdBlobUrls.push(blobUrl);
+      return true;
+    };
+
+    setLoading(true);
+    setError("");
+    setSlides([]);
+    setSlideImageUrls([]);
+    setActiveSlide(0);
+    setRenderMode("css");
+    setVisibleCssThumbnailIndexes(new Set([0]));
 
     (async () => {
-      const serverSlidesTask = (async () => {
-        if (!docId) return [] as string[];
-        try {
-          const token = getAuthToken();
-          const headers: Record<string, string> = {};
-          if (token) headers["Authorization"] = `Bearer ${token}`;
-          const slideRes = await fetch(`/api/v1/documents/${docId}/slides`, { headers });
-          if (slideRes.ok) {
-            const slideData = await slideRes.json();
-            if (slideData.slides?.length > 0) {
-              const blobUrls = await Promise.all(
-                slideData.slides.map(async (s: { url: string }) => {
-                  const res = await fetch(`/api/v1${s.url}`, { headers });
-                  if (!res.ok) throw new Error("Slide fetch failed");
-                  const blob = await res.blob();
-                  const blobUrl = URL.createObjectURL(blob);
-                  createdBlobUrls.push(blobUrl);
-                  return blobUrl;
-                })
-              );
-              return blobUrls;
+      try {
+        const serverSlidesTask = (async () => {
+          try {
+            if (!docId) return [] as string[];
+            const token = getAuthToken();
+            const headers: Record<string, string> = {};
+            if (token) headers["Authorization"] = `Bearer ${token}`;
+            const slideRes = await fetch(`/api/v1/documents/${docId}/slides`, {
+              headers,
+              signal: serverRenderAbortController.signal,
+            });
+            if (slideRes.ok) {
+              const slideData = await slideRes.json();
+              if (cancelled) return [] as string[];
+              if (slideData.slides?.length > 0) {
+                const blobUrls = await Promise.all(
+                  slideData.slides.map(async (s: { url: string }) => {
+                    const res = await fetch(`/api/v1${s.url}`, {
+                      headers,
+                      signal: serverRenderAbortController.signal,
+                    });
+                    if (!res.ok) throw new Error("Slide fetch failed");
+                    const slideBlob = await res.blob();
+                    const blobUrl = URL.createObjectURL(slideBlob);
+                    return trackServerBlobUrl(blobUrl) ? blobUrl : "";
+                  })
+                );
+                return blobUrls.filter(Boolean);
+              }
             }
+          } catch {
+            revokeTrackedBlobUrls(serverBlobUrls);
+            // Server rendering unavailable — the editable browser renderer remains usable.
+          } finally {
+            window.clearTimeout(serverRenderTimeoutId);
+            serverRenderActive = false;
           }
-        } catch {
-          // Server rendering unavailable — the editable browser renderer remains usable.
+          return [] as string[];
+        })();
+
+        const parsedSlidesTask = (async () => {
+          const buf = blob
+            ? await blob.arrayBuffer()
+            : await (async () => {
+              const res = await fetch(url);
+              if (!res.ok) throw new Error(`Failed to load presentation (${res.status})`);
+              return res.arrayBuffer();
+            })();
+          if (cancelled) return [] as PptxSlide[];
+          const bytes = new Uint8Array(buf);
+
+          if (bytes.length >= 2 && bytes[0] === 0x50 && bytes[1] === 0x4B) {
+            const parsed = await parsePptx(buf, {
+              isCancelled: () => cancelled,
+              onObjectUrl: (objectUrl) => {
+                parserBlobUrls.push(objectUrl);
+                createdBlobUrls.push(objectUrl);
+              },
+            });
+            return parsed.length > 0 ? parsed : [{ shapes: [] }];
+          }
+          const parsedSlides = parseTextSlides(new TextDecoder().decode(bytes));
+          return parsedSlides.length > 0 ? parsedSlides : [{ shapes: [] }];
+        })();
+
+        const [serverResult, parsedResult] = await Promise.allSettled([serverSlidesTask, parsedSlidesTask]);
+        if (cancelled) return;
+
+        if (parsedResult.status === "rejected") {
+          revokeTrackedBlobUrls(parserBlobUrls);
         }
-        return [] as string[];
-      })();
 
-      const parsedSlidesTask = (async () => {
-        const res = await fetch(url);
-        if (!res.ok) throw new Error(`Failed to load presentation (${res.status})`);
-        const buf = await res.arrayBuffer();
-        const bytes = new Uint8Array(buf);
-
-        if (bytes.length >= 2 && bytes[0] === 0x50 && bytes[1] === 0x4B) {
-          const parsed = await parsePptx(buf);
-          createdBlobUrls.push(...parsed.objectUrls);
-          return parsed.slides.length > 0 ? parsed.slides : [{ shapes: [] }];
+        const serverSlides = serverResult.status === "fulfilled" ? serverResult.value : [];
+        const parsedSlides = parsedResult.status === "fulfilled" ? parsedResult.value : [];
+        setSlideImageUrls(serverSlides);
+        setSlides(parsedSlides);
+        setRenderMode(serverSlides.length > 0 ? "server" : "css");
+        if (serverSlides.length === 0 && parsedSlides.length === 0) {
+          const reason = parsedResult.status === "rejected" ? parsedResult.reason : serverResult.status === "rejected" ? serverResult.reason : undefined;
+          revokeCreatedBlobUrls();
+          setError(reason instanceof Error ? reason.message : "Failed to parse presentation");
         }
-        const parsedSlides = parseTextSlides(new TextDecoder().decode(bytes));
-        return parsedSlides.length > 0 ? parsedSlides : [{ shapes: [] }];
-      })();
-
-      const [serverResult, parsedResult] = await Promise.allSettled([serverSlidesTask, parsedSlidesTask]);
-      if (cancelled) return;
-
-      const serverSlides = serverResult.status === "fulfilled" ? serverResult.value : [];
-      const parsedSlides = parsedResult.status === "fulfilled" ? parsedResult.value : [];
-      setSlideImageUrls(serverSlides);
-      setSlides(parsedSlides);
-      setRenderMode(serverSlides.length > 0 ? "server" : "css");
-      if (serverSlides.length === 0 && parsedSlides.length === 0) {
-        const reason = parsedResult.status === "rejected" ? parsedResult.reason : serverResult.status === "rejected" ? serverResult.reason : undefined;
-        setError(reason instanceof Error ? reason.message : "Failed to parse presentation");
+        setLoading(false);
+      } catch (e: any) {
+        serverRenderActive = false;
+        revokeCreatedBlobUrls();
+        if (!cancelled) setError(e.message || "Failed to parse presentation");
+        if (!cancelled) setLoading(false);
       }
-      setLoading(false);
     })();
 
     return () => {
       cancelled = true;
-      createdBlobUrls.forEach((blobUrl) => URL.revokeObjectURL(blobUrl));
+      serverRenderActive = false;
+      window.clearTimeout(serverRenderTimeoutId);
+      serverRenderAbortController.abort();
+      revokeCreatedBlobUrls();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [url, docId]);
+  }, [blob, url, docId]);
 
   useEffect(() => {
     if (loading) return undefined;
@@ -4831,6 +5894,43 @@ function PptxViewer({ url, docId, onDownload }: { url: string; docId?: string; o
   useEffect(() => {
     thumbnailRefs.current[activeSlide]?.scrollIntoView({ block: "nearest", inline: "nearest" });
   }, [activeSlide, totalSlides]);
+
+  useEffect(() => {
+    if (renderMode !== "css" || slides.length <= 1) return undefined;
+    const strip = cssThumbnailStripRef.current;
+    if (!strip) return undefined;
+
+    if (typeof IntersectionObserver === "undefined") {
+      setVisibleCssThumbnailIndexes(new Set(slides.map((_, slideIndex) => slideIndex)));
+      return undefined;
+    }
+
+    const observer = new IntersectionObserver((entries) => {
+      setVisibleCssThumbnailIndexes((current) => {
+        const next = new Set(current);
+        let changed = false;
+        entries.forEach((entry) => {
+          const slideIndex = Number((entry.target as HTMLElement).dataset.slideIndex);
+          if (!Number.isInteger(slideIndex)) return;
+          if (entry.isIntersecting && !next.has(slideIndex)) {
+            next.add(slideIndex);
+            changed = true;
+          } else if (!entry.isIntersecting && next.delete(slideIndex)) {
+            changed = true;
+          }
+        });
+        return changed ? next : current;
+      });
+    }, {
+      root: strip,
+      rootMargin: "0px 384px",
+    });
+
+    thumbnailRefs.current.slice(0, slides.length).forEach((thumbnail) => {
+      if (thumbnail) observer.observe(thumbnail);
+    });
+    return () => observer.disconnect();
+  }, [renderMode, slides.length]);
 
   const selectSlide = (slideIndex: number) => {
     setActiveSlide(Math.max(0, Math.min(totalSlides - 1, slideIndex)));
@@ -4856,8 +5956,7 @@ function PptxViewer({ url, docId, onDownload }: { url: string; docId?: string; o
   // Server-rendered mode: show slide images (blob URLs fetched with auth)
   if (renderMode === "server" && slideImageUrls.length > 0) {
     const parsedSlide = slides[activeSlide];
-    const [aspectWidth, aspectHeight] = (parsedSlide?.aspectRatio || "16/9").split("/").map(Number);
-    const aspect = aspectWidth > 0 && aspectHeight > 0 ? aspectWidth / aspectHeight : 16 / 9;
+    const aspect = pptxSlideAspectValue(parsedSlide?.aspectRatio);
     const frameWidth = Math.max(1, Math.min(1200, stageSize.width || 1200, (stageSize.height || 675) * aspect));
     const frameHeight = frameWidth / aspect;
     const nativeVideos = parsedSlide?.shapes.filter((shape) => Boolean(shape.videoUrl)) || [];
@@ -4921,268 +6020,47 @@ function PptxViewer({ url, docId, onDownload }: { url: string; docId?: string; o
 
   const slide = slides[activeSlide];
 
-  // Build slide background style — layer: solid color < gradient < image
-  const slideBg: React.CSSProperties = { backgroundColor: slide.bg || "#ffffff" };
-  if (slide.bgGrad) slideBg.backgroundImage = gradientToCss(slide.bgGrad);
-  if (slide.bgImgUrl) {
-    slideBg.backgroundImage = `url(${slide.bgImgUrl})`;
-    slideBg.backgroundSize = "cover";
-    slideBg.backgroundPosition = "center";
-    slideBg.backgroundRepeat = "no-repeat";
-  }
-
   return (
     <div className="pptx-document-viewer">
       {/* Slide canvas */}
       <div ref={stageRef} className="pptx-document-stage pptx-document-stage--scrollable">
-        <div className="pptx-document-css-slide" style={{
-          aspectRatio: slide.aspectRatio || "16/9",
-          ...slideBg,
-        }}>
-        {slide.shapes.map((shape, si) => {
-          let br: string | number | undefined = shape.borderRadius ? `${shape.borderRadius}%` : undefined;
-          if (shape.presetGeom === "ellipse" || shape.presetGeom === "oval") br = "50%";
-          else if (shape.presetGeom === "roundRect" && !br) br = "8%";
-          const borderStyle = shape.stroke ? `${Math.max(0.5, shape.strokeWidth || 1)}px solid ${shape.stroke}` : undefined;
-
-          // Table rendering
-          if (shape.type === "table" && shape.tableRows) {
-            const totalColW = shape.tableColWidths?.reduce((a, b) => a + b, 0) || 1;
-            return (
-              <div key={si} style={{
-                position: "absolute", left: `${shape.x}%`, top: `${shape.y}%`,
-                width: `${shape.w}%`, height: `${shape.h}%`, overflow: "auto",
-              }}>
-                <table style={{ width: "100%", height: "100%", borderCollapse: "collapse", fontSize: "clamp(8px, 1.2vw, 14px)", tableLayout: "fixed" }}>
-                  {shape.tableColWidths && (
-                    <colgroup>
-                      {shape.tableColWidths.map((w, ci) => (
-                        <col key={ci} style={{ width: `${(w / totalColW) * 100}%` }} />
-                      ))}
-                    </colgroup>
-                  )}
-                  <tbody>
-                    {shape.tableRows.map((row, ri) => (
-                      <tr key={ri}>
-                        {row.map((cell, ci) => {
-                          if ((cell as any).vMerge) return null; // skip merged continuation cells
-                          return (
-                            <td key={ci} colSpan={(cell as any).gridSpan || undefined} style={{
-                              border: "1px solid rgba(28,25,23,0.06)", padding: "2px 4px",
-                              background: cell.fill || (ri === 0 ? "#f5f5f4" : "white"),
-                              color: cell.color || "#292524",
-                              fontWeight: cell.bold || ri === 0 ? 700 : 400,
-                              overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", lineHeight: 1.3,
-                            }}>{cell.text}</td>
-                          );
-                        })}
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            );
-          }
-
-          // Line / connector rendering
-          if (shape.type === "line") {
-            const lineColor = shape.stroke || "#57534e";
-            const lineWidth = Math.max(1, shape.strokeWidth || 1);
-            return (
-              <svg key={si} style={{
-                position: "absolute", left: `${shape.x}%`, top: `${shape.y}%`,
-                width: `${shape.w}%`, height: `${shape.h}%`,
-                overflow: "visible", opacity: shape.opacity,
-                transform: shape.rotation ? `rotate(${shape.rotation}deg)` : undefined,
-              }}>
-                <line x1="0" y1={shape.h > shape.w ? "0" : "50%"} x2="100%" y2={shape.h > shape.w ? "100%" : "50%"}
-                  stroke={lineColor} strokeWidth={lineWidth} />
-              </svg>
-            );
-          }
-
-          // Clip-path for preset geometries
-          const clipPath = _presetClipPath(shape.presetGeom);
-
-          // Vertical alignment
-          const vJustify = shape.vAlign === "top" ? "flex-start" : shape.vAlign === "bottom" ? "flex-end" : shape.texts.length > 0 ? "center" : undefined;
-
-          // Text insets
-          const pad = shape.padding;
-          const padStyle = pad ? `${pad.t}px ${pad.r}px ${pad.b}px ${pad.l}px` : shape.texts.length > 0 ? "2% 3%" : undefined;
-
-          // Build transform (rotation + flip)
-          const transforms: string[] = [];
-          if (shape.rotation) transforms.push(`rotate(${shape.rotation}deg)`);
-          if (shape.flipH) transforms.push("scaleX(-1)");
-          if (shape.flipV) transforms.push("scaleY(-1)");
-
-          // Shadow
-          let boxShadow: string | undefined;
-          if (shape.shadow) {
-            const s = shape.shadow;
-            const rad = (s.angle * Math.PI) / 180;
-            const dx = Math.round(s.dist * Math.cos(rad));
-            const dy = Math.round(s.dist * Math.sin(rad));
-            const r = parseInt(s.color.slice(1, 3), 16);
-            const g = parseInt(s.color.slice(3, 5), 16);
-            const bv = parseInt(s.color.slice(5, 7), 16);
-            boxShadow = `${dx}px ${dy}px ${Math.round(s.blur)}px rgba(${r},${g},${bv},${s.alpha})`;
-          }
-
-          // Image cropping style
-          let imgStyle: React.CSSProperties = {
-            position: "absolute", top: 0, left: 0, width: "100%", height: "100%",
-            objectFit: "fill", borderRadius: br, zIndex: 0,
-          };
-          if (shape.imgCrop) {
-            const c = shape.imgCrop;
-            // Use object-position + object-fit to simulate cropping
-            const scaleX = 100 / Math.max(0.01, 100 - c.l - c.r);
-            const scaleY = 100 / Math.max(0.01, 100 - c.t - c.b);
-            imgStyle = {
-              position: "absolute",
-              top: `-${c.t * scaleY}%`, left: `-${c.l * scaleX}%`,
-              width: `${100 * scaleX}%`, height: `${100 * scaleY}%`,
-              objectFit: "fill", borderRadius: br, zIndex: 0,
-            };
-          }
-
-          // Numbered bullet counter
-          let bulletNum = 0;
-          if (shape.texts.some(t => t.bullet === "#.")) {
-            let counter = 0;
-            for (const t of shape.texts) {
-              if (t.bullet === "#.") counter++;
-            }
-          }
-
-          return (
-            <div
-              key={si}
-              style={{
-                position: "absolute",
-                left: `${shape.x}%`,
-                top: `${shape.y}%`,
-                width: `${shape.w}%`,
-                height: `${shape.h}%`,
-                background: shape.gradFill ? gradientToCss(shape.gradFill) : shape.fill || undefined,
-                borderRadius: br,
-                border: borderStyle,
-                opacity: shape.opacity,
-                overflow: "hidden",
-                display: "flex",
-                flexDirection: "column",
-                justifyContent: vJustify,
-                padding: padStyle,
-                transform: transforms.length > 0 ? transforms.join(" ") : undefined,
-                boxSizing: "border-box",
-                clipPath: clipPath,
-                boxShadow,
-              }}
-            >
-              {shape.videoUrl ? (
-                <video
-                  className="pptx-native-video pptx-native-video--css"
-                  src={shape.videoUrl}
-                  poster={shape.imgUrl}
-                  controls
-                  playsInline
-                  preload="metadata"
-                  aria-label={`Video on ${t("page.file_viewer.slide")} ${activeSlide + 1}`}
-                />
-              ) : shape.imgUrl ? <img src={shape.imgUrl} alt="" style={imgStyle} /> : null}
-              {(() => {
-                let autoNumCounter = 0;
-                return shape.texts.map((t, ti) => {
-                  // Resolve auto-numbered bullets
-                  let displayBullet = t.bullet;
-                  if (t.bullet === "#.") {
-                    autoNumCounter++;
-                    displayBullet = `${autoNumCounter}.`;
-                  } else if (t.bullet === "a.") {
-                    autoNumCounter++;
-                    displayBullet = `${String.fromCharCode(96 + autoNumCounter)}.`;
-                  } else if (t.bullet === "i.") {
-                    autoNumCounter++;
-                    const romans = ["i", "ii", "iii", "iv", "v", "vi", "vii", "viii", "ix", "x"];
-                    displayBullet = `${romans[autoNumCounter - 1] || autoNumCounter}.`;
-                  } else if (!t.bullet) {
-                    autoNumCounter = 0; // reset on non-bulleted paragraph
-                  }
-                  return (
-                    <p
-                      key={ti}
-                      style={{
-                        position: "relative",
-                        margin: 0,
-                        marginTop: t.spaceBefore ? `${t.spaceBefore}pt` : t.text === "" ? "0.3em" : "0.05em",
-                        marginBottom: t.spaceAfter ? `${t.spaceAfter}pt` : "0.05em",
-                        minHeight: t.text === "" ? "0.5em" : undefined,
-                        paddingLeft: t.indent ? `${t.indent}px` : displayBullet ? "18px" : undefined,
-                        fontSize: t.fontSize ? `${(t.fontSize / 5.4).toFixed(3)}cqh` : "2.6cqh",
-                        fontWeight: t.bold ? 700 : 400,
-                        fontStyle: t.italic ? "italic" : undefined,
-                        textDecoration: t.underline ? "underline" : undefined,
-                        color: t.color || _viewerTheme.tx1 || "#000000",
-                        textAlign: (t.align as any) || undefined,
-                        lineHeight: t.lineSpacing || 1.35,
-                        wordBreak: "normal",
-                        overflowWrap: "break-word",
-                        whiteSpace: "pre-wrap",
-                        zIndex: 1,
-                        fontFamily: t.fontFamily ? `"${t.fontFamily}", sans-serif` : (_viewerMinorFont ? `"${_viewerMinorFont}", sans-serif` : undefined),
-                      }}
-                    >
-                      {displayBullet && <span style={{ position: "absolute", left: t.indent ? `${t.indent - 14}px` : "2px" }}>{displayBullet}</span>}
-                      {t.runs ? t.runs.map((run, ri) => (
-                        <span key={ri} style={{
-                          fontWeight: run.bold ? 700 : undefined,
-                          fontStyle: run.italic ? "italic" : undefined,
-                          textDecoration: [run.underline ? "underline" : "", run.strikethrough ? "line-through" : ""].filter(Boolean).join(" ") || undefined,
-                          fontSize: run.fontSize && run.fontSize !== t.fontSize ? `${(run.fontSize / 5.4).toFixed(3)}cqh` : undefined,
-                          color: run.color && run.color !== t.color ? run.color : undefined,
-                          fontFamily: run.fontFamily && run.fontFamily !== t.fontFamily ? `"${run.fontFamily}", sans-serif` : undefined,
-                          verticalAlign: run.baseline ? (run.baseline > 0 ? "super" : "sub") : undefined,
-                          letterSpacing: run.spacing ? `${(run.spacing / 5.4).toFixed(3)}cqh` : undefined,
-                        }}>{run.text}</span>
-                      )) : t.text}
-                    </p>
-                  );
-                });
-              })()}
-            </div>
-          );
-        })}
-        </div>
+        <PptxCssSlidePreview slide={slide} slideIndex={activeSlide} />
       </div>
 
       {/* Thumbnail strip */}
       {slides.length > 1 && (
-        <div className="pptx-document-thumbnail-strip" aria-label={t("page.doc_editor.slides")}>
+        <div
+          ref={cssThumbnailStripRef}
+          className="pptx-document-thumbnail-strip"
+          aria-label={t("page.doc_editor.slides")}
+        >
           <div className="pptx-document-thumbnail-track" role="tablist">
-            {slides.map((s, i) => {
-              const thumbBg: React.CSSProperties = { backgroundColor: s.bg || "#ffffff" };
-              if (s.bgGrad) thumbBg.backgroundImage = gradientToCss(s.bgGrad);
-              if (s.bgImgUrl) { thumbBg.backgroundImage = `url(${s.bgImgUrl})`; thumbBg.backgroundSize = "cover"; thumbBg.backgroundRepeat = "no-repeat"; }
-              return (
-                <button
-                  ref={(button) => { thumbnailRefs.current[i] = button; }}
-                  key={i}
-                  type="button"
-                  role="tab"
-                  aria-selected={i === activeSlide}
-                  tabIndex={i === activeSlide ? 0 : -1}
-                  onClick={() => selectSlide(i)}
-                  onKeyDown={(event) => handleThumbnailKeyDown(event, i)}
-                  className={`pptx-document-thumbnail${i === activeSlide ? " is-active" : ""}`}
-                  style={thumbBg}
-                  title={`${t("page.file_viewer.slide")} ${i + 1}`}
-                >
-                  <span className="pptx-document-thumbnail-number pptx-document-thumbnail-number--light">{i + 1}</span>
-                </button>
-              );
-            })}
+            {slides.map((thumbnailSlide, slideIndex) => (
+              <button
+                ref={(button) => { thumbnailRefs.current[slideIndex] = button; }}
+                key={slideIndex}
+                data-slide-index={slideIndex}
+                type="button"
+                role="tab"
+                aria-selected={slideIndex === activeSlide}
+                tabIndex={slideIndex === activeSlide ? 0 : -1}
+                onClick={() => selectSlide(slideIndex)}
+                onKeyDown={(event) => handleThumbnailKeyDown(event, slideIndex)}
+                className={`pptx-document-thumbnail${slideIndex === activeSlide ? " is-active" : ""}`}
+                title={`${t("page.file_viewer.slide")} ${slideIndex + 1}`}
+              >
+                {visibleCssThumbnailIndexes.has(slideIndex) || slideIndex === activeSlide ? (
+                  <PptxCssSlidePreview slide={thumbnailSlide} slideIndex={slideIndex} thumbnail />
+                ) : (
+                  <span
+                    className="pptx-document-thumbnail-placeholder"
+                    style={{ backgroundColor: thumbnailSlide.bg || "#ffffff" }}
+                    aria-hidden="true"
+                  />
+                )}
+                <span className="pptx-document-thumbnail-number">{slideIndex + 1}</span>
+              </button>
+            ))}
           </div>
         </div>
       )}
@@ -5199,8 +6077,133 @@ type AudioFrequencyGraph = {
   context: AudioContext;
   source: MediaElementAudioSourceNode;
   analyser: AnalyserNode;
+  gain: GainNode;
   frequencyData: Uint8Array<ArrayBuffer>;
 };
+
+type AudioEditState = {
+  duration: number;
+  trimStart: number;
+  trimEnd: number;
+  volume: number;
+  playbackRate: number;
+  fadeIn: number;
+  fadeOut: number;
+};
+
+type AudioAiPreview = {
+  baseline: AudioEditState;
+  current: AudioEditState;
+  status: AiEditPreviewStatus;
+  changeCount: number;
+};
+
+function normalizeAudioEditState(raw: unknown, duration: number): AudioEditState {
+  const source = raw && typeof raw === "object" && "edits" in raw
+    ? (raw as { edits?: unknown }).edits
+    : raw;
+  const edits = source && typeof source === "object" ? source as Record<string, unknown> : {};
+  const safeDuration = Math.max(0, Number.isFinite(duration) ? duration : 0);
+  const clampNumber = (value: unknown, fallback: number, min: number, max: number) => {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? Math.min(max, Math.max(min, parsed)) : fallback;
+  };
+  const trimStart = clampNumber(edits.trimStart, 0, 0, Math.max(0, safeDuration - 0.05));
+  const trimEnd = clampNumber(edits.trimEnd, safeDuration, trimStart + 0.05, safeDuration || trimStart + 0.05);
+  const sourceLength = Math.max(0.05, trimEnd - trimStart);
+  const playbackRate = clampNumber(edits.playbackRate, 1, 0.5, 2);
+  const outputLength = sourceLength / playbackRate;
+  return {
+    duration: safeDuration,
+    trimStart,
+    trimEnd,
+    volume: clampNumber(edits.volume, 1, 0, 1.5),
+    playbackRate,
+    fadeIn: clampNumber(edits.fadeIn, 0, 0, outputLength / 2),
+    fadeOut: clampNumber(edits.fadeOut, 0, 0, outputLength / 2),
+  };
+}
+
+function audioPreviewGain(edit: AudioEditState, sourceTime: number): number {
+  const elapsed = Math.max(0, sourceTime - edit.trimStart) / edit.playbackRate;
+  const remaining = Math.max(0, edit.trimEnd - sourceTime) / edit.playbackRate;
+  const fadeInGain = edit.fadeIn > 0 ? Math.min(1, elapsed / edit.fadeIn) : 1;
+  const fadeOutGain = edit.fadeOut > 0 ? Math.min(1, remaining / edit.fadeOut) : 1;
+  return edit.volume * Math.min(fadeInGain, fadeOutGain);
+}
+
+function encodeAudioBufferAsWav(buffer: AudioBuffer): Blob {
+  const channels = Math.min(2, Math.max(1, buffer.numberOfChannels));
+  const sampleCount = buffer.length;
+  const bytesPerSample = 2;
+  const dataSize = sampleCount * channels * bytesPerSample;
+  const output = new ArrayBuffer(44 + dataSize);
+  const view = new DataView(output);
+  const writeAscii = (offset: number, value: string) => {
+    for (let index = 0; index < value.length; index += 1) view.setUint8(offset + index, value.charCodeAt(index));
+  };
+  writeAscii(0, "RIFF");
+  view.setUint32(4, 36 + dataSize, true);
+  writeAscii(8, "WAVE");
+  writeAscii(12, "fmt ");
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true);
+  view.setUint16(22, channels, true);
+  view.setUint32(24, buffer.sampleRate, true);
+  view.setUint32(28, buffer.sampleRate * channels * bytesPerSample, true);
+  view.setUint16(32, channels * bytesPerSample, true);
+  view.setUint16(34, 16, true);
+  writeAscii(36, "data");
+  view.setUint32(40, dataSize, true);
+  const channelData = Array.from({ length: channels }, (_, channel) => buffer.getChannelData(channel));
+  let offset = 44;
+  for (let sample = 0; sample < sampleCount; sample += 1) {
+    for (let channel = 0; channel < channels; channel += 1) {
+      const value = Math.min(1, Math.max(-1, channelData[channel][sample] || 0));
+      view.setInt16(offset, value < 0 ? value * 0x8000 : value * 0x7fff, true);
+      offset += bytesPerSample;
+    }
+  }
+  return new Blob([output], { type: "audio/wav" });
+}
+
+async function renderAudioEditBlob(blob: Blob, edit: AudioEditState): Promise<Blob> {
+  const AudioContextCtor = window.AudioContext
+    ?? (window as Window & { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+  if (!AudioContextCtor || typeof OfflineAudioContext === "undefined") {
+    throw new Error("This browser cannot render audio edits.");
+  }
+  const decodeContext = new AudioContextCtor();
+  let decoded: AudioBuffer;
+  try {
+    decoded = await decodeContext.decodeAudioData(await blob.arrayBuffer());
+  } finally {
+    if (decodeContext.state !== "closed") await decodeContext.close().catch(() => undefined);
+  }
+  const normalized = normalizeAudioEditState(edit, decoded.duration);
+  const sourceDuration = Math.max(0.05, normalized.trimEnd - normalized.trimStart);
+  const outputDuration = sourceDuration / normalized.playbackRate;
+  const frameCount = Math.max(1, Math.ceil(outputDuration * decoded.sampleRate));
+  const offline = new OfflineAudioContext(Math.min(2, Math.max(1, decoded.numberOfChannels)), frameCount, decoded.sampleRate);
+  const source = offline.createBufferSource();
+  const gain = offline.createGain();
+  source.buffer = decoded;
+  source.playbackRate.value = normalized.playbackRate;
+  source.connect(gain);
+  gain.connect(offline.destination);
+  if (normalized.fadeIn > 0) {
+    gain.gain.setValueAtTime(0, 0);
+    gain.gain.linearRampToValueAtTime(normalized.volume, normalized.fadeIn);
+  } else {
+    gain.gain.setValueAtTime(normalized.volume, 0);
+  }
+  if (normalized.fadeOut > 0) {
+    gain.gain.setValueAtTime(normalized.volume, Math.max(normalized.fadeIn, outputDuration - normalized.fadeOut));
+    gain.gain.linearRampToValueAtTime(0, outputDuration);
+  }
+  source.start(0, normalized.trimStart, sourceDuration);
+  return encodeAudioBufferAsWav(await offline.startRendering());
+}
 
 function audioFrequencyBarHeight(
   frequencyData: Uint8Array<ArrayBuffer>,
@@ -5228,7 +6231,23 @@ function audioFrequencyBarHeight(
   return AUDIO_WAVEFORM_REST_HEIGHT + Math.pow(normalized, 0.72) * (96 - AUDIO_WAVEFORM_REST_HEIGHT);
 }
 
-function AudioViewer({ url, name }: { url: string; name?: string | null }) {
+function AudioViewer({
+  url,
+  blob,
+  docId,
+  name,
+  canEdit,
+  onSaved,
+  onLiveEditBridgeChange,
+}: {
+  url: string;
+  blob: Blob | null;
+  docId?: string;
+  name?: string | null;
+  canEdit: boolean;
+  onSaved: (savedDoc: Document, savedBlob: Blob) => void;
+  onLiveEditBridgeChange?: (bridge: AudioLiveEditBridge | null) => void;
+}) {
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const waveformBarRefs = useRef<Array<HTMLSpanElement | null>>([]);
   const audioGraphRef = useRef<AudioFrequencyGraph | null>(null);
@@ -5238,6 +6257,13 @@ function AudioViewer({ url, name }: { url: string; name?: string | null }) {
   );
   const [currentTime, setCurrentTime] = useState(0);
   const [duration, setDuration] = useState(0);
+  const [audioEdit, setAudioEdit] = useState<AudioEditState>(() => normalizeAudioEditState({}, 0));
+  const audioEditRef = useRef(audioEdit);
+  const [audioAiPreview, setAudioAiPreview] = useState<AudioAiPreview | null>(null);
+  const audioAiPreviewRef = useRef<AudioAiPreview | null>(null);
+  const audioAiCommitCoordinator = useRef(createAiEditCommitCoordinator()).current;
+  const [saving, setSaving] = useState(false);
+  const [message, setMessage] = useState("");
   const displayName = name || categoryLabel("audio");
   const progress = duration > 0 ? Math.min(1, currentTime / duration) : 0;
   const playedBars = Math.round(progress * AUDIO_WAVEFORM_BAR_COUNT);
@@ -5293,16 +6319,19 @@ function AudioViewer({ url, name }: { url: string; name?: string | null }) {
         const context = new AudioContextCtor();
         const source = context.createMediaElementSource(audio);
         const analyser = context.createAnalyser();
+        const gain = context.createGain();
         analyser.fftSize = 2048;
         analyser.smoothingTimeConstant = 0.68;
         analyser.minDecibels = -92;
         analyser.maxDecibels = -18;
         source.connect(analyser);
-        analyser.connect(context.destination);
+        analyser.connect(gain);
+        gain.connect(context.destination);
         graph = {
           context,
           source,
           analyser,
+          gain,
           frequencyData: new Uint8Array(analyser.frequencyBinCount),
         };
         audioGraphRef.current = graph;
@@ -5314,6 +6343,7 @@ function AudioViewer({ url, name }: { url: string; name?: string | null }) {
     if (graph.context.state === "suspended") {
       await graph.context.resume().catch(() => undefined);
     }
+    graph.gain.gain.value = audioPreviewGain(audioEditRef.current, audio.currentTime);
     if (audio.paused || audio.ended) return;
     stopAudioAnalysis();
     drawFrequencyFrame();
@@ -5324,6 +6354,11 @@ function AudioViewer({ url, name }: { url: string; name?: string | null }) {
     resetWaveform();
     setCurrentTime(0);
     setDuration(0);
+    const resetEdit = normalizeAudioEditState({}, 0);
+    audioEditRef.current = resetEdit;
+    setAudioEdit(resetEdit);
+    audioAiPreviewRef.current = null;
+    setAudioAiPreview(null);
   }, [resetWaveform, stopAudioAnalysis, url]);
 
   useEffect(() => () => {
@@ -5332,22 +6367,154 @@ function AudioViewer({ url, name }: { url: string; name?: string | null }) {
     if (!graph) return;
     graph.source.disconnect();
     graph.analyser.disconnect();
+    graph.gain.disconnect();
     if (graph.context.state !== "closed") void graph.context.close();
     audioGraphRef.current = null;
   }, [stopAudioAnalysis]);
 
+  const applyAudioEditToPlayer = useCallback((edit: AudioEditState) => {
+    audioEditRef.current = edit;
+    setAudioEdit(edit);
+    const audio = audioRef.current;
+    if (!audio) return;
+    audio.playbackRate = edit.playbackRate;
+    if (audio.currentTime < edit.trimStart || audio.currentTime >= edit.trimEnd) {
+      audio.currentTime = edit.trimStart;
+    }
+    if (audioGraphRef.current) {
+      audioGraphRef.current.gain.gain.value = audioPreviewGain(edit, audio.currentTime);
+    }
+  }, []);
+
   const syncAudioTime = () => {
     const audio = audioRef.current;
     if (!audio) return;
+    const edit = audioEditRef.current;
+    if (edit.trimEnd > edit.trimStart && audio.currentTime >= edit.trimEnd) {
+      audio.pause();
+      audio.currentTime = edit.trimStart;
+    }
+    if (audioGraphRef.current) {
+      audioGraphRef.current.gain.gain.value = audioPreviewGain(edit, audio.currentTime);
+    }
     setCurrentTime(Number.isFinite(audio.currentTime) ? audio.currentTime : 0);
-    setDuration(Number.isFinite(audio.duration) ? audio.duration : 0);
+    const nextDuration = Number.isFinite(audio.duration) ? audio.duration : 0;
+    setDuration(nextDuration);
+    if (nextDuration > 0 && audioEditRef.current.duration !== nextDuration && !audioAiPreviewRef.current) {
+      applyAudioEditToPlayer(normalizeAudioEditState(audioEditRef.current, nextDuration));
+    }
   };
+
+  const buildAudioLiveEditContent = useCallback(() => JSON.stringify({
+    format: "manor-audio-edit-v1",
+    documentName: name || "audio",
+    edits: audioEditRef.current,
+  }, null, 2), [name]);
+
+  const applyAudioLiveEditContent = useCallback((nextContent: string, meta: EditorLiveApplyMeta) => {
+    if (meta.signal?.aborted) return false;
+    const parsed = JSON.parse(nextContent) as { format?: unknown };
+    if (!parsed || parsed.format !== "manor-audio-edit-v1") throw new Error('Audio edit JSON must preserve format "manor-audio-edit-v1".');
+    const next = normalizeAudioEditState(parsed, duration);
+    const previousPreview = audioAiPreviewRef.current;
+    if (JSON.stringify(next) === JSON.stringify(audioEditRef.current)) throw new Error("AI returned the audio without supported changes.");
+    const preview: AudioAiPreview = {
+      baseline: previousPreview?.baseline ?? structuredClone(audioEditRef.current),
+      current: next,
+      status: AiEditPreviewStatus.Animating,
+      changeCount: nextEditorLiveChangeCount(previousPreview, meta),
+    };
+    audioAiPreviewRef.current = preview;
+    setAudioAiPreview(preview);
+    applyAudioEditToPlayer(next);
+    setMessage("AI audio edit applied in the player.");
+    return true;
+  }, [applyAudioEditToPlayer, duration]);
+
+  const completeAudioAiPreview = useCallback((_content: string, meta: EditorLiveApplyMeta) => {
+    if (meta.signal?.aborted) return false;
+    const preview = audioAiPreviewRef.current;
+    if (!preview) return false;
+    const ready = { ...preview, status: AiEditPreviewStatus.Ready };
+    audioAiPreviewRef.current = ready;
+    setAudioAiPreview(ready);
+    return true;
+  }, []);
+
+  const beginAudioAiTurn = useCallback((meta: EditorLiveApplyMeta) => {
+    if (meta.signal?.aborted) return false;
+    const preview = audioAiPreviewRef.current;
+    if (!preview) return true;
+    const pending = { ...preview, status: AiEditPreviewStatus.Animating };
+    audioAiPreviewRef.current = pending;
+    setAudioAiPreview(pending);
+    return true;
+  }, []);
+
+  const rollbackAudioAiPreview = useCallback(() => {
+    if (audioAiCommitCoordinator.isCommitting()) return;
+    const preview = audioAiPreviewRef.current;
+    if (!preview) return;
+    applyAudioEditToPlayer(preview.baseline);
+    audioAiPreviewRef.current = null;
+    setAudioAiPreview(null);
+    setMessage("AI preview discarded.");
+  }, [applyAudioEditToPlayer, audioAiCommitCoordinator]);
+
+  const acceptAudioAiPreview = useCallback(async () => {
+    if (audioAiCommitCoordinator.isCommitting()) return;
+    const preview = audioAiPreviewRef.current;
+    if (!preview || preview.status !== AiEditPreviewStatus.Ready || !blob || !docId) return;
+    await audioAiCommitCoordinator.run(async () => {
+      setSaving(true);
+      setMessage("Rendering audio edit...");
+      try {
+        const savedBlob = await renderAudioEditBlob(blob, preview.current);
+        const baseName = (name || "audio").replace(/\.[^.]+$/, "");
+        const savedDoc = await api.documents.replaceFile(docId, new File([savedBlob], `${baseName}.wav`, { type: "audio/wav" }));
+        onSaved(savedDoc, savedBlob);
+        audioAiPreviewRef.current = null;
+        setAudioAiPreview(null);
+        setMessage("Audio edit saved.");
+      } catch (error) {
+        setMessage(error instanceof Error ? error.message : "Audio save failed.");
+      } finally {
+        setSaving(false);
+      }
+    });
+  }, [audioAiCommitCoordinator, blob, docId, name, onSaved]);
+
+  useEffect(() => {
+    if (!onLiveEditBridgeChange || !canEdit || !blob || !docId || duration <= 0) return undefined;
+    onLiveEditBridgeChange({
+      commitCoordinator: audioAiCommitCoordinator,
+      getContent: buildAudioLiveEditContent,
+      getTurnPreviewState: () => ({
+        changeCount: audioAiPreviewRef.current?.changeCount || 0,
+      }),
+      beginTurn: beginAudioAiTurn,
+      applyContent: applyAudioLiveEditContent,
+      complete: completeAudioAiPreview,
+      rollback: rollbackAudioAiPreview,
+    });
+    return () => onLiveEditBridgeChange(null);
+  }, [applyAudioLiveEditContent, audioAiCommitCoordinator, beginAudioAiTurn, blob, buildAudioLiveEditContent, canEdit, completeAudioAiPreview, docId, duration, onLiveEditBridgeChange, rollbackAudioAiPreview]);
 
   return (
     <section
       className="manor-editor-audio-stage"
       aria-label={`Audio preview: ${displayName}`}
     >
+      {audioAiPreview && (
+        <AiEditPreviewControls
+          className="audio-ai-edit-controls"
+          status={audioAiPreview.status}
+          changeCount={audioAiPreview.changeCount}
+          accepting={saving}
+          onAccept={acceptAudioAiPreview}
+          onDiscard={rollbackAudioAiPreview}
+        />
+      )}
       <div className="manor-editor-audio-card">
         <div className="manor-editor-audio-waveform" aria-hidden="true">
           {Array.from({ length: AUDIO_WAVEFORM_BAR_COUNT }, (_, index) => (
@@ -5376,6 +6543,14 @@ function AudioViewer({ url, name }: { url: string; name?: string | null }) {
             syncAudioTime();
           }}
         />
+        {audioAiPreview && (
+          <div className="manor-editor-audio-edit-summary" aria-label="Audio edit preview values">
+            <span>{audioEdit.trimStart.toFixed(1)}s–{audioEdit.trimEnd.toFixed(1)}s</span>
+            <span>{audioEdit.playbackRate.toFixed(2)}×</span>
+            <span>{Math.round(audioEdit.volume * 100)}%</span>
+          </div>
+        )}
+        {message && <p className="manor-editor-audio-message" role="status">{message}</p>}
       </div>
     </section>
   );
@@ -5537,23 +6712,40 @@ function AccessLogSection({ docId }: { docId: string }) {
 
 function MarkdownViewer({
   content,
+  commentAnchors = [],
   commentRanges = [],
   activeCommentId,
   onSelectCommentId,
 }: {
   content: string;
+  commentAnchors?: Comment[];
   commentRanges?: CommentTextRange[];
   activeCommentId?: string | null;
   onSelectCommentId?: (commentId: string) => void;
 }) {
   const sourceLike = useMemo(() => looksLikeScriptMarkdown(content), [content]);
+  const commentLabel = t("page.tasks.comments");
+  const commentMarkerPlugin = useMemo(
+    () => markdownCommentMarkerPlugin(commentAnchors, commentRanges, activeCommentId, commentLabel),
+    [activeCommentId, commentAnchors, commentLabel, commentRanges],
+  );
+  const selectMarkedComment = (target: EventTarget | null) => {
+    const mark = target instanceof HTMLElement
+      ? target.closest<HTMLElement>(".document-comment-mark")
+      : null;
+    if (mark?.closest("a")) return false;
+    const commentId = mark?.dataset.commentId;
+    if (!commentId) return false;
+    onSelectCommentId?.(commentId);
+    return true;
+  };
 
   if (sourceLike) {
     return (
       <div className="markdown-viewer-stage">
-        <article className="md-preview markdown-viewer-page markdown-viewer-page--source">
+        <article className="md-preview markdown-viewer-page markdown-viewer-page--source" data-comment-content-surface>
           <pre className="md-code-block markdown-viewer-source-code">
-            <code>
+            <code data-comment-source-mode="markdown">
               {renderCommentMarkedText(content, commentRanges, activeCommentId || null, onSelectCommentId || (() => {}))}
             </code>
           </pre>
@@ -5566,13 +6758,24 @@ function MarkdownViewer({
     <div className="markdown-viewer-stage">
       <article
         className="md-preview markdown-viewer-page"
+        data-comment-content-surface
+        onClick={(event) => {
+          if (selectMarkedComment(event.target)) event.preventDefault();
+        }}
       >
         <ReactMarkdown
           remarkPlugins={[remarkGfm, remarkBreaks]}
+          rehypePlugins={[commentMarkerPlugin]}
           components={{
             a({ href, children, ...props }: any) {
               return (
-                <a {...props} href={href} target="_blank" rel="noopener noreferrer" className="md-link">
+                <a
+                  {...props}
+                  href={href}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="md-link"
+                >
                   {children}
                 </a>
               );
@@ -5615,7 +6818,7 @@ function TextViewer({
   return (
     <div className="text-viewer-stage">
       <article className="text-viewer-page">
-        <pre className="text-viewer-pre">
+        <pre className="text-viewer-pre" data-comment-source-mode="text">
           {renderCommentMarkedText(content, commentRanges, activeCommentId || null, onSelectCommentId || (() => {}))}
         </pre>
       </article>
@@ -5642,6 +6845,7 @@ function ImageEditor({
 }) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const imageRef = useRef<HTMLImageElement | null>(null);
+  const loadedImageSourceRef = useRef<string | null>(null);
   const generatedPreviewUrlRef = useRef<string | null>(null);
   const drawingRef = useRef(false);
   const [imageReady, setImageReady] = useState(false);
@@ -5665,6 +6869,10 @@ function ImageEditor({
   const [saving, setSaving] = useState(false);
   const [status, setStatus] = useState("");
   const [openMenu, setOpenMenu] = useState<"adjust" | "transform" | "brush" | null>(null);
+  const [imageAiPreview, setImageAiPreview] = useState<ImageAiPreview | null>(null);
+  const imageAiPreviewRef = useRef<ImageAiPreview | null>(null);
+  const imageAiTurnCheckpointRef = useRef<ImageAiTurnCheckpoint | null>(null);
+  const imageAiCommitCoordinator = useRef(createAiEditCommitCoordinator()).current;
 
   const outputType = useMemo(() => imageExportType(docName, mimeType), [docName, mimeType]);
   const requiresRasterConversion = useMemo(() => {
@@ -5678,6 +6886,17 @@ function ImageEditor({
     if (generatedPreviewUrlRef.current) {
       URL.revokeObjectURL(generatedPreviewUrlRef.current);
       generatedPreviewUrlRef.current = null;
+    }
+  }, []);
+  const clearImageTurnCheckpoint = useCallback((preserveSourceUrl?: string) => {
+    const checkpointSourceUrl = imageAiTurnCheckpointRef.current?.sourceUrl;
+    imageAiTurnCheckpointRef.current = null;
+    if (
+      checkpointSourceUrl?.startsWith("blob:")
+      && checkpointSourceUrl !== preserveSourceUrl
+      && checkpointSourceUrl !== generatedPreviewUrlRef.current
+    ) {
+      URL.revokeObjectURL(checkpointSourceUrl);
     }
   }, []);
   const imageStateRef = useRef({
@@ -5710,6 +6929,7 @@ function ImageEditor({
 
   useEffect(() => {
     revokeGeneratedPreviewUrl();
+    clearImageTurnCheckpoint();
     setSourceUrl(url);
     setRotation(0);
     setFlipX(false);
@@ -5722,9 +6942,12 @@ function ImageEditor({
     setActiveStroke(null);
     setTool("select");
     setOpenMenu(null);
-  }, [revokeGeneratedPreviewUrl, url]);
+  }, [clearImageTurnCheckpoint, revokeGeneratedPreviewUrl, url]);
 
-  useEffect(() => revokeGeneratedPreviewUrl, [revokeGeneratedPreviewUrl]);
+  useEffect(() => () => {
+    revokeGeneratedPreviewUrl();
+    clearImageTurnCheckpoint();
+  }, [clearImageTurnCheckpoint, revokeGeneratedPreviewUrl]);
 
   useEffect(() => {
     const element = canvasViewportRef.current;
@@ -5742,23 +6965,39 @@ function ImageEditor({
   }, []);
 
   useEffect(() => {
-    let cancelled = false;
-    const img = new Image();
-    img.onload = () => {
-      if (cancelled) return;
-      imageRef.current = img;
-      setCanvasSize({ width: img.naturalWidth, height: img.naturalHeight });
+    if (loadedImageSourceRef.current === sourceUrl && imageRef.current) {
+      setCanvasSize({
+        width: imageRef.current.naturalWidth,
+        height: imageRef.current.naturalHeight,
+      });
+      setImageReady(true);
+      return () => {
+        if (loadedImageSourceRef.current === sourceUrl) {
+          loadedImageSourceRef.current = null;
+          imageRef.current = null;
+          setImageReady(false);
+        }
+      };
+    }
+    const controller = new AbortController();
+    setImageReady(false);
+    void loadImageElement(sourceUrl, controller.signal).then((image) => {
+      imageRef.current = image;
+      loadedImageSourceRef.current = sourceUrl;
+      setCanvasSize({ width: image.naturalWidth, height: image.naturalHeight });
       setImageReady(true);
       setStatus((current) => current.startsWith("AI generated image") ? current : "");
-    };
-    img.onerror = () => {
-      if (!cancelled) setStatus("Image could not be loaded.");
-    };
-    img.src = sourceUrl;
+    }).catch((error) => {
+      if (error instanceof DOMException && error.name === "AbortError") return;
+      setStatus("Image could not be loaded.");
+    });
     return () => {
-      cancelled = true;
-      imageRef.current = null;
-      setImageReady(false);
+      controller.abort();
+      if (loadedImageSourceRef.current === sourceUrl) {
+        loadedImageSourceRef.current = null;
+        imageRef.current = null;
+        setImageReady(false);
+      }
     };
   }, [sourceUrl]);
 
@@ -5833,7 +7072,7 @@ function ImageEditor({
   }, []);
 
   const handlePointerDown = (event: any) => {
-    if (!canEdit || tool !== "draw" || !imageReady) return;
+    if (imageAiPreviewRef.current || !canEdit || tool !== "draw" || !imageReady) return;
     event.preventDefault();
     const point = canvasPoint(event);
     const stroke = {
@@ -5848,12 +7087,13 @@ function ImageEditor({
   };
 
   const handlePointerMove = (event: any) => {
-    if (!canEdit || !drawingRef.current || tool !== "draw") return;
+    if (imageAiPreviewRef.current || !canEdit || !drawingRef.current || tool !== "draw") return;
     const point = canvasPoint(event);
     setActiveStroke((stroke) => stroke ? { ...stroke, points: [...stroke.points, point] } : stroke);
   };
 
   const finishStroke = (event: any) => {
+    if (imageAiPreviewRef.current) return;
     if (!drawingRef.current) return;
     drawingRef.current = false;
     event.currentTarget.releasePointerCapture?.(event.pointerId);
@@ -5864,6 +7104,7 @@ function ImageEditor({
   };
 
   const resetEdits = () => {
+    if (imageAiPreviewRef.current) return;
     setRotation(0);
     setFlipX(false);
     setFlipY(false);
@@ -5890,6 +7131,13 @@ function ImageEditor({
   }), [outputType.mime, renderCanvas]);
 
   const buildImageLiveEditContent = useCallback(() => {
+    imageAiTurnCheckpointRef.current = {
+      sourceUrl,
+      state: structuredClone(normalizeImageLiveEditState(imageStateRef.current)),
+      preview: imageAiPreviewRef.current
+        ? structuredClone(imageAiPreviewRef.current)
+        : null,
+    };
     return JSON.stringify({
       format: "manor-image-edit-v1",
       documentName: docName || "image",
@@ -5903,7 +7151,7 @@ function ImageEditor({
       },
       edits: imageStateRef.current,
     }, null, 2);
-  }, [canvasSize.height, canvasSize.width, docName]);
+  }, [canvasSize.height, canvasSize.width, docName, sourceUrl]);
 
   const applyImageEditState = useCallback((state: ReturnType<typeof normalizeImageLiveEditState>) => {
     setRotation(state.rotation);
@@ -5920,75 +7168,64 @@ function ImageEditor({
     setTool("select");
   }, []);
 
-  const localImageEditContent = useCallback((userRequest: string, currentContent: string) => {
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(currentContent);
-    } catch {
-      return null;
-    }
-    const currentState = normalizeImageLiveEditState(parsed);
-    const nextState = { ...currentState, strokes: [...currentState.strokes] };
-    const request = userRequest.toLowerCase();
-    let changed = false;
-    const setField = <K extends keyof typeof nextState>(key: K, value: (typeof nextState)[K]) => {
-      if (JSON.stringify(nextState[key]) === JSON.stringify(value)) return;
-      nextState[key] = value;
-      changed = true;
-    };
-
-    if (/reset|restore|original|清除|还原|恢复|重置/.test(request)) {
-      setField("rotation", 0);
-      setField("flipX", false);
-      setField("flipY", false);
-      setField("brightness", 100);
-      setField("contrast", 100);
-      setField("saturation", 100);
-      setField("hue", 0);
-      setField("strokes", []);
-    }
-    if (/left|counterclockwise|逆时针|向左/.test(request)) setField("rotation", (nextState.rotation + 270) % 360);
-    else if (/rotate|right|clockwise|旋转|顺时针|向右/.test(request)) setField("rotation", (nextState.rotation + 90) % 360);
-    if (/horizontal|flip h|左右|水平/.test(request)) setField("flipX", !nextState.flipX);
-    if (/vertical|flip v|上下|垂直/.test(request)) setField("flipY", !nextState.flipY);
-    if (/black.?white|grayscale|grey|gray|黑白|灰度/.test(request)) setField("saturation", 0);
-    if (/bright|lighter|曝光|变亮|亮一点|更亮/.test(request)) setField("brightness", Math.min(180, nextState.brightness + 18));
-    if (/dark|darker|变暗|暗一点|更暗/.test(request)) setField("brightness", Math.max(40, nextState.brightness - 18));
-    if (/contrast|对比/.test(request)) setField("contrast", Math.min(180, nextState.contrast + 18));
-    if (/saturat|colorful|vivid|鲜艳|饱和/.test(request)) setField("saturation", Math.min(200, nextState.saturation + 24));
-    if (/warm|warmer|暖|偏黄|yellow/.test(request)) setField("hue", Math.min(180, nextState.hue + 16));
-    if (/cool|cooler|冷|偏蓝|blue/.test(request)) setField("hue", Math.max(-180, nextState.hue - 16));
-    if (/color|颜色|色彩|调色/.test(request) && !/black.?white|grayscale|grey|gray|黑白|灰度/.test(request)) {
-      setField("saturation", Math.min(200, nextState.saturation + 20));
-      setField("hue", nextState.hue === 0 ? 10 : nextState.hue);
-    }
-    if (/enhance|improve|polish|better|美化|优化|好看|清晰|质感/.test(request)) {
-      setField("brightness", Math.max(nextState.brightness, 108));
-      setField("contrast", Math.max(nextState.contrast, 116));
-      setField("saturation", Math.max(nextState.saturation, 112));
-    }
-    if (/remove.*draw|clear.*draw|erase.*draw|清除涂鸦|删除涂鸦|去掉涂鸦/.test(request)) {
-      setField("strokes", []);
-    }
-
-    if (!changed) return null;
-    return JSON.stringify({
-      format: "manor-image-edit-v1",
-      documentName: docName || "image",
-      edits: nextState,
-    }, null, 2);
-  }, [docName]);
-
-  const applyGeneratedImagePreview = useCallback(async (imageUrl: string, meta: EditorLiveApplyMeta) => {
-    if (!meta.complete || !imageUrl) return;
+  const applyGeneratedImagePreview = useCallback(async (
+    imageUrl: string,
+    meta: EditorLiveApplyMeta,
+  ): Promise<boolean> => {
+    if (!imageUrl || meta.signal?.aborted) return false;
+    cancelActiveEditorInteractions();
+    drawingRef.current = false;
+    setActiveStroke(null);
+    const previousPreview = imageAiPreviewRef.current;
+    const baseline = previousPreview?.baseline ?? structuredClone(normalizeImageLiveEditState(imageStateRef.current));
+    const baselineSourceUrl = previousPreview?.baselineSourceUrl ?? sourceUrl;
     setStatus("Loading AI generated image...");
-    const objectUrl = await imageUrlToObjectUrl(imageUrl);
-    revokeGeneratedPreviewUrl();
+    setImageReady(false);
+    const objectUrl = await imageUrlToObjectUrl(imageUrl, meta.signal);
+    if (meta.signal?.aborted) {
+      if (objectUrl.startsWith("blob:")) URL.revokeObjectURL(objectUrl);
+      return false;
+    }
+    let image: HTMLImageElement;
+    try {
+      image = await loadImageElement(objectUrl, meta.signal);
+    } catch (error) {
+      if (objectUrl.startsWith("blob:")) URL.revokeObjectURL(objectUrl);
+      throw error;
+    }
+    if (meta.signal?.aborted) {
+      if (objectUrl.startsWith("blob:")) URL.revokeObjectURL(objectUrl);
+      return false;
+    }
+    const protectedSourceUrl = imageAiTurnCheckpointRef.current?.sourceUrl;
+    if (
+      generatedPreviewUrlRef.current
+      && generatedPreviewUrlRef.current !== protectedSourceUrl
+    ) {
+      URL.revokeObjectURL(generatedPreviewUrlRef.current);
+    }
+    generatedPreviewUrlRef.current = null;
     if (objectUrl.startsWith("blob:")) generatedPreviewUrlRef.current = objectUrl;
+    imageRef.current = image;
+    loadedImageSourceRef.current = objectUrl;
+    setCanvasSize({ width: image.naturalWidth, height: image.naturalHeight });
+    setImageReady(true);
     setSourceUrl(objectUrl);
-    applyImageEditState(normalizeImageLiveEditState({}));
+    const nextState = normalizeImageLiveEditState({});
+    const preview: ImageAiPreview = {
+      baseline,
+      baselineSourceUrl,
+      current: nextState,
+      currentSourceUrl: objectUrl,
+      status: AiEditPreviewStatus.Animating,
+      changeCount: nextEditorLiveChangeCount(previousPreview, meta),
+    };
+    imageAiPreviewRef.current = preview;
+    setImageAiPreview(preview);
+    applyImageEditState(nextState);
     setStatus("AI generated image applied. Review it, then Save image to write the changes.");
-  }, [applyImageEditState, revokeGeneratedPreviewUrl]);
+    return true;
+  }, [applyImageEditState, sourceUrl]);
 
   const getImageLiveEditAttachmentFiles = useCallback(async () => {
     const blob = await canvasToBlob();
@@ -6003,13 +7240,12 @@ function ImageEditor({
   }, [canvasToBlob, outputType.extension, outputType.mime]);
 
   const applyImageLiveEditContent = useCallback(async (next: string, meta: EditorLiveApplyMeta) => {
-    if (!meta.complete) return;
+    if (meta.signal?.aborted) return false;
     try {
       const parsed = JSON.parse(next);
       const replacementImageUrl = extractReplacementImageUrl(parsed);
       if (replacementImageUrl) {
-        await applyGeneratedImagePreview(replacementImageUrl, meta);
-        return true;
+        return await applyGeneratedImagePreview(replacementImageUrl, meta);
       }
       if (!parsed || typeof parsed !== "object" || (parsed as { format?: unknown }).format !== "manor-image-edit-v1") {
         throw new Error('Image edit JSON must preserve format "manor-image-edit-v1".');
@@ -6019,6 +7255,20 @@ function ImageEditor({
       if (JSON.stringify(nextState) === JSON.stringify(currentState)) {
         throw new Error("AI returned the image without making any supported changes.");
       }
+      cancelActiveEditorInteractions();
+      drawingRef.current = false;
+      setActiveStroke(null);
+      const previousPreview = imageAiPreviewRef.current;
+      const preview: ImageAiPreview = {
+        baseline: previousPreview?.baseline ?? structuredClone(currentState),
+        baselineSourceUrl: previousPreview?.baselineSourceUrl ?? sourceUrl,
+        current: structuredClone(nextState),
+        currentSourceUrl: sourceUrl,
+        status: AiEditPreviewStatus.Animating,
+        changeCount: nextEditorLiveChangeCount(previousPreview, meta),
+      };
+      imageAiPreviewRef.current = preview;
+      setImageAiPreview(preview);
       applyImageEditState(nextState);
       setStatus("AI edit applied. Review it, then Save image to write the changes.");
       return true;
@@ -6026,14 +7276,86 @@ function ImageEditor({
       setStatus(error instanceof Error ? error.message : "AI edit returned invalid image edits.");
       throw error;
     }
-  }, [applyGeneratedImagePreview, applyImageEditState]);
+  }, [applyGeneratedImagePreview, applyImageEditState, sourceUrl]);
+
+  const completeImageAiPreview = useCallback((_content: string, meta: EditorLiveApplyMeta) => {
+    if (meta.signal?.aborted) return false;
+    const preview = imageAiPreviewRef.current;
+    if (!preview) return false;
+    clearImageTurnCheckpoint(preview.currentSourceUrl);
+    const ready = { ...preview, status: AiEditPreviewStatus.Ready };
+    imageAiPreviewRef.current = ready;
+    setImageAiPreview(ready);
+    return true;
+  }, [clearImageTurnCheckpoint]);
+
+  const beginImageAiTurn = useCallback((meta: EditorLiveApplyMeta) => {
+    if (meta.signal?.aborted) return false;
+    const preview = imageAiPreviewRef.current;
+    if (!preview) return true;
+    const pending = { ...preview, status: AiEditPreviewStatus.Animating };
+    imageAiPreviewRef.current = pending;
+    setImageAiPreview(pending);
+    return true;
+  }, []);
+
+  const restoreImageAiTurn = useCallback((_content: string, meta: EditorLiveApplyMeta) => {
+    if (meta.signal?.aborted) return false;
+    const checkpoint = imageAiTurnCheckpointRef.current;
+    if (!checkpoint?.preview) return false;
+    const currentGeneratedUrl = generatedPreviewUrlRef.current;
+    if (
+      currentGeneratedUrl
+      && currentGeneratedUrl !== checkpoint.sourceUrl
+    ) {
+      URL.revokeObjectURL(currentGeneratedUrl);
+    }
+    generatedPreviewUrlRef.current = checkpoint.sourceUrl.startsWith("blob:")
+      ? checkpoint.sourceUrl
+      : null;
+    setSourceUrl(checkpoint.sourceUrl);
+    applyImageEditState(checkpoint.state);
+    const restoredPreview: ImageAiPreview = {
+      ...checkpoint.preview,
+      current: structuredClone(checkpoint.state),
+      currentSourceUrl: checkpoint.sourceUrl,
+      status: AiEditPreviewStatus.Ready,
+    };
+    imageAiPreviewRef.current = restoredPreview;
+    setImageAiPreview(restoredPreview);
+    setStatus("Previous AI preview restored.");
+    return true;
+  }, [applyImageEditState]);
+
+  const rollbackImageAiPreview = useCallback(() => {
+    if (imageAiCommitCoordinator.isCommitting()) return;
+    const preview = imageAiPreviewRef.current;
+    if (!preview) {
+      clearImageTurnCheckpoint(sourceUrl);
+      return;
+    }
+    revokeGeneratedPreviewUrl();
+    clearImageTurnCheckpoint();
+    setSourceUrl(preview.baselineSourceUrl);
+    applyImageEditState(preview.baseline);
+    imageAiPreviewRef.current = null;
+    setImageAiPreview(null);
+    setStatus("AI preview discarded.");
+  }, [applyImageEditState, clearImageTurnCheckpoint, imageAiCommitCoordinator, revokeGeneratedPreviewUrl, sourceUrl]);
 
   useEffect(() => {
     if (!onLiveEditBridgeChange || !canEdit || !imageReady) return undefined;
     onLiveEditBridgeChange({
+      commitCoordinator: imageAiCommitCoordinator,
       getContent: buildImageLiveEditContent,
+      getTurnPreviewState: () => ({
+        changeCount: imageAiPreviewRef.current?.changeCount || 0,
+      }),
+      beginTurn: beginImageAiTurn,
       applyContent: applyImageLiveEditContent,
-      localEditContent: localImageEditContent,
+      complete: completeImageAiPreview,
+      restore: restoreImageAiTurn,
+      rollback: rollbackImageAiPreview,
       getAttachmentFiles: getImageLiveEditAttachmentFiles,
       applyGeneratedImage: applyGeneratedImagePreview,
       supportsImageGeneration: true,
@@ -6042,16 +7364,20 @@ function ImageEditor({
   }, [
     applyGeneratedImagePreview,
     applyImageLiveEditContent,
+    beginImageAiTurn,
     buildImageLiveEditContent,
     canEdit,
+    completeImageAiPreview,
     getImageLiveEditAttachmentFiles,
+    imageAiCommitCoordinator,
     imageReady,
-    localImageEditContent,
     onLiveEditBridgeChange,
+    restoreImageAiTurn,
+    rollbackImageAiPreview,
   ]);
 
   const downloadEditedImage = async () => {
-    if (!hasEdits) return;
+    if (imageAiPreviewRef.current || !hasEdits) return;
     try {
       const blob = await canvasToBlob();
       const objectUrl = URL.createObjectURL(blob);
@@ -6065,8 +7391,11 @@ function ImageEditor({
     }
   };
 
-  const saveEditedImage = async () => {
-    if (!docId || !canEdit || !hasEdits) return;
+  const saveEditedImage = async (
+    options: { acceptAiPreview?: boolean } = {},
+  ): Promise<boolean> => {
+    if (imageAiPreviewRef.current && !options.acceptAiPreview) return false;
+    if (!docId || !canEdit || !hasEdits || !imageReady) return false;
     setSaving(true);
     setStatus("Saving image...");
     try {
@@ -6074,13 +7403,28 @@ function ImageEditor({
       const file = new File([blob], imageEditFileName(docName, outputType.extension), { type: outputType.mime });
       const savedDoc = await api.documents.replaceFile(docId, file);
       onSaved(savedDoc, blob);
-      resetEdits();
+      if (!options.acceptAiPreview) resetEdits();
       setStatus("Saved to current image.");
+      return true;
     } catch (err: any) {
       setStatus(err?.message || "Save failed");
+      return false;
     } finally {
       setSaving(false);
     }
+  };
+
+  const acceptImageAiPreview = async () => {
+    if (imageAiCommitCoordinator.isCommitting()) return;
+    const preview = imageAiPreviewRef.current;
+    if (!preview || preview.status !== AiEditPreviewStatus.Ready || !imageReady) return;
+    await imageAiCommitCoordinator.run(async () => {
+      if (!await saveEditedImage({ acceptAiPreview: true })) return;
+      clearImageTurnCheckpoint();
+      imageAiPreviewRef.current = null;
+      setImageAiPreview(null);
+      resetEdits();
+    });
   };
 
   const renderMenu = (
@@ -6120,7 +7464,22 @@ function ImageEditor({
 
   return (
     <div className="manor-editor-media-stage image-editor-stage">
-      <div className="manor-editor-toolbar image-editor-toolbar">
+      {imageAiPreview && (
+        <AiEditPreviewControls
+          className="image-ai-edit-controls"
+          status={imageAiPreview.status}
+          changeCount={imageAiPreview.changeCount}
+          accepting={saving}
+          acceptDisabled={!imageReady}
+          onAccept={acceptImageAiPreview}
+          onDiscard={rollbackImageAiPreview}
+        />
+      )}
+      {imageAiPreview && <AiEditPreviewInteractionShield />}
+      <div
+        className="manor-editor-toolbar image-editor-toolbar"
+        {...aiEditInteractionLockProps(Boolean(imageAiPreview))}
+      >
         {canEdit && (
           <>
             <button
@@ -6225,7 +7584,7 @@ function ImageEditor({
           <button
             type="button"
             className={editorToolButtonClass({ primary: true })}
-            onClick={saveEditedImage}
+            onClick={() => { void saveEditedImage(); }}
             disabled={!imageReady || !hasEdits || saving}
           >
             <IconCheck size={15} /> {saving ? "Saving" : "Save image"}
@@ -6243,7 +7602,11 @@ function ImageEditor({
         )}
       </div>
 
-      <div ref={canvasViewportRef} className="image-editor-canvas-viewport">
+      <div
+        ref={canvasViewportRef}
+        className="image-editor-canvas-viewport"
+        {...aiEditInteractionLockProps(Boolean(imageAiPreview))}
+      >
         {showingOriginal && imageReady && (
           <img
             src={sourceUrl}
@@ -6294,11 +7657,13 @@ export default function FileViewer() {
   const location = useLocation();
   const taskOutputPreview = useMemo(() => getTaskOutputPreview(location.state), [location.state]);
   const viewerSurfaceRef = useRef<HTMLDivElement | null>(null);
+  const fetchGenerationRef = useRef(0);
 
   const queryClient = useQueryClient();
   const [doc, setDoc] = useState<Document | null>(null);
   const [content, setContent] = useState<string>("");
-  const [downloadUrl, setDownloadUrl] = useState<string>("");
+  const [downloadUrl, setDownloadUrlState] = useState<string>("");
+  const [downloadBlob, setDownloadBlob] = useState<Blob | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [previewError, setPreviewError] = useState("");
@@ -6309,21 +7674,37 @@ export default function FileViewer() {
   const [shareDialogOpen, setShareDialogOpen] = useState(false);
   const [pdfLiveEditBridge, setPdfLiveEditBridge] = useState<PdfLiveEditBridge | null>(null);
   const [imageLiveEditBridge, setImageLiveEditBridge] = useState<ImageLiveEditBridge | null>(null);
+  const [audioLiveEditBridge, setAudioLiveEditBridge] = useState<AudioLiveEditBridge | null>(null);
+  const fileViewerMountedRef = useRef(false);
+  const downloadUrlRef = useRef("");
+  const replaceDownloadUrl = useCallback((nextUrl: string) => {
+    if (!fileViewerMountedRef.current && nextUrl) {
+      if (nextUrl.startsWith("blob:")) URL.revokeObjectURL(nextUrl);
+      return;
+    }
+    const previousUrl = downloadUrlRef.current;
+    if (previousUrl !== nextUrl && previousUrl.startsWith("blob:")) {
+      URL.revokeObjectURL(previousUrl);
+    }
+    downloadUrlRef.current = nextUrl;
+    setDownloadUrlState(nextUrl);
+  }, []);
   const canEditCurrentDoc = canEditDocument(currentUser, doc);
   const canCommentCurrentDoc = canCommentDocument(currentUser, doc);
   const canShareCurrentDoc = canShareDocument(currentUser, doc);
+  const currentDocumentId = doc?.source === "task_output_preview" ? docId : doc?.id || docId;
 
   // Live grants + shares — only fetched when the dialog opens (saves a
   // round-trip on most viewer loads).
   const grantsQuery = useQuery({
-    queryKey: ["doc-grants", docId],
-    queryFn: () => api.docPermissions.listGrants(docId!),
-    enabled: !!docId && shareDialogOpen && canShareCurrentDoc,
+    queryKey: ["doc-grants", currentDocumentId],
+    queryFn: () => api.docPermissions.listGrants(currentDocumentId!),
+    enabled: !!currentDocumentId && shareDialogOpen && canShareCurrentDoc,
   });
   const sharesQuery = useQuery({
-    queryKey: ["doc-shares", docId],
-    queryFn: () => api.docPermissions.listShares(docId!),
-    enabled: !!docId && shareDialogOpen && canShareCurrentDoc,
+    queryKey: ["doc-shares", currentDocumentId],
+    queryFn: () => api.docPermissions.listShares(currentDocumentId!),
+    enabled: !!currentDocumentId && shareDialogOpen && canShareCurrentDoc,
   });
 
   // Resolve grant subject_id (user uuid) -> email/display_name for the
@@ -6352,9 +7733,8 @@ export default function FileViewer() {
     return map;
   }, [grantUsersQuery.data]);
 
-  const category = doc ? detectCategory(doc) : "unsupported";
-  const legacyOfficeReadOnly = isLegacyOfficeFile(doc?.name);
-  const knowledgeReturnTo = getKnowledgeReturnTo(location.state);
+  const category = doc ? getFilePreviewKind(doc) : "unsupported";
+  const viewerReturnTo = getViewerReturnTo(location.state);
   const isTaskOutputPreview = doc?.source === "task_output_preview";
   const { data: viewerComments = [] } = useQuery<Comment[]>({
     queryKey: ["comments", "document", doc?.id],
@@ -6366,11 +7746,16 @@ export default function FileViewer() {
   useEffect(() => {
     if (category !== "pdf") setPdfLiveEditBridge(null);
     if (category !== "image") setImageLiveEditBridge(null);
-  }, [category, docId]);
+  }, [category, currentDocumentId]);
 
   const goBack = useCallback(() => {
-    navigate(knowledgeReturnTo || "/knowledge");
-  }, [knowledgeReturnTo, navigate]);
+    const historyIndex = Number(window.history.state?.idx);
+    if (Number.isFinite(historyIndex) && historyIndex > 0) {
+      navigate(-1);
+      return;
+    }
+    navigate(viewerReturnTo || "/knowledge", { replace: true });
+  }, [navigate, viewerReturnTo]);
 
   // ── Permission-v1: derive flags from doc metadata ──────────────────────
   const requiresWatermark =
@@ -6378,6 +7763,7 @@ export default function FileViewer() {
   const watermarkDensity: "normal" | "dense" =
     doc?.classification === "restricted" ? "dense" : "normal";
   const restrictDownload =
+    (!isTaskOutputPreview && !doc?.current_user_capabilities?.includes("download")) ||
     doc?.classification === "restricted" ||
     (doc?.quarantine_status && doc.quarantine_status !== "clean");
   const bannerReason: "quarantine" | "pii" | null =
@@ -6389,22 +7775,50 @@ export default function FileViewer() {
 
   const fetchDoc = useCallback(async () => {
     if (!docId) return;
+    const requestId = ++fetchGenerationRef.current;
+    const isCurrentRequest = () => fetchGenerationRef.current === requestId;
     setLoading(true);
     setError("");
     setPreviewError("");
+    replaceDownloadUrl("");
+    setDownloadBlob(null);
     try {
-      const meta = await api.documents.get(docId);
+      const resolvedDocumentId = docId;
+      const meta = await api.documents.get(resolvedDocumentId);
+      if (!isCurrentRequest()) return;
       setDoc(meta);
 
-      const cat = detectCategory(meta);
+      const cat = getFilePreviewKind(meta);
+      if (cat === "diagram") {
+        try {
+          assertDiagramPreviewFileSize(meta.file_size);
+          const response = await api.documents.previewResponse(resolvedDocumentId);
+          const text = await readDiagramPreviewText(response);
+          if (!isCurrentRequest()) return;
+          setContent(text);
+        } catch (diagramError) {
+          if (!isCurrentRequest()) return;
+          setContent("");
+          setPreviewError(
+            diagramError instanceof Error
+              ? diagramError.message
+              : "This diagram is not available for preview.",
+          );
+        }
+      }
+
       if (["text", "markdown", "code", "html", "csv", "json"].includes(cat)) {
         try {
-          setContent(await readDocumentTextViaDownload(docId));
+          const text = await readDocumentTextViaDownload(resolvedDocumentId);
+          if (!isCurrentRequest()) return;
+          setContent(text);
         } catch (downloadTextError) {
           try {
-            const res = await api.documents.getContent(docId);
+            const res = await api.documents.getContent(resolvedDocumentId);
+            if (!isCurrentRequest()) return;
             setContent(typeof res === "string" ? res : res.content);
           } catch {
+            if (!isCurrentRequest()) return;
             setContent("");
             setPreviewError(
               downloadTextError instanceof Error
@@ -6421,71 +7835,95 @@ export default function FileViewer() {
           if (["video", "audio"].includes(cat)) {
             const streamUrl = api.documents.streamUrl(meta);
             if (streamUrl) {
-              setDownloadUrl(streamUrl);
+              if (!isCurrentRequest()) return;
+              replaceDownloadUrl(streamUrl);
             } else {
-              const url = await api.documents.download(docId);
-              setDownloadUrl(url);
+              const url = await api.documents.preview(resolvedDocumentId);
+              if (!isCurrentRequest()) {
+                if (url.startsWith("blob:")) URL.revokeObjectURL(url);
+                return;
+              }
+              replaceDownloadUrl(url);
             }
           } else {
-            const url = await api.documents.download(docId);
-            setDownloadUrl(url);
+            const blob = await api.documents.previewBlob(resolvedDocumentId);
+            if (!isCurrentRequest()) return;
+            const url = URL.createObjectURL(blob);
+            setDownloadBlob(blob);
+            replaceDownloadUrl(url);
           }
         } catch (downloadErr) {
-          setDownloadUrl("");
+          if (!isCurrentRequest()) return;
+          replaceDownloadUrl("");
+          setDownloadBlob(null);
           setPreviewError(
             downloadErr instanceof Error
               ? downloadErr.message
-              : "This document exists, but its file preview is not available yet.",
+            : "This document exists, but its file preview is not available yet.",
           );
         }
       }
     } catch (err: any) {
+      if (!isCurrentRequest()) return;
       let resolvedPreview = taskOutputPreview;
-      // Backward compatibility for links created before generated files had a
-      // canonical open_url. Those routes encoded an entity-FS path as if it
-      // were a Document id. Read that exact path instead of returning 404.
-      if (!resolvedPreview && docId && /[/.]/.test(docId)) {
-        const legacyFsPath = generatedFileFsPath({ fs_path: docId });
-        if (legacyFsPath) {
-          try {
-            const result = await api.fs.read(legacyFsPath);
-            resolvedPreview = {
-              id: legacyFsPath,
-              name: fileNameFromReference(legacyFsPath),
-              fs_path: legacyFsPath,
-              mime_type: result.mime_type,
-              encoding: result.encoding === "base64" ? "base64" : "utf-8",
-              content: result.content,
-            };
-          } catch {
-            // Preserve the original Document error when neither address exists.
-          }
-        }
-      }
       if (resolvedPreview) {
         const previewDoc = taskOutputPreviewDocument(docId, resolvedPreview);
         setDoc(previewDoc);
+        if (getFilePreviewKind(previewDoc) === "diagram") {
+          try {
+            const diagramContent = diagramPreviewTextFromFsRead({
+              content: resolvedPreview.content,
+              encoding: resolvedPreview.encoding || "utf-8",
+              size: previewDoc.file_size,
+            });
+            setContent(diagramContent);
+            setDownloadBlob(null);
+            replaceDownloadUrl("");
+            setError("");
+            return;
+          } catch (diagramError) {
+            setContent("");
+            setDownloadBlob(null);
+            replaceDownloadUrl("");
+            setPreviewError(
+              diagramError instanceof Error
+                ? diagramError.message
+                : "This diagram is not available for preview.",
+            );
+            setError("");
+            return;
+          }
+        }
         if (resolvedPreview.encoding === "base64") {
-          const previewUrl = URL.createObjectURL(
-            taskOutputPreviewBlob(resolvedPreview, previewDoc.mime_type),
-          );
+          const previewBlob = taskOutputPreviewBlob(resolvedPreview, previewDoc.mime_type);
+          const previewUrl = URL.createObjectURL(previewBlob);
           setContent("");
-          setDownloadUrl((current) => {
-            if (current.startsWith("blob:")) URL.revokeObjectURL(current);
-            return previewUrl;
-          });
+          setDownloadBlob(previewBlob);
+          replaceDownloadUrl(previewUrl);
         } else {
           setContent(resolvedPreview.content);
-          setDownloadUrl("");
+          setDownloadBlob(null);
+          replaceDownloadUrl("");
         }
         setError("");
         return;
       }
       setError(err.message || "Failed to load document");
     } finally {
-      setLoading(false);
+      if (isCurrentRequest()) setLoading(false);
     }
-  }, [docId, taskOutputPreview]);
+  }, [docId, replaceDownloadUrl, taskOutputPreview]);
+
+  useEffect(() => {
+    fileViewerMountedRef.current = true;
+    return () => {
+      fileViewerMountedRef.current = false;
+      fetchGenerationRef.current += 1;
+      const currentUrl = downloadUrlRef.current;
+      if (currentUrl.startsWith("blob:")) URL.revokeObjectURL(currentUrl);
+      downloadUrlRef.current = "";
+    };
+  }, []);
 
   useEffect(() => { fetchDoc(); }, [fetchDoc]);
 
@@ -6525,25 +7963,42 @@ export default function FileViewer() {
 
   const handlePdfSaved = useCallback((savedDoc: Document, savedBlob: Blob) => {
     const savedUrl = URL.createObjectURL(savedBlob);
+    if (!fileViewerMountedRef.current) {
+      URL.revokeObjectURL(savedUrl);
+      return;
+    }
     setDoc(savedDoc);
-    setDownloadUrl((current) => {
-      if (current.startsWith("blob:")) URL.revokeObjectURL(current);
-      return savedUrl;
-    });
-  }, []);
+    setDownloadBlob(savedBlob);
+    replaceDownloadUrl(savedUrl);
+  }, [replaceDownloadUrl]);
 
   const handleImageSaved = useCallback((savedDoc: Document, savedBlob: Blob) => {
     const savedUrl = URL.createObjectURL(savedBlob);
+    if (!fileViewerMountedRef.current) {
+      URL.revokeObjectURL(savedUrl);
+      return;
+    }
     setDoc(savedDoc);
+    setDownloadBlob(savedBlob);
     api.documents.clearDownloadCache(savedDoc.id);
-    setDownloadUrl((current) => {
-      if (current.startsWith("blob:")) URL.revokeObjectURL(current);
-      return savedUrl;
-    });
-  }, []);
+    replaceDownloadUrl(savedUrl);
+  }, [replaceDownloadUrl]);
+
+  const handleAudioSaved = useCallback((savedDoc: Document, savedBlob: Blob) => {
+    const savedUrl = URL.createObjectURL(savedBlob);
+    if (!fileViewerMountedRef.current) {
+      URL.revokeObjectURL(savedUrl);
+      return;
+    }
+    setDoc(savedDoc);
+    setDownloadBlob(savedBlob);
+    api.documents.clearDownloadCache(savedDoc.id);
+    replaceDownloadUrl(savedUrl);
+  }, [replaceDownloadUrl]);
+
 
   const handleDownload = async () => {
-    if (!docId) return;
+    if (!currentDocumentId || restrictDownload) return;
     try {
       if (isTaskOutputPreview && taskOutputPreview) {
         const url = URL.createObjectURL(
@@ -6556,11 +8011,15 @@ export default function FileViewer() {
         window.setTimeout(() => URL.revokeObjectURL(url), 0);
         return;
       }
-      const url = downloadUrl || await api.documents.download(docId);
+      // Re-authorize the download action; never reuse bytes cached for preview.
+      const url = await api.documents.download(currentDocumentId, { cache: false });
       const a = document.createElement("a");
       a.href = url;
       a.download = doc?.name || "download";
       a.click();
+      if (url.startsWith("blob:")) {
+        window.setTimeout(() => URL.revokeObjectURL(url), 0);
+      }
     } catch {
       // silently fail
     }
@@ -6583,11 +8042,12 @@ export default function FileViewer() {
     });
   }, [category, commentAnchor, content, doc]);
 
-  const handleOpenAiEdit = useCallback(() => {
-    if (category !== "pdf" && category !== "image") return;
+  const fileViewerAiEditDetail = useMemo<EditorLiveChatDetail | null>(() => {
+    if (category !== "pdf" && category !== "image" && category !== "audio") return null;
+    if (!currentDocumentId) return null;
 
-    const baseDetail: EditorLiveChatDetail = {
-      documentId: docId,
+    const baseDetail: EditorLiveChatMetadata = {
+      documentId: currentDocumentId,
       documentName: doc?.name,
       fileType: doc?.file_type || category,
       mimeType: doc?.mime_type,
@@ -6595,38 +8055,74 @@ export default function FileViewer() {
     };
 
     if (category === "pdf" && pdfLiveEditBridge) {
-      openEditorLiveChat({
+      return {
         ...baseDetail,
         fileType: "pdf",
         editorType: "PDF",
-        getContent: pdfLiveEditBridge.getContent,
-        applyContent: (next, meta) => {
-          return pdfLiveEditBridge.applyContent(next, meta);
-        },
-        localEditContent: pdfLiveEditBridge.localEditContent,
-      });
-      return;
+        adapter: createEditorLiveAdapter({
+          target: { kind: AiEditTargetKind.Document, id: currentDocumentId },
+          read: pdfLiveEditBridge.getContent,
+          getTurnPreviewState: pdfLiveEditBridge.getTurnPreviewState,
+          beginTurn: pdfLiveEditBridge.beginTurn,
+          preview: pdfLiveEditBridge.applyContent,
+          complete: pdfLiveEditBridge.complete,
+          rollback: pdfLiveEditBridge.rollback,
+          commitCoordinator: pdfLiveEditBridge.commitCoordinator,
+        }),
+      };
     }
 
     if (category === "image" && imageLiveEditBridge) {
-      openEditorLiveChat({
+      return {
         ...baseDetail,
         fileType: "image",
         editorType: "Image",
-        getContent: imageLiveEditBridge.getContent,
-        applyContent: (next, meta) => {
-          return imageLiveEditBridge.applyContent(next, meta);
-        },
-        localEditContent: imageLiveEditBridge.localEditContent,
+        adapter: createEditorLiveAdapter({
+          target: { kind: AiEditTargetKind.Image, id: currentDocumentId },
+          read: imageLiveEditBridge.getContent,
+          getTurnPreviewState: imageLiveEditBridge.getTurnPreviewState,
+          beginTurn: imageLiveEditBridge.beginTurn,
+          preview: imageLiveEditBridge.applyContent,
+          complete: imageLiveEditBridge.complete,
+          restore: imageLiveEditBridge.restore,
+          rollback: imageLiveEditBridge.rollback,
+          commitCoordinator: imageLiveEditBridge.commitCoordinator,
+        }),
         getAttachmentFiles: imageLiveEditBridge.getAttachmentFiles,
-        applyGeneratedImage: (imageUrl, meta) => {
-          return imageLiveEditBridge.applyGeneratedImage(imageUrl, meta);
-        },
+        applyGeneratedImage: imageLiveEditBridge.applyGeneratedImage,
         supportsImageGeneration: imageLiveEditBridge.supportsImageGeneration,
         instruction: `Tell me what to change in ${doc?.name || "this image"}. Try: make it clearer, brighten it, increase contrast, replace text inside the image, regenerate it from this image, rotate right, flip horizontal, or reset edits.`,
-      });
+      };
     }
-  }, [category, doc?.file_type, doc?.mime_type, doc?.name, docId, imageLiveEditBridge, pdfLiveEditBridge]);
+
+    if (category === "audio" && audioLiveEditBridge) {
+      return {
+        ...baseDetail,
+        fileType: "audio",
+        editorType: "Audio",
+        adapter: createEditorLiveAdapter({
+          target: { kind: AiEditTargetKind.Audio, id: currentDocumentId },
+          read: audioLiveEditBridge.getContent,
+          getTurnPreviewState: audioLiveEditBridge.getTurnPreviewState,
+          beginTurn: audioLiveEditBridge.beginTurn,
+          preview: audioLiveEditBridge.applyContent,
+          complete: audioLiveEditBridge.complete,
+          rollback: audioLiveEditBridge.rollback,
+          commitCoordinator: audioLiveEditBridge.commitCoordinator,
+        }),
+        instruction: `Tell me how to edit ${doc?.name || "this audio"}. You can trim the beginning or end, change speed or volume, and add fade in or fade out.`,
+      };
+    }
+    return null;
+  }, [audioLiveEditBridge, category, currentDocumentId, doc?.file_type, doc?.mime_type, doc?.name, imageLiveEditBridge, pdfLiveEditBridge]);
+
+  useEffect(() => {
+    if (fileViewerAiEditDetail) updateEditorLiveChat(fileViewerAiEditDetail);
+  }, [fileViewerAiEditDetail]);
+
+  const handleOpenAiEdit = useCallback(() => {
+    if (fileViewerAiEditDetail) openEditorLiveChat(fileViewerAiEditDetail);
+  }, [fileViewerAiEditDetail]);
 
   if (loading) {
     return (
@@ -6682,17 +8178,17 @@ export default function FileViewer() {
           </div>
         </div>
         <div className="manor-editor-actions">
-          {!isTaskOutputPreview && canEditCurrentDoc && (category === "pdf" || category === "image") && (
+          {!isTaskOutputPreview && canEditCurrentDoc && (category === "pdf" || category === "image" || category === "audio") && (
             <AiEditButton
               onClick={handleOpenAiEdit}
-              disabled={category === "pdf" ? !pdfLiveEditBridge : !imageLiveEditBridge}
-              title={(category === "pdf" ? !pdfLiveEditBridge : !imageLiveEditBridge) ? t("status.loading") : undefined}
+              disabled={category === "pdf" ? !pdfLiveEditBridge : category === "image" ? !imageLiveEditBridge : !audioLiveEditBridge}
+              title={(category === "pdf" ? !pdfLiveEditBridge : category === "image" ? !imageLiveEditBridge : !audioLiveEditBridge) ? t("status.loading") : undefined}
               iconSize={16}
             />
           )}
-          {isEditable(category) && !legacyOfficeReadOnly && !isTaskOutputPreview && canEditCurrentDoc && (
+          {isEditable(category, doc) && !isTaskOutputPreview && canEditCurrentDoc && (
             <Link
-              to={`/editor/${docId}`}
+              to={`/editor/${currentDocumentId}`}
               state={location.state}
               className={editorToolButtonClass({ icon: true })}
               aria-label={t("action.edit")}
@@ -6703,7 +8199,7 @@ export default function FileViewer() {
           )}
           {!isTaskOutputPreview && canEditCurrentDoc && (category === "video" || doc?.name.toLowerCase().endsWith(".video-edit.json")) && (
             <Link
-              to={`/video-editor/${docId}`}
+              to={`/video-editor/${currentDocumentId}`}
               state={location.state}
               className={editorToolButtonClass({ icon: true })}
               aria-label="Edit video"
@@ -6712,7 +8208,9 @@ export default function FileViewer() {
               <IconEdit size={16} />
             </Link>
           )}
-          {!isTaskOutputPreview && category === "html" && <SitePublishAction doc={doc} />}
+          {!isTaskOutputPreview && canEditCurrentDoc && category === "html" && (
+            <SitePublishAction doc={doc} />
+          )}
           {!isTaskOutputPreview && canShareCurrentDoc && (
             <button
               onClick={() => setShareDialogOpen(true)}
@@ -6756,7 +8254,7 @@ export default function FileViewer() {
             onClick={restrictDownload ? undefined : handleDownload}
             disabled={!!restrictDownload}
             aria-label={t("page.file_viewer.download")}
-            title={restrictDownload ? (doc?.classification === "restricted" ? t("page.file_viewer.download_blocked.restricted") : t("page.file_viewer.download_blocked.quarantine")) : t("page.file_viewer.download")}
+            title={restrictDownload ? (doc?.classification === "restricted" ? t("page.file_viewer.download_blocked.restricted") : doc?.quarantine_status && doc.quarantine_status !== "clean" ? t("page.file_viewer.download_blocked.quarantine") : t("permissions.banner.viewer_only")) : t("page.file_viewer.download")}
             className={editorToolButtonClass({ icon: true })}
             style={{
               opacity: restrictDownload ? 0.45 : 1,
@@ -6834,6 +8332,7 @@ export default function FileViewer() {
         {!previewError && category === "markdown" && (
           <MarkdownViewer
             content={content}
+            commentAnchors={viewerAnchoredComments}
             commentRanges={viewerCommentRanges}
             activeCommentId={activeCommentId}
             onSelectCommentId={handleSelectViewerCommentId}
@@ -6846,7 +8345,7 @@ export default function FileViewer() {
 
         {!previewError && category === "code" && (
           <pre className="file-viewer-plain-code">
-            <code>
+            <code data-comment-source-mode="code">
               {renderCommentMarkedText(content, viewerCommentRanges, activeCommentId, handleSelectViewerCommentId)}
             </code>
           </pre>
@@ -6855,7 +8354,7 @@ export default function FileViewer() {
         {!previewError && category === "image" && downloadUrl && (
           <ImageEditor
             url={downloadUrl}
-            docId={docId}
+            docId={currentDocumentId}
             docName={doc?.name}
             mimeType={doc?.mime_type}
             onSaved={handleImageSaved}
@@ -6875,7 +8374,15 @@ export default function FileViewer() {
         )}
 
         {!previewError && category === "audio" && downloadUrl && (
-          <AudioViewer url={downloadUrl} name={doc?.name} />
+          <AudioViewer
+            url={downloadUrl}
+            blob={downloadBlob}
+            docId={currentDocumentId}
+            name={doc?.name}
+            canEdit={canEditCurrentDoc}
+            onSaved={handleAudioSaved}
+            onLiveEditBridgeChange={setAudioLiveEditBridge}
+          />
         )}
 
         {!previewError && category === "pdf" && (
@@ -6883,7 +8390,8 @@ export default function FileViewer() {
             {downloadUrl ? (
               <PdfJsViewer
                 url={downloadUrl}
-                docId={docId}
+                blob={downloadBlob}
+                docId={currentDocumentId}
                 docName={doc?.name}
                 onDownload={handleDownload}
                 onSaved={handlePdfSaved}
@@ -6902,16 +8410,30 @@ export default function FileViewer() {
         {!previewError && category === "docx" && downloadUrl && (
           <DocxViewer
             url={downloadUrl}
+            blob={downloadBlob}
+            docId={currentDocumentId}
+            docName={doc?.name}
+            onDownload={handleDownload}
             commentAnchors={viewerAnchoredComments}
             activeCommentId={activeCommentId}
             onSelectCommentId={handleSelectViewerCommentId}
+            preferSelectablePreview={commentsOpen}
           />
         )}
 
-        {!previewError && category === "xlsx" && downloadUrl && <XlsxViewer url={downloadUrl} />}
+        {!previewError && category === "xlsx" && downloadUrl && (
+          <XlsxViewer url={downloadUrl} blob={downloadBlob} />
+        )}
 
         {!previewError && category === "pptx" && (
-          downloadUrl && <PptxViewer url={downloadUrl} docId={docId} onDownload={handleDownload} />
+          downloadUrl && (
+            <PptxViewer
+              url={downloadUrl}
+              blob={downloadBlob}
+              docId={currentDocumentId}
+              onDownload={handleDownload}
+            />
+          )
         )}
 
         {!previewError && category === "csv" && (() => {
@@ -6940,10 +8462,20 @@ export default function FileViewer() {
 
         {!previewError && category === "json" && (
           <pre className="file-viewer-plain-code">
-            <code>
+            <code data-comment-source-mode="json">
               {renderCommentMarkedText(content, viewerCommentRanges, activeCommentId, handleSelectViewerCommentId)}
             </code>
           </pre>
+        )}
+
+        {!previewError && category === "diagram" && (
+          <Suspense fallback={<LoadingSpinner />}>
+            <LazyDiagramArtifactViewer
+              content={content}
+              title={doc?.name || "Diagram"}
+              fileType={doc?.file_type || undefined}
+            />
+          </Suspense>
         )}
 
         {!previewError && category === "unsupported" && (
@@ -7214,22 +8746,108 @@ export default function FileViewer() {
           flex: 1;
           min-height: 0;
           overflow: auto;
-          display: flex;
-          justify-content: center;
-          align-items: flex-start;
-          padding: clamp(48px, 8vh, 84px) clamp(20px, 5vw, 72px) 60px;
+          display: block;
+          position: relative;
+          padding: clamp(32px, 6vh, 64px) clamp(16px, 4vw, 56px) 64px;
           box-sizing: border-box;
+          background: var(--surface-muted);
+        }
+        .docx-comment-anchor-bar {
+          width: min(100%, 816px);
+          margin: 0 auto 16px;
+          padding: 12px;
+          box-sizing: border-box;
+          border: 1px solid var(--border-subtle);
+          border-radius: var(--radius-card);
+          background: var(--surface-panel);
+          box-shadow: var(--shadow-sm);
+        }
+        .docx-comment-anchor-heading {
+          display: flex;
+          align-items: center;
+          gap: 7px;
+          margin-bottom: 8px;
+          color: var(--text-muted);
+          font-size: 12px;
+          font-weight: 700;
+        }
+        .docx-comment-anchor-list {
+          display: grid;
+          gap: 6px;
+          max-height: 168px;
+          overflow: auto;
+        }
+        .docx-comment-anchor {
+          display: grid;
+          grid-template-columns: minmax(0, 1fr) minmax(120px, 0.7fr);
+          gap: 12px;
+          width: 100%;
+          padding: 9px 10px;
+          border: 1px solid transparent;
+          border-radius: var(--radius-control);
+          background: var(--surface-muted);
+          color: var(--text-default);
+          text-align: left;
+          cursor: pointer;
+        }
+        .docx-comment-anchor:hover,
+        .docx-comment-anchor.is-active {
+          border-color: var(--border-default);
+          background: var(--surface-sunken);
+        }
+        .docx-comment-anchor:focus-visible {
+          outline: 2px solid var(--accent-ring);
+          outline-offset: 2px;
+        }
+        .docx-comment-anchor-quote,
+        .docx-comment-anchor-body {
+          overflow: hidden;
+          text-overflow: ellipsis;
+          white-space: nowrap;
+          font-size: 12px;
+          line-height: 1.4;
+        }
+        .docx-comment-anchor-quote { font-weight: 650; }
+        .docx-comment-anchor-body { color: var(--text-muted); }
+        .docx-server-pages {
+          display: grid;
+          gap: 24px;
+          width: min(100%, 816px);
+          margin: 0 auto;
+        }
+        .docx-server-page {
+          position: relative;
+          width: 100%;
+          margin: 0;
+          overflow: hidden;
+          border-radius: var(--radius-control);
+          background: var(--surface-panel);
+          box-shadow: var(--shadow-md);
+        }
+        .docx-server-page img {
+          display: block;
+          width: 100%;
+          height: 100%;
+          object-fit: contain;
+        }
+        .docx-server-page-loading {
+          position: absolute;
+          inset: 0;
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          color: var(--text-muted);
         }
         .docx-viewer-page {
           width: min(100%, 816px);
+          margin: 0 auto;
           min-height: min(1056px, calc(100dvh - 168px));
           box-sizing: border-box;
           padding: 64px 72px;
-          background: #ffffff;
-          border: 1px solid rgba(231, 229, 228, 0.74);
-          border-radius: 10px;
-          box-shadow: 0 18px 50px rgba(28, 25, 23, 0.09);
-          color: #292524;
+          background: var(--surface-panel);
+          border-radius: var(--radius-control);
+          box-shadow: var(--shadow-md);
+          color: var(--text-default);
           font-size: 15px;
           line-height: 1.68;
         }
@@ -7258,10 +8876,12 @@ export default function FileViewer() {
         }
         @media (max-width: 760px) {
           .docx-viewer-stage { padding: 16px; }
-          .docx-viewer-page {
+          .docx-server-pages { gap: 16px; }
+          .docx-comment-anchor { grid-template-columns: minmax(0, 1fr); gap: 3px; }
+          .docx-viewer-legacy-page {
             min-height: 70vh;
             padding: 34px 26px;
-            border-radius: 12px;
+            border-radius: var(--radius-card);
           }
         }
       `}</style>

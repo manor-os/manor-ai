@@ -1,35 +1,18 @@
-import { useEffect, useState } from "react";
-import {
-  siNotion,
-  siGmail,
-  siDiscord,
-  siGithub,
-  siStripe,
-  siPaypal,
-  siShopify,
-  siWoocommerce,
-  siGooglecalendar,
-  siGoogledrive,
-  siWhatsapp,
-  siTelegram,
-  siX,
-  siYoutube,
-  siTiktok,
-  siFacebook,
-  siSquare,
-  siWechat,
-  siQuickbooks,
-  siGooglesheets,
-  siGoogledocs,
-  type BrandIcon,
-} from "../lib/brandIcons";
+import { useEffect, useRef, useState } from "react";
+import { useLocation, useSearchParams } from "react-router-dom";
+import { parseIntegrationSetupLink } from "../lib/integrationSetupLinks";
+import { integrationCatalogQueryOptions, INTEGRATION_CATALOG_QUERY_KEY } from "../lib/integrationCatalog";
+import IntegrationLogo from "../components/IntegrationLogo";
+import { getIntegrationBrandColor as getLogoColor, resolveIntegrationBrand } from "../lib/brands/catalog";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
-import { api, type WorkerResponse } from "../lib/api";
+import { api, type HealthStatus, type WorkerResponse } from "../lib/api";
 import { useToastStore } from "../stores/toast";
 import { useAuthStore } from "../stores/auth";
 import { MANOR_AGENT_ID } from "../lib/constants";
 import PageHeader from "../components/ui/PageHeader";
-import NangoConnectButton from "../components/integrations/NangoConnectButton";
+import NangoConnectButton, {
+  useNangoConnect,
+} from "../components/integrations/NangoConnectButton";
 import TabSwitcher from "../components/ui/TabSwitcher";
 import SmartToolbar from "../components/ui/SmartToolbar";
 import Modal from "../components/ui/Modal";
@@ -50,52 +33,32 @@ import { openDetail, closeDetail, useDetailStore } from "../stores/detail";
 import InfoPopover from "../components/ui/InfoPopover";
 
 import { t } from "../lib/i18n";
+import {
+  connectorAccessState,
+  integrationReadyCount,
+} from "../lib/integration-usability.mjs";
 // Backend sentinel for "this secret is stored; don't change it". See
 // _SECRET_MASK / credential_preview in apps/api/routers/integrations.py.
 const UNCHANGED = "__unchanged__";
 
 
 import {
-  IconCalendar,
   IconFolder,
-  IconDocument,
   IconChat,
-  IconWebhook,
   IconDollar,
   IconCheckCircle,
-  IconWarning,
-  IconSettings,
-  IconExternalLink,
   IconRefresh,
   IconPause,
   IconPlay,
   IconTerminal,
   IconTrash,
-  IconTelegram,
-  IconWhatsApp,
-  IconWeChat,
-  IconSlack,
-  IconGitHub,
-  IconStripe,
-  IconTwilio,
-  IconEmail,
   IconCode,
   IconChevronDown,
   IconChevronRight,
-  IconLinkedIn,
-  IconTwitter,
-  IconFacebook,
-  IconYouTube,
-  IconTikTok,
-  IconShoppingCart,
-  IconStore,
   IconBox,
-  IconPayPal,
-  IconGoogle,
   IconCloud,
-  IconExcelGrid,
+  IconMegaphone,
   IconMoreHorizontal,
-  IconGlobe,
   IconEdit,
   type IconProps,
 } from "../components/icons";
@@ -111,6 +74,7 @@ type IntegrationAudience =
   | "cloud"
 type IntegrationDisplayCategoryKey =
   | "communication"
+  | "social_marketing"
   | "work_apps"
   | "commerce_payments"
   | "developer_tools"
@@ -126,25 +90,30 @@ const INTEGRATION_DISPLAY_CATEGORIES: Record<
     Icon: IconChat,
     rank: 20,
   },
+  social_marketing: {
+    labelKey: "page.integrations.category_social_marketing",
+    Icon: IconMegaphone,
+    rank: 30,
+  },
   work_apps: {
     labelKey: "page.integrations.category_work_apps",
     Icon: IconFolder,
-    rank: 30,
+    rank: 40,
   },
   commerce_payments: {
     labelKey: "page.integrations.category_commerce_payments",
     Icon: IconDollar,
-    rank: 40,
+    rank: 50,
   },
   developer_tools: {
     labelKey: "page.integrations.category_developer_tools",
     Icon: IconCode,
-    rank: 50,
+    rank: 60,
   },
   ai_media: {
     labelKey: "page.integrations.category_ai_media",
     Icon: IconCloud,
-    rank: 60,
+    rank: 70,
   },
   other: {
     labelKey: "page.integrations.category_other",
@@ -159,8 +128,8 @@ const INTEGRATION_CATEGORY_ALIASES: Record<
 > = {
   email: "communication",
   messaging: "communication",
-  social: "communication",
-  marketing: "communication",
+  social: "social_marketing",
+  marketing: "social_marketing",
   productivity: "work_apps",
   finance: "commerce_payments",
   "e-commerce": "commerce_payments",
@@ -174,7 +143,7 @@ const INTEGRATION_SERVER_CATEGORY_OVERRIDES: Record<
   IntegrationDisplayCategoryKey
 > = {
   _google_workspace: "work_apps",
-  tavily: "developer_tools",
+  tavily: "ai_media",
   github: "developer_tools",
   webhook: "developer_tools",
   replicate: "ai_media",
@@ -187,8 +156,14 @@ const INTEGRATION_SERVER_CATEGORY_OVERRIDES: Record<
 /* ------------------------------------------------------------------ */
 
 export default function Integrations() {
+  const location = useLocation();
+  const [searchParams, setSearchParams] = useSearchParams();
+  const requestedProvider = parseIntegrationSetupLink(`${location.pathname}${location.search}`, window.location.origin);
   const [tab, setTab] = useState<Tab>("agents");
   const [integrationSearch, setIntegrationSearch] = useState("");
+  useEffect(() => {
+    if (requestedProvider) setTab("agents");
+  }, [requestedProvider, location.key]);
 
   // Shared: count of bound channels for the tab badge
   const { data: bindings } = useQuery({
@@ -247,6 +222,13 @@ export default function Integrations() {
       {/* ═══ FOR AGENTS (MCP) TAB ═══ */}
       {tab === "agents" && (
         <MCPAgentsPanel
+          key={requestedProvider ? `${requestedProvider}:${location.key}` : "catalog"}
+          requestedProvider={requestedProvider}
+          onClearProvider={() => {
+            const next = new URLSearchParams(searchParams);
+            next.delete("provider");
+            setSearchParams(next);
+          }}
           search={integrationSearch}
           onClearSearch={() => setIntegrationSearch("")}
         />
@@ -264,154 +246,6 @@ export default function Integrations() {
    current user via tool_pool → agent_permission_service → mcp module.
    ══════════════════════════════════════════════════════════════════════════ */
 
-/** Map server_key → brand icon from the global icon library. Each
- *  provider gets its real logo where we have one; fall back to a generic
- *  functional icon (and, as a final fallback, a monogram) otherwise. */
-const MCP_LOGO_COLOR: Record<string, string> = {
-  gmail: "#EA4335",
-  google_calendar: "#4285F4",
-  google_drive: "#0F9D58",
-  slack: "#4A154B",
-  discord: "#5865F2",
-  telegram: "#229ED9",
-  wechat_personal: "#07C160",
-  wechat_official: "#07C160",
-  whatsapp: "#25D366",
-  twilio: "#F22F46",
-  linkedin: "#0A66C2",
-  twitter_x: "#111111",
-  github: "#181717",
-  webhook: "#57534e",
-  quickbooks: "#2CA01C",
-  stripe: "#635BFF",
-  paypal: "#003087",
-  facebook: "#1877F2",
-  youtube: "#FF0000",
-  tiktok: "#111111",
-  shopify: "#96BF48",
-  woocommerce: "#7F54B3",
-  square: "#3E4348",
-  tiktok_shop: "#FE2C55",
-  amazon: "#FF9900",
-  email: "#78716c",
-  notion: "#111111",
-  // Microsoft 365 — Outlook + OneDrive + MS Calendar in MS blue,
-  // Teams in MS purple, Excel in MS green. All five share one Azure
-  // AD app registration but render with their own product brand.
-  outlook: "#0078D4",
-  onedrive: "#0364B8",
-  ms_calendar: "#0078D4",
-  ms_teams: "#6264A7",
-  ms_excel: "#107C41",
-};
-
-function getLogoColor(serverKey?: string | null, fallback = "#78716c") {
-  if (!serverKey) return fallback;
-  return MCP_LOGO_COLOR[serverKey] || fallback;
-}
-
-const MCP_ICON: Record<string, (p: IconProps) => JSX.Element> = {
-  gmail: IconEmail,
-  email: IconEmail,
-  google_calendar: IconCalendar,
-  google_drive: IconFolder,
-  notion: IconDocument,
-  slack: IconSlack,
-  discord: IconChat,
-  telegram: IconTelegram,
-  wechat: IconWeChat,
-  wechat_personal: IconWeChat,
-  wechat_official: IconWeChat,
-  whatsapp: IconWhatsApp,
-  twilio: IconTwilio,
-  linkedin: IconLinkedIn,
-  twitter_x: IconTwitter,
-  github: IconGitHub,
-  webhook: IconWebhook,
-  quickbooks: IconDollar,
-  stripe: IconStripe,
-  paypal: IconPayPal,
-  facebook: IconFacebook,
-  youtube: IconYouTube,
-  tiktok: IconTikTok,
-  // E-commerce — generic commerce glyphs coloured by MCP_LOGO_COLOR.
-  shopify: IconShoppingCart,
-  woocommerce: IconStore,
-  square: IconBox,
-  tiktok_shop: IconShoppingCart,
-  amazon: IconStore,
-  // Microsoft 365 — generic icons coloured by MCP_LOGO_COLOR. Excel
-  // gets its own grid mark to read clearly at 16-20px.
-  outlook: IconEmail,
-  onedrive: IconCloud,
-  ms_calendar: IconCalendar,
-  ms_teams: IconChat,
-  ms_excel: IconExcelGrid,
-};
-
-/* Official brand marks from simple-icons (CC0). Providers simple-icons has
- * removed at the brand's request (Slack, LinkedIn, Amazon, Twilio, …) fall
- * back to the in-house MCP_ICON below. */
-const BRAND_SI: Record<string, BrandIcon> = {
-  gmail: siGmail,
-  email: siGmail,
-  notion: siNotion,
-  discord: siDiscord,
-  github: siGithub,
-  stripe: siStripe,
-  paypal: siPaypal,
-  shopify: siShopify,
-  woocommerce: siWoocommerce,
-  google_calendar: siGooglecalendar,
-  google_drive: siGoogledrive,
-  google_sheets: siGooglesheets,
-  google_docs: siGoogledocs,
-  whatsapp: siWhatsapp,
-  telegram: siTelegram,
-  twitter_x: siX,
-  youtube: siYoutube,
-  tiktok: siTiktok,
-  tiktok_shop: siTiktok,
-  facebook: siFacebook,
-  square: siSquare,
-  wechat: siWechat,
-  wechat_personal: siWechat,
-  wechat_official: siWechat,
-  quickbooks: siQuickbooks,
-};
-
-/**
- * IntegrationLogo — official brand logo for an integration. Uses the
- * simple-icons (CC0) mark where available, in the brand colour; otherwise
- * renders the provided fallback (in-house icon / monogram).
- */
-function IntegrationLogo({
-  serverKey,
-  size,
-  fallback,
-}: {
-  serverKey: string;
-  size: number;
-  fallback: React.ReactNode;
-}) {
-  const si = BRAND_SI[serverKey];
-  if (si) {
-    return (
-      <svg
-        role="img"
-        viewBox="0 0 24 24"
-        width={size}
-        height={size}
-        fill={`#${si.hex}`}
-        style={{ display: "block" }}
-        aria-hidden
-      >
-        <path d={si.path} />
-      </svg>
-    );
-  }
-  return <>{fallback}</>;
-}
 
 const CARD_SECTION_HEIGHT = {
   header: 88,
@@ -583,8 +417,22 @@ function ChannelBindingsPanel() {
     queryFn: () => api.agents.list(),
   });
 
+  const { data: subscriptions } = useQuery({
+    queryKey: ["agent-subscriptions"],
+    queryFn: () => api.agents.subscriptions(),
+  });
+
+  const { data: workspaces } = useQuery({
+    queryKey: ["workspaces", "channel-bindings"],
+    queryFn: () => api.workspaces.list(),
+  });
+
   const upsert = useMutation({
-    mutationFn: (v: { channel_config_id: string; agent_id: string | null }) =>
+    mutationFn: (v: {
+      channel_config_id: string;
+      agent_id?: string | null;
+      agent_subscription_id?: string | null;
+    }) =>
       api.integrations.upsertChannelBinding(v),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["channel-bindings"] });
@@ -701,12 +549,17 @@ function ChannelBindingsPanel() {
               key={b.channel_config_id}
               binding={b}
               agents={agents || []}
-              onAssign={(agentId) =>
+              subscriptions={subscriptions || []}
+              workspaces={workspaces || []}
+              onAssign={(selectionId) => {
+                const isWhatsApp = b.channel_type === "whatsapp";
                 upsert.mutate({
                   channel_config_id: b.channel_config_id,
-                  agent_id: agentId,
-                })
-              }
+                  ...(isWhatsApp
+                    ? { agent_subscription_id: selectionId }
+                    : { agent_id: selectionId }),
+                });
+              }}
               onUnbind={() => {
                 if (
                   b.bound_channel_id &&
@@ -738,7 +591,10 @@ type ChannelBindingView = {
   status: string;
   bound_channel_id: string | null;
   bound_agent_id: string | null;
+  bound_agent_subscription_id: string | null;
+  bound_workspace_id: string | null;
   agent_name: string | null;
+  workspace_name: string | null;
   last_inbound_at?: string | null;
   last_outbound_at?: string | null;
 };
@@ -789,21 +645,26 @@ function channelDetailText(binding: ChannelBindingView, label: string) {
 function BindingRow({
   binding,
   agents,
+  subscriptions,
+  workspaces,
   onAssign,
   onUnbind,
   busy,
 }: {
   binding: ChannelBindingView;
   agents: any[];
+  subscriptions: any[];
+  workspaces: any[];
   onAssign: (agentId: string | null) => void;
   onUnbind: () => void;
   busy: boolean;
 }) {
-  const Icon = MCP_ICON[binding.channel_type] || MCP_ICON[binding.provider];
+  const brandProvider = resolveIntegrationBrand(binding.channel_type)
+    ? binding.channel_type : binding.provider;
   const iconColor = "#78716c";
-  const channelLabel = channelTypeLabel(binding);
   const label = friendlyChannelName(binding);
   const detailText = channelDetailText(binding, label);
+  const isWhatsApp = binding.channel_type === "whatsapp";
   const isBound = !!binding.bound_agent_id;
   const statusColor = isBound ? "#5f928a" : "#c8c1ba";
   const statusLabel = isBound
@@ -815,7 +676,7 @@ function BindingRow({
 
   // The Manor Master Agent is always available even if the entity
   // hasn't created any custom agents.
-  const options = [
+  const agentOptions = [
     {
       id: MANOR_AGENT_ID,
       name: t("page.integrations.manor_master_agent"),
@@ -824,11 +685,41 @@ function BindingRow({
     },
     ...agents.filter((a) => a.id !== MANOR_AGENT_ID),
   ];
-  const assignedAgent = options.find((a) => a.id === binding.bound_agent_id);
+  const agentsById = new Map(agents.map((agent) => [agent.id, agent]));
+  const workspacesById = new Map(
+    workspaces.map((workspace) => [workspace.id, workspace]),
+  );
+  const subscriptionOptions = subscriptions
+    .filter((subscription) => (
+      subscription.status === "active"
+      && subscription.workspace_id
+      && agentsById.has(subscription.agent_id)
+      && workspacesById.has(subscription.workspace_id)
+      && workspacesById.get(subscription.workspace_id)?.status === "active"
+    ))
+    .map((subscription) => {
+      const agent = agentsById.get(subscription.agent_id);
+      const workspace = workspacesById.get(subscription.workspace_id);
+      return {
+        id: subscription.id,
+        agent_id: subscription.agent_id,
+        name: agent?.name || t("page.agent_dashboard.agent_singular"),
+        role: workspace?.name || "",
+        avatar_url: agent?.avatar_url || null,
+      };
+    });
+  const options = isWhatsApp ? subscriptionOptions : agentOptions;
+  const selectedOptionId = isWhatsApp
+    ? binding.bound_agent_subscription_id
+    : binding.bound_agent_id;
+  const assignedAgent = options.find((option) => option.id === selectedOptionId);
   const assignedAgentName =
     binding.agent_name ||
     assignedAgent?.name ||
     t("page.agent_dashboard.agent_singular");
+  const assignedRouteName = isWhatsApp && binding.workspace_name
+    ? `${assignedAgentName} · ${binding.workspace_name}`
+    : assignedAgentName;
   const activityItems = [
     binding.last_inbound_at
       ? {
@@ -856,13 +747,7 @@ function BindingRow({
           size={34}
           status={{ color: statusColor, label: statusLabel }}
         >
-          {Icon ? (
-            <Icon size={17} style={{ color: iconColor }} />
-          ) : (
-            <span style={{ color: iconColor }}>
-              {channelLabel.slice(0, 2).toUpperCase()}
-            </span>
-          )}
+          <IntegrationLogo provider={brandProvider} size={17} />
         </IconTile>
         <div className="channel-binding-title-block">
           <div className="channel-binding-title-row">
@@ -886,7 +771,7 @@ function BindingRow({
               seed={binding.bound_agent_id || assignedAgentName}
               size={22}
             />
-            <span>{assignedAgentName}</span>
+            <span>{assignedRouteName}</span>
           </span>
         ) : (
           <span className="channel-binding-empty-pill">
@@ -912,7 +797,7 @@ function BindingRow({
       <div className="channel-binding-actions">
         <div className="channel-binding-select-wrap">
           <Select
-            value={binding.bound_agent_id || ""}
+            value={selectedOptionId || ""}
             onChange={(v) => onAssign(v || null)}
             placeholder={t("page.integrations.bind_to_agent")}
             filterable={options.length > 6}
@@ -947,7 +832,7 @@ function BindingRow({
           />
         </div>
 
-        {!isBound && (
+        {!isBound && !isWhatsApp && (
           <Button
             variant="primary"
             size="sm"
@@ -978,9 +863,13 @@ function asRecord(value: unknown): Record<string, unknown> | null {
 function MCPAgentsPanel({
   search: externalSearch,
   onClearSearch,
+  requestedProvider,
+  onClearProvider,
 }: {
   search?: string;
   onClearSearch?: () => void;
+  requestedProvider?: string | null;
+  onClearProvider?: () => void;
 }) {
   const role = useAuthStore((s) => s.user?.role);
   const authToken = useAuthStore((s) => s.token);
@@ -1002,6 +891,7 @@ function MCPAgentsPanel({
     key: string;
     name: string;
     scopes?: string | null;
+    clientSecretRequired?: boolean;
   } | null>(null);
   const [wechatScanFor, setWechatScanFor] = useState<string | null>(null);
   const search = externalSearch ?? "";
@@ -1014,13 +904,7 @@ function MCPAgentsPanel({
     data: servers,
     isLoading,
     isError,
-  } = useQuery({
-    queryKey: ["mcp-servers"],
-    queryFn: () => api.integrations.mcpServers(),
-    enabled: privateApiEnabled,
-    retry: 1,
-    staleTime: 60_000,
-  });
+  } = useQuery(integrationCatalogQueryOptions(privateApiEnabled));
 
   async function startOAuth(
     serverKey: string,
@@ -1074,7 +958,7 @@ function MCPAgentsPanel({
         </p>
         <button
           onClick={() =>
-            queryClient.invalidateQueries({ queryKey: ["mcp-servers"] })
+            queryClient.invalidateQueries({ queryKey: INTEGRATION_CATALOG_QUERY_KEY })
           }
           style={{
             fontSize: 13,
@@ -1107,7 +991,6 @@ function MCPAgentsPanel({
   );
   // Drop internal automation-only cards from the public integration grid.
   const HIDDEN_INTERNAL_AUTOMATION_KEYS = new Set([
-    "local_browser",
     "knowledge_local",
     "chrome_knowledge_local",
   ]);
@@ -1120,6 +1003,10 @@ function MCPAgentsPanel({
     (s) => s.auth_type !== "cli_worker",
   );
   const rowsWithWorkerEntry: McpServerRow[] = baseRows;
+  let setupServer: McpServerRow | undefined = baseRowsRaw.find((server) =>
+    server.server_key === requestedProvider && !HIDDEN_INTERNAL_AUTOMATION_KEYS.has(server.server_key)
+    && server.auth_type !== "cli_worker",
+  );
 
   // Hide unconfigured OAuth cards from non-admins so regular users
   // only see things they can actually click. Admins keep seeing
@@ -1172,10 +1059,7 @@ function MCPAgentsPanel({
   let localAudienceCount = 0;
   const allAudienceCount = cloudAudienceCount + localAudienceCount;
 
-  const renderServerCard = (s: McpServerRow) => {
-    const targetWorkerId =
-      s.cli_workers?.length === 1 ? s.cli_workers[0]?.id : undefined;
-    const localStateKey = localWorkerProviderKey(s.server_key, targetWorkerId);
+  const renderServerCard = (s: McpServerRow, openOnLoad = false) => {
     return s.server_key === "_google_workspace" ? (
       <GoogleWorkspaceCard
         key="_google_workspace"
@@ -1191,6 +1075,7 @@ function MCPAgentsPanel({
     ) : (
       <ServerCard
         key={s.server_key}
+        openOnLoad={openOnLoad}
         server={s}
         canManage={canManage}
         onConnect={(connectionId) =>
@@ -1201,6 +1086,7 @@ function MCPAgentsPanel({
             key: s.server_key,
             name: s.name,
             scopes: s.scopes,
+            clientSecretRequired: s.oauth_client_secret_required,
           })
         }
         onAddApiKey={() => {
@@ -1326,7 +1212,7 @@ function MCPAgentsPanel({
       </div>
 
 
-      {showSearchEmptyState ? (
+      {showSearchEmptyState && !requestedProvider ? (
         <EmptyState
           title={t("page.integrations.no_integrations_match_your_search")}
           description={t("page.integrations.nothing_found_for_search").replace(
@@ -1341,8 +1227,17 @@ function MCPAgentsPanel({
         />
       ) : null}
 
+      {requestedProvider && (
+        <div>
+          <Button variant="ghost" onClick={onClearProvider}>{t("page.integrations.all_integrations")}</Button>
+          {setupServer
+            ? renderServerCard(setupServer, true)
+            : <EmptyState title={t("page.integrations.setup_link_unavailable")} />}
+        </div>
+      )}
+
       {/* Group by display category */}
-      {groupIntegrationsByDisplayCategory(rows).map(([cat, group]) => (
+      {!requestedProvider && groupIntegrationsByDisplayCategory(rows).map(([cat, group]) => (
         <div key={cat} className="integration-section">
           <IntegrationSectionHeader
             categoryKey={cat}
@@ -1357,7 +1252,7 @@ function MCPAgentsPanel({
               gap: 12,
             }}
           >
-            {group.map(renderServerCard)}
+            {group.map((server) => renderServerCard(server))}
           </div>
         </div>
       ))}
@@ -1424,19 +1319,19 @@ type McpServerRow = {
     expires_at: string | null;
     is_default: boolean;
     connected_at: string | null;
-    health: {
-      ok: boolean | null;
-      detail: string | null;
-      checked_at: string | null;
-      wiring?: {
-        ok: boolean | null;
-        detail: string | null;
-        configured_url?: string | null;
-        expected_url?: string | null;
-        last_error?: string | null;
-        pending_update_count?: number | null;
-      } | null;
-    } | null;
+    kind: "oauth_account";
+    ownership: "mine" | "shared";
+    owner_user_id: string | null;
+    owner_display_name: string | null;
+    can_manage: boolean;
+    can_share: boolean;
+    runtime_callable: boolean;
+    availability:
+      | "callable"
+      | "reconnect_required"
+      | "permission_denied"
+      | "load_failed";
+    health: HealthStatus | null;
   }>;
   entity_accounts: Array<{
     id: string;
@@ -1445,19 +1340,21 @@ type McpServerRow = {
     is_default: boolean;
     created_at: string | null;
     status: string;
-    health: {
-      ok: boolean | null;
-      detail: string | null;
-      checked_at: string | null;
-      wiring?: {
-        ok: boolean | null;
-        detail: string | null;
-        configured_url?: string | null;
-        expected_url?: string | null;
-        last_error?: string | null;
-        pending_update_count?: number | null;
-      } | null;
-    } | null;
+    nango_backed: boolean;
+    whatsapp_readiness_code: string | null;
+    kind: "integration";
+    ownership: "mine" | "shared";
+    owner_user_id: string | null;
+    owner_display_name: string | null;
+    can_manage: boolean;
+    can_share: boolean;
+    runtime_callable: boolean;
+    availability:
+      | "callable"
+      | "reconnect_required"
+      | "permission_denied"
+      | "load_failed";
+    health: HealthStatus | null;
   }>;
   user_connected: boolean;
   user_expires_at: string | null;
@@ -1465,6 +1362,7 @@ type McpServerRow = {
   required_permission: string | null;
   user_has_required_permission: boolean;
   agent_can_use: boolean;
+  requires_explicit_account: boolean;
   hint: string;
   /** When set, this provider is configured in our self-hosted Nango.
    *  The Connect button on the card opens Nango's hosted OAuth popup
@@ -1474,6 +1372,7 @@ type McpServerRow = {
    *  provider (env-bootstrapped or admin-overridden). False = the
    *  Connect button is disabled and we surface a hint instead. */
   oauth_configured?: boolean;
+  oauth_client_secret_required?: boolean;
   /** True when this integration is not yet production-ready.
    *  Single source of truth: backend _COMING_SOON_SERVERS. */
   coming_soon?: boolean;
@@ -1531,11 +1430,11 @@ const AUTH_LABELS: Record<
 // rows.
 
 function buildGoogleGroupRow(subs: McpServerRow[]): McpServerRow {
-  const anyConnected = subs.some(
-    (s) => s.connections.length > 0 || (s.entity_accounts?.length ?? 0) > 0,
-  );
+  const anyUserConnected = subs.some((s) => s.user_connected);
+  const anyEntityConnected = subs.some((s) => s.entity_connected);
   const allConfigured = subs.every((s) => s.oauth_configured);
   const allReady = subs.every((s) => s.agent_can_use);
+  const requiresExplicitAccount = subs.some((s) => s.requires_explicit_account);
   const anyComingSoon = subs.some((s) => s.coming_soon);
   const merged: any = {
     server_key: "_google_workspace",
@@ -1553,12 +1452,13 @@ function buildGoogleGroupRow(subs: McpServerRow[]): McpServerRow {
     supports_multi_account: false,
     connections: subs.flatMap((s) => s.connections),
     entity_accounts: subs.flatMap((s) => s.entity_accounts ?? []),
-    user_connected: anyConnected,
+    user_connected: anyUserConnected,
     user_expires_at: null,
-    entity_connected: anyConnected,
+    entity_connected: anyEntityConnected,
     required_permission: null,
     user_has_required_permission: true,
     agent_can_use: allReady,
+    requires_explicit_account: requiresExplicitAccount,
     hint: anyComingSoon ? t("page.integrations.coming_soon") : "",
     coming_soon: anyComingSoon,
     nango_provider_config_key: null,
@@ -1621,11 +1521,12 @@ function GoogleWorkspaceCard({
 }) {
   const logoColor = getLogoColor("google_calendar", "#4285F4");
   const isComingSoon = subs.some((s) => s.coming_soon);
-  const connectedCount = subs.filter(
-    (s) => s.connections.length > 0 || (s.entity_accounts?.length ?? 0) > 0,
-  ).length;
+  const readyCount = integrationReadyCount(subs);
   const total = subs.length;
-  const hasAnyConnection = connectedCount > 0;
+  const hasAnyReadyConnection = readyCount > 0;
+  const hasUnavailableStoredConnection = subs.some(
+    (s) => connectorAccessState(s) === "repair",
+  );
   const hasAuthFailure = subs.some(
     (s) =>
       s.connections.some((connection) => connection.health?.ok === false) ||
@@ -1674,28 +1575,31 @@ function GoogleWorkspaceCard({
     }
     return Array.from(byIdentity.values());
   })();
-  const statusColor = hasAuthFailure
+  const needsAttention = hasAuthFailure || hasUnavailableStoredConnection;
+  const statusColor = needsAttention
     ? "#d65f59"
-    : hasAnyConnection
+    : hasAnyReadyConnection
       ? "#168a5b"
       : "#d6d3d1";
   const statusLabel = isComingSoon
     ? t("page.integrations.coming_soon")
     : hasAuthFailure
       ? t("page.integrations.reconnect_required")
-      : connectedCount === total
-        ? t("page.integrations.ready")
-        : connectedCount > 0
-          ? t("page.integrations.connected_count_of_total")
-              .replace("{count}", String(connectedCount))
-              .replace("{total}", String(total))
-          : t("page.integrations.not_connected");
+      : hasUnavailableStoredConnection
+        ? t("page.integrations.needs_attention")
+        : readyCount === total
+          ? t("page.integrations.ready")
+          : readyCount > 0
+            ? t("page.integrations.connected_count_of_total")
+                .replace("{count}", String(readyCount))
+                .replace("{total}", String(total))
+            : t("page.integrations.not_connected");
 
   return (
     <CompactCard
       icon={
         <IconTile color={logoColor} size={34}>
-          <IconGoogle size={18} />
+          <IntegrationLogo provider="google" size={18} />
         </IconTile>
       }
       title={t("page.integrations.google_workspace")}
@@ -1709,16 +1613,16 @@ function GoogleWorkspaceCard({
             width: 7,
             height: 7,
             borderRadius: "50%",
-            background: hasAuthFailure ? statusColor : "currentColor",
+            background: needsAttention ? statusColor : "currentColor",
           }}
         />
       }
-      metaTone={hasAnyConnection && !hasAuthFailure ? "connected" : "muted"}
+      metaTone={hasAnyReadyConnection && !needsAttention ? "connected" : "muted"}
       onClick={() =>
         openDetail({
           icon: (
             <IconTile color={logoColor} size={48}>
-              <IconGoogle size={25} />
+              <IntegrationLogo provider="google" size={25} />
             </IconTile>
           ),
           title: t("page.integrations.google_workspace"),
@@ -1823,9 +1727,12 @@ function GoogleWorkspaceCard({
                 </div>
               )}
               {subs.map((s) => {
-                const hasConn =
+                const hasStoredConnection =
                   s.connections.length > 0 ||
                   (s.entity_accounts?.length ?? 0) > 0;
+                const accessState = connectorAccessState(s);
+                const hasUsableConnection = accessState === "usable";
+                const subNeedsAttention = accessState === "repair";
                 const subAuthFailed =
                   s.connections.some(
                     (connection) => connection.health?.ok === false,
@@ -1833,7 +1740,6 @@ function GoogleWorkspaceCard({
                   (s.entity_accounts ?? []).some(
                     (account) => account.health?.ok === false,
                   );
-                const Icon = MCP_ICON[s.server_key];
                 const friendlyName =
                   s.server_key === "gmail"
                     ? t("page.integrations.gmail")
@@ -1876,17 +1782,8 @@ function GoogleWorkspaceCard({
                         }}
                       >
                         <IntegrationLogo
-                          serverKey={s.server_key}
+                          provider={s.server_key}
                           size={14}
-                          fallback={
-                            Icon ? (
-                              <Icon size={14} />
-                            ) : (
-                              <span style={{ fontSize: 11, fontWeight: 700 }}>
-                                {friendlyName[0]}
-                              </span>
-                            )
-                          }
                         />
                       </div>
                       <div style={{ flex: 1, minWidth: 0 }}>
@@ -1904,7 +1801,9 @@ function GoogleWorkspaceCard({
                             ? t("page.integrations.coming_soon")
                             : subAuthFailed
                               ? t("page.integrations.reconnect_required")
-                              : hasConn
+                              : subNeedsAttention
+                                ? t("page.integrations.needs_attention")
+                              : hasUsableConnection
                                 ? t("status.connected")
                                 : s.oauth_configured
                                   ? t("page.integrations.ready_to_connect")
@@ -1915,7 +1814,7 @@ function GoogleWorkspaceCard({
                         <Chip size="sm" variant="slate">
                           {t("page.integrations.soon")}
                         </Chip>
-                      ) : hasConn ? (
+                      ) : hasUsableConnection ? (
                         <Chip size="sm" variant="slate">
                           {subAuthFailed ? "!" : "✓"}
                         </Chip>
@@ -1925,7 +1824,9 @@ function GoogleWorkspaceCard({
                           size="sm"
                           onClick={() => onConnect(s.server_key, s.name)}
                         >
-                          {t("page.apps.connect")}
+                          {subNeedsAttention
+                            ? t("page.integrations.reconnect_required")
+                            : t("page.apps.connect")}
                         </Button>
                       ) : canManage ? (
                         <Button
@@ -1940,7 +1841,7 @@ function GoogleWorkspaceCard({
                         </Button>
                       ) : null}
                     </div>
-                    {hasConn && (
+                    {hasStoredConnection && (
                       <div
                         style={{
                           display: "flex",
@@ -1954,7 +1855,8 @@ function GoogleWorkspaceCard({
                             key={`google-oauth-${s.server_key}-${connection.id}`}
                             connection={connection}
                             serverKey={s.server_key}
-                            showActions={canManage}
+                            showActions={connection.can_manage}
+                            canShare={connection.can_share}
                             onReconnect={() =>
                               onConnect(s.server_key, s.name, connection.id)
                             }
@@ -1966,7 +1868,8 @@ function GoogleWorkspaceCard({
                             account={account}
                             serverKey={s.server_key}
                             onEdit={() => {}}
-                            showActions={false}
+                            showActions={account.can_manage}
+                            canShare={account.can_share}
                           />
                         ))}
                         {s.oauth_configured && !isComingSoon ? (
@@ -1995,6 +1898,7 @@ function GoogleWorkspaceCard({
 
 function ServerCard({
   server,
+  openOnLoad = false,
   canManage,
   onConnect,
   onConfigureOAuth,
@@ -2003,6 +1907,7 @@ function ServerCard({
   onScanQr,
 }: {
   server: McpServerRow;
+  openOnLoad?: boolean;
   canManage: boolean;
   onConnect: (connectionId?: string) => void;
   onConfigureOAuth?: () => void;
@@ -2019,31 +1924,18 @@ function ServerCard({
   let isCliWorker = false;
   let isLocalWorkerManager = false;
   let isManagedSessionCard = false;
-  let isChromeManagedSession = false;
-  const hasConnections = server.connections.length > 0;
   const hasEntityAccounts = (server.entity_accounts?.length ?? 0) > 0;
-  const hasPartialConnection =
-    hasConnections ||
-    hasEntityAccounts ||
-    (isManagedSessionCard && server.user_connected);
-  const isReadyConnection = isManagedSessionCard
-    ? server.agent_can_use
-    : server.agent_can_use || hasPartialConnection;
+  const accessState = connectorAccessState(server);
+  const hasPartialConnection = accessState !== "connect";
+  const isReadyConnection = server.agent_can_use;
   const genericCapabilities = isManagedSessionCard
     ? []
     : server.capabilities || [];
   const showGenericCapabilities = genericCapabilities.length > 0;
   let showManagedSessionCapabilities = false;
-  let managedSessionNeedsLoginSave = false;
   let managedSessionBusy = false;
   let managedSessionActionKey = server.server_key;
   const isEntityLevel = !!server.required_permission;
-  const Icon = MCP_ICON[server.server_key];
-  const monogram =
-    server.name
-      .replace(/[^A-Za-z]/g, "")
-      .slice(0, 2)
-      .toUpperCase() || "?";
 
   // "Coming soon" — driven by the backend API response (single source of truth).
   // Cards still render so users see what's coming, but the action
@@ -2064,16 +1956,20 @@ function ServerCard({
   // credentials the upstream has refused reports agent_can_use=false and
   // reads "needs attention" below — the dot follows that, instead of
   // showing a green light next to a warning.
-  const statusColor = server.agent_can_use
-    ? "#168a5b"
-    : hasPartialConnection
-      ? "#cf9b44"
-      : "#d6d3d1";
-  const statusLabel = server.agent_can_use
-    ? t("page.integrations.ready")
-    : hasPartialConnection
-      ? t("page.integrations.needs_attention")
-      : t("page.integrations.not_connected");
+  const statusColor = server.requires_explicit_account
+    ? "#cf9b44"
+    : server.agent_can_use
+      ? "#168a5b"
+      : hasPartialConnection
+        ? "#cf9b44"
+        : "#d6d3d1";
+  const statusLabel = server.requires_explicit_account
+    ? t("page.integrations.needs_attention")
+    : server.agent_can_use
+      ? t("page.integrations.ready")
+      : hasPartialConnection
+        ? t("page.integrations.needs_attention")
+        : t("page.integrations.not_connected");
   const detailKey = `integration:${managedSessionActionKey}`;
   const currentDetailKey = useDetailStore((s) => s.payload?.key);
 
@@ -2083,17 +1979,8 @@ function ServerCard({
       icon: (
         <IconTile color={brandColor} size={48}>
           <IntegrationLogo
-            serverKey={server.server_key}
+            provider={server.server_key}
             size={24}
-            fallback={
-              Icon ? (
-                <Icon size={24} style={{ color: logoColor }} />
-              ) : (
-                <span style={{ color: logoColor, fontWeight: 800 }}>
-                  {monogram}
-                </span>
-              )
-            }
           />
         </IconTile>
       ),
@@ -2183,7 +2070,8 @@ function ServerCard({
                     key={`oauth-${c.id}`}
                     connection={c}
                     serverKey={server.server_key}
-                    showActions={canManage}
+                    showActions={c.can_manage}
+                    canShare={c.can_share}
                     onReconnect={isOAuth ? () => onConnect(c.id) : undefined}
                   />
                 ))}
@@ -2194,7 +2082,9 @@ function ServerCard({
                     serverKey={server.server_key}
                     onEdit={() => onEditAccount(account.id)}
                     onScanQr={onScanQr}
-                    showActions={canManage}
+                    nangoProviderConfigKey={server.nango_provider_config_key}
+                    showActions={account.can_manage}
+                    canShare={account.can_share}
                   />
                 ))}
               </div>
@@ -2215,6 +2105,26 @@ function ServerCard({
             <Button variant="outline" disabled style={{ width: "100%" }}>
               {t("page.integrations.coming_soon")}
             </Button>
+          ) : server.server_key === "whatsapp" ? (
+            server.nango_provider_config_key && !server.entity_connected ? (
+              <NangoConnectButton
+                providerConfigKeys={[server.nango_provider_config_key]}
+                label={t("page.apps.connect")}
+                variant="primary"
+                size="sm"
+              />
+            ) : server.nango_provider_config_key && server.entity_connected ? (
+              <NangoConnectButton
+                providerConfigKeys={[server.nango_provider_config_key]}
+                label={t("page.integrations.plus_add_account")}
+                variant="outline"
+                size="sm"
+              />
+            ) : (
+              <Chip variant="slate" size="sm">
+                {t("page.integrations.oauth_not_configured")}
+              </Chip>
+            )
           ) : server.nango_provider_config_key && !server.entity_connected ? (
             <NangoConnectButton
               providerConfigKeys={[server.nango_provider_config_key]}
@@ -2231,7 +2141,8 @@ function ServerCard({
               variant="outline"
               size="sm"
             />
-          isCredentials ? (
+          )
+          : isCredentials ? (
             <Button
               variant={hasEntityAccounts ? "outline" : "primary"}
               style={{ width: "100%" }}
@@ -2244,7 +2155,7 @@ function ServerCard({
                 ? t("page.integrations.plus_add_account")
                 : configureNoun}
             </Button>
-          ) : isOAuth && server.oauth_configured && !hasConnections ? (
+          ) : isOAuth && server.oauth_configured && !server.agent_can_use ? (
             <Button
               variant="primary"
               style={{ width: "100%" }}
@@ -2253,9 +2164,11 @@ function ServerCard({
                 onConnect();
               }}
             >
-              {t("page.apps.connect")}
+              {accessState === "repair"
+                ? t("page.integrations.reconnect_required")
+                : t("page.apps.connect")}
             </Button>
-          ) : isOAuth && hasConnections && server.supports_multi_account ? (
+          ) : isOAuth && server.user_connected && server.supports_multi_account ? (
             <Button
               variant="outline"
               style={{ width: "100%" }}
@@ -2290,6 +2203,16 @@ function ServerCard({
   }
 
   useEffect(() => {
+    if (!openOnLoad) return;
+    openIntegrationDetail();
+    return () => {
+      if (useDetailStore.getState().payload?.key === detailKey) closeDetail();
+    };
+    // Open the existing setup UI once, without starting OAuth or saving credentials.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [openOnLoad, detailKey]);
+
+  useEffect(() => {
     if (currentDetailKey !== detailKey) return;
     openIntegrationDetail();
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -2312,24 +2235,14 @@ function ServerCard({
       icon={
         <IconTile color={brandColor} size={34}>
           <IntegrationLogo
-            serverKey={server.server_key}
+            provider={server.server_key}
             size={18}
-            fallback={
-              Icon ? (
-                <Icon size={18} style={{ color: logoColor }} />
-              ) : (
-                <span style={{ color: logoColor }}>{monogram}</span>
-              )
-            }
           />
         </IconTile>
       }
       title={server.name}
       subtitle={server.tagline || server.category || ""}
       meta={
-        isManagedSessionCard ? (
-          <LocalToolStatusMeta label={statusLabel} color={statusColor} />
-        ) : (
           <span
             title={statusLabel}
             style={{
@@ -2339,7 +2252,6 @@ function ServerCard({
               background: "currentColor",
             }}
           />
-        )
       }
       metaTone={
         isManagedSessionCard
@@ -2512,7 +2424,7 @@ function EmailConfigModal({
       });
     },
     onSuccess: async (row: any) => {
-      queryClient.invalidateQueries({ queryKey: ["mcp-servers"] });
+      queryClient.invalidateQueries({ queryKey: INTEGRATION_CATALOG_QUERY_KEY });
       const savedId = (row && row.id) || effectiveAccountId;
       if (savedId && !accountId) setCreatedId(savedId);
 
@@ -2527,7 +2439,7 @@ function EmailConfigModal({
           health = null; // test endpoint unreachable ≠ bad credentials
         }
         setTesting(false);
-        queryClient.invalidateQueries({ queryKey: ["mcp-servers"] });
+        queryClient.invalidateQueries({ queryKey: INTEGRATION_CATALOG_QUERY_KEY });
       }
 
       if (health && health.ok === false) {
@@ -2891,22 +2803,6 @@ const API_KEY_FIELDS: Record<string, ApiKeyProviderSpec> = {
     ],
     docs_hint: t("page.integrations.docs_hint_03"),
   },
-  discord: {
-    fields: [
-      {
-        key: "bot_token",
-        label: t("page.integrations.bot_token"),
-        type: "password",
-        placeholder: t("page.integrations.mtq3"),
-        required: true,
-      },
-      {
-        key: "default_guild_id",
-        label: t("page.integrations.default_server_guild_id_optional"),
-      },
-    ],
-    docs_hint: t("page.integrations.docs_hint_04"),
-  },
   telegram: {
     fields: [
       {
@@ -2972,14 +2868,6 @@ const API_KEY_FIELDS: Record<string, ApiKeyProviderSpec> = {
         label: t("page.integrations.callback_token"),
         placeholder: t("page.integrations.token_set_in_the_oa_admin_panel"),
         required: true,
-      },
-      {
-        key: "encoding_aes_key",
-        label: t("page.integrations.encodingaeskey_optional"),
-        type: "password",
-        placeholder: t(
-          "page.integrations.only_if_using_encrypted_message_mode",
-        ),
       },
     ],
     docs_hint: t("page.integrations.docs_hint_09"),
@@ -3109,7 +2997,7 @@ function OAuthClientConfigModal({
   onClose,
 }: {
   open: boolean;
-  target: { key: string; name: string; scopes?: string | null } | null;
+  target: { key: string; name: string; scopes?: string | null; clientSecretRequired?: boolean } | null;
   onClose: () => void;
 }) {
   const queryClient = useQueryClient();
@@ -3135,7 +3023,7 @@ function OAuthClientConfigModal({
       });
     },
     onSuccess: () => {
-      void queryClient.invalidateQueries({ queryKey: ["mcp-servers"] });
+      void queryClient.invalidateQueries({ queryKey: INTEGRATION_CATALOG_QUERY_KEY });
       toast.success(
         t("page.integrations.oauth_client_saved").replace(
           "{name}",
@@ -3155,8 +3043,9 @@ function OAuthClientConfigModal({
   });
 
   if (!target) return null;
+  const needsSecret = target.clientSecretRequired !== false;
   const canSave =
-    !!clientId.trim() && !!clientSecret.trim() && !mutation.isPending;
+    !!clientId.trim() && (!needsSecret || !!clientSecret.trim()) && !mutation.isPending;
 
   return (
     <Modal
@@ -3198,7 +3087,7 @@ function OAuthClientConfigModal({
         <p
           style={{ fontSize: 12, color: "#78716c", lineHeight: 1.5, margin: 0 }}
         >
-          {t("page.integrations.oauth_client_description")}
+          {t(needsSecret ? "page.integrations.oauth_client_description" : "page.integrations.public_oauth_client_hint")}
         </p>
 
         <Input
@@ -3207,13 +3096,13 @@ function OAuthClientConfigModal({
           onChange={(e) => setClientId(e.target.value)}
           placeholder={t("page.integrations.client_id_or_key_placeholder")}
         />
-        <Input
+        {needsSecret && <Input
           label={t("page.integrations.client_secret")}
           type="password"
           value={clientSecret}
           onChange={(e) => setClientSecret(e.target.value)}
           placeholder="client_secret"
-        />
+        />}
         <Input
           label={t("page.integrations.scopes_optional")}
           value={scopes}
@@ -3344,7 +3233,7 @@ function ApiKeyConfigModal({
       });
     },
     onSuccess: (resp: any) => {
-      queryClient.invalidateQueries({ queryKey: ["mcp-servers"] });
+      queryClient.invalidateQueries({ queryKey: INTEGRATION_CATALOG_QUERY_KEY });
       toast.success(
         editing
           ? t("page.integrations.named_account_updated").replace(
@@ -3537,17 +3426,20 @@ function WeChatPersonalScanModal({
   // proxies to the runner's session under the hood.
   const isNew = !!accountId && accountId.startsWith("new:");
 
-  // Cache-bust key — bumped on every poll so the <img> re-fetches.
-  const [tick, setTick] = useState(0);
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [startError, setStartError] = useState<string | null>(null);
   const [finishing, setFinishing] = useState(false);
+  const [qrUrl, setQrUrl] = useState<string | null>(null);
+  const sessionIdRef = useRef<string | null>(null);
+  const sessionFinishedRef = useRef(false);
 
   // Spin up a fresh runner session on open (new flow only). Cleanup
   // tells the runner to drop it if the user bails before finishing.
   useEffect(() => {
     if (!open || !isNew) return;
     let cancelled = false;
+    sessionIdRef.current = null;
+    sessionFinishedRef.current = false;
     setSessionId(null);
     setStartError(null);
     (async () => {
@@ -3557,6 +3449,7 @@ function WeChatPersonalScanModal({
           void api.integrations.wechatPersonalCancelSession(res.session_id);
           return;
         }
+        sessionIdRef.current = res.session_id;
         setSessionId(res.session_id);
       } catch (exc: unknown) {
         const msg = exc instanceof Error ? exc.message : String(exc);
@@ -3565,10 +3458,11 @@ function WeChatPersonalScanModal({
     })();
     return () => {
       cancelled = true;
-      // Capture sessionId at cleanup time so a quick close doesn't
-      // leak the orphan.
-      const sid = sessionId;
-      if (sid) void api.integrations.wechatPersonalCancelSession(sid);
+      const sid = sessionIdRef.current;
+      sessionIdRef.current = null;
+      if (sid && !sessionFinishedRef.current) {
+        void api.integrations.wechatPersonalCancelSession(sid);
+      }
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open, isNew]);
@@ -3587,11 +3481,31 @@ function WeChatPersonalScanModal({
     refetchIntervalInBackground: false,
   });
 
+  const online = status?.online;
+  const qrPending = status?.qr_pending;
+  const qrQuery = useQuery({
+    queryKey: isNew
+      ? ["wechat-personal-session-qr", sessionId]
+      : ["wechat-personal-qr", accountId],
+    queryFn: () =>
+      isNew
+        ? api.integrations.wechatPersonalSessionQrBlob(sessionId!)
+        : api.integrations.wechatPersonalQrBlob(accountId!),
+    enabled: open && !online && (isNew ? !!sessionId : !!accountId),
+    refetchInterval: open && !online ? 3_000 : false,
+    refetchIntervalInBackground: false,
+    gcTime: 0,
+  });
+
   useEffect(() => {
-    if (!open) return;
-    const t = setInterval(() => setTick((n) => n + 1), 3_000);
-    return () => clearInterval(t);
-  }, [open]);
+    if (!qrQuery.data) {
+      setQrUrl(null);
+      return;
+    }
+    const url = URL.createObjectURL(qrQuery.data);
+    setQrUrl(url);
+    return () => URL.revokeObjectURL(url);
+  }, [qrQuery.data]);
 
   // The moment the runner reports ``online: true`` for a new session,
   // promote it to a real Integration row and close the modal.
@@ -3607,7 +3521,9 @@ function WeChatPersonalScanModal({
           t("page.integrations.wechat_connected"),
           t("page.integrations.account_is_online").replace("{id}", integ.id),
         );
-        await queryClient.invalidateQueries({ queryKey: ["mcp-servers"] });
+        sessionFinishedRef.current = true;
+        sessionIdRef.current = null;
+        await queryClient.invalidateQueries({ queryKey: INTEGRATION_CATALOG_QUERY_KEY });
         onClose();
       } catch (exc: unknown) {
         const msg = exc instanceof Error ? exc.message : String(exc);
@@ -3618,18 +3534,9 @@ function WeChatPersonalScanModal({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isNew, sessionId, status?.online, finishing]);
 
-  const qrUrl = isNew
-    ? sessionId
-      ? `${api.integrations.wechatPersonalSessionQrUrl(sessionId)}?t=${tick}`
-      : null
-    : accountId
-      ? `${api.integrations.wechatPersonalQrUrl(accountId)}?t=${tick}`
-      : null;
-
-  const online = status?.online;
-  const qrPending = status?.qr_pending;
   const nick = status?.account?.nick_name || status?.account?.user_name || "";
-  const lastError = startError || status?.last_error;
+  const qrError = qrQuery.error instanceof Error ? qrQuery.error.message : null;
+  const lastError = startError || status?.last_error || qrError;
   const waitingForRunner = isNew && !sessionId && !startError;
 
   return (
@@ -4015,7 +3922,9 @@ function EntityAccountRow({
   serverKey,
   onEdit,
   onScanQr,
+  nangoProviderConfigKey,
   showActions = true,
+  canShare = false,
 }: {
   account: {
     id: string;
@@ -4024,47 +3933,81 @@ function EntityAccountRow({
     is_default: boolean;
     created_at: string | null;
     status: string;
-    health: {
-      ok: boolean | null;
-      detail: string | null;
-      checked_at: string | null;
-      wiring?: {
-        ok: boolean | null;
-        detail: string | null;
-        configured_url?: string | null;
-        expected_url?: string | null;
-        last_error?: string | null;
-        pending_update_count?: number | null;
-      } | null;
-    } | null;
+    nango_backed: boolean;
+    whatsapp_readiness_code: string | null;
+    kind: "integration";
+    ownership: "mine" | "shared";
+    owner_display_name: string | null;
+    can_share: boolean;
+    runtime_callable: boolean;
+    availability:
+      | "callable"
+      | "reconnect_required"
+      | "permission_denied"
+      | "load_failed";
+    health: HealthStatus | null;
   };
   serverKey: string;
   onEdit: () => void;
   onScanQr?: (accountId: string) => void;
+  nangoProviderConfigKey?: string | null;
   showActions?: boolean;
+  canShare?: boolean;
 }) {
   const queryClient = useQueryClient();
   const toast = useToastStore();
+  const [shareOpen, setShareOpen] = useState(false);
+  const [whatsappPinOpen, setWhatsAppPinOpen] = useState(false);
+  const [whatsappPin, setWhatsAppPin] = useState("");
+  const reconnect = useNangoConnect({
+    providerConfigKeys: nangoProviderConfigKey
+      ? [nangoProviderConfigKey]
+      : undefined,
+    replaceIntegrationId: account.nango_backed ? account.id : undefined,
+  });
 
   const setDefault = useMutation({
     mutationFn: () =>
       api.integrations.setDefaultEntityAccount(serverKey, account.id),
     onSuccess: () =>
-      queryClient.invalidateQueries({ queryKey: ["mcp-servers"] }),
+      queryClient.invalidateQueries({ queryKey: INTEGRATION_CATALOG_QUERY_KEY }),
+  });
+
+  const retryWhatsAppProvisioning = useMutation({
+    mutationFn: (registration_pin: string) =>
+      api.integrations.retryWhatsAppProvisioning(account.id, registration_pin),
+    onSuccess: (result) => {
+      queryClient.invalidateQueries({ queryKey: INTEGRATION_CATALOG_QUERY_KEY });
+      queryClient.invalidateQueries({ queryKey: ["channel-bindings"] });
+      if (result.ok) {
+        toast.success(
+          t("page.integrations.whatsapp_setup_complete"),
+          result.detail,
+        );
+        setWhatsAppPin("");
+        setWhatsAppPinOpen(false);
+      } else {
+        toast.error(t("page.integrations.connection_failed"), result.detail);
+      }
+    },
+    onError: (error: Error) => {
+      toast.error(t("page.integrations.connection_failed"), error.message);
+    },
   });
 
   const remove = useMutation({
     mutationFn: () =>
       api.integrations.deleteEntityAccount(serverKey, account.id),
     onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ["mcp-servers"] });
+      queryClient.invalidateQueries({ queryKey: INTEGRATION_CATALOG_QUERY_KEY });
+      queryClient.invalidateQueries({ queryKey: ["channel-bindings"] });
     },
   });
 
   const testNow = useMutation({
     mutationFn: () => api.integrations.testEntityAccount(account.id),
     onSuccess: (r) => {
-      queryClient.invalidateQueries({ queryKey: ["mcp-servers"] });
+      queryClient.invalidateQueries({ queryKey: INTEGRATION_CATALOG_QUERY_KEY });
       if (r.ok)
         toast.success(t("page.integrations.connection_ok"), r.detail || "");
       else
@@ -4075,7 +4018,7 @@ function EntityAccountRow({
   const registerWebhook = useMutation({
     mutationFn: () => api.integrations.registerWebhook(account.id),
     onSuccess: (r) => {
-      queryClient.invalidateQueries({ queryKey: ["mcp-servers"] });
+      queryClient.invalidateQueries({ queryKey: INTEGRATION_CATALOG_QUERY_KEY });
       if (r.registered)
         toast.success(t("page.integrations.webhook_registered"), r.url || "");
       else
@@ -4091,44 +4034,83 @@ function EntityAccountRow({
     providerAccountFallback(serverKey);
   const hasWiring = !!account.health?.wiring;
   const wiringBroken = hasWiring && account.health?.wiring?.ok === false;
+  const unavailable = !account.runtime_callable;
+  const canSetDefault = account.runtime_callable && !account.is_default;
 
   const items = [
-    { key: "edit", label: t("action.edit") },
-    ...(serverKey === "wechat_personal" && onScanQr
-      ? [{ key: "scan", label: t("page.integrations.scan_qr_status") }]
-      : []),
-    {
-      key: "test",
-      label: testNow.isPending
-        ? t("page.integrations.testing")
-        : t("page.integrations.test_connection"),
-    },
-    ...(wiringBroken
+    ...(showActions
       ? [
-          {
-            key: "register-webhook",
-            label: registerWebhook.isPending
-              ? t("page.integrations.registering")
-              : t("page.integrations.register_webhook"),
-          },
+          ...(!(serverKey === "whatsapp" && account.nango_backed)
+            ? [{ key: "edit", label: t("action.edit") }]
+            : []),
+          ...(account.nango_backed && nangoProviderConfigKey
+            ? [
+                {
+                  key: "reconnect",
+                  label: t("page.integrations.reconnect"),
+                  disabled: reconnect.isWorking,
+                },
+              ]
+            : []),
+          ...(serverKey === "whatsapp" &&
+          account.nango_backed &&
+          account.whatsapp_readiness_code === "phone_not_registered"
+            ? [
+                {
+                  key: "whatsapp-pin",
+                  label: t("page.integrations.whatsapp_enter_pin"),
+                },
+              ]
+            : []),
+          ...(serverKey === "wechat_personal" && onScanQr
+            ? [{ key: "scan", label: t("page.integrations.scan_qr_status") }]
+            : []),
+          ...(account.runtime_callable ||
+          (serverKey === "whatsapp" && account.nango_backed)
+            ? [{
+                key: "test",
+                label: testNow.isPending
+                  ? t("page.integrations.testing")
+                  : t("page.integrations.test_connection"),
+              }]
+            : []),
+          ...(serverKey !== "whatsapp" && account.runtime_callable && wiringBroken
+            ? [
+                {
+                  key: "register-webhook",
+                  label: registerWebhook.isPending
+                    ? t("page.integrations.registering")
+                    : t("page.integrations.register_webhook"),
+                },
+              ]
+            : []),
         ]
       : []),
-    ...(!account.is_default
+    ...(canSetDefault
       ? [{ key: "default", label: t("page.integrations.set_as_default") }]
       : []),
-    {
-      key: "remove",
-      label: t("page.task_detail.runtime.remove_rule"),
-      danger: true,
-    },
+    ...(showActions
+      ? [{
+          key: "remove",
+          label: t("page.task_detail.runtime.remove_rule"),
+          danger: true,
+        }]
+      : []),
   ];
 
   // "AUTH FAILED" says something broke; this says what. The health check
   // spells out the cause (wrong app password, username missing its
   // domain, STARTTLS on the wrong port) and it has to be readable
   // without hovering — tooltips do not exist on touch.
-  const failureDetail =
-    account.health?.ok === false ? account.health?.detail || null : null;
+  const failureDetail = account.health?.ok === false
+    ? account.health?.detail || null
+    : account.availability === "reconnect_required"
+      ? "Complete or reconnect this account before agents can use it."
+      : account.availability === "permission_denied"
+        ? "Your role does not have permission to use this account."
+        : account.availability === "load_failed"
+          ? "Account metadata could not be loaded. Repair or remove this account."
+          : null;
 
   return (
     <div
@@ -4147,9 +4129,10 @@ function EntityAccountRow({
     >
       <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
         <ConnectionStatusPip
-          connected={account.status === "active"}
+          connected={!unavailable && account.status === "active"}
           health={account.health}
           busy={testNow.isPending}
+          accountReadiness={serverKey === "whatsapp"}
         />
         <span
           style={{
@@ -4174,11 +4157,18 @@ function EntityAccountRow({
             )}
         </span>
         {account.is_default && <DefaultBadge />}
-        {showActions && (
+        {canShare && !unavailable && (
+          <Button variant="outline" size="sm" onClick={() => setShareOpen(true)}>
+            Share
+          </Button>
+        )}
+        {(showActions || canSetDefault) && (
           <MoreMenu
             items={items}
             onSelect={(key) => {
               if (key === "edit") onEdit();
+              else if (key === "reconnect") reconnect.begin();
+              else if (key === "whatsapp-pin") setWhatsAppPinOpen(true);
               else if (key === "scan") onScanQr?.(account.id);
               else if (key === "test") testNow.mutate();
               else if (key === "register-webhook") registerWebhook.mutate();
@@ -4212,6 +4202,73 @@ function EntityAccountRow({
           {failureDetail}
         </div>
       )}
+      {serverKey === "whatsapp" && (
+        <WhatsAppReadinessChecklist health={account.health} />
+      )}
+      {serverKey === "wechat_official" && account.health?.wiring?.expected_url && (
+        <div
+          style={{
+            fontSize: 11,
+            lineHeight: 1.45,
+            color: "#57534e",
+            paddingLeft: 16,
+            wordBreak: "break-all" as const,
+          }}
+        >
+          <span>{t("page.integrations.callback_url")}: </span>
+          <code>{account.health.wiring.expected_url}</code>
+        </div>
+      )}
+      {account.ownership === "shared" && account.owner_display_name && (
+        <div style={{ color: "#78716c", fontSize: 11, paddingLeft: 16 }}>
+          Shared by {account.owner_display_name}
+        </div>
+      )}
+      <ShareConnectionDialog
+        open={shareOpen}
+        onClose={() => setShareOpen(false)}
+        connection={{ id: account.id, kind: account.kind, label }}
+      />
+      <Modal
+        open={whatsappPinOpen}
+        onClose={() => {
+          if (!retryWhatsAppProvisioning.isPending) setWhatsAppPinOpen(false);
+        }}
+        title={t("page.integrations.whatsapp_complete_setup")}
+        maxWidth="420px"
+        footer={
+          <>
+            <Button
+              variant="ghost"
+              disabled={retryWhatsAppProvisioning.isPending}
+              onClick={() => setWhatsAppPinOpen(false)}
+            >
+              {t("action.cancel")}
+            </Button>
+            <Button
+              loading={retryWhatsAppProvisioning.isPending}
+              disabled={!/^[0-9]{6}$/.test(whatsappPin)}
+              onClick={() => retryWhatsAppProvisioning.mutate(whatsappPin)}
+            >
+              {t("page.integrations.whatsapp_complete_setup")}
+            </Button>
+          </>
+        }
+      >
+        <Input
+          label={t("page.integrations.whatsapp_six_digit_pin")}
+          value={whatsappPin}
+          onChange={(event) => {
+            setWhatsAppPin(event.target.value.replace(/[^0-9]/g, "").slice(0, 6));
+          }}
+          type="password"
+          inputMode="numeric"
+          autoComplete="one-time-code"
+          maxLength={6}
+          pattern="[0-9]{6}"
+          autoFocus
+        />
+      </Modal>
     </div>
   );
 }
@@ -4219,29 +4276,78 @@ function EntityAccountRow({
 /** One account status indicator, combining the connection record, credential
  *  health, and inbound wiring. A connected-but-untested account stays green;
  *  the tooltip explains that its deeper health check has not run yet. */
-type HealthShape = {
-  ok: boolean | null;
-  detail: string | null;
-  checked_at: string | null;
-  wiring?: {
-    ok: boolean | null;
-    detail: string | null;
-    mode?: "webhook" | "polling" | null;
-    configured_url?: string | null;
-    expected_url?: string | null;
-    last_error?: string | null;
-    pending_update_count?: number | null;
-  } | null;
-} | null;
+type HealthShape = HealthStatus | null;
+
+const WHATSAPP_READINESS_CHECKS = [
+  "oauth",
+  "assets",
+  "phone_registration",
+  "app_subscription",
+  "callback",
+] as const;
+
+function WhatsAppReadinessChecklist({ health }: { health: HealthShape }) {
+  const checks = health?.checks;
+  if (!checks) return null;
+  return (
+    <div style={{ paddingLeft: 16, display: "flex", flexDirection: "column", gap: 4 }}>
+      <div
+        style={{
+          color: health?.ok ? "#397354" : "#9f4a45",
+          fontSize: 11,
+          fontWeight: 600,
+        }}
+      >
+        {t(
+          health?.ok
+            ? "page.integrations.whatsapp_account_ready"
+            : "page.integrations.whatsapp_account_not_ready",
+        )}
+      </div>
+      <div style={{ display: "flex", flexWrap: "wrap", gap: "4px 12px" }}>
+        {WHATSAPP_READINESS_CHECKS.map((key) => {
+          const check = checks[key];
+          const color = check?.ok === true
+            ? "#397354"
+            : check?.ok === false
+              ? "#9f4a45"
+              : "#a8a29e";
+          return (
+            <span
+              key={key}
+              title={check?.detail || undefined}
+              style={{
+                display: "inline-flex",
+                alignItems: "center",
+                gap: 5,
+                color: "#57534e",
+                fontSize: 11,
+                whiteSpace: "nowrap",
+              }}
+            >
+              <span
+                aria-hidden="true"
+                style={{ width: 6, height: 6, borderRadius: "50%", background: color }}
+              />
+              {t(`page.integrations.whatsapp_check_${key}`)}
+            </span>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
 
 function ConnectionStatusPip({
   connected,
   health,
   busy,
+  accountReadiness = false,
 }: {
   connected: boolean;
   health: HealthShape;
   busy?: boolean;
+  accountReadiness?: boolean;
 }) {
   const wiring = health?.wiring || null;
   const credOk = health?.ok;
@@ -4253,9 +4359,11 @@ function ConnectionStatusPip({
   const color = busy
     ? "#cf9b44"
     : credOk === false
-      ? "#d65f59"
+        ? "#d65f59"
       : !connected
         ? "#d6d3d1"
+        : wiring && (wireOk === null || wireOk === undefined)
+          ? "#cf9b44"
         : wiring && wireOk === false
           ? "#cf9b44"
           : "#54a176";
@@ -4263,8 +4371,13 @@ function ConnectionStatusPip({
   // Short inline label shown only when there's something worth flagging.
   let label: string | null = null;
   if (busy) label = t("page.integrations.testing");
-  else if (credOk === false) label = t("page.integrations.auth_failed");
+  else if (credOk === false)
+    label = accountReadiness
+      ? t("page.integrations.needs_attention")
+      : t("page.integrations.auth_failed");
   else if (!connected) label = t("page.integrations.not_connected");
+  else if (wiring && (wireOk === null || wireOk === undefined))
+    label = t("page.integrations.webhook_status_unavailable");
   else if (wiring && wireOk === false)
     label =
       wiring.mode === "polling"
@@ -4276,7 +4389,11 @@ function ConnectionStatusPip({
   if (busy) {
     lines.push(t("page.integrations.running_connection_test"));
   } else if (credOk === false) {
-    lines.push(t("page.integrations.credentials_failed"));
+    lines.push(
+      accountReadiness
+        ? t("page.integrations.whatsapp_account_not_ready")
+        : t("page.integrations.credentials_failed"),
+    );
     if (health?.detail) lines.push("  " + health.detail);
   } else if (!connected) {
     lines.push(t("page.integrations.not_connected"));
@@ -4296,9 +4413,11 @@ function ConnectionStatusPip({
           ? t("page.integrations.polling_mode")
           : t("page.integrations.webhook_mode");
       lines.push(
-        (wireOk
+        (wireOk === true
           ? t("page.integrations.inbound_registered")
-          : t("page.integrations.inbound_not_working")
+          : wireOk === false
+            ? t("page.integrations.inbound_not_working")
+            : t("page.integrations.inbound_status_unavailable")
         ).replace("{mode}", mode),
       );
       if (wiring.detail) lines.push("  " + wiring.detail);
@@ -4379,6 +4498,7 @@ function ConnectionRow({
   serverKey,
   showActions,
   onReconnect,
+  canShare = false,
 }: {
   connection: {
     id: string;
@@ -4387,45 +4507,47 @@ function ConnectionRow({
     expires_at: string | null;
     is_default: boolean;
     connected_at: string | null;
-    health?: {
-      ok: boolean | null;
-      detail: string | null;
-      checked_at: string | null;
-      wiring?: {
-        ok: boolean | null;
-        detail: string | null;
-        configured_url?: string | null;
-        expected_url?: string | null;
-        last_error?: string | null;
-        pending_update_count?: number | null;
-      } | null;
-    } | null;
+    kind: "oauth_account";
+    ownership: "mine" | "shared";
+    owner_display_name: string | null;
+    can_share: boolean;
+    runtime_callable: boolean;
+    availability:
+      | "callable"
+      | "reconnect_required"
+      | "permission_denied"
+      | "load_failed";
+    health?: HealthStatus | null;
   };
   serverKey: string;
   showActions: boolean;
   onReconnect?: () => void;
+  canShare?: boolean;
 }) {
   const queryClient = useQueryClient();
   const toast = useToastStore();
+  const [shareOpen, setShareOpen] = useState(false);
 
   const setDefault = useMutation({
     mutationFn: () =>
       api.integrations.setDefaultConnection(serverKey, connection.id),
     onSuccess: () =>
-      queryClient.invalidateQueries({ queryKey: ["mcp-servers"] }),
+      queryClient.invalidateQueries({ queryKey: INTEGRATION_CATALOG_QUERY_KEY }),
   });
 
   const disconnect = useMutation({
     mutationFn: () =>
       api.integrations.disconnectAccount(serverKey, connection.id),
-    onSuccess: () =>
-      queryClient.invalidateQueries({ queryKey: ["mcp-servers"] }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: INTEGRATION_CATALOG_QUERY_KEY });
+      queryClient.invalidateQueries({ queryKey: ["channel-bindings"] });
+    },
   });
 
   const testNow = useMutation({
     mutationFn: () => api.integrations.testOAuthConnection(connection.id),
     onSuccess: (r) => {
-      queryClient.invalidateQueries({ queryKey: ["mcp-servers"] });
+      queryClient.invalidateQueries({ queryKey: INTEGRATION_CATALOG_QUERY_KEY });
       if (r.ok)
         toast.success(t("page.integrations.connection_ok"), r.detail || "");
       else
@@ -4436,16 +4558,64 @@ function ConnectionRow({
   const expired =
     connection.expires_at && new Date(connection.expires_at) < new Date();
   const authFailed = connection.health?.ok === false;
+  const unavailable = !connection.runtime_callable;
+  const canSetDefault = connection.runtime_callable && !connection.is_default;
+  const reconnectUnavailable =
+    connection.availability === "reconnect_required"
+    || connection.availability === "load_failed";
   const label = connectionLabel(
     connection,
-    authFailed
+    unavailable
+      ? t("page.integrations.reconnect_required")
+      : authFailed
       ? t("page.integrations.reconnect_required")
       : expired
         ? t("page.integrations.expired")
         : t("status.connected"),
   );
-  const needsReconnect = Boolean(onReconnect && (authFailed || expired));
-  const failureDetail = authFailed ? connection.health?.detail || null : null;
+  const needsReconnect = Boolean(
+    onReconnect && (reconnectUnavailable || authFailed || expired),
+  );
+  const failureDetail = authFailed
+    ? connection.health?.detail || null
+    : connection.availability === "reconnect_required"
+      ? "Reconnect this account before agents can use it."
+      : connection.availability === "load_failed"
+        ? "Account metadata could not be loaded. Reconnect or disconnect this account."
+        : connection.availability === "permission_denied"
+          ? "Your role does not have permission to use this account."
+          : null;
+  const items = [
+    ...(showActions && onReconnect
+      ? [
+          {
+            key: "reconnect",
+            label: t("page.integrations.reconnect"),
+          },
+        ]
+      : []),
+    ...(showActions && connection.runtime_callable
+      ? [{
+          key: "test",
+          label: testNow.isPending
+            ? t("page.integrations.testing")
+            : t("page.integrations.test_connection"),
+        }]
+      : []),
+    ...(canSetDefault
+      ? [{
+          key: "default",
+          label: t("page.integrations.set_as_default"),
+        }]
+      : []),
+    ...(showActions
+      ? [{
+          key: "disconnect",
+          label: t("page.integrations.disconnect"),
+          danger: true,
+        }]
+      : []),
+  ];
 
   return (
     <div
@@ -4464,7 +4634,7 @@ function ConnectionRow({
     >
       <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
         <ConnectionStatusPip
-          connected={!expired}
+          connected={!unavailable && !expired}
           health={connection.health || null}
           busy={testNow.isPending}
         />
@@ -4483,6 +4653,11 @@ function ConnectionRow({
         </span>
         {connection.is_default && <DefaultBadge />}
         {expired && <ExpiredBadge />}
+        {canShare && !unavailable && (
+          <Button variant="outline" size="sm" onClick={() => setShareOpen(true)}>
+            Share
+          </Button>
+        )}
         {showActions && needsReconnect && (
           <Button
             variant="outline"
@@ -4493,37 +4668,9 @@ function ConnectionRow({
             {t("page.integrations.reconnect")}
           </Button>
         )}
-        {showActions && (
+        {(showActions || canSetDefault) && (
           <MoreMenu
-            items={[
-              ...(onReconnect
-                ? [
-                    {
-                      key: "reconnect",
-                      label: t("page.integrations.reconnect"),
-                    },
-                  ]
-                : []),
-              {
-                key: "test",
-                label: testNow.isPending
-                  ? t("page.integrations.testing")
-                  : t("page.integrations.test_connection"),
-              },
-              ...(!connection.is_default
-                ? [
-                    {
-                      key: "default",
-                      label: t("page.integrations.set_as_default"),
-                    },
-                  ]
-                : []),
-              {
-                key: "disconnect",
-                label: t("page.integrations.disconnect"),
-                danger: true,
-              },
-            ]}
+            items={items}
             onSelect={(key) => {
               if (key === "reconnect") onReconnect?.();
               else if (key === "test") testNow.mutate();
@@ -4558,6 +4705,140 @@ function ConnectionRow({
           {failureDetail}
         </div>
       )}
+      {connection.ownership === "shared" && connection.owner_display_name && (
+        <div style={{ color: "#78716c", fontSize: 11, paddingLeft: 16 }}>
+          Shared by {connection.owner_display_name}
+        </div>
+      )}
+      <ShareConnectionDialog
+        open={shareOpen}
+        onClose={() => setShareOpen(false)}
+        connection={{ id: connection.id, kind: connection.kind, label }}
+      />
     </div>
+  );
+}
+
+function ShareConnectionDialog({
+  open,
+  onClose,
+  connection,
+}: {
+  open: boolean;
+  onClose: () => void;
+  connection: {
+    id: string;
+    kind: "integration" | "oauth_account";
+    label: string;
+  };
+}) {
+  const queryClient = useQueryClient();
+  const toast = useToastStore();
+  const [recipientId, setRecipientId] = useState("");
+  const { data: users = [] } = useQuery({
+    queryKey: ["users", "directory"],
+    queryFn: () => api.users.directory(),
+    enabled: open,
+  });
+  const { data: grants = [] } = useQuery({
+    queryKey: ["connection-grants", connection.kind, connection.id],
+    queryFn: () => api.integrations.listConnectionGrants(connection.kind, connection.id),
+    enabled: open,
+  });
+  const share = useMutation({
+    mutationFn: () => api.integrations.createConnectionGrant(
+      connection.kind,
+      connection.id,
+      { user_id: recipientId },
+    ),
+    onSuccess: () => {
+      setRecipientId("");
+      queryClient.invalidateQueries({
+        queryKey: ["connection-grants", connection.kind, connection.id],
+      });
+      queryClient.invalidateQueries({ queryKey: INTEGRATION_CATALOG_QUERY_KEY });
+      toast.success("Connection shared");
+    },
+    onError: (error: any) =>
+      toast.error("Could not share connection", error?.message || ""),
+  });
+  const revoke = useMutation({
+    mutationFn: (grantId: string) => api.integrations.deleteConnectionGrant(
+      connection.kind,
+      connection.id,
+      grantId,
+    ),
+    onSuccess: () => {
+      queryClient.invalidateQueries({
+        queryKey: ["connection-grants", connection.kind, connection.id],
+      });
+      queryClient.invalidateQueries({ queryKey: INTEGRATION_CATALOG_QUERY_KEY });
+    },
+  });
+  const usersById = new Map(users.map((user) => [user.id, user]));
+  const grantedUserIds = new Set(grants.map((grant) => grant.user_id));
+  const recipientOptions = users
+    .filter((user) => !grantedUserIds.has(user.id))
+    .map((user) => ({
+      value: user.id,
+      label: user.display_name || user.email,
+    }));
+
+  return (
+    <Modal
+      open={open}
+      onClose={onClose}
+      title="Share connection"
+      footer={
+        <>
+          <Button variant="outline" onClick={onClose}>Close</Button>
+          <Button
+            variant="primary"
+            disabled={!recipientId}
+            loading={share.isPending}
+            onClick={() => share.mutate()}
+          >
+            Share
+          </Button>
+        </>
+      }
+    >
+      <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+        <div style={{ fontSize: 13, color: "#57534e" }}>{connection.label}</div>
+        <Select
+          value={recipientId}
+          onChange={setRecipientId}
+          options={recipientOptions}
+          placeholder="Select a member"
+          filterable
+          ariaLabel="Select a member to share with"
+        />
+        {grants.length > 0 && (
+          <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+            {grants.map((grant) => {
+              const user = usersById.get(grant.user_id);
+              return (
+                <div
+                  key={grant.id}
+                  style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 13 }}
+                >
+                  <span style={{ flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis" }}>
+                    {user?.display_name || user?.email || grant.user_id}
+                  </span>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    loading={revoke.isPending}
+                    onClick={() => revoke.mutate(grant.id)}
+                  >
+                    Remove
+                  </Button>
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </div>
+    </Modal>
   );
 }

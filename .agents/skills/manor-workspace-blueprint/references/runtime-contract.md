@@ -12,9 +12,9 @@ flow, state machine, artifact, approval, credit, and lifecycle implications.
 
 The source and installed Workspace must have equivalent runtime-projected
 values after normalizing generated IDs and install metadata. Some Blueprint
-fields are one-shot install declarations and cannot be reconstructed from the
-installed Workspace; verify those through install preview, todos, and check
-results instead of feeding them into the runtime round-trip comparison.
+fields are setup declarations rather than runtime rows; verify those through
+install/upgrade preview, persisted provenance, todos, and check results instead
+of feeding them into the runtime round-trip comparison.
 
 | Area | Portable contract | Current v1.1 path |
 | --- | --- | --- |
@@ -24,20 +24,50 @@ results instead of feeding them into the runtime round-trip comparison.
 | Skills | embedded skill content and external skill requirements | Exported and installed |
 | Knowledge | safe packs, folders, optional inline Markdown | Exported and installed |
 | Workflow | trigger, variables, ordered graph, step config, binding config | Exported and installed; compare graph exactly |
-| Automation | scheduled jobs, workflow triggers, goal/stat install schedules | Scheduled jobs and workflow bindings are installed; verify target resolution |
+| Automation | scheduled jobs, workflow triggers, goal/stat install schedules | Enabled and disabled scheduled definitions are exported; installed jobs follow the installer activation policy and must resolve portable targets |
 | Goal/stat | definition, metric, cadence, baseline, collection config | Exported and installed |
 | Task configuration | entity-level categories, SLA policies, and escalation rules | Not part of a Workspace Blueprint install/export. Configure them through the entity task-policy admin surface; Proposal-generated Tasks remain runtime-created |
 | Governance | never-allow, HITL, auto-approve, risk and budget limits | Exported and installed through policy preset |
-| Integrations | channel/session requirements without credentials | Exported as requirements and surfaced as install todos |
+| Integrations | channel/session requirements without credentials | Exported as requirements; required external channels are selected from accessible accounts and bound in the Workspace creation transaction, while sessions remain live preflight requirements |
 | Deliverables | the output contract of a Proposal Task or Workflow: artifact type/format, producer step, dependency, and completion evidence | Must be encoded in `expected_output`, Plan/Workflow step output contracts, and artifact projection; prose alone never creates a deliverable |
-| Install-only declarations | prerequisites and verification instructions evaluated during install: variables, unresolved channel/session requirements, post-install checks, and expected baseline | Used by install preview/todos/check results. They are not persisted as runtime behavior and are not reconstructed by `export_workspace()` |
+| Setup declarations | prerequisites and verification instructions evaluated during install: variables, channel/session requirements, post-install checks, and expected baseline | Variable values are validated and substituted before materialization and again when a later version is reviewed; install failures persist as todo results while every required declaration persists separately for live readiness. Runtime rows alone cannot reconstruct these declarations. |
 
-`contract.variables` currently describes install settings in the Blueprint
-preview. The install API has no variable-values input and performs no template
-substitution, so a variable must not be described as applied configuration.
-Built-in declarations that are not referenced are descriptive only. Adding
-real substitution requires an explicit values API, validation, persistence,
-and round-trip rules.
+Required setup declarations are live guards, not install-screen warnings.
+Passing installation does not erase them. Readiness
+must re-evaluate the exact Agent identity plus worker binding, enabled scheduled
+job, active Workflow binding/definition, and declared MCP binding fields. An
+optional MCP requirement may remain visible as guidance but must not activate
+the normal-work gate. Credential-shaped MCP setup fields belong to the
+integration/credential flow; only safe allowlisted fields may be required in an
+`AgentMCPBinding.config_override`.
+
+While any required setup check is incomplete, scheduler dispatch may run only
+the matching Workspace-scoped setup job, Strategist persistence may retain only
+explicitly allowlisted human setup requests, and Planner must reject every
+Task. A model-authored Task key is never setup authorization. Prompt
+instructions are not a substitute for these runtime checks.
+
+Legacy installs that predate the durable live contract fail closed rather
+than falling back to a cleared install-time todo list. A reviewed Blueprint
+upgrade/re-sync rebuilds that contract from the pinned payload and installed
+local identities before normal work can resume.
+
+`contract.variables` is an install and version-upgrade personalization
+contract. The APIs accept `variable_values`, apply declared defaults, reject
+missing required or unknown values, and substitute only declared
+`{{variable_key}}` references before materialization. A non-null default
+defines the variable's JSON kind; the server rejects an override with a
+different kind even when a client omits its own validation. Values marked
+`materialize` are retained in `Workspace.settings.blueprint_personalization`
+outside Blueprint provenance and reused when planning later versions; other
+values must be supplied again. Upgrade fingerprints and compare-and-swap use
+the raw published payload, while component diffs and explicit conflict choices
+use the resolved payload. A newly required value blocks planning/application
+until supplied. Variable keys must not be credential-shaped, because
+Blueprint variables are not a secret-input channel. The installed record also
+retains a fingerprint of resolved portable content outside the surgical upgrade
+boundary, so changing a saved value cannot mark an unchanged Workspace shell or
+Knowledge body fully synchronized.
 
 ## Task taxonomy
 
@@ -98,9 +128,12 @@ Recurring TaskTemplate jobs are outside the Workspace Blueprint automation
 contract. Use a Proposal cadence, scheduled agent job, or workflow trigger
 when the Workspace should create business-context-dependent Tasks.
 
-For each entry, verify schedule/timezone, enabled state, target type, target
-slug/service, payload/input, delivery mode, and governance boundary. Exclude
-last-run timestamps, run history, errors, counters, and generated IDs.
+For each entry, verify schedule/timezone, install-time activation policy, target
+type, target slug/service, payload/input, delivery mode, and governance boundary.
+A scheduled Skill must use an embedded component key or exact Marketplace
+identity; its source Entity Skill ID and copied prompt are not portable. Exclude
+last-run timestamps, run history, generation clocks/errors/attempt counters,
+and generated IDs.
 
 ## Install modes and upgrade boundaries
 
@@ -108,4 +141,11 @@ Simulation may add sandbox and simulation-experience metadata; live install may
 not retain those simulation-only fields. Compare the common semantic contract,
 not these mode-specific fields. Blueprint upgrades must preserve Workspace edits
 and only update content proven to be blueprint-owned; reverts restore the last
-explicit upgrade restore point.
+explicit upgrade restore point. When other portable configuration changed outside
+the surgical upgrader's scope, safe component updates may apply as a partial
+upgrade, but the installed Blueprint version and fingerprints remain at the last
+fully synchronized baseline until that configuration is reconciled.
+Upgrade preview and apply resolve current variable declarations against saved
+materialized personalization plus explicit operator overrides. The reviewed
+concurrency fingerprint remains the raw Marketplace payload fingerprint; the
+materialized payload is used only to preview and apply runtime content.

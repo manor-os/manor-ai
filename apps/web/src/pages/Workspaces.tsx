@@ -6,6 +6,7 @@ import { useToastStore } from "../stores/toast";
 import type { Workspace, WorkspaceStaff } from "../lib/types";
 import { useAuthStore } from "../stores/auth";
 import { canManageWorkspace } from "../lib/permissions";
+import BlueprintUpgradeDialog from "../components/blueprints/BlueprintUpgradeDialog";
 import PageHeader, { PageHeaderAddButton } from "../components/ui/PageHeader";
 import TabSwitcher from "../components/ui/TabSwitcher";
 import Dropdown from "../components/ui/Dropdown";
@@ -871,11 +872,17 @@ export default function Workspaces() {
             const chatButtonLabel = chatActionCount > 0
               ? t("page.workspaces.review_workspace_chat")
               : t("page.workspaces.open_workspace_chat");
-            const statusText = ws.status === "active"
-              ? t("page.agents.live")
-              : ws.status === "paused"
-                ? t("page.workspaces.filter_paused")
-                : ws.status;
+            const isWorkspaceSimulation = Boolean(
+              (ws.settings as Record<string, unknown> | undefined)?.sandbox === true ||
+              ws.kind === "sandbox",
+            );
+            const statusText = isWorkspaceSimulation
+              ? t("component.simulation_artifact_gallery.workspace_simulation")
+              : ws.status === "active"
+                ? t("page.agents.live")
+                : ws.status === "paused"
+                  ? t("page.workspaces.filter_paused")
+                  : ws.status;
             return (
               <WorkspaceAppCard
                 key={ws.id}

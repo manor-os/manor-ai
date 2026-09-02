@@ -15,10 +15,12 @@ from packages.core.models.staff import Staff, StaffRole
 from packages.core.permissions import (
     Permission,
     check_effective_permission,
+    effective_user_role_name,
     legacy_role_for_staff_role,
     legacy_role_from_role_name,
     user_effective_permission_keys,
     user_has_effective_permission,
+    user_staff_role_assignment,
     user_staff_role_summary,
 )
 from packages.core.services.auth_service import (
@@ -295,6 +297,16 @@ async def _require_admin(db: AsyncSession, user: User) -> None:
     )
 
 
+async def _require_user_management(db: AsyncSession, user: User) -> None:
+    await check_effective_permission(
+        db,
+        user.id,
+        user.entity_id,
+        user.role,
+        Permission.USERS_MANAGE,
+    )
+
+
 async def _require_role_in_entity(
     db: AsyncSession,
     role_id: str | None,
@@ -487,6 +499,15 @@ async def _membership_response(
             membership.entity_id,
         )
 
+    has_staff_record, _, effective_staff_role, _ = await user_staff_role_assignment(
+        db,
+        user.id,
+        membership.entity_id,
+    )
+    effective_role = (
+        effective_staff_role if has_staff_record else membership.role
+    )
+
     can_manage_team = await user_has_effective_permission(
         db,
         user.id,
@@ -512,7 +533,7 @@ async def _membership_response(
         is_current
         and membership.status == "active"
         and bool(membership.staff_id)
-        and (membership.role or "").lower() not in {"owner", "admin"}
+        and (effective_role or "").lower() not in {"owner", "admin"}
     )
     return GatewayMembershipResponse(
         entity_id=membership.entity_id,
@@ -625,7 +646,12 @@ async def _billing_response(
     entity: Entity | None,
     can_manage_billing: bool,
 ) -> GatewayBillingResponse:
-    from packages.core.constants.plans import canonical_plan_id, get_plan, is_cloud
+    from packages.core.constants.plans import (
+        ai_credit_limits_enabled,
+        canonical_plan_id,
+        get_plan,
+        is_cloud,
+    )
     from packages.core.services.plan_enforcement import get_usage_summary
 
     settings = (entity.settings if entity else {}) or {}
@@ -636,7 +662,7 @@ async def _billing_response(
     plan_summary = await get_usage_summary(db, user.entity_id)
     total = plan_summary.get("credits_total")
     used = plan_summary.get("credits_used")
-    if total is None:
+    if total is None and ai_credit_limits_enabled():
         plan_credits = int(plan.get("credit_amount") or 0)
         budget_usd = plan.get("ai_budget_usd") or 0
         total = int(settings.get("total_credits") or plan_credits or float(budget_usd) * 1000 or 0)
@@ -648,7 +674,7 @@ async def _billing_response(
         can_manage_billing=can_manage_billing,
         total_credits=total,
         used_credits=used,
-        remaining_credits=max(0, int(total or 0) - used),
+        remaining_credits=None if total is None else max(0, int(total) - used),
         own_credits_used=int(own_usage["credits_used"]),
         own_tokens_used=int(own_usage["tokens_used"]),
         own_cost_usd=float(own_usage["cost_usd"]),
@@ -872,7 +898,7 @@ async def leave_people_membership(
         if not membership or membership.status != "active":
             raise HTTPException(404, "Active team membership not found")
         raise HTTPException(400, "Switch to this company before leaving it.")
-    if user.role in {"owner", "admin"}:
+    if await effective_user_role_name(db, user) in {"owner", "admin"}:
         raise HTTPException(403, "Owners and admins must transfer or change role before leaving.")
 
     member = (
@@ -1031,6 +1057,13 @@ async def create_new_staff(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
+    if (
+        req.user_id is not None
+        or req.role_id is not None
+        or str(req.role or "").strip().lower() != "staff"
+        or str(req.status or "").strip().lower() != "active"
+    ):
+        await _require_user_management(db, user)
     await _require_role_in_entity(db, req.role_id, user.entity_id)
     s = await create_staff_member(
         db, user.entity_id, **req.model_dump(exclude_none=True),
@@ -1059,6 +1092,8 @@ async def update_one_staff(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
+    if req.role_id is not None or req.role is not None or req.status is not None:
+        await _require_user_management(db, user)
     await _require_role_in_entity(db, req.role_id, user.entity_id)
     s = await update_staff_member(db, staff_id, user.entity_id, **req.model_dump(exclude_none=True))
     if not s:
@@ -1076,6 +1111,7 @@ async def delete_one_staff(
     # DELETE is intentionally idempotent. Team pages can hold stale staff
     # cards after another tab/user removes a row; returning 204 keeps the
     # UI cleanup path smooth without leaking whether a cross-entity ID exists.
+    await _require_user_management(db, user)
     await delete_staff_member(db, staff_id, user.entity_id)
 
 
@@ -1108,7 +1144,7 @@ async def leave_my_team(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    if user.role in {"owner", "admin"}:
+    if await effective_user_role_name(db, user) in {"owner", "admin"}:
         raise HTTPException(403, "Owners and admins must transfer or change role before leaving.")
 
     member = (

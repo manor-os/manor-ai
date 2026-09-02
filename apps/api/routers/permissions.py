@@ -241,11 +241,13 @@ async def delete_role(
         raise HTTPException(400, "System roles cannot be deleted.")
 
     fallback_id = req.reassign_to_role_id if req else None
+    fallback_role_name = None
     if fallback_id:
         # Confirm the fallback role exists and is in the same entity.
         fb = await _load_role(db, fallback_id, user.entity_id)
         if fb.id == role.id:
             raise HTTPException(400, "Cannot reassign to the role being deleted.")
+        fallback_role_name = fb.name
     else:
         fallback_id = None
 
@@ -254,12 +256,22 @@ async def delete_role(
         await db.execute(
             select(Staff).where(
                 Staff.role_id == role.id,
+                Staff.entity_id == user.entity_id,
                 Staff.deleted_at.is_(None),
             )
         )
     ).scalars().all()
     for s in staff_rows:
         s.role_id = fallback_id
+        meta = dict(s.meta or {})
+        if fallback_role_name:
+            meta["role"] = fallback_role_name
+        else:
+            # Avoid reviving an older Staff metadata role after an explicit
+            # role removal. With neither role_id nor this marker, permission
+            # resolution fails closed even if User.role is stale.
+            meta.pop("role", None)
+        s.meta = meta
 
     await db.delete(role)
     await db.flush()

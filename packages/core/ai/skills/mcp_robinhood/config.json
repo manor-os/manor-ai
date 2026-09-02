@@ -1,0 +1,12 @@
+{
+  "id": "mcp_robinhood",
+  "name": "mcp_robinhood",
+  "type": "runtime_guidance",
+  "category": "finance",
+  "output_format": "guidance",
+  "display_name": "Robinhood account research",
+  "description": "Use the connected user's official Robinhood Trading MCP tools. Discover live schemas before use; account consent may include trading permissions.",
+  "version": "1.0.0",
+  "tags": ["robinhood", "finance", "remote-mcp", "runtime-guidance", "builtin", "mcp"],
+  "tools": ["search_tools"]
+}

@@ -1,5 +1,7 @@
 """E2E tests: workspace CRUD."""
 
+from types import SimpleNamespace
+
 import pytest
 from httpx import AsyncClient
 
@@ -37,6 +39,198 @@ async def test_create_workspace(client: AsyncClient):
     assert data["description"] == "A test workspace"
     assert data["category"] == "development"
     assert data["id"]
+    assert data["heartbeat_enabled"] is False
+
+
+@pytest.mark.asyncio
+async def test_create_workspace_matches_business_ledgers_and_exposes_overview(
+    client: AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+):
+    from packages.core import config
+
+    monkeypatch.setattr(
+        config,
+        "get_settings",
+        lambda: SimpleNamespace(MANOR_FS_ENABLED=True, MANOR_FS_ROOT=str(tmp_path)),
+    )
+    _, headers = await _register(client, "wsrecruiting")
+    resp = await client.post(
+        "/api/v1/workspaces",
+        headers=headers,
+        json={
+            "name": "Talent Operations",
+            "operating_context": "Recruit candidates and manage employee onboarding.",
+            "primary_work": "Run interviews and the hiring pipeline.",
+        },
+    )
+    assert resp.status_code == 201, resp.text
+    workspace = resp.json()
+    assert workspace["settings"]["ledger_contracts"] == [{
+        "contract_id": "manor.recruiting_ledger/v1",
+        "schema_version": 1,
+        "directory": "recruiting-ledger",
+    }]
+
+    overview = await client.get(
+        f"/api/v1/workspaces/{workspace['id']}/ledgers/overview",
+        headers=headers,
+    )
+    assert overview.status_code == 200, overview.text
+    assert overview.json()["ledgers"][0]["projection_kind"] == "current"
+
+    configured = await client.put(
+        f"/api/v1/workspaces/{workspace['id']}/ledgers/configuration",
+        headers=headers,
+        json={"ledger_contracts": ["finance_ledger"]},
+    )
+    assert configured.status_code == 200, configured.text
+    assert configured.json()["ledger_contracts"][0]["contract_id"] == (
+        "manor.finance_ledger/v1"
+    )
+
+    refreshed_overview = await client.get(
+        f"/api/v1/workspaces/{workspace['id']}/ledgers/overview",
+        headers=headers,
+    )
+    assert refreshed_overview.status_code == 200, refreshed_overview.text
+    assert refreshed_overview.json()["ledger_count"] == 1
+    assert refreshed_overview.json()["ledgers"][0]["contract_id"] == (
+        "manor.finance_ledger/v1"
+    )
+
+
+@pytest.mark.asyncio
+async def test_workspace_ledger_configuration_preserves_legacy_storage_config(
+    client: AsyncClient,
+):
+    _, headers = await _register(client, "wslegacyledger")
+    created = await client.post(
+        "/api/v1/workspaces",
+        headers=headers,
+        json={"name": "Legacy workspace"},
+    )
+    assert created.status_code == 201, created.text
+    workspace_id = created.json()["id"]
+
+    updated = await client.put(
+        f"/api/v1/workspaces/{workspace_id}",
+        headers=headers,
+        json={
+            "settings": {
+                "content_ledger": {
+                    "contract_id": "manor.content_ledger/v1",
+                    "directory": "topic-ledger",
+                    "legacy_directories": ["content-ledger"],
+                    "legacy_identity_fields": ["selected_topic"],
+                },
+            },
+        },
+    )
+    assert updated.status_code == 200, updated.text
+
+    configured = await client.put(
+        f"/api/v1/workspaces/{workspace_id}/ledgers/configuration",
+        headers=headers,
+        json={"ledger_contracts": ["content_ledger", "finance_ledger"]},
+    )
+    assert configured.status_code == 200, configured.text
+    contracts = {
+        item["contract_id"]: item
+        for item in configured.json()["ledger_contracts"]
+    }
+    assert contracts["manor.content_ledger/v1"] == {
+        "contract_id": "manor.content_ledger/v1",
+        "schema_version": 1,
+        "directory": "topic-ledger",
+        "legacy_directories": ["content-ledger"],
+        "legacy_identity_fields": ["selected_topic"],
+    }
+
+
+@pytest.mark.asyncio
+async def test_workspace_ledger_overview_returns_503_when_storage_is_unavailable(
+    client: AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from packages.core.services import workspace_ledger_overview as overview_module
+
+    _, headers = await _register(client, "wsledgeroutage")
+    created = await client.post(
+        "/api/v1/workspaces",
+        headers=headers,
+        json={
+            "name": "Recruiting Operations",
+            "primary_work": "Manage candidates and interviews.",
+        },
+    )
+    assert created.status_code == 201, created.text
+
+    async def unavailable(**_kwargs):
+        raise overview_module.RecruitingLedgerError(
+            "filesystem_unavailable",
+            "Workspace filesystem is unavailable",
+        )
+
+    monkeypatch.setattr(overview_module, "read_recruiting_ledger", unavailable)
+    response = await client.get(
+        f"/api/v1/workspaces/{created.json()['id']}/ledgers/overview",
+        headers=headers,
+    )
+
+    assert response.status_code == 503
+    assert response.json()["detail"]["code"] == "filesystem_unavailable"
+
+
+@pytest.mark.asyncio
+async def test_create_autonomous_workspace_without_goal_installs_runtime(
+    client: AsyncClient,
+    db_session,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from sqlalchemy import select
+
+    from apps.api.routers import workspaces as workspaces_router
+    from packages.core.models.goal import Goal
+    from packages.core.models.scheduler import ScheduledJob
+
+    sync_calls: list[str] = []
+    original_sync = workspaces_router.sync_workspace_runtime_schedules
+
+    async def tracked_sync(db, workspace):
+        sync_calls.append(workspace.id)
+        await original_sync(db, workspace)
+
+    monkeypatch.setattr(
+        workspaces_router,
+        "sync_workspace_runtime_schedules",
+        tracked_sync,
+    )
+
+    _, headers = await _register(client, "wsautonomous")
+    resp = await client.post(
+        "/api/v1/workspaces",
+        headers=headers,
+        json={
+            "name": "Autonomous, No Goal",
+            "heartbeat_enabled": True,
+            "heartbeat_cadence": "daily",
+        },
+    )
+
+    assert resp.status_code == 201
+    workspace = resp.json()
+    assert workspace["heartbeat_enabled"] is True
+    assert (await db_session.execute(
+        select(Goal).where(Goal.workspace_id == workspace["id"])
+    )).scalars().all() == []
+    strategist_job = (await db_session.execute(
+        select(ScheduledJob).where(ScheduledJob.job_id == f"sr:{workspace['id']}")
+    )).scalar_one_or_none()
+    assert strategist_job is not None
+    assert strategist_job.enabled is True
+    assert sync_calls == [workspace["id"]]
 
 
 @pytest.mark.asyncio
@@ -164,6 +358,51 @@ async def test_get_workspace(client: AsyncClient):
     resp = await client.get(f"/api/v1/workspaces/{ws_id}", headers=headers)
     assert resp.status_code == 200
     assert resp.json()["name"] == "GetMe"
+
+
+@pytest.mark.asyncio
+async def test_generic_workspace_update_cannot_forge_blueprint_setup_contract(
+    client: AsyncClient,
+):
+    _, headers = await _register(client, "workspace_setup_status")
+    created = await client.post(
+        "/api/v1/workspaces",
+        headers=headers,
+        json={"name": "Setup status"},
+    )
+    workspace_id = created.json()["id"]
+
+    ready = await client.get(
+        f"/api/v1/workspaces/{workspace_id}/setup-status",
+        headers=headers,
+    )
+    assert ready.status_code == 200, ready.text
+    assert ready.json()["ready"] is True
+
+    rejected = await client.put(
+        f"/api/v1/workspaces/{workspace_id}",
+        headers=headers,
+        json={
+            "settings": {
+                "_blueprint": {
+                    "install_todos": [{
+                        "kind": "note",
+                        "detail": "Complete the Blueprint-specific setup.",
+                        "payload": {},
+                        "blocking": True,
+                    }],
+                },
+            },
+        },
+    )
+    assert rejected.status_code == 400, rejected.text
+
+    still_ready = await client.get(
+        f"/api/v1/workspaces/{workspace_id}/setup-status",
+        headers=headers,
+    )
+    assert still_ready.status_code == 200, still_ready.text
+    assert still_ready.json()["ready"] is True
 
 
 @pytest.mark.asyncio

@@ -1,9 +1,8 @@
 /**
- * SitePublishAction — one icon button in the file viewer's action row.
+ * SitePublishAction — one icon button shared by the file viewer and editor.
  *
- * Renders nothing unless the open document is publishable (a folder whose root
- * has index.html, or a standalone .html file — the backend decides). Not
- * published yet: the button opens one publish-and-connect confirmation.
+ * Renders for a publishable document or an existing site that the actor can
+ * still manage. Not published yet: the button opens one publish-and-connect confirmation.
  * Already published: the button is active and opens the site drawer, which
  * owns everything else (address, republish,
  * custom domain, offline). Keeping it to a single control in the row the file
@@ -35,6 +34,13 @@ import {
   IconRefresh,
 } from "./icons";
 import { closeDetail, openDetail, useDetailStore } from "../stores/detail";
+
+type ConfirmedPublish = {
+  target: string;
+  name: string;
+  autoConnect: boolean;
+  snapshotHash: string;
+};
 
 function CopyableUrl({ url }: { url: string }) {
   const [copied, setCopied] = useState(false);
@@ -84,7 +90,7 @@ function PublishConfirmation({
     if (action === "enable") return t("sites.autoEnable");
     return t("sites.autoCreate");
   };
-  const rows = plan?.eligible
+  const rows = plan?.eligible && plan.can_auto_connect
     ? [
         {
           key: "customer-service",
@@ -115,7 +121,7 @@ function PublishConfirmation({
 
   return (
     <div className="space-y-4">
-      {plan?.eligible ? (
+      {plan?.eligible && plan.can_auto_connect ? (
         <>
           <p className="text-sm leading-6 text-stone-600">
             {t("sites.publishConfirmDescription", {
@@ -430,6 +436,7 @@ function SiteDrawerBody({
   excluded,
   publishError,
   publishing,
+  canRepublish,
   onRepublish,
   onSiteChange,
 }: {
@@ -437,6 +444,7 @@ function SiteDrawerBody({
   excluded: SitePublishResult["excluded"];
   publishError: string | null;
   publishing: boolean;
+  canRepublish: boolean;
   onRepublish: () => void;
   onSiteChange: (s: SiteInfo) => void;
 }) {
@@ -491,10 +499,12 @@ function SiteDrawerBody({
               ? t("sites.publishedRev", { rev: site.revision })
               : t("sites.offline")}
           </span>
-          <Button variant="outline" size="sm" disabled={publishing} onClick={onRepublish}>
-            <IconRefresh size={13} className="mr-1 inline" />
-            {publishing ? t("sites.publishing") : t("sites.republish")}
-          </Button>
+          {canRepublish && (
+            <Button variant="outline" size="sm" disabled={publishing} onClick={onRepublish}>
+              <IconRefresh size={13} className="mr-1 inline" />
+              {publishing ? t("sites.publishing") : t("sites.republish")}
+            </Button>
+          )}
         </div>
       </div>
 
@@ -580,7 +590,7 @@ function SiteDrawerBody({
             <IconEyeOff size={13} className="mr-1 inline" />
             {t("sites.takeOffline")}
           </Button>
-        ) : (
+        ) : canRepublish ? (
           <Button
             variant="outline"
             size="sm"
@@ -590,13 +600,19 @@ function SiteDrawerBody({
             <IconEye size={13} className="mr-1 inline" />
             {t("sites.putOnline")}
           </Button>
-        )}
+        ) : null}
       </div>
     </div>
   );
 }
 
-export default function SitePublishAction({ doc }: { doc: Document | null }) {
+export default function SitePublishAction({
+  doc,
+  beforePublish,
+}: {
+  doc: Document | null;
+  beforePublish?: () => Promise<boolean>;
+}) {
   const docPath = doc?.fs_path || "";
   const [target, setTarget] = useState<string | null>(null);
   const [site, setSite] = useState<SiteInfo | null>(null);
@@ -605,8 +621,7 @@ export default function SitePublishAction({ doc }: { doc: Document | null }) {
   const [error, setError] = useState<string | null>(null);
   const [excluded, setExcluded] = useState<SitePublishResult["excluded"]>([]);
   const [hostingConfigured, setHostingConfigured] = useState(true);
-  const [autoConnectionPlan, setAutoConnectionPlan] =
-    useState<SiteAutoConnectionPlan | null>(null);
+  const refreshRequestRef = useRef(0);
   // The store's open key is the single source of truth for "my drawer is
   // showing" — tracking it in local state races with the store update and
   // silently strands the drawer with stale content.
@@ -615,21 +630,22 @@ export default function SitePublishAction({ doc }: { doc: Document | null }) {
   const drawerOpen = !!drawerKey && openKey === drawerKey;
 
   const refresh = useCallback(async () => {
+    const requestId = ++refreshRequestRef.current;
     if (!docPath) {
-      setChecked(true);
+      if (requestId === refreshRequestRef.current) setChecked(true);
       return null;
     }
     try {
       const r = await api.sites.forPath(docPath);
+      if (requestId !== refreshRequestRef.current) return null;
       setTarget(r.publishable ? r.target : null);
       setSite(r.site);
       setHostingConfigured(r.hosting_configured);
-      setAutoConnectionPlan(r.auto_connection_plan);
-      return r.site;
+      return r;
     } catch {
       return null;
     } finally {
-      setChecked(true);
+      if (requestId === refreshRequestRef.current) setChecked(true);
     }
   }, [docPath]);
 
@@ -637,9 +653,11 @@ export default function SitePublishAction({ doc }: { doc: Document | null }) {
     setChecked(false);
     setSite(null);
     setTarget(null);
-    setAutoConnectionPlan(null);
     setExcluded([]);
-    refresh();
+    void refresh();
+    return () => {
+      refreshRequestRef.current += 1;
+    };
   }, [refresh]);
 
   const defaultName = useMemo(() => {
@@ -659,7 +677,7 @@ export default function SitePublishAction({ doc }: { doc: Document | null }) {
     }
   };
 
-  const publishRef = useRef<() => void>(() => {});
+  const openPublishConfirmationRef = useRef<() => void>(() => {});
 
   const buildPayload = (
     s: SiteInfo,
@@ -676,7 +694,8 @@ export default function SitePublishAction({ doc }: { doc: Document | null }) {
         excluded={excludedFiles}
         publishError={publishError}
         publishing={busy}
-        onRepublish={() => publishRef.current()}
+        canRepublish={!!target}
+        onRepublish={() => openPublishConfirmationRef.current()}
         onSiteChange={setSite}
       />
     ),
@@ -691,15 +710,15 @@ export default function SitePublishAction({ doc }: { doc: Document | null }) {
     },
   });
 
-  const publish = async () => {
-    if (!target) return;
+  const publishConfirmed = async (confirmed: ConfirmedPublish) => {
     setBusy(true);
     setError(null);
     try {
       const r = await api.sites.publish({
-        path: target,
-        name: site?.name || defaultName,
-        auto_connect: true,
+        path: confirmed.target,
+        name: confirmed.name,
+        auto_connect: confirmed.autoConnect,
+        expected_snapshot_hash: confirmed.snapshotHash,
       });
       setExcluded(r.excluded);
       setSite(r);
@@ -720,7 +739,7 @@ export default function SitePublishAction({ doc }: { doc: Document | null }) {
             label: t("sites.publish"),
             onClick: () => {
               closeDetail();
-              publish();
+              openPublishConfirmationRef.current();
             },
           },
         });
@@ -730,24 +749,66 @@ export default function SitePublishAction({ doc }: { doc: Document | null }) {
     }
   };
 
-  publishRef.current = publish;
-
-  const openPublishConfirmation = () => {
-    const autoConnect = !!autoConnectionPlan?.eligible;
-    openDetail({
-      key: `site-publish-${target}`,
-      icon: <IconGlobe size={18} />,
-      title: t("sites.publishConfirmTitle"),
-      subtitle: defaultName,
-      body: <PublishConfirmation plan={autoConnectionPlan} />,
-      primaryAction: {
-        label: autoConnect ? t("sites.confirmPublishAndConnect") : t("sites.confirmPublish"),
-        onClick: () => {
-          closeDetail();
-          publishRef.current();
+  const openPublishConfirmation = async () => {
+    setBusy(true);
+    setError(null);
+    try {
+      if (beforePublish && !(await beforePublish())) {
+        throw new Error(t("page.blueprint_detail.save_failed"));
+      }
+      const latest = await refresh();
+      if (
+        !latest?.publishable
+        || !latest.target
+        || !latest.publish_snapshot_hash
+      ) {
+        throw new Error(t("sites.publishFailed"));
+      }
+      const plan = latest.auto_connection_plan;
+      const autoConnect = Boolean(plan?.eligible && plan.can_auto_connect);
+      const confirmed: ConfirmedPublish = {
+        target: latest.target,
+        name: latest.site?.name || defaultName,
+        autoConnect,
+        snapshotHash: latest.publish_snapshot_hash,
+      };
+      openDetail({
+        key: `site-publish-${latest.target}`,
+        icon: <IconGlobe size={18} />,
+        title: t("sites.publishConfirmTitle"),
+        subtitle: confirmed.name,
+        body: <PublishConfirmation plan={plan} />,
+        primaryAction: {
+          label: autoConnect ? t("sites.confirmPublishAndConnect") : t("sites.confirmPublish"),
+          onClick: () => {
+            closeDetail();
+            void publishConfirmed(confirmed);
+          },
         },
-      },
-    });
+      });
+    } catch (e: any) {
+      const message = e?.message || String(e);
+      setError(message);
+      openDetail({
+        key: `site-error-${target || docPath}`,
+        icon: <IconGlobe size={18} />,
+        title: t("sites.publishFailed"),
+        body: <div className="whitespace-pre-wrap text-xs text-red-600">{message}</div>,
+        primaryAction: {
+          label: t("sites.publish"),
+          onClick: () => {
+            closeDetail();
+            openPublishConfirmationRef.current();
+          },
+        },
+      });
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  openPublishConfirmationRef.current = () => {
+    void openPublishConfirmation();
   };
 
   // Poll DNS verification while the drawer is open and a domain is pending.
@@ -769,7 +830,7 @@ export default function SitePublishAction({ doc }: { doc: Document | null }) {
 
   // Hosting unconfigured and nothing published yet: the whole feature is off on
   // this deployment, so don't advertise a button that can't produce a URL.
-  if (!checked || !target || (!hostingConfigured && !site)) return null;
+  if (!checked || (!target && !site) || (!hostingConfigured && !site)) return null;
 
   const published = !!site && site.status === "active";
   const label = published
@@ -785,7 +846,7 @@ export default function SitePublishAction({ doc }: { doc: Document | null }) {
         if (site) {
           openDetail(buildPayload(site, excluded, error));
         } else {
-          openPublishConfirmation();
+          void openPublishConfirmation();
         }
       }}
       disabled={busy}
@@ -796,7 +857,7 @@ export default function SitePublishAction({ doc }: { doc: Document | null }) {
       }`}
       style={{
         opacity: busy ? 0.5 : 1,
-        ...(published ? { color: "#2f7268" } : {}),
+        ...(published ? { color: "var(--accent)" } : {}),
       }}
     >
       <IconGlobe size={16} />

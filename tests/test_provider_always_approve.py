@@ -15,6 +15,7 @@ model never sees an approval it cannot resolve.
 The gate itself is untouched: without a grant, the card flow runs exactly as
 before.
 """
+
 from __future__ import annotations
 
 import json
@@ -24,24 +25,29 @@ import pytest
 from packages.core.ai.runtime import approval_service
 from packages.core.ai.runtime.approval_service import (
     _provider_supports_always_approve,
-    _step_scoped_provider_scope_allows,
     runtime_auto_confirm_provider_approval,
+)
+from packages.core.proposals.external_authorization import (
+    proposal_youtube_public_request_matches,
+    proposal_youtube_public_upload_entry_request_matches,
 )
 
 _ARGS = {"ref": "e1", "tabId": 895206222, "value": "Ship it."}
 
 
 def _approval_required_result(approval_id: str = "approval-1785183097747913000-90e0") -> str:
-    return json.dumps({
-        "ok": False,
-        "status": "approval_required",
-        "approval_required": True,
-        "provider": "chrome",
-        "approvalId": approval_id,
-        "expires_at": "2099-07-19T12:00:00Z",
-        "target_label": "Post",
-        "retry_action": {"name": "mcp__chrome__fill_or_select", "arguments": _ARGS},
-    })
+    return json.dumps(
+        {
+            "ok": False,
+            "status": "approval_required",
+            "approval_required": True,
+            "provider": "chrome",
+            "approvalId": approval_id,
+            "expires_at": "2099-07-19T12:00:00Z",
+            "target_label": "Post",
+            "retry_action": {"name": "mcp__chrome__fill_or_select", "arguments": _ARGS},
+        }
+    )
 
 
 def _recorder(*, token: str | None = "approval-token-abc"):
@@ -66,7 +72,7 @@ def _grant(monkeypatch, granted: bool, *, seen: dict | None = None):
             seen.update(kwargs)
         return granted
 
-    monkeypatch.setattr(approval_service, "_provider_standing_grant", fake_grant)
+    monkeypatch.setattr(approval_service, "_standing_grant", fake_grant)
 
     class _Session:
         async def __aenter__(self):
@@ -76,7 +82,8 @@ def _grant(monkeypatch, granted: bool, *, seen: dict | None = None):
             return False
 
     monkeypatch.setattr(
-        "packages.core.database.async_session", lambda: _Session(),
+        "packages.core.database.async_session",
+        lambda: _Session(),
     )
 
 
@@ -88,76 +95,94 @@ def test_every_normalized_provider_supports_always_approve():
     assert _provider_supports_always_approve(None) is False
 
 
-def test_proposal_always_approve_is_limited_to_blueprint_uploader_step_categories():
-    settings = {
-        "strategist": {"auto_approve_proposals": True},
-        "runtime_approval_scope_grants": [
-            {
-                "owner_service_key": "stickman.production",
-                "provider": "chrome",
-                "policy_categories": ["youtube_upload_start", "file_upload"],
-                "step_key": "upload_to_youtube",
-                "step_kind": "subagent",
-                "enabled": True,
-            },
-        ],
+def _proposal_authorization() -> dict[str, object]:
+    return {
+        "version": 1,
+        "authorization_id": "proposal-item:publish-task",
+        "workspace_id": "workspace-1",
+        "task_id": "publish-task",
+        "provider": "youtube",
+        "action": "publish_video",
+        "destination": "studio.youtube.com",
+        "visibility": "public",
+        "intended_channel": "paired_chrome_signed_in_channel",
+        "max_executions": 1,
     }
 
-    assert _step_scoped_provider_scope_allows(
-        workspace_settings=settings,
-        step_owner_service_key="stickman.production",
-        step_key="upload_to_youtube",
-        step_kind="subagent",
-        provider="chrome",
-        policy_category="youtube_upload_start",
-    ) is True
-    assert _step_scoped_provider_scope_allows(
-        workspace_settings=settings,
-        step_owner_service_key="stickman.production",
-        step_key="upload_to_youtube",
-        step_kind="subagent",
-        provider="chrome",
-        policy_category="representational_communication",
-    ) is False
-    assert _step_scoped_provider_scope_allows(
-        workspace_settings=settings,
-        step_owner_service_key="stickman.production",
-        step_key="produce_video",
-        step_kind="subagent",
-        provider="chrome",
-        policy_category="youtube_upload_start",
-    ) is False
 
-
-def test_proposal_always_approve_requires_the_producer_upload_step():
-    settings = {
-        "runtime_approval_scope_grants": [
-            {
-                "owner_service_key": "stickman.production",
-                "provider": "chrome",
-                "policy_categories": ["youtube_upload_start", "file_upload"],
-                "step_key": "upload_to_youtube",
-                "step_kind": "subagent",
-                "enabled": True,
-            },
-        ],
+def _youtube_browser_request(*, target_label: str) -> dict[str, object]:
+    return {
+        "provider": "chrome",
+        "confirmation_mode": "always_action_time",
+        "policy_category": "representational_communication",
+        "target_label": target_label,
+        "retry_tool": "mcp__chrome__click_element",
+        "url": "https://studio.youtube.com/channel/demo/videos/upload",
     }
 
-    assert _step_scoped_provider_scope_allows(
-        workspace_settings=settings,
-        step_owner_service_key="stickman.production",
-        step_key="upload_to_youtube",
-        step_kind="subagent",
-        provider="chrome",
-        policy_category="youtube_upload_start",
+
+def test_proposal_always_approve_is_limited_to_bound_youtube_actions():
+    authorization = _proposal_authorization()
+
+    assert proposal_youtube_public_request_matches(
+        authorization,
+        _youtube_browser_request(target_label="Publish"),
+        task_id="publish-task",
+        workspace_id="workspace-1",
     ) is True
-    assert _step_scoped_provider_scope_allows(
-        workspace_settings=settings,
-        step_owner_service_key="stickman.production",
-        step_key="produce_video",
-        step_kind="subagent",
-        provider="chrome",
-        policy_category="youtube_upload_start",
+    assert proposal_youtube_public_request_matches(
+        authorization,
+        {
+            **_youtube_browser_request(target_label="Publish"),
+            "policy_category": "file_upload",
+        },
+        task_id="publish-task",
+        workspace_id="workspace-1",
+    ) is False
+    assert proposal_youtube_public_request_matches(
+        authorization,
+        _youtube_browser_request(target_label="Publish"),
+        task_id="another-task",
+        workspace_id="workspace-1",
+    ) is False
+
+
+def test_proposal_always_approve_requires_the_upload_entry_action():
+    authorization = _proposal_authorization()
+
+    assert proposal_youtube_public_upload_entry_request_matches(
+        authorization,
+        _youtube_browser_request(target_label="Upload videos"),
+        task_id="publish-task",
+        workspace_id="workspace-1",
+    ) is True
+    assert proposal_youtube_public_upload_entry_request_matches(
+        authorization,
+        _youtube_browser_request(target_label="Publish"),
+        task_id="publish-task",
+        workspace_id="workspace-1",
+    ) is False
+    assert proposal_youtube_public_upload_entry_request_matches(
+        authorization,
+        {
+            **_youtube_browser_request(target_label="Upload videos"),
+            "url": "https://evil.example/upload",
+        },
+        task_id="publish-task",
+        workspace_id="workspace-1",
+    ) is False
+
+
+def test_proposal_always_approve_rejects_unbound_workspace():
+    settings = {
+        **_proposal_authorization(),
+    }
+
+    assert proposal_youtube_public_request_matches(
+        settings,
+        _youtube_browser_request(target_label="Publish"),
+        task_id="publish-task",
+        workspace_id="workspace-2",
     ) is False
 
 
@@ -222,14 +247,14 @@ async def test_standing_grant_retries_the_exact_action_once(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_step_id_and_provider_category_reach_standing_grant(monkeypatch):
+async def test_canonical_action_scope_reaches_standing_grant(monkeypatch):
     seen: dict = {}
     _grant(monkeypatch, False, seen=seen)
     execute, calls = _recorder()
 
     payload = json.loads(_approval_required_result())
-    payload["confirmation_mode"] = "preapproval_allowed"
-    payload["policy_category"] = "youtube_upload_start"
+    payload["action_key"] = "chrome.fill_or_select"
+    payload["resource_id"] = "tab:1"
     original = json.dumps(payload)
     out = await runtime_auto_confirm_provider_approval(
         tool_name="mcp__chrome__fill_or_select",
@@ -239,14 +264,17 @@ async def test_step_id_and_provider_category_reach_standing_grant(monkeypatch):
         entity_id="ENT",
         user_id="USR",
         workspace_id="WS",
-        step_id="STEP-UPLOAD",
     )
 
     assert out == original
     assert calls == []
-    assert seen["step_id"] == "STEP-UPLOAD"
-    assert seen["provider"] == "chrome"
-    assert seen["policy_category"] == "youtube_upload_start"
+    assert seen == {
+        "workspace_id": "WS",
+        "user_id": "USR",
+        "action_key": "chrome.fill_or_select",
+        "resource_id": "tab:1",
+        "capability_id": "chrome.action",
+    }
 
 
 @pytest.mark.asyncio
@@ -278,8 +306,12 @@ async def test_successful_results_pass_straight_through(monkeypatch):
 
     out = await runtime_auto_confirm_provider_approval(
         tool_name="mcp__chrome__fill_or_select",
-        arguments=_ARGS, result=plain, execute=execute,
-        entity_id="ENT", user_id="USR", workspace_id="WS",
+        arguments=_ARGS,
+        result=plain,
+        execute=execute,
+        entity_id="ENT",
+        user_id="USR",
+        workspace_id="WS",
     )
     assert out == plain
     assert calls == []
@@ -295,8 +327,12 @@ async def test_confirm_without_a_token_falls_back_to_the_card(monkeypatch):
 
     out = await runtime_auto_confirm_provider_approval(
         tool_name="mcp__chrome__fill_or_select",
-        arguments=_ARGS, result=original, execute=execute,
-        entity_id="ENT", user_id="USR", workspace_id="WS",
+        arguments=_ARGS,
+        result=original,
+        execute=execute,
+        entity_id="ENT",
+        user_id="USR",
+        workspace_id="WS",
     )
     assert [name for name, _ in calls] == ["mcp__chrome__confirm_action"]
     assert out == original
@@ -312,8 +348,12 @@ async def test_executor_failure_falls_back_to_the_card(monkeypatch):
     original = _approval_required_result()
     out = await runtime_auto_confirm_provider_approval(
         tool_name="mcp__chrome__fill_or_select",
-        arguments=_ARGS, result=original, execute=exploding,
-        entity_id="ENT", user_id="USR", workspace_id="WS",
+        arguments=_ARGS,
+        result=original,
+        execute=exploding,
+        entity_id="ENT",
+        user_id="USR",
+        workspace_id="WS",
     )
     assert out == original
 
@@ -322,20 +362,26 @@ async def test_executor_failure_falls_back_to_the_card(monkeypatch):
 async def test_expired_provider_approval_is_not_auto_confirmed(monkeypatch):
     _grant(monkeypatch, True)
     execute, calls = _recorder()
-    expired = json.dumps({
-        "ok": False,
-        "status": "approval_required",
-        "approval_required": True,
-        "provider": "chrome",
-        "approvalId": "approval-1-abc",
-        "expires_at": "2000-01-01T00:00:00Z",
-        "retry_action": {"name": "mcp__chrome__fill_or_select", "arguments": _ARGS},
-    })
+    expired = json.dumps(
+        {
+            "ok": False,
+            "status": "approval_required",
+            "approval_required": True,
+            "provider": "chrome",
+            "approvalId": "approval-1-abc",
+            "expires_at": "2000-01-01T00:00:00Z",
+            "retry_action": {"name": "mcp__chrome__fill_or_select", "arguments": _ARGS},
+        }
+    )
 
     out = await runtime_auto_confirm_provider_approval(
         tool_name="mcp__chrome__fill_or_select",
-        arguments=_ARGS, result=expired, execute=execute,
-        entity_id="ENT", user_id="USR", workspace_id="WS",
+        arguments=_ARGS,
+        result=expired,
+        execute=execute,
+        entity_id="ENT",
+        user_id="USR",
+        workspace_id="WS",
     )
     assert calls == []
     assert out == expired
@@ -364,7 +410,9 @@ async def test_a_gated_retry_does_not_recurse(monkeypatch):
         arguments=_ARGS,
         result=_approval_required_result(),
         execute=always_gated,
-        entity_id="ENT", user_id="USR", workspace_id="WS",
+        entity_id="ENT",
+        user_id="USR",
+        workspace_id="WS",
     )
 
     # exactly one confirm + one retry, then stop

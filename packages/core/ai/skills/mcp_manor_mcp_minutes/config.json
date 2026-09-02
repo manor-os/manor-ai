@@ -1,0 +1,19 @@
+{
+  "id": "mcp_manor_mcp_minutes",
+  "name": "mcp_manor_mcp_minutes",
+  "type": "runtime_guidance",
+  "description": "Search and read the current entity's Manor Minutes meeting notes, transcripts, summaries, action items, and meeting Q&A.",
+  "category": "meetings",
+  "output_format": "guidance",
+  "tags": ["minutes", "meetings", "transcripts", "runtime-guidance", "builtin", "mcp"],
+  "tools": [
+    "mcp__manor_mcp_minutes__search_meetings",
+    "mcp__manor_mcp_minutes__get_transcript",
+    "mcp__manor_mcp_minutes__get_summary",
+    "mcp__manor_mcp_minutes__list_recent_meetings",
+    "mcp__manor_mcp_minutes__get_action_items",
+    "mcp__manor_mcp_minutes__chat_with_meeting",
+    "mcp__manor_mcp_minutes__get_meeting_details",
+    "mcp__manor_mcp_minutes__get_meeting_stats"
+  ]
+}

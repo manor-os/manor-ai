@@ -1,5 +1,8 @@
 """E2E tests: OpenAPI schema export and API versioning."""
 
+import json
+from pathlib import Path
+
 import pytest
 from httpx import AsyncClient
 from fastapi.routing import APIRoute
@@ -64,6 +67,8 @@ def test_app_does_not_register_duplicate_http_routes():
                 seen[key] = endpoint
 
     assert duplicates == []
+
+
 
 
 def _route_paths(app) -> set[str]:

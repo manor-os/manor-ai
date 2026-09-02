@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Iterator
 from xml.etree import ElementTree as ET
+from defusedxml import ElementTree as SafeET
 
 from .emu_units import NS, emu_attr_to_px
 
@@ -56,7 +57,7 @@ def _parse_rels(zf: zipfile.ZipFile, rels_path: str) -> dict[str, dict[str, str]
     if rels_path not in zf.namelist():
         return {}
     try:
-        root = ET.fromstring(zf.read(rels_path))
+        root = SafeET.fromstring(zf.read(rels_path))
     except ET.ParseError:
         return {}
 
@@ -81,7 +82,7 @@ def _load_xml(zf: zipfile.ZipFile, part_path: str) -> ET.Element | None:
     if part_path not in zf.namelist():
         return None
     try:
-        return ET.fromstring(zf.read(part_path))
+        return SafeET.fromstring(zf.read(part_path))
     except ET.ParseError:
         return None
 
@@ -372,4 +373,3 @@ class OoxmlPackage:
                         continue
                     self._layouts[target] = cached
                 yield cached, master
-

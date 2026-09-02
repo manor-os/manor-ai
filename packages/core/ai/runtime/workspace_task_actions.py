@@ -9,7 +9,9 @@ from typing import Any
 
 from sqlalchemy import select
 
-from packages.core.constants.task import TaskLogType
+from packages.core.constants.goals import GoalStatus
+from packages.core.constants.review import ReviewSkipReason
+from packages.core.constants.task import TaskLogType, TaskType
 from packages.core.ai.runtime.task_actions import runtime_normalize_task_priority
 
 logger = logging.getLogger(__name__)
@@ -185,6 +187,38 @@ def _customer_context_from_runtime_tool_kwargs(kwargs: dict[str, Any]) -> dict[s
     return {key: value for key, value in context.items() if value not in (None, "", [])}
 
 
+def _internal_task_creator_id_from_runtime_tool_kwargs(
+    kwargs: dict[str, Any],
+    *,
+    fallback_user_id: str | None,
+) -> str | None:
+    """Return a User id only when the runtime principal is an internal human."""
+
+    from packages.core.ai.runtime.principals import RuntimePrincipalKind
+    from packages.core.ai.runtime.tool_context import runtime_tool_call_context_from_kwargs
+
+    runtime_context = runtime_tool_call_context_from_kwargs(kwargs)
+    envelope = runtime_context.runtime_envelope
+    if envelope is None:
+        return str(fallback_user_id or "").strip() or None
+
+    principal = getattr(envelope, "principal", None)
+    kind = getattr(principal, "kind", None)
+    kind_value = getattr(kind, "value", kind)
+    if kind_value not in {
+        RuntimePrincipalKind.OWNER.value,
+        RuntimePrincipalKind.WORKSPACE_MEMBER.value,
+    }:
+        return None
+
+    return str(
+        getattr(principal, "execution_user_id", None)
+        or getattr(principal, "actor_user_id", None)
+        or fallback_user_id
+        or ""
+    ).strip() or None
+
+
 def _workspace_task_to_dict(task: Any) -> dict[str, Any]:
     return {
         "id": task.id,
@@ -303,7 +337,7 @@ async def _resolve_goal_links_for_task(
         select(Goal).where(
             Goal.entity_id == entity_id,
             Goal.workspace_id == workspace_id,
-            Goal.status == "active",
+            Goal.status == GoalStatus.ACTIVE.value,
         )
     )).scalars().all())
     if not goals:
@@ -340,18 +374,20 @@ async def _link_task_to_goals(
 ) -> None:
     if not task_id or not goal_ids:
         return
-    from packages.core.models.goal import GoalTaskLink
+    from packages.core.goals.service import link_task_to_goal
 
-    existing = set((await db.execute(
-        select(GoalTaskLink.goal_id).where(
-            GoalTaskLink.task_id == task_id,
-            GoalTaskLink.goal_id.in_(goal_ids),
-        )
-    )).scalars().all())
     for goal_id in goal_ids:
-        if goal_id in existing:
+        try:
+            await link_task_to_goal(
+                db,
+                goal_id=goal_id,
+                task_id=task_id,
+                contribution=contribution,
+            )
+        except ValueError:
+            # A Goal may be deleted after link inference but before the task
+            # is flushed. The task remains valid without that stale link.
             continue
-        db.add(GoalTaskLink(goal_id=goal_id, task_id=task_id, contribution=contribution))
 
 
 async def runtime_workspace_create_task_action(
@@ -365,6 +401,10 @@ async def runtime_workspace_create_task_action(
 ) -> str:
     raw_params = dict(params or {})
     customer_context = _customer_context_from_runtime_tool_kwargs(raw_params)
+    creator_user_id = _internal_task_creator_id_from_runtime_tool_kwargs(
+        raw_params,
+        fallback_user_id=user_id,
+    )
     title = str(raw_params.get("title") or "").strip()
     if not title:
         return _dumps({"error": "title is required"})
@@ -381,6 +421,9 @@ async def runtime_workspace_create_task_action(
             if raw_params.get("start") is not None
             else raw_params.get("run_now") or raw_params.get("execute")
         )
+        task_type = str(raw_params.get("task_type") or TaskType.GENERAL.value)
+        if task_type == TaskType.INTERACTIVE.value:
+            dispatch_requested = False
         requested_owner = str(
             raw_params.get("owner_service_key") or raw_params.get("service_key") or raw_params.get("agent_type") or ""
         ).strip() or None
@@ -411,7 +454,7 @@ async def runtime_workspace_create_task_action(
             if not workspace:
                 return _dumps({"error": "workspace not found"})
             author_created_by, author_meta, author_actor = await task_service.agent_log_authorship(
-                db, actor_agent_id, fallback=user_id,
+                db, actor_agent_id, fallback=creator_user_id,
             )
             owner_service_key, owner_subscription_id, available_service_keys = await _resolve_owner_binding(
                 db,
@@ -419,6 +462,15 @@ async def runtime_workspace_create_task_action(
                 workspace_id=workspace_id,
                 requested_service_key=requested_owner,
             )
+            if (
+                task_type == TaskType.INTERACTIVE.value
+                and raw_params.get("agent_id")
+                and not requested_owner
+            ):
+                # A directly assigned session Host is already unambiguous; do
+                # not attach the Workspace's sole service implicitly.
+                owner_service_key = None
+                owner_subscription_id = None
             if requested_owner and not owner_service_key:
                 return _dumps({
                     "error": "owner_service_not_found",
@@ -452,7 +504,7 @@ async def runtime_workspace_create_task_action(
                 required_capabilities=required_capabilities,
                 replace=True,
                 conversation_id=conversation_id or None,
-                user_id=user_id or None,
+                user_id=creator_user_id,
             )
             goal_link_ids, goal_link_source = await _resolve_goal_links_for_task(
                 db,
@@ -476,6 +528,9 @@ async def runtime_workspace_create_task_action(
             if goal_link_ids:
                 details["goal_ids"] = goal_link_ids
                 details["goal_link_source"] = goal_link_source
+            session_config = raw_params.get("session_config")
+            if isinstance(session_config, dict) and session_config:
+                details["session"] = session_config
 
             task = await task_service.create_task(
                 db,
@@ -483,13 +538,24 @@ async def runtime_workspace_create_task_action(
                 title=title,
                 description=raw_params.get("description") or "",
                 priority=runtime_normalize_task_priority(raw_params.get("priority") or 3),
-                task_type=raw_params.get("task_type") or "general",
+                task_type=task_type,
                 workspace_id=workspace_id,
                 assignee_id=raw_params.get("assignee_id") or None,
                 agent_id=raw_params.get("agent_id") or None,
                 agent_type=raw_params.get("agent_type") or None,
-                creator_id=author_created_by,
-                conversation_id=conversation_id or None,
+                # ``creator_id`` is an internal User identity. Agent authorship
+                # belongs on the creation log; external identity stays in the
+                # customer context instead of inheriting workspace membership.
+                creator_id=creator_user_id,
+                creator_agent_id=actor_agent_id,
+                conversation_id=(
+                    None
+                    if task_type == TaskType.INTERACTIVE.value
+                    else conversation_id or None
+                ),
+                owner_service_key=owner_service_key,
+                owner_subscription_id=owner_subscription_id,
+                delegate_service_keys=delegate_service_keys,
                 details=details,
                 deadline=raw_params.get("deadline") or None,
             )
@@ -531,16 +597,18 @@ async def runtime_workspace_create_task_action(
                         db,
                         task.id,
                         entity_id,
-                        user_id=user_id or None,
+                        user_id=creator_user_id,
+                        dispatch_plan=False,
                         status="in_progress",
                         details=dict(task.details or {}),
                     )
                     if updated:
                         task = updated
                     dispatch_after_commit = True
-            task.owner_service_key = owner_service_key
-            task.owner_subscription_id = owner_subscription_id
-            task.delegate_service_keys = delegate_service_keys
+            if task.task_type == TaskType.INTERACTIVE.value:
+                # The conversation is the execution surface. Interactive Tasks
+                # are not dispatched to the background Planner/Runner.
+                dispatch_after_commit = False
             await record_activity(
                 db,
                 workspace_id,
@@ -558,7 +626,8 @@ async def runtime_workspace_create_task_action(
                     "goal_link_source": goal_link_source,
                     "available_service_keys": available_service_keys,
                 },
-                user_id=user_id or None,
+                user_id=creator_user_id,
+                agent_id=actor_agent_id,
             )
             await db.commit()
             await db.refresh(task)
@@ -734,6 +803,20 @@ async def runtime_workspace_request_strategist_review_action(
             workspace = await _load_workspace(db, entity_id=entity_id, workspace_id=workspace_id)
             if not workspace:
                 return _dumps({"error": "workspace not found"})
+            if workspace.status != "active":
+                return _dumps({
+                    "requested": False,
+                    "blocked": True,
+                    "reason": ReviewSkipReason.WORKSPACE_INACTIVE,
+                    "workspace_id": workspace_id,
+                    "workspace_status": workspace.status,
+                    "next_step": (
+                        "Tell the user the Strategist review did not start because "
+                        f"the workspace is {workspace.status}. Do not claim that the "
+                        "review was requested or is running. Ask them to start the "
+                        "workspace first, then request the review again."
+                    ),
+                })
 
             open_tasks = await list_open_proposals(db, workspace_id)
             superseded: dict | None = None

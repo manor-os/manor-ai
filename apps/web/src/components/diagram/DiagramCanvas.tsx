@@ -4,9 +4,12 @@ import {
   createDiagramId,
   getAnchorPoint,
   getElementBounds,
+  MAX_DIAGRAM_CANVAS_DIMENSION,
   resolveEndpoint,
   type DiagramAnchor,
+  type DiagramBounds,
   type DiagramConnectorElement,
+  type DiagramConnectorMarker,
   type DiagramEndpointBinding,
   type DiagramConnectorRouting,
   type DiagramElement,
@@ -82,6 +85,8 @@ const CONNECTOR_SNAP_PX = 34;
 const MIN_SIZE = 24;
 const MIN_ZOOM = 0.35;
 const MAX_ZOOM = 2.5;
+const MAX_DIAGRAM_SVG_INTRINSIC_DIMENSION = 10_000;
+const MAX_DIAGRAM_SVG_VIEWBOX_DIMENSION = 1_000_000;
 const EDITOR_VIEW_MIN_WIDTH = 2400;
 const EDITOR_VIEW_MIN_HEIGHT = 1600;
 const EDITOR_VIEW_PAD_X = 160;
@@ -100,6 +105,31 @@ const DIAGRAM_SHAPE_TOOLS: Array<{ shape: DiagramShapeElement["shape"]; label: s
   { shape: "rightArrow", label: "Right arrow" },
   { shape: "downArrow", label: "Down arrow" },
 ];
+
+function connectorMarker(
+  connector: DiagramConnectorElement,
+  endpoint: "start" | "end",
+): DiagramConnectorMarker | undefined {
+  const marker = endpoint === "start" ? connector.markerStart : connector.markerEnd;
+  if (marker === "arrow" || marker === "circle" || marker === "cross") return marker;
+  return (endpoint === "start" ? connector.arrowStart : connector.arrowEnd)
+    ? "arrow"
+    : undefined;
+}
+
+function parsedConnectorMarker(value: string): DiagramConnectorMarker | undefined {
+  return value === "arrow" || value === "circle" || value === "cross"
+    ? value
+    : undefined;
+}
+
+function connectorMarkerUrl(
+  connector: DiagramConnectorElement,
+  endpoint: "start" | "end",
+): string | undefined {
+  const marker = connectorMarker(connector, endpoint);
+  return marker ? `url(#diagram-${marker}-${endpoint})` : undefined;
+}
 
 function clampZoom(value: number) {
   return Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, value));
@@ -808,7 +838,7 @@ export default function DiagramCanvas({ document, onChange }: DiagramCanvasProps
   }, [connectorSource, finishOrStartConnector, tool]);
 
   const exportSvg = useCallback(() => {
-    const blob = new Blob([buildExportSvg(diagram)], { type: "image/svg+xml;charset=utf-8" });
+    const blob = new Blob([buildDiagramSvg(diagram)], { type: "image/svg+xml;charset=utf-8" });
     downloadBlob(blob, `${diagram.title || "diagram"}.svg`);
   }, [diagram]);
 
@@ -1019,8 +1049,20 @@ export default function DiagramCanvas({ document, onChange }: DiagramCanvasProps
                 <marker id="diagram-arrow-end" markerWidth="14" markerHeight="14" refX="12" refY="7" orient="auto" markerUnits="userSpaceOnUse">
                   <path d="M1,1 L13,7 L1,13 Z" fill="context-stroke" />
                 </marker>
-                <marker id="diagram-arrow-start" markerWidth="14" markerHeight="14" refX="2" refY="7" orient="auto-start-reverse" markerUnits="userSpaceOnUse">
+                <marker id="diagram-arrow-start" markerWidth="14" markerHeight="14" refX="2" refY="7" orient="auto" markerUnits="userSpaceOnUse">
                   <path d="M13,1 L1,7 L13,13 Z" fill="context-stroke" />
+                </marker>
+                <marker id="diagram-circle-end" markerWidth="14" markerHeight="14" refX="7" refY="7" orient="auto" markerUnits="userSpaceOnUse">
+                  <circle cx="7" cy="7" r="4.5" fill="#ffffff" stroke="context-stroke" strokeWidth="2" />
+                </marker>
+                <marker id="diagram-circle-start" markerWidth="14" markerHeight="14" refX="7" refY="7" orient="auto" markerUnits="userSpaceOnUse">
+                  <circle cx="7" cy="7" r="4.5" fill="#ffffff" stroke="context-stroke" strokeWidth="2" />
+                </marker>
+                <marker id="diagram-cross-end" markerWidth="14" markerHeight="14" refX="7" refY="7" orient="auto" markerUnits="userSpaceOnUse">
+                  <path d="M3,3 L11,11 M11,3 L3,11" fill="none" stroke="context-stroke" strokeWidth="2" />
+                </marker>
+                <marker id="diagram-cross-start" markerWidth="14" markerHeight="14" refX="7" refY="7" orient="auto" markerUnits="userSpaceOnUse">
+                  <path d="M3,3 L11,11 M11,3 L3,11" fill="none" stroke="context-stroke" strokeWidth="2" />
                 </marker>
               </defs>
               {diagram.elements.filter((element) => element.kind === "connector").map((element) => (
@@ -1307,8 +1349,8 @@ function Connector({
             stroke={stroke}
             strokeWidth={connector.strokeWidth || 2}
             strokeDasharray={dashArray(connector.strokeDash)}
-            markerEnd={connector.arrowEnd ? "url(#diagram-arrow-end)" : undefined}
-            markerStart={connector.arrowStart ? "url(#diagram-arrow-start)" : undefined}
+            markerEnd={connectorMarkerUrl(connector, "end")}
+            markerStart={connectorMarkerUrl(connector, "start")}
           />
           <path d={d} fill="none" stroke="transparent" strokeWidth={18} />
           {connector.label && (
@@ -1413,14 +1455,36 @@ function Inspector({
         <Field label="To">
           <EndpointSelect endpoint={element.to.bind} shapes={shapes} onChange={(bind) => onChange((current) => ({ ...(current as DiagramConnectorElement), to: { bind } }))} />
         </Field>
-        <label style={checkStyle}>
-          <input type="checkbox" checked={Boolean(element.arrowStart)} onChange={(event) => onChange((current) => ({ ...(current as DiagramConnectorElement), arrowStart: event.target.checked }))} />
-          Arrow start
-        </label>
-        <label style={checkStyle}>
-          <input type="checkbox" checked={Boolean(element.arrowEnd)} onChange={(event) => onChange((current) => ({ ...(current as DiagramConnectorElement), arrowEnd: event.target.checked }))} />
-          Arrow end
-        </label>
+        <Field label="Start marker">
+          <select value={connectorMarker(element, "start") || "none"} onChange={(event) => {
+            const markerStart = parsedConnectorMarker(event.target.value);
+            onChange((current) => ({
+              ...(current as DiagramConnectorElement),
+              arrowStart: Boolean(markerStart),
+              markerStart,
+            }));
+          }} style={selectStyle}>
+            <option value="none">None</option>
+            <option value="arrow">Arrow</option>
+            <option value="circle">Circle</option>
+            <option value="cross">Cross</option>
+          </select>
+        </Field>
+        <Field label="End marker">
+          <select value={connectorMarker(element, "end") || "none"} onChange={(event) => {
+            const markerEnd = parsedConnectorMarker(event.target.value);
+            onChange((current) => ({
+              ...(current as DiagramConnectorElement),
+              arrowEnd: Boolean(markerEnd),
+              markerEnd,
+            }));
+          }} style={selectStyle}>
+            <option value="none">None</option>
+            <option value="arrow">Arrow</option>
+            <option value="circle">Circle</option>
+            <option value="cross">Cross</option>
+          </select>
+        </Field>
       </div>
     );
   }
@@ -1767,8 +1831,15 @@ function ensureCanvasFitsDocument(document: EditableDiagramDocument, margin = 16
   return fitted;
 }
 
-function fitCanvasToContent(document: EditableDiagramDocument, margin = 120, growOnly = false): EditableDiagramDocument {
-  const bounds = contentBounds(document.elements);
+function fitCanvasToContent(
+  document: EditableDiagramDocument,
+  margin = 120,
+  growOnly = false,
+  elementBoundsById?: ReadonlyMap<string, DiagramBounds>,
+  overflow: "clamp" | "throw" = "clamp",
+  maxDimension = MAX_DIAGRAM_CANVAS_DIMENSION,
+): EditableDiagramDocument {
+  const bounds = contentBounds(document.elements, elementBoundsById);
   if (!bounds) return document;
   const currentOriginX = document.canvas.originX ?? 0;
   const currentOriginY = document.canvas.originY ?? 0;
@@ -1782,8 +1853,16 @@ function fitCanvasToContent(document: EditableDiagramDocument, margin = 120, gro
   const originY = growOnly ? Math.min(currentOriginY, contentOriginY) : contentOriginY;
   const right = growOnly ? Math.max(currentRight, contentRight) : contentRight;
   const bottom = growOnly ? Math.max(currentBottom, contentBottom) : contentBottom;
-  const width = Math.min(10000, Math.max(320, right - originX));
-  const height = Math.min(10000, Math.max(180, bottom - originY));
+  const rawWidth = Math.max(320, right - originX);
+  const rawHeight = Math.max(180, bottom - originY);
+  if (
+    overflow === "throw"
+    && (rawWidth > maxDimension || rawHeight > maxDimension)
+  ) {
+    throw new Error("Diagram canvas is too large to preview");
+  }
+  const width = Math.min(maxDimension, rawWidth);
+  const height = Math.min(maxDimension, rawHeight);
   if (
     originX === currentOriginX
     && originY === currentOriginY
@@ -1798,12 +1877,24 @@ function fitCanvasToContent(document: EditableDiagramDocument, margin = 120, gro
   };
 }
 
-function contentBounds(elements: DiagramElement[]) {
+function diagramElementBoundsById(elements: DiagramElement[]): Map<string, DiagramBounds> {
+  const boundsById = new Map<string, DiagramBounds>();
+  elements.forEach((element) => {
+    const bounds = getElementBounds(element);
+    if (bounds) boundsById.set(element.id, bounds);
+  });
+  return boundsById;
+}
+
+function contentBounds(
+  elements: DiagramElement[],
+  elementBoundsById: ReadonlyMap<string, DiagramBounds> = diagramElementBoundsById(elements),
+) {
   const boxes: Array<{ x: number; y: number; w: number; h: number }> = [];
   elements.forEach((element) => {
     if (element.kind === "connector") {
-      const from = resolveEndpoint(element.from, elements);
-      const to = resolveEndpoint(element.to, elements);
+      const from = resolveEndpoint(element.from, elements, elementBoundsById);
+      const to = resolveEndpoint(element.to, elements, elementBoundsById);
       const controlPoint = connectorSupportsControlPoint(element.routing || "straight")
         ? element.controlPoint || defaultConnectorControlPoint(element.routing || "straight", from, to)
         : null;
@@ -1830,20 +1921,44 @@ function contentBounds(elements: DiagramElement[]) {
   return { x: minX, y: minY, w: maxX - minX, h: maxY - minY };
 }
 
-function buildExportSvg(document: EditableDiagramDocument): string {
-  const exportBounds = fitCanvasToContent(document, 96, false).canvas;
+export function buildDiagramSvg(
+  document: EditableDiagramDocument,
+  options: { background?: boolean } = {},
+): string {
+  const elementBoundsById = diagramElementBoundsById(document.elements);
+  const exportBounds = fitCanvasToContent(
+    document,
+    96,
+    false,
+    elementBoundsById,
+    "throw",
+    MAX_DIAGRAM_SVG_VIEWBOX_DIMENSION,
+  ).canvas;
   const originX = exportBounds.originX ?? 0;
   const originY = exportBounds.originY ?? 0;
+  const intrinsicScale = Math.min(
+    1,
+    MAX_DIAGRAM_SVG_INTRINSIC_DIMENSION / exportBounds.width,
+    MAX_DIAGRAM_SVG_INTRINSIC_DIMENSION / exportBounds.height,
+  );
+  const intrinsicWidth = Math.max(1, Math.round(exportBounds.width * intrinsicScale));
+  const intrinsicHeight = Math.max(1, Math.round(exportBounds.height * intrinsicScale));
   const body = [
-    `<rect x="${originX}" y="${originY}" width="${exportBounds.width}" height="${exportBounds.height}" fill="#ffffff"/>`,
-    ...document.elements.filter((element) => element.kind === "connector").map((element) => connectorToSvg(element as DiagramConnectorElement, document.elements)),
+    ...(options.background === false
+      ? []
+      : [`<rect x="${originX}" y="${originY}" width="${exportBounds.width}" height="${exportBounds.height}" fill="#ffffff"/>`]),
+    ...document.elements.filter((element) => element.kind === "connector").map((element) => connectorToSvg(element as DiagramConnectorElement, document.elements, elementBoundsById)),
     ...document.elements.filter((element) => element.kind !== "connector").map((element) => objectToSvg(element as DiagramShapeElement | DiagramTextElement)),
   ].join("\n");
   return [
-    `<svg xmlns="http://www.w3.org/2000/svg" width="${exportBounds.width}" height="${exportBounds.height}" viewBox="${originX} ${originY} ${exportBounds.width} ${exportBounds.height}">`,
+    `<svg xmlns="http://www.w3.org/2000/svg" width="${intrinsicWidth}" height="${intrinsicHeight}" viewBox="${originX} ${originY} ${exportBounds.width} ${exportBounds.height}">`,
     `<defs>`,
     `<marker id="diagram-arrow-end" markerWidth="14" markerHeight="14" refX="12" refY="7" orient="auto" markerUnits="userSpaceOnUse"><path d="M1,1 L13,7 L1,13 Z" fill="context-stroke"/></marker>`,
-    `<marker id="diagram-arrow-start" markerWidth="14" markerHeight="14" refX="2" refY="7" orient="auto-start-reverse" markerUnits="userSpaceOnUse"><path d="M13,1 L1,7 L13,13 Z" fill="context-stroke"/></marker>`,
+    `<marker id="diagram-arrow-start" markerWidth="14" markerHeight="14" refX="2" refY="7" orient="auto" markerUnits="userSpaceOnUse"><path d="M13,1 L1,7 L13,13 Z" fill="context-stroke"/></marker>`,
+    `<marker id="diagram-circle-end" markerWidth="14" markerHeight="14" refX="7" refY="7" orient="auto" markerUnits="userSpaceOnUse"><circle cx="7" cy="7" r="4.5" fill="#ffffff" stroke="context-stroke" stroke-width="2"/></marker>`,
+    `<marker id="diagram-circle-start" markerWidth="14" markerHeight="14" refX="7" refY="7" orient="auto" markerUnits="userSpaceOnUse"><circle cx="7" cy="7" r="4.5" fill="#ffffff" stroke="context-stroke" stroke-width="2"/></marker>`,
+    `<marker id="diagram-cross-end" markerWidth="14" markerHeight="14" refX="7" refY="7" orient="auto" markerUnits="userSpaceOnUse"><path d="M3,3 L11,11 M11,3 L3,11" fill="none" stroke="context-stroke" stroke-width="2"/></marker>`,
+    `<marker id="diagram-cross-start" markerWidth="14" markerHeight="14" refX="7" refY="7" orient="auto" markerUnits="userSpaceOnUse"><path d="M3,3 L11,11 M11,3 L3,11" fill="none" stroke="context-stroke" stroke-width="2"/></marker>`,
     `</defs>`,
     body,
     `</svg>`,
@@ -1895,11 +2010,17 @@ function shapeToSvg(element: DiagramShapeElement): string {
   return `<rect x="${element.x}" y="${element.y}" width="${element.w}" height="${element.h}" rx="${element.shape === "roundRect" ? element.radius || 16 : 0}" ${common}/>`;
 }
 
-function connectorToSvg(connector: DiagramConnectorElement, elements: DiagramElement[]): string {
-  const from = resolveEndpoint(connector.from, elements);
-  const to = resolveEndpoint(connector.to, elements);
+function connectorToSvg(
+  connector: DiagramConnectorElement,
+  elements: DiagramElement[],
+  elementBoundsById?: ReadonlyMap<string, DiagramBounds>,
+): string {
+  const from = resolveEndpoint(connector.from, elements, elementBoundsById);
+  const to = resolveEndpoint(connector.to, elements, elementBoundsById);
   const d = connectorPath(connector.routing || "straight", from, to, connector.controlPoint);
-  const line = `<path d="${d}" fill="none" stroke="${xmlAttr(connector.stroke || "#1c1917")}" stroke-width="${connector.strokeWidth || 2}"${dashSvgAttr(connector.strokeDash)}${connector.arrowStart ? ` marker-start="url(#diagram-arrow-start)"` : ""}${connector.arrowEnd ? ` marker-end="url(#diagram-arrow-end)"` : ""}/>`;
+  const markerStart = connectorMarkerUrl(connector, "start");
+  const markerEnd = connectorMarkerUrl(connector, "end");
+  const line = `<path d="${d}" fill="none" stroke="${xmlAttr(connector.stroke || "#1c1917")}" stroke-width="${connector.strokeWidth || 2}"${dashSvgAttr(connector.strokeDash)}${markerStart ? ` marker-start="${markerStart}"` : ""}${markerEnd ? ` marker-end="${markerEnd}"` : ""}/>`;
   if (!connector.label) return line;
   const labelPoint = { x: (from.x + to.x) / 2, y: (from.y + to.y) / 2 - 8 };
   return `${line}\n${textToSvg(connector.label, labelPoint.x - 80, labelPoint.y - 14, 160, 28, connector.textStyle, 0)}`;

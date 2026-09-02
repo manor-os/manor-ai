@@ -7,6 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from packages.core.database import get_db
 from packages.core.models.user import User
+from packages.core.permissions import user_is_effective_entity_admin
 from packages.core.services.entity_service import get_entity, update_entity
 from apps.api.deps import get_current_user
 
@@ -64,7 +65,7 @@ async def update_my_entity(
     db: AsyncSession = Depends(get_db),
 ):
     """Update the current user's entity."""
-    if user.role not in ("owner", "admin"):
+    if not await user_is_effective_entity_admin(db, user):
         raise HTTPException(403, "Only owner/admin can update entity")
     entity = await update_entity(db, user.entity_id, **req.model_dump(exclude_none=True))
     if not entity:

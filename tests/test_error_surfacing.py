@@ -15,6 +15,7 @@ from packages.core.models.base import generate_ulid
 from packages.core.models.execution import ExecutionPlan, ExecutionStep
 from packages.core.models.worker import SubscriptionWorker, Worker
 from packages.core.models.workspace import Agent, AgentSubscription, Workspace
+from packages.core.models.user import User, UserMembership
 
 
 
@@ -72,6 +73,7 @@ async def _gated_scenario(db):
     step_id = generate_ulid()
     agent_id = generate_ulid()
     subscription_id = generate_ulid()
+    approval_actor_id = "operator"
     worker = Worker(
         id=generate_ulid(), entity_id=entity_id, kind="internal",
         display_name="Internal worker",
@@ -79,6 +81,20 @@ async def _gated_scenario(db):
         monthly_spent_usd=Decimal("0"), auto_pause_on_budget=True, status="active",
     )
     db.add_all([
+        User(
+            id=approval_actor_id,
+            entity_id=entity_id,
+            email=f"{approval_actor_id}-{entity_id}@example.com",
+            password_hash="test-only",
+            role="owner",
+            status="active",
+        ),
+        UserMembership(
+            user_id=approval_actor_id,
+            entity_id=entity_id,
+            role="owner",
+            status="active",
+        ),
         Workspace(id=workspace_id, entity_id=entity_id,
                   name="Gated workspace", status="active"),
         worker,
@@ -108,7 +124,12 @@ async def _gated_scenario(db):
         ),
     ])
     await db.flush()
-    return {"entity_id": entity_id, "step_id": step_id, "worker": worker}
+    return {
+        "entity_id": entity_id,
+        "step_id": step_id,
+        "worker": worker,
+        "approval_actor_id": approval_actor_id,
+    }
 
 
 async def _open_request(db, entity_id):
@@ -140,7 +161,12 @@ async def test_expired_lease_also_records_the_real_failure(db_session, monkeypat
 
     await dispatcher.checkout_steps_for_worker(db_session, s["worker"], max_n=1)
     request = await _open_request(db_session, s["entity_id"])
-    await grant_approval(db_session, request, by_user_id="operator", via="chat_card")
+    await grant_approval(
+        db_session,
+        request,
+        by_user_id=s["approval_actor_id"],
+        via="chat_card",
+    )
     step = await db_session.get(ExecutionStep, s["step_id"])
     step.step_status = "pending"
     step.error = None
@@ -381,7 +407,12 @@ async def _approved_and_dispatched(db, dispatcher, s):
     """跑到「人已批准、步骤已派发」这一刻,返回租约。"""
     assert await dispatcher.checkout_steps_for_worker(db, s["worker"], max_n=1) == []
     request = await _open_request(db, s["entity_id"])
-    await grant_approval(db, request, by_user_id="operator", via="chat_card")
+    await grant_approval(
+        db,
+        request,
+        by_user_id=s["approval_actor_id"],
+        via="chat_card",
+    )
     step = await db.get(ExecutionStep, s["step_id"])
     step.step_status = "pending"
     step.error = None

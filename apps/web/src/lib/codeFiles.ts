@@ -103,6 +103,7 @@ const EXTENSION_LANGUAGE: Record<string, string> = {
   dockerfile: "docker",
   dockerignore: "ignore",
   dot: "dot",
+  drawio: "markup",
   eex: "elixir",
   ejs: "ejs",
   elm: "elm",
@@ -178,6 +179,7 @@ const EXTENSION_LANGUAGE: Record<string, string> = {
   mli: "ocaml",
   mm: "objectivec",
   mmd: "mermaid",
+  mermaid: "mermaid",
   module: "go-module",
   moon: "moonscript",
   nginx: "nginx",
@@ -379,6 +381,10 @@ function cleanMime(value?: string | null): string {
   return String(value || "").split(";")[0].trim().toLowerCase();
 }
 
+function cleanFileType(value?: string | null): string {
+  return cleanMime(value).replace(/^\.+/, "");
+}
+
 function basename(name?: string | null): string {
   return String(name || "").split(/[\\/]/).pop()?.toLowerCase() || "";
 }
@@ -410,13 +416,19 @@ export function isCodeLikeFile(ref: CodeFileReference | string): boolean {
     return Boolean(specialFilenameLanguage(ref)) || CODE_FILE_EXTENSIONS.has(extensionFromName(ref));
   }
 
+  const fileType = cleanFileType(ref.file_type || ref.fileType);
+  if (fileType) {
+    return CODE_FILE_EXTENSIONS.has(fileType)
+      || CODE_MIME_TYPES.has(fileType)
+      || fileType.endsWith("+json")
+      || fileType.endsWith("+xml")
+      || fileType.startsWith("text/x-");
+  }
+
   if (specialFilenameLanguage(ref.name)) return true;
 
   const ext = extensionFromName(ref.name);
   if (CODE_FILE_EXTENSIONS.has(ext)) return true;
-
-  const fileType = cleanMime(ref.file_type || ref.fileType);
-  if (fileType && (CODE_FILE_EXTENSIONS.has(fileType) || fileType in EXTENSION_LANGUAGE)) return true;
 
   const mime = mimeFromReference(ref);
   if (!mime) return false;
@@ -429,6 +441,17 @@ export function isCodeLikeFile(ref: CodeFileReference | string): boolean {
 }
 
 export function codeLanguageForFile(ref: CodeFileReference | string): string {
+  if (typeof ref !== "string") {
+    const fileType = cleanFileType(ref.file_type || ref.fileType);
+    if (fileType) {
+      if (EXTENSION_LANGUAGE[fileType]) return EXTENSION_LANGUAGE[fileType];
+      if (MIME_LANGUAGE[fileType]) return MIME_LANGUAGE[fileType];
+      if (fileType.endsWith("+json")) return "json";
+      if (fileType.endsWith("+xml")) return "markup";
+      return "text";
+    }
+  }
+
   const name = typeof ref === "string" ? ref : ref.name;
   const special = specialFilenameLanguage(name);
   if (special) return special;
@@ -437,9 +460,6 @@ export function codeLanguageForFile(ref: CodeFileReference | string): string {
   if (ext && EXTENSION_LANGUAGE[ext]) return EXTENSION_LANGUAGE[ext];
 
   if (typeof ref !== "string") {
-    const fileType = cleanMime(ref.file_type || ref.fileType);
-    if (fileType && EXTENSION_LANGUAGE[fileType]) return EXTENSION_LANGUAGE[fileType];
-
     const mime = mimeFromReference(ref);
     if (mime && MIME_LANGUAGE[mime]) return MIME_LANGUAGE[mime];
     if (mime.endsWith("+json")) return "json";

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+import logging
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
@@ -19,13 +20,20 @@ from packages.core.services.resource_access import (
     is_read_capability,
     user_can_access_resource,
 )
-from packages.core.services.workspace_access import user_can_write_workspace_id
+from packages.core.services.workspace_access import (
+    user_can_write_workspace_id,
+    user_readable_workspace_ids,
+)
 from packages.core.services.agent_service import (
+    AgentMCPActionToolIdFactory,
+    AgentHasActiveWorkspaceMappingsError,
     list_agents, get_agent, create_agent,
     update_agent, delete_agent, subscribe_agent, list_subscriptions,
     unsubscribe_agent, bind_tools, unbind_tools, get_agent_tools,
-    list_tool_definitions,
+    get_agent_mcp_action_refs, list_tool_definitions,
+    update_agent_mcp_action_refs,
 )
+from apps.api.errors import CodedError
 from packages.core.services.agent_prompt_preview import preview_agent_prompt
 from packages.core.services.agent_runtime_config import normalize_agent_runtime_config
 from apps.api.deps import get_current_user
@@ -35,9 +43,11 @@ from apps.api.routers.workspaces import (
     _learning_candidate_response,
     _runtime_evidence_response,
 )
+from apps.api.streaming_concurrency import acquire_chat_stream_lease
 from packages.core.constants.execution import WorkerStatus
 
 router = APIRouter(prefix="/api/v1/agents", tags=["agents"])
+logger = logging.getLogger(__name__)
 
 
 async def _require_agent(
@@ -107,6 +117,9 @@ class AgentResponse(BaseModel):
     status: str = "active"
     tool_count: int = 0
     skill_count: int = 0
+    capability_ids: list[str] = []
+    capability_plan_status: str = "ready"
+    capability_setup_required: list[dict] = []
 
 
 class AgentCreateRequest(BaseModel):
@@ -123,6 +136,7 @@ class AgentCreateRequest(BaseModel):
     # ``entity`` so behaviour matches agents created before this existed.
     workspace_id: str | None = None
     visibility: str = Visibility.ENTITY
+    capability_ids: list[str] = []
 
 
 class PromptPreviewRequest(BaseModel):
@@ -214,6 +228,52 @@ class ToolResponse(BaseModel):
     status: str = "active"
 
 
+async def _actor_agent_capability_catalog(
+    db: AsyncSession,
+    user: User,
+):
+    from packages.core.services.agent_capability_catalog import (
+        AgentCapabilityCatalogFactory,
+    )
+
+    return await AgentCapabilityCatalogFactory.create(
+        db,
+        entity_id=user.entity_id,
+        user_id=user.id,
+    )
+
+
+def _actor_mcp_operations(catalog) -> dict[str, dict[str, dict]]:
+    operations: dict[str, dict[str, dict]] = {}
+    for integration in catalog.integrations:
+        server_key = str(integration.get("mcp_server_key") or "").strip()
+        if not server_key:
+            continue
+        server_operations = operations.setdefault(server_key, {})
+        for operation in integration.get("tools") or []:
+            action = str(operation.get("name") or "").strip()
+            if action:
+                server_operations[action] = dict(operation)
+    return operations
+
+
+def _mcp_action_tool_response(
+    *,
+    server_key: str,
+    action: str,
+    operation: dict | None,
+) -> ToolResponse:
+    operation = operation or {}
+    return ToolResponse(
+        id=AgentMCPActionToolIdFactory.create(server_key, action),
+        name=str(operation.get("tool_name") or f"mcp__{server_key}__{action}"),
+        display_name=str(operation.get("label") or action.replace("_", " ").title()),
+        description=str(operation.get("description") or ""),
+        category="mcp",
+        status="active",
+    )
+
+
 def _agent_resp(a, tool_count: int = 0, skill_count: int = 0) -> AgentResponse:
     config = normalize_agent_runtime_config(a.config)
     description_i18n = (
@@ -250,6 +310,17 @@ def _agent_draft_resp(draft: dict, entity_id: str) -> AgentResponse:
         status="draft",
         tool_count=0,
         skill_count=0,
+        capability_ids=(
+            list(draft.get("capability_ids") or [])
+            if isinstance(draft.get("capability_ids"), list)
+            else []
+        ),
+        capability_plan_status=str(draft.get("capability_plan_status") or "ready"),
+        capability_setup_required=(
+            list(draft.get("capability_setup_required") or [])
+            if isinstance(draft.get("capability_setup_required"), list)
+            else []
+        ),
     )
 
 
@@ -291,20 +362,66 @@ def _user_visible_worker_scope(stmt, user: User):
 async def _owned_subscription(
     db: AsyncSession,
     subscription_id: str,
-    entity_id: str,
+    user: User,
 ) -> AgentSubscription:
     sub = (
         await db.execute(
             select(AgentSubscription).where(
                 AgentSubscription.id == subscription_id,
-                AgentSubscription.entity_id == entity_id,
+                AgentSubscription.entity_id == user.entity_id,
                 AgentSubscription.status == "active",
             )
         )
     ).scalar_one_or_none()
     if not sub:
         raise HTTPException(404, "Subscription not found")
+    if sub.workspace_id and not await _subscription_is_visible(db, sub, user):
+        raise HTTPException(404, "Subscription not found")
     return sub
+
+
+async def _subscription_is_visible(
+    db: AsyncSession,
+    subscription: AgentSubscription,
+    user: User,
+) -> bool:
+    if not subscription.workspace_id:
+        return True
+    readable_workspace_ids = await user_readable_workspace_ids(
+        db,
+        entity_id=user.entity_id,
+        user_id=user.id,
+        role=user.role,
+        workspace_ids={str(subscription.workspace_id)},
+    )
+    return str(subscription.workspace_id) in readable_workspace_ids
+
+
+async def _visible_subscriptions(
+    db: AsyncSession,
+    subscriptions: list[AgentSubscription],
+    user: User,
+) -> list[AgentSubscription]:
+    workspace_ids = {
+        str(subscription.workspace_id)
+        for subscription in subscriptions
+        if subscription.workspace_id
+    }
+    if not workspace_ids:
+        return subscriptions
+    readable_workspace_ids = await user_readable_workspace_ids(
+        db,
+        entity_id=user.entity_id,
+        user_id=user.id,
+        role=user.role,
+        workspace_ids=workspace_ids,
+    )
+    return [
+        subscription
+        for subscription in subscriptions
+        if not subscription.workspace_id
+        or str(subscription.workspace_id) in readable_workspace_ids
+    ]
 
 
 async def _subscription_workers(
@@ -416,17 +533,78 @@ async def create_new_agent(
         role=getattr(user, "role", None),
     ):
         raise HTTPException(403, "Cannot create an agent in this workspace")
+    capability_plan = None
+    if req.capability_ids:
+        from packages.core.services.agent_capability_catalog import (
+            AgentCapabilityCatalogFactory,
+            AgentCapabilitySelectionError,
+        )
+
+        try:
+            catalog = await AgentCapabilityCatalogFactory.create(
+                db,
+                entity_id=user.entity_id,
+                user_id=user.id,
+            )
+            capability_plan = catalog.resolve(req.capability_ids)
+        except AgentCapabilitySelectionError as exc:
+            raise HTTPException(422, str(exc)) from exc
+
+    config = dict(req.config or {})
+    if capability_plan is not None:
+        config["capability_selection"] = {
+            "version": 1,
+            "catalog_ids": list(capability_plan.selected_catalog_ids),
+            "source": "agent_ai" if req.source == "llm-generated" else "agent_create",
+        }
     agent = await create_agent(
         db, user.entity_id,
         name=req.name, description=req.description,
         system_prompt=req.system_prompt, avatar_url=req.avatar_url,
         category=req.category, tags=req.tags,
-        config=req.config, source=req.source,
+        config=config, source=req.source,
         owner_user_id=user.id,
         workspace_id=req.workspace_id,
         visibility=req.visibility,
     )
-    return _agent_resp(agent)
+    tool_count = 0
+    skill_count = 0
+    if capability_plan is not None:
+        from packages.core.services.agent_capability_catalog import (
+            AgentCapabilitySelectionError,
+            materialize_agent_capability_plan,
+        )
+
+        try:
+            materialized = await materialize_agent_capability_plan(
+                db,
+                entity_id=user.entity_id,
+                user_id=user.id,
+                agent_id=agent.id,
+                plan=capability_plan,
+            )
+        except AgentCapabilitySelectionError as exc:
+            raise HTTPException(422, str(exc)) from exc
+        tool_count = len(materialized["tools"])
+        skill_count = len(materialized["skills"])
+    response = _agent_resp(agent, tool_count=tool_count, skill_count=skill_count)
+    if capability_plan is not None:
+        response.capability_ids = list(capability_plan.selected_catalog_ids)
+        response.capability_plan_status = capability_plan.status.value
+        response.capability_setup_required = list(capability_plan.setup_required)
+        logger.info(
+            "Agent capability plan materialized agent=%s entity=%s user=%s "
+            "status=%s selected=%s tools=%s skills=%s setup_required=%s",
+            agent.id,
+            user.entity_id,
+            user.id,
+            capability_plan.status.value,
+            list(capability_plan.selected_catalog_ids),
+            tool_count,
+            skill_count,
+            list(capability_plan.setup_required),
+        )
+    return response
 
 
 class AgentGenerateRequest(BaseModel):
@@ -468,7 +646,12 @@ async def generate_new_agent(
     from packages.core.services.agent_generator import generate_agent
 
     try:
-        agent = await generate_agent(body.prompt, user.entity_id, db)
+        agent = await generate_agent(
+            body.prompt,
+            user.entity_id,
+            db,
+            user_id=user.id,
+        )
     except ValueError as exc:
         raise HTTPException(422, str(exc))
     return _agent_resp(agent)
@@ -494,7 +677,12 @@ async def generate_new_agent_stream(
     async def event_stream():
         try:
             agent = None
-            async for kind, payload in generate_agent_streaming(body.prompt, user.entity_id, db):
+            async for kind, payload in generate_agent_streaming(
+                body.prompt,
+                user.entity_id,
+                db,
+                user_id=user.id,
+            ):
                 if kind == "step":
                     yield format_sse("step", {"label": payload})
                 elif kind == "agent":
@@ -506,8 +694,9 @@ async def generate_new_agent_stream(
         except Exception as exc:  # noqa: BLE001 — surface any failure to the client
             yield format_sse("error", {"message": str(exc)})
 
+    lease = await acquire_chat_stream_lease(scope="agent-generate")
     return StreamingResponse(
-        event_stream(),
+        lease.wrap(event_stream()),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
@@ -517,6 +706,7 @@ async def generate_new_agent_stream(
 async def generate_agent_draft_stream(
     body: AgentGenerateRequest,
     user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
 ):
     """AI-generate an agent draft, streaming progress without persisting it."""
     from fastapi.responses import StreamingResponse
@@ -527,7 +717,12 @@ async def generate_agent_draft_stream(
     async def event_stream():
         try:
             draft = None
-            async for kind, payload in generate_agent_draft_streaming(body.prompt, user.entity_id):
+            async for kind, payload in generate_agent_draft_streaming(
+                body.prompt,
+                user.entity_id,
+                db=db,
+                user_id=user.id,
+            ):
                 if kind == "step":
                     yield format_sse("step", {"label": payload})
                 elif kind == "draft":
@@ -539,8 +734,9 @@ async def generate_agent_draft_stream(
         except Exception as exc:  # noqa: BLE001 — surface any failure to the client
             yield format_sse("error", {"message": str(exc)})
 
+    lease = await acquire_chat_stream_lease(scope="agent-draft")
     return StreamingResponse(
-        event_stream(),
+        lease.wrap(event_stream()),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
@@ -656,7 +852,14 @@ async def delete_one_agent(
     db: AsyncSession = Depends(get_db),
 ):
     await _require_agent(db, user, agent_id, Capability.DELETE)
-    ok = await delete_agent(db, agent_id, user.entity_id)
+    try:
+        ok = await delete_agent(db, agent_id, user.entity_id)
+    except AgentHasActiveWorkspaceMappingsError as exc:
+        raise CodedError(
+            409,
+            code="agents.error.active_workspace_mapping",
+            message=str(exc),
+        ) from exc
     if not ok:
         raise HTTPException(404, "Agent not found")
 
@@ -688,6 +891,7 @@ async def my_subscriptions(
     db: AsyncSession = Depends(get_db),
 ):
     subs = await list_subscriptions(db, user.entity_id)
+    subs = await _visible_subscriptions(db, subs, user)
     return [SubscriptionResponse(
         id=s.id, entity_id=s.entity_id, agent_id=s.agent_id,
         workspace_id=s.workspace_id, custom_prompt=s.custom_prompt, status=s.status,
@@ -700,10 +904,23 @@ async def subscribe(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    sub = await subscribe_agent(
-        db, user.entity_id, req.agent_id,
-        workspace_id=req.workspace_id, custom_prompt=req.custom_prompt,
+    from packages.core.services.marketplace_resource_links import (
+        MarketplaceIdentityConflictError,
     )
+
+    try:
+        sub = await subscribe_agent(
+            db,
+            user.entity_id,
+            req.agent_id,
+            workspace_id=req.workspace_id,
+            custom_prompt=req.custom_prompt,
+            owner_user_id=user.id,
+        )
+    except MarketplaceIdentityConflictError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(404, "Agent not found") from exc
     return SubscriptionResponse(
         id=sub.id, entity_id=sub.entity_id, agent_id=sub.agent_id,
         workspace_id=sub.workspace_id, custom_prompt=sub.custom_prompt, status=sub.status,
@@ -727,7 +944,7 @@ async def list_subscription_workers_endpoint(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    await _owned_subscription(db, subscription_id, user.entity_id)
+    await _owned_subscription(db, subscription_id, user)
     return (await _subscription_workers(db, [subscription_id], user=user)).get(subscription_id, [])
 
 
@@ -738,7 +955,7 @@ async def bind_subscription_worker_endpoint(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    await _owned_subscription(db, subscription_id, user.entity_id)
+    await _owned_subscription(db, subscription_id, user)
     worker = (
         await db.execute(
             _user_visible_worker_scope(select(Worker), user).where(
@@ -787,7 +1004,7 @@ async def unbind_subscription_worker_endpoint(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    await _owned_subscription(db, subscription_id, user.entity_id)
+    await _owned_subscription(db, subscription_id, user)
     binding = (
         await db.execute(
             select(SubscriptionWorker)
@@ -832,6 +1049,17 @@ async def agent_deployments(
             .order_by(AgentSubscription.created_at.desc())
         )
     ).all()
+    visible_subscriptions = await _visible_subscriptions(
+        db,
+        [sub for sub, _workspace in rows],
+        user,
+    )
+    visible_subscription_ids = {sub.id for sub in visible_subscriptions}
+    rows = [
+        (sub, workspace)
+        for sub, workspace in rows
+        if sub.id in visible_subscription_ids
+    ]
     sub_ids = [sub.id for sub, _workspace in rows]
     workers_by_sub = await _subscription_workers(db, sub_ids, user=user)
 
@@ -865,7 +1093,47 @@ async def agent_tools(
 ):
     await _require_agent(db, user, agent_id, Capability.VIEW)
     tools = await get_agent_tools(db, agent_id)
-    return [ToolResponse(id=t.id, name=t.name, display_name=t.display_name, description=t.description, category=t.category) for t in tools]
+    catalog = await _actor_agent_capability_catalog(db, user)
+    operations = _actor_mcp_operations(catalog)
+    actor_tool_names = {
+        str(operation.get("tool_name") or "").strip()
+        for server_operations in operations.values()
+        for operation in server_operations.values()
+        if str(operation.get("tool_name") or "").strip()
+    }
+    public_tools = [
+        ToolResponse(
+            id=tool.id,
+            name=tool.name,
+            display_name=tool.display_name,
+            description=tool.description,
+            category=tool.category,
+        )
+        for tool in tools
+        if not (
+            str(tool.name or "").startswith("mcp__")
+            and str(tool.name or "") in actor_tool_names
+        )
+    ]
+    refs = await get_agent_mcp_action_refs(
+        db,
+        agent_id=agent_id,
+        available_actions_by_server={
+            server_key: set(actions)
+            for server_key, actions in operations.items()
+        },
+    )
+    return [
+        *public_tools,
+        *(
+            _mcp_action_tool_response(
+                server_key=ref.server_key,
+                action=ref.action,
+                operation=operations.get(ref.server_key, {}).get(ref.action),
+            )
+            for ref in refs
+        ),
+    ]
 
 
 @router.post("/{agent_id}/tools", status_code=200)
@@ -876,7 +1144,43 @@ async def bind_agent_tools(
     db: AsyncSession = Depends(get_db),
 ):
     await _require_agent(db, user, agent_id, Capability.EDIT)
-    count = await bind_tools(db, agent_id, req.tool_ids)
+    action_refs = [
+        ref
+        for tool_id in req.tool_ids
+        if (ref := AgentMCPActionToolIdFactory.parse(tool_id)) is not None
+    ]
+    database_tool_ids = [
+        tool_id
+        for tool_id in req.tool_ids
+        if AgentMCPActionToolIdFactory.parse(tool_id) is None
+    ]
+    count = await bind_tools(db, agent_id, database_tool_ids)
+    if action_refs:
+        catalog = await _actor_agent_capability_catalog(db, user)
+        operations = _actor_mcp_operations(catalog)
+        invalid = [
+            f"{ref.server_key}:{ref.action}"
+            for ref in action_refs
+            if ref.action not in operations.get(ref.server_key, {})
+        ]
+        if invalid:
+            raise HTTPException(
+                400,
+                "Unknown or inaccessible MCP actions: " + ", ".join(invalid),
+            )
+        try:
+            count += await update_agent_mcp_action_refs(
+                db,
+                agent_id=agent_id,
+                refs=action_refs,
+                bind=True,
+                available_actions_by_server={
+                    server_key: set(actions)
+                    for server_key, actions in operations.items()
+                },
+            )
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
     return {"bound": count}
 
 
@@ -888,7 +1192,33 @@ async def unbind_agent_tools(
     db: AsyncSession = Depends(get_db),
 ):
     await _require_agent(db, user, agent_id, Capability.EDIT)
-    count = await unbind_tools(db, agent_id, req.tool_ids)
+    action_refs = [
+        ref
+        for tool_id in req.tool_ids
+        if (ref := AgentMCPActionToolIdFactory.parse(tool_id)) is not None
+    ]
+    database_tool_ids = [
+        tool_id
+        for tool_id in req.tool_ids
+        if AgentMCPActionToolIdFactory.parse(tool_id) is None
+    ]
+    count = await unbind_tools(db, agent_id, database_tool_ids)
+    if action_refs:
+        catalog = await _actor_agent_capability_catalog(db, user)
+        operations = _actor_mcp_operations(catalog)
+        try:
+            count += await update_agent_mcp_action_refs(
+                db,
+                agent_id=agent_id,
+                refs=action_refs,
+                bind=False,
+                available_actions_by_server={
+                    server_key: set(actions)
+                    for server_key, actions in operations.items()
+                },
+            )
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
     return {"unbound": count}
 
 
@@ -914,9 +1244,20 @@ async def tool_catalog(
 
 
 @router.get("/tools/all", response_model=list[ToolResponse])
-async def all_tools_for_agent_create(db: AsyncSession = Depends(get_db)):
+async def all_tools_for_agent_create(
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    catalog = await _actor_agent_capability_catalog(db, user)
     tools = await list_tool_definitions(db, include_inactive=True)
-    return [
+    operations = _actor_mcp_operations(catalog)
+    actor_tool_names = {
+        str(operation.get("tool_name") or "").strip()
+        for server_operations in operations.values()
+        for operation in server_operations.values()
+        if str(operation.get("tool_name") or "").strip()
+    }
+    public_tools = [
         ToolResponse(
             id=t.id,
             name=t.name,
@@ -926,4 +1267,20 @@ async def all_tools_for_agent_create(db: AsyncSession = Depends(get_db)):
             status=t.status,
         )
         for t in tools
+        if not (
+            str(t.name or "").startswith("mcp__")
+            and str(t.name or "") in actor_tool_names
+        )
+    ]
+    return [
+        *public_tools,
+        *(
+            _mcp_action_tool_response(
+                server_key=server_key,
+                action=action,
+                operation=operation,
+            )
+            for server_key, server_operations in sorted(operations.items())
+            for action, operation in sorted(server_operations.items())
+        ),
     ]

@@ -18,6 +18,7 @@ import Dropdown from "../components/ui/Dropdown";
 import {
   IconInfo,
   IconPlus,
+  IconRefresh,
   IconSkill,
   IconUpload,
 } from "../components/icons";

@@ -135,6 +135,19 @@ test("Knowledge page uses the browse endpoint without showing pagination control
   assert.doesNotMatch(knowledgeSource, /<Pagination\b/);
 });
 
+test("document uploads surface non-2xx responses instead of treating them as success", () => {
+  const uploadStart = apiSource.indexOf("function uploadDocumentRequest(");
+  const uploadEnd = apiSource.indexOf("\nasync function requestStreamResponse", uploadStart);
+  assert.notEqual(uploadStart, -1);
+  assert.notEqual(uploadEnd, -1);
+  const uploadSource = apiSource.slice(uploadStart, uploadEnd);
+  assert.match(uploadSource, /xhr\.status < 200 \|\| xhr\.status >= 300/);
+  assert.match(uploadSource, /const error = documentUploadHttpError\(xhr, path, token, body\)/);
+  assert.match(uploadSource, /uploadBytesSent && xhr\.status >= 500[\s\S]*?finishHttpFailureReconciliation\(error\)/);
+  assert.match(uploadSource, /finishReject\(error\)/);
+  assert.doesNotMatch(uploadSource, /fetch\([^\n]*documents\/upload[\s\S]*?\.then\(\(r\) => r\.json\(\)/);
+});
+
 test("Knowledge caches browse data and polls only lightweight indexing statuses", () => {
   assert.match(apiSource, /function\s+listDocumentIndexingStatuses\s*\(ids:\s*string\[\]\)/);
   assert.match(apiSource, /\/documents\/indexing-status\?\$\{q\}/);
@@ -203,4 +216,17 @@ test("Knowledge header uses recursive totals from the visible directory tree", (
   assert.match(knowledgeSource, /data\?\.total_size/);
   assert.match(knowledgeSource, /const\s+totalFiles\s*=\s*data\?\.total_files/);
   assert.doesNotMatch(knowledgeSource, /data\?\.direct_total_(?:size|files)/);
+});
+
+test("Knowledge folders can be added recursively to a Workspace", () => {
+  assert.match(apiSource, /addFolder:\s*\(wsId:\s*string,\s*folderId:\s*string\)/);
+  assert.match(apiSource, /\/workspaces\/\$\{wsId\}\/documents\/folders\/\$\{folderId\}/);
+  assert.match(knowledgeSource, /page\.knowledge\.add_folder_to_workspace/);
+  assert.match(knowledgeSource, /api\.workspaces\.knowledge\.addFolder\(workspace\.id,\s*folderId\)/);
+  assert.match(knowledgeSource, /workspaces\.filter\(\(workspace\)\s*=>\s*workspace\.can_manage\)/);
+  assert.match(knowledgeSource, /canManageFolderMetadataItem\(folder\)/);
+  assert.match(knowledgeSource, /open=\{!!workspacePickerFolder\s*&&\s*canManageFolderMetadataItem\(workspacePickerFolder\)\}/);
+  assert.doesNotMatch(knowledgeSource, /canAddToWorkspace\s*=\s*canManageAllDocuments\s*&&\s*canManage\b/);
+  assert.match(knowledgeSource, /pendingWorkspaceId=\{/);
+  assert.match(knowledgeSource, /aria-busy=\{isPending\}/);
 });

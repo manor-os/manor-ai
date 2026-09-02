@@ -31,6 +31,7 @@ import {
 interface ScheduledJob {
   id: string; job_id: string; entity_id: string; name: string; job_type: string;
   workspace_id?: string;
+  can_manage?: boolean;
   schedule_kind?: string; cron_expr?: string; interval_seconds?: number; every_seconds?: number;
   run_at?: string; payload?: Record<string, any>; payload_message?: string;
   execution_target?: Record<string, any>;
@@ -361,11 +362,13 @@ function RunDetail({ jobId, runId }: { jobId: string; runId: string }) {
 
 interface ScheduledJobsProps {
   workspaceId?: string;
+  workspaceStatus?: string;
   workflowsEnabled?: boolean;
+  canWriteWorkspace?: boolean;
 }
 
 /* ── main ── */
-export default function ScheduledJobs({ workspaceId, workflowsEnabled }: ScheduledJobsProps) {
+export default function ScheduledJobs({ workspaceId, workspaceStatus, workflowsEnabled, canWriteWorkspace = true }: ScheduledJobsProps) {
   const qc = useQueryClient();
   const toast = useToastStore();
   const flowsAccess = usePreviewFeatureAccess("flows");
@@ -466,6 +469,11 @@ export default function ScheduledJobs({ workspaceId, workflowsEnabled }: Schedul
     ),
     [availableWorkspaces],
   );
+  const isAutomationEnabled = (job: ScheduledJob) => {
+    const sourceWorkspace = job.workspace_id ? workspaceById.get(job.workspace_id) : undefined;
+    const status = workspaceId ? workspaceStatus : sourceWorkspace?.status;
+    return Boolean(job.enabled && (!status || status === "active"));
+  };
   const workspaceFilterOptions = useMemo(
     () => [
       { key: "all", label: t("page.scheduled_jobs.all_workspaces") },
@@ -777,7 +785,7 @@ export default function ScheduledJobs({ workspaceId, workflowsEnabled }: Schedul
             className="w-full sm:w-56"
           />
         )}
-        actions={<PageHeaderAddButton label={t("page.scheduled_jobs.add_automation")} onClick={openNewModal} />}
+        actions={<PageHeaderAddButton label={t("page.scheduled_jobs.add_automation")} onClick={openNewModal} disabled={!!workspaceId && !canWriteWorkspace} />}
       />
 
       <FilterBar
@@ -827,7 +835,7 @@ export default function ScheduledJobs({ workspaceId, workflowsEnabled }: Schedul
           <p style={{ fontSize: 13, color: "#a8a29e", margin: "0 0 16px", maxWidth: 320, marginLeft: "auto", marginRight: "auto" }}>
             {t("page.scheduled_jobs.schedule_recurring_tasks_daily_reports_weekly_sy")}
           </p>
-          <PageHeaderAddButton label={t("page.scheduled_jobs.add_automation")} onClick={openNewModal} />
+          <PageHeaderAddButton label={t("page.scheduled_jobs.add_automation")} onClick={openNewModal} disabled={!!workspaceId && !canWriteWorkspace} />
         </div>
       )}
 
@@ -845,7 +853,7 @@ export default function ScheduledJobs({ workspaceId, workflowsEnabled }: Schedul
       {/* Workspace-event workflow bindings share this tab with scheduled jobs. */}
       {!isLoading && !bindingsLoading && filteredBindings.map((binding) => {
         const workflow = (workflows as WorkflowSummary[]).find((item) => item.id === binding.workflow_id);
-        const enabled = binding.enabled && binding.status === "active";
+        const enabled = binding.enabled && binding.status === "active" && (!workspaceId || workspaceStatus === "active");
         const eventName = String(binding.trigger_config?.event || "workspace event");
         return (
           <div
@@ -881,12 +889,13 @@ export default function ScheduledJobs({ workspaceId, workflowsEnabled }: Schedul
                 <Toggle
                   checked={enabled}
                   onChange={() => toggleBindingMut.mutate({ id: binding.id, enabled: !enabled })}
+                  disabled={!canWriteWorkspace || (!!workspaceId && workspaceStatus !== "active")}
                   aria-label={`${enabled ? "Pause" : "Enable"} ${binding.name || workflow?.name || "workflow automation"}`}
                 />
                 <button
                   type="button"
                   onClick={() => runBindingMut.mutate(binding.id)}
-                  disabled={!enabled || (runBindingMut.isPending && runBindingMut.variables === binding.id)}
+                  disabled={!canWriteWorkspace || !enabled || (runBindingMut.isPending && runBindingMut.variables === binding.id)}
                   className="btn-manor-ghost workspace-workflow-automation-action"
                   aria-label={`Run ${binding.name || workflow?.name || "workflow automation"}`}
                   title={enabled ? t("page.scheduled_jobs.run_now") : t("page.scheduled_jobs.enable_first")}
@@ -894,6 +903,7 @@ export default function ScheduledJobs({ workspaceId, workflowsEnabled }: Schedul
                 <button
                   type="button"
                   onClick={() => openBindingModal(binding)}
+                  disabled={!canWriteWorkspace}
                   className="btn-manor-ghost workspace-workflow-automation-action"
                   aria-label={`Edit ${binding.name || workflow?.name || "workflow automation"}`}
                   title={t("action.edit")}
@@ -901,6 +911,7 @@ export default function ScheduledJobs({ workspaceId, workflowsEnabled }: Schedul
                 <button
                   type="button"
                   onClick={() => setDeleteBindingTarget(binding.id)}
+                  disabled={!canWriteWorkspace}
                   className="btn-manor-ghost workspace-workflow-automation-action is-delete"
                   aria-label={`Delete ${binding.name || workflow?.name || "workflow automation"}`}
                   title={t("action.delete")}
@@ -928,9 +939,11 @@ export default function ScheduledJobs({ workspaceId, workflowsEnabled }: Schedul
         const jobWorkflow = job.execution_type === "workflow"
           ? (workflows as WorkflowSummary[]).find((item) => item.id === job.execution_target?.workflow_id)
           : null;
+        const effectiveEnabled = isAutomationEnabled(job);
+        const canManageJob = job.can_manage !== false && (!job.workspace_id || canWriteWorkspace);
 
         return (
-          <div key={job.id} className={`glass-card scheduled-job-card${job.enabled ? "" : " scheduled-job-card--disabled"}`} style={{
+          <div key={job.id} className={`glass-card scheduled-job-card${effectiveEnabled ? "" : " scheduled-job-card--disabled"}`} style={{
             padding: 0, overflow: "visible", borderRadius: 8, transform: "none",
           }}>
             {/* Main row */}
@@ -947,7 +960,7 @@ export default function ScheduledJobs({ workspaceId, workflowsEnabled }: Schedul
               <div className="scheduled-job-info" style={{ flex: 1, minWidth: 0 }}>
                 <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 3 }}>
                   <span className="scheduled-job-title" style={{ fontSize: 14, fontWeight: 600, color: "#0f172a" }}>{formatUserFacingText(job.name)}</span>
-                  {!job.enabled && (
+                  {!effectiveEnabled && (
                     <span className="workspace-workflow-automation-state">
                       {t("page.workspaces.filter_paused")}
                     </span>
@@ -1043,19 +1056,20 @@ export default function ScheduledJobs({ workspaceId, workflowsEnabled }: Schedul
                   )}
                 </span>
                 <Toggle
-                  checked={job.enabled}
-                  onChange={() => toggleMut.mutate({ id: job.id, enabled: !job.enabled })}
-                  aria-label={`${job.enabled ? "Pause" : "Enable"} ${job.name}`}
+                  checked={effectiveEnabled}
+                  onChange={() => toggleMut.mutate({ id: job.id, enabled: !effectiveEnabled })}
+                  disabled={!canManageJob || (!!workspaceId && workspaceStatus !== "active")}
+                  aria-label={`${effectiveEnabled ? "Pause" : "Enable"} ${job.name}`}
                 />
                 <button
                   onClick={() => runNowMut.mutate(job.id)}
-                  disabled={!job.enabled || (runNowMut.isPending && runNowMut.variables === job.id)}
+                  disabled={!canManageJob || !effectiveEnabled || (runNowMut.isPending && runNowMut.variables === job.id)}
                   className="btn-manor-ghost"
                   style={{ width: 28, height: 28, padding: 0, borderRadius: 8, color: "#4f7d75" }}
-                  title={job.enabled ? t("page.scheduled_jobs.run_now") : t("page.scheduled_jobs.enable_first")}
+                  title={effectiveEnabled ? t("page.scheduled_jobs.run_now") : t("page.scheduled_jobs.enable_first")}
                 ><IconPlay size={13} /></button>
-                <button onClick={() => openModal(job)} className="btn-manor-ghost" style={{ width: 28, height: 28, padding: 0, borderRadius: 8 }} title={t("action.edit")}><IconEdit size={13} /></button>
-                <button onClick={() => setDeleteTarget(job.job_id)} className="btn-manor-ghost" style={{ width: 28, height: 28, padding: 0, borderRadius: 8, color: "#a8a29e" }} title={t("action.delete")}><IconTrash size={13} /></button>
+                <button onClick={() => openModal(job)} disabled={!canManageJob} className="btn-manor-ghost" style={{ width: 28, height: 28, padding: 0, borderRadius: 8 }} title={t("action.edit")}><IconEdit size={13} /></button>
+                <button onClick={() => setDeleteTarget(job.job_id)} disabled={!canManageJob} className="btn-manor-ghost" style={{ width: 28, height: 28, padding: 0, borderRadius: 8, color: "#a8a29e" }} title={t("action.delete")}><IconTrash size={13} /></button>
               </div>
 
               <IconChevronRight className="scheduled-automation-expand" size={12} style={{ color: "#d6d3d1", transition: "transform 0.2s", transform: exp ? "rotate(90deg)" : "none", flexShrink: 0 }} />
@@ -1148,7 +1162,8 @@ export default function ScheduledJobs({ workspaceId, workflowsEnabled }: Schedul
               className="btn-manor"
               onClick={submit}
               disabled={
-                !fName.trim()
+                !canWriteWorkspace
+                || !fName.trim()
                 || workflowSelectionMissing
                 || (fKind === "workflow_event" && !fEvent.trim())
               }

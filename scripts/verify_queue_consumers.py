@@ -5,7 +5,7 @@ A queue split is only half a deploy: the compose file can declare a worker
 service and the deploy can still never start it, leaving that queue with no
 consumer. Nothing else notices — the control plane keeps ticking, /health
 stays green, and tasks accumulate on an unread queue until someone reports
-that "nothing runs any more". That happened once (the ``work`` queue landed
+that "nothing runs any more". That happened once (the ``heavy`` queue landed
 in docker-compose but not in the deploy's service list), which is why this
 check exists.
 

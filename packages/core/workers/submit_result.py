@@ -12,13 +12,15 @@ is the deliberate, structured hand-off:
     directly instead of prose the coercion layer must mine;
   * calling it TERMINATES the loop (terminal_tool_result_policy), so the
     model cannot submit and then wander;
-  * the handler never rejects — malformed payloads degrade to a summary-only
-    result and the envelope layer (contracts/envelope.py) still validates,
-    preserving the "no OutputSchemaError" invariant of part ①;
+  * the handler never rejects — malformed payloads are captured for the
+    finalizer. Explicit hard contracts then reject an omitted ``result`` at
+    the shared OutputContract gate, while legacy/unmarked steps retain their
+    tolerant summary fallback;
   * if the loop ends WITHOUT a submit (model just stopped talking), the
     caller runs one cheap follow-up round whose ONLY tool is submit_result;
-    if even that yields nothing, the legacy text-coercion path applies — so
-    this is strictly additive, never a new failure mode.
+    legacy/unmarked steps may still use the historical text-coercion fallback,
+    while an explicit hard contract fails closed if the follow-up also omits
+    ``result``.
 """
 from __future__ import annotations
 
@@ -31,9 +33,12 @@ from packages.core.contracts.envelope import (
     normalize_step_result_status,
 )
 from packages.core.contracts.task_output import (
-    declared_output_payload_schema,
-    is_plan_output_contract_schema,
-    task_output_payload_schema,
+    OutputContractKind,
+    SchemaContractError,
+    output_contract_for_schema,
+    task_failure_control_schema,
+    task_output_terminal_branch_schema,
+    validate_schema_contract,
 )
 
 SUBMIT_RESULT_TOOL_NAME = "submit_result"
@@ -61,6 +66,11 @@ SUBMIT_RESULT_TERMINAL_POLICY: dict[str, Any] = {
 SUBMIT_RESULT_PROMPT_SUFFIX = (
     "\n\nWhen the work is complete (or you cannot proceed), you MUST finish by "
     "calling the `submit_result` tool exactly once with your final outcome. "
+    "If status is failed, include a factual failure block. Set retryable=false "
+    "when another identical attempt cannot change the blocker, and set "
+    "requires_human=true when permissions, credentials, or missing human input "
+    "must change before any plan can proceed. For a failed outcome, do not "
+    "fabricate or include a `result`; put all evidence in `failure`. "
     "Do not end with a plain text message."
 )
 
@@ -70,18 +80,28 @@ def build_submit_result_tool(expected_output_schema: Optional[dict]) -> dict[str
 
     Legacy, unmarked object schemas expose their properties as advisory hints
     without required fields. Task-authored terminal contracts and explicit
-    PlanStep output contracts preserve the complete payload schema and
-    require ``result``; missing fields must retry instead of becoming a
-    summary-only success. Steps without either schema receive a free object.
+    PlanStep output contracts preserve the complete payload schema.
+    Successful/partial outcomes require ``result``; a failed Task envelope
+    requires ``failure`` instead. Missing success fields must retry instead
+    of becoming a summary-only success. Steps without either schema receive
+    a free object.
     """
-    declared_payload_schema = declared_output_payload_schema(expected_output_schema)
-    hard_declared_contract = declared_payload_schema is not None
+    contract = output_contract_for_schema(expected_output_schema)
+    declared_payload_schema = contract.payload_schema
+    hard_declared_contract = contract.requires_result
     result_schema: dict[str, Any] = {"type": "object"}
-    if hard_declared_contract:
+    if hard_declared_contract and declared_payload_schema is not None:
         # Task.expected_output and explicit PlanStep output contracts are
         # known before execution. Preserve required fields, cardinality, and
         # nested schemas in the tool call itself.
-        result_schema = declared_payload_schema
+        try:
+            validate_schema_contract(declared_payload_schema)
+            result_schema = declared_payload_schema
+        except SchemaContractError:
+            # Keep the tool itself callable for a persisted pre-migration
+            # plan; the dispatcher will report the invalid hard contract as a
+            # controlled schema failure rather than crashing tool creation.
+            result_schema = {"type": "object"}
     elif (
         isinstance(expected_output_schema, dict)
         and expected_output_schema.get("type") == "object"
@@ -94,6 +114,54 @@ def build_submit_result_tool(expected_output_schema: Optional[dict]) -> dict[str
             # backfilled by the tool-evidence mergers, and the envelope never
             # fails validation.
         }
+    failure_schema: dict[str, Any] = {
+        "type": "object",
+        "description": "Why a failed step could not complete and whether retrying can help.",
+        "properties": {
+            "reason": {"type": "string"},
+            "blockers": {
+                "type": "array",
+                "items": {"type": "string"},
+            },
+            "retryable": {"type": "boolean"},
+            "requires_human": {"type": "boolean"},
+        },
+        "required": ["reason", "retryable"],
+    }
+    if contract.kind is OutputContractKind.TASK_ENVELOPE:
+        failure_schema = task_failure_control_schema()
+        failure_schema["description"] = (
+            "Why a failed step could not complete and whether retrying can help."
+        )
+    parameters: dict[str, Any] = {
+        "type": "object",
+        "properties": {
+            "summary": {
+                "type": "string",
+                "description": "One short paragraph: what was done and the outcome.",
+            },
+            "status": {
+                "type": "string",
+                # The canonical vocabulary — the same enum the envelope
+                # schema, the dispatcher success gate and the executor
+                # blocker check use. Advertising any other words here
+                # (this once offered done|partial|blocked) means the
+                # agent's answer is silently rewritten downstream.
+                "enum": list(StepResultStatus.values()),
+                "description": (
+                    "succeeded = objective met; partial = some of it; "
+                    "failed = could not proceed."
+                ),
+            },
+            "result": result_schema,
+            "failure": failure_schema,
+        },
+        "required": ["summary"],
+    }
+    if contract.kind is OutputContractKind.TASK_ENVELOPE:
+        parameters["allOf"] = [task_output_terminal_branch_schema("result")]
+    elif hard_declared_contract:
+        parameters["required"].append("result")
     return {
         "type": "function",
         "function": {
@@ -103,30 +171,7 @@ def build_submit_result_tool(expected_output_schema: Optional[dict]) -> dict[str
                 "once, at the end. `summary` is a short factual account of what was "
                 "done and the outcome; put the deliverable's fields in `result`."
             ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "summary": {
-                        "type": "string",
-                        "description": "One short paragraph: what was done and the outcome.",
-                    },
-                    "status": {
-                        "type": "string",
-                        # The canonical vocabulary — the same enum the envelope
-                        # schema, the dispatcher success gate and the executor
-                        # blocker check use. Advertising any other words here
-                        # (this once offered done|partial|blocked) means the
-                        # agent's answer is silently rewritten downstream.
-                        "enum": list(StepResultStatus.values()),
-                        "description": (
-                            "succeeded = objective met; partial = some of it; "
-                            "failed = could not proceed."
-                        ),
-                    },
-                    "result": result_schema,
-                },
-                "required": ["summary", "result"] if hard_declared_contract else ["summary"],
-            },
+            "parameters": parameters,
         },
     }
 
@@ -158,9 +203,14 @@ def step_result_from_submit(
     expected_output_schema: Optional[dict] = None,
 ) -> Any:
     """Normalize a submit_result payload into the step_result dict shape the
-    downstream mergers/envelope consume. Tolerant by construction."""
-    task_payload_schema = task_output_payload_schema(expected_output_schema)
-    if task_payload_schema is not None:
+    downstream mergers/envelope consume. Legacy payloads are tolerant; hard
+    contracts reject an omitted ``result`` before normalization."""
+    contract = output_contract_for_schema(expected_output_schema)
+    # Keep omission distinct from an explicit JSON null.  The latter is
+    # allowed to reach the validator for schemas whose value is nullable; an
+    # omitted member is always a malformed hard-contract submission.
+    contract.require_submission_result(payload)
+    if contract.kind is OutputContractKind.TASK_ENVELOPE:
         summary = str(payload.get("summary") or "").strip()
         status = normalize_step_result_status(payload.get("status"))
         envelope: dict[str, Any] = {
@@ -169,11 +219,13 @@ def step_result_from_submit(
         }
         # Presence matters: JSON null can be valid when the task schema allows
         # it, while an omitted result must remain omitted and fail validation.
-        if "result" in payload:
+        if "result" in payload and status is not StepResultStatus.FAILED:
             envelope["outputs"] = {"data": payload.get("result")}
+        if isinstance(payload.get("failure"), dict):
+            envelope["failure"] = dict(payload["failure"])
         return envelope
 
-    if is_plan_output_contract_schema(expected_output_schema):
+    if contract.is_bare_payload:
         # A PlanStep payload is the exact declared value, not a control
         # envelope. Injecting the tool's summary/status here would violate
         # custom schemas that correctly use additionalProperties=false.
@@ -192,6 +244,8 @@ def step_result_from_submit(
         result["text"] = summary
     if summary:
         result.setdefault("summary", summary)
+    if isinstance(payload.get("failure"), dict):
+        result["failure"] = dict(payload["failure"])
 
     # Normalize onto the canonical enum. A model that answers "done" (the
     # word this tool used to advertise, and the one it reaches for naturally)
@@ -214,7 +268,8 @@ def step_result_from_submit(
 def submit_result_followup_message(expected_output_schema: Optional[dict]) -> str:
     """The nudge for the fallback round when the loop ended without a submit."""
     hint = ""
-    payload_schema = declared_output_payload_schema(expected_output_schema)
+    contract = output_contract_for_schema(expected_output_schema)
+    payload_schema = contract.payload_schema
     schema_for_hint = payload_schema or expected_output_schema
     if isinstance(schema_for_hint, dict) and isinstance(schema_for_hint.get("properties"), dict):
         fields = ", ".join(sorted(schema_for_hint["properties"].keys()))

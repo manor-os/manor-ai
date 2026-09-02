@@ -174,8 +174,8 @@ def test_installing_records_the_fingerprint():
     from packages.core.blueprints import installer
 
     body = inspect.getsource(installer)
-    assert "CONTENT_FINGERPRINT_KEY: blueprint_content_fingerprint(payload)" in body
-    assert "SECTION_FINGERPRINTS_KEY: blueprint_section_fingerprints(payload)" in body
+    assert "CONTENT_FINGERPRINT_KEY: blueprint_content_fingerprint(source_payload)" in body
+    assert "SECTION_FINGERPRINTS_KEY: blueprint_section_fingerprints(source_payload)" in body
 
 
 def test_the_workspace_api_reports_it():
@@ -218,10 +218,11 @@ def test_marketplace_installs_are_resolved_by_id_not_slug():
     from apps.api.routers import workspaces
 
     body = inspect.getsource(workspaces._blueprint_payloads_for)
-    assert "WorkspaceBlueprint" in body, (
-        "payloads must come from the blueprint table"
+    assert "resolve_blueprint_rows(db, references)" in body
+    assert "BlueprintRowReference(" in body
+    assert "prefer_platform" not in body, (
+        "an exact Marketplace id must not be redirected by a matching slug"
     )
-    assert "_workspace_blueprint_candidates(settings)" in body
     assert "_builtin_blueprint_payload" not in body, (
         "the platform's blueprints are rows now — no config-directory branch"
     )
@@ -246,7 +247,7 @@ def test_installing_records_the_fingerprint_for_any_payload():
     from packages.core.blueprints import installer
 
     body = inspect.getsource(installer.install_blueprint)
-    assert "blueprint_content_fingerprint(payload)" in body
+    assert "blueprint_content_fingerprint(source_payload)" in body
 
 
 # ── Identity is the id; the version is what moves ─────────────────────
@@ -361,9 +362,10 @@ def test_a_payload_install_adopts_the_published_row_it_matches():
     from apps.api.routers import blueprints
 
     body = inspect.getsource(blueprints.install_from_payload)
-    assert "platform_blueprint_id(payload_slug)" in body
+    assert "_published_platform_blueprint_matching_payload" in body
     assert "blueprint_id=matched.id if matched else None" in body
-    assert "blueprint_version=matched.content_version if matched else None" in body
+    assert "paid_source[2]" in body
+    assert "matched.content_version if matched else None" in body
 
 
 def test_a_marketplace_install_records_the_version_it_took():
@@ -372,27 +374,24 @@ def test_a_marketplace_install_records_the_version_it_took():
     from apps.api.routers import blueprints
 
     body = inspect.getsource(blueprints)
-    assert "blueprint_version=row.content_version" in body
+    assert "blueprint_version=source_version" in body
 
 
-def test_builtin_installs_record_the_published_identity_and_version():
-    """The compatibility route must not create another detached workspace."""
+def test_builtin_installs_use_the_same_canonical_row_as_marketplace_installs():
     import inspect
 
     from apps.api.routers import blueprints
 
     body = inspect.getsource(blueprints.install)
-    assert "durable_id = platform_blueprint_id(slug)" in body
-    assert "blueprint_id=durable_id" in body
-    assert "published.content_version" in body
+    assert "_load_blueprint" in body
+    assert "blueprint_id=row.id" in body
+    assert "blueprint_version=source_version" in body
 
 
 def test_legacy_builtin_installs_resolve_to_the_platform_row():
     """Existing workspaces with the old null id stay upgradeable by slug."""
-    from apps.api.routers.workspaces import (
-        _workspace_blueprint_candidates,
-        _workspace_blueprint_id,
-    )
+    from apps.api.routers.workspaces import _workspace_blueprint_id
+    from packages.core.blueprints.seed import BlueprintRowReference
 
     assert _workspace_blueprint_id({
         "_blueprint": {"blueprint_slug": SLUG, "blueprint_id": None},
@@ -401,9 +400,7 @@ def test_legacy_builtin_installs_resolve_to_the_platform_row():
         "_blueprint": {"blueprint_slug": SLUG, "blueprint_id": "01CUSTOM"},
     }) == "01CUSTOM"
     assert _workspace_blueprint_id({}) == ""
-    assert _workspace_blueprint_candidates({
-        "_blueprint": {"blueprint_slug": SLUG, "blueprint_id": "01DELETEDDUPLICATE"},
-    }) == [f"builtin:{SLUG}", "01DELETEDDUPLICATE"]
+    assert BlueprintRowReference(None, SLUG).blueprint_slug == SLUG
 
 
 def test_legacy_builtin_summary_exposes_the_repaired_identity(payload):

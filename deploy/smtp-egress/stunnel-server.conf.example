@@ -1,0 +1,13 @@
+foreground = yes
+pid =
+debug = notice
+sslVersionMin = TLSv1.2
+
+[smtp-egress]
+accept = 0.0.0.0:8443
+connect = danted:1080
+cert = /etc/manor/tls/server.crt
+key = /etc/manor/tls/server.key
+CAfile = /etc/manor/tls/client-ca.crt
+verifyChain = yes
+requireCert = yes

@@ -1,15 +1,16 @@
 """Ledger gap events (M1 completion).
 
 Covers the three gaps closed after the main adapter wave:
-* automation_run_missed — the scheduler tick's throttled missed-run scan
-  (interval jobs >= 1h whose last run is > 2x their interval old, plus
-  cron jobs whose previous occurrence went unserved past the grace
-  period; see _previous_cron_occurrence and its 24h lookback bound).
+* automation_run_missed — the scheduler tick's indexed missed-run scan
+  (interval jobs >= 1h whose persisted due clock is overdue by at least
+  one interval, plus cron jobs whose indexed occurrence passed the grace
+  period).
 * approval_expired — emitted when resolve_origin_requests expires the open
   requests of a terminal origin.
 * workflow_definitions revision (M11) — template content changes bump the
   revision and append an automation_revisions audit row.
 """
+
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
@@ -62,23 +63,36 @@ def _mk_job(db, ws: Workspace | None, **overrides) -> ScheduledJob:
 
 
 async def _events(db, *, entity_id: str, event_type: str) -> list[WorkspaceEvent]:
-    return list((await db.execute(
-        select(WorkspaceEvent)
-        .where(
-            WorkspaceEvent.entity_id == entity_id,
-            WorkspaceEvent.event_type == event_type,
+    return list(
+        (
+            await db.execute(
+                select(WorkspaceEvent)
+                .where(
+                    WorkspaceEvent.entity_id == entity_id,
+                    WorkspaceEvent.event_type == event_type,
+                )
+                .order_by(WorkspaceEvent.id.asc())
+            )
         )
-        .order_by(WorkspaceEvent.id.asc())
-    )).scalars().all())
+        .scalars()
+        .all()
+    )
 
 
 # ── automation_run_missed ──────────────────────────────────────────
+
 
 async def test_missed_scan_emits_one_event_and_dedupes_same_period(db_session):
     ws = _mk_workspace(db_session)
     now = datetime.now(timezone.utc)
     stale_last_run = now - timedelta(hours=13)  # > 2 x 6h
-    job = _mk_job(db_session, ws, last_run_at=stale_last_run)
+    expected_by = stale_last_run + timedelta(seconds=21600)
+    job = _mk_job(
+        db_session,
+        ws,
+        last_run_at=stale_last_run,
+        next_run_at=expected_by,
+    )
     await db_session.flush()
 
     await _scan_missed_runs(db_session, now)
@@ -90,7 +104,6 @@ async def test_missed_scan_emits_one_event_and_dedupes_same_period(db_session):
     assert row.source_kind == "scheduled_job"
     assert row.source_id == job.id
     assert row.status == "missed"
-    expected_by = stale_last_run + timedelta(seconds=21600)
     assert row.period_key == expected_by.strftime("%Y-%m-%dT%H")  # sub-daily -> hourly key
     assert row.idempotency_key == f"sj:{job.id}:missed:{row.period_key}"
     occurred = row.occurred_at
@@ -110,18 +123,41 @@ async def test_missed_scan_skips_subhourly_disabled_and_on_time_jobs(db_session)
     very_stale = now - timedelta(days=2)
 
     # Sub-hourly: recovers next tick, would be pure noise.
-    _mk_job(db_session, ws, every_seconds=600.0, last_run_at=very_stale)
+    _mk_job(
+        db_session,
+        ws,
+        every_seconds=600.0,
+        last_run_at=very_stale,
+        next_run_at=very_stale + timedelta(minutes=10),
+    )
     # Disabled: not expected to run at all.
-    _mk_job(db_session, ws, enabled=False, last_run_at=very_stale)
+    _mk_job(
+        db_session,
+        ws,
+        enabled=False,
+        last_run_at=very_stale,
+        next_run_at=very_stale + timedelta(hours=6),
+    )
     # Disabled cron: same — an off job cannot miss a run.
     _mk_job(
-        db_session, ws, schedule_kind="cron", cron_expr="0 9 * * *",
-        every_seconds=None, enabled=False, last_run_at=very_stale,
+        db_session,
+        ws,
+        schedule_kind="cron",
+        cron_expr="0 9 * * *",
+        every_seconds=None,
+        enabled=False,
+        last_run_at=very_stale,
+        next_run_at=now - timedelta(days=1),
     )
     # Late but under the 2x threshold: not yet a missed period.
-    _mk_job(db_session, ws, last_run_at=now - timedelta(hours=7))
+    _mk_job(
+        db_session,
+        ws,
+        last_run_at=now - timedelta(hours=7),
+        next_run_at=now - timedelta(hours=1),
+    )
     # Never ran at all: no reference period to have missed.
-    _mk_job(db_session, ws, last_run_at=None)
+    _mk_job(db_session, ws, last_run_at=None, next_run_at=now)
     await db_session.flush()
 
     await _scan_missed_runs(db_session, now)
@@ -142,6 +178,7 @@ async def test_missed_scan_skips_jobs_without_workspace(db_session):
         enabled=True,
         execution_target={},
         last_run_at=now - timedelta(days=2),
+        next_run_at=now - timedelta(hours=42),
     )
     db_session.add(job)
     await db_session.flush()
@@ -172,7 +209,13 @@ def _mk_cron_job(db, ws: Workspace, **overrides) -> ScheduledJob:
 
 async def test_missed_scan_emits_for_cron_with_stale_last_run(db_session):
     ws = _mk_workspace(db_session)
-    job = _mk_cron_job(db_session, ws, last_run_at=_CRON_NOW - timedelta(days=2))
+    expected_by = datetime(2026, 7, 24, 9, 0, tzinfo=timezone.utc)
+    job = _mk_cron_job(
+        db_session,
+        ws,
+        last_run_at=_CRON_NOW - timedelta(days=2),
+        next_run_at=expected_by,
+    )
     await db_session.flush()
 
     await _scan_missed_runs(db_session, _CRON_NOW)
@@ -182,7 +225,6 @@ async def test_missed_scan_emits_for_cron_with_stale_last_run(db_session):
     row = rows[0]
     assert row.source_id == job.id
     assert row.status == "missed"
-    expected_by = datetime(2026, 7, 24, 9, 0, tzinfo=timezone.utc)
     # Cron jobs are not "every" jobs → daily dedupe period.
     assert row.period_key == "2026-07-24"
     assert row.idempotency_key == f"sj:{job.id}:missed:2026-07-24"
@@ -201,8 +243,10 @@ async def test_missed_scan_skips_cron_that_ran_after_its_occurrence(db_session):
     ws = _mk_workspace(db_session)
     # Fired at 09:00:05, right after the 09:00 occurrence.
     _mk_cron_job(
-        db_session, ws,
+        db_session,
+        ws,
         last_run_at=datetime(2026, 7, 24, 9, 0, 5, tzinfo=timezone.utc),
+        next_run_at=datetime(2026, 7, 25, 9, 0, tzinfo=timezone.utc),
     )
     await db_session.flush()
 
@@ -213,7 +257,12 @@ async def test_missed_scan_skips_cron_that_ran_after_its_occurrence(db_session):
 
 async def test_missed_scan_respects_cron_grace_period(db_session):
     ws = _mk_workspace(db_session)
-    _mk_cron_job(db_session, ws, last_run_at=_CRON_NOW - timedelta(days=2))
+    _mk_cron_job(
+        db_session,
+        ws,
+        last_run_at=_CRON_NOW - timedelta(days=2),
+        next_run_at=datetime(2026, 7, 24, 9, 0, tzinfo=timezone.utc),
+    )
     await db_session.flush()
 
     # 3 minutes past the 09:00 occurrence — inside the 5-minute grace, so
@@ -223,13 +272,16 @@ async def test_missed_scan_respects_cron_grace_period(db_session):
     assert await _events(db_session, entity_id=ws.entity_id, event_type=et.AUTOMATION_RUN_MISSED) == []
 
 
-async def test_missed_scan_skips_cron_whose_occurrence_predates_lookback(db_session):
+async def test_missed_scan_skips_cron_without_indexed_due_clock(db_session):
     ws = _mk_workspace(db_session)
-    # Fires once a year (Jan 1 09:00) — no occurrence inside the 24h
-    # lookback window, so nothing can be claimed as missed.
+    # The scanner consumes the durable due-time projection. It must not
+    # reconstruct a historical occurrence when that projection is absent.
     _mk_cron_job(
-        db_session, ws, cron_expr="0 9 1 1 *",
+        db_session,
+        ws,
+        cron_expr="0 9 1 1 *",
         last_run_at=_CRON_NOW - timedelta(days=200),
+        next_run_at=None,
     )
     await db_session.flush()
 
@@ -240,7 +292,12 @@ async def test_missed_scan_skips_cron_whose_occurrence_predates_lookback(db_sess
 
 async def test_missed_scan_emits_for_cron_that_never_ran(db_session):
     ws = _mk_workspace(db_session)
-    _mk_cron_job(db_session, ws, last_run_at=None)
+    _mk_cron_job(
+        db_session,
+        ws,
+        last_run_at=None,
+        next_run_at=datetime(2026, 7, 24, 9, 0, tzinfo=timezone.utc),
+    )
     await db_session.flush()
 
     await _scan_missed_runs(db_session, _CRON_NOW)
@@ -251,22 +308,21 @@ async def test_missed_scan_emits_for_cron_that_never_ran(db_session):
 
 # ── _previous_cron_occurrence ──────────────────────────────────────
 
+
 def test_previous_cron_occurrence_daily():
     from packages.core.tasks.scheduler_tasks import _previous_cron_occurrence
 
     now = datetime(2026, 7, 24, 12, 0, tzinfo=timezone.utc)
-    assert _previous_cron_occurrence("0 9 * * *", now) == datetime(
-        2026, 7, 24, 9, 0, tzinfo=timezone.utc
-    )
+    assert _previous_cron_occurrence("0 9 * * *", now) == datetime(2026, 7, 24, 9, 0, tzinfo=timezone.utc)
     # Before today's 09:00 → yesterday's occurrence (still inside 24h).
-    assert _previous_cron_occurrence(
-        "0 9 * * *", datetime(2026, 7, 24, 8, 30, tzinfo=timezone.utc)
-    ) == datetime(2026, 7, 23, 9, 0, tzinfo=timezone.utc)
+    assert _previous_cron_occurrence("0 9 * * *", datetime(2026, 7, 24, 8, 30, tzinfo=timezone.utc)) == datetime(
+        2026, 7, 23, 9, 0, tzinfo=timezone.utc
+    )
     # The current minute never counts as "previous" — the scan looks at
     # minutes strictly before now.
-    assert _previous_cron_occurrence(
-        "0 9 * * *", datetime(2026, 7, 24, 9, 0, 30, tzinfo=timezone.utc)
-    ) == datetime(2026, 7, 23, 9, 0, tzinfo=timezone.utc)
+    assert _previous_cron_occurrence("0 9 * * *", datetime(2026, 7, 24, 9, 0, 30, tzinfo=timezone.utc)) == datetime(
+        2026, 7, 23, 9, 0, tzinfo=timezone.utc
+    )
 
 
 def test_previous_cron_occurrence_weekday_restricted():
@@ -278,13 +334,13 @@ def test_previous_cron_occurrence_weekday_restricted():
     assert _previous_cron_occurrence("0 9 * * 1", now) is None
     # Widen the window and the Monday occurrence is found.
     assert _previous_cron_occurrence(
-        "0 9 * * 1", now, lookback_minutes=7 * 1440,
+        "0 9 * * 1",
+        now,
+        lookback_minutes=7 * 1440,
     ) == datetime(2026, 7, 20, 9, 0, tzinfo=timezone.utc)
 
     # Weekday-restricted expression that DID fire today (Friday = cron 5).
-    assert _previous_cron_occurrence("0 9 * * 5", now) == datetime(
-        2026, 7, 24, 9, 0, tzinfo=timezone.utc
-    )
+    assert _previous_cron_occurrence("0 9 * * 5", now) == datetime(2026, 7, 24, 9, 0, tzinfo=timezone.utc)
 
 
 def test_previous_cron_occurrence_unparseable_returns_none():
@@ -298,6 +354,7 @@ def test_previous_cron_occurrence_unparseable_returns_none():
 
 
 # ── approval_expired ───────────────────────────────────────────────
+
 
 async def test_resolve_origin_requests_emits_approval_expired(db_session):
     from packages.core.governance.approvals import resolve_origin_requests
@@ -341,6 +398,7 @@ async def test_resolve_origin_requests_emits_approval_expired(db_session):
 
 # ── workflow_definitions revision (M11) ────────────────────────────
 
+
 async def test_workflow_definition_content_update_bumps_revision_with_audit(db_session):
     from packages.core.services import workflow_service as svc
 
@@ -351,16 +409,26 @@ async def test_workflow_definition_content_update_bumps_revision_with_audit(db_s
 
     steps_v2 = [{"id": "s1", "type": "agent", "name": "Draft v2", "config": {}, "next": []}]
     wf = await svc.update_workflow(
-        db_session, wf.id, entity_id, steps=steps_v2, name="Gap WF v2",
+        db_session,
+        wf.id,
+        entity_id,
+        steps=steps_v2,
+        name="Gap WF v2",
     )
     assert wf.revision == 2
 
-    audits = list((await db_session.execute(
-        select(AutomationRevision).where(
-            AutomationRevision.target_kind == "workflow_definition",
-            AutomationRevision.target_id == wf.id,
+    audits = list(
+        (
+            await db_session.execute(
+                select(AutomationRevision).where(
+                    AutomationRevision.target_kind == "workflow_definition",
+                    AutomationRevision.target_id == wf.id,
+                )
+            )
         )
-    )).scalars().all())
+        .scalars()
+        .all()
+    )
     assert len(audits) == 1
     assert audits[0].revision == 2
     assert audits[0].entity_id == entity_id
@@ -382,10 +450,16 @@ async def test_workflow_definition_cosmetic_or_noop_update_does_not_bump(db_sess
     wf = await svc.update_workflow(db_session, wf.id, entity_id, name="Gap WF", steps=steps)
     assert wf.revision == 1
 
-    audits = list((await db_session.execute(
-        select(AutomationRevision).where(
-            AutomationRevision.target_kind == "workflow_definition",
-            AutomationRevision.target_id == wf.id,
+    audits = list(
+        (
+            await db_session.execute(
+                select(AutomationRevision).where(
+                    AutomationRevision.target_kind == "workflow_definition",
+                    AutomationRevision.target_id == wf.id,
+                )
+            )
         )
-    )).scalars().all())
+        .scalars()
+        .all()
+    )
     assert audits == []

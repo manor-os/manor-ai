@@ -1,1 +1,1 @@
-"""Channel webhook routers — provider-specific callback endpoints."""
+"""Channel webhook routers, including fixed provider callback endpoints."""

@@ -7,18 +7,11 @@ import uuid
 from fastapi.responses import JSONResponse
 from starlette.types import ASGIApp, Receive, Scope, Send
 
+from apps.api.chat_stream_routes import is_chat_stream_path
+
 
 def _env_bool(name: str, default: str = "false") -> bool:
     return os.getenv(name, default).lower() in ("1", "true", "yes", "on")
-
-
-def _is_chat_stream(path: str) -> bool:
-    return (
-        path == "/api/v1/chat/stream"
-        or (path.startswith("/api/v1/public/chat/") and path.endswith("/message/stream"))
-        or path.startswith("/api/v1/workspace-drafts/") and path.endswith("/stream")
-        or path == "/api/v1/workspace-drafts/stream"
-    )
 
 
 def _is_sandbox_work(path: str) -> bool:
@@ -56,7 +49,7 @@ def _is_large_upload(path: str, method: str) -> bool:
 def degraded_reason(path: str, method: str) -> str | None:
     """Return a reason when degraded mode should shed this request."""
     method = method.upper()
-    if _env_bool("DEGRADED_DISABLE_CHAT_STREAM", "true") and _is_chat_stream(path):
+    if _env_bool("DEGRADED_DISABLE_CHAT_STREAM", "true") and is_chat_stream_path(path):
         return "chat_stream"
     if _env_bool("DEGRADED_DISABLE_SANDBOX", "true") and _is_sandbox_work(path):
         return "sandbox"

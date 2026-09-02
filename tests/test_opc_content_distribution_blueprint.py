@@ -205,6 +205,31 @@ def test_daily_slot_router_supports_all_six_publishers() -> None:
     }
 
 
+def test_post_install_checks_cover_every_workspace_binding_and_schedule() -> None:
+    payload = get_solo_company_blueprint(BLUEPRINT_SLUG)
+    checks = payload["policy"]["post_install_checks"]
+    checked_workflows = {
+        check["workflow_slug"]
+        for check in checks
+        if check["kind"] == "workflow_present"
+    }
+    checked_jobs = {
+        check["job_id"]
+        for check in checks
+        if check["kind"] == "cron_scheduled"
+    }
+
+    assert checked_workflows == {
+        workflow["slug"]
+        for workflow in payload["recipe"]["workflows"]
+        if not workflow.get("internal")
+    }
+    assert checked_jobs == {
+        job["job_id"]
+        for job in payload["recipe"]["scheduled_jobs"]
+    }
+
+
 @pytest.mark.asyncio
 async def test_opc_blueprint_installs_all_workflows_as_runnable_graphs(
     db_session: AsyncSession,
@@ -308,7 +333,7 @@ async def test_every_opc_atom_runs_to_review_before_any_public_side_effect(
         db_session,
         entity_id=entity_id,
         payload=payload,
-        mode=InstallMode.SIMULATE,
+        mode=InstallMode.LIVE,
         governance_preset="standard",
     )
     await db_session.commit()

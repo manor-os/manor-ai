@@ -23,6 +23,9 @@ from packages.core.dispatcher.service import Dispatcher
 from packages.core.models.base import generate_ulid
 from packages.core.models.execution import ExecutionPlan, ExecutionStep
 from packages.core.models.worker import WorkLease, Worker
+from packages.core.services.integration_account_service import (
+    IntegrationAccountFanoutResultFactory,
+)
 
 # The staging payload, verbatim, after coercion by build_step_result_envelope.
 _FAILED_ENVELOPE = {"text": "", "status": "failed", "summary": "no structured summary provided"}
@@ -161,6 +164,31 @@ async def test_failed_envelope_carries_the_failure_block(client) -> None:
 
 
 @pytest.mark.asyncio
+async def test_failed_envelope_marked_non_retryable_stops_immediately(client) -> None:
+    import packages.core.database as dbmod
+
+    envelope = {
+        "status": "failed",
+        "summary": "workspace file writes are not permitted",
+        "failure": {
+            "reason": "docs.upload is blocked for this run",
+            "blockers": ["docs.upload"],
+            "retryable": False,
+            "requires_human": True,
+        },
+    }
+    async with dbmod.async_session() as db:
+        step_id, lease_id = await _setup_step(db, attempt_count=1, max_attempts=3)
+        await Dispatcher().complete_lease(db, lease_id, result=envelope)
+        await db.flush()
+
+        step = await db.get(ExecutionStep, step_id)
+        assert step.step_status in ("failed", "waiting_human")
+        assert step.step_status != "pending"
+        assert step.error.get("failure", {}).get("retryable") is False
+
+
+@pytest.mark.asyncio
 async def test_partial_envelope_is_a_success(client) -> None:
     """Partial output is usable output — the step stays done."""
     import packages.core.database as dbmod
@@ -211,6 +239,107 @@ async def test_non_envelope_step_with_status_failed_payload_still_completes(clie
         assert step.error is None
         assert step.result == payload
         assert lease.status == "completed"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {
+            "integration_account_selection": "all",
+            "status": "partial",
+            "total_account_count": 2,
+            "account_count": 1,
+            "failed_count": 0,
+            "result_truncated_count": 0,
+            "omitted_account_count": 1,
+            "results": [
+                {
+                    "integration_account_id": "account-1",
+                    "ok": True,
+                    "result": {"id": "one"},
+                }
+            ],
+        },
+        {
+            "integration_account_selection": "all",
+            "status": "complete",
+            "total_account_count": 2,
+            "account_count": 1,
+            "failed_count": 0,
+            "result_truncated_count": 0,
+            "omitted_account_count": 0,
+            "results": [
+                {
+                    "integration_account_id": "account-1",
+                    "ok": True,
+                    "result": {"id": "one"},
+                }
+            ],
+        },
+        {
+            "integration_account_selection": "all",
+            "status": "complete",
+            "total_account_count": 2,
+            "account_count": 2,
+            "failed_count": 0,
+            "result_truncated_count": 0,
+            "omitted_account_count": 0,
+            "results": [
+                {
+                    "integration_account_id": "account-1",
+                    "ok": True,
+                    "result": {"id": "one"},
+                },
+                {
+                    "integration_account_id": "account-1",
+                    "ok": True,
+                    "result": {"id": "duplicate"},
+                },
+            ],
+        },
+        {
+            "integration_account_selection": "all",
+            "status": "complete",
+            "total_account_count": 2,
+            "account_count": 2,
+            "failed_count": 0,
+            "result_truncated_count": 0,
+            "omitted_account_count": 0,
+            "results": [
+                {
+                    "integration_account_id": "account-1",
+                    "ok": True,
+                    "result": {"id": "one"},
+                },
+                {
+                    "integration_account_id": "account-2",
+                    "ok": False,
+                    "result": {"error": "provider unavailable"},
+                },
+            ],
+        },
+    ],
+)
+async def test_incomplete_account_fanout_does_not_complete_action_step(
+    client,
+    payload,
+) -> None:
+    import packages.core.database as dbmod
+
+    schema = IntegrationAccountFanoutResultFactory.output_schema({})
+    async with dbmod.async_session() as db:
+        step_id, lease_id = await _setup_step(db, kind="action", schema=schema)
+        await Dispatcher().complete_lease(db, lease_id, result=payload)
+        await db.flush()
+
+        step = await db.get(ExecutionStep, step_id)
+        lease = await db.get(WorkLease, lease_id)
+        assert step.step_status == "pending"
+        assert step.error["type"] == "IntegrationAccountFanoutIncomplete"
+        assert step.result == payload
+        assert lease.status == "failed"
+        assert lease.result == payload
 
 
 @pytest.mark.asyncio

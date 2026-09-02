@@ -17,6 +17,7 @@ import pytest
 import packages.core.ai.mcp.shopify as sh
 import packages.core.ai.mcp.woocommerce as wc
 import packages.core.ai.mcp.square as sq
+import packages.core.ai.mcp.stripe as st
 
 
 # ── httpx fake ───────────────────────────────────────────────────────────────
@@ -64,6 +65,14 @@ class _FakeClient:
         _FakeClient.calls.append({"method": "POST", "url": url, "headers": headers, "json": json})
         return _FakeClient.response
 
+    async def get(self, url, headers=None, params=None, auth=None):
+        _FakeClient.calls.append({"method": "GET", "url": url, "headers": headers, "params": params, "auth": auth})
+        return _FakeClient.response
+
+    async def delete(self, url, headers=None, auth=None):
+        _FakeClient.calls.append({"method": "DELETE", "url": url, "headers": headers, "auth": auth})
+        return _FakeClient.response
+
 
 def _last():
     assert _FakeClient.calls, "no HTTP request made"
@@ -74,7 +83,7 @@ def _last():
 def http(monkeypatch):
     _FakeClient.calls = []
     _FakeClient.response = _FakeResp(200, {"ok": True})
-    for mod in (sh, wc, sq):
+    for mod in (sh, wc, sq, st):
         monkeypatch.setattr(mod.httpx, "AsyncClient", _FakeClient)
     return _FakeClient
 
@@ -83,6 +92,7 @@ def http(monkeypatch):
 SH_CREDS = json.dumps({"shop_domain": "demo.myshopify.com", "access_token": "shpat_x"})
 WC_CREDS = json.dumps({"site_url": "https://shop.example.com", "consumer_key": "ck_1", "consumer_secret": "cs_2"})
 SQ_CREDS = json.dumps({"access_token": "EAAA_tok", "environment": "sandbox", "location_id": "L1"})
+STRIPE_KEY = "sk_test_x"
 
 
 # ── Registration parity ──────────────────────────────────────────────────────
@@ -107,6 +117,39 @@ async def test_shopify_uses_graphql_endpoint_and_token_header(http):
     assert out["isError"] is False
 
 
+async def test_shopify_normalizes_admin_url_credentials(http):
+    """A copied Shopify admin URL must resolve to the API host."""
+    http.response = _FakeResp(200, {"data": {"shop": {"name": "Demo"}}})
+    creds = json.dumps(
+        {"shop_domain": " https://Demo.myshopify.com/admin/ ", "access_token": "shpat_x"}
+    )
+    await sh.call_tool("get_shop", {}, creds)
+    assert _last()["url"] == f"https://demo.myshopify.com/admin/api/{sh._ADMIN_API_VERSION}/graphql.json"
+
+
+async def test_shopify_non_object_credentials_are_rejected_without_http(http):
+    out = await sh.call_tool("get_shop", {}, "[]")
+    assert out["isError"] is True
+    assert "malformed" in out["content"][0]["text"]
+    assert not http.calls
+
+
+async def test_shopify_non_string_token_is_rejected_without_http(http):
+    out = await sh.call_tool(
+        "get_shop", {}, json.dumps({"shop_domain": "demo.myshopify.com", "access_token": {"value": "bad"}})
+    )
+    assert out["isError"] is True
+    assert "access_token" in out["content"][0]["text"]
+    assert not http.calls
+
+
+async def test_shopify_non_object_arguments_are_rejected_without_http(http):
+    out = await sh.call_tool("get_shop", [], SH_CREDS)
+    assert out["isError"] is True
+    assert "object" in out["content"][0]["text"].lower()
+    assert not http.calls
+
+
 async def test_shopify_get_product_normalizes_numeric_id_to_gid(http):
     http.response = _FakeResp(200, {"data": {"product": {"id": "gid://shopify/Product/5"}}})
     await sh.call_tool("get_product", {"product_id": "5"}, SH_CREDS)
@@ -128,6 +171,30 @@ async def test_shopify_create_product_mutation_input(http):
     assert "productCreate" in body["query"]
     assert body["variables"]["input"]["title"] == "Tee"
     assert body["variables"]["input"]["tags"] == ["a", "b"]
+
+
+async def test_shopify_create_product_defaults_to_draft(http):
+    http.response = _FakeResp(200, {"data": {"productCreate": {"userErrors": []}}})
+
+    await sh.call_tool("create_product", {"title": "Staging product"}, SH_CREDS)
+
+    assert _last()["json"]["variables"]["input"]["status"] == "DRAFT"
+
+
+async def test_shopify_delete_product_is_exposed_and_uses_product_gid(http):
+    http.response = _FakeResp(
+        200,
+        {"data": {"productDelete": {"deletedProductId": "gid://shopify/Product/7", "userErrors": []}}},
+    )
+
+    result = await sh.call_tool("delete_product", {"product_id": "7"}, SH_CREDS)
+
+    assert result["isError"] is False
+    call = _last()
+    assert "productDelete" in call["json"]["query"]
+    assert call["json"]["variables"]["input"] == {
+        "id": "gid://shopify/Product/7"
+    }
 
 
 async def test_shopify_user_errors_surface_as_error(http):
@@ -154,6 +221,32 @@ async def test_shopify_missing_credentials(http):
     assert "access_token" in out["content"][0]["text"]
 
 
+async def test_shopify_blank_token_is_rejected_without_http(http):
+    out = await sh.call_tool(
+        "get_shop",
+        {},
+        json.dumps({"shop_domain": "demo.myshopify.com", "access_token": "   "}),
+    )
+    assert out["isError"] is True
+    assert "access_token" in out["content"][0]["text"]
+    assert not http.calls
+
+
+@pytest.mark.parametrize("first", [0, -1, 251])
+async def test_shopify_list_products_rejects_invalid_first_without_http(http, first):
+    out = await sh.call_tool("list_products", {"first": first}, SH_CREDS)
+    assert out["isError"] is True
+    assert "first" in out["content"][0]["text"]
+    assert not http.calls
+
+
+async def test_shopify_blank_title_is_rejected_without_http(http):
+    out = await sh.call_tool("create_product", {"title": "   "}, SH_CREDS)
+    assert out["isError"] is True
+    assert "title" in out["content"][0]["text"]
+    assert not http.calls
+
+
 # ── WooCommerce (REST, basic auth) ────────────────────────────────────────────
 
 
@@ -174,6 +267,25 @@ async def test_woo_create_product_price_coerced_to_string(http):
     assert body["name"] == "Hat"
     assert body["regular_price"] == "19.99"
     assert body["manage_stock"] is True and body["stock_quantity"] == 5
+
+
+async def test_woo_create_product_defaults_to_draft(http):
+    http.response = _FakeResp(201, {"id": 7})
+
+    await wc.call_tool("create_product", {"name": "Staging product"}, WC_CREDS)
+
+    assert _last()["json"]["status"] == "draft"
+
+
+async def test_woo_delete_product_defaults_to_recoverable_trash(http):
+    http.response = _FakeResp(200, {"id": 7, "status": "trash"})
+
+    result = await wc.call_tool("delete_product", {"product_id": 7}, WC_CREDS)
+
+    assert result["isError"] is False
+    call = _last()
+    assert call["method"] == "DELETE"
+    assert call["url"].endswith("/products/7?force=false")
 
 
 async def test_woo_set_stock(http):
@@ -218,6 +330,65 @@ async def test_woo_missing_credentials(http):
     assert "consumer_key" in out["content"][0]["text"]
 
 
+async def test_woo_non_object_credentials_are_rejected_without_http(http):
+    out = await wc.call_tool("list_products", {}, "[]")
+    assert out["isError"] is True
+    assert "malformed" in out["content"][0]["text"]
+    assert not http.calls
+
+
+async def test_woo_non_string_key_is_rejected_without_http(http):
+    out = await wc.call_tool(
+        "list_products",
+        {},
+        json.dumps({"site_url": "https://shop.example.com", "consumer_key": ["bad"], "consumer_secret": "cs_2"}),
+    )
+    assert out["isError"] is True
+    assert "consumer_key" in out["content"][0]["text"]
+    assert not http.calls
+
+
+async def test_woo_non_object_arguments_are_rejected_without_http(http):
+    out = await wc.call_tool("list_products", [], WC_CREDS)
+    assert out["isError"] is True
+    assert "object" in out["content"][0]["text"].lower()
+    assert not http.calls
+
+
+async def test_woo_blank_credentials_are_rejected_without_http(http):
+    out = await wc.call_tool(
+        "list_products",
+        {},
+        json.dumps({"site_url": "https://shop.example.com", "consumer_key": "ck_1", "consumer_secret": "  "}),
+    )
+    assert out["isError"] is True
+    assert "consumer_secret" in out["content"][0]["text"]
+    assert not http.calls
+
+
+@pytest.mark.parametrize("per_page", [0, -1, 101])
+async def test_woo_list_products_rejects_invalid_per_page_without_http(http, per_page):
+    out = await wc.call_tool("list_products", {"per_page": per_page}, WC_CREDS)
+    assert out["isError"] is True
+    assert "per_page" in out["content"][0]["text"]
+    assert not http.calls
+
+
+@pytest.mark.parametrize("page", [0, -1])
+async def test_woo_list_products_rejects_invalid_page_without_http(http, page):
+    out = await wc.call_tool("list_products", {"page": page}, WC_CREDS)
+    assert out["isError"] is True
+    assert "page" in out["content"][0]["text"]
+    assert not http.calls
+
+
+async def test_woo_blank_product_name_is_rejected_without_http(http):
+    out = await wc.call_tool("create_product", {"name": "   "}, WC_CREDS)
+    assert out["isError"] is True
+    assert "name" in out["content"][0]["text"]
+    assert not http.calls
+
+
 # ── Square (REST) ─────────────────────────────────────────────────────────────
 
 
@@ -236,6 +407,29 @@ async def test_square_production_base_when_env_omitted(http):
     assert _last()["url"].startswith("https://connect.squareup.com/v2/")
 
 
+async def test_square_unknown_environment_is_rejected_without_http(http):
+    out = await sq.call_tool(
+        "list_locations",
+        {},
+        json.dumps({"access_token": "t", "environment": "staging"}),
+    )
+    assert out["isError"] is True
+    assert "environment" in out["content"][0]["text"]
+    assert not http.calls
+
+
+@pytest.mark.parametrize("tool_name", ["search_catalog_items", "search_orders"])
+@pytest.mark.parametrize("limit", [0, -1, 101])
+async def test_square_search_limit_is_bounded_without_http(http, tool_name, limit):
+    args = {"limit": limit}
+    if tool_name == "search_orders":
+        args["location_ids"] = ["L1"]
+    out = await sq.call_tool(tool_name, args, SQ_CREDS)
+    assert out["isError"] is True
+    assert "limit" in out["content"][0]["text"]
+    assert not http.calls
+
+
 async def test_square_search_orders_uses_default_location(http):
     http.response = _FakeResp(200, {"orders": []})
     await sq.call_tool("search_orders", {"state": "OPEN"}, SQ_CREDS)
@@ -243,6 +437,18 @@ async def test_square_search_orders_uses_default_location(http):
     assert call["url"].endswith("/v2/orders/search")
     assert call["json"]["location_ids"] == ["L1"]
     assert call["json"]["query"]["filter"]["state_filter"]["states"] == ["OPEN"]
+
+
+async def test_square_search_orders_requires_location(http):
+    result = await sq.call_tool(
+        "search_orders",
+        {},
+        json.dumps({"access_token": "t", "environment": "sandbox"}),
+    )
+
+    assert result["isError"] is True
+    assert "location_ids" in result["content"][0]["text"]
+    assert not http.calls
 
 
 async def test_square_non_2xx_surfaces_as_error(http):
@@ -255,9 +461,13 @@ async def test_square_non_2xx_surfaces_as_error(http):
 
 async def test_square_create_catalog_item_shape(http):
     http.response = _FakeResp(200, {"catalog_object": {"id": "X"}})
-    await sq.call_tool("create_catalog_item", {"name": "Mug", "price_amount": 1200}, SQ_CREDS)
+    await sq.call_tool(
+        "create_catalog_item",
+        {"name": "Mug", "price_amount": 1200, "idempotency_key": "catalog-create-1"},
+        SQ_CREDS,
+    )
     body = _last()["json"]
-    assert body["idempotency_key"]  # generated
+    assert body["idempotency_key"] == "catalog-create-1"
     item = body["object"]
     assert item["type"] == "ITEM" and item["item_data"]["name"] == "Mug"
     var = item["item_data"]["variations"][0]["item_variation_data"]
@@ -267,23 +477,208 @@ async def test_square_create_catalog_item_shape(http):
 async def test_square_adjust_inventory_requires_location(http):
     out = await sq.call_tool(
         "adjust_inventory",
-        {"catalog_object_id": "V1", "quantity": 3},
+        {
+            "catalog_object_id": "V1",
+            "quantity": 3,
+            "idempotency_key": "inventory-location-check",
+        },
         json.dumps({"access_token": "t"}),  # no location_id in creds
     )
+    assert out["isError"] is True
     assert "location_id" in out["content"][0]["text"]
     assert not http.calls
 
 
 async def test_square_adjust_inventory_change_body(http):
     http.response = _FakeResp(200, {"counts": []})
-    await sq.call_tool("adjust_inventory", {"catalog_object_id": "V1", "quantity": 3}, SQ_CREDS)
+    await sq.call_tool(
+        "adjust_inventory",
+        {
+            "catalog_object_id": "V1",
+            "quantity": 3,
+            "idempotency_key": "inventory-adjust-1",
+        },
+        SQ_CREDS,
+    )
     body = _last()["json"]
-    assert body["idempotency_key"]
+    assert body["idempotency_key"] == "inventory-adjust-1"
     change = body["changes"][0]
     assert change["type"] == "ADJUSTMENT"
     assert change["adjustment"]["catalog_object_id"] == "V1"
     assert change["adjustment"]["location_id"] == "L1"
     assert change["adjustment"]["quantity"] == "3"
+
+
+@pytest.mark.parametrize(
+    "tool,args",
+    [
+        ("create_catalog_item", {"name": "Mug", "price_amount": 1200}),
+        ("create_customer", {"given_name": "Ada"}),
+        ("adjust_inventory", {"catalog_object_id": "V1", "quantity": 3}),
+    ],
+)
+async def test_square_mutations_require_caller_idempotency_key(http, tool, args):
+    result = await sq.call_tool(tool, args, SQ_CREDS)
+
+    assert result["isError"] is True
+    assert "idempotency_key" in result["content"][0]["text"]
+    assert not http.calls
+
+
+@pytest.mark.parametrize(
+    ("tool", "args"),
+    [
+        ("create_catalog_item", {"name": "Mug", "price_amount": 1200}),
+        ("adjust_inventory", {"catalog_object_id": "V1", "quantity": 3}),
+    ],
+)
+async def test_square_catalog_and_inventory_accept_128_char_idempotency_key(
+    http,
+    tool,
+    args,
+):
+    http.response = _FakeResp(200, {"ok": True})
+    key = "x" * 128
+
+    result = await sq.call_tool(tool, {**args, "idempotency_key": key}, SQ_CREDS)
+
+    assert result["isError"] is False
+    assert _last()["json"]["idempotency_key"] == key
+
+
+@pytest.mark.parametrize(
+    ("tool", "args"),
+    [
+        ("create_catalog_item", {"name": "Mug", "price_amount": 1200}),
+        ("adjust_inventory", {"catalog_object_id": "V1", "quantity": 3}),
+    ],
+)
+async def test_square_catalog_and_inventory_reject_129_char_idempotency_key(
+    http,
+    tool,
+    args,
+):
+    result = await sq.call_tool(
+        tool,
+        {**args, "idempotency_key": "x" * 129},
+        SQ_CREDS,
+    )
+
+    assert result["isError"] is True
+    assert "128" in result["content"][0]["text"]
+    assert not http.calls
+
+
+async def test_square_customer_does_not_apply_unpublished_45_char_limit(http):
+    http.response = _FakeResp(200, {"customer": {"id": "C1"}})
+    key = "x" * 46
+
+    result = await sq.call_tool(
+        "create_customer",
+        {"given_name": "Ada", "idempotency_key": key},
+        SQ_CREDS,
+    )
+
+    assert result["isError"] is False
+    assert _last()["json"]["idempotency_key"] == key
+
+
+async def test_square_forwards_caller_idempotency_key_unchanged(http):
+    http.response = _FakeResp(200, {"catalog_object": {"id": "X"}})
+    key = "  catalog-retry-key  "
+
+    result = await sq.call_tool(
+        "create_catalog_item",
+        {"name": "Mug", "price_amount": 1200, "idempotency_key": key},
+        SQ_CREDS,
+    )
+
+    assert result["isError"] is False
+    assert _last()["json"]["idempotency_key"] == key
+
+
+async def test_square_delete_catalog_object_is_exposed(http):
+    http.response = _FakeResp(200, {"deleted_object_ids": ["ITEM1"]})
+
+    result = await sq.call_tool(
+        "delete_catalog_object",
+        {"object_id": "ITEM1"},
+        SQ_CREDS,
+    )
+
+    assert result["isError"] is False
+    call = _last()
+    assert call["method"] == "DELETE"
+    assert call["url"].endswith("/v2/catalog/object/ITEM1")
+
+
+async def test_square_blank_token_is_rejected_without_http(http):
+    out = await sq.call_tool("list_locations", {}, json.dumps({"access_token": "  "}))
+    assert out["isError"] is True
+    assert "access_token" in out["content"][0]["text"]
+    assert not http.calls
+
+
+async def test_square_non_object_credentials_are_rejected_without_http(http):
+    out = await sq.call_tool("list_locations", {}, "[]")
+    assert out["isError"] is True
+    assert "malformed" in out["content"][0]["text"]
+    assert not http.calls
+
+
+async def test_square_non_string_token_is_rejected_without_http(http):
+    out = await sq.call_tool(
+        "list_locations", {}, json.dumps({"access_token": {"value": "bad"}, "environment": "sandbox"})
+    )
+    assert out["isError"] is True
+    assert "access_token" in out["content"][0]["text"]
+    assert not http.calls
+
+
+async def test_square_non_object_arguments_are_rejected_without_http(http):
+    out = await sq.call_tool("list_locations", [], SQ_CREDS)
+    assert out["isError"] is True
+    assert "object" in out["content"][0]["text"].lower()
+    assert not http.calls
+
+
+async def test_square_blank_required_name_is_rejected_without_http(http):
+    out = await sq.call_tool("create_catalog_item", {"name": "   ", "price_amount": 100}, SQ_CREDS)
+    assert out["isError"] is True
+    assert "name" in out["content"][0]["text"]
+    assert not http.calls
+
+
+# ── Stripe (REST, Basic auth) ────────────────────────────────────────────────
+
+
+async def test_stripe_blank_key_is_rejected_without_http(http):
+    out = await st.call_tool("get_balance", {}, "   ")
+    assert out["isError"] is True
+    assert "key" in out["content"][0]["text"]
+    assert not http.calls
+
+
+@pytest.mark.parametrize("limit", [0, -1, 101])
+async def test_stripe_list_customers_rejects_invalid_limit_without_http(http, limit):
+    out = await st.call_tool("list_customers", {"limit": limit}, STRIPE_KEY)
+    assert out["isError"] is True
+    assert "limit" in out["content"][0]["text"]
+    assert not http.calls
+
+
+async def test_stripe_non_2xx_surfaces_as_error(http):
+    http.response = _FakeResp(500, text="upstream down")
+    out = await st.call_tool("get_balance", {}, STRIPE_KEY)
+    assert out["isError"] is True
+    assert "500" in out["content"][0]["text"]
+
+
+async def test_stripe_json_error_preserves_provider_message(http):
+    http.response = _FakeResp(400, {"error": {"message": "amount is invalid"}})
+    out = await st.call_tool("get_balance", {}, STRIPE_KEY)
+    assert out["isError"] is True
+    assert out["content"][0]["text"] == "Stripe API error (400): amount is invalid"
 
 
 # ── Shared guards ────────────────────────────────────────────────────────────

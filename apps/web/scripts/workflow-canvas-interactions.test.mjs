@@ -171,7 +171,7 @@ test("connector nodes choose live MCP operations and render typed arguments", ()
   assert.match(panelSource, /label="Resource"/);
   assert.match(panelSource, /filterable[\s\S]*?ariaLabel="Integration operation"/);
   assert.match(panelSource, /function ConnectorArgumentField/);
-  assert.match(panelSource, /selectedOperation\?\.input_schema\?\.properties/);
+  assert.match(panelSource, /connectorOperationInputSchema\([\s\S]*?selectedOperation[\s\S]*?selectedAccount/);
   assert.match(panelSource, /This operation can remove or irreversibly change external data/);
   assert.match(panelSource, /className="workflow-connector-advanced"/);
   assert.match(panelSource, /k\.startsWith\("__raw_"\) \|\| k\.startsWith\("__connector_"\)/);

@@ -19,7 +19,7 @@ the runner gets via ``/config`` from :py:meth:`register_webhook`.
 Inbound payload includes the runner's ``session_id`` so multiple
 accounts on the same Manor entity stay attributable.
 
-Credentials in ``ChannelConfig.credentials``::
+Credentials are leased from the ChannelConfig's source Integration::
 
     {
       "runner_url":   "https://wechat-bot.internal:8800",  # default OK
@@ -29,6 +29,8 @@ Credentials in ``ChannelConfig.credentials``::
                                                              # the user
                                                              # finishes
                                                              # the QR flow
+      "bot_token":    "<encrypted iLink token>",             # persisted
+      "base_url":     "https://ilinkai.weixin.qq.com",      # persisted
       "default_target": "<ilink_user_id>"                   # optional
     }
 
@@ -49,7 +51,7 @@ import httpx
 from packages.core.config import get_settings
 from packages.core.models.channel import ChannelConfig
 from packages.core.services.channels.base import (
-    ChannelAdapter, NormalizedInbound, register_adapter,
+    ChannelAdapter, ChannelTextSendError, NormalizedInbound, register_adapter,
 )
 
 logger = logging.getLogger(__name__)
@@ -62,24 +64,23 @@ class WeChatPersonalChannelAdapter(ChannelAdapter):
 
     # ── Helpers ─────────────────────────────────────────────────────────
 
-    def _runner(self, cc: ChannelConfig) -> tuple[str, str, str]:
+    def _runner(self, credentials: dict) -> tuple[str, str, str]:
         """Return ``(runner_url, bearer_token, session_id)``. Raises if
         any of the required pieces are missing."""
-        creds = cc.credentials or {}
-        runner_url = (creds.get("runner_url") or "").rstrip("/")
+        runner_url = (credentials.get("runner_url") or "").rstrip("/")
         if not runner_url:
-            raise RuntimeError(
+            raise ChannelTextSendError.determinate(
                 "WeChat (personal) ChannelConfig is missing runner_url. "
                 "Configure the bot runner in Integrations → WeChat (Personal)."
             )
-        session_id = (creds.get("session_id") or "").strip()
+        session_id = (credentials.get("session_id") or "").strip()
         if not session_id:
-            raise RuntimeError(
+            raise ChannelTextSendError.determinate(
                 "WeChat (personal) ChannelConfig is missing session_id. "
                 "The QR scan flow assigns this — open the connect modal "
                 "and scan with your WeChat ClawBot plugin."
             )
-        return runner_url, creds.get("bearer_token") or "", session_id
+        return runner_url, credentials.get("bearer_token") or "", session_id
 
     def _headers(self, token: str) -> Dict[str, str]:
         h = {"Accept": "application/json"}
@@ -92,10 +93,11 @@ class WeChatPersonalChannelAdapter(ChannelAdapter):
     async def send_text(
         self, cc: ChannelConfig, to: str, text: str, **kwargs: Any,
     ) -> Dict[str, Any]:
-        runner_url, token, session_id = self._runner(cc)
-        target = to or (cc.credentials or {}).get("default_target")
+        credentials = await self.credentials(cc, reason="channel.wechat_personal.send_text")
+        runner_url, token, session_id = self._runner(credentials)
+        target = to or credentials.get("default_target")
         if not target:
-            raise RuntimeError(
+            raise ChannelTextSendError.determinate(
                 "WeChat (personal) send_text needs a target ilink_user_id."
             )
         # iLink personal-account API doesn't expose group ids the same
@@ -110,22 +112,25 @@ class WeChatPersonalChannelAdapter(ChannelAdapter):
                 json={"kind": kind, "target": target, "body": text},
             )
         if resp.status_code == 401:
-            raise RuntimeError("WeChat runner rejected the bearer token.")
+            raise ChannelTextSendError.determinate(
+                "WeChat runner rejected the bearer token."
+            )
         if resp.status_code == 404:
-            raise RuntimeError(
+            raise ChannelTextSendError.determinate(
                 f"WeChat session {session_id!r} not found on the runner — "
                 "session was lost (runner restart?). Re-scan the ClawBot QR."
             )
         if resp.status_code == 409:
             # iLink reply-only constraint surfaced from the sidecar.
-            raise RuntimeError(
+            raise ChannelTextSendError.determinate(
                 f"iLink: no recent context_token for {target!r}. "
                 "Personal-account bots can only reply, not initiate — "
                 "ask the contact to message us first."
             )
         if not resp.is_success:
-            raise RuntimeError(
-                f"WeChat runner error {resp.status_code}: {resp.text[:200]}"
+            raise ChannelTextSendError.from_http_status(
+                f"WeChat runner error {resp.status_code}: {resp.text[:200]}",
+                status_code=resp.status_code,
             )
         data = resp.json()
         return {"to": target, "kind": kind, "status": "sent",
@@ -141,8 +146,11 @@ class WeChatPersonalChannelAdapter(ChannelAdapter):
         # Keep the signature so ChannelAdapter conformance is happy;
         # raise rather than fire a request we know will 501.
         _ = (data, mime_type, kind)
-        runner_url, token, session_id = self._runner(cc)
-        target = to or (cc.credentials or {}).get("default_target")
+        credentials = await self.credentials(
+            cc, reason="channel.wechat_personal.send_attachment",
+        )
+        runner_url, token, session_id = self._runner(credentials)
+        target = to or credentials.get("default_target")
         if not target:
             raise RuntimeError("WeChat (personal) send_attachment needs a target.")
         if not url:
@@ -168,7 +176,10 @@ class WeChatPersonalChannelAdapter(ChannelAdapter):
     ) -> bool:
         """If the runner was given a bearer token, every inbound POST it
         makes back to us must echo it in ``Authorization: Bearer ...``."""
-        expected = (cc.credentials or {}).get("bearer_token")
+        credentials = await self.credentials(
+            cc, reason="channel.wechat_personal.verify_inbound",
+        )
+        expected = credentials.get("bearer_token")
         if not expected:
             return True  # no shared secret configured — accept
         got = (headers.get("authorization") or headers.get("Authorization") or "").strip()
@@ -217,8 +228,11 @@ class WeChatPersonalChannelAdapter(ChannelAdapter):
         on every save.
         """
         try:
-            runner_url, token, session_id = self._runner(cc)
-        except RuntimeError as e:
+            credentials = await self.credentials(
+                cc, reason="channel.wechat_personal.register_webhook",
+            )
+            runner_url, token, session_id = self._runner(credentials)
+        except (RuntimeError, ValueError) as e:
             return {"registered": False, "reason": str(e)}
 
         s = get_settings()

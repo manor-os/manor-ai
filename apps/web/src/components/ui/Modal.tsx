@@ -1,4 +1,4 @@
-import { type CSSProperties, useEffect, useRef } from "react";
+import { type CSSProperties, useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 
 const FOCUSABLE_SELECTOR = [
@@ -7,9 +7,46 @@ const FOCUSABLE_SELECTOR = [
   'input:not([disabled]):not([type="hidden"])',
   "select:not([disabled])",
   "textarea:not([disabled])",
+  'audio[controls]:not([tabindex="-1"])',
+  'video[controls]:not([tabindex="-1"])',
+  'iframe:not([tabindex="-1"])',
   '[contenteditable="true"]',
   '[tabindex]:not([tabindex="-1"])',
 ].join(", ");
+
+type ModalLayerId = string;
+
+const MODAL_LAYER_ATTRIBUTE = "data-manor-modal-layer-id";
+let nextModalLayerId = 0;
+let bodyScrollLockCount = 0;
+let bodyOverflowBeforeLock = "";
+
+function isTopModalLayer(layerId: ModalLayerId): boolean {
+  const renderedLayers = document.body.querySelectorAll<HTMLElement>(
+    `[${MODAL_LAYER_ATTRIBUTE}]`,
+  );
+  return renderedLayers.item(renderedLayers.length - 1)?.dataset.manorModalLayerId
+    === layerId;
+}
+
+function lockBodyScroll(): () => void {
+  if (bodyScrollLockCount === 0) {
+    bodyOverflowBeforeLock = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+  }
+  bodyScrollLockCount += 1;
+
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    bodyScrollLockCount = Math.max(0, bodyScrollLockCount - 1);
+    if (bodyScrollLockCount === 0) {
+      document.body.style.overflow = bodyOverflowBeforeLock;
+      bodyOverflowBeforeLock = "";
+    }
+  };
+}
 
 function getFocusableElements(container: HTMLElement): HTMLElement[] {
   return Array.from(container.querySelectorAll<HTMLElement>(FOCUSABLE_SELECTOR)).filter(
@@ -30,6 +67,31 @@ function getFocusableElements(container: HTMLElement): HTMLElement[] {
   );
 }
 
+export function trapDialogTabKey(event: KeyboardEvent, dialog: HTMLElement): void {
+  if (event.key !== "Tab") return;
+
+  const focusableElements = getFocusableElements(dialog);
+  if (focusableElements.length === 0) {
+    event.preventDefault();
+    dialog.focus();
+    return;
+  }
+
+  const first = focusableElements[0];
+  const last = focusableElements[focusableElements.length - 1];
+  const activeIndex = focusableElements.indexOf(document.activeElement as HTMLElement);
+  if (event.shiftKey && activeIndex <= 0) {
+    event.preventDefault();
+    last.focus();
+  } else if (!event.shiftKey && activeIndex === focusableElements.length - 1) {
+    event.preventDefault();
+    first.focus();
+  } else if (activeIndex === -1) {
+    event.preventDefault();
+    (event.shiftKey ? last : first).focus();
+  }
+}
+
 interface ModalProps {
   open: boolean;
   onClose: () => void;
@@ -37,6 +99,7 @@ interface ModalProps {
   children: React.ReactNode;
   footer?: React.ReactNode;
   className?: string;
+  overlayClassName?: string;
   bodyClassName?: string;
   width?: string;
   height?: string;
@@ -51,6 +114,7 @@ export default function Modal({
   children,
   footer,
   className,
+  overlayClassName,
   bodyClassName,
   width,
   height,
@@ -58,15 +122,17 @@ export default function Modal({
   restoreFocusFallback,
 }: ModalProps) {
   const dialogRef = useRef<HTMLDivElement>(null);
+  const [modalLayerId] = useState<ModalLayerId>(
+    () => `modal-layer-${++nextModalLayerId}`,
+  );
   const previouslyFocusedElementRef = useRef<HTMLElement | null>(null);
   const restoreFocusFallbackRef = useRef(restoreFocusFallback);
   restoreFocusFallbackRef.current = restoreFocusFallback;
 
   useEffect(() => {
-    if (open) {
-      document.body.style.overflow = "hidden";
-      return () => { document.body.style.overflow = ""; };
-    }
+    if (!open) return;
+    const unlockBodyScroll = lockBodyScroll();
+    return unlockBodyScroll;
   }, [open]);
 
   useEffect(() => {
@@ -99,37 +165,24 @@ export default function Modal({
     function handleKey(event: KeyboardEvent) {
       const dialog = dialogRef.current;
       if (!dialog) return;
+      if (!isTopModalLayer(modalLayerId)) return;
       if (event.key === "Escape") {
+        const target = event.target;
+        if (
+          target instanceof Element
+          && target.closest('[data-manor-popup-open="true"]')
+        ) {
+          return;
+        }
         event.preventDefault();
         onClose();
         return;
       }
-      if (event.key !== "Tab") return;
-
-      const focusableElements = getFocusableElements(dialog);
-      if (focusableElements.length === 0) {
-        event.preventDefault();
-        dialog.focus();
-        return;
-      }
-
-      const first = focusableElements[0];
-      const last = focusableElements[focusableElements.length - 1];
-      const activeIndex = focusableElements.indexOf(document.activeElement as HTMLElement);
-      if (event.shiftKey && activeIndex <= 0) {
-        event.preventDefault();
-        last.focus();
-      } else if (!event.shiftKey && activeIndex === focusableElements.length - 1) {
-        event.preventDefault();
-        first.focus();
-      } else if (activeIndex === -1) {
-        event.preventDefault();
-        (event.shiftKey ? last : first).focus();
-      }
+      trapDialogTabKey(event, dialog);
     }
     document.addEventListener("keydown", handleKey);
     return () => document.removeEventListener("keydown", handleKey);
-  }, [open, onClose]);
+  }, [modalLayerId, open, onClose]);
 
   if (!open) return null;
 
@@ -174,7 +227,12 @@ export default function Modal({
   };
 
   return createPortal(
-    <div className="manor-dialog-overlay" style={overlayStyle} onClick={onClose}>
+    <div
+      data-manor-modal-layer-id={modalLayerId}
+      className={["manor-dialog-overlay", overlayClassName].filter(Boolean).join(" ")}
+      style={overlayStyle}
+      onClick={onClose}
+    >
       <div
         ref={dialogRef}
         role="dialog"
@@ -186,7 +244,7 @@ export default function Modal({
         onClick={(e) => e.stopPropagation()}
       >
         <div className="manor-dialog-header">
-          <h2 className="manor-dialog-title">{title}</h2>
+          <h2 className="manor-dialog-title" title={title}>{title}</h2>
           <button type="button" className="manor-dialog-close" onClick={onClose} aria-label="Close" title="Close">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2.5} strokeLinecap="round">
               <path d="M18 6L6 18M6 6l12 12" />

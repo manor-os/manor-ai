@@ -35,10 +35,11 @@ from sqlalchemy import and_, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from packages.core.constants.notification_types import (
+    NotificationChannel,
     SUPPORTED_CHANNELS,
     event_default_severity,
 )
-from packages.core.models.channel import ChannelContact
+from packages.core.models.channel import ChannelConfig, ChannelContact
 from packages.core.models.user import Entity, User, UserMembership
 from packages.core.models.workspace import Workspace
 
@@ -60,7 +61,7 @@ class ChannelChoice:
     address: Optional[str] = None
 
 
-_INAPP = "inapp"
+_INAPP = NotificationChannel.INAPP.value
 
 
 # ── User preference helpers ─────────────────────────────────────────────────
@@ -217,13 +218,15 @@ async def resolve_channel_targets(
     severity: str | None = None,
     workspace_id: str | None = None,
     now: datetime | None = None,
+    explicit_channels: list[str] | None = None,
+    allow_registered_email: bool = True,
 ) -> list[ChannelChoice]:
     """Resolve channel selection for a user to concrete delivery targets.
 
     Returns at least one entry (the ``inapp`` fallback). External channel
-    types are dropped silently when the user has no active linked
-    ``ChannelContact`` — operators see no error, just a single in-app row,
-    which is the desired fail-safe behaviour.
+    types are dropped silently when the user has no usable target. Registered
+    email can be disabled for actionable notifications, which require a linked
+    contact so replies can be correlated to ``NotificationDelivery``.
     """
     user = (await db.execute(
         select(User).outerjoin(
@@ -245,38 +248,49 @@ async def resolve_channel_targets(
     if not user:
         return [ChannelChoice(channel_type=_INAPP)]
 
-    entity = (await db.execute(
-        select(Entity).where(Entity.id == entity_id)
-    )).scalar_one_or_none()
-
-    workspace: Workspace | None = None
-    if workspace_id:
-        workspace = (await db.execute(
-            select(Workspace).where(
-                Workspace.id == workspace_id,
-                Workspace.entity_id == entity_id,
-            )
+    if explicit_channels is None:
+        entity = (await db.execute(
+            select(Entity).where(Entity.id == entity_id)
         )).scalar_one_or_none()
 
-    effective_severity = severity or event_default_severity(kind)
-    channel_types = select_channels(
-        kind=kind,
-        severity=effective_severity,
-        user_prefs=user.preferences,
-        workspace_settings=workspace.settings if workspace else None,
-        entity_settings=entity.settings if entity else None,
-        now=now,
-    )
+        workspace: Workspace | None = None
+        if workspace_id:
+            workspace = (await db.execute(
+                select(Workspace).where(
+                    Workspace.id == workspace_id,
+                    Workspace.entity_id == entity_id,
+                )
+            )).scalar_one_or_none()
+
+        effective_severity = severity or event_default_severity(kind)
+        channel_types = select_channels(
+            kind=kind,
+            severity=effective_severity,
+            user_prefs=user.preferences,
+            workspace_settings=workspace.settings if workspace else None,
+            entity_settings=entity.settings if entity else None,
+            now=now,
+        )
+    else:
+        channel_types = _normalise_channels(explicit_channels)
 
     external_types = [ct for ct in channel_types if ct != _INAPP]
     contacts_by_type: dict[str, list[ChannelContact]] = {}
     if external_types:
         rows = (await db.execute(
-            select(ChannelContact).where(
+            select(ChannelContact)
+            .join(
+                ChannelConfig,
+                ChannelConfig.id == ChannelContact.channel_config_id,
+            )
+            .where(
                 ChannelContact.entity_id == entity_id,
                 ChannelContact.user_id == user_id,
                 ChannelContact.status == "active",
                 ChannelContact.channel_type.in_(external_types),
+                ChannelConfig.entity_id == entity_id,
+                ChannelConfig.channel_type == ChannelContact.channel_type,
+                ChannelConfig.status == "active",
             )
         )).scalars().all()
         # Prefer the most-recently-seen contact when a user linked the same
@@ -294,7 +308,7 @@ async def resolve_channel_targets(
             choices.append(ChannelChoice(channel_type=_INAPP))
             continue
         contacts = contacts_by_type.get(ct, [])
-        if ct == "email":
+        if ct == NotificationChannel.EMAIL.value:
             seen_addresses = {
                 str(contact.source_id).strip().lower()
                 for contact in contacts
@@ -302,7 +316,11 @@ async def resolve_channel_targets(
             }
             for contact in contacts:
                 choices.append(ChannelChoice(channel_type=ct, contact=contact))
-            user_email = str(user.email or "").strip().lower()
+            user_email = (
+                str(user.email or "").strip().lower()
+                if allow_registered_email
+                else ""
+            )
             if user_email and user_email not in seen_addresses:
                 choices.append(ChannelChoice(channel_type=ct, address=user_email))
             if contacts or user_email:

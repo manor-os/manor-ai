@@ -7,6 +7,7 @@ basic retry on transport errors. Exposed to user code through
 from __future__ import annotations
 
 import asyncio
+from http import HTTPStatus
 import logging
 from typing import Any, Optional
 
@@ -29,13 +30,23 @@ class WorkerClientError(Exception):
         self.status_code = status_code
         self.body = body
 
+    @property
+    def requires_operator_action(self) -> bool:
+        """Whether retrying unchanged credentials/protocol cannot recover."""
+
+        return self.status_code in {
+            HTTPStatus.UNAUTHORIZED,
+            HTTPStatus.FORBIDDEN,
+            HTTPStatus.UPGRADE_REQUIRED,
+        }
+
 
 class ManorClient:
     """Stateless-ish HTTP client. One per worker process."""
 
     PROTOCOL_HEADER = "Manor-Protocol-Version"
     WORKER_ID_HEADER = "Manor-Worker-Id"
-    PROTOCOL_VERSION = "1"
+    PROTOCOL_VERSION = "2"
 
     def __init__(
         self,
@@ -96,15 +107,38 @@ class ManorClient:
     # ── Endpoints ────────────────────────────────────────────────────
 
     async def heartbeat(self, req: HeartbeatRequest) -> HeartbeatResponse:
-        body = await self._post("/api/v1/workers/heartbeat", json=req.model_dump(mode="json", exclude_none=True))
+        payload = req.model_dump(mode="json", exclude_none=True)
+        # ``exclude_none`` recursively removes an explicitly supplied JSON
+        # null from heartbeat completions. Restore it when the Pydantic field
+        # was present so the server can distinguish null from omission.
+        completed_payload = payload.get("completed_since_last")
+        if isinstance(completed_payload, list):
+            for index, completion in enumerate(req.completed_since_last):
+                if "result" not in completion.model_fields_set:
+                    continue
+                if index >= len(completed_payload) or not isinstance(completed_payload[index], dict):
+                    continue
+                if completion.result is None:
+                    completed_payload[index]["result"] = None
+        body = await self._post("/api/v1/workers/heartbeat", json=payload)
         return HeartbeatResponse.model_validate(body)
 
     async def complete_lease(
         self, lease_id: str, result: LeaseResult,
     ) -> None:
+        payload = result.model_dump(
+            mode="json", exclude_unset=True, exclude_none=False,
+        )
+        # The discriminator is a protocol default, not an optional payload
+        # field. ``exclude_unset`` is still required to preserve omitted
+        # result versus explicit JSON null.
+        payload["task_output_value_kind"] = result.task_output_value_kind.value
         await self._post(
             f"/api/v1/workers/leases/{lease_id}/complete",
-            json=result.model_dump(mode="json", exclude_none=True),
+            # ``exclude_unset`` preserves explicit ``result=None`` while still
+            # omitting fields the handler never supplied (notably
+            # ``LeaseResult()``'s omitted result).
+            json=payload,
             expect_204=True,
         )
 
@@ -190,19 +224,18 @@ class ManorClient:
                 )
 
             if resp.status_code >= 400:
-                # 401 / 403 are not retried — auth won't fix itself.
-                if resp.status_code in (401, 403):
-                    raise WorkerClientError(
-                        f"POST {path}: {resp.status_code}",
-                        status_code=resp.status_code,
-                        body=_safe_body(resp),
-                    )
-                # Other 4xx / 5xx — back off + retry.
-                last_exc = WorkerClientError(
+                response_error = WorkerClientError(
                     f"POST {path}: {resp.status_code}",
                     status_code=resp.status_code,
                     body=_safe_body(resp),
                 )
+                # Credentials and a rejected protocol registration cannot
+                # repair themselves. Surface the first response immediately
+                # so the worker loop can stop and ask the operator to act.
+                if response_error.requires_operator_action:
+                    raise response_error
+                # Other 4xx / 5xx — back off + retry.
+                last_exc = response_error
                 if attempt + 1 < max_attempts:
                     await asyncio.sleep(min(30.0, 0.5 * (2 ** attempt)))
                     continue

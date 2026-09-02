@@ -8,10 +8,12 @@ from typing import Any
 
 from sqlalchemy import delete as sa_delete, func, select
 
+from packages.core.constants.document_groups import WorkspaceDocumentGroupKind
+
 logger = logging.getLogger(__name__)
 
-_WORKSPACE_GROUP_DEFAULT_KIND = "workspace_collection"
-_WORKSPACE_GROUP_FOLDER_KIND = "knowledge_net"
+_WORKSPACE_GROUP_DEFAULT_KIND = WorkspaceDocumentGroupKind.DEFAULT_COLLECTION.value
+_WORKSPACE_GROUP_FOLDER_KIND = WorkspaceDocumentGroupKind.KNOWLEDGE_NET.value
 _WORKSPACE_DEFAULT_COLLECTION_NAME = "Workspace Knowledge"
 
 
@@ -66,11 +68,15 @@ def _workspace_group_settings(group: Any) -> dict[str, Any]:
 def _workspace_group_kind(group: Any) -> str:
     settings = _workspace_group_settings(group)
     if settings.get("workspace_file_bucket"):
-        return "workspace_files"
+        return WorkspaceDocumentGroupKind.FILE_BUCKET.value
     if settings.get("default_collection"):
         return _WORKSPACE_GROUP_DEFAULT_KIND
     kind = str(settings.get("kind") or _WORKSPACE_GROUP_FOLDER_KIND)
-    return _WORKSPACE_GROUP_FOLDER_KIND if kind == "knowledge_folder" else kind
+    return (
+        _WORKSPACE_GROUP_FOLDER_KIND
+        if kind == WorkspaceDocumentGroupKind.LEGACY_KNOWLEDGE_FOLDER
+        else kind
+    )
 
 
 def _is_workspace_default_collection(group: Any) -> bool:
@@ -230,7 +236,7 @@ async def _resolve_visible_documents(
                 "query": name,
                 "candidates": [
                     {
-                        "id": doc.id,
+                        "document_id": doc.id,
                         "name": doc.name,
                         "file_type": doc.file_type,
                         "source": doc.source,
@@ -330,7 +336,7 @@ async def _workspace_group_to_dict(
         )).all()
         docs = [
             {
-                "id": row.id,
+                "document_id": row.id,
                 "name": row.name,
                 "file_type": row.file_type,
                 "file_size": row.file_size,
@@ -512,6 +518,8 @@ async def runtime_workspace_add_knowledge_documents_action(
 
     try:
         from packages.core.database import async_session
+        from packages.core.models.permission import Capability
+        from packages.core.services.document_access import partition_documents_by_capability
         from packages.core.services.document_service import add_document_to_group
         from packages.core.services.tool_cache_version import bump_tool_cache_version
         from packages.core.services.workspace_service import record_activity
@@ -552,11 +560,41 @@ async def runtime_workspace_add_knowledge_documents_action(
                     "message": "Call workspace_list_knowledge or search documents, then retry with exact ids.",
                 })
 
+            docs, unauthorized_docs = await partition_documents_by_capability(
+                db,
+                docs,
+                entity_id=entity_id,
+                user_id=user_id,
+                required_capability=Capability.MANAGE_METADATA,
+                workspace_id=workspace_id,
+                actor_type="agent",
+            )
+            unauthorized_targets = [
+                {
+                    "document_id": doc.id,
+                    "name": doc.name,
+                    "file_type": doc.file_type,
+                    "reason": "manage_metadata_required",
+                }
+                for doc in unauthorized_docs
+            ]
+            if not docs:
+                return _dumps({
+                    "error": "no_documents_authorized",
+                    "skipped": unauthorized_targets,
+                    **resolution,
+                    "message": "Metadata management permission is required to attach documents.",
+                })
+
             added_docs: list[dict[str, Any]] = []
-            skipped_docs: list[dict[str, Any]] = []
+            skipped_docs: list[dict[str, Any]] = list(unauthorized_targets)
             for doc in docs:
                 added = await add_document_to_group(db, doc.id, group.id, entity_id=entity_id)
-                target = {"id": doc.id, "name": doc.name, "file_type": doc.file_type}
+                target = {
+                    "document_id": doc.id,
+                    "name": doc.name,
+                    "file_type": doc.file_type,
+                }
                 if added:
                     added_docs.append(target)
                 else:
@@ -690,7 +728,7 @@ async def runtime_workspace_remove_knowledge_document_action(
         return _dumps({
             "updated": True,
             "removed": removed,
-            "document": {"id": doc.id, "name": doc.name},
+            "document": {"document_id": doc.id, "name": doc.name},
             "group_ids": group_ids,
             "message": "Document was detached from workspace knowledge; the Knowledge document itself was not deleted.",
         })

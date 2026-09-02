@@ -180,6 +180,20 @@ export function canManageWorkspace(
   ));
 }
 
+/** Workspace content write access: owner/editor/contributor, excluding viewer. */
+export function canWriteWorkspace(
+  user: Pick<User, "id" | "role"> | null | undefined,
+  staffRows: WorkspaceStaff[] | null | undefined,
+): boolean {
+  if (!user) return false;
+  if (_isEntityAdminRole(user.role)) return true;
+  return (staffRows || []).some((row) => (
+    ["owner", "editor", "contributor"].includes(String(row.role || "").toLowerCase())
+    && _sameIdentity(row.user_id, user.id)
+    && _isActiveWorkspaceStaff(row)
+  ));
+}
+
 /**
  * React hook — reads the current user's role from the auth store and
  * returns a memoized `can(permission)` function.

@@ -3,23 +3,32 @@ from __future__ import annotations
 
 import logging
 from datetime import UTC, datetime
-from typing import Any
+from typing import Annotated, Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from pydantic import BaseModel, Field
-from sqlalchemy import select, delete as sa_delete, or_
+from pydantic import BaseModel, Field, field_validator
+from sqlalchemy import and_, select, delete as sa_delete, or_, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from packages.core.constants.agents import is_master_agent
+from packages.core.contracts.webchat_page import ResolvedWorkspaceContent, WebchatPage
+from packages.core.constants.document_groups import WorkspaceDocumentGroupKind
+from packages.core.constants.goals import GoalStatus
+from packages.core.constants.notification_types import NotificationOutboxStatus
+from packages.core.goals.numbers import GoalNumberInput
 from packages.core.constants.task import TaskStatus
 from packages.core.constants.execution import (
     ExecutionStepStatus,
 )
 from packages.core.database import get_db
-from packages.core.models.user import User
+from packages.core.models.user import Entity, User
+from packages.core.models.event import EventLog
 from packages.core.models.workspace import Workspace, WorkspaceStaff
 from packages.core.models.channel import ChannelConfig
 from packages.core.models.document import DocumentGroup
+from packages.core.permissions import user_is_effective_entity_admin
 from packages.core.services.entity_service import (
+    ProtectedWorkspaceSettingsError,
     WORKSPACE_PURGE_GRACE_DAYS,
     list_workspaces, get_workspace, create_workspace, update_workspace,
     soft_delete_workspace, restore_workspace, list_trashed_workspaces,
@@ -33,17 +42,29 @@ from packages.core.services.workspace_runtime import (
 )
 from packages.core.services.workspace_access import (
     ensure_workspace_owner_membership,
-    filter_workspaces_for_user,
-    get_active_workspace_membership,
+    lock_workspace_access_boundary,
+    manageable_workspace_ids_for_user,
     settings_with_default_workspace_access,
-    user_can_read_workspace,
+    user_can_manage_workspace,
 )
+from packages.core.services.actor_authorization import AuthenticatedUserCredential
+from packages.core.services.permission_gate import ResourcePermissionGate
 from packages.core.services.provider_keys import (
     canonical_provider_key,
     provider_key_aliases,
     provider_keys_match,
 )
+from packages.core.services.oauth_account_credentials import (
+    oauth_account_is_runtime_usable_clause,
+)
 from packages.core.services.tool_cache_version import bump_tool_cache_version
+from packages.core.services.document_service import (
+    create_workspace_knowledge_group,
+    mark_workspace_knowledge_changed,
+)
+from packages.core.services.reusable_resource_locks import (
+    lock_reusable_resource_references,
+)
 from apps.api.deps import get_current_user, require_plan
 
 logger = logging.getLogger(__name__)
@@ -54,6 +75,10 @@ router = APIRouter(prefix="/api/v1/workspaces", tags=["workspaces"])
 # ── Request / Response models ────────────────────────────────────────────────
 
 _SUPPORTED_CHANNEL_LANGUAGES = {"en", "zh", "es", "de"}
+_WEBCHAT_RESOURCE_LIMIT = 200
+_WEBCHAT_DOCUMENT_SCAN_BATCH = 200
+_WEBCHAT_DOCUMENT_SCAN_LIMIT = 1000
+_WEBCHAT_DOCUMENT_CURSOR_LIMIT = 1_000_000
 
 
 def _normalize_channel_language(value: Any) -> str:
@@ -66,6 +91,35 @@ def _normalized_channel_config(config: dict[str, Any] | None) -> dict[str, Any]:
     raw_language = cfg.get("language") or cfg.pop("locale", None)
     cfg["language"] = _normalize_channel_language(raw_language)
     return cfg
+
+
+async def _resolved_webchat_page_config(
+    db: AsyncSession,
+    config: dict[str, Any],
+    *,
+    entity_id: str,
+    workspace_id: str,
+) -> dict[str, Any]:
+    """Normalize public references so stored content matches server Review."""
+    if config.get("public_page") is None:
+        return config
+    from packages.core.services.webchat_page import (
+        resolve_workspace_webchat_page,
+        webchat_page_for_storage,
+    )
+
+    resolved = await resolve_workspace_webchat_page(
+        db,
+        value=config["public_page"],
+        entity_id=entity_id,
+        workspace_id=workspace_id,
+    )
+    if resolved is None:
+        raise HTTPException(422, "Invalid Webchat page")
+    return {
+        **config,
+        "public_page": webchat_page_for_storage(resolved).model_dump(exclude_none=True),
+    }
 
 
 class WorkspaceResponse(BaseModel):
@@ -88,6 +142,7 @@ class WorkspaceResponse(BaseModel):
     created_by_name: str | None = None
     created_by_email: str | None = None
     created_by_avatar_url: str | None = None
+    can_manage: bool = False
     #: Whether the blueprint this workspace was installed from has changed
     #: since. Detection only — applying an update is a deliberate act.
     blueprint_update: dict | None = None
@@ -106,6 +161,13 @@ class WorkspaceResponse(BaseModel):
     last_heartbeat_at: datetime | None = None
     stats: dict[str, Any] = Field(default_factory=dict)
     deleted_at: datetime | None = None
+
+
+class WorkspaceSetupStatusResponse(BaseModel):
+    ready: bool
+    status: str
+    summary: str
+    incomplete_checks: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class WorkspaceCreateRequest(BaseModel):
@@ -153,12 +215,25 @@ class WorkspaceUpdateRequest(BaseModel):
     settings: dict | None = None
 
 
+class WorkspaceLedgerContractsRequest(BaseModel):
+    ledger_contracts: list[Any] = Field(default_factory=list)
+
+
+class WorkspaceResumeGoalRequest(BaseModel):
+    title: str = Field(min_length=1, max_length=200)
+    target_value: GoalNumberInput = 1
+
+
+class WorkspaceResumeRequest(BaseModel):
+    goal: WorkspaceResumeGoalRequest | None = None
+
+
 class StaffAssignRequest(BaseModel):
     staff_id: str
     role: str | None = None
-    # Permission-v1: workspace-level role (owner / editor / contributor /
-    # viewer) + optional expiry. Backward compat: legacy callers that didn't
-    # send these get permanent assignment with no role enum validation.
+    # User-linked memberships require a workspace role (owner / editor /
+    # contributor / viewer). Unlinked staff assignments may keep a legacy
+    # business label for backward compatibility.
     expires_at: datetime | None = None
     user_id: str | None = None
 
@@ -168,6 +243,8 @@ class StaffResponse(BaseModel):
     workspace_id: str
     staff_id: str | None = None
     user_id: str | None = None
+    display_name: str | None = None
+    email: str | None = None
     role: str | None = None
     added_by: str | None = None
     added_at: datetime | None = None
@@ -192,6 +269,15 @@ class WorkspaceKnowledgeMembersRequest(BaseModel):
     document_ids: list[str] = Field(default_factory=list)
 
 
+class WorkspaceKnowledgeFolderAddResponse(BaseModel):
+    group_id: str
+    group_name: str
+    created: bool
+    added: int
+    existing: int
+    total: int
+
+
 class ServiceRequest(BaseModel):
     key: str
     name: str
@@ -205,7 +291,27 @@ class AgentMappingRequest(BaseModel):
     custom_prompt: str | None = None
 
 
-class WorkspaceChannelRequest(BaseModel):
+class WorkspaceChannelConfigRequest(BaseModel):
+    config: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("config")
+    @classmethod
+    def validate_public_page(cls, value: dict[str, Any]) -> dict[str, Any]:
+        if value.get("public_page") is not None:
+            page = WebchatPage.model_validate(value["public_page"])
+            # Resolved Workspace content is a read-time projection. Never
+            # trust or persist the browser's preview snapshot.
+            for module in page.modules:
+                if getattr(module, "type", None) == "workspace_content":
+                    module.resolved = None
+            value = {
+                **value,
+                "public_page": page.model_dump(exclude_none=True),
+            }
+        return value
+
+
+class WorkspaceChannelRequest(WorkspaceChannelConfigRequest):
     channel_config_id: str | None = None
     channel_type: str = "webchat"
     name: str | None = None
@@ -214,17 +320,15 @@ class WorkspaceChannelRequest(BaseModel):
     linked_service_key: str | None = None
     agent_subscription_id: str | None = None
     agent_id: str | None = None
-    config: dict[str, Any] = Field(default_factory=dict)
 
 
-class WorkspaceChannelUpdateRequest(BaseModel):
+class WorkspaceChannelUpdateRequest(WorkspaceChannelConfigRequest):
     name: str | None = None
     purpose: str | None = None
     role: str | None = None
     linked_service_key: str | None = None
     agent_subscription_id: str | None = None
     agent_id: str | None = None
-    config: dict[str, Any] = Field(default_factory=dict)
 
 
 class GoalsRequest(BaseModel):
@@ -302,6 +406,28 @@ class SetupFinalizeRequest(BaseModel):
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
+
+
+async def _cancel_unconnected_twilio_binding_calls(
+    db: AsyncSession,
+    *,
+    channel_config: ChannelConfig,
+    channel_binding_id: str,
+    reason: str,
+) -> None:
+    if channel_config.channel_type != "twilio_voice":
+        return
+    from packages.core.services.voice.call_sessions import (
+        cancel_unconnected_call_sessions_for_binding,
+    )
+
+    await cancel_unconnected_call_sessions_for_binding(
+        db,
+        channel_config_id=channel_config.id,
+        channel_binding_id=channel_binding_id,
+        reason=reason,
+    )
+
 
 def _user_display_name(user: User | None) -> str | None:
     if not user:
@@ -416,37 +542,6 @@ def _workspace_blueprint_id(settings: Any) -> str:
     return platform_blueprint_id(slug) if slug else ""
 
 
-def _workspace_blueprint_candidates(settings: Any) -> list[str]:
-    """Ids that may own an installed workspace, in preference order.
-
-    Marketplace deduplication removed old duplicate rows after platform
-    blueprints received stable ``builtin:<slug>`` ids. A workspace installed
-    from one of those duplicates can still carry the deleted ULID. Try that
-    exact id first, then the stable platform id for its recorded slug.
-    """
-    from packages.core.blueprints.freshness import (
-        BLUEPRINT_ID_KEY,
-        installed_blueprint_record,
-    )
-    from packages.core.blueprints.seed import platform_blueprint_id
-
-    record = installed_blueprint_record(settings)
-    candidates: list[str] = []
-    slug = str(record.get("blueprint_slug") or "").strip()
-    stable_id = platform_blueprint_id(slug) if slug else ""
-    # Prefer the stable platform row. Before platform blueprints were seeded
-    # under builtin:<slug>, the marketplace could contain a published Manor
-    # duplicate with a ULID. Those rows may still exist archived or hidden and
-    # carry the old payload; resolving them first makes an outdated workspace
-    # incorrectly report "nothing to update".
-    if stable_id:
-        candidates.append(stable_id)
-    exact_id = str(record.get(BLUEPRINT_ID_KEY) or "").strip()
-    if exact_id and exact_id not in candidates:
-        candidates.append(exact_id)
-    return candidates
-
-
 async def _blueprint_payloads_for(db: AsyncSession, workspaces) -> dict[str, tuple]:
     """Map each workspace to the blueprint payload it would upgrade toward.
 
@@ -456,40 +551,45 @@ async def _blueprint_payloads_for(db: AsyncSession, workspaces) -> dict[str, tup
 
     One query for all of them: this feeds the workspace list.
     """
+    from packages.core.blueprints.freshness import (
+        BLUEPRINT_ID_KEY,
+        installed_blueprint_record,
+    )
+    from packages.core.blueprints.seed import (
+        BlueprintRowReference,
+        resolve_blueprint_rows,
+    )
+
     payloads: dict[str, tuple] = {}
-    candidates_by_workspace: dict[str, list[str]] = {}
-    wanted_ids: set[str] = set()
+    references: dict[str, BlueprintRowReference] = {}
 
     for ws in workspaces:
         settings = ws.settings if isinstance(getattr(ws, "settings", None), dict) else {}
-        candidates = _workspace_blueprint_candidates(settings)
-        if candidates:
-            candidates_by_workspace[ws.id] = candidates
-            wanted_ids.update(candidates)
+        record = installed_blueprint_record(settings)
+        blueprint_id = str(record.get(BLUEPRINT_ID_KEY) or "").strip() or None
+        blueprint_slug = str(record.get("blueprint_slug") or "").strip() or None
+        if blueprint_id or blueprint_slug:
+            references[ws.id] = BlueprintRowReference(
+                blueprint_id,
+                blueprint_slug,
+            )
 
-    if wanted_ids:
-        try:
-            from packages.core.models.blueprint import WorkspaceBlueprint
+    if not references:
+        return payloads
 
-            rows = (await db.execute(
-                select(WorkspaceBlueprint).where(
-                    WorkspaceBlueprint.id.in_(list(wanted_ids)),
-                )
-            )).scalars().all()
-            rows_by_id = {row.id: row for row in rows}
-            for workspace_id, candidates in candidates_by_workspace.items():
-                row = next(
-                    (rows_by_id[item_id] for item_id in candidates if item_id in rows_by_id),
-                    None,
-                )
-                if row is None:
-                    continue
-                payload = row.payload if isinstance(row.payload, dict) else None
-                if not payload:
-                    continue
+    try:
+        rows = await resolve_blueprint_rows(db, references)
+        from packages.core.constants.blueprints import BlueprintStatus
+
+        for workspace_id, row in rows.items():
+            payload = row.payload if isinstance(row.payload, dict) else None
+            # Only a published row is an update release. Archived/draft
+            # content is editable and must never leak through upgrade preview
+            # or be applied to an installed Workspace.
+            if payload and row.status == BlueprintStatus.PUBLISHED:
                 payloads[workspace_id] = (payload, row.content_version, row.id)
-        except Exception:
-            logger.warning("blueprint freshness: payload lookup failed", exc_info=True)
+    except Exception:
+        logger.warning("blueprint freshness: payload lookup failed", exc_info=True)
 
     return payloads
 
@@ -535,6 +635,7 @@ def _to_response(
     *,
     creator: User | dict[str, Any] | None = None,
     blueprint_payload: tuple | None = None,
+    can_manage: bool = False,
 ) -> WorkspaceResponse:
     creator_summary = _coerce_user_summary(creator)
     return WorkspaceResponse(
@@ -552,6 +653,7 @@ def _to_response(
         created_by_name=(creator_summary or {}).get("name"),
         created_by_email=(creator_summary or {}).get("email"),
         created_by_avatar_url=(creator_summary or {}).get("avatar_url"),
+        can_manage=can_manage,
         longitude=float(ws.longitude) if ws.longitude is not None else None,
         latitude=float(ws.latitude) if ws.latitude is not None else None,
         cover_image_url=ws.cover_image_url,
@@ -575,27 +677,22 @@ async def _require_workspace(db: AsyncSession, workspace_id: str, entity_id: str
     return ws
 
 
-async def _require_workspace_read(db: AsyncSession, workspace_id: str, user: User):
+async def _require_workspace_read(
+    db: AsyncSession,
+    workspace_id: str,
+    user: User,
+    *,
+    credential: AuthenticatedUserCredential | None = None,
+):
     ws = await _require_workspace(db, workspace_id, user.entity_id)
-    if not await user_can_read_workspace(db, workspace=ws, user=user):
+    authorized = await ResourcePermissionGate.authorize_workspace_read(
+        db,
+        credential=credential or AuthenticatedUserCredential.from_user(user),
+        workspace_id=workspace_id,
+    )
+    if authorized is None:
         raise HTTPException(404, "Workspace not found")
     return ws
-
-
-async def _workspace_role_of(
-    db: AsyncSession, workspace_id: str, user_id: str | None
-) -> str | None:
-    """Return the caller's active, non-expired membership role, or None.
-
-    Delegates to :func:`get_active_workspace_membership` so the *manage* path
-    honors ``expires_at`` exactly like the *read* path does — otherwise a
-    time-boxed workspace-``owner`` grant would keep management rights after its
-    read access has lapsed.
-    """
-    membership = await get_active_workspace_membership(
-        db, workspace_id=workspace_id, user_id=user_id
-    )
-    return membership.role if membership else None
 
 
 async def _require_workspace_manage(db: AsyncSession, workspace_id: str, user: User):
@@ -609,12 +706,28 @@ async def _require_workspace_manage(db: AsyncSession, workspace_id: str, user: U
     hole. Workspace creators are auto-enrolled as ``owner`` at create time
     so a non-admin creator is never locked out of their own workspace.
     """
-    ws = await _require_workspace(db, workspace_id, user.entity_id)
-    if user.role in ("owner", "admin"):
+    # Management endpoints frequently read/merge/write the Workspace JSON
+    # settings document. Lock before both authorization and the read so two
+    # independent patches cannot restore a stale access_mode value.
+    ws = await lock_workspace_access_boundary(
+        db,
+        workspace_id=workspace_id,
+        entity_id=user.entity_id,
+    )
+    if not ws or ws.deleted_at is not None:
+        raise HTTPException(404, "Workspace not found")
+    if await user_can_manage_workspace(
+        db,
+        workspace_id=workspace_id,
+        user_id=user.id,
+        entity_role=user.role,
+    ):
         return ws
-    if await _workspace_role_of(db, workspace_id, user.id) == "owner":
-        return ws
-    if not await user_can_read_workspace(db, workspace=ws, user=user):
+    if await ResourcePermissionGate.authorize_workspace_read(
+        db,
+        credential=AuthenticatedUserCredential.from_user(user),
+        workspace_id=workspace_id,
+    ) is None:
         raise HTTPException(404, "Workspace not found")
     raise HTTPException(
         403,
@@ -671,8 +784,7 @@ def _invalidate_workspace_context(workspace_id: str) -> None:
 
 
 async def _mark_workspace_knowledge_changed(entity_id: str, workspace_id: str) -> None:
-    await bump_tool_cache_version(entity_id, "documents")
-    _invalidate_workspace_context(workspace_id)
+    await mark_workspace_knowledge_changed(entity_id, workspace_id)
 
 
 async def _mark_workspace_staff_changed(entity_id: str, workspace_id: str) -> None:
@@ -742,8 +854,20 @@ async def list_my_workspaces(
     from packages.core.models.goal import Goal
     from packages.core.models.workspace import AgentSubscription
 
+    credential = AuthenticatedUserCredential.from_user(user)
     workspaces = await list_workspaces(db, user.entity_id)
-    workspaces = await filter_workspaces_for_user(db, workspaces=workspaces, user=user)
+    authorized = await ResourcePermissionGate.authorize_workspace_batch_read(
+        db,
+        credential=credential,
+        workspace_ids={str(workspace.id) for workspace in workspaces},
+    )
+    if authorized is None:
+        raise HTTPException(404, "Workspace not found")
+    workspaces = [
+        workspace
+        for workspace in workspaces
+        if str(workspace.id) in authorized.workspace_ids
+    ]
 
     # Batch-load lightweight stats for all workspaces
     ws_ids = [ws.id for ws in workspaces]
@@ -808,7 +932,7 @@ async def list_my_workspaces(
             .where(
                 Goal.workspace_id.in_(ws_ids),
                 Goal.entity_id == user.entity_id,
-                Goal.status == "active",
+                Goal.status == GoalStatus.ACTIVE.value,
             )
             .group_by(Goal.workspace_id)
         )).all()
@@ -925,12 +1049,32 @@ async def list_my_workspaces(
 
     creator_map = await _workspace_creator_summaries(db, workspaces)
     blueprint_payloads = await _blueprint_payloads_for(db, workspaces)
+    final_authorized = await ResourcePermissionGate.authorize_workspace_batch_read(
+        db,
+        credential=credential,
+        workspace_ids={str(workspace.id) for workspace in workspaces},
+    )
+    if final_authorized is None:
+        raise HTTPException(404, "Workspace not found")
+    workspaces = [
+        workspace
+        for workspace in workspaces
+        if str(workspace.id) in final_authorized.workspace_ids
+    ]
+    manageable_workspace_ids = await manageable_workspace_ids_for_user(
+        db,
+        workspaces=workspaces,
+        entity_id=final_authorized.actor.entity_id,
+        user_id=final_authorized.actor.user_id,
+        entity_role=final_authorized.actor.role,
+    )
     result = []
     for ws in workspaces:
         resp = _to_response(
             ws,
             creator=creator_map.get(ws.id),
             blueprint_payload=blueprint_payloads.get(ws.id),
+            can_manage=ws.id in manageable_workspace_ids,
         )
         data = resp.model_dump() if hasattr(resp, "model_dump") else resp.__dict__.copy()
         data["stats"] = stats_map.get(ws.id, {})
@@ -1003,7 +1147,7 @@ async def create_new_workspace(
 
     invalidate_gate_cache(user.entity_id)
     await db.refresh(ws)
-    return _to_response(ws, creator=user)
+    return _to_response(ws, creator=user, can_manage=True)
 
 
 # ── Trash / Restore ─────────────────────────────────────────────────────────
@@ -1016,13 +1160,18 @@ async def list_trash(
     """Workspaces in the soft-delete grace window. Returns rows with
     ``deleted_at`` set; consumers can compute days-until-purge from
     that timestamp + ``WORKSPACE_PURGE_GRACE_DAYS``."""
-    if user.role not in ("owner", "admin"):
+    if not await user_is_effective_entity_admin(db, user):
         raise HTTPException(403, "Only owner/admin can view workspace trash")
     rows = await list_trashed_workspaces(db, user.entity_id)
     creator_map = await _workspace_creator_summaries(db, rows)
     payloads = await _blueprint_payloads_for(db, rows)
     return [
-        _to_response(ws, creator=creator_map.get(ws.id), blueprint_payload=payloads.get(ws.id))
+        _to_response(
+            ws,
+            creator=creator_map.get(ws.id),
+            blueprint_payload=payloads.get(ws.id),
+            can_manage=True,
+        )
         for ws in rows
     ]
 
@@ -1040,13 +1189,162 @@ async def get_one_workspace(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    ws = await _require_workspace_read(db, workspace_id, user)
+    credential = AuthenticatedUserCredential.from_user(user)
+    ws = await _require_workspace_read(
+        db, workspace_id, user, credential=credential,
+    )
     creator_map = await _workspace_creator_summaries(db, [ws])
+    blueprint_payload = (await _blueprint_payloads_for(db, [ws])).get(ws.id)
+    final_authorized = await ResourcePermissionGate.authorize_workspace_read(
+        db,
+        credential=credential,
+        workspace_id=workspace_id,
+    )
+    if final_authorized is None:
+        raise HTTPException(404, "Workspace not found")
+    can_manage = await user_can_manage_workspace(
+        db,
+        workspace_id=ws.id,
+        user_id=final_authorized.actor.user_id,
+        entity_role=final_authorized.actor.role,
+    )
     return _to_response(
         ws,
         creator=creator_map.get(ws.id),
-        blueprint_payload=(await _blueprint_payloads_for(db, [ws])).get(ws.id),
+        blueprint_payload=blueprint_payload,
+        can_manage=can_manage,
     )
+
+
+@router.get(
+    "/{workspace_id}/setup-status",
+    response_model=WorkspaceSetupStatusResponse,
+)
+async def get_workspace_setup_status(
+    workspace_id: str,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Return the live Blueprint setup gate, not its install-time snapshot."""
+
+    workspace = await _require_workspace_read(db, workspace_id, user)
+    from packages.core.services.workspace_readiness import (
+        evaluate_workspace_blocking_setup,
+    )
+
+    status = await evaluate_workspace_blocking_setup(db, workspace)
+    if status is None:
+        return WorkspaceSetupStatusResponse(
+            ready=True,
+            status="not_required",
+            summary="No blocking Blueprint setup is required.",
+        )
+    return WorkspaceSetupStatusResponse(
+        ready=not status.blocks_work,
+        status=status.status,
+        summary=status.summary,
+        incomplete_checks=list(status.details.get("incomplete_checks") or []),
+    )
+
+
+@router.get("/{workspace_id}/ledgers/overview")
+async def get_workspace_ledger_overview(
+    workspace_id: str,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Return aggregate-only Ledger projections for Workspace chat."""
+
+    from packages.core.services.workspace_ledger_overview import (
+        WorkspaceLedgerOverviewUnavailable,
+        workspace_ledger_overview,
+    )
+
+    ws = await _require_workspace_read(db, workspace_id, user)
+    try:
+        return await workspace_ledger_overview(
+            entity_id=user.entity_id,
+            workspace_id=workspace_id,
+            settings=ws.settings,
+        )
+    except WorkspaceLedgerOverviewUnavailable as exc:
+        raise HTTPException(
+            503,
+            detail={"code": exc.code, "message": str(exc)},
+        ) from exc
+
+
+@router.put("/{workspace_id}/ledgers/configuration")
+async def configure_workspace_ledgers(
+    workspace_id: str,
+    req: WorkspaceLedgerContractsRequest,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Manually replace installed Ledger contracts without touching other settings."""
+
+    from packages.core.services.workspace_ledger_matching import (
+        normalize_workspace_ledger_contracts,
+    )
+    from packages.core.services.ledger_query_service import (
+        workspace_queryable_ledger_configs,
+    )
+
+    ws = await _require_workspace_manage(db, workspace_id, user)
+    try:
+        settings = ws.settings if isinstance(ws.settings, dict) else {}
+        existing_source = (
+            settings.get("ledger_contracts")
+            if "ledger_contracts" in settings
+            # Preserve legacy storage locations when the dialog first writes
+            # the canonical contract list.
+            else list(workspace_queryable_ledger_configs(settings).values())
+        )
+        existing = normalize_workspace_ledger_contracts(existing_source)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    existing_by_contract = {item["contract_id"]: item for item in existing}
+    contracts: list[dict[str, Any]] = []
+    seen_contracts: set[str] = set()
+    try:
+        for raw in req.ledger_contracts:
+            item = normalize_workspace_ledger_contracts([raw])[0]
+            if item["contract_id"] in seen_contracts:
+                continue
+            contracts.append(
+                existing_by_contract.get(item["contract_id"], item)
+                if isinstance(raw, str)
+                else item
+            )
+            seen_contracts.add(item["contract_id"])
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    settings = dict(settings)
+    settings["ledger_contracts"] = contracts
+    settings.pop("ledger_matching", None)
+    ws.settings = settings
+    await db.flush()
+    from packages.core.services.workspace_service import record_activity
+
+    await record_activity(
+        db,
+        workspace_id,
+        user.entity_id,
+        event_type="workspace.ledgers.configured",
+        summary="Workspace business Ledgers configured",
+        details={"contract_ids": [item["contract_id"] for item in contracts]},
+        user_id=user.id,
+    )
+    # The chat editor immediately refreshes the overview after this response.
+    # Commit before returning so that read-after-write cannot observe the old
+    # Ledger configuration while the request dependency is still unwinding.
+    await db.commit()
+    await bump_tool_cache_version(user.entity_id, "ledgers")
+    return {
+        "workspace_id": workspace_id,
+        "ledger_contracts": contracts,
+        "source": "manual",
+    }
 
 
 @router.put("/{workspace_id}", response_model=WorkspaceResponse)
@@ -1072,13 +1370,16 @@ async def update_one_workspace(
 
     audit_fields = sorted(set(update_fields.keys()) | set(heartbeat_payload.keys()))
     clear_fields = {key for key, value in update_fields.items() if value is None}
-    ws = await update_workspace(
-        db,
-        workspace_id,
-        user.entity_id,
-        clear_fields=clear_fields,
-        **update_fields,
-    )
+    try:
+        ws = await update_workspace(
+            db,
+            workspace_id,
+            user.entity_id,
+            clear_fields=clear_fields,
+            **update_fields,
+        )
+    except ProtectedWorkspaceSettingsError as exc:
+        raise HTTPException(400, str(exc)) from exc
     if not ws:
         raise HTTPException(404, "Workspace not found")
     if heartbeat_touched:
@@ -1109,6 +1410,7 @@ async def update_one_workspace(
         ws,
         creator=creator_map.get(ws.id),
         blueprint_payload=(await _blueprint_payloads_for(db, [ws])).get(ws.id),
+        can_manage=True,
     )
 
 
@@ -1125,7 +1427,7 @@ async def delete_one_workspace(
     hard-deletes it. Restoring recreates built-in runtime jobs, not deleted
     user automations.
     """
-    if user.role not in ("owner", "admin"):
+    if not await user_is_effective_entity_admin(db, user):
         raise HTTPException(403, "Only owner/admin can delete workspaces")
     ok = await soft_delete_workspace(db, workspace_id, user.entity_id)
     if not ok:
@@ -1145,28 +1447,32 @@ async def restore_one_workspace(
 ):
     """Recover a soft-deleted workspace before the grace window
     expires. After hard-purge there's nothing to restore."""
-    if user.role not in ("owner", "admin"):
+    if not await user_is_effective_entity_admin(db, user):
         raise HTTPException(403, "Only owner/admin can restore workspaces")
-    from packages.core.services.plan_gate import check as check_plan_gate
-
-    gate = await check_plan_gate(db, user.entity_id, "workspaces")
-    if not gate.allowed:
-        raise HTTPException(
-            402,
-            detail={
-                "message": gate.message,
-                "limit": gate.limit,
-                "current": gate.current,
-                "plan": gate.plan,
-                "kind": "workspaces",
-            },
-        )
     ws = await restore_workspace(db, workspace_id, user.entity_id)
     if not ws:
         raise HTTPException(
             404,
             "Workspace not found in trash (already purged or never deleted)",
         )
+    embedding_document_ids = tuple(
+        getattr(ws, "_restored_embedding_document_ids", ())
+    )
+    # The lifecycle row and cleared block markers must be visible before a
+    # worker can claim any restored document.
+    await db.commit()
+    if embedding_document_ids:
+        from packages.core.tasks.ai_tasks import process_document_embeddings
+
+        for document_id in embedding_document_ids:
+            try:
+                process_document_embeddings.delay(document_id)
+            except Exception:
+                logger.warning(
+                    "Failed to dispatch restored document embedding %s",
+                    document_id,
+                    exc_info=True,
+                )
     from packages.core.services.plan_gate import invalidate_gate_cache
 
     invalidate_gate_cache(user.entity_id)
@@ -1176,25 +1482,124 @@ async def restore_one_workspace(
         ws,
         creator=creator_map.get(ws.id),
         blueprint_payload=(await _blueprint_payloads_for(db, [ws])).get(ws.id),
+        can_manage=True,
     )
 
 
 # ── Pause / Resume ──────────────────────────────────────────────────────────
 
+_WORKSPACE_LIFECYCLE_BODIES = {
+    ("start", "completed"):
+        "Workspace automation started · AI is tracking goals and preparing the next tasks.",
+    ("start_without_goals", "completed"):
+        "Workspace automation started without goals · AI is autonomously preparing the next tasks.",
+    ("pause", "completed"):
+        "Workspace automation paused · no new Strategist or Goal schedules will be created.",
+}
+
+
+async def _persist_workspace_lifecycle_activity(
+    db: AsyncSession,
+    workspace: Workspace,
+    *,
+    action: str,
+    transition_id: str | None,
+    use_goals: bool | None = None,
+) -> str | None:
+    """Commit a lifecycle receipt, then fan it out to open Workspace Chats."""
+    from packages.core.workspace_chat import service as chat_service
+
+    workspace_id = workspace.id
+    entity_id = workspace.entity_id
+    try:
+        message = await chat_service.post_workspace_lifecycle_activity(
+            db,
+            entity_id=entity_id,
+            workspace_id=workspace_id,
+            body=_WORKSPACE_LIFECYCLE_BODIES[
+                ("start_without_goals" if action == "start" and use_goals is False else action, "completed")
+            ],
+            action=action,
+            phase="completed",
+            transition_id=transition_id,
+        )
+        message_id = message.id
+        await db.commit()
+    except Exception:  # noqa: BLE001 — a receipt must not block lifecycle control
+        await db.rollback()
+        logger.debug(
+            "Workspace lifecycle receipt skipped for %s action=%s",
+            workspace_id,
+            action,
+            exc_info=True,
+        )
+        return None
+
+    try:
+        await chat_service.publish_workspace_chat_message_event(
+            entity_id,
+            workspace_id=workspace_id,
+            message=message,
+        )
+    except Exception:  # noqa: BLE001 — realtime fanout is best-effort
+        logger.debug(
+            "Workspace lifecycle realtime publish skipped for %s action=%s",
+            workspace_id,
+            action,
+            exc_info=True,
+        )
+    return message_id
+
 @router.post("/{workspace_id}/pause")
 async def pause_workspace(
     workspace_id: str,
+    transition_id: str | None = Query(default=None, max_length=128),
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
     """Pause a workspace — stops its automations and autonomous runtime."""
     ws = await _require_workspace_manage(db, workspace_id, user)
+    # Serialize pause with other Workspace lifecycle changes before canceling
+    # pending external delivery for this Workspace.
+    ws = (
+        await db.execute(
+            select(Workspace)
+            .where(
+                Workspace.id == workspace_id,
+                Workspace.entity_id == user.entity_id,
+            )
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one_or_none()
+    if ws is None:
+        raise HTTPException(404, "Workspace not found")
     if ws.status == "paused":
         # Re-assert the lifecycle invariant in case an automation was created
         # or enabled after the workspace originally entered the paused state.
         from packages.core.services.scheduler_service import pause_workspace_automations
 
+        await db.execute(
+            update(EventLog)
+            .where(
+                EventLog.entity_id == user.entity_id,
+                EventLog.workspace_id == workspace_id,
+                EventLog.external_delivery_status.in_([
+                    NotificationOutboxStatus.PENDING.value,
+                    NotificationOutboxStatus.PROCESSING.value,
+                ]),
+            )
+            .values(
+                external_delivery_status=NotificationOutboxStatus.CANCELED.value,
+                external_delivery_locked_until=None,
+                external_delivery_claim_token=None,
+                external_delivery_last_error=(
+                    "workspace paused before external event delivery"
+                ),
+            )
+        )
         await pause_workspace_automations(db, workspace_id, user.entity_id)
+        await db.commit()
         return {"status": "paused", "workspace_id": workspace_id}
     if ws.status != "active":
         raise HTTPException(
@@ -1202,6 +1607,25 @@ async def pause_workspace(
             f"Workspace status is {ws.status!r}; only an active workspace can be paused",
         )
     ws.status = "paused"
+    await db.execute(
+        update(EventLog)
+        .where(
+            EventLog.entity_id == user.entity_id,
+            EventLog.workspace_id == workspace_id,
+            EventLog.external_delivery_status.in_([
+                NotificationOutboxStatus.PENDING.value,
+                NotificationOutboxStatus.PROCESSING.value,
+            ]),
+        )
+        .values(
+            external_delivery_status=NotificationOutboxStatus.CANCELED.value,
+            external_delivery_locked_until=None,
+            external_delivery_claim_token=None,
+            external_delivery_last_error=(
+                "workspace paused before external event delivery"
+            ),
+        )
+    )
     await _apply_workspace_operation_patches(
         db,
         workspace_id=workspace_id,
@@ -1210,37 +1634,142 @@ async def pause_workspace(
         source_event_id="api_workspace_pause",
         patches=[{"op": "heartbeat_policy.update", "payload": {"enabled": False}}],
     )
-    return {"status": "paused", "workspace_id": workspace_id}
+    await db.commit()
+    lifecycle_message_id = await _persist_workspace_lifecycle_activity(
+        db,
+        ws,
+        action="pause",
+        transition_id=transition_id,
+    )
+    return {
+        "status": "paused",
+        "workspace_id": workspace_id,
+        "lifecycle_message_id": lifecycle_message_id,
+    }
 
 
+@router.post("/{workspace_id}/resume/v2")
 @router.post("/{workspace_id}/resume")
 async def resume_workspace(
     workspace_id: str,
+    transition_id: str | None = Query(default=None, max_length=128),
+    req: WorkspaceResumeRequest | None = None,
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Resume a paused workspace — re-enables strategist and heartbeat."""
+    """Start autonomous runtime, deriving Goal use from active Workspace Goals."""
     ws = await _require_workspace_manage(db, workspace_id, user)
-    if ws.status == "active":
-        return {"status": "active", "workspace_id": workspace_id}
-    if ws.status != "paused":
+    from packages.core.workspaces import is_sandbox_workspace
+
+    if is_sandbox_workspace(ws):
         raise HTTPException(
             409,
-            f"Workspace status is {ws.status!r}; only a paused workspace can be resumed",
+            "Workspace simulation cannot start the ordinary autonomous runtime",
         )
+    from packages.core.goals.locking import lock_workspace_for_goal_mutation
+
+    locked_ws = await lock_workspace_for_goal_mutation(
+        db,
+        workspace_id=workspace_id,
+        entity_id=user.entity_id,
+    )
+    if locked_ws is None:
+        raise HTTPException(404, "Workspace not found")
+    # The authorization lookup may have populated this identity before a
+    # concurrent Goal mutation committed. Refresh only after owning the
+    # canonical Workspace -> Goal lock so status and Goal mode are one snapshot.
+    await db.refresh(locked_ws)
+    ws = locked_ws
+    if ws.status == "active" and ws.heartbeat_enabled and req is None:
+        return {"status": "active", "workspace_id": workspace_id}
+    if ws.status not in {"active", "paused"}:
+        raise HTTPException(
+            409,
+            f"Workspace status is {ws.status!r}; only an active or paused workspace can start autonomous runtime",
+        )
+
+    from packages.core.models.goal import Goal
+
+    goal = (await db.execute(
+        select(Goal)
+        .where(
+            Goal.entity_id == user.entity_id,
+            Goal.workspace_id == workspace_id,
+            Goal.status == GoalStatus.ACTIVE.value,
+        )
+        .order_by(Goal.priority.desc(), Goal.created_at.desc(), Goal.id.asc())
+        .limit(1)
+    )).scalar_one_or_none()
+    goal_created = False
+    goal_updated = False
+    created_goal_id: str | None = None
+    if req is not None and req.goal is not None:
+        from packages.core.goals import service as goal_service
+
+        if goal is None:
+            goal = await goal_service.create_goal(
+                db,
+                entity_id=user.entity_id,
+                workspace_id=workspace_id,
+                title=req.goal.title,
+                metric_key=None,
+                target_value=req.goal.target_value,
+            )
+            goal_created = True
+            created_goal_id = goal.id
+        elif goal.title != req.goal.title:
+            updated_goal = await goal_service.update_goal(
+                db,
+                goal.id,
+                user.entity_id,
+                title=req.goal.title,
+            )
+            if updated_goal is None:
+                raise HTTPException(404, "Goal not found")
+            goal = updated_goal
+            goal_updated = True
+
+    use_goals = goal is not None
     ws.status = "active"
+    patches: list[dict[str, Any]] = [
+        {
+            "op": "heartbeat_policy.update",
+            "payload": {"enabled": True, "cadence": ws.heartbeat_cadence or "daily"},
+        },
+        {
+            "op": "strategist.update",
+            "payload": {"use_goals": use_goals},
+        },
+    ]
     await _apply_workspace_operation_patches(
         db,
         workspace_id=workspace_id,
         entity_id=user.entity_id,
         user_id=user.id,
         source_event_id="api_workspace_resume",
-        patches=[{
-            "op": "heartbeat_policy.update",
-            "payload": {"enabled": True, "cadence": ws.heartbeat_cadence or "daily"},
-        }],
+        patches=patches,
     )
-    return {"status": "active", "workspace_id": workspace_id}
+    if goal_created:
+        await sync_workspace_runtime_schedules(db, ws)
+    await db.commit()
+    lifecycle_message_id = await _persist_workspace_lifecycle_activity(
+        db,
+        ws,
+        action="start",
+        transition_id=transition_id,
+        use_goals=use_goals,
+    )
+    return {
+        "status": "active",
+        "workspace_id": workspace_id,
+        "heartbeat_enabled": True,
+        "use_goals": use_goals,
+        "goal_id": goal.id if goal is not None else None,
+        "goal_created": goal_created,
+        "goal_updated": goal_updated,
+        "created_goal_id": created_goal_id,
+        "lifecycle_message_id": lifecycle_message_id,
+    }
 
 
 # ── Dashboard ────────────────────────────────────────────────────────────────
@@ -1558,7 +2087,52 @@ async def list_agent_mappings(
 ):
     from packages.core.services.workspace_service import get_workspace_agent_mappings
     await _require_workspace_manage(db, workspace_id, user)
-    return await get_workspace_agent_mappings(db, workspace_id, user.entity_id)
+    return await get_workspace_agent_mappings(
+        db,
+        workspace_id,
+        user.entity_id,
+        include_agent_identity=True,
+    )
+
+
+@router.get("/{workspace_id}/agents/assignable")
+async def list_assignable_workspace_agents(
+    workspace_id: str,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Return only the active Agent IDs safe to assign to Workspace Tasks.
+
+    Contributors may need this list to assign a task, but must not receive
+    service mapping configuration or custom prompts reserved for managers.
+    """
+    from packages.core.models.workspace import AgentSubscription
+
+    await _require_workspace_read(db, workspace_id, user)
+    rows = await db.execute(
+        select(AgentSubscription).where(
+            AgentSubscription.entity_id == user.entity_id,
+            AgentSubscription.workspace_id == workspace_id,
+            AgentSubscription.status == "active",
+        )
+    )
+    subscriptions = list(rows.scalars())
+    return {
+        "agent_ids": list(dict.fromkeys(
+            subscription.agent_id
+            for subscription in subscriptions
+            if subscription.agent_id
+        )),
+        "subscriptions": [
+            {
+                "id": subscription.id,
+                "agent_id": subscription.agent_id,
+                "role_label": subscription.name or subscription.service_key,
+            }
+            for subscription in subscriptions
+            if subscription.agent_id
+        ],
+    }
 
 
 @router.post("/{workspace_id}/agents")
@@ -1608,6 +2182,19 @@ async def unmap_agent(
     )
     await db.commit()
     return result
+
+
+@router.get("/{workspace_id}/connection-status")
+async def get_workspace_connection_status(
+    workspace_id: str,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Current connection guidance; never mutates setup or account bindings."""
+    from packages.core.services.workspace_connection_status import WorkspaceConnectionStatusFactory
+
+    workspace = await _require_workspace_read(db, workspace_id, user)
+    return await WorkspaceConnectionStatusFactory.create(db, workspace=workspace, user_id=user.id)
 
 
 @router.get("/{workspace_id}/capabilities")
@@ -1713,7 +2300,7 @@ async def list_workspace_capabilities(
     oauth_rows = (await db.execute(
         select(OAuthAccount.provider).where(
             OAuthAccount.user_id == user.id,
-            OAuthAccount.access_token.is_not(None),
+            oauth_account_is_runtime_usable_clause(),
         )
     )).scalars().all()
     for provider in oauth_rows:
@@ -2118,40 +2705,65 @@ async def list_workspace_staff(
 ):
     """List staff assigned to a workspace."""
     from packages.core.models.staff import Staff
+    from packages.core.models.user import User as UserModel
 
     await _require_workspace_read(db, workspace_id, user)
     result = await db.execute(
-        select(WorkspaceStaff)
+        select(WorkspaceStaff, Staff, UserModel)
         .join(Workspace, Workspace.id == WorkspaceStaff.workspace_id)
-        .join(Staff, Staff.id == WorkspaceStaff.staff_id)
+        .outerjoin(
+            Staff,
+            and_(
+                Staff.id == WorkspaceStaff.staff_id,
+                Staff.entity_id == user.entity_id,
+                Staff.deleted_at.is_(None),
+            ),
+        )
+        .outerjoin(
+            UserModel,
+            and_(
+                UserModel.id == WorkspaceStaff.user_id,
+                UserModel.entity_id == user.entity_id,
+                UserModel.deleted_at.is_(None),
+            ),
+        )
         .where(
             WorkspaceStaff.workspace_id == workspace_id,
             Workspace.entity_id == user.entity_id,
             Workspace.deleted_at.is_(None),
-            Staff.entity_id == user.entity_id,
-            Staff.deleted_at.is_(None),
             WorkspaceStaff.status == "active",
+            or_(
+                and_(
+                    WorkspaceStaff.staff_id.is_not(None),
+                    Staff.id.is_not(None),
+                ),
+                and_(
+                    WorkspaceStaff.staff_id.is_(None),
+                    UserModel.id.is_not(None),
+                ),
+            ),
         )
     )
-    rows = result.scalars().all()
+    rows = result.all()
     return [
         StaffResponse(
-            id=r.id, workspace_id=r.workspace_id,
-            staff_id=r.staff_id, user_id=getattr(r, "user_id", None),
-            role=r.role,
-            added_by=getattr(r, "added_by", None),
-            added_at=getattr(r, "added_at", None),
-            expires_at=getattr(r, "expires_at", None),
-            status=getattr(r, "status", None),
-            created_at=r.created_at,
+            id=membership.id, workspace_id=membership.workspace_id,
+            staff_id=membership.staff_id, user_id=getattr(membership, "user_id", None),
+            display_name=(staff.name if staff else user_record.display_name),
+            email=(staff.email if staff else user_record.email),
+            role=membership.role,
+            added_by=getattr(membership, "added_by", None),
+            added_at=getattr(membership, "added_at", None),
+            expires_at=getattr(membership, "expires_at", None),
+            status=getattr(membership, "status", None),
+            created_at=membership.created_at,
         )
-        for r in rows
+        for membership, staff, user_record in rows
     ]
 
 
-# Workspace-role enum from RFC §5.2. Empty / None / legacy values are
-# accepted for backwards compatibility but new code should send one of
-# these.
+# Workspace-role enum from RFC §5.2. User-linked memberships always require
+# one of these roles; legacy business labels are not authorization roles.
 _WORKSPACE_ROLES = {"owner", "editor", "contributor", "viewer"}
 
 
@@ -2174,6 +2786,7 @@ async def assign_staff(
     )).scalar_one_or_none()
     if not staff:
         raise HTTPException(404, "Staff member not found")
+    linked_user_id = req.user_id or staff.user_id
     # A supplied user_id must belong to this entity — otherwise a foreign or
     # mismatched user_id would be written onto the membership row (a data-
     # integrity footgun for the membership lookups keyed on user_id).
@@ -2189,27 +2802,35 @@ async def assign_staff(
         )).scalar_one_or_none()
         if not member:
             raise HTTPException(400, "user_id does not belong to this entity")
+        if staff.user_id and staff.user_id != req.user_id:
+            raise HTTPException(400, "user_id does not match the staff member")
     # Permission-v1 user-scoped assignments should use the canonical
     # workspace role enum. Legacy staff-scoped assignments historically used
     # business labels like "reviewer" / "lead"; keep those working.
-    if req.user_id is not None and req.role and req.role not in _WORKSPACE_ROLES:
+    if linked_user_id and req.role not in _WORKSPACE_ROLES:
         raise HTTPException(
-            400, f"Invalid workspace role: {req.role}. "
+            400, f"Invalid or missing workspace role: {req.role}. "
             f"Expected one of {sorted(_WORKSPACE_ROLES)}"
         )
-    ws_staff = (await db.execute(
+    membership_filters = [WorkspaceStaff.staff_id == req.staff_id]
+    if linked_user_id:
+        membership_filters.append(WorkspaceStaff.user_id == linked_user_id)
+    existing_rows = list((await db.execute(
         select(WorkspaceStaff).where(
             WorkspaceStaff.workspace_id == workspace_id,
-            WorkspaceStaff.staff_id == req.staff_id,
-        ).limit(1)
-    )).scalar_one_or_none()
+            or_(*membership_filters),
+        ).order_by(WorkspaceStaff.updated_at.desc(), WorkspaceStaff.created_at.desc())
+    )).scalars().all())
+    ws_staff = existing_rows[0] if existing_rows else None
     was_existing = ws_staff is not None
     if ws_staff:
+        ws_staff.staff_id = req.staff_id
+        ws_staff.user_id = linked_user_id
         ws_staff.role = req.role
-        if req.expires_at is not None:
-            ws_staff.expires_at = req.expires_at
-        if req.user_id is not None:
-            ws_staff.user_id = req.user_id
+        # Reassignment is a complete membership policy update. Omitting an
+        # expiry means a permanent assignment and must clear any stale/expired
+        # value left on the row.
+        ws_staff.expires_at = req.expires_at
         # Reactivate if previously inactive
         if getattr(ws_staff, "status", None) != "active":
             ws_staff.status = "active"
@@ -2217,7 +2838,7 @@ async def assign_staff(
         ws_staff = WorkspaceStaff(
             workspace_id=workspace_id,
             staff_id=req.staff_id,
-            user_id=req.user_id or staff.user_id,
+            user_id=linked_user_id,
             role=req.role,
             expires_at=req.expires_at,
             added_by=user.id,
@@ -2225,6 +2846,10 @@ async def assign_staff(
             status="active",
         )
         db.add(ws_staff)
+    # Rolling-upgrade repair: collapse any pre-constraint duplicate rows while
+    # this authorized member assignment is already being updated.
+    for duplicate in existing_rows[1:]:
+        await db.delete(duplicate)
     from packages.core.services.workspace_service import record_activity
 
     await record_activity(
@@ -2499,6 +3124,13 @@ async def list_available_workspace_channels(
             ChannelConfig.entity_id == user.entity_id,
             ChannelConfig.status == "active",
             or_(
+                ChannelConfig.owner_user_id == user.id,
+                and_(
+                    ChannelConfig.owner_user_id.is_(None),
+                    ChannelConfig.workspace_id == workspace_id,
+                ),
+            ),
+            or_(
                 ChannelConfig.workspace_id.is_(None),
                 ChannelConfig.workspace_id == workspace_id,
             ),
@@ -2517,6 +3149,233 @@ async def list_available_workspace_channels(
         }
         for ch in rows
     ]
+
+
+@router.get("/{workspace_id}/webchat/resources")
+async def list_webchat_workspace_resources(
+    workspace_id: str,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+    document_cursor: Annotated[
+        int,
+        Query(ge=0, le=_WEBCHAT_DOCUMENT_CURSOR_LIMIT),
+    ] = 0,
+):
+    """Return Workspace resources that may be deliberately published in Webchat.
+
+    Document visibility is evaluated through the same client-visible policy
+    used by public-agent RAG. Workflow definitions, steps, variables and
+    binding config are intentionally omitted from this picker projection.
+    """
+    from packages.core.models.document import (
+        Document,
+        DocumentGroup,
+        DocumentGroupMember,
+    )
+    from packages.core.models.workflow import WorkflowBinding, WorkflowDefinition
+    from packages.core.services.document_access import (
+        public_agent_visible_document_ids_batched,
+    )
+
+    from packages.core.contracts.webchat_page import BrandModule
+    from packages.core.services.webchat_page import public_workspace_name
+
+    workspace = await _require_workspace_manage(db, workspace_id, user)
+    entity = await db.get(Entity, user.entity_id)
+    public_documents: list[dict[str, str]] = []
+    next_document_cursor: int | None = document_cursor
+    scanned_documents = 0
+    while (
+        len(public_documents) < _WEBCHAT_RESOURCE_LIMIT
+        and scanned_documents < _WEBCHAT_DOCUMENT_SCAN_LIMIT
+    ):
+        batch_limit = min(
+            _WEBCHAT_DOCUMENT_SCAN_BATCH,
+            _WEBCHAT_DOCUMENT_SCAN_LIMIT - scanned_documents,
+        )
+        candidates = list((await db.scalars(
+            select(Document)
+            .join(DocumentGroupMember, DocumentGroupMember.document_id == Document.id)
+            .join(DocumentGroup, DocumentGroup.id == DocumentGroupMember.group_id)
+            .where(
+                Document.entity_id == user.entity_id,
+                DocumentGroup.entity_id == user.entity_id,
+                DocumentGroup.workspace_id == workspace_id,
+                Document.is_trashed.is_(False),
+            )
+            .distinct()
+            .order_by(Document.name.asc(), Document.id.asc())
+            .offset(next_document_cursor)
+            .limit(batch_limit + 1)
+        )).unique().all())
+        has_more_candidates = len(candidates) > batch_limit
+        documents = candidates[:batch_limit]
+        if not documents:
+            next_document_cursor = None
+            break
+        public_document_ids = await public_agent_visible_document_ids_batched(
+            db,
+            documents,
+            entity_id=user.entity_id,
+            workspace_id=workspace_id,
+        )
+        consumed = 0
+        for document in documents:
+            consumed += 1
+            if str(document.id) not in public_document_ids:
+                continue
+            public_documents.append({
+                "id": document.id,
+                "name": str(document.name)[:160],
+                # Exact content is resolved only for the candidate page sent
+                # to the Review endpoint below.
+                "body": "",
+            })
+            if len(public_documents) == _WEBCHAT_RESOURCE_LIMIT:
+                break
+        next_document_cursor += consumed
+        scanned_documents += consumed
+        if consumed < len(documents):
+            break
+        if not has_more_candidates:
+            next_document_cursor = None
+            break
+
+    rows = (await db.execute(
+        select(WorkflowBinding, WorkflowDefinition)
+        .join(WorkflowDefinition, WorkflowDefinition.id == WorkflowBinding.workflow_id)
+        .where(
+            WorkflowBinding.entity_id == user.entity_id,
+            WorkflowBinding.workspace_id == workspace_id,
+            WorkflowBinding.trigger_type == "manual",
+            WorkflowBinding.enabled.is_(True),
+            WorkflowBinding.status == "active",
+            WorkflowDefinition.entity_id == user.entity_id,
+            WorkflowDefinition.is_active.is_(True),
+            WorkflowDefinition.status == "active",
+        )
+        .order_by(WorkflowBinding.name.asc(), WorkflowDefinition.name.asc())
+        .limit(_WEBCHAT_RESOURCE_LIMIT)
+    )).all()
+    public_name = public_workspace_name(workspace)
+    profile_values = {
+        "name": public_name,
+        "body": str(workspace.description or "")[:4000],
+        "image_url": str(workspace.cover_image_url or ""),
+        "items": [
+            str(value)[:500]
+            for value in (workspace.category, workspace.address)
+            if value
+        ][:8],
+    }
+    try:
+        profile = ResolvedWorkspaceContent(**profile_values)
+    except ValueError:
+        profile = ResolvedWorkspaceContent(**{**profile_values, "image_url": ""})
+    brand_values = {
+        "id": "brand-default",
+        "side": "left",
+        "type": "brand",
+        "name": public_name,
+        "logo_url": str(getattr(entity, "logo_url", "") or ""),
+        "website": "",
+    }
+    try:
+        brand = BrandModule(**brand_values)
+    except ValueError:
+        brand = BrandModule(**{**brand_values, "logo_url": ""})
+    return {
+        "brand": {
+            "name": brand.name,
+            "logo_url": brand.logo_url,
+            "website": brand.website,
+        },
+        "profile": {"id": "workspace", **profile.model_dump()},
+        "documents": public_documents,
+        "documents_next_cursor": next_document_cursor,
+        "actions": [
+            {
+                "id": binding.id,
+                "name": str(binding.name or workflow.name)[:160],
+                "description": str(workflow.description or "")[:1000],
+            }
+            for binding, workflow in rows
+        ],
+    }
+
+
+@router.post("/{workspace_id}/webchat/review", response_model=WebchatPage)
+async def review_webchat_workspace_page(
+    workspace_id: str,
+    page: WebchatPage,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Resolve a candidate page through the exact public Workspace policy."""
+    await _require_workspace_manage(db, workspace_id, user)
+    from packages.core.services.webchat_page import resolve_workspace_webchat_page
+
+    resolved = await resolve_workspace_webchat_page(
+        db,
+        value=page,
+        entity_id=user.entity_id,
+        workspace_id=workspace_id,
+    )
+    if resolved is None:  # The request model already validates; stay fail-closed.
+        raise HTTPException(422, "Invalid Webchat page")
+    return resolved
+
+
+@router.get(
+    "/{workspace_id}/channels/{channel_binding_id}/webchat/review",
+    response_model=WebchatPage,
+)
+async def review_saved_webchat_workspace_page(
+    workspace_id: str,
+    channel_binding_id: str,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Resolve only the already-published page for a read-only reviewer."""
+    from packages.core.models.document import Channel
+    from packages.core.services.channel_bindings import channel_runtime_config
+    from packages.core.services.webchat_page import resolve_workspace_webchat_page
+
+    await _require_workspace_read(db, workspace_id, user)
+    binding = await db.scalar(select(Channel).where(
+        Channel.id == channel_binding_id,
+        Channel.entity_id == user.entity_id,
+        Channel.workspace_id == workspace_id,
+        Channel.type == "webchat",
+        Channel.status == "active",
+    ))
+    if binding is None:
+        raise HTTPException(404, "Webchat channel not found")
+    channel_config_id = str(
+        (binding.config or {}).get("channel_config_id") or ""
+    ).strip()
+    if not channel_config_id:
+        raise HTTPException(404, "Webchat channel not found")
+    channel_config = await db.scalar(select(ChannelConfig).where(
+        ChannelConfig.id == channel_config_id,
+        ChannelConfig.entity_id == user.entity_id,
+        ChannelConfig.channel_type == "webchat",
+        ChannelConfig.status == "active",
+        or_(
+            ChannelConfig.workspace_id.is_(None),
+            ChannelConfig.workspace_id == workspace_id,
+        ),
+    ))
+    if channel_config is None:
+        raise HTTPException(404, "Webchat channel not found")
+    config = channel_runtime_config(channel_config, binding)
+    resolved = await resolve_workspace_webchat_page(
+        db,
+        value=config.get("public_page"),
+        entity_id=user.entity_id,
+        workspace_id=workspace_id,
+    )
+    return resolved or WebchatPage()
 
 
 @router.post("/{workspace_id}/channels", status_code=201)
@@ -2538,6 +3397,12 @@ async def attach_workspace_channel(
     from packages.core.services.workspace_service import record_activity
 
     await _require_workspace_manage(db, workspace_id, user)
+    request_config = await _resolved_webchat_page_config(
+        db,
+        _normalized_channel_config(req.config) if req.config else {},
+        entity_id=user.entity_id,
+        workspace_id=workspace_id,
+    )
 
     sub = None
     if req.agent_subscription_id:
@@ -2570,6 +3435,8 @@ async def attach_workspace_channel(
             )
         )).scalar_one_or_none()
 
+    resolved_agent_id = sub.agent_id if sub else req.agent_id
+
     channel_config = None
     if req.channel_config_id:
         channel_config = (await db.execute(
@@ -2578,10 +3445,19 @@ async def attach_workspace_channel(
                 ChannelConfig.entity_id == user.entity_id,
                 ChannelConfig.status == "active",
                 or_(
+                    ChannelConfig.owner_user_id == user.id,
+                    and_(
+                        ChannelConfig.owner_user_id.is_(None),
+                        ChannelConfig.workspace_id == workspace_id,
+                    ),
+                ),
+                or_(
                     ChannelConfig.workspace_id.is_(None),
                     ChannelConfig.workspace_id == workspace_id,
                 ),
             )
+            .with_for_update()
+            .execution_options(populate_existing=True)
         )).scalar_one_or_none()
         if not channel_config:
             raise HTTPException(404, "Channel config not found")
@@ -2590,7 +3466,7 @@ async def attach_workspace_channel(
         if channel_type != "webchat":
             raise HTTPException(400, "channel_config_id is required for external channels")
         public_token = generate_ulid()
-        cfg = _normalized_channel_config(req.config or {})
+        cfg = dict(request_config)
         cfg.update({
             "public_token": public_token,
             "role": req.role or "primary_external",
@@ -2618,8 +3494,8 @@ async def attach_workspace_channel(
         "purpose": req.purpose or (channel_config.config or {}).get("purpose") or "",
         "linked_service_key": req.linked_service_key or (sub.service_key if sub else ""),
     }
-    if req.config:
-        binding_config.update(_normalized_channel_config(req.config))
+    if request_config:
+        binding_config.update(request_config)
     existing = (await db.execute(
         select(Channel).where(
             Channel.entity_id == user.entity_id,
@@ -2627,21 +3503,62 @@ async def attach_workspace_channel(
             Channel.config["channel_config_id"].astext == channel_config.id,
         )
     )).scalar_one_or_none()
+    if channel_config.channel_type == "slack":
+        other_binding = (await db.execute(
+            select(Channel.id).where(
+                Channel.entity_id == user.entity_id,
+                Channel.type == "slack",
+                Channel.status == "active",
+                Channel.config["channel_config_id"].astext == channel_config.id,
+                *([Channel.id != existing.id] if existing else []),
+            ).limit(1)
+        )).scalar_one_or_none()
+        if other_binding is not None:
+            raise HTTPException(
+                409,
+                "Slack installation already has an active Agent binding",
+            )
+    if (
+        resolved_agent_id
+        and (existing is None or resolved_agent_id != existing.agent_id)
+        and not is_master_agent(resolved_agent_id)
+    ):
+        await lock_reusable_resource_references(
+            db,
+            entity_id=user.entity_id,
+            agent_ids=(resolved_agent_id,),
+        )
     if existing:
-        existing.agent_id = sub.agent_id if sub else req.agent_id
+        if (
+            existing.agent_id != resolved_agent_id
+            or existing.agent_subscription_id != (sub.id if sub else None)
+            or existing.workspace_id != workspace_id
+            or existing.status != "active"
+        ):
+            await _cancel_unconnected_twilio_binding_calls(
+                db,
+                channel_config=channel_config,
+                channel_binding_id=existing.id,
+                reason=(
+                    "Twilio Voice Agent binding changed before the call connected."
+                ),
+            )
+        existing.agent_id = resolved_agent_id
         existing.agent_subscription_id = sub.id if sub else None
         existing.name = req.name or existing.name or channel_config.name or channel_config.channel_type
         existing.config = binding_config
         existing.status = "active"
+        existing.user_id = channel_config.owner_user_id
         channel_binding = existing
     else:
         channel_binding = Channel(
             id=generate_ulid(),
             entity_id=user.entity_id,
+            user_id=channel_config.owner_user_id,
             workspace_id=workspace_id,
             type=channel_config.channel_type,
             name=req.name or channel_config.name or channel_config.channel_type,
-            agent_id=sub.agent_id if sub else req.agent_id,
+            agent_id=resolved_agent_id,
             agent_subscription_id=sub.id if sub else None,
             config=binding_config,
             status="active",
@@ -2661,7 +3578,7 @@ async def attach_workspace_channel(
             "linked_service_key": binding_config["linked_service_key"],
         },
         user_id=user.id,
-        agent_id=sub.agent_id if sub else req.agent_id,
+        agent_id=resolved_agent_id,
     )
     await db.commit()
     return {"channel_config_id": channel_config.id, "channel_binding_id": channel_binding.id}
@@ -2687,7 +3604,7 @@ async def update_workspace_channel(
             Channel.workspace_id == workspace_id,
             Channel.entity_id == user.entity_id,
             Channel.status == "active",
-        )
+        ).execution_options(populate_existing=True)
     )).scalar_one_or_none()
     if not binding:
         raise HTTPException(404, "Channel binding not found")
@@ -2700,10 +3617,26 @@ async def update_workspace_channel(
             ChannelConfig.id == cc_id,
             ChannelConfig.entity_id == user.entity_id,
             ChannelConfig.status == "active",
+            ChannelConfig.channel_type == binding.type,
+            or_(
+                ChannelConfig.workspace_id.is_(None),
+                ChannelConfig.workspace_id == workspace_id,
+            ),
         )
+        .with_for_update()
+        .execution_options(populate_existing=True)
     )).scalar_one_or_none()
     if not channel_config:
         raise HTTPException(404, "Channel config not found")
+
+    # A missing legacy owner may be repaired, but an ownership transfer
+    # requires the new account owner to explicitly authorize the binding.
+    if (
+        binding.user_id is not None
+        and binding.user_id != channel_config.owner_user_id
+        and user.id != channel_config.owner_user_id
+    ):
+        raise HTTPException(403, "Channel account ownership changed; ask its owner to reconnect it")
 
     routing_requested = (
         req.agent_subscription_id is not None
@@ -2741,7 +3674,28 @@ async def update_workspace_channel(
             )
         )).scalar_one_or_none()
 
-    req_config = _normalized_channel_config(req.config) if req.config else {}
+    resolved_agent_id = sub.agent_id if sub else req.agent_id
+    if (
+        routing_requested
+        and resolved_agent_id
+        and resolved_agent_id != binding.agent_id
+        and not is_master_agent(resolved_agent_id)
+    ):
+        await lock_reusable_resource_references(
+            db,
+            entity_id=user.entity_id,
+            agent_ids=(resolved_agent_id,),
+        )
+
+    req_config = await _resolved_webchat_page_config(
+        db,
+        _normalized_channel_config(req.config) if req.config else {},
+        entity_id=user.entity_id,
+        workspace_id=workspace_id,
+    )
+    # PATCHing page content must not reset the channel's existing language.
+    if "language" not in req.config and "locale" not in req.config:
+        req_config.pop("language", None)
     binding_config = dict(binding.config or {})
     binding_config["channel_config_id"] = cc_id
     if req.role is not None:
@@ -2756,9 +3710,22 @@ async def update_workspace_channel(
     if req.name is not None:
         binding.name = req.name.strip() or binding.name
     if routing_requested:
-        binding.agent_id = sub.agent_id if sub else req.agent_id
+        if (
+            binding.agent_id != resolved_agent_id
+            or binding.agent_subscription_id != (sub.id if sub else None)
+        ):
+            await _cancel_unconnected_twilio_binding_calls(
+                db,
+                channel_config=channel_config,
+                channel_binding_id=binding.id,
+                reason=(
+                    "Twilio Voice Agent binding changed before the call connected."
+                ),
+            )
+        binding.agent_id = resolved_agent_id
         binding.agent_subscription_id = sub.id if sub else None
     binding.config = binding_config
+    binding.user_id = channel_config.owner_user_id
 
     if channel_config.workspace_id == workspace_id:
         if req.name is not None:
@@ -2789,7 +3756,7 @@ async def update_workspace_channel(
             "linked_service_key": binding_config.get("linked_service_key"),
         },
         user_id=user.id,
-        agent_id=(sub.agent_id if sub else req.agent_id) if routing_requested else binding.agent_id,
+        agent_id=resolved_agent_id if routing_requested else binding.agent_id,
     )
     await db.commit()
     return {"channel_config_id": channel_config.id, "channel_binding_id": binding.id}
@@ -2815,6 +3782,22 @@ async def remove_workspace_channel(
     if not binding:
         raise HTTPException(404, "Channel binding not found")
     cc_id = (binding.config or {}).get("channel_config_id")
+    if cc_id:
+        channel_config = await db.scalar(
+            select(ChannelConfig).where(
+                ChannelConfig.id == cc_id,
+                ChannelConfig.entity_id == user.entity_id,
+            )
+        )
+        if channel_config is not None:
+            await _cancel_unconnected_twilio_binding_calls(
+                db,
+                channel_config=channel_config,
+                channel_binding_id=binding.id,
+                reason=(
+                    "Twilio Voice Agent binding was removed before the call connected."
+                ),
+            )
     await db.delete(binding)
     if cc_id:
         cc = (await db.execute(
@@ -2878,7 +3861,7 @@ async def resolve_flagged_integrations(
     oauth_rows = (await db.execute(
         select(OAuthAccount.provider).where(
             OAuthAccount.user_id == user.id,
-            OAuthAccount.access_token.is_not(None),
+            oauth_account_is_runtime_usable_clause(),
         )
     )).scalars().all()
     active_providers = {
@@ -3031,10 +4014,11 @@ async def resolve_flagged_integrations(
 
 # ── Documents scoped to workspace ───────────────────────────────────────
 
-_WORKSPACE_GROUP_DEFAULT_KIND = "workspace_collection"
-_WORKSPACE_GROUP_FOLDER_KIND = "knowledge_net"
-_WORKSPACE_GROUP_FILE_BUCKET_KIND = "workspace_files"
+_WORKSPACE_GROUP_DEFAULT_KIND = WorkspaceDocumentGroupKind.DEFAULT_COLLECTION.value
+_WORKSPACE_GROUP_FOLDER_KIND = WorkspaceDocumentGroupKind.KNOWLEDGE_NET.value
+_WORKSPACE_GROUP_FILE_BUCKET_KIND = WorkspaceDocumentGroupKind.FILE_BUCKET.value
 _WORKSPACE_DEFAULT_COLLECTION_NAME = "Workspace Knowledge"
+_WORKSPACE_KNOWLEDGE_REVALIDATION_BATCH_SIZE = 500
 
 
 def _workspace_group_settings(group: DocumentGroup) -> dict:
@@ -3048,7 +4032,102 @@ def _workspace_group_kind(group: DocumentGroup) -> str:
     if settings.get("default_collection"):
         return _WORKSPACE_GROUP_DEFAULT_KIND
     kind = str(settings.get("kind") or _WORKSPACE_GROUP_FOLDER_KIND)
-    return _WORKSPACE_GROUP_FOLDER_KIND if kind == "knowledge_folder" else kind
+    return (
+        _WORKSPACE_GROUP_FOLDER_KIND
+        if kind == WorkspaceDocumentGroupKind.LEGACY_KNOWLEDGE_FOLDER
+        else kind
+    )
+
+
+async def _lock_workspace_knowledge_import_authority(
+    db: AsyncSession,
+    *,
+    workspace_id: str,
+    user: User,
+) -> str:
+    """Serialize revocation of every row that can authorize a folder import."""
+    from packages.core.models.permission import (
+        GrantStatus,
+        ResourceGrant,
+        ResourceType,
+        SubjectType,
+    )
+    from packages.core.models.staff import Staff, StaffRole
+    from packages.core.models.user import UserMembership
+    from packages.core.permissions import effective_user_role_name
+
+    await db.execute(
+        select(User.id)
+        .where(User.id == user.id, User.deleted_at.is_(None))
+        .with_for_update()
+    )
+    await db.execute(
+        select(UserMembership)
+        .where(
+            UserMembership.user_id == user.id,
+            UserMembership.entity_id == user.entity_id,
+        )
+        .execution_options(populate_existing=True)
+        .with_for_update()
+    )
+    staff_rows = list((await db.execute(
+        select(Staff)
+        .where(
+            Staff.user_id == user.id,
+            Staff.entity_id == user.entity_id,
+        )
+        .order_by(Staff.id)
+        .execution_options(populate_existing=True)
+        .with_for_update()
+    )).scalars().all())
+    role_ids = {staff.role_id for staff in staff_rows if staff.role_id}
+    if role_ids:
+        await db.execute(
+            select(StaffRole)
+            .where(
+                StaffRole.id.in_(role_ids),
+                StaffRole.entity_id == user.entity_id,
+            )
+            .order_by(StaffRole.id)
+            .execution_options(populate_existing=True)
+            .with_for_update()
+        )
+    await db.execute(
+        select(WorkspaceStaff)
+        .where(
+            WorkspaceStaff.workspace_id == workspace_id,
+            WorkspaceStaff.user_id == user.id,
+        )
+        .order_by(WorkspaceStaff.id)
+        .execution_options(populate_existing=True)
+        .with_for_update()
+    )
+
+    subject_ids = {
+        user.id,
+        *(
+            staff.id
+            for staff in staff_rows
+            if staff.status == "active" and staff.deleted_at is None
+        ),
+    }
+    await db.execute(
+        select(ResourceGrant)
+        .where(
+            ResourceGrant.entity_id == user.entity_id,
+            ResourceGrant.subject_type == SubjectType.USER,
+            ResourceGrant.subject_id.in_(subject_ids),
+            ResourceGrant.resource_type.in_([
+                ResourceType.DOCUMENT,
+                ResourceType.DOCUMENT_FOLDER,
+            ]),
+            ResourceGrant.status == GrantStatus.ACTIVE,
+        )
+        .order_by(ResourceGrant.id)
+        .execution_options(populate_existing=True)
+        .with_for_update()
+    )
+    return await effective_user_role_name(db, user)
 
 
 def _workspace_group_network_type(group: DocumentGroup) -> str:
@@ -3307,14 +4386,12 @@ async def create_workspace_document_group(
     db: AsyncSession = Depends(get_db),
 ):
     """Create a user-manageable Knowledge Net scoped to this workspace."""
-    from packages.core.models.base import generate_ulid
-
     ws = await _require_workspace_manage(db, workspace_id, user)
     name = (req.name or "").strip()
     if not name:
         raise HTTPException(400, "Knowledge Net name is required")
     kind = (req.kind or _WORKSPACE_GROUP_FOLDER_KIND).strip() or _WORKSPACE_GROUP_FOLDER_KIND
-    if kind == "knowledge_folder":
+    if kind == WorkspaceDocumentGroupKind.LEGACY_KNOWLEDGE_FOLDER:
         kind = _WORKSPACE_GROUP_FOLDER_KIND
     if kind == _WORKSPACE_GROUP_DEFAULT_KIND:
         existing = await _ensure_default_workspace_collection(
@@ -3341,19 +4418,14 @@ async def create_workspace_document_group(
             "document_count": 0,
             "documents": [],
         }
-    group = DocumentGroup(
-        id=generate_ulid(),
+    group = await create_workspace_knowledge_group(
+        db,
         entity_id=user.entity_id,
         workspace_id=workspace_id,
         name=name,
-        settings={
-            "kind": kind,
-            "scope": "workspace",
-            "purpose": (req.purpose or "").strip(),
-            "user_manageable": True,
-        },
+        kind=kind,
+        purpose=req.purpose or "",
     )
-    db.add(group)
     await db.commit()
     await _mark_workspace_knowledge_changed(user.entity_id, workspace_id)
     await db.refresh(group)
@@ -3403,7 +4475,11 @@ async def update_workspace_document_group(
         _set_group_purpose_in_operating_model(ws, group.id, purpose)
     if req.kind is not None and not settings.get("workspace_file_bucket") and not _is_workspace_default_collection(group):
         next_kind = req.kind.strip() or _WORKSPACE_GROUP_FOLDER_KIND
-        settings["kind"] = _WORKSPACE_GROUP_FOLDER_KIND if next_kind == "knowledge_folder" else next_kind
+        settings["kind"] = (
+            _WORKSPACE_GROUP_FOLDER_KIND
+            if next_kind == WorkspaceDocumentGroupKind.LEGACY_KNOWLEDGE_FOLDER
+            else next_kind
+        )
     group.settings = settings
     await db.commit()
     await _mark_workspace_knowledge_changed(user.entity_id, workspace_id)
@@ -3464,7 +4540,11 @@ async def add_workspace_document_group_members(
 ):
     """Attach existing Knowledge documents to a workspace group."""
     from packages.core.services.document_service import add_document_to_group
-    from packages.core.services.document_access import get_visible_document
+    from packages.core.models.permission import Capability
+    from packages.core.services.document_access import (
+        get_visible_document,
+        partition_documents_by_capability,
+    )
 
     await _require_workspace_manage(db, workspace_id, user)
     await _require_workspace_document_group(
@@ -3483,7 +4563,7 @@ async def add_workspace_document_group_members(
     if not doc_ids:
         raise HTTPException(400, "document_ids is required")
 
-    added = 0
+    visible_documents = []
     skipped: list[str] = []
     for doc_id in doc_ids:
         doc = await get_visible_document(
@@ -3497,6 +4577,25 @@ async def add_workspace_document_group_members(
         if not doc:
             skipped.append(doc_id)
             continue
+        visible_documents.append(doc)
+    manageable_documents, _ = await partition_documents_by_capability(
+        db,
+        visible_documents,
+        entity_id=user.entity_id,
+        user_id=user.id,
+        role=user.role,
+        required_capability=Capability.MANAGE_METADATA,
+        workspace_id=workspace_id,
+    )
+    manageable_by_id = {document.id: document for document in manageable_documents}
+
+    added = 0
+    for doc_id in doc_ids:
+        doc = manageable_by_id.get(doc_id)
+        if doc is None:
+            if doc_id not in skipped:
+                skipped.append(doc_id)
+            continue
         if await add_document_to_group(db, doc.id, group_id, entity_id=user.entity_id):
             added += 1
         else:
@@ -3505,6 +4604,321 @@ async def add_workspace_document_group_members(
     if added:
         await _mark_workspace_knowledge_changed(user.entity_id, workspace_id)
     return {"added": added, "skipped": skipped, "total": len(doc_ids)}
+
+
+@router.post(
+    "/{workspace_id}/documents/folders/{folder_id}",
+    response_model=WorkspaceKnowledgeFolderAddResponse,
+)
+async def add_knowledge_folder_to_workspace(
+    workspace_id: str,
+    folder_id: str,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Attach every visible document in a Knowledge folder subtree.
+
+    Workspace Knowledge Nets are flat collections, so one source folder maps
+    to one same-named Net. Repeating the operation reuses that Net and adds
+    only documents that are not already members.
+    """
+    from packages.core.models.base import generate_ulid
+    from packages.core.models.document import Document, DocumentFolder
+    from packages.core.models.permission import Capability
+    from packages.core.services.document_access import (
+        list_visible_document_ids_batched,
+        partition_documents_by_capability,
+        user_can_read_folder,
+        user_has_folder_capability,
+    )
+    from packages.core.services.document_service import add_documents_to_group
+    from packages.core.services.knowledge_visibility import (
+        is_user_visible_folder_path,
+    )
+
+    await _require_workspace_manage(db, workspace_id, user)
+    source_folder = (await db.execute(
+        select(DocumentFolder).where(
+            DocumentFolder.id == folder_id,
+            DocumentFolder.entity_id == user.entity_id,
+        )
+    )).scalar_one_or_none()
+    if source_folder is None:
+        raise HTTPException(404, "Knowledge folder not found")
+
+    path_parts: list[str] = []
+    current = source_folder
+    path_seen: set[str] = set()
+    while current and current.id not in path_seen:
+        path_seen.add(current.id)
+        path_parts.append(current.name)
+        if not await user_can_read_folder(
+            db,
+            current,
+            entity_id=user.entity_id,
+            user_id=user.id,
+            role=user.role,
+        ):
+            raise HTTPException(404, "Knowledge folder not found")
+        if not current.parent_id:
+            current = None
+            continue
+        current = (await db.execute(
+            select(DocumentFolder).where(
+                DocumentFolder.id == current.parent_id,
+                DocumentFolder.entity_id == user.entity_id,
+            )
+        )).scalar_one_or_none()
+    if not is_user_visible_folder_path("/".join(reversed(path_parts))):
+        raise HTTPException(404, "Knowledge folder not found")
+    can_manage_source_folder = (
+        source_folder.owner_id == user.id
+        or await user_is_effective_entity_admin(db, user)
+        or await user_has_folder_capability(
+            db,
+            entity_id=user.entity_id,
+            folder_id=source_folder.id,
+            user_id=user.id,
+            capabilities={Capability.MANAGE_METADATA},
+        )
+    )
+    if not can_manage_source_folder:
+        raise HTTPException(
+            403,
+            "Folder metadata management permission is required",
+        )
+
+    folder_tree = select(DocumentFolder.id).where(
+        DocumentFolder.id == source_folder.id,
+        DocumentFolder.entity_id == user.entity_id,
+    ).cte("knowledge_folder_tree", recursive=True)
+    folder_tree = folder_tree.union(
+        select(DocumentFolder.id)
+        .join(folder_tree, DocumentFolder.parent_id == folder_tree.c.id)
+        .where(DocumentFolder.entity_id == user.entity_id)
+    )
+    subtree_ids = set((await db.execute(
+        select(folder_tree.c.id)
+    )).scalars().all())
+
+    try:
+        document_ids = await list_visible_document_ids_batched(
+            db,
+            user.entity_id,
+            user_id=user.id,
+            role=user.role,
+            folder_ids=subtree_ids,
+            required_capability=Capability.MANAGE_METADATA,
+        )
+    except PermissionError as exc:
+        raise HTTPException(
+            403,
+            "Every imported document must allow metadata management",
+        ) from exc
+
+    # Serialize only the same-folder Net lookup/create and member upserts. The
+    # recursive permission scan above can be large and must not block unrelated
+    # Workspace management for its entire duration.
+    locked_workspace_id = (await db.execute(
+        select(Workspace.id).where(
+            Workspace.id == workspace_id,
+            Workspace.entity_id == user.entity_id,
+            Workspace.deleted_at.is_(None),
+        ).with_for_update()
+    )).scalar_one_or_none()
+    if locked_workspace_id is None:
+        raise HTTPException(404, "Workspace not found")
+    # The recursive scan intentionally happens outside the Workspace lock.
+    # Lock every row that can authorize this actor before re-checking, so a
+    # concurrent role, membership, or grant revocation commits after this
+    # import rather than between its authorization check and member writes.
+    effective_entity_role = await _lock_workspace_knowledge_import_authority(
+        db,
+        workspace_id=workspace_id,
+        user=user,
+    )
+    if not await user_can_manage_workspace(
+        db,
+        workspace_id=workspace_id,
+        user_id=user.id,
+        entity_role=effective_entity_role,
+    ):
+        raise HTTPException(
+            403,
+            "Only an entity owner/admin or the workspace owner can manage this workspace",
+        )
+    source_folder = (await db.execute(
+        select(DocumentFolder)
+        .where(
+            DocumentFolder.id == folder_id,
+            DocumentFolder.entity_id == user.entity_id,
+        )
+        .execution_options(populate_existing=True)
+        .with_for_update()
+    )).scalar_one_or_none()
+    if source_folder is None:
+        raise HTTPException(404, "Knowledge folder not found")
+    current = source_folder
+    path_parts = []
+    path_seen = set()
+    while current and current.id not in path_seen:
+        path_seen.add(current.id)
+        path_parts.append(current.name)
+        if not await user_can_read_folder(
+            db,
+            current,
+            entity_id=user.entity_id,
+            user_id=user.id,
+            role=effective_entity_role,
+        ):
+            raise HTTPException(404, "Knowledge folder not found")
+        if not current.parent_id:
+            current = None
+            continue
+        current = (await db.execute(
+            select(DocumentFolder)
+            .where(
+                DocumentFolder.id == current.parent_id,
+                DocumentFolder.entity_id == user.entity_id,
+            )
+            .execution_options(populate_existing=True)
+            .with_for_update()
+        )).scalar_one_or_none()
+    if not is_user_visible_folder_path("/".join(reversed(path_parts))):
+        raise HTTPException(404, "Knowledge folder not found")
+    can_manage_source_folder = (
+        source_folder.owner_id == user.id
+        or effective_entity_role in {"owner", "admin"}
+        or await user_has_folder_capability(
+            db,
+            entity_id=user.entity_id,
+            folder_id=source_folder.id,
+            user_id=user.id,
+            capabilities={Capability.MANAGE_METADATA},
+        )
+    )
+    if not can_manage_source_folder:
+        raise HTTPException(
+            403,
+            "Folder metadata management permission is required",
+        )
+
+    current_folder_tree = select(DocumentFolder.id).where(
+        DocumentFolder.id == source_folder.id,
+        DocumentFolder.entity_id == user.entity_id,
+    ).cte("current_knowledge_folder_tree", recursive=True)
+    current_folder_tree = current_folder_tree.union(
+        select(DocumentFolder.id)
+        .join(
+            current_folder_tree,
+            DocumentFolder.parent_id == current_folder_tree.c.id,
+        )
+        .where(DocumentFolder.entity_id == user.entity_id)
+    )
+    # Folder moves/deletes update these rows, so lock the current subtree in a
+    # deterministic order before validating its original document snapshot.
+    await db.execute(
+        select(DocumentFolder)
+        .where(
+            DocumentFolder.entity_id == user.entity_id,
+            DocumentFolder.id.in_(select(current_folder_tree.c.id)),
+        )
+        .order_by(DocumentFolder.id)
+        .execution_options(populate_existing=True)
+        .with_for_update()
+    )
+    if document_ids:
+        manageable_document_ids: set[str] = set()
+        for start in range(
+            0,
+            len(document_ids),
+            _WORKSPACE_KNOWLEDGE_REVALIDATION_BATCH_SIZE,
+        ):
+            document_batch = document_ids[
+                start : start + _WORKSPACE_KNOWLEDGE_REVALIDATION_BATCH_SIZE
+            ]
+            current_documents = list((await db.execute(
+                select(Document)
+                .where(
+                    Document.id.in_(document_batch),
+                    Document.entity_id == user.entity_id,
+                    Document.folder_id.in_(select(current_folder_tree.c.id)),
+                    Document.is_trashed.is_(False),
+                )
+                .order_by(Document.id)
+                .execution_options(populate_existing=True)
+                .with_for_update()
+            )).scalars().all())
+            manageable_documents, _ = await partition_documents_by_capability(
+                db,
+                current_documents,
+                entity_id=user.entity_id,
+                user_id=user.id,
+                role=effective_entity_role,
+                required_capability=Capability.MANAGE_METADATA,
+            )
+            manageable_document_ids.update(
+                document.id for document in manageable_documents
+            )
+        if manageable_document_ids != set(document_ids):
+            raise HTTPException(
+                403,
+                "Every imported document must allow metadata management",
+            )
+    groups = list((await db.execute(
+        select(DocumentGroup).where(
+            DocumentGroup.entity_id == user.entity_id,
+            DocumentGroup.workspace_id == workspace_id,
+        )
+    )).scalars().all())
+    group = next(
+        (
+            candidate
+            for candidate in groups
+            if isinstance((candidate.settings or {}).get("knowledge_folder_source"), dict)
+            and (candidate.settings or {})["knowledge_folder_source"].get("folder_id") == source_folder.id
+        ),
+        None,
+    )
+    created = group is None
+    if group is None:
+        group = DocumentGroup(
+            id=generate_ulid(),
+            entity_id=user.entity_id,
+            workspace_id=workspace_id,
+            name=source_folder.name,
+            settings={
+                "kind": _WORKSPACE_GROUP_FOLDER_KIND,
+                "scope": "workspace",
+                "purpose": f"Documents from the Knowledge folder {source_folder.name}.",
+                "user_manageable": True,
+                "knowledge_folder_source": {
+                    "folder_id": source_folder.id,
+                    "mode": "recursive_snapshot",
+                },
+            },
+        )
+        db.add(group)
+        await db.flush()
+
+    added = await add_documents_to_group(
+        db,
+        document_ids,
+        group.id,
+        entity_id=user.entity_id,
+    )
+    await db.commit()
+    if created or added:
+        await _mark_workspace_knowledge_changed(user.entity_id, workspace_id)
+
+    return WorkspaceKnowledgeFolderAddResponse(
+        group_id=group.id,
+        group_name=group.name,
+        created=created,
+        added=added,
+        existing=len(document_ids) - added,
+        total=len(document_ids),
+    )
 
 
 @router.delete("/{workspace_id}/documents/groups/{group_id}/members/{document_id}", status_code=204)
@@ -3568,7 +4982,7 @@ async def create_sandbox(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """One-click "Try a demo" — provisions a complete sandbox workspace
+    """One-click "Try a demo" — provisions a complete Workspace simulation
     (workspace + agent + subscription + goal + 1 starter task) so the
     user can see the full Strategist→Planner→Executor→chat pipeline
     without connecting any real integrations.
@@ -3638,7 +5052,7 @@ async def create_sandbox(
         except Exception:
             import logging
             logging.getLogger(__name__).warning(
-                "sandbox: memory seeding failed (workspace still usable)",
+                "Workspace simulation: memory seeding failed (Workspace still usable)",
                 exc_info=True,
             )
 
@@ -3765,11 +5179,239 @@ async def update_workspace_budget(
 # second — nothing upgrades on its own.
 
 
-async def _blueprint_payload_for(db: AsyncSession, ws) -> dict | None:
+class BlueprintConflictResolutionRequest(BaseModel):
+    kind: Literal["skill", "agent", "workflow"]
+    slug: str = Field(min_length=1, max_length=200)
+    resolution: Literal["keep_yours", "use_blueprint"]
+    expected_revision: int = Field(ge=1)
+
+
+class BlueprintUpgradeVariableValuesRequest(BaseModel):
+    variable_values: dict[str, Any] = Field(default_factory=dict, max_length=50)
+    channel_config_ids: dict[str, str] = Field(default_factory=dict, max_length=50)
+
+
+class BlueprintUpgradePreviewRequest(BlueprintUpgradeVariableValuesRequest):
+    pass
+
+
+class BlueprintUpgradeApplyRequest(BlueprintUpgradeVariableValuesRequest):
+    expected_blueprint_fingerprint: str = Field(min_length=1, max_length=128)
+    conflict_resolutions: list[BlueprintConflictResolutionRequest] = Field(
+        default_factory=list,
+        max_length=200,
+    )
+
+
+BLUEPRINT_UPGRADE_PROTOCOL_VERSION = 2
+
+
+async def _blueprint_payload_for(db: AsyncSession, ws) -> tuple | None:
     """The payload this workspace would upgrade toward — built-in or
     marketplace, resolved the same way the list does."""
-    resolved = (await _blueprint_payloads_for(db, [ws])).get(ws.id)
-    return resolved[0] if resolved else None
+    return (await _blueprint_payloads_for(db, [ws])).get(ws.id)
+
+
+async def _require_blueprint_upgrade_access(
+    db: AsyncSession,
+    *,
+    user: User,
+    resolved_blueprint_id: str | None,
+) -> None:
+    """Apply the same paid-content gate used by Blueprint installation."""
+    if not resolved_blueprint_id:
+        return
+
+    from packages.core.models.blueprint import WorkspaceBlueprint
+    from packages.core.constants.blueprints import BlueprintPurchaseStatus
+    from packages.core.models.blueprint_purchase import BlueprintPurchase
+    from packages.core.services.marketplace_billing import (
+        MarketplacePaidPlanRequiredError,
+        require_paid_marketplace_plan,
+    )
+
+    row = await db.get(WorkspaceBlueprint, resolved_blueprint_id)
+    if (
+        row is None
+        or row.entity_id == user.entity_id
+        or (row.price_cents or 0) <= 0
+    ):
+        return
+
+    try:
+        await require_paid_marketplace_plan(
+            db,
+            entity_id=user.entity_id,
+            blueprint_id=row.id,
+        )
+    except MarketplacePaidPlanRequiredError as exc:
+        raise HTTPException(402, detail=exc.detail) from exc
+
+    purchase_id = (await db.execute(
+        select(BlueprintPurchase.id).where(
+            BlueprintPurchase.blueprint_id == row.id,
+            BlueprintPurchase.buyer_entity_id == user.entity_id,
+            BlueprintPurchase.status == BlueprintPurchaseStatus.COMPLETED.value,
+        ).limit(1)
+    )).scalar_one_or_none()
+    if purchase_id is None:
+        raise HTTPException(402, "purchase required to upgrade this blueprint")
+
+
+async def _blueprint_upgrade_setup_preflight(
+    db: AsyncSession,
+    *,
+    payload: dict | None,
+    user: User,
+    workspace_id: str,
+    selected_channel_config_ids: dict[str, str] | None = None,
+) -> dict:
+    if not payload:
+        return {"ready": True, "blocking_count": 0, "requirements": []}
+    from packages.core.blueprints.setup_preflight import (
+        BlueprintSetupPreflightError,
+        BlueprintSetupPreflightFactory,
+    )
+
+    try:
+        result = await BlueprintSetupPreflightFactory.from_payload(
+            db,
+            payload=payload,
+            entity_id=user.entity_id,
+            user_id=user.id,
+            workspace_id=workspace_id,
+            selected_channel_config_ids=selected_channel_config_ids,
+        )
+    except BlueprintSetupPreflightError as exc:
+        logger.warning("Blueprint upgrade preflight rejected a payload", exc_info=True)
+        raise HTTPException(
+            400,
+            "Blueprint setup requirements could not be evaluated.",
+        ) from exc
+    requirements = [{
+        "kind": item.kind.value,
+        "provider": item.provider,
+        "label": item.label,
+        "required": item.required,
+        "ready": item.ready,
+        "reason": item.reason,
+        "purpose": item.purpose,
+        "setup_kind": item.setup_kind,
+        "scope": item.scope,
+        "config_fields_to_set": list(item.config_fields_to_set),
+        "requirement_key": item.requirement_key,
+        "resource_id": item.resource_id,
+        "resource_options": [
+            {"id": option.id, "label": option.label}
+            for option in item.resource_options
+        ],
+    } for item in result.requirements]
+    return {
+        "ready": result.ready,
+        "blocking_count": len(result.blocking_requirements),
+        "requirements": requirements,
+    }
+
+
+def _blueprint_upgrade_variable_inputs(
+    *,
+    workspace: Workspace,
+    payload: dict | None,
+    supplied: dict[str, Any] | None,
+) -> tuple[dict[str, Any], list[str]]:
+    declarations = {
+        str(item.get("key")): item
+        for item in ((payload or {}).get("contract") or {}).get("variables") or []
+        if isinstance(item, dict) and item.get("key")
+    }
+    saved = (workspace.settings or {}).get("blueprint_personalization")
+    values = {
+        key: value
+        for key, value in (saved if isinstance(saved, dict) else {}).items()
+        if key in declarations
+    }
+    values.update(dict(supplied or {}))
+    resolved_keys = []
+    for key, declaration in declarations.items():
+        value = values.get(key, declaration.get("default"))
+        if value is not None and not (
+            isinstance(value, str) and not value.strip()
+        ):
+            resolved_keys.append(key)
+    return values, resolved_keys
+
+
+async def _preview_blueprint_upgrade(
+    *,
+    workspace_id: str,
+    variable_values: dict[str, Any],
+    channel_config_ids: dict[str, str] | None,
+    user: User,
+    db: AsyncSession,
+) -> dict[str, Any]:
+    ws = await _require_workspace_read(db, workspace_id, user)
+    from apps.api.routers.blueprints import _payload_setup_preview
+    from packages.core.blueprints.installer import (
+        InstallError,
+        resolve_install_variables,
+    )
+    from packages.core.blueprints.upgrade import plan
+
+    resolved = await _blueprint_payload_for(db, ws)
+    source_payload, _current_version, resolved_id = (
+        resolved if resolved else (None, None, None)
+    )
+    await _require_blueprint_upgrade_access(
+        db,
+        user=user,
+        resolved_blueprint_id=resolved_id,
+    )
+    effective_payload = source_payload
+    variables_ready = True
+    resolved_variable_keys: list[str] = []
+    if isinstance(source_payload, dict):
+        merged_values, resolved_variable_keys = _blueprint_upgrade_variable_inputs(
+            workspace=ws,
+            payload=source_payload,
+            supplied=variable_values,
+        )
+        try:
+            effective_payload, _personalization = resolve_install_variables(
+                source_payload,
+                merged_values,
+            )
+        except InstallError:
+            variables_ready = False
+            # An unresolved raw payload must never be compared with already
+            # materialized Workspace content. The variable form remains
+            # available, but component planning waits for valid values.
+            effective_payload = None
+    result = await plan(
+        db,
+        workspace=ws,
+        payload=effective_payload,
+        source_payload=source_payload,
+        source_blueprint_id=resolved_id,
+    )
+    setup_preflight = (
+        await _blueprint_upgrade_setup_preflight(
+            db,
+            payload=effective_payload,
+            user=user,
+            workspace_id=ws.id,
+            selected_channel_config_ids=channel_config_ids,
+        )
+        if variables_ready
+        else {"ready": True, "blocking_count": 0, "requirements": []}
+    )
+    return {
+        "upgrade_protocol_version": BLUEPRINT_UPGRADE_PROTOCOL_VERSION,
+        "setup_preflight": setup_preflight,
+        "setup_preview": _payload_setup_preview(source_payload).model_dump(),
+        "variables_ready": variables_ready,
+        "resolved_variable_keys": resolved_variable_keys,
+        **result,
+    }
 
 
 @router.get("/{workspace_id}/blueprint/upgrade")
@@ -3779,44 +5421,135 @@ async def preview_blueprint_upgrade(
     db: AsyncSession = Depends(get_db),
 ):
     """What an upgrade would change. Reads only — this is what gets confirmed."""
-    ws = await _require_workspace_read(db, workspace_id, user)
-    from packages.core.blueprints.upgrade import plan
+    return await _preview_blueprint_upgrade(
+        workspace_id=workspace_id,
+        variable_values={},
+        channel_config_ids={},
+        user=user,
+        db=db,
+    )
 
-    return await plan(db, workspace=ws, payload=await _blueprint_payload_for(db, ws))
 
-
-@router.post("/{workspace_id}/blueprint/upgrade")
-async def apply_blueprint_upgrade(
+@router.post("/{workspace_id}/blueprint/upgrade/preview")
+async def preview_blueprint_upgrade_with_variables(
     workspace_id: str,
+    req: BlueprintUpgradePreviewRequest,
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Apply the update. Items the workspace edited are left alone, and the
-    previous values are kept so this can be undone."""
+    """Rebuild the reviewed plan with typed one-shot Blueprint values."""
+    return await _preview_blueprint_upgrade(
+        workspace_id=workspace_id,
+        variable_values=req.variable_values,
+        channel_config_ids=req.channel_config_ids,
+        user=user,
+        db=db,
+    )
+
+
+@router.post("/{workspace_id}/blueprint/upgrade/v2")
+@router.post("/{workspace_id}/blueprint/upgrade")
+async def apply_blueprint_upgrade(
+    workspace_id: str,
+    req: BlueprintUpgradeApplyRequest,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Apply the reviewed update. Workspace edits stay untouched unless the
+    operator explicitly chose the Blueprint version; overwritten values are
+    retained so the update can be undone."""
     ws = await _require_workspace_manage(db, workspace_id, user)
-    from packages.core.blueprints.upgrade import apply
+    from packages.core.blueprints.upgrade import (
+        BlueprintUpgradeAccessDeniedError,
+        BlueprintUpgradeIncompleteError,
+        BlueprintUpgradePlanChangedError,
+        apply,
+    )
 
     resolved = (await _blueprint_payloads_for(db, [ws])).get(ws.id)
-    payload, current_version, resolved_id = resolved if resolved else (None, None, None)
-    if resolved_id:
-        from packages.core.blueprints.freshness import (
-            BLUEPRINT_ID_KEY,
-            BLUEPRINT_SETTINGS_KEY,
-            installed_blueprint_record,
-        )
-
-        settings = dict(ws.settings or {})
-        record = dict(installed_blueprint_record(settings))
-        if record.get(BLUEPRINT_ID_KEY) != resolved_id:
-            record[BLUEPRINT_ID_KEY] = resolved_id
-            settings[BLUEPRINT_SETTINGS_KEY] = record
-            ws.settings = settings
-    result = await apply(
-        db, workspace=ws, payload=payload,
-        by_user_id=user.id, current_version=current_version,
+    source_payload, current_version, resolved_id = (
+        resolved if resolved else (None, None, None)
     )
+    await _require_blueprint_upgrade_access(
+        db,
+        user=user,
+        resolved_blueprint_id=resolved_id,
+    )
+    from packages.core.blueprints.installer import (
+        InstallError,
+        resolve_install_variables,
+    )
+
+    payload = source_payload
+    personalization: dict[str, Any] | None = None
+    try:
+        if isinstance(source_payload, dict):
+            merged_values, _resolved_keys = _blueprint_upgrade_variable_inputs(
+                workspace=ws,
+                payload=source_payload,
+                supplied=req.variable_values,
+            )
+            payload, personalization = resolve_install_variables(
+                source_payload,
+                merged_values,
+            )
+    except InstallError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail="Blueprint personalization values are incomplete or invalid.",
+        ) from exc
+    setup_preflight = await _blueprint_upgrade_setup_preflight(
+        db,
+        payload=payload,
+        user=user,
+        workspace_id=ws.id,
+        selected_channel_config_ids=req.channel_config_ids,
+    )
+    if not setup_preflight["ready"]:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "blueprint_setup_required",
+                "message": (
+                    "Connect all newly required Blueprint integrations, channels, "
+                    "and sessions before upgrading the Workspace."
+                ),
+                "preflight": setup_preflight,
+            },
+        )
+    try:
+        result = await apply(
+            db,
+            workspace=ws,
+            payload=payload,
+            source_payload=source_payload,
+            personalization=personalization,
+            by_user_id=user.id,
+            current_version=current_version,
+            source_blueprint_id=resolved_id,
+            expected_blueprint_fingerprint=req.expected_blueprint_fingerprint,
+            conflict_resolutions=[
+                item.model_dump() for item in req.conflict_resolutions
+            ],
+            channel_config_ids={
+                requirement["requirement_key"]: requirement["resource_id"]
+                for requirement in setup_preflight["requirements"]
+                if requirement.get("requirement_key") and requirement.get("resource_id")
+            } | req.channel_config_ids,
+            actor=user,
+            require_complete_workspace=True,
+        )
+    except BlueprintUpgradeAccessDeniedError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except BlueprintUpgradeIncompleteError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except BlueprintUpgradePlanChangedError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     await db.commit()
-    return result
+    return {
+        "upgrade_protocol_version": BLUEPRINT_UPGRADE_PROTOCOL_VERSION,
+        **result,
+    }
 
 
 @router.post("/{workspace_id}/blueprint/revert")
@@ -3827,8 +5560,22 @@ async def revert_blueprint_upgrade(
 ):
     """Put back what the most recent upgrade overwrote."""
     ws = await _require_workspace_manage(db, workspace_id, user)
-    from packages.core.blueprints.upgrade import revert
+    from packages.core.blueprints.upgrade import (
+        BlueprintUpgradeAccessDeniedError,
+        BlueprintUpgradePlanChangedError,
+        revert,
+    )
 
-    result = await revert(db, workspace=ws, by_user_id=user.id)
+    try:
+        result = await revert(
+            db,
+            workspace=ws,
+            by_user_id=user.id,
+            actor=user,
+        )
+    except BlueprintUpgradeAccessDeniedError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except BlueprintUpgradePlanChangedError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     await db.commit()
     return result

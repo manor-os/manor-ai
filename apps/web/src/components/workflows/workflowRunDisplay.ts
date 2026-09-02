@@ -72,6 +72,7 @@ export interface WorkflowRunView {
   nodes: WorkflowRunNode[];
   workflowId?: string;
   currentNodeId?: string | null;
+  retryFromStepId?: string | null;
   attemptNumber?: number;
   startedAt?: string | null;
   completedAt?: string | null;
@@ -1371,4 +1372,11 @@ export function canRetryWithoutCorrection(run: WorkflowHistoryRun): boolean {
     && run.status === "failed"
     && Boolean(run.retry_from_step_id || run.current_step_id)
     && !hasCorrectionRequirement(run.error);
+}
+
+export function canShowDirectWorkflowRetry(
+  run: WorkflowHistoryRun,
+  hasVisibleIntervention: boolean,
+): boolean {
+  return !hasVisibleIntervention && canRetryWithoutCorrection(run);
 }

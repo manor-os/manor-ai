@@ -84,7 +84,12 @@ class WorkspaceStaff(Base, TimestampMixin):
     """
     __tablename__ = "workspace_staff"
     __table_args__ = (
-        Index("ix_workspace_staff_workspace_user", "workspace_id", "user_id"),
+        Index(
+            "uq_workspace_staff_workspace_user",
+            "workspace_id",
+            "user_id",
+            unique=True,
+        ),
         Index("ix_workspace_staff_user", "user_id"),
     )
 
@@ -113,7 +118,9 @@ class Agent(Base, TimestampMixin, SoftDeleteMixin):
     entity_id: Mapped[Optional[str]] = mapped_column(String(26))  # NULL = platform template
     # Ownership triple read by packages/core/services/resource_access.py.
     # NULL owner = pre-migration row (only an entity admin may modify it);
-    # NULL workspace = shared entity-wide rather than scoped to one workspace.
+    # workspace_id records the owning/home Workspace for access and lifecycle.
+    # Deployment is separate: an explicit subscription may reuse this Agent in
+    # other Workspaces, and NULL means it has no home Workspace.
     owner_user_id: Mapped[Optional[str]] = mapped_column(String(26))
     workspace_id: Mapped[Optional[str]] = mapped_column(String(26))
     visibility: Mapped[str] = mapped_column(

@@ -3,14 +3,21 @@ from __future__ import annotations
 
 import re
 from datetime import datetime, timezone
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from packages.core.constants.agents import is_master_agent
 from packages.core.models.base import generate_ulid
 from packages.core.models.task import Task
 from packages.core.models.task_template import TaskTemplate
+from packages.core.services.reusable_resource_locks import (
+    lock_reusable_resource_references,
+)
+
+if TYPE_CHECKING:
+    from packages.core.models.scheduler import ScheduledJob
 
 
 # ── CRUD ──
@@ -49,6 +56,12 @@ async def create_template(
     details_template: dict | None = None,
     tags: list[str] | None = None,
 ) -> TaskTemplate:
+    if default_agent_id and not is_master_agent(default_agent_id):
+        await lock_reusable_resource_references(
+            db,
+            entity_id=entity_id,
+            agent_ids=(default_agent_id,),
+        )
     tmpl = TaskTemplate(
         id=generate_ulid(),
         entity_id=entity_id,
@@ -76,6 +89,17 @@ async def update_template(
     tmpl = await get_template(db, template_id, entity_id)
     if not tmpl:
         return None
+    next_agent_id = kwargs.get("default_agent_id")
+    if (
+        next_agent_id
+        and next_agent_id != tmpl.default_agent_id
+        and not is_master_agent(next_agent_id)
+    ):
+        await lock_reusable_resource_references(
+            db,
+            entity_id=entity_id,
+            agent_ids=(next_agent_id,),
+        )
     for key, value in kwargs.items():
         if value is not None and hasattr(tmpl, key):
             setattr(tmpl, key, value)
@@ -155,8 +179,9 @@ async def setup_recurring_task(
         execution_target={"template_id": template_id},
         user_id=user_id,
     )
-    db.add(job)
-    await db.flush()
+    from packages.core.services.product_growth import persist_scheduled_job
+
+    await persist_scheduled_job(db, job)
 
     # Mark template as recurring
     template.is_recurring = True

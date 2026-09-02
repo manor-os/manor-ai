@@ -4,14 +4,10 @@ import { useAuthStore } from "../stores/auth";
 import { api, ApiError } from "../lib/api";
 import { IconEye, IconEyeOff, IconInfo } from "../components/icons";
 import AuthShell, { AuthBrand } from "../components/auth/AuthShell";
+import { navigateAfterAuth, safeAuthRedirect } from "../lib/authNavigation";
 import { t } from "../lib/i18n";
 
 type Tab = "login" | "register";
-
-function safeAuthRedirect(value: string | null, fallback = "/chat"): string {
-  if (!value || !value.startsWith("/") || value.startsWith("//")) return fallback;
-  return value;
-}
 
 export default function Login() {
   const [searchParams] = useSearchParams();
@@ -22,18 +18,10 @@ export default function Login() {
     ? `/account?team_invite=${encodeURIComponent(teamInviteToken)}`
     : safeNextPath;
   const finishAuthNavigation = useCallback(() => {
-    navigate(inviteRedirectPath, { replace: true });
+    navigateAfterAuth(inviteRedirectPath, navigate);
   }, [inviteRedirectPath, navigate]);
   const defaultTab = searchParams.get("tab") === "register" ? "register" : "login";
   const [tab, setTab] = useState<Tab>(defaultTab);
-  // Set by the API layer when a 401 mid-session forced a redirect here.
-  const [sessionExpired, setSessionExpired] = useState(false);
-  useEffect(() => {
-    if (typeof sessionStorage !== "undefined" && sessionStorage.getItem("manor_session_expired")) {
-      setSessionExpired(true);
-      sessionStorage.removeItem("manor_session_expired");
-    }
-  }, []);
   const [email, setEmail] = useState(() => searchParams.get("email") || "");
   const [password, setPassword] = useState("");
   const [entityName, setEntityName] = useState("");
@@ -215,14 +203,6 @@ export default function Login() {
                 ? t("page.login.sign_in_desc")
                 : t("page.login.create_desc")}
             </p>
-
-            {/* Session expired — redirected here by the API layer on a 401 */}
-            {sessionExpired && tab === "login" && !pending2fa && !pendingVerificationEmail && !showForgotPassword && (
-              <div style={{ marginBottom: 20, padding: 12, borderRadius: 10, background: "#faf7ef", display: "flex", gap: 8, alignItems: "flex-start" }}>
-                <IconInfo size={16} className="shrink-0" style={{ color: "#cf9b44", marginTop: 1 }} />
-                <span style={{ fontSize: 13, color: "#78716c", lineHeight: 1.45 }}>{t("page.login.session_expired")}</span>
-              </div>
-            )}
 
             {/* Error */}
             {error && (
@@ -435,7 +415,6 @@ export default function Login() {
                       <input
                         type={showPassword ? "text" : "password"}
                         required
-                        minLength={12}
                         maxLength={72}
                         value={password}
                         onChange={(e) => setPassword(e.target.value)}

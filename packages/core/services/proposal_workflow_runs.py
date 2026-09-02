@@ -7,10 +7,13 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from packages.core.constants.proposal import ProposalItemKind, ProposalItemStatus
+from packages.core.constants.workflow import WorkflowRunStatus
 from packages.core.models.proposal import ProposalItemRecord
 from packages.core.models.task import Message
 from packages.core.models.user import User
 from packages.core.models.workflow import WorkflowBinding, WorkflowDefinition, WorkflowRun
+from packages.core.proposals.constants import WORKFLOW_RUN_EXTERNAL_ACTION_KEY
 from packages.core.models.workspace import Workspace
 
 
@@ -18,12 +21,29 @@ class ProposalWorkflowRunError(ValueError):
     pass
 
 
+class ProposalWorkflowRunConflict(ProposalWorkflowRunError):
+    """The approved item lost a final dispatch race to existing live work."""
+
+    def __init__(self, run: WorkflowRun, *, workflow_slug: str):
+        self.run_id = run.id
+        self.run_status = run.status
+        self.workflow_slug = workflow_slug
+        super().__init__(
+            f"Workspace Flow {workflow_slug!r} already has active "
+            f"{run.status} run {run.id}"
+        )
+
+
 async def resolve_proposal_workflow_binding(
     db: AsyncSession,
     *,
     item: ProposalItemRecord,
+    lock_binding: bool = False,
 ) -> tuple[Any, WorkflowBinding, WorkflowDefinition, Workspace]:
-    from packages.core.services.workspace_workflow_router import normalize_chat_entrypoint
+    from packages.core.services.workspace_flow_catalog import (
+        WorkspaceFlowCatalogError,
+        resolve_workspace_flow,
+    )
 
     payload = item.payload if isinstance(item.payload, dict) else {}
     workflow_ref = payload.get("workflow_ref") if isinstance(payload.get("workflow_ref"), dict) else {}
@@ -38,36 +58,17 @@ async def resolve_proposal_workflow_binding(
         or workspace.deleted_at is not None
     ):
         raise ProposalWorkflowRunError("Proposal Workspace is unavailable")
-    installed_blueprint = str(
-        ((workspace.settings or {}).get("_blueprint") or {}).get("blueprint_slug")
-        or ""
-    ).strip()
-    if installed_blueprint != blueprint_slug:
-        raise ProposalWorkflowRunError("Referenced Blueprint is not installed in this Workspace")
-    rows = (await db.execute(
-        select(WorkflowBinding, WorkflowDefinition)
-        .join(WorkflowDefinition, WorkflowDefinition.id == WorkflowBinding.workflow_id)
-        .where(
-            WorkflowBinding.entity_id == item.entity_id,
-            WorkflowBinding.workspace_id == item.workspace_id,
-            WorkflowBinding.enabled.is_(True),
-            WorkflowBinding.status == "active",
-            WorkflowDefinition.is_active.is_(True),
-            WorkflowDefinition.status == "active",
+    try:
+        flow = await resolve_workspace_flow(
+            db,
+            workspace=workspace,
+            blueprint_slug=blueprint_slug,
+            workflow_slug=workflow_slug,
+            lock_binding=lock_binding,
         )
-    )).all()
-    matches = [
-        (binding, workflow)
-        for binding, workflow in rows
-        if str((binding.config or {}).get("workspace_blueprint_workflow_slug") or "")
-        == workflow_slug
-    ]
-    if len(matches) != 1:
-        raise ProposalWorkflowRunError("Referenced Workspace Flow is unavailable or ambiguous")
-    binding, workflow = matches[0]
-    entrypoint = normalize_chat_entrypoint(binding, workflow)
-    if entrypoint is None:
-        raise ProposalWorkflowRunError("Referenced Workflow is not a user-facing Flow")
+    except WorkspaceFlowCatalogError as exc:
+        raise ProposalWorkflowRunError(str(exc)) from None
+    entrypoint = flow.entrypoint
     declared_keys = {str(field.get("key") or "") for field in entrypoint.run_inputs}
     inputs = payload.get("inputs") if isinstance(payload.get("inputs"), dict) else {}
     unknown_keys = sorted(set(inputs) - declared_keys)
@@ -75,7 +76,7 @@ async def resolve_proposal_workflow_binding(
         raise ProposalWorkflowRunError(
             f"Unknown Flow input keys: {', '.join(unknown_keys)}"
         )
-    return entrypoint, binding, workflow, workspace
+    return entrypoint, flow.binding, flow.workflow, workspace
 
 
 async def _dispatch_user(
@@ -177,21 +178,67 @@ async def dispatch_workflow_run_item(
         .where(ProposalItemRecord.id == item_id)
         .with_for_update()
     )).scalar_one_or_none()
-    if item is None or item.kind != "workflow_run":
+    if item is None or item.kind != ProposalItemKind.WORKFLOW_RUN:
         raise ProposalWorkflowRunError("Workflow-run Proposal item not found")
     if item.execution_root_id:
         existing = await db.get(WorkflowRun, item.execution_root_id)
         if existing is not None:
             return existing
         raise ProposalWorkflowRunError("Proposal item references a missing Workflow lineage")
-    if item.status != "approved":
+    if item.status != ProposalItemStatus.APPROVED:
         raise ProposalWorkflowRunError("Workflow-run Proposal item is not approved")
-    entrypoint, binding, _workflow, workspace = await resolve_proposal_workflow_binding(
+    entrypoint, binding, workflow, workspace = await resolve_proposal_workflow_binding(
         db,
         item=item,
+        lock_binding=True,
     )
+    from packages.core.services.workspace_flow_catalog import (
+        latest_open_flow_run,
+        workspace_flow_slug,
+    )
+
+    conflict = await latest_open_flow_run(
+        db,
+        workspace=workspace,
+        binding_id=binding.id,
+    )
+    if conflict is not None:
+        raise ProposalWorkflowRunConflict(
+            conflict,
+            workflow_slug=workspace_flow_slug(binding),
+        )
     user = await _dispatch_user(db, workspace=workspace, actor_id=actor_id)
     payload = dict(item.payload or {})
+    from packages.core.services.workflow_action_grant_service import (
+        create_proposal_workflow_action_grant,
+        proposal_workflow_authorization_for_inputs,
+    )
+
+    declaration = proposal_workflow_authorization_for_inputs(
+        (binding.config or {}).get("proposal_authorization"),
+        payload.get("inputs"),
+        workflow_steps=workflow.steps,
+    )
+    authorization_snapshot = payload.get("_proposal_authorization_binding")
+    snapshot_matches = bool(
+        isinstance(authorization_snapshot, dict)
+        and authorization_snapshot.get("binding_id") == binding.id
+        and authorization_snapshot.get("workflow_id") == workflow.id
+        and authorization_snapshot.get("revision") == binding.revision
+        and authorization_snapshot.get("declaration") == declaration
+    )
+    if declaration is not None and (
+        item.action_key != WORKFLOW_RUN_EXTERNAL_ACTION_KEY
+        or item.risk_level != "high"
+        or not snapshot_matches
+    ):
+        raise ProposalWorkflowRunError(
+            "Workflow publication authorization changed after Proposal review"
+        )
+    if declaration is None and item.action_key == WORKFLOW_RUN_EXTERNAL_ACTION_KEY:
+        raise ProposalWorkflowRunError(
+            "Workflow publication authorization is no longer available"
+        )
     source_brief = str(payload.get("source_brief") or "").strip()
     conversation, origin = await _proposal_origin_message(
         db,
@@ -200,7 +247,10 @@ async def dispatch_workflow_run_item(
         user=user,
         source_brief=source_brief,
     )
-    from packages.core.services.workspace_flow_launcher import launch_workspace_flow
+    from packages.core.services.workspace_flow_launcher import (
+        enqueue_workspace_flow_launch,
+        launch_workspace_flow,
+    )
 
     launched = await launch_workspace_flow(
         db,
@@ -224,9 +274,24 @@ async def dispatch_workflow_run_item(
             "proposal_item_id": item.id,
             "run_key": payload.get("run_key"),
         },
+        transaction_owner="caller",
     )
     run = launched.run
-    item.status = "executing"
+    if declaration is not None:
+        grant = await create_proposal_workflow_action_grant(
+            db,
+            item=item,
+            run=run,
+            binding=binding,
+            declaration=declaration,
+            granted_by=user.id,
+        )
+        trigger_data = dict(run.trigger_data or {})
+        runtime_context = dict(trigger_data.get("_workflow_runtime_context") or {})
+        runtime_context["workflow_action_grant_id"] = grant.id
+        trigger_data["_workflow_runtime_context"] = runtime_context
+        run.trigger_data = trigger_data
+    item.status = ProposalItemStatus.EXECUTING
     item.execution_root_id = run.lineage_root_run_id or run.id
     decision = dict(item.decision or {})
     decision.update({
@@ -235,7 +300,11 @@ async def dispatch_workflow_run_item(
         "dispatched_at": datetime.now(timezone.utc).isoformat(),
     })
     item.decision = decision
-    await db.flush()
+    await db.commit()
+    queued = await enqueue_workspace_flow_launch(db, launched)
+    if not queued:
+        await sync_proposal_workflow_run_item(db, run)
+        await db.commit()
     return run
 
 
@@ -256,7 +325,7 @@ async def proposal_item_for_workflow_run(
             ProposalItemRecord.id == item_id,
             ProposalItemRecord.entity_id == run.entity_id,
             ProposalItemRecord.workspace_id == run.workspace_id,
-            ProposalItemRecord.kind == "workflow_run",
+            ProposalItemRecord.kind == ProposalItemKind.WORKFLOW_RUN,
         ).with_for_update()
     )).scalar_one_or_none()
 
@@ -300,23 +369,25 @@ async def sync_proposal_workflow_run_item(
         or ""
     ).strip()
     actionable_completed = (
-        run.status == "completed"
+        run.status == WorkflowRunStatus.COMPLETED
         and business_outcome in {"needs_input", "revision_required"}
     )
-    retryable_failed = run.status == "failed" and bool(retry_from_step_id)
+    retryable_failed = run.status == WorkflowRunStatus.FAILED and bool(
+        retry_from_step_id
+    )
 
     now = datetime.now(timezone.utc)
-    if run.status == "cancelled":
-        item.status = "cancelled"
+    if run.status == WorkflowRunStatus.CANCELLED:
+        item.status = ProposalItemStatus.CANCELLED
         item.finished_at = run.completed_at or now
-    elif run.status == "completed" and not actionable_completed:
-        item.status = "succeeded"
+    elif run.status == WorkflowRunStatus.COMPLETED and not actionable_completed:
+        item.status = ProposalItemStatus.SUCCEEDED
         item.finished_at = run.completed_at or now
-    elif run.status == "failed" and not retryable_failed:
-        item.status = "failed"
+    elif run.status == WorkflowRunStatus.FAILED and not retryable_failed:
+        item.status = ProposalItemStatus.FAILED
         item.finished_at = run.completed_at or now
     else:
-        item.status = "executing"
+        item.status = ProposalItemStatus.EXECUTING
         item.finished_at = None
 
     decision.update({
@@ -329,3 +400,22 @@ async def sync_proposal_workflow_run_item(
     item.decision = decision
     await db.flush()
     return item
+
+
+def mark_workflow_run_item_conflict(
+    item: ProposalItemRecord,
+    conflict: ProposalWorkflowRunConflict,
+) -> None:
+    """Settle a raced duplicate as a deterministic cancellation, not failure."""
+    now = datetime.now(timezone.utc)
+    item.status = ProposalItemStatus.CANCELLED
+    item.finished_at = now
+    decision = dict(item.decision or {})
+    decision.update({
+        "reason_code": "DUPLICATE",
+        "dispatch_error": str(conflict),
+        "conflicting_workflow_run_id": conflict.run_id,
+        "conflicting_workflow_run_status": conflict.run_status,
+        "finished_at": now.isoformat(),
+    })
+    item.decision = decision

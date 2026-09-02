@@ -1,4 +1,4 @@
-"""Simulation report — "should I promote this sandbox to live?"
+"""Simulation report — "should I promote this Workspace simulation to live?"
 
 Reads the steps that ran during the workspace's simulation window and
 produces a digest the operator can stare at for 30 seconds before
@@ -35,6 +35,7 @@ from typing import Any, Optional
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from packages.core.constants.goals import GoalStatus
 from packages.core.governance import get_policy
 from packages.core.governance.policy import decide
 from packages.core.governance.presets import list_presets
@@ -394,7 +395,7 @@ async def _build_goal_pace(
     goals = list((await db.execute(
         select(Goal).where(
             Goal.workspace_id == workspace_id,
-            Goal.status == "active",
+            Goal.status == GoalStatus.ACTIVE.value,
         )
     )).scalars().all())
     if not goals:

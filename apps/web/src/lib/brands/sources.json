@@ -1,0 +1,441 @@
+{
+  "googlenews": {
+    "source": "https://www.gstatic.com/marketing-cms/assets/images/ec/ca/17131dff4c4fa87ba0491b991ae3/news.png",
+    "upstream": "Google official product artwork",
+    "guidelines": "https://about.google/brand-resource-center/products-and-services/",
+    "format": "Original provider PNG",
+    "file": "assets/google-news.png"
+  },
+  "googlebusinessprofile": {
+    "source": "https://www.gstatic.com/marketing-cms/assets/images/49/06/e6b298d84423b883a499fc4aa0ce/business.png",
+    "upstream": "Google official product artwork",
+    "guidelines": "https://about.google/brand-resource-center/products-and-services/",
+    "format": "Original provider PNG",
+    "file": "assets/google-business-profile.png"
+  },
+  "googleplay": {
+    "source": "https://www.gstatic.com/marketing-cms/assets/images/28/fe/f27a2e8f401b92129b9b27764746/play.png",
+    "upstream": "Google official product artwork",
+    "guidelines": "https://about.google/brand-resource-center/products-and-services/",
+    "format": "Original provider PNG",
+    "file": "assets/google-play.png"
+  },
+  "googlecontacts": {
+    "source": "https://www.gstatic.com/marketing-cms/assets/images/ff/21/95f22bf94e35bea3ec097d3f4720/contacts.png",
+    "upstream": "Google official product artwork",
+    "guidelines": "https://about.google/brand-resource-center/products-and-services/",
+    "format": "Original provider PNG",
+    "file": "assets/google-contacts.png"
+  },
+  "googlemaps": {
+    "source": "https://www.gstatic.com/marketing-cms/assets/images/55/0e/c70d6751460a973c06968f0b64e0/logo-maps-2025-color-2x-web-96dp.webp",
+    "upstream": "Google official product artwork",
+    "guidelines": "https://about.google/brand-resource-center/products-and-services/",
+    "format": "Original provider WEBP",
+    "file": "assets/google-maps.webp"
+  },
+  "agilecrm": {
+    "source": "https://raw.githubusercontent.com/n8n-io/n8n/master/packages/nodes-base/nodes/AgileCrm/agilecrm.png",
+    "format": "Locally embedded provider PNG"
+  },
+  "hubspot": {
+    "source": "https://www.hubspot.com/style-guide",
+    "upstream": "simple-icons@16.23.0",
+    "guidelines": "https://www.hubspot.com/style-guide"
+  },
+  "airtable": {
+    "source": "https://airtable.com/newsroom",
+    "upstream": "simple-icons@16.23.0"
+  },
+  "jira": {
+    "source": "https://atlassian.design/resources/logo-library",
+    "upstream": "simple-icons@16.23.0",
+    "guidelines": "https://atlassian.design/foundations/logos/"
+  },
+  "linear": {
+    "source": "https://linear.app",
+    "upstream": "simple-icons@16.23.0"
+  },
+  "zendesk": {
+    "source": "https://brandland.zendesk.com",
+    "upstream": "simple-icons@16.23.0",
+    "guidelines": "https://brandland.zendesk.com"
+  },
+  "trello": {
+    "source": "https://atlassian.design/resources/logo-library",
+    "upstream": "simple-icons@16.23.0",
+    "guidelines": "https://atlassian.design/foundations/logos"
+  },
+  "asana": {
+    "source": "https://asana.com/brand",
+    "upstream": "simple-icons@16.23.0",
+    "guidelines": "https://asana.com/brand"
+  },
+  "mailchimp": {
+    "source": "https://mailchimp.com/about/brand-assets",
+    "upstream": "simple-icons@16.23.0",
+    "guidelines": "https://mailchimp.com/about/brand-assets"
+  },
+  "dropbox": {
+    "source": "https://www.dropbox.com/branding",
+    "upstream": "simple-icons@16.23.0"
+  },
+  "intercom": {
+    "source": "https://www.intercom.com/press",
+    "upstream": "simple-icons@16.23.0",
+    "guidelines": "https://www.intercom.com/press"
+  },
+  "gitlab": {
+    "source": "https://about.gitlab.com/press/press-kit/",
+    "upstream": "simple-icons@16.23.0",
+    "guidelines": "https://about.gitlab.com/handbook/marketing/corporate-marketing/brand-activation/trademark-guidelines/"
+  },
+  "openrouter": {
+    "source": "https://openrouter.ai",
+    "upstream": "simple-icons@16.23.0"
+  },
+  "anthropic": {
+    "source": "https://www.anthropic.com",
+    "upstream": "simple-icons@16.23.0"
+  },
+  "clickup": {
+    "source": "https://clickup.com/brand",
+    "upstream": "simple-icons@16.23.0"
+  },
+  "todoist": {
+    "source": "https://doist.com/press",
+    "upstream": "simple-icons@16.23.0"
+  },
+  "googletasks": {
+    "source": "https://www.gstatic.com/marketing-cms/assets/images/12/ec/17c08d8843a58337e32d8aa16e18/logo-tasks-2026-color-2x-web-64dp.webp",
+    "upstream": "Google official product artwork",
+    "guidelines": "https://about.google/brand-resource-center/products-and-services/",
+    "format": "Original provider WEBP",
+    "file": "assets/google-tasks.webp"
+  },
+  "mysql": {
+    "source": "https://www.mysql.com/about/legal/logos.html",
+    "upstream": "simple-icons@16.23.0",
+    "guidelines": "https://www.mysql.com/about/legal/logos.html"
+  },
+  "mongodb": {
+    "source": "https://www.mongodb.com/pressroom",
+    "upstream": "simple-icons@16.23.0"
+  },
+  "redis": {
+    "source": "https://redis.io/brand-guidelines",
+    "upstream": "simple-icons@16.23.0",
+    "guidelines": "https://redis.io/brand-guidelines"
+  },
+  "supabase": {
+    "source": "https://github.com/supabase/supabase/blob/4031a7549f5d46da7bc79c01d56be4177dc7c114/packages/common/assets/images/supabase-logo-wordmark--light.svg",
+    "upstream": "simple-icons@16.23.0"
+  },
+  "elasticsearch": {
+    "source": "https://www.elastic.co/brand",
+    "upstream": "simple-icons@16.23.0"
+  },
+  "storyblok": {
+    "source": "https://www.storyblok.com/press",
+    "upstream": "simple-icons@16.23.0",
+    "guidelines": "https://www.storyblok.com/press"
+  },
+  "baserow": {
+    "source": "https://baserow.io",
+    "upstream": "simple-icons@16.23.0"
+  },
+  "clockify": {
+    "source": "https://clockify.me/brand-assets",
+    "upstream": "simple-icons@16.23.0"
+  },
+  "googlechrome": {
+    "source": "https://fonts.gstatic.com/s/i/productlogos/chrome/v7/192px.svg",
+    "upstream": "Google official product artwork",
+    "guidelines": "https://about.google/brand-resource-center/products-and-services/",
+    "format": "Original provider SVG",
+    "file": "assets/google-chrome.svg"
+  },
+  "replicate": {
+    "source": "https://replicate.com",
+    "upstream": "simple-icons@16.23.0"
+  },
+  "elevenlabs": {
+    "source": "https://elevenlabs.io/brand",
+    "upstream": "simple-icons@16.23.0",
+    "guidelines": "https://elevenlabs.io/brand"
+  },
+  "claude": {
+    "source": "https://claude.ai",
+    "upstream": "simple-icons@16.23.0"
+  },
+  "googlegemini": {
+    "source": "https://www.gstatic.com/marketing-cms/assets/images/a4/97/92c1ec494d129f3fb8d7caa91584/gemini-update.png",
+    "upstream": "Google official product artwork",
+    "guidelines": "https://about.google/brand-resource-center/products-and-services/",
+    "format": "Original provider PNG",
+    "file": "assets/google-gemini.png"
+  },
+  "cursor": {
+    "source": "https://cursor.com/brand",
+    "upstream": "simple-icons@16.23.0"
+  },
+  "producthunt": {
+    "source": "https://www.producthunt.com/branding",
+    "upstream": "simple-icons@16.23.0",
+    "guidelines": "https://www.producthunt.com/branding"
+  },
+  "google": {
+    "source": "https://www.gstatic.com/marketing-cms/assets/images/4d/ec/8e911638411fbbe504374a60e5de/googleg-gradient-192px.svg",
+    "upstream": "Google official product artwork",
+    "guidelines": "https://about.google/brand-resource-center/products-and-services/",
+    "format": "Original provider SVG",
+    "file": "assets/google.svg"
+  },
+  "amazon": {
+    "source": "https://www.amazon.com",
+    "upstream": "https://raw.githubusercontent.com/simple-icons/simple-icons/11.15.0/icons/amazon.svg"
+  },
+  "microsoftoutlook": {
+    "source": "https://developer.microsoft.com/en-us/outlook/docs",
+    "upstream": "https://raw.githubusercontent.com/simple-icons/simple-icons/11.15.0/icons/microsoftoutlook.svg",
+    "guidelines": "https://www.microsoft.com/en-us/legal/intellectualproperty/trademarks"
+  },
+  "microsoftonedrive": {
+    "source": "https://developer.microsoft.com/en-us/fluentui#/styles/web/colors/products",
+    "upstream": "https://raw.githubusercontent.com/simple-icons/simple-icons/11.15.0/icons/microsoftonedrive.svg",
+    "license": {
+      "type": "custom",
+      "url": "https://aka.ms/fluentui-assets-license"
+    },
+    "guidelines": "https://www.microsoft.com/en-us/legal/intellectualproperty/trademarks"
+  },
+  "microsoftteams": {
+    "source": "https://developer.microsoft.com/en-us/fluentui#/styles/web/colors/products",
+    "upstream": "https://raw.githubusercontent.com/simple-icons/simple-icons/11.15.0/icons/microsoftteams.svg",
+    "license": {
+      "type": "custom",
+      "url": "https://aka.ms/fluentui-assets-license"
+    },
+    "guidelines": "https://www.microsoft.com/en-us/legal/intellectualproperty/trademarks"
+  },
+  "microsoftexcel": {
+    "source": "https://developer.microsoft.com/en-us/fluentui#/styles/web/colors/products",
+    "upstream": "https://raw.githubusercontent.com/simple-icons/simple-icons/11.15.0/icons/microsoftexcel.svg",
+    "license": {
+      "type": "custom",
+      "url": "https://aka.ms/fluentui-assets-license"
+    },
+    "guidelines": "https://www.microsoft.com/en-us/legal/intellectualproperty/trademarks"
+  },
+  "microsoft": {
+    "source": "https://developer.microsoft.com",
+    "upstream": "https://raw.githubusercontent.com/simple-icons/simple-icons/11.15.0/icons/microsoft.svg",
+    "guidelines": "https://www.microsoft.com/en-us/legal/intellectualproperty/trademarks"
+  },
+  "openai": {
+    "source": "https://openai.com",
+    "upstream": "https://raw.githubusercontent.com/simple-icons/simple-icons/11.15.0/icons/openai.svg"
+  },
+  "slack": {
+    "source": "https://slack.com/brand-guidelines",
+    "upstream": "https://raw.githubusercontent.com/simple-icons/simple-icons/11.15.0/icons/slack.svg",
+    "guidelines": "https://slack.com/brand-guidelines"
+  },
+  "linkedin": {
+    "source": "https://brand.linkedin.com",
+    "upstream": "https://raw.githubusercontent.com/simple-icons/simple-icons/11.15.0/icons/linkedin.svg",
+    "guidelines": "https://brand.linkedin.com/policies"
+  },
+  "twilio": {
+    "source": "https://www.twilio.com/company/brand",
+    "upstream": "https://raw.githubusercontent.com/simple-icons/simple-icons/11.15.0/icons/twilio.svg"
+  },
+  "salesforce": {
+    "source": "https://raw.githubusercontent.com/simple-icons/simple-icons/11.15.0/icons/salesforce.svg",
+    "upstream": "https://raw.githubusercontent.com/simple-icons/simple-icons/11.15.0/icons/salesforce.svg"
+  },
+  "postgresql": {
+    "source": "https://raw.githubusercontent.com/simple-icons/simple-icons/11.15.0/icons/postgresql.svg",
+    "upstream": "https://raw.githubusercontent.com/simple-icons/simple-icons/11.15.0/icons/postgresql.svg"
+  },
+  "tavily": {
+    "source": "https://raw.githubusercontent.com/lobehub/lobe-icons/4aaf4ee1fb2678a7f989ea570f0f6ce14a9abf75/src/Tavily/components/Mono.tsx",
+    "license": "MIT; see LOBE-ICONS-LICENSE"
+  },
+  "jimeng": {
+    "source": "https://raw.githubusercontent.com/lobehub/lobe-icons/4aaf4ee1fb2678a7f989ea570f0f6ce14a9abf75/src/Jimeng/components/Mono.tsx",
+    "license": "MIT; see LOBE-ICONS-LICENSE"
+  },
+  "alpha_vantage": {
+    "source": "https://www.alphavantage.co/static/img/favicon.ico",
+    "format": "Original provider favicon; embedded locally"
+  },
+  "twelve_data": {
+    "source": "https://twelvedata.com/build/favicons/favicon-192.png",
+    "format": "Original provider favicon; embedded locally"
+  },
+  "aider": {
+    "source": "https://raw.githubusercontent.com/Aider-AI/aider/5dc9490bb35f9729ef2c95d00a19ccd30c26339c/aider/website/assets/icons/favicon-32x32.png",
+    "format": "Original provider favicon; embedded locally"
+  },
+  "brightdata": {
+    "source": "https://docs.brightdata.com/mintlify-assets/_mintlify/favicons/brightdata/uUUbPQlQGu6JyjN0/_generated/favicon/favicon-32x32.png",
+    "format": "Original provider favicon; embedded locally"
+  },
+  "mindee": {
+    "source": "https://cdn.prod.website-files.com/67e9eeb19d0cc4c32feb7410/67ef7c4440d0a33a439059f1_webclip-mindee.png",
+    "format": "Original provider favicon; embedded locally"
+  },
+  "nango": {
+    "source": "https://raw.githubusercontent.com/nangohq/nango/8de834738aaf0570f69950a3f87467598ce396f2/packages/webapp/public/logo-icon-light.svg",
+    "format": "Original provider SVG"
+  },
+  "continue": {
+    "source": "https://raw.githubusercontent.com/continuedev/continue/5522c6f44ca0ac3528b37244818fbfa39b5af470/extensions/intellij/src/main/resources/META-INF/pluginIcon.svg",
+    "format": "Original provider SVG"
+  },
+  "alpaca": {
+    "source": "https://files.alpaca.markets/webassets/safari-pinned-tab.svg",
+    "format": "Original provider SVG"
+  },
+  "freshdesk": {
+    "source": "https://raw.githubusercontent.com/nangohq/nango/8de834738aaf0570f69950a3f87467598ce396f2/packages/webapp/public/images/template-logos/freshdesk.svg",
+    "format": "Original provider SVG"
+  },
+  "pipedrive": {
+    "source": "https://raw.githubusercontent.com/nangohq/nango/8de834738aaf0570f69950a3f87467598ce396f2/packages/webapp/public/images/template-logos/pipedrive.svg",
+    "format": "Original provider SVG"
+  },
+  "raindrop": {
+    "source": "https://raw.githubusercontent.com/nangohq/nango/8de834738aaf0570f69950a3f87467598ce396f2/packages/webapp/public/images/template-logos/raindrop-mcp.svg",
+    "format": "Original provider SVG"
+  },
+  "sendgrid": {
+    "source": "https://raw.githubusercontent.com/nangohq/nango/8de834738aaf0570f69950a3f87467598ce396f2/packages/webapp/public/images/template-logos/sendgrid.svg",
+    "format": "Original provider SVG"
+  },
+  "mailerlite": {
+    "source": "https://www.mailerlite.com/site/themes/new/img/favicons/safari-pinned-tab.svg",
+    "format": "Original provider SVG"
+  },
+  "siNotion": {
+    "source": "https://www.notion.so",
+    "upstream": "Existing vendored Simple Icons mark"
+  },
+  "siGmail": {
+    "source": "https://www.gstatic.com/marketing-cms/assets/images/3b/69/c8499c0b4d33a35b4cd4ca975e79/logo-gmail-2026-color-2x-web-64dp.webp",
+    "upstream": "Google official product artwork",
+    "guidelines": "https://about.google/brand-resource-center/products-and-services/",
+    "format": "Original provider WEBP",
+    "file": "assets/gmail.webp"
+  },
+  "siDiscord": {
+    "source": "https://discord.com/branding",
+    "guidelines": "https://discord.com/branding",
+    "upstream": "Existing vendored Simple Icons mark"
+  },
+  "siGithub": {
+    "source": "https://github.com/logos",
+    "guidelines": "https://github.com/logos",
+    "upstream": "Existing vendored Simple Icons mark"
+  },
+  "siStripe": {
+    "source": "https://stripe.com/newsroom/information",
+    "upstream": "Existing vendored Simple Icons mark"
+  },
+  "siPaypal": {
+    "source": "https://www.paypal.com/us",
+    "guidelines": "https://newsroom.paypal-corp.com/media-resources",
+    "upstream": "Existing vendored Simple Icons mark"
+  },
+  "siShopify": {
+    "source": "https://www.shopify.com/brand-assets",
+    "guidelines": "https://www.shopify.com/brand-assets",
+    "upstream": "Existing vendored Simple Icons mark"
+  },
+  "siWoocommerce": {
+    "source": "https://woocommerce.com/style-guide",
+    "guidelines": "https://woocommerce.com/trademark-guidelines",
+    "upstream": "Existing vendored Simple Icons mark"
+  },
+  "siGooglecalendar": {
+    "source": "https://www.gstatic.com/marketing-cms/assets/images/66/89/f778a1de49ea98641f402886ce6a/logo-calendar-2026-color-2x-web-64dp.webp",
+    "upstream": "Google official product artwork",
+    "guidelines": "https://about.google/brand-resource-center/products-and-services/",
+    "format": "Original provider WEBP",
+    "file": "assets/google-calendar.webp"
+  },
+  "siGoogledrive": {
+    "source": "https://www.gstatic.com/marketing-cms/assets/images/53/ed/91a2405a4aa28e40fc8c4d5d934d/logo-drive-2026-color-2x-web-64dp.webp",
+    "upstream": "Google official product artwork",
+    "guidelines": "https://about.google/brand-resource-center/products-and-services/",
+    "format": "Original provider WEBP",
+    "file": "assets/google-drive.webp"
+  },
+  "siWhatsapp": {
+    "source": "https://about.meta.com/brand/resources/whatsapp/whatsapp-brand",
+    "guidelines": "https://about.meta.com/brand/resources/whatsapp/whatsapp-brand",
+    "upstream": "Existing vendored Simple Icons mark"
+  },
+  "siTelegram": {
+    "source": "https://telegram.org/tour/screenshots",
+    "upstream": "Existing vendored Simple Icons mark"
+  },
+  "siX": {
+    "source": "https://x.com",
+    "guidelines": "https://about.x.com/en/who-we-are/brand-toolkit",
+    "upstream": "Existing vendored Simple Icons mark"
+  },
+  "siYoutube": {
+    "source": "https://fonts.gstatic.com/s/i/productlogos/youtube/v9/192px.svg",
+    "upstream": "Google official product artwork",
+    "guidelines": "https://about.google/brand-resource-center/products-and-services/",
+    "format": "Original provider SVG",
+    "file": "assets/youtube.svg"
+  },
+  "siTiktok": {
+    "source": "https://tiktok.com",
+    "upstream": "Existing vendored Simple Icons mark"
+  },
+  "siFacebook": {
+    "source": "https://about.meta.com/brand/resources/facebook/logo",
+    "guidelines": "https://about.meta.com/brand/resources/facebook/logo",
+    "upstream": "Existing vendored Simple Icons mark"
+  },
+  "siSquare": {
+    "source": "https://squareup.com",
+    "upstream": "Existing vendored Simple Icons mark"
+  },
+  "siWechat": {
+    "source": "https://wechat.design/tool/brand",
+    "guidelines": "https://wechat.design/brand/main-brand",
+    "upstream": "Existing vendored Simple Icons mark"
+  },
+  "siQuickbooks": {
+    "source": "https://design.intuit.com/quickbooks/brand",
+    "guidelines": "https://design.intuit.com/quickbooks/brand",
+    "upstream": "Existing vendored Simple Icons mark"
+  },
+  "siXiaohongshu": {
+    "source": "https://pro.xiaohongshu.com",
+    "upstream": "Existing vendored Simple Icons mark"
+  },
+  "siGooglesheets": {
+    "source": "https://www.gstatic.com/marketing-cms/assets/images/14/7b/ad10ae6549cba0bbaf0c3545c1c0/logo-sheets-2026-color-2x-web-64dp.webp",
+    "upstream": "Google official product artwork",
+    "guidelines": "https://about.google/brand-resource-center/products-and-services/",
+    "format": "Original provider WEBP",
+    "file": "assets/google-sheets.webp"
+  },
+  "siGoogledocs": {
+    "source": "https://www.gstatic.com/marketing-cms/assets/images/3f/a8/73db6d7b4aedafe318b3a94d2dc9/logo-docs-2026-color-2x-web-64dp.webp",
+    "upstream": "Google official product artwork",
+    "guidelines": "https://about.google/brand-resource-center/products-and-services/",
+    "format": "Original provider WEBP",
+    "file": "assets/google-docs.webp"
+  },
+  "siRobinhood": {
+    "source": "https://press.robinhood.com",
+    "upstream": "Simple Icons 16.23.0; monochrome mark on light surfaces"
+  }
+}

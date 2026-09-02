@@ -727,7 +727,7 @@ async def test_runtime_document_tools_filter_by_user_and_workspace(client: Async
             params={"limit": 10},
         )
     )
-    assert {doc["id"] for doc in viewer_workspace["documents"]} == {workspace_doc_id}
+    assert {doc["document_id"] for doc in viewer_workspace["documents"]} == {workspace_doc_id}
 
     member_workspace = json.loads(
         await runtime_list_documents_action(
@@ -746,7 +746,7 @@ async def test_runtime_document_tools_filter_by_user_and_workspace(client: Async
             params={"limit": 10},
         )
     )
-    assert {doc["id"] for doc in member_entity["documents"]} == {entity_doc_id}
+    assert {doc["document_id"] for doc in member_entity["documents"]} == {entity_doc_id}
 
     rag_viewer = json.loads(
         await runtime_rag_action(

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from types import SimpleNamespace
 
@@ -18,6 +18,7 @@ from packages.core.ai.runtime import (
 from packages.core.models.base import generate_ulid
 from packages.core.models.execution import ExecutionPlan, ExecutionStep
 from packages.core.models.task import Task
+from packages.core.models.user import User
 from packages.core.models.worker import Worker, WorkLease
 from packages.core.workers import internal
 
@@ -46,21 +47,31 @@ async def test_lease_snapshot_inherits_task_proposal_external_authorization(
     entity_id = generate_ulid()
     workspace_id = generate_ulid()
     task_id = generate_ulid()
+    user_id = generate_ulid()
     plan_id = generate_ulid()
     step_id = generate_ulid()
     lease_id = generate_ulid()
     worker_id = generate_ulid()
     authorization = _authorization(task_id=task_id, workspace_id=workspace_id)
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
 
     db_session.add_all(
         [
+            User(
+                id=user_id,
+                entity_id=entity_id,
+                email=f"{user_id.lower()}@example.test",
+                password_hash="not-used-by-this-test",
+                role="owner",
+                status="active",
+            ),
             Task(
                 id=task_id,
                 entity_id=entity_id,
                 workspace_id=workspace_id,
                 title="Publish the verified video",
                 status="in_progress",
+                creator_id=user_id,
                 details={"proposal_external_authorization": authorization},
             ),
             Worker(
@@ -69,7 +80,7 @@ async def test_lease_snapshot_inherits_task_proposal_external_authorization(
                 kind="internal",
                 display_name="Internal worker",
                 capabilities={"supported_kinds": ["subagent"], "max_risk_level": "high"},
-                monthly_spent_usd=Decimal("0"),
+                monthly_spent_usd=Decimal(0),
                 auto_pause_on_budget=True,
                 status="active",
             ),

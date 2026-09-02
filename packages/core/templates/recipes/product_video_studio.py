@@ -13,6 +13,7 @@ from packages.core.templates.registry import TemplateInput, TemplateResult, regi
 
 PROJECT_TYPE = "product_video"
 PROJECT_SCHEMA_VERSION = 1
+PRODUCT_VIDEO_STUDIO_BLUEPRINT_ID = "product-video-studio-v1"
 PROJECT_STAGES = [
     "draft",
     "discovering",
@@ -4856,8 +4857,9 @@ def _collector_agent_step(
         service_key="product_video.capture",
         skill="screen_asset_collector",
         tools=COLLECTOR_TOOLS,
+        # Workflow prompt prose; never executed as SQL.
         prompt=(
-            "Collect the approved product-video asset batch in the current paired Chrome session. The complete "
+            "Collect the approved product-video asset batch in the current paired Chrome session. The complete "  # nosec B608
             f"approved shot list is {segments_ref}; operate only on Retry Segment IDs {retry_ids_ref}. Use the "
             "Operator revision notes are {{revision_notes}}; apply them only to resolve the reported blocker without "
             "changing approved scene identity, route, or scope. Use the "
@@ -6710,6 +6712,8 @@ async def _provision_role_agent(
             skill_bindings=list(role.skill_bindings),
             mcp_bindings=list(role.mcp_bindings),
             source="marketplace_template",
+            source_blueprint_id=PRODUCT_VIDEO_STUDIO_BLUEPRINT_ID,
+            source_blueprint_component_key=role.service_key,
             workspace_id=workspace_id,
             service_key=role.service_key,
         ),
@@ -6748,15 +6752,20 @@ async def _install_marketplace_skills(
     # export, see .ossexclude) — self-hosted deployments simply have no
     # marketplace skills to resolve, and every requested slug falls through
     # to the "unavailable in this deployment" warning below.
-    slug_to_id: dict[str, str] = {}
+    slug_to_ids: dict[str, list[str]] = {}
     if is_cloud():
         pass
 
     warnings: list[str] = []
     for slug in marketplace_skills:
-        marketplace_id = slug_to_id.get(slug)
-        if marketplace_id is None:
+        marketplace_ids = slug_to_ids.get(slug) or []
+        if not marketplace_ids:
             warnings.append(f"Marketplace skill {slug!r} is unavailable in this deployment.")
+            continue
+        if len(marketplace_ids) > 1:
+            warnings.append(
+                f"Marketplace skill slug {slug!r} is ambiguous; configure its exact id."
+            )
             continue
         pass
     return warnings

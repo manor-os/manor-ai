@@ -8,7 +8,7 @@ import {
   WorkerClientError,
 } from "./types.js";
 
-const PROTOCOL_VERSION = "1";
+const PROTOCOL_VERSION = "2";
 const PROTOCOL_HEADER = "Manor-Protocol-Version";
 const WORKER_ID_HEADER = "Manor-Worker-Id";
 const USER_AGENT = `manor-worker-sdk-ts/0.1 (proto/${PROTOCOL_VERSION})`;
@@ -61,9 +61,13 @@ export class ManorClient {
   }
 
   async completeLease(leaseId: string, result: LeaseResult): Promise<void> {
+    const payload = {
+      ...stripUndefined(result),
+      task_output_value_kind: result.task_output_value_kind ?? "task_payload",
+    };
     await this.post(
       `/api/v1/workers/leases/${encodeURIComponent(leaseId)}/complete`,
-      stripUndefined(result),
+      payload,
       { expect204: true },
     );
   }
@@ -127,7 +131,16 @@ export class ManorClient {
     worker_secret: string;
     [k: string]: unknown;
   }> {
-    return this.postUnauthenticated("/api/v1/workers/register", payload);
+    const declaredCapabilities = isRecord(payload.capabilities)
+      ? payload.capabilities
+      : {};
+    return this.postUnauthenticated("/api/v1/workers/register", {
+      ...payload,
+      capabilities: {
+        ...declaredCapabilities,
+        protocol_version: 2,
+      },
+    });
   }
 
   // ── Internals ──────────────────────────────────────────────────────
@@ -199,17 +212,14 @@ export class ManorClient {
       }
 
       if (resp.status >= 400) {
-        // 401 / 403 → auth won't fix itself, fail fast.
-        if (resp.status === 401 || resp.status === 403) {
-          throw new WorkerClientError(`POST ${path}: ${resp.status}`, {
-            statusCode: resp.status,
-            body: await safeBody(resp),
-          });
-        }
-        lastErr = new WorkerClientError(`POST ${path}: ${resp.status}`, {
+        const responseError = new WorkerClientError(`POST ${path}: ${resp.status}`, {
           statusCode: resp.status,
           body: await safeBody(resp),
         });
+        // Credentials and a rejected protocol registration cannot repair
+        // themselves. Let the worker loop stop on the first response.
+        if (responseError.requiresOperatorAction) throw responseError;
+        lastErr = responseError;
         if (attempt + 1 < this.maxAttempts) {
           await sleep(backoffMs(attempt));
           continue;
@@ -268,4 +278,8 @@ function stripUndefined<T>(obj: T): T {
     return out as T;
   }
   return obj;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }

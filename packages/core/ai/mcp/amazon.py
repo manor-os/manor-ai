@@ -41,6 +41,7 @@ _REGION_HOSTS = {
 }
 _MAX_CHARS = 12_000
 _TIMEOUT = 30.0
+_MAX_CATALOG_PAGE_SIZE = 20
 
 # Cache LWA access tokens by refresh-token prefix → (token, expires_monotonic).
 _token_cache: Dict[str, tuple[str, float]] = {}
@@ -64,9 +65,12 @@ async def call_tool(
     handler = _HANDLERS.get(name)
     if not handler:
         return _error(f"Unknown tool: {name}")
+    if not isinstance(arguments, dict):
+        return _error("arguments must be an object")
+    arguments = dict(arguments)
 
     spec = _TOOLS.get(name, {})
-    missing = [p for p in spec.get("required", []) if arguments.get(p) in (None, "")]
+    missing = [p for p in spec.get("required", []) if _is_blank(arguments.get(p))]
     if missing:
         return _error(f"Missing required params: {', '.join(missing)}")
 
@@ -74,12 +78,28 @@ async def call_tool(
         cfg = json.loads(bearer_token) if bearer_token else {}
     except Exception:
         return _error("Amazon credentials malformed (expected JSON).")
-    if not cfg.get("access_token") and not (
-        cfg.get("refresh_token") and cfg.get("lwa_client_id") and cfg.get("lwa_client_secret")
-    ):
+    if not isinstance(cfg, dict):
+        return _error("Amazon credentials malformed (expected JSON object).")
+    for field in ("access_token", "refresh_token", "lwa_client_id", "lwa_client_secret"):
+        if cfg.get(field) is not None and not isinstance(cfg[field], str):
+            return _error(f"Amazon {field} must be a string.")
+    direct_token = cfg.get("access_token")
+    has_refresh_credentials = all(
+        not _is_blank(cfg.get(field))
+        for field in ("refresh_token", "lwa_client_id", "lwa_client_secret")
+    )
+    if _is_blank(direct_token) and not has_refresh_credentials:
         return _error(
             "Amazon needs either access_token, or refresh_token + lwa_client_id + lwa_client_secret."
         )
+    cfg = {
+        **cfg,
+        **{
+            field: str(cfg[field]).strip()
+            for field in ("access_token", "refresh_token", "lwa_client_id", "lwa_client_secret")
+            if not _is_blank(cfg.get(field))
+        },
+    }
 
     try:
         text = await handler(cfg, arguments)
@@ -93,6 +113,10 @@ async def call_tool(
 
 def _error(msg: str) -> Dict[str, Any]:
     return {"content": [{"type": "text", "text": msg}], "isError": True}
+
+
+def _is_blank(value: Any) -> bool:
+    return value is None or (isinstance(value, str) and not value.strip())
 
 
 # ── Auth + client ──────────────────────────────────────────────────────────────
@@ -148,11 +172,13 @@ async def _api(
         resp = await client.request(method, url, headers=headers, json=body)
 
     if resp.status_code in (401, 403):
-        return f"Amazon authorization failed ({resp.status_code}). Check LWA creds / roles: {resp.text[:200]}"
+        raise _AmazonError(
+            f"Amazon authorization failed ({resp.status_code}). Check LWA creds / roles: {resp.text[:200]}"
+        )
     if resp.status_code == 404:
-        return "Not found."
+        raise _AmazonError("Not found.")
     if not resp.is_success:
-        return f"Amazon SP-API error ({resp.status_code}): {resp.text[:300]}"
+        raise _AmazonError(f"Amazon SP-API error ({resp.status_code}): {resp.text[:300]}")
 
     if not resp.text:
         return json.dumps({"ok": True})
@@ -168,12 +194,27 @@ def _marketplace(cfg, args) -> Optional[str]:
     return args.get("marketplace_id") or cfg.get("marketplace_id")
 
 
+def _catalog_page_size(args: Dict[str, Any]) -> int:
+    raw = args.get("page_size", 10)
+    if isinstance(raw, bool):
+        raise _AmazonError("page_size must be an integer between 1 and 20.")
+    try:
+        page_size = int(raw)
+    except (TypeError, ValueError):
+        raise _AmazonError("page_size must be an integer between 1 and 20.") from None
+    if isinstance(raw, float) and raw != page_size:
+        raise _AmazonError("page_size must be an integer between 1 and 20.")
+    if page_size < 1 or page_size > _MAX_CATALOG_PAGE_SIZE:
+        raise _AmazonError("page_size must be an integer between 1 and 20.")
+    return page_size
+
+
 # ── Orders ────────────────────────────────────────────────────────────────────
 
 async def _get_orders(cfg, args) -> str:
     mp = _marketplace(cfg, args)
     if not mp:
-        return "Provide marketplace_id (or set a default in credentials)."
+        raise _AmazonError("Provide marketplace_id (or set a default in credentials).")
     params: Dict[str, Any] = {"MarketplaceIds": mp}
     if args.get("created_after"):
         params["CreatedAfter"] = args["created_after"]
@@ -204,11 +245,11 @@ async def _get_order_items(cfg, args) -> str:
 async def _search_catalog_items(cfg, args) -> str:
     mp = _marketplace(cfg, args)
     if not mp:
-        return "Provide marketplace_id (or set a default in credentials)."
+        raise _AmazonError("Provide marketplace_id (or set a default in credentials).")
     params: Dict[str, Any] = {
         "marketplaceIds": mp,
         "includedData": args.get("included_data", "summaries"),
-        "pageSize": int(args.get("page_size", 10)),
+        "pageSize": _catalog_page_size(args),
     }
     if args.get("keywords"):
         params["keywords"] = args["keywords"]
@@ -222,7 +263,7 @@ async def _search_catalog_items(cfg, args) -> str:
 async def _get_catalog_item(cfg, args) -> str:
     mp = _marketplace(cfg, args)
     if not mp:
-        return "Provide marketplace_id (or set a default in credentials)."
+        raise _AmazonError("Provide marketplace_id (or set a default in credentials).")
     return await _api(cfg, "GET", f"/catalog/2022-04-01/items/{quote(args['asin'], safe='')}", {
         "marketplaceIds": mp,
         "includedData": args.get("included_data", "summaries,attributes"),
@@ -234,7 +275,7 @@ async def _get_catalog_item(cfg, args) -> str:
 async def _get_inventory_summaries(cfg, args) -> str:
     mp = _marketplace(cfg, args)
     if not mp:
-        return "Provide marketplace_id (or set a default in credentials)."
+        raise _AmazonError("Provide marketplace_id (or set a default in credentials).")
     return await _api(cfg, "GET", "/fba/inventory/v1/summaries", {
         "granularityType": "Marketplace",
         "granularityId": mp,
@@ -253,7 +294,7 @@ async def _get_listing_item(cfg, args) -> str:
     mp = _marketplace(cfg, args)
     seller = _seller(cfg, args)
     if not (mp and seller):
-        return "Provide marketplace_id and seller_id (or set defaults in credentials)."
+        raise _AmazonError("Provide marketplace_id and seller_id (or set defaults in credentials).")
     return await _api(
         cfg, "GET",
         f"/listings/2021-08-01/items/{quote(seller, safe='')}/{quote(args['sku'], safe='')}",
@@ -266,7 +307,7 @@ async def _patch_listing(cfg, args) -> str:
     mp = _marketplace(cfg, args)
     seller = _seller(cfg, args)
     if not (mp and seller):
-        return "Provide marketplace_id and seller_id (or set defaults in credentials)."
+        raise _AmazonError("Provide marketplace_id and seller_id (or set defaults in credentials).")
     patches = args["patches"]
     if isinstance(patches, str):
         patches = json.loads(patches)
@@ -283,7 +324,7 @@ async def _put_listing(cfg, args) -> str:
     mp = _marketplace(cfg, args)
     seller = _seller(cfg, args)
     if not (mp and seller):
-        return "Provide marketplace_id and seller_id (or set defaults in credentials)."
+        raise _AmazonError("Provide marketplace_id and seller_id (or set defaults in credentials).")
     attributes = args["attributes"]
     if isinstance(attributes, str):
         attributes = json.loads(attributes)

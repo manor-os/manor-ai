@@ -2,6 +2,7 @@
 
 from packages.core.ai.agentic_loop import (
     FINAL_RESPONSE_SENTINEL,
+    _output_schema_validation_error,
     _strip_final_response_sentinel,
 )
 from packages.core.services.chat_service import (
@@ -40,3 +41,26 @@ def test_none_and_empty():
 
 def test_marker_only_yields_empty():
     assert _strip_final_response_sentinel(FINAL_RESPONSE_SENTINEL) == ""
+
+
+def test_agentic_output_schema_enforces_registered_formats():
+    error = _output_schema_validation_error(
+        '"not a uri"',
+        {"type": "string", "format": "uri"},
+    )
+
+    assert error is not None
+    assert "uri" in error
+
+
+def test_agentic_output_schema_fails_closed_for_unsupported_dialect():
+    error = _output_schema_validation_error(
+        '{}',
+        {
+            "$schema": "http://json-schema.org/draft-07/schema#",
+            "type": "object",
+        },
+    )
+
+    assert error is not None
+    assert "unsupported JSON Schema dialect" in error

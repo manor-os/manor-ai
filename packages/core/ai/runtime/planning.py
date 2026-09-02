@@ -6,7 +6,12 @@ from dataclasses import dataclass, field
 from typing import Any, Iterable
 
 from packages.core.ai.runtime.approvals import runtime_capability_id_for_action_key
-from packages.core.ai.runtime.billing import runtime_llm_billing_context
+from packages.core.ai.runtime.billing import (
+    RuntimeResolvedBillingScope,
+    runtime_current_billing_context,
+    runtime_ensure_task_billing_context,
+    runtime_llm_billing_context,
+)
 from packages.core.ai.runtime.completions import runtime_resolve_text_completion_route
 from packages.core.ai.runtime.capabilities import (
     capabilities_for_tool_names,
@@ -21,12 +26,21 @@ from packages.core.ai.runtime.sources import (
     RUNTIME_PLAN_SUPERVISOR_SOURCE,
 )
 from packages.core.constants.execution import ExecutionStepStatus
+from packages.core.constants.integrations import INTEGRATION_ACCOUNT_SELECTION_ARGUMENT
 from packages.core.constants.supervisor import (
     MAX_EVIDENCE_CHARS,
     MODEL_CHOOSABLE_VERDICTS,
     SupervisorDecision,
     SupervisorDecisionSource,
     SupervisorVerdict,
+)
+from packages.core.services.official_remote_mcp import (
+    MCPActionEffect,
+    OfficialRemoteMCPActionPolicyFactory,
+)
+from packages.core.services.integration_account_service import (
+    IntegrationAccountFanoutResultFactory,
+    IntegrationAccountSelectionMode,
 )
 
 
@@ -41,6 +55,49 @@ class RuntimePlannerActionBinding:
     description: str | None = None
     input_schema: dict[str, Any] | None = None
     output_schema: dict[str, Any] | None = None
+    effect: MCPActionEffect | None = None
+    account_ids: tuple[str, ...] = ()
+    account_options: tuple[dict[str, Any], ...] = ()
+    account_input_schemas: Mapping[str, dict[str, Any]] = field(default_factory=dict)
+    account_output_schemas: Mapping[str, dict[str, Any]] = field(default_factory=dict)
+    requires_explicit_account: bool = False
+    supports_all_accounts: bool = False
+
+    def input_schema_for(
+        self,
+        account_id: str | None,
+        *,
+        selection: str | None = None,
+    ) -> dict[str, Any] | None:
+        if (
+            str(selection or "").strip().lower()
+            == IntegrationAccountSelectionMode.ALL.value
+        ):
+            return IntegrationAccountFanoutResultFactory.input_schema(
+                self.input_schema
+            )
+        selected = str(account_id or "").strip()
+        if selected and selected in self.account_input_schemas:
+            return self.account_input_schemas[selected]
+        return self.input_schema
+
+    def output_schema_for(
+        self,
+        account_id: str | None,
+        *,
+        selection: str | None = None,
+    ) -> dict[str, Any] | None:
+        if (
+            str(selection or "").strip().lower()
+            == IntegrationAccountSelectionMode.ALL.value
+        ):
+            return IntegrationAccountFanoutResultFactory.output_schema(
+                self.output_schema
+            )
+        selected = str(account_id or "").strip()
+        if selected and selected in self.account_output_schemas:
+            return self.account_output_schemas[selected]
+        return self.output_schema
 
     def to_dict(self, *, include_schema: bool = False) -> dict[str, Any]:
         payload: dict[str, Any] = {
@@ -57,15 +114,34 @@ class RuntimePlannerActionBinding:
             payload["risk_level"] = self.risk_level
         if self.required_approval is not None:
             payload["required_approval"] = self.required_approval
+        if self.effect is not None:
+            payload["effect"] = self.effect.value
+        if self.account_ids:
+            payload["account_ids"] = list(self.account_ids)
+        if self.account_options:
+            payload["account_options"] = [dict(item) for item in self.account_options]
+        if self.requires_explicit_account:
+            payload["requires_explicit_account"] = True
+        payload["supports_all_accounts"] = self.supports_all_accounts
         if self.input_schema is not None:
             payload["has_input_schema"] = True
             payload["parameters"] = _schema_parameter_names(self.input_schema)
             if include_schema:
                 payload["input_schema"] = self.input_schema
+                if self.account_input_schemas:
+                    payload["account_input_schemas"] = {
+                        account_id: dict(schema)
+                        for account_id, schema in self.account_input_schemas.items()
+                    }
         if self.output_schema is not None:
             payload["has_output_schema"] = True
             if include_schema:
                 payload["output_schema"] = self.output_schema
+                if self.account_output_schemas:
+                    payload["account_output_schemas"] = {
+                        account_id: dict(schema)
+                        for account_id, schema in self.account_output_schemas.items()
+                    }
         return payload
 
 
@@ -118,6 +194,10 @@ RUNTIME_PLAN_JSON_HINT = {
             "provider": "<provider key, only if kind=action>",
             "action_key": "<action name, only if kind=action>",
             "capability_id": "<runtime capability id, only if kind=action and known>",
+            "integration_id": (
+                "<exact connected account id from the selected action binding, "
+                "only for account-scoped actions>"
+            ),
             "params": {"prompt": "<required for llm/subagent steps>"},
             "output_shape": (
                 "<canonical shape for llm/subagent, or omit when using an exact "
@@ -262,8 +342,17 @@ def runtime_planner_system_prompt(
         "  * Do NOT require platform receipts (tweet ids, urns, post URLs, "
         "published_at timestamps) from llm/subagent step outputs — the runtime "
         "captures those as execution evidence.\n"
-        "  * Reference upstream llm/subagent results via "
-        "steps.<key>.result.outputs.text / .outputs.files / .outputs.data / .status.\n"
+        "  * Reference upstream results according to the producer's declared output contract. "
+        "For a canonical `output_shape` or an exact `expected_output_schema`, reference "
+        "payload fields directly (for example `${{ steps.<key>.result.files }}` or "
+        "`${{ steps.<key>.result.text }}`, or the declared field); do not add an "
+        "`outputs` wrapper. Canonical payload fields are ArtifactResult.files, "
+        "DocumentResult.fs_path/document_id, TextResult.text, ListResult.items, "
+        "PublishResult.url, CountResult.count, and DraftPack.drafts. "
+        "Use `${{ steps.<key>.result.outputs.text }}`, `${{ steps.<key>.result.outputs.files }}`, "
+        "`${{ steps.<key>.result.outputs.data }}`, or `${{ steps.<key>.result.status }}` "
+        "only for a legacy/unshaped StepResult envelope. The unique terminal step bound "
+        "to Task.expected_output uses `${{ steps.<key>.result.outputs.data }}`.\n"
         "  * If the task deliverable is a user-visible artifact (file, image, PDF, "
         "document, deck, spreadsheet, video, export, attachment, or domain-specific file), "
         "do not satisfy it with a plain text-only LLM step. Use a subagent step whose "
@@ -279,15 +368,12 @@ def runtime_planner_system_prompt(
         "always-allow, and deny rules are inherited from workspace governance "
         "policy. Use a human step only when the task genuinely needs missing "
         "input or a user decision to proceed.\n"
-        "  * Do not mark free-form llm/subagent work as risk_level='high' just "
-        "because it creates an internal workspace artifact such as a saved file, "
-        "image, audio, or video. Reserve high risk for concrete external side "
-        "effects, destructive operations, or action steps whose bound capability "
-        "is governed externally.\n"
         "  * When a human step reviews an upstream draft or artifact, do not "
         "put only its filename in params.prompt. Set params.review_title and "
         "params.review_artifacts to a bare upstream reference such as "
-        "${{ steps.draft.result.outputs.files }}; optionally bind "
+        "${{ steps.draft.result.files }} when the draft declares ArtifactResult; use "
+        "`${{ steps.draft.result.outputs.files }}` only when the draft is a legacy "
+        "StepResult envelope; optionally bind "
         "params.review to concise structured review data. The runtime routes "
         "these fields through the typed review HITL surface (the same review "
         "renderer used by Workflow approvals), not the free-form input card.\n"
@@ -421,14 +507,42 @@ def runtime_planner_llm_billing_context(
     *,
     entity_id: str,
     workspace_id: str | None = None,
+    billing_scope: RuntimeResolvedBillingScope | None = None,
     source: str = RUNTIME_PLANNER_SOURCE,
 ) -> Any:
     """Build the LLM billing context for Planner generation."""
 
+    if billing_scope is not None and (
+        billing_scope.entity_id != str(entity_id)
+        or billing_scope.workspace_id != (
+            str(workspace_id) if workspace_id else None
+        )
+    ):
+        raise ValueError("Planner billing scope does not match the Task scope")
+
+    billing_kwargs: dict[str, Any] = {}
+    if billing_scope is not None:
+        billing_kwargs["user_id"] = billing_scope.user_id
+        billing_kwargs["byok"] = billing_scope.byok
     return runtime_llm_billing_context(
         entity_id,
         workspace_id=workspace_id,
         source=source,
+        **billing_kwargs,
+    )
+
+
+async def runtime_ensure_planner_task_billing_context(
+    db: Any,
+    task_id: str,
+) -> RuntimeResolvedBillingScope:
+    """Resolve the Task requester and BYOK policy for a Planner call."""
+
+    return await runtime_ensure_task_billing_context(
+        db,
+        task_id,
+        source=RUNTIME_PLANNER_SOURCE,
+        model_role="primary",
     )
 
 
@@ -609,6 +723,11 @@ def runtime_execute_planner_tool_call(
             "Use this binding in a kind='action' step with provider, action_key, "
             "capability_id, and params matching input_schema when present."
         )
+        if binding.requires_explicit_account:
+            payload["hint"] += (
+                " This account registry is partial; include one exact "
+                "integration_id from account_ids."
+            )
         return payload
 
     if tool_name == "submit_plan":
@@ -679,6 +798,7 @@ RUNTIME_PLAN_SUPERVISOR_VERDICTS = tuple(
 #: megabytes of text — never as a working constraint.
 SUPERVISOR_INSTRUCTION_CHARS = 4000
 SUPERVISOR_RESULT_CHARS = 4000
+SUPERVISOR_CONTRACT_CHARS = 4000
 SUPERVISOR_ERROR_CHARS = 1000
 SUPERVISOR_MAX_STEPS = 50
 SUPERVISOR_MAX_ARTIFACTS = 10
@@ -703,6 +823,20 @@ def _render_supervisor_step(index: int, info: dict[str, Any]) -> str:
     result = str(info.get("result") or "").strip()
     if result:
         lines.append(f"   reported: {result[:SUPERVISOR_RESULT_CHARS]}")
+    output_contract = info.get("output_contract")
+    if isinstance(output_contract, dict):
+        rendered_contract = json.dumps(
+            output_contract,
+            ensure_ascii=False,
+            sort_keys=True,
+            default=str,
+        )
+        lines.append(
+            f"   must deliver: {rendered_contract[:SUPERVISOR_CONTRACT_CHARS]}"
+        )
+        lines.append(
+            f"   contract check: {str(info.get('contract_check') or 'not_run')}"
+        )
     error = str(info.get("error") or "").strip()
     if error:
         lines.append(f"   error: {error[:SUPERVISOR_ERROR_CHARS]}")
@@ -721,10 +855,14 @@ def runtime_plan_supervisor_prompt(
     *,
     task_title: str,
     task_description: str,
+    task_output_contract: dict[str, Any] | None = None,
+    acceptance_contract: dict[str, Any] | None = None,
+    actual_result: dict[str, Any] | None = None,
     done_count: int,
     failed_count: int,
     skipped_count: int,
-    steps: Iterable[dict[str, Any]],
+    steps: Iterable[dict[str, Any]] = (),
+    step_lines: Iterable[str] = (),
     retryable_step_keys: Iterable[str] = (),
     plan_rationale: str = "",
     is_replan: bool = False,
@@ -746,6 +884,9 @@ def runtime_plan_supervisor_prompt(
         _render_supervisor_step(i + 1, info)
         for i, info in enumerate(step_list[:SUPERVISOR_MAX_STEPS])
     ]
+    rendered_steps.extend(
+        str(line) for line in step_lines if str(line or "").strip()
+    )
     if len(step_list) > SUPERVISOR_MAX_STEPS:
         rendered_steps.append(f"(+{len(step_list) - SUPERVISOR_MAX_STEPS} more steps omitted)")
     plan_context = ""
@@ -755,6 +896,43 @@ def runtime_plan_supervisor_prompt(
         plan_context += (
             "This plan is already a REPLAN of an earlier failed attempt — "
             "weigh that before asking for another one.\n"
+        )
+
+    task_contract_context = ""
+    if isinstance(task_output_contract, dict):
+        task_contract_context = (
+            "Task deliverable contract (authoritative JSON Schema): "
+            + json.dumps(
+                task_output_contract,
+                ensure_ascii=False,
+                sort_keys=True,
+                default=str,
+            )[:SUPERVISOR_CONTRACT_CHARS]
+            + "\n"
+        )
+
+    acceptance_context = ""
+    if isinstance(acceptance_contract, dict):
+        acceptance_context = (
+            "Task acceptance contract (authoritative): "
+            + json.dumps(
+                acceptance_contract,
+                ensure_ascii=False,
+                sort_keys=True,
+                default=str,
+            )[:SUPERVISOR_CONTRACT_CHARS]
+            + "\n"
+        )
+    if isinstance(actual_result, dict):
+        acceptance_context += (
+            "Actual result evidence selected by that contract: "
+            + json.dumps(
+                actual_result,
+                ensure_ascii=False,
+                sort_keys=True,
+                default=str,
+            )[:SUPERVISOR_CONTRACT_CHARS]
+            + "\n"
         )
 
     history = ""
@@ -792,13 +970,21 @@ def runtime_plan_supervisor_prompt(
         "results, and your verdict either continues the work (retry_step, "
         "needs_replan, needs_human) or closes the task (completed, failed).\n\n"
         f"Task: {task_title}\n"
-        f"Description: {task_description}\n\n"
+        f"Description: {task_description}\n"
+        + task_contract_context
+        + acceptance_context
+        + "\n"
         f"Latest plan result: {done_count} steps done, {failed_count} failed, "
         f"{skipped_count} skipped\n" + plan_context + history + "\n"
         "Steps:\n" + "\n".join(rendered_steps) + "\n\n"
         "Judge whether the TASK'S OWN deliverable was produced and delivered "
         "— judge the task itself, not the subject it reports on.\n\n"
         "Rules:\n"
+        "- Judge only the task acceptance contract when one is supplied. "
+        "Do not invent extra acceptance requirements.\n"
+        "- Runtime validates every declared Step output contract and the Task "
+        "deliverable contract before this semantic review. You cannot override "
+        "a failed contract check or accept a differently shaped result.\n"
         "- The deliverable is what THIS task was asked to produce or do: a "
         "report, email, post, file, message, or action. If that deliverable "
         "was produced and any send / publish / save / execute step succeeded, "
@@ -848,6 +1034,9 @@ def runtime_plan_supervisor_messages(
     *,
     task_title: str,
     task_description: str,
+    task_output_contract: dict[str, Any] | None = None,
+    acceptance_contract: dict[str, Any] | None = None,
+    actual_result: dict[str, Any] | None = None,
     done_count: int,
     failed_count: int,
     skipped_count: int,
@@ -865,6 +1054,9 @@ def runtime_plan_supervisor_messages(
         "content": runtime_plan_supervisor_prompt(
             task_title=task_title,
             task_description=task_description,
+            task_output_contract=task_output_contract,
+            acceptance_contract=acceptance_contract,
+            actual_result=actual_result,
             done_count=done_count,
             failed_count=failed_count,
             skipped_count=skipped_count,
@@ -882,6 +1074,9 @@ async def runtime_execute_plan_supervisor_completion(
     *,
     task_title: str,
     task_description: str,
+    task_output_contract: dict[str, Any] | None = None,
+    acceptance_contract: dict[str, Any] | None = None,
+    actual_result: dict[str, Any] | None = None,
     done_count: int,
     failed_count: int,
     skipped_count: int,
@@ -900,6 +1095,9 @@ async def runtime_execute_plan_supervisor_completion(
         runtime_plan_supervisor_messages(
             task_title=task_title,
             task_description=task_description,
+            task_output_contract=task_output_contract,
+            acceptance_contract=acceptance_contract,
+            actual_result=actual_result,
             done_count=done_count,
             failed_count=failed_count,
             skipped_count=skipped_count,
@@ -1011,6 +1209,14 @@ async def runtime_execute_planner_chat_turn(
         wire_messages.append({"role": "system", "content": system_prompt})
     wire_messages.extend(dict(message) for message in messages)
 
+    if user_id is None:
+        billing = runtime_current_billing_context()
+        if billing is not None and (
+            entity_id is None
+            or str(getattr(billing, "entity_id", "")) == str(entity_id)
+        ):
+            user_id = getattr(billing, "user_id", None)
+
     resolved_model, resolved_metadata, _resolved_byok = await runtime_resolve_text_completion_route(
         entity_id=entity_id,
         user_id=user_id,
@@ -1049,14 +1255,31 @@ def runtime_planner_action_bindings(
                 runtime_capability_id_for_action_key(action, provider=provider_key)
             )
             spec = action_specs.get(action) or {}
+            try:
+                effect = MCPActionEffect(str(spec.get("effect") or ""))
+            except ValueError:
+                effect = None
+            effect_policy = (
+                OfficialRemoteMCPActionPolicyFactory.create(provider_key, effect)
+                if effect is not None
+                else None
+            )
             bindings.append(
                 RuntimePlannerActionBinding(
                     provider=provider_key,
                     action_key=action,
                     capability_id=capability.id if capability else None,
                     capability_name=capability.name if capability else None,
-                    risk_level=capability.risk_level if capability else None,
-                    required_approval=capability.required_approval if capability else None,
+                    risk_level=(
+                        effect_policy.risk_level
+                        if effect_policy is not None
+                        else (capability.risk_level if capability else None)
+                    ),
+                    required_approval=(
+                        effect_policy.required_approval
+                        if effect_policy is not None
+                        else (capability.required_approval if capability else None)
+                    ),
                     description=_clean_description(spec.get("description")),
                     input_schema=_first_schema(
                         spec.get("input_schema"),
@@ -1065,6 +1288,31 @@ def runtime_planner_action_bindings(
                     output_schema=_first_schema(
                         spec.get("output_schema"),
                         spec.get("result_schema"),
+                    ),
+                    effect=effect,
+                    account_ids=tuple(
+                        str(account_id).strip()
+                        for account_id in spec.get("account_ids", ())
+                        if str(account_id or "").strip()
+                    ),
+                    account_options=tuple(
+                        dict(option)
+                        for option in spec.get("account_options", ())
+                        if isinstance(option, dict)
+                    ),
+                    account_input_schemas=_schema_mapping(
+                        spec.get("account_input_schemas")
+                    ),
+                    account_output_schemas=_schema_mapping(
+                        spec.get("account_output_schemas")
+                    ),
+                    requires_explicit_account=(
+                        spec.get("requires_explicit_account") is True
+                    ),
+                    supports_all_accounts=(
+                        spec["supports_all_accounts"]
+                        if isinstance(spec.get("supports_all_accounts"), bool)
+                        else effect is MCPActionEffect.READ
                     ),
                 )
             )
@@ -1136,12 +1384,26 @@ def runtime_apply_action_binding_schemas_to_steps(
         )
         if binding is None:
             continue
-        if binding.input_schema is not None and not getattr(step, "expected_input_schema", None):
-            setattr(step, "expected_input_schema", binding.input_schema)
-            attached += 1
-        if binding.output_schema is not None and not getattr(step, "expected_output_schema", None):
-            setattr(step, "expected_output_schema", binding.output_schema)
-            attached += 1
+        account_id = str(getattr(step, "integration_id", "") or "").strip()
+        selection = (getattr(step, "params", None) or {}).get(
+            INTEGRATION_ACCOUNT_SELECTION_ARGUMENT
+        )
+        input_schema = binding.input_schema_for(
+            account_id,
+            selection=selection,
+        )
+        output_schema = binding.output_schema_for(
+            account_id,
+            selection=selection,
+        )
+        if input_schema is not None:
+            if getattr(step, "expected_input_schema", None) != input_schema:
+                attached += 1
+            setattr(step, "expected_input_schema", input_schema)
+        if output_schema is not None:
+            if getattr(step, "expected_output_schema", None) != output_schema:
+                attached += 1
+            setattr(step, "expected_output_schema", output_schema)
     return attached
 
 
@@ -1322,6 +1584,31 @@ def _normalize_cached_tool_spec(raw_tool: Any) -> dict[str, Any]:
         ),
         "input_schema": input_schema,
         "output_schema": output_schema,
+        "effect": str(raw_tool.get("effect") or "").strip().lower() or None,
+        "account_ids": [
+            str(account_id).strip()
+            for account_id in raw_tool.get("account_ids", ())
+            if str(account_id or "").strip()
+        ],
+        "account_options": [
+            dict(option)
+            for option in raw_tool.get("account_options", ())
+            if isinstance(option, dict)
+        ],
+        "account_input_schemas": _schema_mapping(
+            raw_tool.get("account_input_schemas")
+        ),
+        "account_output_schemas": _schema_mapping(
+            raw_tool.get("account_output_schemas")
+        ),
+        "requires_explicit_account": (
+            raw_tool.get("requires_explicit_account") is True
+        ),
+        "supports_all_accounts": (
+            raw_tool.get("supports_all_accounts")
+            if isinstance(raw_tool.get("supports_all_accounts"), bool)
+            else None
+        ),
     }
 
 
@@ -1335,6 +1622,16 @@ def _first_schema(*values: Any) -> dict[str, Any] | None:
 
 def _schema_if_dict(value: Any) -> dict[str, Any] | None:
     return value if isinstance(value, dict) else None
+
+
+def _schema_mapping(value: Any) -> dict[str, dict[str, Any]]:
+    if not isinstance(value, Mapping):
+        return {}
+    return {
+        str(account_id): dict(schema)
+        for account_id, schema in value.items()
+        if str(account_id or "").strip() and isinstance(schema, Mapping)
+    }
 
 
 def _schema_parameter_names(schema: dict[str, Any] | None) -> list[str]:

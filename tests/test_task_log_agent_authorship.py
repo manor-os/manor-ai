@@ -19,6 +19,7 @@ from __future__ import annotations
 import pytest
 
 from packages.core.constants.agents import MANOR_AGENT_NAME
+from packages.core.constants.task import TaskType
 from packages.core.constants.task_actors import TaskActor
 from packages.core.services import agent_service, task_service
 
@@ -55,7 +56,7 @@ async def test_no_agent_uses_human_fallback(fake_agent):
 async def test_a_legacy_placeholder_fallback_is_not_mistaken_for_a_person(fake_agent):
     """Old call sites passed a placeholder as the fallback. It names an agent
     that failed to be recorded, never a user."""
-    created_by, meta, actor = await task_service.agent_log_authorship(
+    created_by, _meta, actor = await task_service.agent_log_authorship(
         object(), None, fallback="workspace-agent",
     )
     assert created_by == MANOR_AGENT_NAME
@@ -95,6 +96,7 @@ async def test_task_comment_routes_and_attributes_to_task_agent(monkeypatch):
         id="T1",
         workspace_id="W1",
         title="t",
+        task_type=TaskType.GENERAL.value,
         conversation_id=None,
         agent_id="01AGENTX",
         agent_type=None,
@@ -136,9 +138,9 @@ async def test_task_comment_routes_and_attributes_to_task_agent(monkeypatch):
             return (fallback or MANOR_AGENT_NAME), None, TaskActor.MANOR
         return agent_id, {"agent_id": agent_id, "agent_name": "X Growth Analyst"}, TaskActor.AGENT
 
-    import packages.core.database as database
-    import packages.core.services.conversation_messages as conversation_messages
     import packages.core.ai.runtime as runtime_pkg
+    from packages.core import database
+    from packages.core.services import conversation_messages
 
     monkeypatch.setattr(workspace_runtime, "_load_task_for_runtime", _load_task)
     monkeypatch.setattr(workspace_runtime, "ensure_workspace_task_conversation", _ensure_conv)

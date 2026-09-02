@@ -13,6 +13,7 @@ from __future__ import annotations
 
 from collections.abc import AsyncGenerator
 from urllib.parse import urlparse
+from uuid import uuid4
 
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.pool import NullPool
@@ -29,13 +30,33 @@ def _build_engine_kwargs(settings, *, is_test_database: bool) -> dict:
         "echo": settings.DATABASE_ECHO,
         "pool_pre_ping": True,
     }
-    if is_test_database:
+    if getattr(settings, "DATABASE_POOL_MODE", "sqlalchemy") == "pgbouncer":
+        kwargs["poolclass"] = NullPool
+        kwargs["connect_args"] = _pgbouncer_connect_args()
+    elif is_test_database:
         kwargs["poolclass"] = NullPool
     else:
         kwargs["pool_size"] = settings.DATABASE_POOL_SIZE
         kwargs["max_overflow"] = settings.DATABASE_MAX_OVERFLOW
         kwargs["pool_timeout"] = settings.DATABASE_POOL_TIMEOUT
         kwargs["pool_recycle"] = settings.DATABASE_POOL_RECYCLE
+    return kwargs
+
+
+def _pgbouncer_connect_args() -> dict:
+    return {
+        "prepared_statement_cache_size": 0,
+        "prepared_statement_name_func": lambda: f"__asyncpg_{uuid4()}__",
+    }
+
+
+def _build_worker_engine_kwargs(settings) -> dict:
+    kwargs = {
+        "echo": settings.DATABASE_ECHO,
+        "poolclass": NullPool,
+    }
+    if getattr(settings, "DATABASE_POOL_MODE", "sqlalchemy") == "pgbouncer":
+        kwargs["connect_args"] = _pgbouncer_connect_args()
     return kwargs
 
 
@@ -71,9 +92,5 @@ def create_worker_session() -> async_sessionmaker[AsyncSession]:
     from the forked parent process's module-level engine.
     """
     _settings = get_settings()
-    _engine = create_async_engine(
-        _settings.DATABASE_URL,
-        echo=_settings.DATABASE_ECHO,
-        poolclass=NullPool,
-    )
+    _engine = create_async_engine(_settings.DATABASE_URL, **_build_worker_engine_kwargs(_settings))
     return async_sessionmaker(_engine, class_=AsyncSession, expire_on_commit=False)

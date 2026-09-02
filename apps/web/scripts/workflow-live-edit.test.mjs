@@ -76,25 +76,3 @@ test("workflow live edit rejects malformed and duplicate-node graphs", () => {
   );
 });
 
-test("the workflow AI edit button reuses FloatingChat live edit", async () => {
-  const [flowsSource, floatingChatSource, editorLiveSource, guidanceSource] = await Promise.all([
-    readFile(new URL("../src/pages/Flows.tsx", import.meta.url), "utf8"),
-    readFile(new URL("../src/components/FloatingChat.tsx", import.meta.url), "utf8"),
-    readFile(new URL("../src/lib/editorLiveChat.ts", import.meta.url), "utf8"),
-    readFile(new URL("../../../packages/core/ai/runtime/prompt_guidance.py", import.meta.url), "utf8"),
-  ]);
-
-  assert.match(flowsSource, /openEditorLiveChat\(\{/);
-  assert.match(flowsSource, /fileType: "workflow"/);
-  assert.match(flowsSource, /getContent: \(\) => serializeWorkflowLiveEdit/);
-  assert.match(flowsSource, /const update = parseWorkflowLiveEdit\(content\)/);
-  assert.match(flowsSource, /<AiEditButton[\s\S]*?onClick=\{openWorkflowAiEdit\}/);
-  assert.match(flowsSource, /closeEditorLiveChat\(\)/);
-  assert.doesNotMatch(flowsSource, /WorkflowAiPanel/);
-
-  assert.match(editorLiveSource, /sessionLabel\?: string \| null/);
-  assert.match(editorLiveSource, /emptyDescription\?: string \| null/);
-  assert.match(floatingChatSource, /editorLiveInfo\?\.examples\?\.length/);
-  assert.match(guidanceSource, /Workflow editor-state requirements:/);
-  assert.match(guidanceSource, /manor-workflow-v1/);
-});

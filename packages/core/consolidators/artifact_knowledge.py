@@ -9,6 +9,7 @@ from __future__ import annotations
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from packages.core.constants.review import ConsolidationReportStatus
 from packages.core.consolidators.base import SnapshotContext, evidence_ids
 from packages.core.consolidators.contract import (
     ConsolidationReportModel,
@@ -74,7 +75,7 @@ class ArtifactKnowledgeConsolidator:
         artifact_events = created_events + used_events
         return ConsolidationReportModel(
             domain=self.domain,
-            status="complete",
+            status=ConsolidationReportStatus.COMPLETE,
             summary=(
                 f"{len(created_events)} artifact(s) created, {len(used_events)} "
                 f"used downstream; {deliverables_missing} deliverable(s) missing"

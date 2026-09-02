@@ -8,6 +8,7 @@ const DATE_LOCALES = {
   en: "en-US",
   zh: "zh-CN",
   es: "es-ES",
+  fr: "fr-FR",
   de: "de-DE",
 } as const;
 

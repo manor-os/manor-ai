@@ -25,6 +25,7 @@ import argparse
 from pathlib import Path
 from typing import Any, Tuple
 from xml.etree import ElementTree as ET
+from defusedxml import ElementTree as SafeET
 
 
 def rect_to_rounded_path(
@@ -100,7 +101,7 @@ def process_svg(content: str, verbose: bool = False) -> Tuple[str, int]:
     ET.register_namespace('xlink', 'http://www.w3.org/1999/xlink')
     
     try:
-        root = ET.fromstring(content)
+        root = SafeET.fromstring(content)
     except ET.ParseError as e:
         if verbose:
             print(f"    XML parse error: {e}")

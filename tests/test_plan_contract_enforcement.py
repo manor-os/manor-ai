@@ -43,6 +43,47 @@ def _clean_plan():
     return Plan(steps=[_llm_step("a", output_shape="TextResult")])
 
 
+def _stale_artifact_review_plan():
+    """Reproduce the production artifact -> review -> report contract gap."""
+    artifact_ref = "${{ steps.prepare_outreach_pack.result.outputs.files }}"
+    return Plan(
+        steps=[
+            PlanStep(
+                key="prepare_outreach_pack",
+                kind="subagent",
+                service_key="partnership_development",
+                output_shape="ArtifactResult",
+                params={"prompt": "Prepare the outreach packet as files."},
+            ),
+            PlanStep(
+                key="calvin_approval",
+                kind="human",
+                params={
+                    "prompt": "Review the outreach packet.",
+                    "review_artifacts": artifact_ref,
+                },
+                depends_on=["prepare_outreach_pack"],
+            ),
+            PlanStep(
+                key="send_update_and_report",
+                kind="llm",
+                service_key="partnership_development",
+                output_shape="TextResult",
+                params={"prompt": "Report on " + artifact_ref},
+                depends_on=["calvin_approval"],
+            ),
+        ]
+    )
+
+
+def _direct_artifact_review_plan():
+    plan = _stale_artifact_review_plan()
+    direct_ref = "${{ steps.prepare_outreach_pack.result.files }}"
+    plan.steps[1].params["review_artifacts"] = direct_ref
+    plan.steps[2].params["prompt"] = "Report on " + direct_ref
+    return plan
+
+
 def test_required_plan_steps_reject_a_plan_missing_the_upload_step():
     task = _FakeTask()
     task.details = {
@@ -285,6 +326,9 @@ class _FakeResult:
     def __init__(self, task):
         self._task = task
 
+    def one_or_none(self):
+        return self._task
+
     def scalar_one_or_none(self):
         return self._task
 
@@ -294,16 +338,296 @@ class _FakeTask:
         self.id = "task_1"
         self.entity_id = "ent_1"
         self.workspace_id = None
+        self.task_type = "general"
+        self.status = "in_progress"
         self.owner_subscription_id = None
         self.details = {}
+
+
+def test_replan_keeps_same_denied_operation_behind_approval() -> None:
+    task = _FakeTask()
+    task.details = {
+        "_replan_context": {
+            "approval_constraints": [{
+                "step_key": "publish_post",
+                "kind": "subagent",
+                "action_key": "social.publish",
+                "capability_id": "external.social",
+                "decision": {
+                    "choice": "request_changes",
+                    "guidance": "Use the approved image instead.",
+                },
+            }],
+        },
+    }
+    plan = Plan(steps=[PlanStep(
+        key="publish_post",
+        kind="subagent",
+        service_key="content",
+        action_key="social.publish",
+        capability_id="external.social",
+        params={"prompt": "Publish the revised post."},
+        requires_approval=False,
+    )])
+
+    constrained = planner_mod._apply_replan_approval_constraints(task, plan)
+
+    assert constrained.steps[0].requires_approval is True
+
+
+def test_replan_allows_a_materially_different_alternative() -> None:
+    task = _FakeTask()
+    task.details = {
+        "_replan_context": {
+            "approval_constraints": [{
+                "step_key": "publish_post",
+                "kind": "subagent",
+                "action_key": "social.publish",
+                "capability_id": "external.social",
+            }],
+        },
+    }
+    plan = Plan(steps=[PlanStep(
+        key="save_draft_for_user",
+        kind="subagent",
+        service_key="content",
+        capability_id="file.write",
+        params={"prompt": "Save a local draft without publishing."},
+        requires_approval=False,
+    )])
+
+    constrained = planner_mod._apply_replan_approval_constraints(task, plan)
+
+    assert constrained.steps[0].requires_approval is False
+
+
+def test_replan_gates_renamed_step_with_same_subject_and_params() -> None:
+    from packages.core.ai.runtime import (
+        approval_args_hash,
+        approval_stable_target_hash,
+    )
+
+    params = {
+        "prompt": "Publish the approved launch post.",
+        "channel": "launch-account",
+    }
+    task = _FakeTask()
+    task.details = {
+        "_replan_context": {
+            "approval_constraints": [{
+                "step_key": "publish_post",
+                "kind": "subagent",
+                "action_key": "social.publish",
+                "capability_id": "external.social",
+                "params_fingerprint": approval_args_hash(params),
+                "target_fingerprint": approval_stable_target_hash(params),
+            }],
+        },
+    }
+    plan = Plan(steps=[PlanStep(
+        key="publish_launch_post",
+        kind="subagent",
+        service_key="content",
+        action_key="social.publish",
+        capability_id="external.social",
+        params=params,
+        requires_approval=False,
+    )])
+
+    constrained = planner_mod._apply_replan_approval_constraints(task, plan)
+
+    assert constrained.steps[0].requires_approval is True
+
+
+def test_replan_gates_renamed_step_after_reviewable_content_changes() -> None:
+    from packages.core.ai.runtime import approval_stable_target_hash
+
+    original_params = {
+        "prompt": "Publish the original launch post.",
+        "channel": "launch-account",
+        "payload": {"caption": "Original caption", "visibility": "public"},
+    }
+    task = _FakeTask()
+    task.details = {
+        "_replan_context": {
+            "approval_constraints": [{
+                "step_key": "publish_post",
+                "kind": "subagent",
+                "action_key": "social.publish",
+                "capability_id": "external.social",
+                "target_fingerprint": approval_stable_target_hash(original_params),
+            }],
+        },
+    }
+    plan = Plan(steps=[PlanStep(
+        key="publish_revised_post",
+        kind="subagent",
+        service_key="content",
+        action_key="social.publish",
+        capability_id="external.social",
+        params={
+            "prompt": "Publish the revised launch post.",
+            "channel": "launch-account",
+            "payload": {"caption": "Revised caption", "visibility": "public"},
+        },
+        requires_approval=False,
+    )])
+
+    constrained = planner_mod._apply_replan_approval_constraints(task, plan)
+
+    assert constrained.steps[0].requires_approval is True
+
+
+def test_replan_does_not_gate_same_capability_for_different_target() -> None:
+    from packages.core.ai.runtime import (
+        approval_args_hash,
+        approval_stable_target_hash,
+    )
+
+    original_params = {
+        "prompt": "Publish launch post.",
+        "channel": "launch-account",
+    }
+
+    task = _FakeTask()
+    task.details = {
+        "_replan_context": {
+            "approval_constraints": [{
+                "step_key": "publish_post",
+                "kind": "subagent",
+                "action_key": "social.publish",
+                "capability_id": "external.social",
+                "params_fingerprint": approval_args_hash(original_params),
+                "target_fingerprint": approval_stable_target_hash(original_params),
+            }],
+        },
+    }
+    plan = Plan(steps=[PlanStep(
+        key="publish_support_update",
+        kind="subagent",
+        service_key="content",
+        action_key="social.publish",
+        capability_id="external.social",
+        params={
+            "prompt": "Publish support update.",
+            "channel": "support-account",
+        },
+        requires_approval=False,
+    )])
+
+    constrained = planner_mod._apply_replan_approval_constraints(task, plan)
+
+    assert constrained.steps[0].requires_approval is False
+
+
+def test_replan_gates_renamed_step_with_dynamic_target_reference() -> None:
+    from packages.core.ai.runtime import approval_stable_target_hash
+
+    original_params = {
+        "prompt": "Publish launch post.",
+        "channel": "launch-account",
+    }
+    task = _FakeTask()
+    task.details = {
+        "_replan_context": {
+            "approval_constraints": [{
+                "step_key": "publish_post",
+                "kind": "subagent",
+                "action_key": "social.publish",
+                "capability_id": "external.social",
+                "target_fingerprint": approval_stable_target_hash(original_params),
+            }],
+        },
+    }
+    plan = Plan(steps=[PlanStep(
+        key="publish_selected_channel",
+        kind="subagent",
+        service_key="content",
+        action_key="social.publish",
+        capability_id="external.social",
+        params={
+            "prompt": "Publish the revised launch post.",
+            "channel": "${{ steps.select_channel.result.name }}",
+        },
+        requires_approval=False,
+    )])
+
+    constrained = planner_mod._apply_replan_approval_constraints(task, plan)
+
+    assert constrained.steps[0].requires_approval is True
+
+
+def test_replan_dynamic_review_content_does_not_gate_different_target() -> None:
+    from packages.core.ai.runtime import approval_stable_target_hash
+
+    original_params = {
+        "prompt": "Publish launch post.",
+        "channel": "launch-account",
+    }
+    task = _FakeTask()
+    task.details = {
+        "_replan_context": {
+            "approval_constraints": [{
+                "step_key": "publish_post",
+                "kind": "subagent",
+                "action_key": "social.publish",
+                "capability_id": "external.social",
+                "target_fingerprint": approval_stable_target_hash(original_params),
+            }],
+        },
+    }
+    plan = Plan(steps=[PlanStep(
+        key="publish_support_update",
+        kind="subagent",
+        service_key="content",
+        action_key="social.publish",
+        capability_id="external.social",
+        params={
+            "prompt": "${{ steps.draft_support_update.result.text }}",
+            "channel": "support-account",
+        },
+        requires_approval=False,
+    )])
+
+    constrained = planner_mod._apply_replan_approval_constraints(task, plan)
+
+    assert constrained.steps[0].requires_approval is False
 
 
 class _FakeDB:
     def __init__(self, task):
         self._task = task
 
-    async def execute(self, *_args, **_kwargs):
+    async def execute(self, statement, *_args, **_kwargs):
+        if "execution_plans" in str(statement):
+            return _FakeResult(None)
         return _FakeResult(self._task)
+
+    async def commit(self):
+        return None
+
+
+@pytest.mark.asyncio
+async def test_plan_task_rejects_inactive_workspace_before_context(monkeypatch):
+    from types import SimpleNamespace
+
+    task = _FakeTask()
+    task.workspace_id = "ws_1"
+
+    async def _deleted_workspace(*_args, **_kwargs):
+        return SimpleNamespace(deleted_at=object(), status="active")
+
+    async def _unexpected_context(*_args, **_kwargs):
+        raise AssertionError("inactive Workspace must fail before context/provider work")
+
+    monkeypatch.setattr(
+        "packages.core.services.workspace_access.lock_workspace_access_boundary",
+        _deleted_workspace,
+    )
+    monkeypatch.setattr(planner_mod, "_gather_context", _unexpected_context)
+
+    with pytest.raises(planner_mod.PlannerError, match="not active"):
+        await planner_mod.plan_task(_FakeDB(task), task.id, execution_mode="live")
 
 
 @contextlib.asynccontextmanager
@@ -329,6 +653,136 @@ def _patch_common(monkeypatch):
 
 async def _fake_gather_context(db, task):
     return object()
+
+
+@pytest.mark.asyncio
+async def test_plan_task_rejects_model_labeled_setup_work_while_setup_is_blocked(
+    monkeypatch,
+):
+    from types import SimpleNamespace
+
+    from packages.core.services import workspace_readiness
+    from packages.core.services.workspace_readiness import (
+        WorkspaceReadinessPartStatus,
+    )
+
+    task = _FakeTask()
+    task.workspace_id = "ws_1"
+    # Matching the allowlisted label is not authorization. Setup automation
+    # enters through the server-owned ScheduledJob path, not Planner.
+    task.details = {"strategist_task_key": "prepare_workspace_identity"}
+    workspace = SimpleNamespace(id="ws_1")
+
+    async def _context(_db, _task):
+        return SimpleNamespace(workspace=workspace)
+
+    async def _blocked(*_args, **_kwargs):
+        return WorkspaceReadinessPartStatus(
+            key="blocking_setup",
+            name="Blocking Workspace setup",
+            role="setup gate",
+            check="live requirements",
+            status="missing",
+            summary="setup incomplete",
+            missing_setup_key="blocking_setup_incomplete",
+            details={"allowed_setup_task_keys": ["prepare_workspace_identity"]},
+        )
+
+    generated = False
+
+    async def _generate(_task, _context):
+        nonlocal generated
+        generated = True
+        return _clean_plan()
+
+    async def _active_workspace(*_args, **_kwargs):
+        return SimpleNamespace(deleted_at=None, status="active")
+
+    monkeypatch.setattr(planner_mod, "_gather_context", _context)
+    monkeypatch.setattr(
+        "packages.core.services.workspace_access.lock_workspace_access_boundary",
+        _active_workspace,
+    )
+    monkeypatch.setattr(
+        workspace_readiness,
+        "evaluate_current_workspace_blocking_setup",
+        _blocked,
+    )
+    monkeypatch.setattr(planner_mod, "_generate_plan", _generate)
+
+    with pytest.raises(planner_mod.PlannerError, match="setup is incomplete"):
+        await planner_mod.plan_task(_FakeDB(task), task.id, execution_mode="live")
+
+    assert generated is False
+
+
+@pytest.mark.asyncio
+async def test_plan_task_rechecks_setup_before_plan_persistence(monkeypatch):
+    from types import SimpleNamespace
+
+    from packages.core.services import workspace_readiness
+    from packages.core.services.workspace_readiness import (
+        WorkspaceReadinessPartStatus,
+    )
+
+    task = _FakeTask()
+    task.workspace_id = "ws_1"
+    task.details = {"strategist_task_key": "normal_growth_task"}
+    context = SimpleNamespace(workspace=SimpleNamespace(id="ws_1"))
+    checks = 0
+
+    async def _context(_db, _task):
+        return context
+
+    async def _becomes_blocked(*_args, **_kwargs):
+        nonlocal checks
+        checks += 1
+        if checks == 1:
+            return None
+        return WorkspaceReadinessPartStatus(
+            key="blocking_setup",
+            name="Blocking Workspace setup",
+            role="setup gate",
+            check="live requirements",
+            status="missing",
+            summary="setup became incomplete",
+            missing_setup_key="blocking_setup_incomplete",
+            details={"allowed_setup_task_keys": ["repair_connection"]},
+        )
+
+    async def _generate(_task, _context):
+        return _clean_plan()
+
+    persisted = False
+
+    async def _persist(*_args, **_kwargs):
+        nonlocal persisted
+        persisted = True
+        return object()
+
+    async def _active_workspace(*_args, **_kwargs):
+        return SimpleNamespace(deleted_at=None, status="active")
+
+    monkeypatch.setattr(planner_mod, "_gather_context", _context)
+    monkeypatch.setattr(
+        "packages.core.services.workspace_access.lock_workspace_access_boundary",
+        _active_workspace,
+    )
+    monkeypatch.setattr(
+        workspace_readiness,
+        "evaluate_current_workspace_blocking_setup",
+        _becomes_blocked,
+    )
+    monkeypatch.setattr(planner_mod, "runtime_planner_llm_billing_context", _noop_billing)
+    monkeypatch.setattr(planner_mod, "_generate_plan", _generate)
+    monkeypatch.setattr(planner_mod, "_enforce_allowlists", lambda plan, ctx: None)
+    monkeypatch.setattr(planner_mod, "create_plan_from_dag", _persist)
+
+    with pytest.raises(planner_mod.PlannerError, match="setup is incomplete"):
+        await planner_mod.plan_task(_FakeDB(task), task.id, execution_mode="live")
+
+    assert checks == 2
+    assert persisted is False
 
 
 @pytest.mark.asyncio
@@ -366,6 +820,31 @@ async def test_enforcement_replan_recovers(monkeypatch):
     # The clean (second) plan was the one persisted.
     assert persisted["plan"].steps[0].output_shape == "TextResult"
     assert len(persisted["plan"].steps) == 1
+
+
+@pytest.mark.asyncio
+async def test_enforcement_replan_recovers_stale_artifact_reference(monkeypatch):
+    """The screenshot-shaped stale ref is corrected before persistence."""
+    persisted = _patch_common(monkeypatch)
+    monkeypatch.setattr(planner_mod, "_enforce_allowlists", lambda plan, ctx: None)
+
+    calls = {"n": 0}
+
+    async def _stale_then_direct(task, ctx):
+        calls["n"] += 1
+        return _stale_artifact_review_plan() if calls["n"] == 1 else _direct_artifact_review_plan()
+
+    monkeypatch.setattr(planner_mod, "_generate_plan", _stale_then_direct)
+
+    task = _FakeTask()
+    db = _FakeDB(task)
+    await planner_mod.plan_task(db, "task_1", execution_mode="live")
+
+    assert calls["n"] == 2
+    assert "contract_gaps" in task.details["_replan_context"]
+    saved = persisted["plan"]
+    assert saved.steps[1].params["review_artifacts"] == "${{ steps.prepare_outreach_pack.result.files }}"
+    assert saved.steps[2].params["prompt"].endswith("${{ steps.prepare_outreach_pack.result.files }}")
 
 
 @pytest.mark.asyncio
@@ -433,6 +912,309 @@ def test_plan_and_run_task_contract_error_fails_no_retry(monkeypatch):
     assert result == {"plan_id": None, "status": "failed"}
     assert failed["task_id"] == "task_1"
     assert "contract" in failed["reason"].lower()
+
+
+def test_plan_and_run_task_capability_error_fails_no_retry(monkeypatch):
+    from packages.core.tasks import ai_tasks
+
+    def _raise_capability(coro):
+        coro.close()
+        raise planner_mod.CapabilityError("skill is no longer callable")
+
+    monkeypatch.setattr(ai_tasks, "_run_async", _raise_capability)
+
+    failed = {}
+    monkeypatch.setattr(
+        ai_tasks,
+        "_mark_task_failed",
+        lambda task_id, reason, **kwargs: failed.update(
+            task_id=task_id,
+            reason=reason,
+            **kwargs,
+        ),
+    )
+
+    def _no_retry(*_args, **_kwargs):
+        raise AssertionError("capability rejection must not burn a Planner retry")
+
+    monkeypatch.setattr(ai_tasks.plan_and_run_task, "retry", _no_retry, raising=False)
+
+    result = ai_tasks.plan_and_run_task.run("task-capability-rejected")
+
+    assert result == {
+        "plan_id": None,
+        "status": "failed",
+        "error": "skill is no longer callable",
+    }
+    assert failed == {
+        "task_id": "task-capability-rejected",
+        "reason": "Plan capability validation failed: skill is no longer callable",
+        "error_type": "CapabilityError",
+    }
+
+
+def test_plan_and_run_task_credit_exhaustion_returns_terminal_failure(monkeypatch):
+    from packages.core.ai.llm_client import CreditExhaustedError
+    from packages.core.tasks import ai_tasks
+
+    def _raise_credit_exhaustion(coro):
+        coro.close()
+        raise CreditExhaustedError("no credits")
+
+    failed = {}
+    monkeypatch.setattr(ai_tasks, "_run_async", _raise_credit_exhaustion)
+    monkeypatch.setattr(
+        ai_tasks,
+        "_mark_task_failed",
+        lambda task_id, reason, **kwargs: failed.update(
+            task_id=task_id,
+            reason=reason,
+            **kwargs,
+        ),
+    )
+
+    result = ai_tasks.plan_and_run_task.run("task-credit-exhausted")
+
+    assert result == {
+        "plan_id": None,
+        "status": "failed",
+        "error": "Credits exhausted: no credits",
+    }
+    assert failed == {
+        "task_id": "task-credit-exhausted",
+        "reason": "Credits exhausted: no credits",
+        "error_type": "CreditExhaustedError",
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "error_type",
+    [
+        pytest.param("CreditExhaustedError", id="exhausted"),
+        pytest.param("CreditCheckUnavailableError", id="check-unavailable"),
+    ],
+)
+async def test_generate_plan_never_falls_back_after_credit_gate_failure(
+    monkeypatch,
+    error_type,
+):
+    from packages.core.ai import llm_client
+
+    error_class = getattr(llm_client, error_type)
+
+    async def _reject_credit(*_args, **_kwargs):
+        raise error_class("credit gate rejected the call")
+
+    monkeypatch.setattr(
+        planner_mod,
+        "runtime_execute_planner_chat_turn",
+        _reject_credit,
+    )
+    context = planner_mod._Context(
+        workspace=None,
+        subscriptions=[],
+        agents_by_id={},
+        allowed_service_keys=set(),
+        provider_actions={},
+    )
+
+    with pytest.raises(error_class, match="credit gate rejected"):
+        await planner_mod._generate_plan(_FakeTask(), context)
+
+
+def test_plan_and_run_task_redispatches_the_committed_active_plan(monkeypatch):
+    from packages.core.plans.service import ActiveTaskPlanError
+    from packages.core.tasks import ai_tasks
+
+    def _raise_active(coro):
+        coro.close()
+        raise ActiveTaskPlanError("task-1", "plan-1", "draft")
+
+    dispatched: list[str] = []
+    monkeypatch.setattr(ai_tasks, "_run_async", _raise_active)
+    monkeypatch.setattr(
+        ai_tasks.run_plan,
+        "delay",
+        lambda plan_id: dispatched.append(plan_id),
+    )
+
+    result = ai_tasks.plan_and_run_task.run("task-1")
+
+    assert result == {"plan_id": "plan-1", "status": "draft"}
+    assert dispatched == ["plan-1"]
+
+
+@pytest.mark.asyncio
+async def test_from_task_api_retry_dispatches_the_committed_active_plan(monkeypatch):
+    from types import SimpleNamespace
+
+    from apps.api.routers import plans as plans_router
+    from packages.core.plans.service import ActiveTaskPlanError
+
+    plan = SimpleNamespace(
+        id="plan-1",
+        task_id="task-1",
+        entity_id="entity-1",
+        workspace_id="workspace-1",
+        execution_mode="live",
+    )
+
+    class _Db:
+        def __init__(self):
+            self.rollbacks = 0
+            self.refreshed = []
+
+        async def rollback(self):
+            self.rollbacks += 1
+
+        async def refresh(self, row):
+            self.refreshed.append(row)
+
+    db = _Db()
+    dispatched: list[str] = []
+
+    async def _authorize(*_args, **_kwargs):
+        return None
+
+    async def _raise_active(*_args, **_kwargs):
+        raise ActiveTaskPlanError("task-1", "plan-1", "draft")
+
+    async def _get_plan(*_args, **_kwargs):
+        return plan
+
+    async def _writable(*_args, **_kwargs):
+        return None
+
+    async def _dispatch(_db, row, **_kwargs):
+        dispatched.append(row.id)
+
+    monkeypatch.setattr(plans_router, "_authorize_task_for_planner", _authorize)
+    monkeypatch.setattr(plans_router, "plan_task_and_commit", _raise_active)
+    monkeypatch.setattr(plans_router, "get_plan", _get_plan)
+    monkeypatch.setattr(plans_router, "require_workspace_writable", _writable)
+    monkeypatch.setattr(plans_router, "_maybe_dispatch", _dispatch)
+    monkeypatch.setattr(plans_router, "_to_plan", lambda row: row.id)
+
+    result = await plans_router.create_from_task(
+        "task-1",
+        plans_router.PlanFromTaskRequest(),
+        user=SimpleNamespace(id="user-1", entity_id="entity-1"),
+        db=db,
+    )
+
+    assert result == "plan-1"
+    assert db.rollbacks == 1
+    assert db.refreshed == [plan]
+    assert dispatched == ["plan-1"]
+
+
+def test_plan_and_run_task_schedules_one_claim_recovery(monkeypatch):
+    from packages.core.plans.planner import TaskPlanClaimHeldError
+    from packages.core.tasks import ai_tasks
+
+    def _raise_claim_held(coro):
+        coro.close()
+        raise TaskPlanClaimHeldError("task-1")
+
+    scheduled: list[dict] = []
+    monkeypatch.setattr(ai_tasks, "_run_async", _raise_claim_held)
+    monkeypatch.setattr(
+        ai_tasks.plan_and_run_task,
+        "apply_async",
+        lambda *args, **kwargs: scheduled.append({"args": args, **kwargs}),
+    )
+
+    result = ai_tasks.plan_and_run_task.run("task-1")
+
+    assert result["duplicate_suppressed"] is True
+    assert result["recheck_scheduled"] is True
+    assert scheduled[0]["args"] == ["task-1"]
+    assert scheduled[0]["kwargs"] == {"planning_claim_recheck": True}
+
+
+def test_plan_claim_recovery_reschedules_while_claim_remains_held(monkeypatch):
+    from packages.core.plans.planner import TaskPlanClaimHeldError
+    from packages.core.tasks import ai_tasks
+
+    def _raise_claim_held(coro):
+        coro.close()
+        raise TaskPlanClaimHeldError("task-1")
+
+    scheduled: list[dict] = []
+    monkeypatch.setattr(ai_tasks, "_run_async", _raise_claim_held)
+    monkeypatch.setattr(
+        ai_tasks.plan_and_run_task,
+        "apply_async",
+        lambda *args, **kwargs: scheduled.append({"args": args, **kwargs}),
+    )
+
+    result = ai_tasks.plan_and_run_task.run(
+        "task-1",
+        planning_claim_recheck=True,
+    )
+
+    assert result["duplicate_suppressed"] is True
+    assert result["recheck_scheduled"] is True
+    assert scheduled[0]["args"] == ["task-1"]
+    assert scheduled[0]["kwargs"] == {"planning_claim_recheck": True}
+
+
+def test_plan_claim_recovery_stops_when_the_task_is_terminal(monkeypatch):
+    from packages.core.plans.planner import TaskPlanAdmissionError
+    from packages.core.tasks import ai_tasks
+
+    def _raise_terminal(coro):
+        coro.close()
+        raise TaskPlanAdmissionError(
+            "task-1",
+            "completed",
+            "task status 'completed' cannot start a new Plan",
+        )
+
+    monkeypatch.setattr(ai_tasks, "_run_async", _raise_terminal)
+    monkeypatch.setattr(
+        ai_tasks.plan_and_run_task,
+        "retry",
+        lambda **_kwargs: pytest.fail("terminal recovery must not retry"),
+    )
+
+    result = ai_tasks.plan_and_run_task.run(
+        "task-1",
+        planning_claim_recheck=True,
+    )
+
+    assert result == {
+        "plan_id": None,
+        "status": "completed",
+        "duplicate_suppressed": True,
+        "recheck_scheduled": False,
+    }
+
+
+@pytest.mark.asyncio
+async def test_plan_task_and_commit_denied_claim_skips_billable_work(monkeypatch):
+    from contextlib import asynccontextmanager
+
+    from packages.core.services import workflow_run_execution_claim as claim_service
+
+    @asynccontextmanager
+    async def _held_claim(task_id):
+        yield claim_service._claim(
+            task_id,
+            "other-owner",
+            granted=False,
+            reason=claim_service.CLAIM_HELD,
+        )
+
+    async def _unexpected_plan(*_args, **_kwargs):
+        raise AssertionError("a denied claim must not reach Planner/provider work")
+
+    monkeypatch.setattr(planner_mod, "task_plan_execution_claim", _held_claim)
+    monkeypatch.setattr(planner_mod, "plan_task", _unexpected_plan)
+
+    with pytest.raises(planner_mod.TaskPlanClaimHeldError):
+        await planner_mod.plan_task_and_commit(object(), "task-1")
 
 
 # ── minimal replan guidance in the planner system prompt ──────────────

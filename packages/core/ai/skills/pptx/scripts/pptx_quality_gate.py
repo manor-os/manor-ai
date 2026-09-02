@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Iterable
 from urllib.parse import unquote
 from xml.etree import ElementTree as ET
+from defusedxml import ElementTree as SafeET
 
 from PIL import Image, ImageChops, ImageStat
 from pptx import Presentation
@@ -399,7 +400,7 @@ def _inspect_text_containment_evidence(
             svg_text = ""
             if source_svg is not None:
                 try:
-                    svg_root = ET.parse(source_svg).getroot()
+                    svg_root = SafeET.parse(source_svg).getroot()
                     svg_text = " ".join(
                         "".join(node.itertext()).strip()
                         for node in svg_root.iter()
@@ -567,7 +568,7 @@ def validate_relationships(pptx_path: Path) -> list[str]:
             rel_paths = sorted(name for name in names if name.endswith(".rels"))
             for rel_path in rel_paths:
                 try:
-                    root = ET.fromstring(package.read(rel_path))
+                    root = SafeET.fromstring(package.read(rel_path))
                 except (KeyError, ET.ParseError) as exc:
                     errors.append(f"{rel_path}: unreadable relationship XML ({exc})")
                     continue
@@ -620,7 +621,7 @@ def _inspect_font_portability(pptx_path: Path, result: GateResult) -> None:
             )
             for slide_name in slide_names:
                 slide_number = int(re.search(r"slide(\d+)\.xml$", slide_name).group(1))
-                root = ET.fromstring(package.read(slide_name))
+                root = SafeET.fromstring(package.read(slide_name))
                 for table in root.findall(f".//{{{DRAWINGML_NS}}}tbl"):
                     for paragraph in table.findall(f".//{{{DRAWINGML_NS}}}p"):
                         runs = []
@@ -716,7 +717,7 @@ def _inspect_character_spacing(pptx_path: Path, result: GateResult) -> None:
                 slide_number = int(
                     re.search(r"slide(\d+)\.xml$", slide_name).group(1)
                 )
-                root = ET.fromstring(package.read(slide_name))
+                root = SafeET.fromstring(package.read(slide_name))
                 for paragraph_properties in root.findall(
                     f".//{{{DRAWINGML_NS}}}pPr"
                 ):
@@ -1430,7 +1431,7 @@ def _inspect_project(
         inspected_slots = 0
         for slide_index, (svg_file, render_file) in enumerate(zip(svg_files, rendered), start=1):
             try:
-                svg_root = ET.fromstring(svg_file.read_text(encoding="utf-8"))
+                svg_root = SafeET.fromstring(svg_file.read_text(encoding="utf-8"))
                 viewbox = [float(value) for value in (svg_root.get("viewBox") or "").split()]
                 if len(viewbox) != 4:
                     continue

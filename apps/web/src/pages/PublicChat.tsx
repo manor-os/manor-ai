@@ -3,19 +3,21 @@ import { useParams } from "react-router-dom";
 
 import ChatMarkdown from "../components/ChatMarkdown";
 import CollapsibleSentMessage from "../components/chat/CollapsibleSentMessage";
+import { ReadAloudButton, VoiceInputButton, VoiceInputStatus } from "../components/chat/ChatVoiceControls";
+import LiveChatCallButton from "../components/chat/LiveChatCallButton";
 import AgentAvatar from "../components/ui/AgentAvatar";
+import WebchatPageLayout from "../components/webchat/WebchatPageLayout";
 import { api, ApiError } from "../lib/api";
 import { tForLocale } from "../lib/i18n";
+import { useChatVoiceInput } from "../lib/useChatVoiceInput";
+import {
+  hasAssistantStreamPlaceholder,
+  mergePublicChatMessages,
+  publicChatMessageNeedsRefresh,
+  removeAssistantStreamPlaceholder,
+  type PublicChatMessage as ChatMessage,
+} from "../lib/publicChatMessages";
 const API_BASE = "/api/v1/public/chat";
-
-interface ChatMessage {
-  id: string;
-  role: "user" | "assistant";
-  content: string;
-  created_at: string | null;
-  local_status?: "pending" | "notice";
-  attachments?: { name?: string; filename?: string; original_name?: string }[] | null;
-}
 
 interface ChatInfo {
   channel_name: string;
@@ -29,6 +31,7 @@ interface ChatInfo {
   login_url?: string | null;
   signup_url?: string | null;
   auth_hint?: string | null;
+  public_page?: unknown;
 }
 
 type CustomerAuthMode = "login" | "register" | "verify";
@@ -63,29 +66,9 @@ function authBearerHeaders(): HeadersInit {
   return token ? { Authorization: `Bearer ${token}` } : {};
 }
 
-function publicMessageContentMatches(localContent: string, serverContent: string): boolean {
-  const normalize = (value: string) =>
-    value
-      .replace(/\n\n\[Attached:[\s\S]*?\]$/i, "")
-      .replace(/\n\[Image:[\s\S]*?\]$/i, "")
-      .trim();
-  const local = normalize(localContent || "");
-  const server = normalize(serverContent || "");
-  if (local === server) return true;
-  if (local && server && (local.startsWith(server) || server.startsWith(local))) return true;
-  return local.startsWith("[Attached:") && server.startsWith("Attached file");
-}
-
-const ASSISTANT_STREAM_STARTED_CONTENT =
-  "The assistant started this response and is still working. If this remains after a reload, the stream was interrupted before it could finish.";
-
-function hasAssistantStreamPlaceholder(content: string): boolean {
-  return (content || "").startsWith(ASSISTANT_STREAM_STARTED_CONTENT);
-}
-
-function removeAssistantStreamPlaceholder(content: string): string {
-  if (!hasAssistantStreamPlaceholder(content)) return content || "";
-  return (content || "").slice(ASSISTANT_STREAM_STARTED_CONTENT.length).replace(/^\s+/, "");
+async function publicChatForbiddenCode(response: Response): Promise<string> {
+  const body = await response.json().catch(() => null);
+  return typeof body?.detail?.code === "string" ? body.detail.code : "";
 }
 
 function displayNameForUser(user: PublicChatUser | null): string {
@@ -172,6 +155,7 @@ export default function PublicChat() {
   const [attachedFiles, setAttachedFiles] = useState<File[]>([]);
   const [sending, setSending] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [accessDenied, setAccessDenied] = useState(false);
   const [visitorName, setVisitorName] = useState("");
   const [started, setStarted] = useState(false);
   const [authChecked, setAuthChecked] = useState(false);
@@ -190,6 +174,7 @@ export default function PublicChat() {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const pollRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const lastServerMessageIdRef = useRef("");
+  const pendingServerMessageIdsRef = useRef(new Set<string>());
   const lastActivityAtRef = useRef(Date.now());
   const sendingRef = useRef(false);
   const resumeAttemptedForTokenRef = useRef<string | null>(null);
@@ -206,6 +191,41 @@ export default function PublicChat() {
     (key: string, vars?: Record<string, string | number>) => tForLocale(key, info?.language || "en", vars),
     [info?.language],
   );
+  const publicPageProps = {
+    page: info?.public_page,
+    language: info?.language,
+    enabled: !isEmbedded,
+    onPrepareMessage: started && sessionId && !sending && !accessDenied ? (message: string) => {
+      setInput(previous => previous.trim() ? `${previous}\n\n${message}` : message);
+      requestAnimationFrame(() => {
+        textareaRef.current?.focus();
+        textareaRef.current?.scrollIntoView({ block: "center" });
+      });
+    } : undefined,
+    onRunAction: started && sessionId && token && !sending && !accessDenied ? async (moduleId: string, values: Record<string, string>, submissionId: string) => {
+      const response = await fetch(`${API_BASE}/${token}/actions/${encodeURIComponent(moduleId)}`, {
+        method: "POST",
+        headers: authHeaders(),
+        body: JSON.stringify({ session_id: sessionId, submission_id: submissionId, values }),
+      });
+      if (response.status === 401) {
+        setCurrentUser(null);
+        setStarted(false);
+      }
+      if (!response.ok) throw new Error("Public action failed");
+    } : undefined,
+  };
+
+  const voiceScope = { publicToken: token, sessionId };
+  const voice = useChatVoiceInput({
+    scope: voiceScope,
+    disabled: sending || !started || !sessionId,
+    locale: info?.language || "en",
+    onTranscript: (text) => {
+      setInput((previous) => previous ? `${previous.trimEnd()} ${text}` : text);
+      textareaRef.current?.focus();
+    },
+  });
 
   // Fetch chat info
   useEffect(() => {
@@ -275,15 +295,27 @@ export default function PublicChat() {
       return;
     }
     if (res.status === 403 && storedSessionId) {
+      const code = await publicChatForbiddenCode(res);
+      if (code !== "session_mismatch") {
+        setAccessDenied(true);
+        setError(customerText(code === "visitor_blocked" ? "page.public_chat.visitor_blocked" : "page.public_chat.access_denied"));
+        return;
+      }
       // Same browser, different signed-in customer: do not expose the old chat.
       forgetStoredSessionId(token);
+      setMessages([]);
       res = await fetch(`${API_BASE}/${token}/session`, {
         method: "POST",
         headers: authHeaders(),
         body: JSON.stringify({ ...sessionPayload, session_id: undefined }),
       });
     }
-    if (!res.ok) { setError(customerText("page.public_chat.failed_to_start_chat")); return; }
+    if (!res.ok) {
+      const code = res.status === 403 ? await publicChatForbiddenCode(res) : "";
+      setAccessDenied(res.status === 403);
+      setError(customerText(code === "visitor_blocked" ? "page.public_chat.visitor_blocked" : "page.public_chat.failed_to_start_chat"));
+      return;
+    }
     const data = await res.json();
     setSessionId(data.session_id);
     saveStoredSessionId(token, data.session_id);
@@ -314,9 +346,10 @@ export default function PublicChat() {
 
   // Poll for messages
   useEffect(() => {
-    if (!token || !sessionId) return;
+    if (!token || !sessionId || error) return;
     let active = true;
     lastServerMessageIdRef.current = "";
+    pendingServerMessageIdsRef.current.clear();
     lastActivityAtRef.current = Date.now();
     const nextDelay = () => {
       if (document.visibilityState === "hidden") return 15_000;
@@ -325,67 +358,58 @@ export default function PublicChat() {
     const poll = async () => {
       try {
         const lastId = lastServerMessageIdRef.current;
+        const params = new URLSearchParams({ session_id: sessionId, after: lastId });
+        for (const id of [...pendingServerMessageIdsRef.current].slice(0, 50)) {
+          params.append("refresh", id);
+        }
         const res = await fetch(
-          `${API_BASE}/${token}/messages?session_id=${sessionId}&after=${lastId}`,
+          `${API_BASE}/${token}/messages?${params}`,
           { headers: authHeaders(), cache: "no-store" }
         );
+        if (!active) return;
         if (res.status === 401) {
           setCurrentUser(null);
           setStarted(false);
           return;
         }
         if (res.status === 403) {
-          forgetStoredSessionId(token);
-          setSessionId(null);
-          setStarted(false);
+          const code = await publicChatForbiddenCode(res);
+          if (!active) return;
+          if (code === "session_mismatch") {
+            forgetStoredSessionId(token);
+            setSessionId(null);
+            setMessages([]);
+            setStarted(false);
+          } else {
+            setAccessDenied(true);
+            setError(customerText(code === "visitor_blocked" ? "page.public_chat.visitor_blocked" : "page.public_chat.access_denied"));
+          }
           return;
         }
         if (!res.ok) return;
         const data = await res.json();
-        if (data.messages && data.messages.length > 0) {
-          const serverMessages = (data.messages as ChatMessage[]).flatMap((msg) => {
-            if (sendingRef.current && msg.role === "assistant") return [];
-            if (msg.role !== "assistant" || !hasAssistantStreamPlaceholder(msg.content || "")) return msg;
-            const strippedContent = removeAssistantStreamPlaceholder(msg.content || "");
-            if (strippedContent) return { ...msg, content: strippedContent };
-            return msg;
-          });
-          if (serverMessages.length === 0) return;
-          const hasServerAssistant = serverMessages.some((msg) => msg.role === "assistant");
-          setMessages((prev) => {
-            let changed = false;
-            const next = hasServerAssistant
-              ? prev.filter((m) => !(m.id.startsWith("tmp-assistant-") && m.local_status))
-              : [...prev];
-            if (next.length !== prev.length) changed = true;
-            const ids = new Set(next.map((m) => m.id));
-            const newMsgs: ChatMessage[] = [];
-            let newestServerMsg: ChatMessage | null = null;
-            for (const msg of serverMessages) {
-              if (ids.has(msg.id)) continue;
-              const optimisticIndex = next.findIndex((m) =>
-                m.id.startsWith("tmp-") &&
-                m.role === msg.role &&
-                publicMessageContentMatches(m.content, msg.content)
-              );
-              if (optimisticIndex >= 0) {
-                next[optimisticIndex] = msg;
-                ids.add(msg.id);
-                changed = true;
-                newestServerMsg = msg;
-              } else {
-                newMsgs.push(msg);
-                ids.add(msg.id);
-                newestServerMsg = msg;
-              }
-            }
-            if (!changed && newMsgs.length === 0) return prev;
-            lastActivityAtRef.current = Date.now();
-            const lastServer = newestServerMsg || [...newMsgs].reverse().find((m) => !m.id.startsWith("tmp-"));
-            if (lastServer) lastServerMessageIdRef.current = lastServer.id;
-            return [...next, ...newMsgs];
-          });
+        if (!active) return;
+        const canApply = (msg: ChatMessage) => !(sendingRef.current && msg.role === "assistant");
+        const serverMessages: ChatMessage[] = [];
+        for (const msg of (data.messages || []) as ChatMessage[]) {
+          // Keep the cursor before any reply postponed during a live stream.
+          if (!canApply(msg)) break;
+          serverMessages.push(msg);
         }
+        const updates = ((data.updates || []) as ChatMessage[]).filter(canApply);
+        const incoming = [...serverMessages, ...updates];
+        for (const msg of incoming) {
+          if (publicChatMessageNeedsRefresh(msg)) pendingServerMessageIdsRef.current.add(msg.id);
+          else pendingServerMessageIdsRef.current.delete(msg.id);
+        }
+        // Refreshed older messages must never move the incremental cursor.
+        const lastServer = serverMessages.at(-1);
+        if (lastServer) lastServerMessageIdRef.current = lastServer.id;
+        setMessages((prev) => {
+          const next = mergePublicChatMessages(prev, incoming);
+          if (next !== prev) lastActivityAtRef.current = Date.now();
+          return next;
+        });
       } finally {
         if (active) pollRef.current = setTimeout(poll, nextDelay());
       }
@@ -395,7 +419,7 @@ export default function PublicChat() {
       active = false;
       if (pollRef.current) clearTimeout(pollRef.current);
     };
-  }, [token, sessionId]);
+  }, [token, sessionId, error, customerText]);
 
   // Auto-scroll
   useEffect(() => {
@@ -423,29 +447,31 @@ export default function PublicChat() {
 
   // Send message with SSE streaming
   const send = async () => {
-    if ((!input.trim() && attachedFiles.length === 0) || !token || !sessionId || sending) return;
+    if ((!input.trim() && attachedFiles.length === 0) || !token || !sessionId || sending || voice.busy) return;
     const text = input.trim();
     const filesToSend = [...attachedFiles];
     const displayContent = text || (filesToSend.length ? `[Attached: ${filesToSend.map((file) => file.name).join(", ")}]` : "");
     setInput("");
     setAttachedFiles([]);
+    sendingRef.current = true;
     setSending(true);
 
     // Optimistic add
-    const tempStamp = Date.now();
-    const tempId = `tmp-user-${tempStamp}`;
-    const assistantTempId = `tmp-assistant-${tempStamp}`;
+    const clientTurnId = globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    const tempId = `tmp-user-${clientTurnId}`;
+    const assistantTempId = `tmp-assistant-${clientTurnId}`;
     lastActivityAtRef.current = Date.now();
     setMessages((prev) => [
       ...prev,
       {
         id: tempId,
+        client_turn_id: clientTurnId,
         role: "user",
         content: displayContent || text,
         created_at: null,
         attachments: filesToSend.map((file) => ({ name: file.name })),
       },
-      { id: assistantTempId, role: "assistant", content: "", created_at: null, local_status: "pending" },
+      { id: assistantTempId, client_turn_id: clientTurnId, role: "assistant", content: "", created_at: null, local_status: "pending" },
     ]);
 
     let assistantMessageId = assistantTempId;
@@ -474,6 +500,7 @@ export default function PublicChat() {
       const form = new FormData();
       form.append("session_id", sessionId);
       form.append("message", text);
+      form.append("client_turn_id", clientTurnId);
       filesToSend.forEach((file) => form.append("files", file));
       const res = await fetch(`${API_BASE}/${token}/message/stream`, {
         method: "POST",
@@ -487,10 +514,16 @@ export default function PublicChat() {
         return;
       }
       if (res.status === 403) {
-        updateLocalAssistant("", "notice");
-        forgetStoredSessionId(token);
-        setSessionId(null);
-        setStarted(false);
+        const code = await publicChatForbiddenCode(res);
+        if (code === "session_mismatch") {
+          forgetStoredSessionId(token);
+          setSessionId(null);
+          setMessages([]);
+          setStarted(false);
+        } else {
+          setAccessDenied(true);
+          setError(customerText(code === "visitor_blocked" ? "page.public_chat.visitor_blocked" : "page.public_chat.access_denied"));
+        }
         return;
       }
       if (!res.ok || !res.body) {
@@ -505,6 +538,7 @@ export default function PublicChat() {
       let receivedText = false;
 
       const applyAssistantId = (messageId?: string) => {
+        if (messageId) pendingServerMessageIdsRef.current.add(messageId);
         if (!messageId || messageId === assistantMessageId) return;
         setMessages((prev) =>
           prev.map((msg) =>
@@ -571,6 +605,7 @@ export default function PublicChat() {
     } catch {
       updateLocalAssistant(customerText("page.public_chat.send_failed"), "notice");
     } finally {
+      sendingRef.current = false;
       setSending(false);
     }
   };
@@ -701,9 +736,9 @@ export default function PublicChat() {
                 <path strokeLinecap="round" strokeLinejoin="round" d="M16.5 10.5V7.5a4.5 4.5 0 10-9 0v3m-.75 0h10.5A1.75 1.75 0 0119 12.25v6A1.75 1.75 0 0117.25 20H6.75A1.75 1.75 0 015 18.25v-6a1.75 1.75 0 011.75-1.75z" />
               </svg>
             </div>
-            <h1 style={styles.errorTitle}>{customerText("page.public_chat.link_unavailable_title")}</h1>
+            <h1 style={styles.errorTitle}>{customerText(accessDenied ? "page.public_chat.access_denied_title" : "page.public_chat.link_unavailable_title")}</h1>
             <p style={styles.errorCopy}>{error}</p>
-            <p style={styles.errorHint}>{customerText("page.public_chat.link_unavailable_hint")}</p>
+            <p style={styles.errorHint}>{customerText(accessDenied ? "page.public_chat.access_denied_hint" : "page.public_chat.link_unavailable_hint")}</p>
           </div>
         </div>
       </div>
@@ -740,6 +775,7 @@ export default function PublicChat() {
     const publicAgentSeed = `${info.channel_name}::${info.workspace_name || ""}::${info.agent_name || ""}`;
     return (
       <div style={shellStyle}>
+        <WebchatPageLayout {...publicPageProps}>
         <div style={cardStyle}>
           <div style={{ padding: "30px 24px" }}>
             <AgentAvatar
@@ -895,6 +931,7 @@ export default function PublicChat() {
           </div>
         </div>
         <div style={brandingStyle}>{customerText("page.public_chat.powered_by_manor_ai")}</div>
+        </WebchatPageLayout>
       </div>
     );
   }
@@ -905,6 +942,7 @@ export default function PublicChat() {
     const publicAgentSeed = `${info.channel_name}::${info.workspace_name || ""}::${info.agent_name || ""}`;
     return (
       <div style={shellStyle}>
+        <WebchatPageLayout {...publicPageProps}>
         <div style={cardStyle}>
           <div style={{ textAlign: "center", padding: "32px 24px" }}>
             <AgentAvatar
@@ -947,6 +985,7 @@ export default function PublicChat() {
           </div>
         </div>
         <div style={brandingStyle}>{customerText("page.public_chat.powered_by_manor_ai")}</div>
+        </WebchatPageLayout>
       </div>
     );
   }
@@ -955,6 +994,7 @@ export default function PublicChat() {
   const publicAgentSeed = `${info.channel_name}::${info.workspace_name || ""}::${info.agent_name || ""}`;
   return (
     <div style={shellStyle}>
+      <WebchatPageLayout {...publicPageProps}>
       <div style={chatCardStyle}>
         {/* Header */}
         <div style={styles.header}>
@@ -991,10 +1031,17 @@ export default function PublicChat() {
           )}
           {messages.map((m) => {
             const isUser = m.role === "user";
-            const isSystemNotice = m.local_status === "notice";
-            const isPendingAssistant = m.role === "assistant" && m.local_status === "pending" && !m.content;
+            const messageContent = isUser ? m.content : removeAssistantStreamPlaceholder(m.content);
+            // Startup recovery can interrupt a placeholder without adding text.
+            const isEmptyInterrupted = !isUser && m.stream_status === "interrupted" && !messageContent.trim();
+            const isSystemNotice = m.local_status === "notice" || isEmptyInterrupted;
+            const visibleContent = isEmptyInterrupted
+              ? customerText("page.public_chat.response_interrupted")
+              : messageContent;
+            const isPendingAssistant = !isUser && !visibleContent.trim() && (
+              m.local_status === "pending" || publicChatMessageNeedsRefresh(m)
+            );
             const isStreamingAssistant = sending && m.role === "assistant" && messages[messages.length - 1]?.id === m.id;
-            const visibleContent = isUser ? m.content : removeAssistantStreamPlaceholder(m.content);
             return (
               <div
                 key={m.id}
@@ -1044,6 +1091,9 @@ export default function PublicChat() {
                       {isStreamingAssistant && <span className="chat-streaming-cursor" />}
                     </>
                   )}
+                  {!isUser && !isSystemNotice && !isStreamingAssistant && visibleContent.trim() && (
+                    <ReadAloudButton text={visibleContent} scope={voiceScope} messageId={m.id} locale={info.language || "en"} disabled={sending} />
+                  )}
                   {m.attachments && m.attachments.length > 0 && (
                     <div style={styles.messageAttachmentList}>
                       {m.attachments.map((attachment, idx) => (
@@ -1081,6 +1131,7 @@ export default function PublicChat() {
               ))}
             </div>
           )}
+          <VoiceInputStatus voice={voice} />
           <div style={styles.inputBar}>
           <input
             ref={fileInputRef}
@@ -1104,6 +1155,8 @@ export default function PublicChat() {
               <path strokeLinecap="round" strokeLinejoin="round" d="M21.44 11.05 12.25 20.24a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 1 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48" />
             </svg>
           </button>
+          <VoiceInputButton voice={voice} disabled={sending} />
+          <LiveChatCallButton scope={voiceScope} disabled={sending || voice.busy || !sessionId} locale={info.language || "en"} />
           <textarea
             ref={textareaRef}
             placeholder={customerText("page.public_chat.type_a_message")}
@@ -1123,10 +1176,10 @@ export default function PublicChat() {
             aria-label={customerText("page.public_chat.send_message")}
             title={customerText("page.public_chat.send_message")}
             onClick={send}
-            disabled={(!input.trim() && attachedFiles.length === 0) || sending}
+            disabled={(!input.trim() && attachedFiles.length === 0) || sending || voice.busy}
             style={{
               ...styles.sendBtn,
-              opacity: (!input.trim() && attachedFiles.length === 0) || sending ? 0.4 : 1,
+              opacity: (!input.trim() && attachedFiles.length === 0) || sending || voice.busy ? 0.4 : 1,
             }}
           >
             <svg width="16" height="16" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
@@ -1137,6 +1190,7 @@ export default function PublicChat() {
         </div>
       </div>
       <div style={brandingStyle}>{customerText("page.public_chat.powered_by_manor_ai")}</div>
+      </WebchatPageLayout>
     </div>
   );
 }

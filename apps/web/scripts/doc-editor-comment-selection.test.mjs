@@ -50,3 +50,9 @@ test("rendered comment anchors store the selected range text itself", () => {
     /const quote = trimCommentQuote\(range\.toString\(\)\)[\s\S]*?type: "rendered_text_selection"[\s\S]*?quote/,
   );
 });
+
+test("comment loading uses a stable empty value instead of retriggering its sync effect", () => {
+  assert.match(editorSource, /const EMPTY_COMMENTS: Comment\[\] = \[\];/);
+  assert.match(editorSource, /data: editorComments = EMPTY_COMMENTS/);
+  assert.doesNotMatch(editorSource, /data: editorComments = \[\]/);
+});

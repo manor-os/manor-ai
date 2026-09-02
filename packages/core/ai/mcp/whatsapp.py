@@ -35,7 +35,11 @@ import logging
 from typing import Any, Dict, List
 
 from packages.core.ai.mcp._http import mcp_err as _err, mcp_ok as _ok
-from packages.core.services.channels.whatsapp_adapter import WhatsAppAdapter
+from packages.core.services.channels.base import ChannelTextSendError
+from packages.core.services.channels.whatsapp_adapter import (
+    WHATSAPP_TEMPLATE_REQUIRED_REASON_CODE,
+    WhatsAppAdapter,
+)
 from packages.core.services.meta_graph import MetaGraphError, graph as _graph
 
 logger = logging.getLogger(__name__)
@@ -419,6 +423,13 @@ async def call_tool(
             )
         else:  # pragma: no cover - guarded by _TOOLS
             return _err(f"Unhandled WhatsApp tool: {name!r}")
+    except ChannelTextSendError as exc:
+        if exc.reason_code == WHATSAPP_TEMPLATE_REQUIRED_REASON_CODE:
+            return _err(
+                f"{exc.reason_code}: {exc} Use send_template with an approved "
+                "template name and language."
+            )
+        return _err(str(exc))
     except (ValueError, MetaGraphError, RuntimeError) as exc:
         return _err(str(exc))
     except Exception as exc:  # noqa: BLE001

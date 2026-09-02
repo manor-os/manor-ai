@@ -18,7 +18,9 @@ from . import (
     gmail,
     google_calendar,
     google_drive,
+    notion,
     manor_mcp_calendar,
+    manor_mcp_minutes,
     github,
     linkedin,
     outlook,
@@ -33,9 +35,13 @@ from . import (
     wechat_official,
     wechat_personal,
     telegram,
+    discord,
     replicate,
     elevenlabs,
     tavily,
+    alpaca_market_data,
+    alpha_vantage,
+    twelve_data,
     jimeng,
     producthunt,
     facebook,
@@ -47,6 +53,8 @@ from . import (
     square,
     tiktok_shop,
     amazon,
+    twilio,
+    webhook,
 )
 from . import email as email_module   # aliased to avoid shadowing stdlib `email`
 
@@ -63,7 +71,9 @@ BUILTIN_MCP_MODULES: dict[str, MCPModule] = {
     "gmail": gmail,
     "google_calendar": google_calendar,
     "manor_mcp_calendar": manor_mcp_calendar,
+    "manor_mcp_minutes": manor_mcp_minutes,
     "google_drive": google_drive,
+    "notion": notion,
     "github": github,
     "linkedin": linkedin,
     # Microsoft 365 (Graph API, shared Azure AD app registration). The
@@ -87,10 +97,14 @@ BUILTIN_MCP_MODULES: dict[str, MCPModule] = {
     "wechat_official": wechat_official,
     "wechat_personal": wechat_personal,
     "telegram": telegram,
+    "discord": discord,
     # AI generation / research APIs (api_key auth)
     "replicate": replicate,
     "elevenlabs": elevenlabs,
     "tavily": tavily,
+    "alpaca_market_data": alpaca_market_data,
+    "alpha_vantage": alpha_vantage,
+    "twelve_data": twelve_data,
     "jimeng": jimeng,
     # Launch / community platforms
     "producthunt": producthunt,
@@ -110,6 +124,8 @@ BUILTIN_MCP_MODULES: dict[str, MCPModule] = {
     # Marketplace seller APIs (signed / token-exchange auth)
     "tiktok_shop": tiktok_shop,
     "amazon": amazon,
+    "twilio": twilio,
+    "webhook": webhook,
 }
 
 

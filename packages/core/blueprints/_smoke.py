@@ -14,7 +14,7 @@ Cases (against an in-memory sqlite DB):
      preflight_promote returns []
   8. promote_workspace flips settings.sandbox=false + restores kind +
      strips [SIM] prefix
-  9. Promote on a non-sandbox workspace raises PromoteError
+  9. Promote outside Workspace simulation raises PromoteError
  10. Forbidden-key payload (with credential_ref) is rejected by validate_payload
 
 Run with: uv run python -m packages.core.blueprints._smoke
@@ -49,13 +49,12 @@ from packages.core.blueprints import (
     promote_workspace,
 )
 from packages.core.blueprints.payload import validate_payload
-from packages.core.governance import WorkspacePolicy, update_policy
-from packages.core.models.base import Base, generate_ulid
+from packages.core.governance import WorkspacePolicy, get_policy, update_policy
+from packages.core.models.base import generate_ulid
 from packages.core.models.blueprint import WorkspaceBlueprint
 from packages.core.models.channel import ChannelConfig
 from packages.core.models.custom_field import CustomFieldDefinition
 from packages.core.models.document import Channel
-from packages.core.governance import WorkspacePolicy, get_policy
 from packages.core.governance.presets import apply_preset, list_presets
 from packages.core.blueprints.report import simulate_report
 from packages.core.models.execution import ExecutionPlan, ExecutionStep
@@ -464,7 +463,7 @@ async def main() -> None:
             await promote_workspace(db, new_ws_id)
             _check(False, "should have raised")
         except PromoteError as exc:
-            _check("not in sandbox" in str(exc), "error names the cause")
+            _check("not in Workspace simulation" in str(exc), "error names the cause")
 
     # ─────────────────────────────────────────────────────────────
     print("\n[case] install (live) → sandbox=false from the start, no [SIM] prefix")
@@ -583,9 +582,6 @@ async def main() -> None:
         ws_for_window = (await db.execute(
             select(Workspace).where(Workspace.id == sim_ws_id)
         )).scalar_one()
-        installed_at = datetime.fromisoformat(
-            ws_for_window.settings["_blueprint"]["installed_at"]
-        )
         # Force a 1-day window so projected_monthly arithmetic is stable.
         bp_meta = dict(ws_for_window.settings["_blueprint"])
         bp_meta["installed_at"] = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
@@ -661,7 +657,6 @@ async def main() -> None:
 
     print("\n[case] counterfactuals show preset deltas")
     cf_safe = next(c for c in report2.counterfactuals if c.preset_key == "safe")
-    cf_std = next(c for c in report2.counterfactuals if c.preset_key == "standard")
     cf_aggro = next(c for c in report2.counterfactuals if c.preset_key == "aggressive")
 
     # Operator-relevant signal: how much each preset lets through.

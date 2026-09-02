@@ -29,13 +29,18 @@ import { resolveDisplayMediaUrl } from "../lib/api";
 import { t } from "../lib/i18n";
 import InlineFileReferenceCard from "./InlineFileReferenceCard";
 import InlineTaskReferenceCard from "./InlineTaskReferenceCard";
+import InlineIntegrationLink from "./InlineIntegrationLink";
+import SourceCitation from "./SourceCitation";
+import remarkSourceCitations from "../lib/remarkSourceCitations.mjs";
+import { parseIntegrationSetupLink } from "../lib/integrationSetupLinks";
 import {
   decodeRouteReferenceHref,
   linkifyChatRouteReferencesInMarkdown,
   looksLikeTaskRouteReference,
   looksLikeViewerRouteReference,
 } from "../lib/chatRouteReferences";
-import { stripEditorLiveEditBlocks } from "../lib/editorLiveChat";
+import { visibleAssistantText } from "../lib/assistantTextProjection";
+import { redactInternalAssistantErrorDetails } from "../lib/assistant-visible-text.mjs";
 import { decodeFileReferenceHref, isOpenableFileReference, linkifyFileReferencesInMarkdown } from "../lib/fileReferences";
 
 
@@ -187,26 +192,18 @@ function toMarkdownText(value: unknown): string {
   }
 }
 
-const MANOR_FINAL_RESPONSE_OPEN_TAG = "<manor-final-response>";
-const MANOR_FINAL_RESPONSE_TAG_RE = /<\/?manor-final-response>\s*/gi;
-
-function stripManorFinalResponseMarker(value: string): string {
-  const markerIndex = value.toLowerCase().lastIndexOf(MANOR_FINAL_RESPONSE_OPEN_TAG);
-  const visible = markerIndex >= 0
-    ? value.slice(markerIndex + MANOR_FINAL_RESPONSE_OPEN_TAG.length)
-    : value;
-  return visible.replace(MANOR_FINAL_RESPONSE_TAG_RE, "").trim();
-}
-
 function ChatMarkdown({ content, isUser, streaming, enableFileCards = true, returnTo }: ChatMarkdownProps) {
-  const rawText = stripEditorLiveEditBlocks(stripManorFinalResponseMarker(toMarkdownText(content)));
+  const projectedText = visibleAssistantText(toMarkdownText(content));
+  const rawText = isUser
+    ? projectedText
+    : redactInternalAssistantErrorDetails(projectedText);
   const routeLinkedText = enableFileCards ? linkifyChatRouteReferencesInMarkdown(rawText) : rawText;
   const text = enableFileCards ? linkifyFileReferencesInMarkdown(routeLinkedText) : routeLinkedText;
 
   return (
     <div className={isUser ? "chat-md chat-md--user" : `chat-md${streaming ? " chat-md--streaming" : ""}`}>
       <Markdown
-        remarkPlugins={[remarkGfm, remarkBreaks]}
+        remarkPlugins={isUser ? [remarkGfm, remarkBreaks] : [remarkGfm, remarkSourceCitations, remarkBreaks]}
         urlTransform={(url) => {
           if (url.startsWith("manor-route:") || url.startsWith("manor-file:")) {
             return url;
@@ -214,6 +211,17 @@ function ChatMarkdown({ content, isUser, streaming, enableFileCards = true, retu
           return defaultUrlTransform(url);
         }}
         components={{
+          span({ node, children, ...props }) {
+            if (node?.properties?.["data-source-citation"]) {
+              return <SourceCitation
+                label={String(node.properties["data-source-label"] || "Source")}
+                kind={node.properties["data-source-kind"] === "file" ? "file" : "web"}
+                iconUrl={String(node.properties["data-source-icon"] || "")}
+                count={Number(node.properties["data-source-count"] || 1)}
+              >{children}</SourceCitation>;
+            }
+            return <span {...props}>{children}</span>;
+          },
           /* Override pre to handle fenced code blocks */
           pre({ children }) {
             // children is a <code> element with className="language-xxx"
@@ -283,6 +291,12 @@ function ChatMarkdown({ content, isUser, streaming, enableFileCards = true, retu
 
           a({ href, children }) {
             const label = getTextContent(children).trim();
+            const integrationProvider = href && typeof window !== "undefined"
+              ? parseIntegrationSetupLink(href, window.location.origin)
+              : null;
+            if (integrationProvider) {
+              return <InlineIntegrationLink provider={integrationProvider} label={label} />;
+            }
             const routeReference = href ? decodeRouteReferenceHref(href) : null;
             const fileReference = href ? decodeFileReferenceHref(href) : null;
             const targetReference = routeReference || fileReference || href || label;

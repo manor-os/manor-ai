@@ -14,8 +14,11 @@
 
 FROM python:3.12-slim
 
+ARG BUILD_VERSION=dev
+
 ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1
+    PYTHONUNBUFFERED=1 \
+    MANOR_BUILD_VERSION=$BUILD_VERSION
 
 # Install Docker CLI (needed to create/manage sandbox containers via host daemon)
 RUN apt-get update \

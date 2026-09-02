@@ -22,6 +22,7 @@ import {
 import "@xyflow/react/dist/style.css";
 import MediaPreview from "./MediaPreview";
 import { resolveConnectorBrand } from "../../lib/workflowBrand";
+import IntegrationLogo from "../IntegrationLogo";
 import type { MediaRef } from "../../lib/workflowMedia";
 
 /* ------------------------------------------------------------------ */
@@ -177,7 +178,7 @@ export function NodeIcon({ type, size = 18 }: { type: string; size?: number }) {
   );
 }
 
-type NodeData = { type: string; label: string; branches: boolean; cases?: string[]; status?: string; preview?: MediaRef; issue?: "error" | "warning"; brand?: { color: string; path?: string }; agent?: { model?: string; tools?: string[]; memory?: boolean }; outType?: string; output?: string };
+type NodeData = { type: string; label: string; branches: boolean; cases?: string[]; status?: string; preview?: MediaRef; issue?: "error" | "warning"; brand?: { color: string; provider: string }; agent?: { model?: string; tools?: string[]; memory?: boolean }; outType?: string; output?: string };
 
 // ComfyUI-style typed sockets: the data type a node emits → a socket colour,
 // also used to tint the data wire. ``any`` stays neutral so ordinary flows are
@@ -583,10 +584,8 @@ function WorkflowNode({ id, data, selected }: NodeProps<Node<NodeData>>) {
             display: "flex", alignItems: "center", justifyContent: "center",
           }}
         >
-          {data.brand?.path ? (
-            <svg width={19} height={19} viewBox="0 0 24 24" fill={tileColor} aria-hidden>
-              <path d={data.brand.path} />
-            </svg>
+          {data.brand ? (
+            <IntegrationLogo provider={data.brand.provider} size={19} />
           ) : (
             <NodeIcon type={data.type} />
           )}
@@ -740,7 +739,7 @@ function buildGraph(
     const brand = s.type === "connector"
       ? (() => {
           const b = resolveConnectorBrand(s.meta?.original_type || s.config?.tool || s.config?.n8n?.type);
-          return b.color || b.icon ? { color: b.color, path: b.icon?.path } : undefined;
+          return b.color || b.icon ? { color: b.color, provider: b.key } : undefined;
         })()
       : undefined;
     // agent nodes surface their folded model / memory / tools as ports

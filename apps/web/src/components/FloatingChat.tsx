@@ -14,17 +14,25 @@ import {
 } from "react";
 import { useMutation, useQueryClient, useQuery } from "@tanstack/react-query";
 import { useLocation } from "react-router-dom";
-import { api, type GlobalChatFlowEntrypoint } from "../lib/api";
+import {
+  api,
+  ApiError,
+  ConversationSurfaceKind,
+  type GlobalChatFlowEntrypoint,
+} from "../lib/api";
 import { invalidateKnowledgeQueries } from "../lib/knowledgeInvalidation";
 import {
   type ChatMessage,
   type ChatStreamSnapshot,
+  type ResponseSurfaceSubmissionReceipt,
+  type ResponseSurfaceSubmissionResult,
   type ToolCall,
   isInternalFilePermissionMessage,
   isRedundantApprovalResolutionReceipt,
   isTerminalStreamSnapshot,
   mergeChatStreamSnapshot,
   mergeResolvedWorkflowMessage,
+  normalizeWorkspaceRecommendation,
   streamSnapshotNeedsHistory,
   pendingHITLIds,
   hitlActionTranscriptText,
@@ -32,22 +40,40 @@ import {
   useDebounced,
   resolveGlobalWorkflowMessageAction,
 } from "../lib/chatStream";
-import { hasLocallyStreamedConversation, useChatStreamStore } from "../stores/chatStream";
+import {
+  collectResponseSurfaceSubmissionFailureMessageIds,
+  collectResponseSurfaceSubmissionReceipts,
+  isResponseSurfaceSubmissionMessage,
+  rollbackResponseSurfaceSubmissionMessages,
+  settleResponseSurfaceSubmissionFailure,
+  responseSurfaceSubmissionMessage,
+  responseSurfaceSubmissionMeta,
+} from "../lib/responseSurface";
+import {
+  ChatStreamCompletionStatus,
+  hasLocallyStreamedConversation,
+  shouldIgnoreLocallyStoppedStreamUpdate,
+  useChatStreamStore,
+} from "../stores/chatStream";
 import { useAuthStore } from "../stores/auth";
 import { useToastStore } from "../stores/toast";
 import ChatMarkdown from "./ChatMarkdown";
 import WorkflowResultCard from "./WorkflowResultCard";
-import AssistantMessageBlocks from "./AssistantMessageBlocks";
+import AssistantMessageBlocks, {
+  assistantPendingActionKindForMessage,
+} from "./AssistantMessageBlocks";
 import FloatingPanel from "./FloatingPanel";
 import PanelHeader from "./chat/PanelHeader";
 import MessageRow from "./chat/MessageRow";
 import MessageBubble from "./chat/MessageBubble";
 import ChatTimestamp from "./chat/ChatTimestamp";
 import ChatMessageActions, {
+  chatMessageActionText,
   type ChatMessageFeedbackRating,
   displayContentForAssistantMessage,
   isRetryableAssistantMessage,
 } from "./chat/ChatMessageActions";
+import useChatMessageFeedback from "./chat/useChatMessageFeedback";
 import CollapsibleSentMessage from "./chat/CollapsibleSentMessage";
 import ManorAvatar from "./ui/ManorAvatar";
 import AgentActivityOrb, { inferAgentActivity } from "./ui/AgentActivityOrb";
@@ -58,6 +84,7 @@ import { chatMessageAnchorId } from "../lib/chatMessageAnchor";
 import { DEFAULT_APPROVAL_OPTIONS } from "../lib/approvalOptions";
 import SessionSwitcher from "./SessionSwitcher";
 import ToolCallList from "./ui/ToolCallList";
+import LoadingSpinner from "./ui/LoadingSpinner";
 import { ChatMessagesSkeleton } from "./ui/Skeleton";
 import CreditLimitNotice from "./ui/CreditLimitNotice";
 import ChatInputFooter, {
@@ -80,6 +107,8 @@ import { type ChatBoxMode } from "./ChatModeSelector";
 import ChatModeToolbar from "./ChatModeToolbar";
 import ChatModeTemplateGallery from "./ChatModeTemplateGallery";
 import { chatModeTemplateSamples } from "./EmbeddedChat";
+import WorkspaceRecommendationCard from "./WorkspaceRecommendationCard";
+import useWorkspaceRecommendationActions from "./useWorkspaceRecommendationActions";
 import { prepareTemplateRemix } from "./templateRemix";
 import {
   getDefaultChatModePayload,
@@ -99,6 +128,10 @@ import {
   type PendingChatRetry,
 } from "../lib/chatRetry";
 import {
+  manualSkillReferences,
+  resolveManualSkillReferenceIds,
+} from "../lib/manualSkillRefs";
+import {
   OPEN_FLOATING_CHAT_EVENT,
   type OpenFloatingChatDetail,
 } from "../lib/selectionActions";
@@ -108,14 +141,37 @@ function maybeLocalCodingRunNoticeForTools(_tools: ToolCall[]): string | null {
 }
 import {
   applyEditorLivePatch,
-  buildEditorLiveEditFallbackContent,
   buildEditorLiveEditRequest,
   EDITOR_LIVE_CHAT_CLOSE_EVENT,
   EDITOR_LIVE_CHAT_EVENT,
+  EDITOR_LIVE_CHAT_UPDATE_EVENT,
+  AiEditApplyPhase,
+  AiEditPatchStreamEventKind,
+  AiEditPreviewStatus,
+  AiEditSessionCleanupStatus,
+  aiEditConversationOwnerKey,
+  containsEditorLivePatchProtocol,
+  countCompleteEditorLivePatchOperations,
+  createAiEditConversationDeleteCoordinator,
+  createAiEditSessionCleanupCoordinator,
+  createEditorLiveChatSseProjector,
+  createEditorLivePatchDeltaQueue,
+  createEditorLivePatchStream,
+  extractRecoverableEditorLivePatchOperationPayloads,
   extractEditorLivePatchPayloads,
+  hasReviewableEditorLivePreview,
+  isEditorLivePatchCommitAlreadyPreviewed,
+  isSameAiEditConversationOwner,
+  isSameEditorLiveTarget,
+  nativeFilePatchResultFromSseFrame,
+  shouldAttachEditorLiveSourceDocument,
+  shouldStreamEditorLiveDeltaPreview,
   stripEditorLiveEditBlocks,
+  type AiEditConversationOwnerScope,
   type EditorLiveChatDetail,
+  type EditorNativeFilePatchResult,
 } from "../lib/editorLiveChat";
+import { decodeAuthTokenClaims, getAuthToken } from "../lib/authToken";
 import type { Agent, UserSummary } from "../lib/types";
 import { useChatAutoFollow } from "../lib/useChatAutoFollow";
 import { t } from "../lib/i18n";
@@ -136,6 +192,11 @@ function toDisplayText(value: unknown): string {
 }
 
 type ChatRetryRequest = Omit<PendingChatRetry, "createdAt">;
+interface FloatingChatSendOptions {
+  forceAutoMode?: boolean;
+  forceOwnerChat?: boolean;
+  responseSurfaceSubmission?: ResponseSurfaceSubmissionReceipt;
+}
 /* See EmbeddedChat: snapshots are the fast path, not a guaranteed one. */
 const FOLLOWED_RUN_SILENCE_MS = 45_000;
 /* A row can claim "streaming" forever if its API process was hard-killed (the
@@ -343,114 +404,6 @@ function buildEditorLiveDiff(before: string, after: string, fileName: string) {
   return lines.join("\n");
 }
 
-function parseFencedCodeBlocks(text: string) {
-  const blocks: Array<{ language: string; content: string }> = [];
-  const re = /```([a-zA-Z0-9_+.-]*)[^\n]*\n([\s\S]*?)```/g;
-  let match: RegExpExecArray | null;
-  while ((match = re.exec(text))) {
-    const content = (match[2] || "").trim();
-    if (!content) continue;
-    blocks.push({
-      language: (match[1] || "").trim().toLowerCase(),
-      content,
-    });
-  }
-  return blocks;
-}
-
-function looksHtmlLike(text: string) {
-  return /<(!doctype\s+html|html|head|body)\b/i.test(text);
-}
-
-function tryParseJsonObject(text: string) {
-  try {
-    const parsed = JSON.parse(text);
-    return parsed && typeof parsed === "object";
-  } catch {
-    return false;
-  }
-}
-
-function looksMostlyCode(text: string) {
-  const lines = text
-    .split("\n")
-    .map((line) => line.trim())
-    .filter(Boolean);
-  if (lines.length < 2) return false;
-  const codeish = lines.filter((line) =>
-    /^(import|export|from|function|class|const|let|var|return|if|for|while|switch|case|def|async|await|try|catch|finally|#|\/\/|\/\*|\*|<|{|}|\.|@)/.test(line) ||
-    /[{};=<>]/.test(line),
-  ).length;
-  return codeish / lines.length >= 0.45;
-}
-
-function replacementCandidateIsComplete(
-  candidate: string,
-  currentContent: string,
-  detail: EditorLiveChatDetail,
-) {
-  const trimmed = candidate.trim();
-  if (!trimmed || trimmed === currentContent.trim()) return false;
-
-  const name = (detail.documentName || "").toLowerCase();
-  const type = `${detail.fileType || ""} ${detail.mimeType || ""} ${detail.editorType || ""}`.toLowerCase();
-
-  if (
-    name.endsWith(".html") ||
-    name.endsWith(".htm") ||
-    type.includes("html") ||
-    looksHtmlLike(currentContent)
-  ) {
-    return looksHtmlLike(trimmed);
-  }
-
-  if (
-    name.endsWith(".json") ||
-    type.includes("json") ||
-    tryParseJsonObject(currentContent)
-  ) {
-    return tryParseJsonObject(trimmed);
-  }
-
-  if (name.endsWith(".css") || type.includes("css")) {
-    return /[{}:;]/.test(trimmed) && trimmed.split("\n").length >= 2;
-  }
-
-  return looksMostlyCode(trimmed);
-}
-
-function extractEditorLiveReplacementContent(
-  assistantText: string,
-  currentContent: string,
-  detail: EditorLiveChatDetail,
-) {
-  const blocks = parseFencedCodeBlocks(assistantText);
-  const fileExt = (detail.documentName || "").split(".").pop()?.toLowerCase() || "";
-  const preferred = blocks
-    .filter((block) => {
-      if (!block.language) return true;
-      if (fileExt && (block.language === fileExt || block.language.includes(fileExt))) return true;
-      if (fileExt === "html" || fileExt === "htm") return ["html", "markup", "xml"].includes(block.language);
-      if (fileExt === "js") return ["js", "javascript"].includes(block.language);
-      if (fileExt === "ts") return ["ts", "typescript"].includes(block.language);
-      return true;
-    })
-    .sort((a, b) => b.content.length - a.content.length);
-
-  for (const block of preferred) {
-    if (replacementCandidateIsComplete(block.content, currentContent, detail)) {
-      return block.content;
-    }
-  }
-
-  const raw = assistantText.trim();
-  if (replacementCandidateIsComplete(raw, currentContent, detail)) {
-    return raw;
-  }
-
-  return null;
-}
-
 function makeEditorLiveProgressTool(
   step: EditorLiveProgressStep,
   status: ToolCall["status"],
@@ -489,44 +442,308 @@ function withEditorLiveProgress(
   return updated;
 }
 
+type EditorLiveTurnState = {
+  sessionKey?: string;
+  turnId?: string;
+  content: string;
+  phase: "idle" | "pending" | "streaming" | "complete" | "failed";
+  operationCount?: number;
+  appliedPatchCount?: number;
+  basePatchCount?: number;
+  abortController?: AbortController;
+};
+
+async function rollbackEditorLiveAdapter(detail: EditorLiveChatDetail | null) {
+  if (!detail) return true;
+  try {
+    await detail.adapter.rollback();
+    return true;
+  } catch (error) {
+    console.warn("Editor live edit rollback failed", error);
+    return false;
+  }
+}
+
+async function restoreEditorLiveTurn(
+  detail: EditorLiveChatDetail,
+  content: string,
+  hadReviewablePreview: boolean,
+  signal?: AbortSignal,
+  turnId?: string,
+  turnBasePatchCount = 0,
+) {
+  if (hadReviewablePreview && !signal?.aborted) {
+    try {
+      const restored = await detail.adapter.restore(content, {
+        complete: true,
+        phase: AiEditApplyPhase.Complete,
+        source: "assistant-stream",
+        turnId,
+        turnBasePatchCount,
+        patchCount: 0,
+        mode: "patch",
+        sourceLabel: "previous preview",
+        signal,
+      });
+      if (restored !== false && !signal?.aborted) return true;
+    } catch (error) {
+      console.warn("Editor live edit turn restore failed", error);
+    }
+  }
+  await rollbackEditorLiveAdapter(detail);
+  return false;
+}
+
+const AI_EDIT_DELETE_QUEUE_PREFIX = "manor.ai-edit.pending-conversation-deletes.v3";
+const AI_EDIT_DELETE_RETRY_DELAYS_MS = [0, 400, 1_600] as const;
+const AI_EDIT_DELETE_QUEUE_EVENT = "manor:ai-edit-delete-queued";
+const AI_EDIT_DELETE_RETRY_MIN_MS = 5_000;
+const AI_EDIT_DELETE_RETRY_MAX_MS = 60_000;
+const aiEditConversationDeleteCoordinator = createAiEditConversationDeleteCoordinator();
+
+function currentAiEditConversationOwner(): AiEditConversationOwnerScope | null {
+  const claims = decodeAuthTokenClaims(getAuthToken());
+  if (!claims?.sub || !claims.entity_id) return null;
+  return { userId: claims.sub, entityId: claims.entity_id };
+}
+
+function aiEditDeleteQueueKey(owner: AiEditConversationOwnerScope) {
+  return `${AI_EDIT_DELETE_QUEUE_PREFIX}:${aiEditConversationOwnerKey(owner)}`;
+}
+
+function readPendingAiEditConversationDeletes(
+  owner: AiEditConversationOwnerScope,
+): string[] {
+  try {
+    const parsed = JSON.parse(window.sessionStorage.getItem(aiEditDeleteQueueKey(owner)) || "[]");
+    return Array.isArray(parsed)
+      ? Array.from(new Set(
+          parsed.filter((value): value is string => typeof value === "string" && Boolean(value)),
+        ))
+      : [];
+  } catch {
+    return [];
+  }
+}
+
+function writePendingAiEditConversationDeletes(
+  owner: AiEditConversationOwnerScope,
+  ids: string[],
+) {
+  try {
+    const key = aiEditDeleteQueueKey(owner);
+    if (ids.length > 0) window.sessionStorage.setItem(key, JSON.stringify(Array.from(new Set(ids))));
+    else window.sessionStorage.removeItem(key);
+  } catch {
+    // Storage can be unavailable; the bounded in-memory retry still runs.
+  }
+}
+
+function enqueueAiEditConversationDelete(
+  owner: AiEditConversationOwnerScope,
+  conversationId: string,
+) {
+  const pending = readPendingAiEditConversationDeletes(owner);
+  if (pending.includes(conversationId)) return;
+  writePendingAiEditConversationDeletes(owner, [...pending, conversationId]);
+  window.dispatchEvent(new Event(AI_EDIT_DELETE_QUEUE_EVENT));
+}
+
+function removePendingAiEditConversationDelete(
+  owner: AiEditConversationOwnerScope,
+  conversationId: string,
+) {
+  writePendingAiEditConversationDeletes(
+    owner,
+    readPendingAiEditConversationDeletes(owner).filter((id) => id !== conversationId),
+  );
+}
+
+function deleteAiEditConversation(
+  conversationId: string,
+  owner?: AiEditConversationOwnerScope | null,
+): Promise<boolean> {
+  if (!owner) return Promise.resolve(false);
+  enqueueAiEditConversationDelete(owner, conversationId);
+  if (!isSameAiEditConversationOwner(currentAiEditConversationOwner(), owner)) {
+    // Never send a previous entity's host-owned conversation id with the
+    // current token. Its queue is retried when that exact owner returns.
+    return Promise.resolve(false);
+  }
+  const deletion = aiEditConversationDeleteCoordinator.run(owner, conversationId, async () => {
+    for (const delayMs of AI_EDIT_DELETE_RETRY_DELAYS_MS) {
+      if (delayMs > 0) {
+        await new Promise<void>((resolve) => window.setTimeout(resolve, delayMs));
+      }
+      if (!isSameAiEditConversationOwner(currentAiEditConversationOwner(), owner)) {
+        return false;
+      }
+      try {
+        await api.chat.deleteConversation(conversationId, { silent: true });
+        return true;
+      } catch (error) {
+        if (error instanceof ApiError && error.status === 404) {
+          return true;
+        }
+      }
+    }
+
+    console.warn("AI Edit conversation cleanup is queued for retry", conversationId);
+    return false;
+  });
+  return deletion.then((deleted) => {
+    if (deleted) removePendingAiEditConversationDelete(owner, conversationId);
+    return deleted;
+  });
+}
+
+async function waitForEditorLivePreviewPaint(signal?: AbortSignal, settleDelay = true) {
+  if (signal?.aborted) return;
+  await new Promise<void>((resolve) => window.requestAnimationFrame(() => resolve()));
+  if (
+    !settleDelay
+    || signal?.aborted
+    || window.matchMedia?.("(prefers-reduced-motion: reduce)").matches
+  ) return;
+  await new Promise<void>((resolve) => window.setTimeout(resolve, 70));
+}
+
 function pipeEditorLiveEditStream(
   response: Response,
   detail: EditorLiveChatDetail,
   sessionKey: string | undefined,
-  appliedRef: MutableRefObject<{
-    sessionKey?: string;
-    content: string;
-    complete?: boolean;
-  }>,
+  turnId: string,
+  appliedRef: MutableRefObject<EditorLiveTurnState>,
   isActive: () => boolean,
   onProgress?: (tool: ToolCall) => void,
   onCompleteApplied?: () => void,
-  userRequest = "",
+  onSettled?: () => void,
+  initialContent = "",
+  hadReviewablePreview = false,
+  turnBasePatchCount = 0,
 ) {
-  if (!response.body || !detail.applyContent) return response;
-  if (typeof response.body.tee !== "function") return response;
+  const settleUnfinishedTurn = () => {
+    const applied = appliedRef.current;
+    if (
+      applied.turnId === turnId
+      && (applied.phase === "pending" || applied.phase === "streaming")
+    ) {
+      appliedRef.current = { ...applied, phase: "failed" };
+    }
+    onSettled?.();
+  };
+  if (!response.body) {
+    settleUnfinishedTurn();
+    return response;
+  }
+  if (typeof response.body.tee !== "function") {
+    settleUnfinishedTurn();
+    return response;
+  }
 
   const [chatBody, liveBody] = response.body.tee();
-  const liveResponse = new Response(chatBody, {
-    status: response.status,
-    statusText: response.statusText,
-    headers: response.headers,
-  });
-
-  void (async () => {
+  const liveProcessing = (async () => {
     const reader = liveBody.getReader();
     const decoder = new TextDecoder();
     let buffer = "";
     let currentEvent = "";
     let assistantText = "";
     let completeNotified = false;
-    let processedPatchCount = 0;
+    let processedOperationCount = 0;
+    let appliedPatchCount = 0;
+    let patchFailureCount = 0;
+    let sawStreamError = false;
+    let lastAppliedPatch = "";
     let appliedGeneratedImageUrl = "";
-    let workingContent = detail.getContent?.() || "";
+    let persistedNativePatchKey = "";
+    let reloadedNativePatchKey = "";
+    let nativePatchReloadError = "";
+    let lastDeltaOperationIndex: number | null = null;
+    const patchStream = createEditorLivePatchStream();
+    // The caller reads once at turn start. Re-reading here could retarget a
+    // Project edit if the user switches tabs while the response is opening.
+    const baselineContent = initialContent;
+    let workingContent = baselineContent;
+    let lastPreviewContent = baselineContent;
+    const signal = appliedRef.current.turnId === turnId
+      ? appliedRef.current.abortController?.signal
+      : undefined;
+    const cancelLiveReader = () => {
+      void reader.cancel();
+    };
+    signal?.addEventListener("abort", cancelLiveReader, { once: true });
+    if (!isActive() || signal?.aborted) {
+      await reader.cancel();
+      signal?.removeEventListener("abort", cancelLiveReader);
+      settleUnfinishedTurn();
+      return;
+    }
+    appliedRef.current = {
+      ...appliedRef.current,
+      sessionKey,
+      turnId,
+      content: workingContent,
+      phase: "streaming",
+      operationCount: 0,
+      appliedPatchCount: 0,
+    };
 
-    const finishLiveEdit = () => {
-      if (completeNotified) return;
+    const rollbackFailedLiveEdit = async () => {
+      if (!isActive() || signal?.aborted) return false;
+      const restoredPreviousPreview = await restoreEditorLiveTurn(
+        detail,
+        baselineContent,
+        hadReviewablePreview,
+        signal,
+        turnId,
+        turnBasePatchCount,
+      );
+      if (!isActive() || signal?.aborted) return false;
+      appliedRef.current = {
+        sessionKey,
+        content: baselineContent,
+        phase: restoredPreviousPreview ? "complete" : "failed",
+        operationCount: 0,
+        appliedPatchCount: 0,
+        basePatchCount: turnBasePatchCount,
+      };
+      return true;
+    };
+
+    const finishLiveEdit = async (patch = "", sourceLabel = "assistant patch") => {
+      if (completeNotified) return true;
+      if (!isActive() || signal?.aborted) return false;
+      const diff = buildEditorLiveDiff(
+        baselineContent,
+        workingContent,
+        detail.documentName || "current file",
+      );
+      const accepted = await detail.adapter.complete(workingContent, {
+        complete: true,
+        phase: AiEditApplyPhase.Complete,
+        source: "assistant-stream",
+        turnId,
+        turnBasePatchCount,
+        mode: "patch",
+        diff,
+        patch: truncateToolText(patch, 5000),
+        patchCount: appliedPatchCount,
+        sourceLabel,
+        signal,
+      });
+      if (accepted === false) throw new Error("The editor rejected the completed edit.");
+      if (!isActive() || signal?.aborted) return false;
       completeNotified = true;
+      appliedRef.current = {
+        sessionKey,
+        turnId,
+        content: workingContent,
+        phase: "complete",
+        operationCount: processedOperationCount,
+        appliedPatchCount,
+        basePatchCount: turnBasePatchCount,
+        abortController: appliedRef.current.abortController,
+      };
       onProgress?.(
         makeEditorLiveProgressTool(
           "verify_patch",
@@ -536,18 +753,111 @@ function pipeEditorLiveEditStream(
             stage: "verified",
           },
           {
-            status: "ok",
-            patches: processedPatchCount,
+            status: patchFailureCount > 0 ? "partial" : "ok",
+            patches: appliedPatchCount,
+            failed: patchFailureCount,
           },
         ),
       );
       onCompleteApplied?.();
+      return true;
+    };
+
+    const finishNativeFilePatch = () => {
+      if (completeNotified || !persistedNativePatchKey || !reloadedNativePatchKey) return false;
+      if (!isActive() || signal?.aborted) return false;
+      completeNotified = true;
+      appliedRef.current = {
+        sessionKey,
+        turnId,
+        content: baselineContent,
+        phase: "complete",
+        operationCount: 1,
+        appliedPatchCount: 1,
+        basePatchCount: turnBasePatchCount,
+        abortController: appliedRef.current.abortController,
+      };
+      onProgress?.(
+        makeEditorLiveProgressTool(
+          "verify_patch",
+          "success",
+          { file: detail.documentName || "current file", stage: "persisted bytes reloaded" },
+          { status: "ok", source: "native patch_file" },
+        ),
+      );
+      onCompleteApplied?.();
+      return true;
+    };
+
+    const applyNativeFilePatchResult = async (result: EditorNativeFilePatchResult) => {
+      if (!detail.applyNativeFilePatch || !isActive() || signal?.aborted) return false;
+      const key = String(result.source_sha256 || `${result.document_id || ""}:${result.path}`);
+      if (key === persistedNativePatchKey) return key === reloadedNativePatchKey;
+      persistedNativePatchKey = key;
+      nativePatchReloadError = "";
+      onProgress?.(
+        makeEditorLiveProgressTool(
+          "apply_patch",
+          "pending",
+          { file: detail.documentName || result.path, patch: 1 },
+          { status: "persisted", source: "native patch_file" },
+        ),
+      );
+      try {
+        const accepted = await detail.applyNativeFilePatch(result, {
+          complete: true,
+          phase: AiEditApplyPhase.Complete,
+          source: "assistant-stream",
+          turnId,
+          turnBasePatchCount,
+          mode: "patch",
+          patchCount: 1,
+          sourceLabel: "native patch_file",
+          signal,
+        });
+        if (accepted === false) throw new Error("The editor rejected the persisted file reload.");
+        if (!isActive() || signal?.aborted) return false;
+        reloadedNativePatchKey = key;
+        appliedRef.current = {
+          sessionKey,
+          turnId,
+          content: baselineContent,
+          phase: "streaming",
+          operationCount: 1,
+          appliedPatchCount: 1,
+          basePatchCount: turnBasePatchCount,
+          abortController: appliedRef.current.abortController,
+        };
+        onProgress?.(
+          makeEditorLiveProgressTool(
+            "apply_patch",
+            "success",
+            { file: detail.documentName || result.path, patch: 1 },
+            { status: "ok", source: "native patch_file", path: result.path },
+          ),
+        );
+        return true;
+      } catch (error) {
+        nativePatchReloadError = error instanceof Error ? error.message : String(error);
+        onProgress?.(
+          makeEditorLiveProgressTool(
+            "verify_patch",
+            "error",
+            { file: detail.documentName || result.path, stage: "reload failed" },
+            {
+              status: "failed",
+              error: nativePatchReloadError,
+              recovery: "Reload the document to read the already-persisted native patch.",
+            },
+          ),
+        );
+        return false;
+      }
     };
 
     const applyGeneratedImageUrl = async (imageUrl: string) => {
-      if (!detail.applyGeneratedImage || !imageUrl || !isActive()) return false;
+      if (!detail.applyGeneratedImage || !imageUrl || !isActive() || signal?.aborted) return false;
       if (imageUrl === appliedGeneratedImageUrl) return true;
-      appliedGeneratedImageUrl = imageUrl;
       const fileLabel = detail.documentName || "current file";
       const diff = [
         `--- ${fileLabel}`,
@@ -578,26 +888,36 @@ function pipeEditorLiveEditStream(
           "pending",
           {
             file: detail.documentName || "current file",
-            patch: processedPatchCount + 1,
+            patch: appliedPatchCount + 1,
           },
         ),
       );
 
       try {
-        await detail.applyGeneratedImage(imageUrl, {
-          complete: true,
+        const accepted = await detail.applyGeneratedImage(imageUrl, {
+          complete: false,
+          phase: AiEditApplyPhase.Preview,
           source: "assistant-stream",
+          turnId,
+          turnBasePatchCount,
           mode: "patch",
           diff,
-          patchCount: processedPatchCount + 1,
+          patchCount: appliedPatchCount + 1,
           sourceLabel: "generated image",
+          signal,
         });
-        workingContent = detail.getContent?.() || workingContent;
-        processedPatchCount += 1;
+        if (accepted === false) throw new Error("The editor rejected the generated image.");
+        if (!isActive() || signal?.aborted) return false;
+        appliedGeneratedImageUrl = imageUrl;
+        appliedPatchCount += 1;
         appliedRef.current = {
           sessionKey,
+          turnId,
           content: workingContent,
-          complete: true,
+          phase: "streaming",
+          appliedPatchCount,
+          basePatchCount: turnBasePatchCount,
+          abortController: appliedRef.current.abortController,
         };
         onProgress?.(
           makeEditorLiveProgressTool(
@@ -605,7 +925,7 @@ function pipeEditorLiveEditStream(
             "success",
             {
               file: detail.documentName || "current file",
-              patch: processedPatchCount,
+              patch: appliedPatchCount,
             },
             {
               status: "ok",
@@ -613,7 +933,6 @@ function pipeEditorLiveEditStream(
             },
           ),
         );
-        finishLiveEdit();
         return true;
       } catch (err) {
         onProgress?.(
@@ -622,7 +941,7 @@ function pipeEditorLiveEditStream(
             "error",
             {
               file: detail.documentName || "current file",
-              patch: processedPatchCount + 1,
+              patch: appliedPatchCount + 1,
             },
             {
               status: "failed",
@@ -634,52 +953,31 @@ function pipeEditorLiveEditStream(
       }
     };
 
-    const applyFallbackEdit = () => {
-      if (!isActive()) return false;
-      let fallbackContent: string | null = null;
-      try {
-        fallbackContent = buildEditorLiveEditFallbackContent(
-          detail,
-          userRequest,
-          workingContent,
-        );
-      } catch (err) {
-        console.warn("Editor live edit fallback failed", err);
-        return false;
-      }
-      if (
-        typeof fallbackContent !== "string" ||
-        !fallbackContent ||
-        fallbackContent === workingContent
-      ) {
-        return false;
-      }
+    const applyPatchCommit = async (event: ReturnType<typeof patchStream.push>[number]) => {
+      if (!isActive() || signal?.aborted) return;
+      const patchJson = event.patch;
+      const patchNumber = processedOperationCount + 1;
+      processedOperationCount = patchNumber;
       const beforeContent = workingContent;
-      const patchJson = JSON.stringify([
-        {
-          op: "replace",
-          find: beforeContent,
-          replace: fallbackContent,
-        },
-      ]);
-      const diff = buildEditorLiveDiff(
-        beforeContent,
-        fallbackContent,
-        detail.documentName || "current file",
-      );
-
+      const result = applyEditorLivePatch(beforeContent, patchJson);
+      const diff = result.failed.length
+        ? ""
+        : buildEditorLiveDiff(
+            beforeContent,
+            result.content,
+            detail.documentName || "current file",
+          );
       onProgress?.(
         makeEditorLiveProgressTool(
           "generate_patch",
           "success",
           {
             file: detail.documentName || "current file",
-            stage: "fallback patch",
+            stage: "patch streamed",
           },
           {
             status: "ok",
-            source: "local fallback",
-            patches: processedPatchCount + 1,
+            patches: patchNumber,
             patch: truncateToolText(patchJson, 5000),
           },
         ),
@@ -690,301 +988,276 @@ function pipeEditorLiveEditStream(
           "pending",
           {
             file: detail.documentName || "current file",
-            patch: processedPatchCount + 1,
+            patch: patchNumber,
           },
         ),
       );
 
-      try {
-        workingContent = fallbackContent;
-        processedPatchCount += 1;
+      if (result.failed.length > 0) {
         appliedRef.current = {
-          sessionKey,
-          content: workingContent,
-          complete: true,
+          ...appliedRef.current,
+          operationCount: processedOperationCount,
         };
-        detail.applyContent?.(workingContent, {
-          complete: true,
-          source: "assistant-stream",
-          mode: "patch",
-          diff,
-          patch: truncateToolText(patchJson, 5000),
-          patchCount: processedPatchCount,
-          sourceLabel: "local fallback",
-        });
-        onProgress?.(
-          makeEditorLiveProgressTool(
-            "apply_patch",
-            "success",
-            {
-              file: detail.documentName || "current file",
-              patch: processedPatchCount,
-            },
-            {
-              status: "ok",
-              source: "local fallback",
-              operations: 1,
-              patch: truncateToolText(patchJson, 5000),
-            },
-          ),
-        );
-        finishLiveEdit();
-        return true;
-      } catch (err) {
+        patchFailureCount += 1;
         onProgress?.(
           makeEditorLiveProgressTool(
             "apply_patch",
             "error",
             {
               file: detail.documentName || "current file",
-              patch: processedPatchCount || 1,
+              patch: patchNumber,
             },
             {
               status: "failed",
-              error: (err as Error).message,
-            },
-          ),
-        );
-        return false;
-      }
-    };
-
-    const applyAssistantReplacementEdit = () => {
-      if (!isActive()) return false;
-      const replacementContent = extractEditorLiveReplacementContent(
-        assistantText,
-        workingContent,
-        detail,
-      );
-      if (!replacementContent) return false;
-
-      const beforeContent = workingContent;
-      const patchJson = JSON.stringify([
-        {
-          op: "replace",
-          find: beforeContent,
-          replace: replacementContent,
-        },
-      ]);
-      const diff = buildEditorLiveDiff(
-        beforeContent,
-        replacementContent,
-        detail.documentName || "current file",
-      );
-
-      onProgress?.(
-        makeEditorLiveProgressTool(
-          "generate_patch",
-          "success",
-          {
-            file: detail.documentName || "current file",
-            stage: "replacement inferred from assistant response",
-          },
-          {
-            status: "ok",
-            source: "assistant replacement",
-            patches: processedPatchCount + 1,
-            patch: truncateToolText(patchJson, 5000),
-          },
-        ),
-      );
-      onProgress?.(
-        makeEditorLiveProgressTool(
-          "apply_patch",
-          "pending",
-          {
-            file: detail.documentName || "current file",
-            patch: processedPatchCount + 1,
-          },
-        ),
-      );
-
-      try {
-        workingContent = replacementContent;
-        processedPatchCount += 1;
-        appliedRef.current = {
-          sessionKey,
-          content: workingContent,
-          complete: true,
-        };
-        detail.applyContent?.(workingContent, {
-          complete: true,
-          source: "assistant-stream",
-          mode: "patch",
-          diff,
-          patch: truncateToolText(patchJson, 5000),
-          patchCount: processedPatchCount,
-          sourceLabel: "assistant replacement",
-        });
-        onProgress?.(
-          makeEditorLiveProgressTool(
-            "apply_patch",
-            "success",
-            {
-              file: detail.documentName || "current file",
-              patch: processedPatchCount,
-            },
-            {
-              status: "ok",
-              source: "assistant replacement",
-              operations: 1,
+              failed: result.failed,
               patch: truncateToolText(patchJson, 5000),
             },
           ),
         );
-        finishLiveEdit();
-        return true;
-      } catch (err) {
         onProgress?.(
           makeEditorLiveProgressTool(
-            "apply_patch",
+            "verify_patch",
             "error",
             {
               file: detail.documentName || "current file",
-              patch: processedPatchCount + 1,
+              stage: "patch failed",
             },
             {
               status: "failed",
-              error: (err as Error).message,
+              failed: result.failed,
               patch: truncateToolText(patchJson, 5000),
             },
           ),
         );
-        return false;
+        return;
       }
-    };
 
-    const applyPatchPayloads = () => {
-      const payloads = extractEditorLivePatchPayloads(assistantText);
-      if (payloads.length <= processedPatchCount) return;
-      if (!isActive()) return;
-
-      for (
-        let patchIndex = processedPatchCount;
-        patchIndex < payloads.length;
-        patchIndex += 1
-      ) {
-        const patchJson = payloads[patchIndex]!;
-        const beforeContent = workingContent;
-        const result = applyEditorLivePatch(beforeContent, patchJson);
-        const diff = result.failed.length
-          ? ""
-          : buildEditorLiveDiff(
-              beforeContent,
-              result.content,
-              detail.documentName || "current file",
-            );
-        onProgress?.(
-          makeEditorLiveProgressTool(
-            "generate_patch",
-            "success",
-            {
-              file: detail.documentName || "current file",
-              stage: "patch streamed",
-            },
-            {
-              status: "ok",
-              patches: patchIndex + 1,
-              patch: truncateToolText(patchJson, 5000),
-            },
-          ),
+      try {
+        const continuesStreamedDelta = event.operationIndex === lastDeltaOperationIndex;
+        const alreadyPreviewed = isEditorLivePatchCommitAlreadyPreviewed(
+          event.operationIndex,
+          lastDeltaOperationIndex,
+          result.content,
+          lastPreviewContent,
         );
-        onProgress?.(
-          makeEditorLiveProgressTool(
-            "apply_patch",
-            "pending",
-            {
-              file: detail.documentName || "current file",
-              patch: patchIndex + 1,
-            },
-          ),
-        );
-
-        if (result.failed.length > 0) {
-          processedPatchCount = patchIndex + 1;
-          onProgress?.(
-            makeEditorLiveProgressTool(
-              "apply_patch",
-              "error",
-              {
-                file: detail.documentName || "current file",
-                patch: patchIndex + 1,
-              },
-              {
-                status: "failed",
-                failed: result.failed,
-                patch: truncateToolText(patchJson, 5000),
-              },
-            ),
-          );
-          onProgress?.(
-            makeEditorLiveProgressTool(
-              "verify_patch",
-              "error",
-              {
-                file: detail.documentName || "current file",
-                stage: "patch failed",
-              },
-              {
-                status: "failed",
-                failed: result.failed,
-                patch: truncateToolText(patchJson, 5000),
-              },
-            ),
-          );
-          continue;
-        }
-
-        workingContent = result.content;
-        processedPatchCount = patchIndex + 1;
-        appliedRef.current = {
-          sessionKey,
-          content: workingContent,
-          complete: true,
-        };
-        try {
-          detail.applyContent?.(workingContent, {
-            complete: true,
+        if (!alreadyPreviewed) {
+          const accepted = await detail.adapter.preview(result.content, {
+            complete: false,
+            phase: AiEditApplyPhase.Preview,
             source: "assistant-stream",
+            streamEvent: continuesStreamedDelta
+              ? AiEditPatchStreamEventKind.Delta
+              : undefined,
+            turnId,
+            turnBasePatchCount,
             mode: "patch",
             diff,
             patch: truncateToolText(patchJson, 5000),
-            patchCount: processedPatchCount,
+            patchCount: appliedPatchCount + 1,
             sourceLabel: "assistant patch",
+            signal,
           });
-          onProgress?.(
-            makeEditorLiveProgressTool(
-              "apply_patch",
-              "success",
-              {
-                file: detail.documentName || "current file",
-                patch: patchIndex + 1,
-              },
-              {
-                status: "ok",
-                operations: result.applied,
-                patch: truncateToolText(patchJson, 5000),
-              },
-            ),
-          );
-        } catch (err) {
-          onProgress?.(
-            makeEditorLiveProgressTool(
-              "apply_patch",
-              "error",
-              {
-                file: detail.documentName || "current file",
-                patch: patchIndex + 1,
-              },
-              {
-                status: "failed",
-                error: (err as Error).message,
-              },
-            ),
-          );
-          console.warn("Editor live edit apply failed", err);
+          if (accepted === false) throw new Error("The editor rejected the generated change.");
+        }
+        await waitForEditorLivePreviewPaint(signal);
+        if (!isActive() || signal?.aborted) return;
+        workingContent = result.content;
+        lastPreviewContent = result.content;
+        lastDeltaOperationIndex = null;
+        appliedPatchCount += 1;
+        lastAppliedPatch = patchJson;
+        appliedRef.current = {
+          sessionKey,
+          turnId,
+          content: workingContent,
+          phase: "streaming",
+          operationCount: processedOperationCount,
+          appliedPatchCount,
+          basePatchCount: turnBasePatchCount,
+          abortController: appliedRef.current.abortController,
+        };
+        onProgress?.(
+          makeEditorLiveProgressTool(
+            "apply_patch",
+            "success",
+            {
+              file: detail.documentName || "current file",
+              patch: patchNumber,
+            },
+            {
+              status: "ok",
+              operations: result.applied,
+              patch: truncateToolText(patchJson, 5000),
+            },
+          ),
+        );
+      } catch (err) {
+        appliedRef.current = {
+          ...appliedRef.current,
+          operationCount: processedOperationCount,
+        };
+        patchFailureCount += 1;
+        onProgress?.(
+          makeEditorLiveProgressTool(
+            "apply_patch",
+            "error",
+            {
+              file: detail.documentName || "current file",
+              patch: patchNumber,
+            },
+            {
+              status: "failed",
+              error: (err as Error).message,
+            },
+          ),
+        );
+        onProgress?.(
+          makeEditorLiveProgressTool(
+            "verify_patch",
+            "error",
+            {
+              file: detail.documentName || "current file",
+              stage: "editor rejected patch",
+            },
+            {
+              status: "failed",
+              error: (err as Error).message,
+              patch: truncateToolText(patchJson, 5000),
+            },
+          ),
+        );
+        console.warn("Editor live edit apply failed", err);
+      }
+    };
+
+    const applyPatchDelta = async (event: ReturnType<typeof patchStream.push>[number]) => {
+      if (!isActive() || signal?.aborted) return;
+      if (!shouldStreamEditorLiveDeltaPreview(workingContent.length)) return;
+      try {
+        const result = applyEditorLivePatch(workingContent, event.patch);
+        if (result.failed.length > 0 || result.content === lastPreviewContent) return;
+        const accepted = await detail.adapter.preview(result.content, {
+          complete: false,
+          phase: AiEditApplyPhase.Preview,
+          streamEvent: AiEditPatchStreamEventKind.Delta,
+          source: "assistant-stream",
+          turnId,
+          turnBasePatchCount,
+          mode: "patch",
+          patch: truncateToolText(event.patch, 5000),
+          patchCount: appliedPatchCount + 1,
+          sourceLabel: "assistant delta",
+          signal,
+        });
+        if (accepted !== false && isActive() && !signal?.aborted) {
+          lastPreviewContent = result.content;
+          lastDeltaOperationIndex = event.operationIndex;
+        }
+      } catch {
+        // A semantic editor may reject an intermediate but accept the validated commit.
+      }
+    };
+
+    const deltaPreviewQueue = createEditorLivePatchDeltaQueue(applyPatchDelta);
+
+    const applyPatchStreamEvents = async (
+      events: ReturnType<typeof patchStream.push>,
+    ) => {
+      for (const event of events) {
+        if (!isActive() || signal?.aborted) return;
+        if (event.kind === AiEditPatchStreamEventKind.Delta) {
+          deltaPreviewQueue.enqueue(event);
+          continue;
+        }
+        if (event.kind === AiEditPatchStreamEventKind.Commit) {
+          await deltaPreviewQueue.flush();
+          await applyPatchCommit(event);
         }
       }
+    };
+
+    const resetPatchStreamAttempt = async () => {
+      await deltaPreviewQueue.reset();
+      if (!isActive() || signal?.aborted) return;
+      await restoreEditorLiveTurn(
+        detail,
+        baselineContent,
+        hadReviewablePreview,
+        signal,
+        turnId,
+        turnBasePatchCount,
+      );
+      if (!isActive() || signal?.aborted) return;
+      await detail.adapter.beginTurn({
+        complete: false,
+        phase: AiEditApplyPhase.Preview,
+        source: "assistant-stream",
+        turnId,
+        turnBasePatchCount,
+        patchCount: 0,
+        mode: "patch",
+        sourceLabel: "assistant stream retry",
+        signal,
+      });
+      if (!isActive() || signal?.aborted) return;
+      patchStream.reset();
+      assistantText = "";
+      completeNotified = false;
+      processedOperationCount = 0;
+      appliedPatchCount = 0;
+      patchFailureCount = 0;
+      sawStreamError = false;
+      lastAppliedPatch = "";
+      appliedGeneratedImageUrl = "";
+      persistedNativePatchKey = "";
+      reloadedNativePatchKey = "";
+      nativePatchReloadError = "";
+      lastDeltaOperationIndex = null;
+      workingContent = baselineContent;
+      lastPreviewContent = baselineContent;
+      appliedRef.current = {
+        sessionKey,
+        turnId,
+        content: baselineContent,
+        phase: "streaming",
+        operationCount: 0,
+        appliedPatchCount: 0,
+        basePatchCount: turnBasePatchCount,
+        abortController: appliedRef.current.abortController,
+      };
+    };
+
+    const processSseLine = async (rawLine: string) => {
+      const line = rawLine.endsWith("\r") ? rawLine.slice(0, -1) : rawLine;
+      if (!line) {
+        currentEvent = "";
+        return;
+      }
+      if (line.startsWith("event: ")) {
+        currentEvent = line.slice(7).trim();
+        return;
+      }
+      if (!line.startsWith("data: ")) return;
+      const rawData = line.slice(6).trim();
+      let parsedFrame: unknown = null;
+      try {
+        parsedFrame = JSON.parse(rawData);
+      } catch {
+        parsedFrame = null;
+      }
+      if (currentEvent === "text_reset") {
+        await resetPatchStreamAttempt();
+        return;
+      }
+      if (currentEvent === "error") sawStreamError = true;
+      const generatedImageUrl = generatedImageUrlFromSseFrame(parsedFrame);
+      if (generatedImageUrl) await applyGeneratedImageUrl(generatedImageUrl);
+      const nativeFilePatchResult = nativeFilePatchResultFromSseFrame(parsedFrame);
+      if (nativeFilePatchResult) await applyNativeFilePatchResult(nativeFilePatchResult);
+      const token = parseLiveEditStreamFrame(rawData, currentEvent);
+      if (!token) return;
+      assistantText += token;
+      await applyPatchStreamEvents(patchStream.push(token));
     };
 
     try {
@@ -994,38 +1267,57 @@ function pipeEditorLiveEditStream(
         buffer += decoder.decode(value, { stream: true });
         const lines = buffer.split("\n");
         buffer = lines.pop() || "";
-
-        for (const line of lines) {
-          if (line.startsWith("event: ")) {
-            currentEvent = line.slice(7).trim();
-            continue;
-          }
-          if (!line.startsWith("data: ")) continue;
-          const rawData = line.slice(6).trim();
-          let parsedFrame: unknown = null;
-          try {
-            parsedFrame = JSON.parse(rawData);
-          } catch {
-            parsedFrame = null;
-          }
-          const generatedImageUrl = generatedImageUrlFromSseFrame(parsedFrame);
-          if (generatedImageUrl) {
-            await applyGeneratedImageUrl(generatedImageUrl);
-          }
-          const token = parseLiveEditStreamFrame(rawData, currentEvent);
-          if (!token) continue;
-          assistantText += token;
-          applyPatchPayloads();
+        for (const line of lines) await processSseLine(line);
+      }
+      buffer += decoder.decode();
+      if (buffer) await processSseLine(buffer);
+      await deltaPreviewQueue.flush();
+      const completePatchOperationCount = countCompleteEditorLivePatchOperations(assistantText);
+      const hasCompletePatchProtocol = processedOperationCount > 0
+        && completePatchOperationCount === processedOperationCount;
+      const hasGeneratedImageOnly = Boolean(appliedGeneratedImageUrl)
+        && processedOperationCount === 0
+        && !containsEditorLivePatchProtocol(assistantText);
+      if (persistedNativePatchKey && reloadedNativePatchKey) {
+        finishNativeFilePatch();
+      } else if (persistedNativePatchKey) {
+        completeNotified = true;
+        appliedRef.current = {
+          ...appliedRef.current,
+          phase: "failed",
+          operationCount: 1,
+          appliedPatchCount: 1,
+        };
+        if (!nativePatchReloadError) {
+          onProgress?.(
+            makeEditorLiveProgressTool(
+              "verify_patch",
+              "error",
+              { file: detail.documentName || "current file", stage: "reload unavailable" },
+              {
+                status: "failed",
+                error: "The native patch was saved, but the editor could not reload it.",
+              },
+            ),
+          );
         }
-      }
-      if (processedPatchCount > 0) finishLiveEdit();
-      else if (applyAssistantReplacementEdit()) {
-        // A complete replacement was recovered from the assistant response.
-      }
-      else if (applyFallbackEdit()) {
-        // Fallback already applied and marked complete.
-      }
-      else {
+      } else if (sawStreamError) {
+        await deltaPreviewQueue.cancel();
+        await rollbackFailedLiveEdit();
+      } else if (
+        appliedPatchCount > 0
+        && (hasCompletePatchProtocol || hasGeneratedImageOnly)
+      ) {
+        await finishLiveEdit(
+          lastAppliedPatch || extractEditorLivePatchPayloads(assistantText).at(-1) || "",
+          hasGeneratedImageOnly
+            ? "generated image"
+            : patchFailureCount > 0
+              ? "assistant patch (partial)"
+              : "assistant patch",
+        );
+      } else {
+        const invalidPatchProtocol = appliedPatchCount > 0 && !hasCompletePatchProtocol;
         onProgress?.(
           makeEditorLiveProgressTool(
             "generate_patch",
@@ -1036,7 +1328,9 @@ function pipeEditorLiveEditStream(
             },
             {
               status: "failed",
-              error: "The assistant did not return a live patch.",
+              error: invalidPatchProtocol
+                ? "The live patch stream ended with an incomplete or invalid payload."
+                : "The assistant did not return a live patch.",
               response: truncateToolText(stripEditorLiveEditBlocks(assistantText), 1500),
             },
           ),
@@ -1051,17 +1345,70 @@ function pipeEditorLiveEditStream(
             },
             {
               status: "failed",
-              error: "No patch was applied to the current file.",
+              error: invalidPatchProtocol
+                ? "The temporary preview was rolled back because the patch protocol was invalid."
+                : "No patch was applied to the current file.",
             },
           ),
         );
+        await rollbackFailedLiveEdit();
       }
     } catch (err) {
-      if (isActive()) console.warn("Editor live edit stream failed", err);
+      if (isActive() && !signal?.aborted) {
+        await deltaPreviewQueue.cancel();
+        await rollbackFailedLiveEdit();
+        console.warn("Editor live edit stream failed", err);
+      }
+    } finally {
+      await deltaPreviewQueue.cancel();
+      signal?.removeEventListener("abort", cancelLiveReader);
+      settleUnfinishedTurn();
     }
   })();
 
-  return liveResponse;
+  // Project hidden protocol out of Chat as each model chunk arrives, while the
+  // editor branch consumes the same tee concurrently. Keep the response body
+  // open until the editor catches up so input unlock and preview completion
+  // still share one terminal boundary.
+  const chatProtocolDecoder = new TextDecoder();
+  const chatProtocolEncoder = new TextEncoder();
+  const chatSseProjector = createEditorLiveChatSseProjector();
+  let chatSseBuffer = "";
+
+  const enqueueProjectedChatText = (
+    decoded: string,
+    controller: TransformStreamDefaultController<Uint8Array>,
+    final = false,
+  ) => {
+    chatSseBuffer += decoded;
+    const lines = chatSseBuffer.split("\n");
+    chatSseBuffer = final ? "" : lines.pop() || "";
+    let projected = lines.map(chatSseProjector.projectLine).join("\n");
+    if (!final && lines.length > 0) projected += "\n";
+    if (final && projected && !projected.endsWith("\n")) projected += "\n";
+    if (projected) controller.enqueue(chatProtocolEncoder.encode(projected));
+  };
+
+  const synchronizedChatBody = chatBody.pipeThrough(
+    new TransformStream<Uint8Array, Uint8Array>({
+      transform(chunk, controller) {
+        const decoded = chatProtocolDecoder.decode(chunk, { stream: true });
+        enqueueProjectedChatText(decoded, controller);
+      },
+      async flush(controller) {
+        enqueueProjectedChatText(chatProtocolDecoder.decode(), controller, true);
+        const pendingText = chatSseProjector.flush();
+        if (pendingText) controller.enqueue(chatProtocolEncoder.encode(pendingText));
+        await liveProcessing;
+      },
+    }),
+  );
+
+  return new Response(synchronizedChatBody, {
+    status: response.status,
+    statusText: response.statusText,
+    headers: response.headers,
+  });
 }
 
 function hasApprovalRequest(msg: ChatMessage) {
@@ -1152,8 +1499,15 @@ export default function FloatingChat() {
   const queryClient = useQueryClient();
   const location = useLocation();
   const currentUserId = useAuthStore((s) => s.user?.id);
-
+  const currentAuthToken = useAuthStore((s) => s.token);
+  const currentAiEditOwner = useMemo<AiEditConversationOwnerScope | null>(() => {
+    const claims = decodeAuthTokenClaims(currentAuthToken);
+    return claims?.sub && claims.entity_id
+      ? { userId: claims.sub, entityId: claims.entity_id }
+      : null;
+  }, [currentAuthToken]);
   const [open, setOpen] = useState(false);
+
   const [input, setInput] = useState("");
   const [chatMode, setChatMode] = useState<ChatBoxMode>("auto");
   const [chatModePayload, setChatModePayload] = useState<ChatModePayload>(() =>
@@ -1170,6 +1524,8 @@ export default function FloatingChat() {
   const [editorLiveInfo, setEditorLiveInfo] =
     useState<EditorLiveChatDetail | null>(null);
   const [editorLiveSessionActive, setEditorLiveSessionActive] = useState(false);
+  const [editorLiveCleanupStatus, setEditorLiveCleanupStatus] =
+    useState(AiEditSessionCleanupStatus.Idle);
   const [selectedMentions, setSelectedMentions] = useState<MentionOption[]>([]);
   const [mentionedAgentId, setMentionedAgentId] = useState<
     string | undefined
@@ -1205,6 +1561,17 @@ export default function FloatingChat() {
   );
   const streaming = Boolean(currentSession?.streaming);
   const messages = currentSession?.messages || [];
+  const responseSurfaceSubmissionReceipts = useMemo(
+    () => collectResponseSurfaceSubmissionReceipts(messages),
+    [messages],
+  );
+  const responseSurfaceSubmissionFailureMessageIds = useMemo(
+    () => collectResponseSurfaceSubmissionFailureMessageIds(
+      messages,
+      responseSurfaceSubmissionReceipts,
+    ),
+    [messages, responseSurfaceSubmissionReceipts],
+  );
   /* A server-side turn this tab is following rather than streaming. Display
    * only — `streaming` still means "this tab owns the connection". */
   const [followedRunActive, setFollowedRunActive] = useState(false);
@@ -1239,9 +1606,16 @@ export default function FloatingChat() {
     [activeAssistantMessage],
   );
   const streamingConvId = currentSession?.convId;
-  const [messageFeedback, setMessageFeedback] = useState<
-    Record<string, ChatMessageFeedbackRating>
-  >({});
+  const {
+    hydrateConversation: hydrateMessageFeedback,
+    submit: submitMessageFeedback,
+    values: messageFeedback,
+  } = useChatMessageFeedback(currentUserId);
+  useEffect(() => {
+    const conversationId = currentConvId || streamingConvId;
+    if (!conversationId) return;
+    void hydrateMessageFeedback(conversationId).catch(() => {});
+  }, [currentConvId, hydrateMessageFeedback, streamingConvId]);
   const [conversationLoading, setConversationLoading] = useState(false);
   const setSessionMessages = useChatStreamStore((s) => s.setSessionMessages);
   const createDraftSession = useChatStreamStore((s) => s.createDraftSession);
@@ -1255,11 +1629,20 @@ export default function FloatingChat() {
   const currentSessionKeyRef = useRef<string | undefined>(currentSessionKey);
   const editorLiveConversationIdRef = useRef<string | undefined>();
   const editorLiveDetailRef = useRef<EditorLiveChatDetail | null>(null);
-  const editorLiveAppliedRef = useRef<{
-    sessionKey?: string;
-    content: string;
-    complete?: boolean;
-  }>({ content: "" });
+  const editorLivePendingDetailRef = useRef<EditorLiveChatDetail | null>(null);
+  const editorLiveSessionTokenRef = useRef<string | null>(null);
+  const editorLiveOwnerRef = useRef<AiEditConversationOwnerScope | null>(null);
+  const editorLiveCleanupCoordinator = useMemo(
+    () => createAiEditSessionCleanupCoordinator(),
+    [],
+  );
+  const editorLiveOpenRevisionRef = useRef(0);
+  const conversationSelectionRevisionRef = useRef(0);
+  const resumedRef = useRef(false);
+  const editorLiveAppliedRef = useRef<EditorLiveTurnState>({
+    content: "",
+    phase: "idle",
+  });
   useEffect(() => {
     currentSessionKeyRef.current = currentSessionKey;
   }, [currentSessionKey]);
@@ -1282,11 +1665,18 @@ export default function FloatingChat() {
   );
   const visibleWorkflowMessageEntries = useMemo(
     () => messages.flatMap((message, index) => (
-      message.id && hostOwnedWorkflowMessageIds.has(message.id)
+      isResponseSurfaceSubmissionMessage(message, responseSurfaceSubmissionReceipts)
+        || Boolean(message.id && responseSurfaceSubmissionFailureMessageIds.has(message.id))
+        || (message.id && hostOwnedWorkflowMessageIds.has(message.id))
         ? []
         : [{ message, index }]
     )),
-    [hostOwnedWorkflowMessageIds, messages],
+    [
+      hostOwnedWorkflowMessageIds,
+      messages,
+      responseSurfaceSubmissionFailureMessageIds,
+      responseSurfaceSubmissionReceipts,
+    ],
   );
   const visibleWorkflowMessages = useMemo(
     () => visibleWorkflowMessageEntries.map(({ message }) => message),
@@ -1335,32 +1725,74 @@ export default function FloatingChat() {
   });
 
   const clearEditorLiveSession = useCallback(
-    (deleteConversation = false) => {
-      const convId =
-        editorLiveConversationIdRef.current ||
-        currentConvId ||
-        streamingConvId;
+    (deleteConversation = false, notifyFailure = true) => {
+      // Only the explicit AI Edit ownership ref is deletable. `currentConvId`
+      // may still point at the normal chat that was visible one render ago.
+      const convId = editorLiveConversationIdRef.current;
       const sessionKey = currentSessionKeyRef.current;
-      editorLiveConversationIdRef.current = undefined;
-      editorLiveDetailRef.current = null;
-      editorLiveAppliedRef.current = { content: "" };
-      setEditorLiveSessionActive(false);
-      setEditorSessionLabel(null);
-      setEditorLiveInfo(null);
-      setComposerSeed(null);
-      if (sessionKey) resetSession(sessionKey);
-      setCurrentConvId(undefined);
-      setDraftSessionKey(undefined);
-      if (deleteConversation && convId) {
-        api.chat
-          .deleteConversation(convId)
-          .then(() =>
-            queryClient.invalidateQueries({ queryKey: ["conversations"] }),
-          )
-          .catch(() => {});
+      const sessionToken = editorLiveSessionTokenRef.current;
+      const owner = editorLiveOwnerRef.current;
+      const detail = editorLiveDetailRef.current;
+      const ownsCapturedSession = () => (
+        sessionToken
+          ? editorLiveSessionTokenRef.current === sessionToken
+          : Boolean(detail && editorLiveDetailRef.current === detail)
+      );
+      conversationSelectionRevisionRef.current += 1;
+      editorLiveAppliedRef.current.abortController?.abort();
+      if (ownsCapturedSession()) {
+        setEditorLiveCleanupStatus(AiEditSessionCleanupStatus.Closing);
       }
+      return editorLiveCleanupCoordinator.run(async (): Promise<boolean> => {
+        const failCleanup = (error?: unknown) => {
+          if (error) console.warn("AI Edit session cleanup failed", error);
+          if (ownsCapturedSession()) {
+            setEditorLiveCleanupStatus(AiEditSessionCleanupStatus.Failed);
+            if (notifyFailure) {
+              useToastStore.getState().error(
+                t("component.floating_chat.ai_edit_close_failed"),
+              );
+            }
+          }
+          return false;
+        };
+        try {
+          if (detail) {
+            await detail.adapter.waitForCommit();
+            const rolledBack = await rollbackEditorLiveAdapter(detail);
+            if (!rolledBack) return failCleanup();
+          }
+          if (deleteConversation && convId) {
+            const deleted = await deleteAiEditConversation(convId, owner);
+            if (!deleted) return failCleanup();
+            void queryClient.invalidateQueries({ queryKey: ["conversations"] });
+          }
+        } catch (error) {
+          return failCleanup(error);
+        }
+
+        if (ownsCapturedSession()) {
+          editorLiveConversationIdRef.current = undefined;
+          editorLiveDetailRef.current = null;
+          editorLivePendingDetailRef.current = null;
+          editorLiveSessionTokenRef.current = null;
+          editorLiveOwnerRef.current = null;
+          editorLiveAppliedRef.current = { content: "", phase: "idle" };
+          setEditorLiveSessionActive(false);
+          setEditorLiveCleanupStatus(AiEditSessionCleanupStatus.Idle);
+          setEditorSessionLabel(null);
+          setEditorLiveInfo(null);
+          setComposerSeed(null);
+          resumedRef.current = false;
+          currentSessionKeyRef.current = undefined;
+          setCurrentConvId(undefined);
+          setDraftSessionKey(undefined);
+        }
+        if (sessionKey) resetSession(sessionKey);
+        return true;
+      });
     },
-    [currentConvId, queryClient, resetSession, streamingConvId],
+    [editorLiveCleanupCoordinator, queryClient, resetSession],
   );
 
   // Attach menu
@@ -1385,6 +1817,7 @@ export default function FloatingChat() {
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const composerEditorRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const attachMenuRef = useRef<HTMLDivElement>(null);
   const { autoFollowRef, handleAutoFollowScroll } = useChatAutoFollow();
@@ -1540,9 +1973,9 @@ export default function FloatingChat() {
         window.open(directUrl, "_blank", "noopener,noreferrer");
         return;
       }
-      if (!refItem.id) return;
+      if (!refItem.document_id) return;
       try {
-        const blobUrl = await api.documents.download(refItem.id);
+        const blobUrl = await api.documents.preview(refItem.document_id);
         window.open(blobUrl, "_blank", "noopener,noreferrer");
         window.setTimeout(() => URL.revokeObjectURL(blobUrl), 60_000);
       } catch {
@@ -1553,12 +1986,98 @@ export default function FloatingChat() {
   );
 
   /* ---- Auto-resume most recent conversation when first opened ---- */
-  const resumedRef = useRef(false);
-  const userIdRef = useRef<string | undefined>(currentUserId);
+  const authOwnerRef = useRef<AiEditConversationOwnerScope | null>(currentAiEditOwner);
   const resetStream = useChatStreamStore((s) => s.reset);
   useEffect(() => {
-    if (userIdRef.current !== currentUserId) {
+    if (!currentAiEditOwner) return undefined;
+    let cancelled = false;
+    let flushing = false;
+    let retryDelayMs = AI_EDIT_DELETE_RETRY_MIN_MS;
+    let retryTimer: number | undefined;
+    const scheduleFlush = (delayMs = 0) => {
+      if (cancelled) return;
+      if (retryTimer !== undefined) window.clearTimeout(retryTimer);
+      retryTimer = window.setTimeout(() => {
+        retryTimer = undefined;
+        void flushPendingDeletes();
+      }, delayMs);
+    };
+    const flushPendingDeletes = async () => {
+      if (cancelled || flushing) return;
+      const activeConversationId = isSameAiEditConversationOwner(
+        editorLiveOwnerRef.current,
+        currentAiEditOwner,
+      ) ? editorLiveConversationIdRef.current : undefined;
+      const ids = readPendingAiEditConversationDeletes(currentAiEditOwner).filter(
+        (id) => id !== activeConversationId,
+      );
+      if (ids.length === 0) return;
+      flushing = true;
+      try {
+        const results = await Promise.all(
+          ids.map((id) => deleteAiEditConversation(id, currentAiEditOwner)),
+        );
+        if (!cancelled && results.some(Boolean)) {
+          await queryClient.invalidateQueries({ queryKey: ["conversations"] });
+        }
+      } finally {
+        flushing = false;
+      }
+      const remainingActiveConversationId = isSameAiEditConversationOwner(
+        editorLiveOwnerRef.current,
+        currentAiEditOwner,
+      ) ? editorLiveConversationIdRef.current : undefined;
+      const remaining = readPendingAiEditConversationDeletes(currentAiEditOwner).filter(
+        (id) => id !== remainingActiveConversationId,
+      );
+      if (remaining.length > 0) {
+        scheduleFlush(retryDelayMs);
+        retryDelayMs = Math.min(retryDelayMs * 2, AI_EDIT_DELETE_RETRY_MAX_MS);
+      } else {
+        retryDelayMs = AI_EDIT_DELETE_RETRY_MIN_MS;
+      }
+    };
+    const handleQueued = () => scheduleFlush();
+    const handleOnline = () => {
+      retryDelayMs = AI_EDIT_DELETE_RETRY_MIN_MS;
+      scheduleFlush();
+    };
+    scheduleFlush();
+    window.addEventListener(AI_EDIT_DELETE_QUEUE_EVENT, handleQueued);
+    window.addEventListener("online", handleOnline);
+    return () => {
+      cancelled = true;
+      if (retryTimer !== undefined) window.clearTimeout(retryTimer);
+      window.removeEventListener(AI_EDIT_DELETE_QUEUE_EVENT, handleQueued);
+      window.removeEventListener("online", handleOnline);
+    };
+  }, [currentAiEditOwner, queryClient]);
+
+  useEffect(() => {
+    if (!isSameAiEditConversationOwner(authOwnerRef.current, currentAiEditOwner)) {
+      const previousEditorConversationId = editorLiveConversationIdRef.current;
+      const previousEditorOwner = editorLiveOwnerRef.current || authOwnerRef.current;
+      const cleanup = editorLiveDetailRef.current || previousEditorConversationId
+        ? clearEditorLiveSession(true, false)
+        : Promise.resolve(true);
+      conversationSelectionRevisionRef.current += 1;
+      editorLiveOpenRevisionRef.current += 1;
+      editorLiveAppliedRef.current.abortController?.abort();
+      void cleanup.then(async (cleaned) => {
+        if (!cleaned && previousEditorConversationId && previousEditorOwner) {
+          const deleted = await deleteAiEditConversation(
+            previousEditorConversationId,
+            previousEditorOwner,
+          );
+          if (deleted) {
+            await queryClient.invalidateQueries({ queryKey: ["conversations"] });
+          }
+        }
+      }).catch((error) => {
+        console.warn("AI Edit user-change cleanup failed", error);
+      });
       resetStream();
+      currentSessionKeyRef.current = undefined;
       setCurrentConvId(undefined);
       setDraftSessionKey(undefined);
       setAttachedFiles([]);
@@ -1566,24 +2085,34 @@ export default function FloatingChat() {
       setEditorSessionLabel(null);
       setEditorLiveInfo(null);
       setEditorLiveSessionActive(false);
+      setEditorLiveCleanupStatus(AiEditSessionCleanupStatus.Idle);
       editorLiveConversationIdRef.current = undefined;
       editorLiveDetailRef.current = null;
-      editorLiveAppliedRef.current = { content: "" };
+      editorLivePendingDetailRef.current = null;
+      editorLiveSessionTokenRef.current = null;
+      editorLiveOwnerRef.current = null;
+      editorLiveAppliedRef.current = { content: "", phase: "idle" };
       setSelectedMentions([]);
       setMentionedAgentId(undefined);
       setConversationLoading(false);
       resumedRef.current = false;
-      userIdRef.current = currentUserId;
     }
-  }, [currentUserId, resetStream]);
+    authOwnerRef.current = currentAiEditOwner;
+  }, [clearEditorLiveSession, currentAiEditOwner, queryClient, resetStream]);
 
   useEffect(() => {
     if (!open || resumedRef.current) return;
     if (streamingRef.current) return;
     resumedRef.current = true;
+    const selectionRevision = conversationSelectionRevisionRef.current + 1;
+    conversationSelectionRevisionRef.current = selectionRevision;
     setConversationLoading(true);
     api.chat.listConversations()
       .then((convs) => {
+        if (
+          conversationSelectionRevisionRef.current !== selectionRevision
+          || editorLiveDetailRef.current
+        ) return undefined;
         const latest = (convs || []).find(
           (conv: any) => !conv.agent_id && !conv.workspace_id,
         );
@@ -1592,7 +2121,11 @@ export default function FloatingChat() {
         setDraftSessionKey(undefined);
         return loadRecentMessages(latest.id)
           .then((msgs) => {
-            if (streamingRef.current) return;
+            if (
+              streamingRef.current
+              || conversationSelectionRevisionRef.current !== selectionRevision
+              || editorLiveDetailRef.current
+            ) return;
             setSessionMessages(latest.id, msgs);
           })
           .catch(() => {});
@@ -1602,20 +2135,50 @@ export default function FloatingChat() {
   }, [loadRecentMessages, open, setSessionMessages]);
 
   useEffect(() => {
-    const handleOpenEditorLiveChat = (event: Event) => {
+    const handleOpenEditorLiveChat = async (event: Event) => {
+      const openRevision = editorLiveOpenRevisionRef.current + 1;
+      editorLiveOpenRevisionRef.current = openRevision;
       const detail =
         (event as CustomEvent<EditorLiveChatDetail>).detail || {};
+      const pendingCleanup = editorLiveCleanupCoordinator.current();
+      if (
+        pendingCleanup
+        && !(await pendingCleanup)
+        && editorLiveSessionTokenRef.current
+      ) {
+        setOpen(true);
+        return;
+      }
+      if (editorLiveOpenRevisionRef.current !== openRevision) return;
+      if (isSameEditorLiveTarget(editorLiveDetailRef.current, detail)) {
+        if (streamingRef.current) editorLivePendingDetailRef.current = detail;
+        else editorLiveDetailRef.current = detail;
+        setEditorLiveInfo(editorLiveDetailRef.current || detail);
+        setOpen(true);
+        window.setTimeout(() => composerEditorRef.current?.focus(), 0);
+        return;
+      }
+      if (
+        editorLiveDetailRef.current
+        && !(await clearEditorLiveSession(true))
+      ) {
+        setOpen(true);
+        return;
+      }
+      if (editorLiveOpenRevisionRef.current !== openRevision) return;
+      const owner = currentAiEditOwner || currentAiEditConversationOwner();
+      if (!owner) return;
       const key = `editor-live-${Date.now()}-${Math.random()
         .toString(36)
         .slice(2)}`;
       const draftKey = createDraftSession();
       const attachments: AttachedItem[] =
-        detail.documentId && detail.documentName
+        shouldAttachEditorLiveSourceDocument(detail)
           ? [
               {
                 type: "knowledge",
-                id: detail.documentId,
-                name: detail.documentName,
+                id: detail.documentId!,
+                name: detail.documentName!,
                 fileType: detail.fileType || undefined,
                 mimeType: detail.mimeType || undefined,
               },
@@ -1623,17 +2186,27 @@ export default function FloatingChat() {
           : [];
 
       resumedRef.current = true;
+      conversationSelectionRevisionRef.current += 1;
       setOpen(true);
       setCurrentConvId(undefined);
       setDraftSessionKey(draftKey);
+      currentSessionKeyRef.current = draftKey;
       setSessionMessages(draftKey, []);
       setInput("");
       setAttachedFiles([]);
       setComposerSeed({ key, attachments });
       editorLiveConversationIdRef.current = undefined;
       editorLiveDetailRef.current = detail;
-      editorLiveAppliedRef.current = { sessionKey: draftKey, content: "" };
+      editorLivePendingDetailRef.current = null;
+      editorLiveSessionTokenRef.current = draftKey;
+      editorLiveOwnerRef.current = owner;
+      editorLiveAppliedRef.current = {
+        sessionKey: draftKey,
+        content: "",
+        phase: "idle",
+      };
       setEditorLiveSessionActive(true);
+      setEditorLiveCleanupStatus(AiEditSessionCleanupStatus.Idle);
       setEditorLiveInfo(detail);
       setEditorSessionLabel(
         detail.sessionLabel?.trim() ||
@@ -1641,19 +2214,58 @@ export default function FloatingChat() {
       );
       setSelectedMentions([]);
       setMentionedAgentId(undefined);
-      window.setTimeout(() => textareaRef.current?.focus(), 0);
+      window.setTimeout(() => composerEditorRef.current?.focus(), 0);
+    };
+
+    const handleUpdateEditorLiveChat = (event: Event) => {
+      const detail = (event as CustomEvent<EditorLiveChatDetail>).detail;
+      if (!isSameEditorLiveTarget(editorLiveDetailRef.current, detail)) return;
+      if (
+        streamingRef.current
+        || editorLiveAppliedRef.current.phase === "pending"
+        || editorLiveAppliedRef.current.phase === "streaming"
+      ) {
+        editorLivePendingDetailRef.current = detail;
+        return;
+      }
+      editorLiveDetailRef.current = detail;
+      setEditorLiveInfo(detail);
     };
 
     window.addEventListener(
       EDITOR_LIVE_CHAT_EVENT,
       handleOpenEditorLiveChat as EventListener,
     );
-    return () =>
+    window.addEventListener(
+      EDITOR_LIVE_CHAT_UPDATE_EVENT,
+      handleUpdateEditorLiveChat as EventListener,
+    );
+    return () => {
       window.removeEventListener(
         EDITOR_LIVE_CHAT_EVENT,
         handleOpenEditorLiveChat as EventListener,
       );
-  }, [createDraftSession, setSessionMessages]);
+      window.removeEventListener(
+        EDITOR_LIVE_CHAT_UPDATE_EVENT,
+        handleUpdateEditorLiveChat as EventListener,
+      );
+    };
+  }, [
+    clearEditorLiveSession,
+    createDraftSession,
+    currentAiEditOwner,
+    editorLiveCleanupCoordinator,
+    setSessionMessages,
+  ]);
+
+  useEffect(() => {
+    if (streaming) return;
+    const pending = editorLivePendingDetailRef.current;
+    if (!pending || !isSameEditorLiveTarget(editorLiveDetailRef.current, pending)) return;
+    editorLivePendingDetailRef.current = null;
+    editorLiveDetailRef.current = pending;
+    setEditorLiveInfo(pending);
+  }, [streaming]);
 
   useEffect(() => {
     const handleOpenFloatingChat = (event: Event) => {
@@ -1667,7 +2279,7 @@ export default function FloatingChat() {
         const current = prev.trim();
         return current ? `${current}\n\n${prompt}` : prompt;
       });
-      window.setTimeout(() => textareaRef.current?.focus(), 0);
+      window.setTimeout(() => composerEditorRef.current?.focus(), 0);
     };
 
     window.addEventListener(
@@ -1732,44 +2344,141 @@ export default function FloatingChat() {
 
   useEffect(() => {
     if (!editorLiveSessionActive) return;
+    if (streamingRef.current) return;
     const detail = editorLiveDetailRef.current;
-    if (!detail?.applyContent) return;
+    if (!detail) return;
     const last = messages[messages.length - 1];
     if (!last || last.role !== "assistant") return;
-    if (editorLiveAppliedRef.current.complete) return;
-    const payloads = extractEditorLivePatchPayloads(toDisplayText(last.content));
-    if (payloads.length === 0) return;
-    const beforeContent = detail.getContent?.() || editorLiveAppliedRef.current.content;
-    let nextContent = beforeContent;
-    let applied = 0;
-    let lastPatch = "";
-    for (const payload of payloads) {
-      const result = applyEditorLivePatch(nextContent, payload);
-      if (result.failed.length > 0) continue;
-      nextContent = result.content;
-      applied += 1;
-      lastPatch = payload;
-    }
-    if (applied === 0 || nextContent === editorLiveAppliedRef.current.content) return;
-    editorLiveAppliedRef.current = {
-      sessionKey: currentSessionKeyRef.current,
-      content: nextContent,
-      complete: true,
-    };
-    const diff = buildEditorLiveDiff(
-      beforeContent,
-      nextContent,
-      detail.documentName || "current file",
-    );
-    detail.applyContent(nextContent, {
-      complete: true,
-      source: "assistant-stream",
-      mode: "patch",
-      diff,
-      patch: truncateToolText(lastPatch, 5000),
-      patchCount: applied,
-      sourceLabel: "assistant patch",
-    });
+    const turn = editorLiveAppliedRef.current;
+    if (!["pending", "failed"].includes(turn.phase) || !turn.turnId) return;
+    if (last.stream_error || last.stop_reason) return;
+    const assistantContent = toDisplayText(last.content);
+    const allPayloads = extractRecoverableEditorLivePatchOperationPayloads(assistantContent);
+    if (!allPayloads) return;
+    const processedOperationCount = Math.min(turn.operationCount || 0, allPayloads.length);
+    const payloads = allPayloads.slice(processedOperationCount);
+    const recoveredAppliedPatchCount = turn.appliedPatchCount || 0;
+    const canFinalizeRecoveredPreview = turn.phase === "failed"
+      && recoveredAppliedPatchCount > 0
+      && payloads.length === 0;
+    if (payloads.length === 0 && !canFinalizeRecoveredPreview) return;
+    const beforeContent = turn.content;
+    const sessionKey = currentSessionKeyRef.current;
+    const turnId = turn.turnId;
+    const signal = turn.abortController?.signal;
+    if (signal?.aborted) return;
+    editorLiveAppliedRef.current = { ...turn, phase: "streaming" };
+    void (async () => {
+      try {
+        let nextContent = beforeContent;
+        let applied = 0;
+        let consumed = 0;
+        let lastPatch = "";
+        for (const payload of payloads) {
+          consumed += 1;
+          const result = applyEditorLivePatch(nextContent, payload);
+          if (result.failed.length > 0 || result.content === nextContent) {
+            editorLiveAppliedRef.current = {
+              ...editorLiveAppliedRef.current,
+              operationCount: processedOperationCount + consumed,
+            };
+            continue;
+          }
+          const operationDiff = buildEditorLiveDiff(
+            nextContent,
+            result.content,
+            detail.documentName || "current file",
+          );
+          const accepted = await detail.adapter.preview(result.content, {
+            complete: false,
+            phase: AiEditApplyPhase.Preview,
+            source: "assistant-stream",
+            turnId,
+            turnBasePatchCount: turn.basePatchCount || 0,
+            mode: "patch",
+            diff: operationDiff,
+            patch: truncateToolText(payload, 5000),
+            patchCount: recoveredAppliedPatchCount + applied + 1,
+            sourceLabel: "assistant patch",
+            signal,
+          });
+          if (
+            accepted === false
+            || !isSameEditorLiveTarget(editorLiveDetailRef.current, detail)
+            || editorLiveAppliedRef.current.turnId !== turnId
+            || signal?.aborted
+          ) return;
+          await waitForEditorLivePreviewPaint(signal);
+          if (
+            !isSameEditorLiveTarget(editorLiveDetailRef.current, detail)
+            || editorLiveAppliedRef.current.turnId !== turnId
+            || signal?.aborted
+          ) return;
+          nextContent = result.content;
+          applied += 1;
+          lastPatch = payload;
+          editorLiveAppliedRef.current = {
+            sessionKey,
+            turnId,
+            content: nextContent,
+            phase: "streaming",
+            operationCount: processedOperationCount + consumed,
+            appliedPatchCount: recoveredAppliedPatchCount + applied,
+            basePatchCount: turn.basePatchCount || 0,
+            abortController: turn.abortController,
+          };
+        }
+        if (applied === 0 && !canFinalizeRecoveredPreview) {
+          editorLiveAppliedRef.current = {
+            ...editorLiveAppliedRef.current,
+            phase: "failed",
+          };
+          return;
+        }
+        const diff = buildEditorLiveDiff(
+          beforeContent,
+          nextContent,
+          detail.documentName || "current file",
+        );
+        const completed = await detail.adapter.complete(nextContent, {
+          complete: true,
+          phase: AiEditApplyPhase.Complete,
+          source: "assistant-stream",
+          turnId,
+          turnBasePatchCount: turn.basePatchCount || 0,
+          mode: "patch",
+          diff,
+          patch: truncateToolText(lastPatch, 5000),
+          patchCount: recoveredAppliedPatchCount + applied,
+          sourceLabel: "assistant patch",
+          signal,
+        });
+        if (
+          completed === false
+          || !isSameEditorLiveTarget(editorLiveDetailRef.current, detail)
+          || editorLiveAppliedRef.current.turnId !== turnId
+          || signal?.aborted
+        ) return;
+        editorLiveAppliedRef.current = {
+          sessionKey,
+          turnId,
+          content: nextContent,
+          phase: "complete",
+          operationCount: processedOperationCount + consumed,
+          appliedPatchCount: recoveredAppliedPatchCount + applied,
+          basePatchCount: turn.basePatchCount || 0,
+          abortController: turn.abortController,
+        };
+      } catch (error) {
+        if (editorLiveAppliedRef.current.turnId === turnId && !signal?.aborted) {
+          editorLiveAppliedRef.current = {
+            ...editorLiveAppliedRef.current,
+            phase: "failed",
+          };
+        }
+        console.warn("Recovered editor live edit apply failed", error);
+      }
+    })();
   }, [editorLiveSessionActive, messages]);
 
   /* Listen for video completion — reload messages so VideoCard picks up result */
@@ -1799,8 +2508,18 @@ export default function FloatingChat() {
         detail?.conversation_id === currentConvId &&
         !streamingRef.current
       ) {
+        const messageId =
+          typeof detail?.message_id === "string" ? detail.message_id : undefined;
+        if (shouldIgnoreLocallyStoppedStreamUpdate(currentConvId, messageId)) {
+          return;
+        }
         loadRecentMessages(detail.conversation_id)
-          .then((msgs) => setMessages(msgs))
+          .then((msgs) => {
+            if (shouldIgnoreLocallyStoppedStreamUpdate(currentConvId, messageId)) {
+              return;
+            }
+            setMessages(msgs);
+          })
           .catch(() => {});
       }
     };
@@ -1818,6 +2537,17 @@ export default function FloatingChat() {
       const liveKey = streamState.getSessionKeyForConversation(currentConvId);
       if (liveKey && streamState.sessions[liveKey]?.streaming) return;
       if (hasLocallyStreamedConversation(currentConvId)) return;
+      if (
+        shouldIgnoreLocallyStoppedStreamUpdate(
+          currentConvId,
+          snapshot.message_id,
+          snapshot.status,
+        )
+      ) {
+        setFollowedRunActive(false);
+        followedRunPollsRef.current = 0;
+        return;
+      }
 
       const seqKey = snapshot.message_id || currentConvId;
       const seq = typeof snapshot.seq === "number" ? snapshot.seq : 0;
@@ -1862,6 +2592,10 @@ export default function FloatingChat() {
   useEffect(() => {
     if (!currentConvId || !remoteRunInFlight) return;
     const timer = window.setTimeout(() => {
+      if (shouldIgnoreLocallyStoppedStreamUpdate(currentConvId)) {
+        setFollowedRunActive(false);
+        return;
+      }
       if (followedRunPollsRef.current >= FOLLOWED_RUN_MAX_POLLS) {
         setFollowedRunActive(false);
         return;
@@ -1911,13 +2645,6 @@ export default function FloatingChat() {
         Math.min(textareaRef.current.scrollHeight, 120) + "px";
     }
   }, [input]);
-
-  /* Focus textarea when opened */
-  useEffect(() => {
-    if (open) {
-      setTimeout(() => textareaRef.current?.focus(), 200);
-    }
-  }, [open]);
 
   /* Close attach menu on outside click */
   useEffect(() => {
@@ -1977,11 +2704,16 @@ export default function FloatingChat() {
     [],
   );
 
-  const addKbDoc = (doc: { id: string; name: string }) => {
+  const addKbDoc = (doc: { id: string; name: string; fs_path?: string | null }) => {
     if (attachedFiles.some((f) => f.id === doc.id)) return;
     setAttachedFiles((prev) => [
       ...prev,
-      { name: doc.name, id: doc.id, type: "knowledge" },
+      {
+        name: doc.name,
+        id: doc.id,
+        fsPath: doc.fs_path || undefined,
+        type: "knowledge",
+      },
     ]);
     setKbPickerOpen(false);
     setKbSearch("");
@@ -2024,7 +2756,7 @@ export default function FloatingChat() {
   );
 
   const selectHashDoc = useCallback(
-    (doc: { id: string; name: string }) => {
+    (doc: { id: string; name: string; fs_path?: string | null }) => {
       // Remove the #query text from input
       const before = input.substring(0, hashTriggerPos);
       const cursorPos = textareaRef.current?.selectionStart || input.length;
@@ -2033,12 +2765,20 @@ export default function FloatingChat() {
       // Add as attachment chip (same as KB doc picker)
       setAttachedFiles((prev) => {
         if (prev.some((f) => f.id === doc.id)) return prev;
-        return [...prev, { name: doc.name, id: doc.id, type: "knowledge" }];
+        return [
+          ...prev,
+          {
+            name: doc.name,
+            id: doc.id,
+            fsPath: doc.fs_path || undefined,
+            type: "knowledge",
+          },
+        ];
       });
       setHashDropdownOpen(false);
       setHashQuery("");
       setHashTriggerPos(-1);
-      setTimeout(() => textareaRef.current?.focus(), 0);
+      setTimeout(() => composerEditorRef.current?.focus(), 0);
     },
     [input, hashTriggerPos],
   );
@@ -2173,30 +2913,58 @@ export default function FloatingChat() {
       manualSkills: ManualSkillItem[] = [],
       workflow?: WorkflowInvokeItem | null,
       sendContext?: ChatComposerSendContext,
+      sendOptions: FloatingChatSendOptions = {},
     ) => {
+      const isResponseSurfaceSubmission = Boolean(sendOptions.responseSurfaceSubmission);
       const rawText = (
         typeof textInput === "string" ? textInput : input
       ).trim();
-      const selectedWorkflow = workflow || null;
-      const effectiveManualSkills = selectedWorkflow ? [] : manualSkills;
+      const selectedWorkflow = isResponseSurfaceSubmission ? null : workflow || null;
+      const effectiveManualSkills = selectedWorkflow || isResponseSurfaceSubmission ? [] : manualSkills;
+      const requestedManualSkillRefs =
+        effectiveManualSkills.length > 0
+          ? manualSkillReferences(effectiveManualSkills)
+          : undefined;
+      let manualSkillRefs = requestedManualSkillRefs;
+      if (requestedManualSkillRefs?.some((reference) => reference.kind === "slug")) {
+        try {
+          const availableSkills = await queryClient.fetchQuery({
+            queryKey: ["skills", "chat-manual-skill-resolution", "platform"],
+            queryFn: () => api.skills.list({ include_platform: true }),
+            staleTime: 60_000,
+          });
+          manualSkillRefs = resolveManualSkillReferenceIds(
+            requestedManualSkillRefs,
+            availableSkills,
+          );
+        } catch (error) {
+          toast.error(
+            t("lib.api.chat_failed"),
+            error instanceof Error ? error.message : undefined,
+          );
+          return false;
+        }
+      }
       const text = stripWorkflowInvokeToken(
         stripManualSkillTokens(rawText, manualSkills),
         selectedWorkflow,
       );
-      const attachmentSnapshot = footerAttachments || attachedFiles;
+      const attachmentSnapshot = isResponseSurfaceSubmission
+        ? []
+        : footerAttachments || attachedFiles;
       if (
         !text &&
         attachmentSnapshot.length === 0 &&
         effectiveManualSkills.length === 0 &&
         !selectedWorkflow
       )
-        return;
+        return false;
       let sessionKey = currentSessionKeyRef.current;
       if (!sessionKey) {
         sessionKey = createDraftSession();
         setDraftSessionKey(sessionKey);
       }
-      if (useChatStreamStore.getState().sessions[sessionKey]?.streaming) return;
+      if (useChatStreamStore.getState().sessions[sessionKey]?.streaming) return false;
 
       // Sending is an explicit jump back to the newest message.
       autoFollowRef.current = true;
@@ -2204,7 +2972,7 @@ export default function FloatingChat() {
       // Stop voice if active — also drains the recorder so any in-flight
       // chunks transcribe before send (the user can edit the result
       // before pressing send if they want).
-      if (listening) {
+      if (listening && !isResponseSurfaceSubmission) {
         stopRecording();
       }
 
@@ -2228,14 +2996,18 @@ export default function FloatingChat() {
           ? `\n\n[Referenced people: ${peopleMentions.map((mention) => `${mention.name} <id:${mention.id}>${mention.subtitle ? ` ${mention.subtitle}` : ""}`).join(", ")}]`
           : "";
 
-      setInput("");
-      setSelectedMentions([]);
-      setMentionedAgentId(undefined);
       const sentAttachments = [...attachmentSnapshot];
-      setAttachedFiles([]);
-      const requestChatMode = selectedWorkflow
+      if (!isResponseSurfaceSubmission) {
+        setInput("");
+        setSelectedMentions([]);
+        setMentionedAgentId(undefined);
+        setAttachedFiles([]);
+      }
+      const requestChatMode = sendOptions.responseSurfaceSubmission
+        ? undefined
+        : selectedWorkflow
         ? "flows"
-        : !editorLiveSessionActive && chatMode !== "auto"
+        : !sendOptions.forceAutoMode && !editorLiveSessionActive && chatMode !== "auto"
           ? chatMode
           : undefined;
       const requestChatModePayload =
@@ -2260,11 +3032,33 @@ export default function FloatingChat() {
         (selectedWorkflow
           ? workflowInvokeMessage(selectedWorkflow)
           : "Use the manually selected skill with the current conversation context.");
-      const liveEditDetail = editorLiveSessionActive
+      const liveEditSessionDetail = editorLiveSessionActive
         ? editorLiveDetailRef.current
         : null;
-      const isLiveEdit = Boolean(liveEditDetail);
-      const liveEditContent = liveEditDetail?.getContent?.();
+      const liveEditSessionToken = liveEditSessionDetail
+        ? editorLiveSessionTokenRef.current
+        : null;
+      const liveEditOwner = liveEditSessionDetail
+        ? editorLiveOwnerRef.current
+        : null;
+      const isLiveEdit = Boolean(liveEditSessionDetail);
+      const liveEditContent = liveEditSessionDetail?.adapter.read();
+      const liveEditTurnBasePatchCount = Math.max(
+        0,
+        liveEditSessionDetail?.adapter.getTurnPreviewState().changeCount || 0,
+      );
+      const liveEditHadReviewablePreview = hasReviewableEditorLivePreview(
+        { changeCount: liveEditTurnBasePatchCount },
+      );
+      const liveEditDetail = liveEditSessionDetail
+        ? {
+            ...liveEditSessionDetail,
+            ...(liveEditSessionDetail.getTurnMetadata?.() || {}),
+          }
+        : null;
+      const liveEditTurnId = liveEditSessionDetail
+        ? `turn-${Date.now()}-${Math.random().toString(36).slice(2)}`
+        : undefined;
       const sendText =
         liveEditDetail && typeof liveEditContent === "string"
           ? buildEditorLiveEditRequest(
@@ -2300,6 +3094,51 @@ export default function FloatingChat() {
           ]
         : undefined;
 
+      if (liveEditDetail) {
+        editorLiveAppliedRef.current.abortController?.abort();
+        const abortController = new AbortController();
+        editorLiveAppliedRef.current = {
+          sessionKey,
+          turnId: liveEditTurnId,
+          content: liveEditContent || "",
+          phase: "pending",
+          operationCount: 0,
+          appliedPatchCount: 0,
+          basePatchCount: liveEditTurnBasePatchCount,
+          abortController,
+        };
+        const beganTurn = await liveEditDetail.adapter.beginTurn({
+          complete: false,
+          phase: AiEditApplyPhase.Preview,
+          source: "assistant-stream",
+          turnId: liveEditTurnId,
+          turnBasePatchCount: liveEditTurnBasePatchCount,
+          patchCount: 0,
+          mode: "patch",
+          sourceLabel: "assistant turn",
+          signal: abortController.signal,
+        });
+        if (beganTurn === false || abortController.signal.aborted) {
+          editorLiveAppliedRef.current = {
+            sessionKey,
+            content: liveEditContent || "",
+            phase: liveEditHadReviewablePreview ? "complete" : "failed",
+            operationCount: 0,
+            appliedPatchCount: 0,
+            basePatchCount: liveEditTurnBasePatchCount,
+          };
+          return false;
+        }
+      }
+
+      const ownsLiveEditTurn = () => !liveEditSessionDetail || Boolean(
+        liveEditSessionToken
+        && editorLiveSessionTokenRef.current === liveEditSessionToken
+        && isSameEditorLiveTarget(editorLiveDetailRef.current, liveEditSessionDetail)
+        && editorLiveAppliedRef.current.turnId === liveEditTurnId
+        && !editorLiveAppliedRef.current.abortController?.signal.aborted
+      );
+
       let liveEditAttachmentFiles: File[] = [];
       if (isLiveEdit && liveEditDetail?.getAttachmentFiles) {
         try {
@@ -2308,6 +3147,7 @@ export default function FloatingChat() {
           console.warn("Editor live edit attachment capture failed", err);
         }
       }
+      if (!ownsLiveEditTurn()) return false;
 
       // Separate local files and KB document IDs (merge inline refs). Live
       // editor files are hidden from the visible message but available to the
@@ -2329,14 +3169,16 @@ export default function FloatingChat() {
             message: sendText,
             conversationId: currentConvId,
             documentIds: documentIds.length > 0 ? documentIds : undefined,
-            agentId: mentionedAgentId,
+            agentId: isResponseSurfaceSubmission
+              ? undefined
+              : sendOptions.forceOwnerChat
+                ? undefined
+                : mentionedAgentId,
             localWorkerId: sendContext?.localWorkerId,
             chatMode: requestChatMode,
             chatModePayload: requestChatModePayload,
-            manualSkillIds:
-              effectiveManualSkills.length > 0
-                ? effectiveManualSkills.map((skill) => skill.id)
-                : undefined,
+            manualSkillRefs,
+            responseSurfaceSubmission: sendOptions.responseSurfaceSubmission,
           }
         : undefined;
       if (retryRequest) savePendingChatRetry(retryRequest);
@@ -2344,6 +3186,7 @@ export default function FloatingChat() {
       const sentAttachmentSnapshots = await Promise.all(
         sentAttachments.map(createChatMessageAttachmentSnapshot),
       );
+      if (!ownsLiveEditTurn()) return false;
 
       const msgsBeforeSend = [
         ...messages,
@@ -2364,6 +3207,9 @@ export default function FloatingChat() {
               : undefined,
           chatMode: requestChatMode,
           chatModePayload: requestChatMode ? chatModePayload : undefined,
+          meta: sendOptions.responseSurfaceSubmission
+            ? responseSurfaceSubmissionMeta(sendOptions.responseSurfaceSubmission)
+            : undefined,
         },
         {
           role: "assistant" as const,
@@ -2374,32 +3220,44 @@ export default function FloatingChat() {
         },
       ];
 
-      if (liveEditDetail) {
-        editorLiveAppliedRef.current = { sessionKey, content: "" };
-      }
       const updateLiveEditProgress = (tool: ToolCall) => {
         setSessionMessages(sessionKey, (prev) =>
           withEditorLiveProgress(prev, tool),
         );
+      };
+      const adoptPendingLiveEditDetail = () => {
+        const pending = editorLivePendingDetailRef.current;
+        if (!pending || !isSameEditorLiveTarget(editorLiveDetailRef.current, pending)) return;
+        editorLivePendingDetailRef.current = null;
+        editorLiveDetailRef.current = pending;
+        setEditorLiveInfo(pending);
       };
       let liveEditClosed = false;
       const closeCompletedLiveEdit = () => {
         if (!isLiveEdit || liveEditClosed) return;
         const applied = editorLiveAppliedRef.current;
         if (
-          applied.complete &&
+          applied.phase === "complete" &&
           applied.content.trim()
         ) {
           liveEditClosed = true;
           // Keep the live-edit panel open after a successful apply so the
           // user can review the assistant's result, inspect tool status, and
           // continue with follow-up edits. The explicit close button still
-          // clears the ephemeral live-edit session.
+          // rolls back any unaccepted preview and deletes the temporary
+          // conversation that carries this live-edit session's context.
         }
       };
 
+      let sendSucceeded = true;
+      let responseSurfaceResult: ResponseSurfaceSubmissionResult = {
+        status: "succeeded",
+        serverAccepted: false,
+        terminalObserved: false,
+      };
+      if (!ownsLiveEditTurn()) return false;
       await startStream(
-        async () => {
+        async (streamSignal) => {
           const response = selectedWorkflow
             ? await api.chat.streamFlowEntrypoint(
                 selectedWorkflow.bindingId,
@@ -2414,19 +3272,23 @@ export default function FloatingChat() {
             : await api.chat.stream(sendText, currentConvId, {
                 files: localFiles.length > 0 ? localFiles : undefined,
                 documentIds: documentIds.length > 0 ? documentIds : undefined,
-                agentId: mentionedAgentId,
+                agentId: isResponseSurfaceSubmission
+                  ? undefined
+                  : sendOptions.forceOwnerChat
+                    ? undefined
+                    : mentionedAgentId,
                 localWorkerId: sendContext?.localWorkerId,
                 chatMode: requestChatMode,
                 chatModePayload: requestChatModePayload,
-                manualSkillIds:
-                  effectiveManualSkills.length > 0
-                    ? effectiveManualSkills.map((skill) => skill.id)
-                    : undefined,
+                manualSkillRefs,
+                responseSurfaceSubmission: sendOptions.responseSurfaceSubmission,
                 editorContext: isLiveEdit
                   ? {
+                      target_kind: liveEditDetail?.adapter.target.kind,
+                      target_id: liveEditDetail?.adapter.target.id,
                       path: liveEditDetail?.sourcePath,
                       sourcePath: liveEditDetail?.sourcePath,
-                      documentId: liveEditDetail?.documentId,
+                      document_id: liveEditDetail?.documentId,
                       documentName: liveEditDetail?.documentName,
                       fileType: liveEditDetail?.fileType,
                       mimeType: liveEditDetail?.mimeType,
@@ -2435,55 +3297,148 @@ export default function FloatingChat() {
                         liveEditDetail?.supportsImageGeneration ||
                         liveEditDetail?.applyGeneratedImage,
                       ),
+                      supportsNativeFilePatch: Boolean(
+                        liveEditDetail?.supportsNativeFilePatch
+                        && liveEditDetail?.applyNativeFilePatch,
+                      ),
                       currentDocumentContent:
                         typeof liveEditContent === "string" ? liveEditContent : undefined,
                     }
                   : undefined,
-                ephemeral: isLiveEdit,
+                conversationSurface: isLiveEdit
+                  ? ConversationSurfaceKind.AiEdit
+                  : undefined,
+                signal: streamSignal,
               });
-          if (!liveEditDetail?.applyContent) return response;
+          if (!liveEditDetail || !liveEditSessionDetail || !liveEditTurnId) return response;
           return pipeEditorLiveEditStream(
             response,
             liveEditDetail,
             sessionKey,
+            liveEditTurnId,
             editorLiveAppliedRef,
             () =>
-              editorLiveSessionActive &&
-              editorLiveDetailRef.current === liveEditDetail,
+              isSameEditorLiveTarget(
+                editorLiveDetailRef.current,
+                liveEditSessionDetail,
+              )
+              && editorLiveAppliedRef.current.turnId === liveEditTurnId
+              && !editorLiveAppliedRef.current.abortController?.signal.aborted,
             updateLiveEditProgress,
             closeCompletedLiveEdit,
-            visibleRequest,
+            adoptPendingLiveEditDetail,
+            liveEditContent || "",
+            liveEditHadReviewablePreview,
+            liveEditTurnBasePatchCount,
           );
         },
         currentConvId,
         msgsBeforeSend,
         (newConvId) => {
-          if (editorLiveSessionActive) {
+          const ownsLiveEditSession = Boolean(
+            liveEditSessionDetail
+            && isSameEditorLiveTarget(
+              editorLiveDetailRef.current,
+              liveEditSessionDetail,
+            )
+            && editorLiveAppliedRef.current.turnId === liveEditTurnId
+            && !editorLiveAppliedRef.current.abortController?.signal.aborted,
+          );
+          if (ownsLiveEditSession) {
             editorLiveConversationIdRef.current = newConvId;
+            if (liveEditOwner) {
+              // An active AI Edit conversation must not sit in this tab's
+              // cleanup queue. Explicit close/user change queues and deletes
+              // it; sessionStorage keeps other tabs' sessions isolated.
+              removePendingAiEditConversationDelete(liveEditOwner, newConvId);
+            }
+            setCurrentConvId(newConvId);
+            setDraftSessionKey(undefined);
+          } else if (isLiveEdit) {
+            // Closing during the first response can happen before the server
+            // yields its new conversation id. Delete that late id instead of
+            // leaving a resumable AI Edit conversation behind.
+            void deleteAiEditConversation(newConvId, liveEditOwner);
           }
-          if (currentSessionKeyRef.current === sessionKey) {
+          if (!isLiveEdit && currentSessionKeyRef.current === sessionKey) {
             setCurrentConvId(newConvId);
             setDraftSessionKey(undefined);
           }
         },
         sessionKey,
+        (status, details) => {
+          sendSucceeded = status === ChatStreamCompletionStatus.Succeeded;
+          responseSurfaceResult = {
+            status: status === ChatStreamCompletionStatus.Succeeded
+              ? "succeeded"
+              : status === ChatStreamCompletionStatus.Cancelled
+                ? "cancelled"
+                : "failed",
+            serverAccepted: details.serverAccepted,
+            terminalObserved: details.terminalObserved,
+          };
+        },
       );
+      if (!sendSucceeded) {
+        const applied = editorLiveAppliedRef.current;
+        const ownsFailedLiveEdit = Boolean(
+          isLiveEdit
+          && liveEditSessionDetail
+          && applied.turnId === liveEditTurnId
+          && isSameEditorLiveTarget(editorLiveDetailRef.current, liveEditSessionDetail)
+        );
+        if (ownsFailedLiveEdit && liveEditSessionDetail) {
+          applied.abortController?.abort();
+          const restoredPreviousPreview = await restoreEditorLiveTurn(
+            liveEditSessionDetail,
+            liveEditContent || "",
+            liveEditHadReviewablePreview,
+            undefined,
+            liveEditTurnId,
+            liveEditTurnBasePatchCount,
+          );
+          if (
+            editorLiveAppliedRef.current.turnId === liveEditTurnId
+            && isSameEditorLiveTarget(editorLiveDetailRef.current, liveEditSessionDetail)
+          ) {
+            editorLiveAppliedRef.current = {
+              sessionKey,
+              content: liveEditContent || "",
+              phase: restoredPreviousPreview ? "complete" : "failed",
+              operationCount: 0,
+              appliedPatchCount: 0,
+              basePatchCount: liveEditTurnBasePatchCount,
+            };
+          }
+        } else if (
+          applied.turnId === liveEditTurnId
+          && (applied.phase === "pending" || applied.phase === "streaming")
+        ) {
+          editorLiveAppliedRef.current = { ...applied, phase: "failed" };
+        }
+        adoptPendingLiveEditDetail();
+        return isResponseSurfaceSubmission ? responseSurfaceResult : false;
+      }
       clearPendingChatRetry();
-      if (requestChatMode) resetChatModeAfterTurn();
+      if (!isResponseSurfaceSubmission && requestChatMode) resetChatModeAfterTurn();
       if (isLiveEdit) {
         window.setTimeout(closeCompletedLiveEdit, 350);
         window.setTimeout(closeCompletedLiveEdit, 1200);
-        return;
+        return true;
       }
       queryClient.invalidateQueries({ queryKey: ["conversations"] });
       // The agent may have created or changed Knowledge documents during this
       // turn; without this, a mounted Knowledge page never learns about them
       // (no polling, refetchOnWindowFocus off, 60s staleTime).
       invalidateKnowledgeQueries(queryClient);
+      return isResponseSurfaceSubmission
+        ? responseSurfaceResult
+        : true;
     },
     [
       input,
       currentConvId,
+      currentUserId,
       attachedFiles,
       queryClient,
       listening,
@@ -2498,8 +3453,70 @@ export default function FloatingChat() {
       resetChatModeAfterTurn,
       stopRecording,
       createDraftSession,
+      toast,
     ],
   );
+
+  const handleResponseSurfaceSubmit = useCallback(
+    async (receipt: ResponseSurfaceSubmissionReceipt) => {
+      const rollback = () => {
+        setMessages((current) => (
+          rollbackResponseSurfaceSubmissionMessages(current, receipt.eventId)
+        ));
+      };
+      try {
+        const accepted = await handleSend(
+          responseSurfaceSubmissionMessage(receipt),
+          [],
+          [],
+          null,
+          undefined,
+          { responseSurfaceSubmission: receipt },
+        );
+        if (typeof accepted === "object") {
+          if (!accepted.serverAccepted) {
+            rollback();
+          } else if (accepted.status !== "succeeded" && accepted.terminalObserved) {
+            setMessages((current) => settleResponseSurfaceSubmissionFailure(
+              current,
+              receipt.eventId,
+              accepted.status === "cancelled" ? "interrupted" : "failed",
+            ));
+          }
+        } else if (accepted === false) rollback();
+        return accepted;
+      } catch (error) {
+        rollback();
+        throw error;
+      }
+    },
+    [handleSend, setMessages],
+  );
+
+  const createWorkspaceFromRecommendation = useCallback(
+    async (prompt: string) => {
+      await handleSend(prompt, [], [], null, undefined, {
+        forceAutoMode: true,
+        forceOwnerChat: true,
+      });
+    },
+    [handleSend],
+  );
+  const {
+    dismissedWorkspaceRecommendations,
+    dismissWorkspaceRecommendation,
+    handleWorkspaceRecommendationAdd,
+    handleWorkspaceRecommendationCreate,
+    handleWorkspaceRecommendationOpen,
+    handleWorkspaceRecommendationOptOut,
+    workspaceRecommendationBusyKey,
+    workspaceRecommendationPreferenceBusy,
+    workspaceRecommendationPreferencesReady,
+    workspaceRecommendationsSuppressed,
+  } = useWorkspaceRecommendationActions({
+    enabled: open,
+    createWorkspace: createWorkspaceFromRecommendation,
+  });
 
   const handleStopRequest = useCallback(() => {
     const convId = currentConvId || streamingConvId;
@@ -2510,19 +3527,43 @@ export default function FloatingChat() {
         () => undefined,
       );
     }
-    stopStream(currentSessionKeyRef.current);
+    editorLiveAppliedRef.current.abortController?.abort();
+    void stopStream(currentSessionKeyRef.current);
   }, [currentConvId, streamingConvId, messages, stopStream, queryClient]);
 
-  const handleCloseChat = useCallback(() => {
-    if (editorLiveSessionActive) {
-      if (streamingRef.current) stopStream(currentSessionKeyRef.current);
-      clearEditorLiveSession(true);
+  const closeEditorLiveSession = useCallback(async () => {
+    const pendingCleanup = editorLiveCleanupCoordinator.current();
+    if (pendingCleanup) return pendingCleanup;
+    setEditorLiveCleanupStatus(AiEditSessionCleanupStatus.Closing);
+    editorLiveAppliedRef.current.abortController?.abort();
+    if (streamingRef.current) {
+      const stopped = await stopStream(currentSessionKeyRef.current);
+      if (!stopped) {
+        setEditorLiveCleanupStatus(AiEditSessionCleanupStatus.Failed);
+        useToastStore.getState().error(
+          t("component.floating_chat.ai_edit_close_failed"),
+        );
+        return false;
+      }
+    }
+    return clearEditorLiveSession(true);
+  }, [clearEditorLiveSession, editorLiveCleanupCoordinator, stopStream]);
+
+  const handleCloseChat = useCallback(async () => {
+    if (editorLiveSessionActive && !(await closeEditorLiveSession())) {
+      setOpen(true);
+      return;
     }
     setOpen(false);
-  }, [clearEditorLiveSession, editorLiveSessionActive, stopStream]);
+  }, [
+    closeEditorLiveSession,
+    editorLiveSessionActive,
+  ]);
 
   useEffect(() => {
-    const handleCloseEditorLiveChat = () => handleCloseChat();
+    const handleCloseEditorLiveChat = () => {
+      void handleCloseChat();
+    };
     window.addEventListener(
       EDITOR_LIVE_CHAT_CLOSE_EVENT,
       handleCloseEditorLiveChat,
@@ -2536,17 +3577,17 @@ export default function FloatingChat() {
 
   useEffect(() => {
     if (!editorLiveSessionActive) return;
-    const sourcePath = editorLiveInfo?.sourcePath;
-    if (!sourcePath || location.pathname === sourcePath) return;
-    if (streamingRef.current) stopStream(currentSessionKeyRef.current);
-    clearEditorLiveSession(true);
-    setOpen(false);
+    const routePath = editorLiveInfo?.routePath;
+    if (!routePath || location.pathname === routePath) return;
+    void (async () => {
+      const cleaned = await closeEditorLiveSession();
+      setOpen(!cleaned);
+    })();
   }, [
-    clearEditorLiveSession,
-    editorLiveInfo?.sourcePath,
+    closeEditorLiveSession,
+    editorLiveInfo?.routePath,
     editorLiveSessionActive,
     location.pathname,
-    stopStream,
   ]);
 
   useEffect(() => {
@@ -2561,7 +3602,14 @@ export default function FloatingChat() {
     setDraftSessionKey(pending.conversationId ? undefined : sessionKey);
     const msgsBeforeSend = [
       ...messages,
-      { role: "user" as const, content: pending.message, timestamp: now },
+      {
+        role: "user" as const,
+        content: pending.message,
+        timestamp: now,
+        meta: pending.responseSurfaceSubmission
+          ? responseSurfaceSubmissionMeta(pending.responseSurfaceSubmission)
+          : undefined,
+      },
       { role: "assistant" as const, content: "", timestamp: now },
     ];
     startStream(
@@ -2573,7 +3621,9 @@ export default function FloatingChat() {
           workspaceId: pending.workspaceId,
           chatMode: pending.chatMode,
           chatModePayload: pending.chatModePayload,
+          manualSkillRefs: pending.manualSkillRefs,
           manualSkillIds: pending.manualSkillIds,
+          responseSurfaceSubmission: pending.responseSurfaceSubmission,
         }),
       pending.conversationId,
       msgsBeforeSend,
@@ -2592,8 +3642,15 @@ export default function FloatingChat() {
   }, [location.search, messages, queryClient, startStream, createDraftSession]);
 
   /* ---- New conversation ---- */
-  const handleNewChat = () => {
-    if (editorLiveSessionActive) clearEditorLiveSession(true);
+  const handleNewChat = async () => {
+    conversationSelectionRevisionRef.current += 1;
+    if (
+      editorLiveSessionActive
+      && !(await clearEditorLiveSession(true))
+    ) {
+      setOpen(true);
+      return;
+    }
     const key = createDraftSession();
     setCurrentConvId(undefined);
     setDraftSessionKey(key);
@@ -2603,15 +3660,22 @@ export default function FloatingChat() {
     setEditorSessionLabel(null);
     setEditorLiveInfo(null);
     editorLiveDetailRef.current = null;
-    editorLiveAppliedRef.current = { content: "" };
+    editorLiveAppliedRef.current = { content: "", phase: "idle" };
     setSelectedMentions([]);
     setMentionedAgentId(undefined);
     setConversationLoading(false);
   };
 
-  const handleSwitchSession = (convId: string) => {
+  const handleSwitchSession = async (convId: string) => {
     if (convId === currentConvId) return;
-    if (editorLiveSessionActive) clearEditorLiveSession(true);
+    conversationSelectionRevisionRef.current += 1;
+    if (
+      editorLiveSessionActive
+      && !(await clearEditorLiveSession(true))
+    ) {
+      setOpen(true);
+      return;
+    }
     // A session that is still streaming owns its transcript: clearing it and
     // reloading from the API would drop everything streamed so far and race
     // the live writer, which only checkpoints to the DB every few seconds.
@@ -2628,7 +3692,7 @@ export default function FloatingChat() {
       setEditorSessionLabel(null);
       setEditorLiveInfo(null);
       editorLiveDetailRef.current = null;
-      editorLiveAppliedRef.current = { content: "" };
+      editorLiveAppliedRef.current = { content: "", phase: "idle" };
       setSelectedMentions([]);
       setMentionedAgentId(undefined);
       setConversationLoading(false);
@@ -2640,7 +3704,7 @@ export default function FloatingChat() {
     setEditorSessionLabel(null);
     setEditorLiveInfo(null);
     editorLiveDetailRef.current = null;
-    editorLiveAppliedRef.current = { content: "" };
+    editorLiveAppliedRef.current = { content: "", phase: "idle" };
     setSelectedMentions([]);
     setMentionedAgentId(undefined);
     setConversationLoading(true);
@@ -2655,6 +3719,9 @@ export default function FloatingChat() {
   /* ---- HITL action handler ---- */
   const handleHITLAction = useCallback(
     async (hitlId: string, action: string, review?: unknown) => {
+      const targetHitl = messages
+        .flatMap((message) => message.hitl_requests || [])
+        .find((hitl) => hitl.id === hitlId);
       const markResolved = (items: ChatMessage[]) =>
         items.map((msg) => ({
           ...msg,
@@ -2686,8 +3753,66 @@ export default function FloatingChat() {
         setDraftSessionKey(sessionKey);
       }
 
+      const activeEditorDetail = (
+        editorLiveSessionActive
+        && targetHitl?.tool === "patch_file"
+        && editorLiveDetailRef.current?.applyNativeFilePatch
+      )
+        ? {
+            ...editorLiveDetailRef.current,
+            ...(editorLiveDetailRef.current.getTurnMetadata?.() || {}),
+          }
+        : null;
+      const liveEditContent = activeEditorDetail?.adapter.read() || "";
+      const liveEditTurnId = activeEditorDetail
+        ? `approval-${Date.now()}-${Math.random().toString(36).slice(2)}`
+        : undefined;
+      const liveEditTurnBasePatchCount = Math.max(
+        0,
+        activeEditorDetail?.adapter.getTurnPreviewState().changeCount || 0,
+      );
+      if (activeEditorDetail && liveEditTurnId) {
+        editorLiveAppliedRef.current.abortController?.abort();
+        editorLiveAppliedRef.current = {
+          sessionKey,
+          turnId: liveEditTurnId,
+          content: liveEditContent,
+          phase: "pending",
+          operationCount: 0,
+          appliedPatchCount: 0,
+          basePatchCount: liveEditTurnBasePatchCount,
+          abortController: new AbortController(),
+        };
+      }
+
       await startStream(
-        () => api.chat.stream(hitlMessage, currentConvId),
+        async (streamSignal) => {
+          const response = await api.chat.stream(hitlMessage, currentConvId, {
+            signal: streamSignal,
+          });
+          if (!activeEditorDetail || !liveEditTurnId) return response;
+          return pipeEditorLiveEditStream(
+            response,
+            activeEditorDetail,
+            sessionKey,
+            liveEditTurnId,
+            editorLiveAppliedRef,
+            () => Boolean(
+              editorLiveDetailRef.current
+              && isSameEditorLiveTarget(editorLiveDetailRef.current, activeEditorDetail)
+              && editorLiveAppliedRef.current.turnId === liveEditTurnId
+              && !editorLiveAppliedRef.current.abortController?.signal.aborted
+            ),
+            (tool) => setSessionMessages(sessionKey, (previous) => (
+              withEditorLiveProgress(previous, tool)
+            )),
+            undefined,
+            undefined,
+            liveEditContent,
+            hasReviewableEditorLivePreview({ changeCount: liveEditTurnBasePatchCount }),
+            liveEditTurnBasePatchCount,
+          );
+        },
         currentConvId,
         msgsForHitl,
         (newConvId) => {
@@ -2702,8 +3827,10 @@ export default function FloatingChat() {
     },
     [
       currentConvId,
+      editorLiveSessionActive,
       queryClient,
       messages,
+      setSessionMessages,
       startStream,
       createDraftSession,
       setMessages,
@@ -2728,6 +3855,14 @@ export default function FloatingChat() {
           : undefined);
       if (!retryRequest?.message?.trim()) return;
 
+      // Retrying inside AI Edit must re-enter the editor-aware send pipeline.
+      // A plain chat retry drops editorContext, the patch-only tool surface,
+      // and the persisted-file reload callback.
+      if (editorLiveSessionActive) {
+        await handleSend(retryRequest.message, [], [], null);
+        return;
+      }
+
       const now = new Date().toISOString();
       const sessionKey =
         currentSessionKeyRef.current ||
@@ -2751,6 +3886,9 @@ export default function FloatingChat() {
           manualSkills: fallbackUserMessage?.manualSkills,
           chatMode: fallbackUserMessage?.chatMode,
           chatModePayload: fallbackUserMessage?.chatModePayload,
+          meta: retryRequest.responseSurfaceSubmission
+            ? responseSurfaceSubmissionMeta(retryRequest.responseSurfaceSubmission)
+            : fallbackUserMessage?.meta,
         },
         {
           role: "assistant",
@@ -2771,7 +3909,9 @@ export default function FloatingChat() {
               workspaceId: retryRequest.workspaceId,
               chatMode: retryRequest.chatMode,
               chatModePayload: retryRequest.chatModePayload,
+              manualSkillRefs: retryRequest.manualSkillRefs,
               manualSkillIds: retryRequest.manualSkillIds,
+              responseSurfaceSubmission: retryRequest.responseSurfaceSubmission,
             },
           ),
         retryRequest.conversationId || currentConvId,
@@ -2789,6 +3929,8 @@ export default function FloatingChat() {
     [
       currentConvId,
       createDraftSession,
+      editorLiveSessionActive,
+      handleSend,
       messages,
       queryClient,
       setMessages,
@@ -2817,9 +3959,6 @@ export default function FloatingChat() {
       if (message.role !== "assistant" || !message.id || !conversationId) return;
 
       const key = feedbackKeyForMessage(message, index);
-      const previous = messageFeedback[key] || null;
-      setMessageFeedback((prev) => ({ ...prev, [key]: rating }));
-
       const fallbackRequestPreview = messages
         .slice(0, index)
         .reverse()
@@ -2828,25 +3967,20 @@ export default function FloatingChat() {
         );
 
       try {
-        await api.chat.feedback(conversationId, message.id, {
-          rating,
-          content_preview: contentPreview,
-          request_preview: (toDisplayText(fallbackRequestPreview?.content) || "").slice(0, 1000),
-        });
-      } catch {
-        setMessageFeedback((prev) => {
-          const next = { ...prev };
-          if (previous) next[key] = previous;
-          else delete next[key];
-          return next;
-        });
-      }
+        await submitMessageFeedback(key, rating, (queuedRating) =>
+          api.chat.feedback(conversationId, message.id!, {
+            rating: queuedRating,
+            content_preview: contentPreview,
+            request_preview: (toDisplayText(fallbackRequestPreview?.content) || "").slice(0, 1000),
+          }),
+        );
+      } catch {}
     },
     [
       currentConvId,
       feedbackKeyForMessage,
-      messageFeedback,
       messages,
+      submitMessageFeedback,
       streamingConvId,
     ],
   );
@@ -2879,6 +4013,10 @@ export default function FloatingChat() {
   const editorLiveExamples = editorLiveInfo?.examples?.length
     ? editorLiveInfo.examples
     : ["Rewrite", "Format", "Add content", "Fix layout"];
+  const editorLivePreviewReady = editorLiveInfo?.previewStatus === AiEditPreviewStatus.Ready
+    && Boolean(editorLiveInfo.acceptPreview || editorLiveInfo.discardPreview);
+  const editorLivePreviewBusy = Boolean(editorLiveInfo?.previewAccepting)
+    || editorLiveCleanupStatus === AiEditSessionCleanupStatus.Closing;
 
   /* ================================================================ */
   /*  Render                                                           */
@@ -2887,32 +4025,31 @@ export default function FloatingChat() {
   return (
     <>
       {/* ---- Floating Button ---- */}
-      <style>{`
-        @keyframes float-chat-glow {
-          0%, 100% { box-shadow: 0 4px 20px rgba(67,107,101,0.35); }
-          50% { box-shadow: 0 4px 20px rgba(67,107,101,0.35), 0 0 24px rgba(67,107,101,0.4), 0 0 48px rgba(79,125,117,0.2); }
-        }
-        .float-chat-btn:hover {
-          box-shadow: 0 6px 28px rgba(67,107,101,0.5), 0 0 24px rgba(67,107,101,0.35), 0 0 48px rgba(79,125,117,0.2) !important;
-          transform: scale(1.08) !important;
-          animation: float-chat-glow 4s ease-in-out infinite !important;
-        }
-      `}</style>
       <button
+        type="button"
         className="float-chat-btn"
         data-tour="chat-input"
+        data-open={open ? "true" : "false"}
+        aria-label={t("component.floating_chat.chat_with_manor_ai")}
+        aria-expanded={open}
+        aria-controls="floating-chat-panel"
+        aria-hidden={open}
+        tabIndex={open ? -1 : 0}
         onClick={() => {
           const nextOpen = !open;
+          if (!nextOpen) {
+            setConversationLoading(false);
+            void handleCloseChat();
+            return;
+          }
           if (
-            nextOpen &&
             !resumedRef.current &&
             !streamingRef.current &&
             messages.length === 0
           ) {
             setConversationLoading(true);
           }
-          if (!nextOpen) setConversationLoading(false);
-          setOpen(nextOpen);
+          setOpen(true);
         }}
         style={{
           position: "fixed",
@@ -2929,10 +4066,6 @@ export default function FloatingChat() {
           alignItems: "center",
           justifyContent: "center",
           cursor: "pointer",
-          transition: "all 0.25s cubic-bezier(0.16,1,0.3,1)",
-          transform: open ? "scale(0)" : "scale(1)",
-          opacity: open ? 0 : 1,
-          pointerEvents: open ? "none" : "auto",
         }}
       >
         <svg
@@ -2951,15 +4084,63 @@ export default function FloatingChat() {
 
       {/* ---- Chat Panel ---- */}
       <FloatingPanel
+        id="floating-chat-panel"
         open={open}
         zIndex={1001}
         ariaLabel={editorLiveSessionActive ? "AI edit" : t("page.chat_history.manor_ai")}
+        onClose={handleCloseChat}
+        initialFocusRef={composerEditorRef}
       >
         {/* ── Header ── */}
         <PanelHeader
           avatar={<ManorAvatar size={34} />}
           title={editorLiveSessionActive ? "AI edit" : t("page.chat_history.manor_ai")}
-          subtitle={editorSessionLabel ? (
+          subtitle={editorLiveSessionActive
+            && editorLiveCleanupStatus === AiEditSessionCleanupStatus.Closing ? (
+                <div
+                  role="status"
+                  style={{
+                    display: "flex",
+                    alignItems: "center",
+                    gap: 5,
+                    maxWidth: 220,
+                    marginTop: 1,
+                    color: "var(--text-muted, #78716c)",
+                    fontSize: 10,
+                    fontWeight: 650,
+                  }}
+                >
+                  <LoadingSpinner size={10} />
+                  <span>{t("component.floating_chat.ai_edit_closing")}</span>
+                </div>
+              ) : editorLiveSessionActive
+                && editorLiveCleanupStatus === AiEditSessionCleanupStatus.Failed ? (
+                    <div
+                      role="alert"
+                      style={{
+                        display: "flex",
+                        alignItems: "center",
+                        gap: 5,
+                        maxWidth: 220,
+                        marginTop: 1,
+                        color: "var(--editor-danger-text, #a23e38)",
+                        fontSize: 10,
+                        fontWeight: 650,
+                      }}
+                    >
+                      <span
+                        aria-hidden="true"
+                        style={{
+                          width: 5,
+                          height: 5,
+                          flexShrink: 0,
+                          borderRadius: "50%",
+                          background: "currentColor",
+                        }}
+                      />
+                      <span>{t("component.floating_chat.ai_edit_close_failed")}</span>
+                    </div>
+                  ) : editorSessionLabel ? (
                 <div
                   title={editorSessionLabel}
                   style={{
@@ -3035,19 +4216,31 @@ export default function FloatingChat() {
               )}
               <button
                 onClick={handleCloseChat}
-                title={t("page.flows.close")}
+                disabled={editorLiveCleanupStatus === AiEditSessionCleanupStatus.Closing}
+                aria-busy={editorLiveCleanupStatus === AiEditSessionCleanupStatus.Closing}
+                aria-label={editorLiveCleanupStatus === AiEditSessionCleanupStatus.Closing
+                  ? t("component.floating_chat.ai_edit_closing")
+                  : t("page.flows.close")}
+                title={editorLiveCleanupStatus === AiEditSessionCleanupStatus.Closing
+                  ? t("component.floating_chat.ai_edit_closing")
+                  : t("page.flows.close")}
                 style={{
                   width: 28,
                   height: 28,
                   borderRadius: 8,
                   border: "none",
                   background: "transparent",
-                  cursor: "pointer",
+                  cursor: editorLiveCleanupStatus === AiEditSessionCleanupStatus.Closing
+                    ? "wait"
+                    : "pointer",
                   display: "flex",
                   alignItems: "center",
                   justifyContent: "center",
                   color: "var(--text-faint, #a8a29e)",
                   transition: "all 0.15s",
+                  opacity: editorLiveCleanupStatus === AiEditSessionCleanupStatus.Closing
+                    ? 0.65
+                    : 1,
                 }}
                 onMouseEnter={(e) => {
                   e.currentTarget.style.background = "var(--modal-control-hover-bg, #f5f5f4)";
@@ -3058,7 +4251,10 @@ export default function FloatingChat() {
                   e.currentTarget.style.color = "var(--text-faint, #a8a29e)";
                 }}
               >
-                <svg
+                {editorLiveCleanupStatus === AiEditSessionCleanupStatus.Closing ? (
+                  <LoadingSpinner size={14} />
+                ) : (
+                  <svg
                   width="14"
                   height="14"
                   viewBox="0 0 24 24"
@@ -3067,9 +4263,10 @@ export default function FloatingChat() {
                   strokeWidth={2.5}
                   strokeLinecap="round"
                   strokeLinejoin="round"
-                >
-                  <path d="M18 6L6 18M6 6l12 12" />
-                </svg>
+                  >
+                    <path d="M18 6L6 18M6 6l12 12" />
+                  </svg>
+                )}
               </button>
             </>
           }
@@ -3159,20 +4356,21 @@ export default function FloatingChat() {
                     }}
                   >
                     {editorLiveExamples.map((example) => (
-                      <span
+                      <button
+                        type="button"
                         key={example}
-                        style={{
-                          padding: "4px 8px",
-                          borderRadius: 999,
-                          border: "1px solid var(--accent-soft-border, rgba(67,107,101,0.18))",
-                          background: "var(--accent-soft, #f2f6f5)",
-                          color: "var(--accent, #436b65)",
-                          fontSize: 10,
-                          fontWeight: 700,
+                        className="floating-chat-suggestion"
+                        disabled={
+                          assistantWorking
+                          || editorLiveCleanupStatus === AiEditSessionCleanupStatus.Closing
+                        }
+                        onClick={() => {
+                          setInput(example);
+                          window.requestAnimationFrame(() => composerEditorRef.current?.focus());
                         }}
                       >
                         {example}
-                      </span>
+                      </button>
                     ))}
                   </div>
                 )}
@@ -3201,12 +4399,25 @@ export default function FloatingChat() {
                 ? displayContentForAssistantMessage(msg, rawBubbleContent)
                 : rawBubbleContent;
             const isLatestStreaming = assistantWorking && i === messages.length - 1;
+            const renderedBubbleDisplay = parseUserMessageDisplay(
+              { ...msg, content: bubbleContent },
+              { streaming: isLatestStreaming },
+            );
+            const renderedBubbleContent = renderedBubbleDisplay.cleanContent;
+            const assistantReferenceDisplay = localCodingNotice
+              ? parseUserMessageDisplay(msg, {
+                  renderedContent: renderedBubbleContent,
+                  streaming: isLatestStreaming,
+                })
+              : renderedBubbleDisplay;
             const suppressApprovalBubble =
               isApprovalBoilerplateContent(msg) && !isLatestStreaming;
             const showCreditLimitNotice =
               msg.role === "assistant" &&
               msg.stop_reason === "credit_exhausted";
-            const actionCopyText = msg.role === "user" ? content : rawBubbleContent;
+            const actionCopyText = msg.role === "user"
+              ? content
+              : chatMessageActionText(msg, rawBubbleContent);
             const showMessageActions = Boolean(
               !suppressApprovalBubble &&
                 !showCreditLimitNotice &&
@@ -3222,6 +4433,10 @@ export default function FloatingChat() {
                 );
             const canRetryMessage =
               canRetryFromContent && hasRetryTarget;
+            const workspaceRecommendation = msg.role === "assistant"
+              ? normalizeWorkspaceRecommendation(msg.meta?.workspace_recommendation)
+              : null;
+            const workspaceRecommendationKey = `${msg.id || currentConvId || "draft"}:${i}`;
             // Only backend HITL cards have an id that can be safely resolved.
             const showInlineApproval = false;
             return (
@@ -3345,12 +4560,16 @@ export default function FloatingChat() {
                         >
                           <AssistantMessageBlocks
                             blocks={msg.assistant_blocks}
-                            content={bubbleContent}
+                            content={renderedBubbleContent}
                             keyPrefix={i}
                             streaming={assistantWorking && i === messages.length - 1}
+                            onResponseSurfaceSubmit={handleResponseSurfaceSubmit}
+                            sourceMessageId={msg.id || ""}
+                            pendingActionKind={assistantPendingActionKindForMessage(msg)}
+                            responseSurfaceSubmissionReceipts={responseSurfaceSubmissionReceipts}
                           />
                           <ChatMessageReferenceStrip
-                            references={parseUserMessageDisplay(msg).references}
+                            references={assistantReferenceDisplay.references}
                             inlineFileCards
                             returnTo={`${location.pathname}${location.search}${location.hash}`}
                           />
@@ -3361,10 +4580,13 @@ export default function FloatingChat() {
                       return null;
                     // Attachment-only turns still need a bubble for the file card.
                     if (!bubbleContent && (msg.attachments?.length ?? 0) === 0 && msg.role !== "user") return null;
-                    const display = parseUserMessageDisplay({
-                      ...msg,
-                      content: bubbleContent,
-                    });
+                    const display = parseUserMessageDisplay(
+                      {
+                        ...msg,
+                        content: bubbleContent,
+                      },
+                      { streaming: isLatestStreaming },
+                    );
                     const { cleanContent, chips, references } = display;
                     if (!cleanContent && chips.length === 0 && references.length === 0) return null;
                     return (
@@ -3442,6 +4664,34 @@ export default function FloatingChat() {
                       </MessageBubble>
                     )}
 
+                  {workspaceRecommendation &&
+                    workspaceRecommendationPreferencesReady &&
+                    !workspaceRecommendationsSuppressed &&
+                    !dismissedWorkspaceRecommendations.has(workspaceRecommendationKey) && (
+                      <WorkspaceRecommendationCard
+                        recommendation={workspaceRecommendation}
+                        loading={workspaceRecommendationBusyKey === workspaceRecommendationKey}
+                        preferenceLoading={workspaceRecommendationPreferenceBusy}
+                        disabled={assistantWorking || workspaceRecommendationPreferenceBusy}
+                        onCreate={() => void handleWorkspaceRecommendationCreate(
+                          workspaceRecommendation,
+                          workspaceRecommendationKey,
+                        )}
+                        onOpen={() => handleWorkspaceRecommendationOpen(
+                          workspaceRecommendation,
+                          workspaceRecommendationKey,
+                        )}
+                        onAdd={() => void handleWorkspaceRecommendationAdd(
+                          workspaceRecommendation,
+                          workspaceRecommendationKey,
+                        )}
+                        onContinue={() => dismissWorkspaceRecommendation(
+                          workspaceRecommendationKey,
+                        )}
+                        onDontSuggestAgain={() => void handleWorkspaceRecommendationOptOut()}
+                      />
+                    )}
+
                   {(!isLatestStreaming || Boolean(content) || visibleTools.length > 0 || hasAssistantBlocks) && (
                     <div
                     className={`chat-message-meta-row ${
@@ -3454,6 +4704,8 @@ export default function FloatingChat() {
                         <ChatMessageActions
                           align="right"
                           copyText={actionCopyText}
+                          speechText={msg.role === "assistant" ? actionCopyText : undefined}
+                          voiceScope={{ conversationId: msg.conversation_id || currentConvId || streamingConvId }}
                           copyLabel={t(
                             msg.role === "user"
                               ? "component.chat_message_actions.copy_request"
@@ -3465,7 +4717,7 @@ export default function FloatingChat() {
                               ? messageFeedback[feedbackKeyForMessage(msg, i)] || null
                               : null
                           }
-                          disabled={streaming}
+                          disabled={streaming || !open}
                           onRetry={() => handleRetryMessage(msg, i)}
                           onFeedback={
                             msg.role === "assistant" &&
@@ -3494,6 +4746,37 @@ export default function FloatingChat() {
           <div ref={messagesEndRef} />
         </div>
 
+        {editorLiveSessionActive && editorLivePreviewReady && (
+          <div
+            role="group"
+            aria-label={t("page.doc_editor.ai_edit_preview_controls")}
+            style={{
+              display: "flex",
+              justifyContent: "flex-end",
+              gap: 8,
+              padding: "10px 14px 0",
+              borderTop: "1px solid var(--panel-border, rgba(120, 113, 108, 0.14))",
+            }}
+          >
+            <button
+              type="button"
+              className="floating-chat-suggestion"
+              disabled={editorLivePreviewBusy}
+              onClick={() => { void editorLiveInfo?.discardPreview?.(); }}
+            >
+              {t("page.doc_editor.ai_edit_discard")}
+            </button>
+            <button
+              type="button"
+              className="floating-chat-suggestion"
+              disabled={editorLivePreviewBusy}
+              onClick={() => { void editorLiveInfo?.acceptPreview?.(); }}
+            >
+              {editorLiveInfo?.previewAccepting ? t("status.saving") : t("page.doc_editor.ai_edit_accept")}
+            </button>
+          </div>
+        )}
+
         {/* Sticky approval bar (same component used by EmbeddedChat). The
             "floating" variant matches the 12 px padding and 100% width that
             .floating-chat-footer uses for its own composer. */}
@@ -3516,6 +4799,14 @@ export default function FloatingChat() {
         />
 
         <ChatInputFooter
+          disabled={!open}
+          voiceScope={{ conversationId: currentConvId || streamingConvId }}
+          onVoiceConversation={(id) => {
+            setCurrentConvId(id);
+            setDraftSessionKey(undefined);
+            void loadRecentMessages(id).then(msgs => setSessionMessages(id, msgs)).catch(() => {});
+            void queryClient.invalidateQueries({ queryKey: ["conversations"] });
+          }}
           value={input}
           onChange={handleComposerChange}
           streaming={streaming}
@@ -3525,6 +4816,11 @@ export default function FloatingChat() {
           onSendWorkflow={(text, attachments, manualSkills, workflow, context) => {
             void handleSend(text, attachments, manualSkills, workflow, context);
           }}
+          onKeyDown={
+            editorLiveSessionActive
+              ? (event) => event.stopPropagation()
+              : undefined
+          }
           onStop={handleStopRequest}
           topSlot={
             messages.length > 0 && !editorLiveSessionActive ? (
@@ -3549,7 +4845,7 @@ export default function FloatingChat() {
                           "{name}", sample.title,
                         ),
                       );
-                      window.setTimeout(() => textareaRef.current?.focus(), 0);
+                      window.setTimeout(() => composerEditorRef.current?.focus(), 0);
                     } catch (error) {
                       toast.error(
                         t("component.embedded_chat.template_create_failed"),
@@ -3589,6 +4885,7 @@ export default function FloatingChat() {
           onMentionSelect={handleMentionSelect}
           onMentionRemove={handleMentionRemove}
           textareaRef={textareaRef}
+          editorRef={composerEditorRef}
           seedAttachments={composerSeed?.attachments}
           seedAttachmentsKey={composerSeed?.key}
           className="floating-chat-footer"

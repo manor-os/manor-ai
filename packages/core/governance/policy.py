@@ -37,8 +37,10 @@ matches any post variant. Empty lists = no opinion.
 from __future__ import annotations
 
 import fnmatch
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from typing import Any, Optional
+
+from packages.core.governance.approval_scope import approval_scope_candidates
 
 # Risk ranking — duplicated with dispatcher.service to keep the two
 # from import-coupling. Three levels is the contract.
@@ -79,6 +81,73 @@ DEFAULT_AUTO_APPROVE_CAPABILITIES = ("file.write", "manor.composite")
 DEFAULT_POLICY = WorkspacePolicy(
     auto_approve_capabilities=list(DEFAULT_AUTO_APPROVE_CAPABILITIES)
 )
+
+
+def with_default_auto_approve_capabilities(
+    policy: WorkspacePolicy,
+) -> WorkspacePolicy:
+    """Add routine default grants without weakening explicit HITL rules.
+
+    This helper is for *constructing a new policy* (Workspace setup and
+    Blueprint presets).  It deliberately does not rewrite an auto-approval
+    already present in ``policy``: an operator/author may explicitly use one
+    as an exception to a broader HITL rule.  It only decides which missing
+    system defaults are safe to add.
+    """
+    from packages.core.ai.runtime.approvals import (
+        runtime_capability_id_for_action_key,
+    )
+
+    if "*" in policy.hitl_required_actions:
+        eligible_defaults: list[str] = []
+    else:
+        hitl_action_capabilities = {
+            capability_id
+            for pattern in policy.hitl_required_actions
+            if (
+                capability_id := runtime_capability_id_for_action_key(pattern)
+            )
+        }
+        file_action_probes = (
+            "workspace.file.create",
+            "workspace.file.modify",
+            "workspace.file.delete",
+            "write_file",
+            "edit_file",
+            "delete_file",
+            "generate_file",
+        )
+        if any(
+            fnmatch.fnmatchcase(action_key, pattern)
+            for pattern in policy.hitl_required_actions
+            for action_key in file_action_probes
+        ):
+            hitl_action_capabilities.add("file.write")
+        restricted_capability_patterns = (
+            policy.never_allow_capabilities
+            + policy.hitl_required_capabilities
+        )
+        eligible_defaults = [
+            capability_id
+            for capability_id in DEFAULT_AUTO_APPROVE_CAPABILITIES
+            if capability_id not in hitl_action_capabilities
+            and not any(
+                fnmatch.fnmatchcase(capability_id, pattern)
+                for pattern in restricted_capability_patterns
+            )
+        ]
+
+    missing = [
+        capability_id
+        for capability_id in eligible_defaults
+        if capability_id not in policy.auto_approve_capabilities
+    ]
+    if not missing:
+        return policy
+    return replace(
+        policy,
+        auto_approve_capabilities=policy.auto_approve_capabilities + missing,
+    )
 
 
 @dataclass
@@ -148,19 +217,20 @@ def policy_auto_approves(
     policy: WorkspacePolicy,
     *,
     action_key: Optional[str] = None,
+    resource_id: Optional[str] = None,
     capability_id: Optional[str] = None,
 ) -> bool:
-    """True only when the policy *explicitly* auto-approves this action or
-    capability (matches an ``auto_approve_*`` pattern).
+    """True only when the policy *explicitly* auto-approves this scope.
 
     This is intentionally narrow: a default-allow (no rule matched anything) is
     NOT an auto-approval. Used by the dispatcher to let a workspace's explicit
     auto-approve override a capability's intrinsic ``required_approval`` — never
-    to clear approval just because nothing denied it. Deny/risk/budget gates
-    still run afterward in :func:`decide`."""
-    if action_key:
+    to clear approval just because nothing denied it. ``resource_id`` narrows an
+    action grant when the caller has one; otherwise the broader action key is
+    matched. Deny/risk/budget gates still run afterward in :func:`decide`."""
+    for candidate in approval_scope_candidates(action_key, resource_id):
         for pattern in policy.auto_approve_actions:
-            if _matches(pattern, action_key):
+            if _matches(pattern, candidate):
                 return True
     if capability_id:
         for pattern in policy.auto_approve_capabilities:
@@ -174,6 +244,7 @@ def decide(
     *,
     kind: str,
     action_key: Optional[str],
+    resource_id: Optional[str] = None,
     risk_level: str,
     capability_id: Optional[str] = None,
     spent_credits_per_kind: Optional[dict[str, int]] = None,
@@ -206,12 +277,12 @@ def decide(
             )
 
     # Deny gates have highest precedence across action and capability axes.
-    if action_key:
+    for candidate in approval_scope_candidates(action_key, resource_id):
         for pattern in policy.never_allow_actions:
-            if _matches(pattern, action_key):
+            if _matches(pattern, candidate):
                 return PolicyDecision(
                     allowed=False,
-                    reason=f"action_key={action_key!r} blocked by rule {pattern!r}",
+                    reason=f"action_key={candidate!r} blocked by rule {pattern!r}",
                     matched_rule=pattern,
                 )
     if capability_id:
@@ -225,23 +296,23 @@ def decide(
 
     # auto_approve has higher precedence than hitl_required so the operator can
     # carve exceptions out of an otherwise-HITL pattern.
-    if action_key:
+    for candidate in approval_scope_candidates(action_key, resource_id):
         for pattern in policy.auto_approve_actions:
-            if _matches(pattern, action_key):
+            if _matches(pattern, candidate):
                 return PolicyDecision(allowed=True, matched_rule=pattern)
     if capability_id:
         for pattern in policy.auto_approve_capabilities:
             if _matches(pattern, capability_id):
                 return PolicyDecision(allowed=True, matched_rule=pattern)
 
-    if action_key:
+    for candidate in approval_scope_candidates(action_key, resource_id):
         for pattern in policy.hitl_required_actions:
-            if _matches(pattern, action_key):
+            if _matches(pattern, candidate):
                 return PolicyDecision(
                     allowed=False,
                     pause_for_hitl=True,
                     reason=(
-                        f"action_key={action_key!r} requires operator "
+                        f"action_key={candidate!r} requires operator "
                         f"approval (rule {pattern!r})"
                     ),
                     matched_rule=pattern,

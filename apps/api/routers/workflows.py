@@ -7,25 +7,34 @@ from time import perf_counter
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from packages.core.ai.workflow_import import UnknownWorkflowFormat, import_workflow
-from packages.core.ai.workflow_runner import WorkflowRunner
+from packages.core.ai.workflow_runner import (
+    WorkflowRunner,
+    finalize_workflow_terminal_effects_best_effort,
+    mark_workflow_terminal_effects_pending,
+)
 from packages.core.database import get_db
 from packages.core.models.document import Document
 from packages.core.models.permission import Capability, ResourceType, Visibility
 from packages.core.models.user import User
 from packages.core.models.workflow import WorkflowDefinition
+from packages.core.models.workspace import Workspace
 from packages.core.services import workflow_service as svc
+from packages.core.services.workflow_run_trace import visible_workflow_tags
 from packages.core.services.document_access import user_can_read_document
 from packages.core.services.resource_access import (
     ResourceDescriptor,
     is_read_capability,
     user_can_access_resource,
 )
+from packages.core.services.sensitive_data import sanitize_sensitive_payload
 from packages.core.services.workflow_run_trace import summarize_trace_text
 from packages.core.services.workspace_access import (
     is_entity_admin_role,
+    resolve_workspace_read_access,
     user_can_control_workspace_run,
     user_can_read_workspace_id,
     user_readable_workspace_ids,
@@ -38,6 +47,84 @@ from packages.core.constants.pending_actions import PendingActionKind
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/v1/workflows", tags=["workflows"])
+
+
+async def _persisted_workspace_id(
+    db: AsyncSession,
+    user: User,
+    workspace_id: str | None,
+) -> str | None:
+    """Return a persisted Workspace id, including soft-deleted rows.
+
+    Bindings predate a foreign key on ``workspace_id``, so labels that never
+    identified a Workspace remain entity-level compatibility data. Once an id
+    identifies a Workspace, however, deletion must fail closed rather than
+    reclassifying its binding as entity-level.
+    """
+    normalized = str(workspace_id or "").strip()
+    if not normalized:
+        return None
+    found = (await db.execute(
+        select(Workspace.id).where(Workspace.id == normalized).limit(1)
+    )).scalar_one_or_none()
+    return str(found) if found else None
+
+
+async def _require_binding_workspace_read(
+    db: AsyncSession,
+    user: User,
+    workspace_id: str | None,
+) -> bool:
+    """Authorize persisted Workspace bindings; legacy labels stay valid."""
+    real_id = await _persisted_workspace_id(db, user, workspace_id)
+    if real_id:
+        if not await user_can_read_workspace_id(
+            db,
+            workspace_id=real_id,
+            entity_id=user.entity_id,
+            user_id=user.id,
+            role=user.role,
+        ):
+            raise HTTPException(404, "Workspace not found")
+        return True
+    return False
+
+
+async def _require_binding_workspace_write(
+    db: AsyncSession,
+    user: User,
+    workspace_id: str | None,
+) -> bool:
+    real_id = await _persisted_workspace_id(db, user, workspace_id)
+    if real_id:
+        if not await user_can_write_workspace_id(
+            db,
+            workspace_id=real_id,
+            entity_id=user.entity_id,
+            user_id=user.id,
+            role=user.role,
+        ):
+            raise HTTPException(403, "You do not have write access to this workspace")
+        return True
+    return False
+
+
+async def _require_binding_write(
+    db: AsyncSession,
+    user: User,
+    *,
+    workflow_id: str,
+    workspace_id: str | None,
+) -> bool:
+    """Authorize a binding mutation through its Workspace or definition."""
+    workspace_scoped = await _require_binding_workspace_write(
+        db,
+        user,
+        workspace_id,
+    )
+    if not workspace_scoped:
+        await _require_workflow(db, user, workflow_id, Capability.EDIT)
+    return workspace_scoped
 
 
 async def _require_workflow(
@@ -111,6 +198,7 @@ class WorkflowUpdateRequest(BaseModel):
     tags: list[str] | None = None
     is_active: bool | None = None
     status: str | None = None
+    validate_steps: bool = False
 
 
 class WorkflowTemplateInstallRequest(BaseModel):
@@ -256,7 +344,7 @@ def _wf_to_dict(wf) -> dict:
         steps=wf.steps or [],
         variables=wf.variables or {},
         category=wf.category,
-        tags=wf.tags or [],
+        tags=visible_workflow_tags(wf.tags),
         is_active=wf.is_active,
         version=wf.version,
         status=wf.status,
@@ -666,6 +754,16 @@ async def _message_backed_workflow_intervention(
 
 
 async def _run_can_control(db: AsyncSession, run, user: User) -> bool:
+    if not getattr(run, "workspace_id", None):
+        if str(getattr(run, "started_by", "") or "") == str(user.id):
+            return True
+        resolved_role, _ = await resolve_workspace_read_access(
+            db,
+            entity_id=user.entity_id,
+            user_id=user.id,
+            role=user.role,
+        )
+        return is_entity_admin_role(resolved_role)
     return await user_can_control_workspace_run(
         db,
         run=run,
@@ -686,11 +784,18 @@ async def _run_control_capabilities(
     }
     writable_workspace_ids = await user_writable_workspace_ids(
         db,
+        entity_id=user.entity_id,
         workspace_ids=workspace_ids,
         user_id=user.id,
         role=user.role,
     )
-    entity_admin = is_entity_admin_role(user.role)
+    resolved_role, _ = await resolve_workspace_read_access(
+        db,
+        entity_id=user.entity_id,
+        user_id=user.id,
+        role=user.role,
+    )
+    entity_admin = is_entity_admin_role(resolved_role)
     return {
         run.id: bool(
             str(getattr(run, "started_by", "") or "") == str(user.id)
@@ -932,6 +1037,14 @@ async def import_workflow_endpoint(
             result = import_workflow(body.content, name=body.name)
             return {"report": result.report.to_dict(), "definition": result.definition}
 
+        if body.create_binding and body.workspace_id:
+            if not await _require_binding_workspace_write(
+                db,
+                user,
+                body.workspace_id,
+            ):
+                raise HTTPException(404, "Workspace not found")
+
         wf, binding, report = await svc.import_workflow_definition(
             db,
             entity_id=user.entity_id,
@@ -950,11 +1063,23 @@ async def import_workflow_endpoint(
         }
     except UnknownWorkflowFormat as exc:
         raise HTTPException(422, str(exc))
+    except ValueError as exc:
+        if str(exc) == "Workspace not found":
+            raise HTTPException(404, "Workspace not found") from exc
+        raise
 
 
 # ── Workflow Bindings + Triggers ──
 
-def _binding_to_dict(b) -> dict:
+def _binding_to_dict(b, *, include_sensitive: bool = False) -> dict:
+    trigger_config = dict(b.trigger_config or {})
+    variables = dict(b.variables or {})
+    config = dict(b.config or {})
+    if not include_sensitive:
+        trigger_config = sanitize_sensitive_payload(trigger_config)
+        trigger_config.pop("webhook_token", None)
+        variables = {}
+        config = {}
     return {
         "id": b.id,
         "entity_id": b.entity_id,
@@ -963,9 +1088,9 @@ def _binding_to_dict(b) -> dict:
         "business_line": b.business_line,
         "name": b.name,
         "trigger_type": b.trigger_type,
-        "trigger_config": b.trigger_config or {},
-        "variables": b.variables or {},
-        "config": b.config or {},
+        "trigger_config": trigger_config,
+        "variables": variables,
+        "config": config,
         "enabled": b.enabled,
         "status": b.status,
     }
@@ -982,25 +1107,38 @@ async def create_binding(
     A ``schedule`` trigger is an automation, not a binding — it creates a
     ScheduledJob (the workflow stays independent) and returns the automation.
     """
-    wf = await svc.get_workflow(db, body.workflow_id, user.entity_id)
-    if not wf:
-        raise HTTPException(404, "Workflow not found")
+    workspace_scoped = await _require_binding_workspace_write(
+        db, user, body.workspace_id
+    )
+    if body.workspace_id and not workspace_scoped:
+        raise HTTPException(404, "Workspace not found")
+    wf = await _require_workflow(
+        db,
+        user,
+        body.workflow_id,
+        Capability.VIEW if workspace_scoped else Capability.EDIT,
+    )
 
     if body.trigger_type == "schedule":
         cfg = body.trigger_config or {}
         cron = cfg.get("cron") or cfg.get("schedule")
         if not cron:
             raise HTTPException(400, "A schedule trigger needs a 'cron' in trigger_config")
-        job = await svc.schedule_workflow(
-            db,
-            entity_id=user.entity_id,
-            workflow_id=body.workflow_id,
-            cron=str(cron),
-            name=body.name or wf.name,
-            workspace_id=body.workspace_id,
-            timezone_str=str(cfg.get("timezone") or "UTC"),
-            created_by=user.id,
-        )
+        try:
+            job = await svc.schedule_workflow(
+                db,
+                entity_id=user.entity_id,
+                workflow_id=body.workflow_id,
+                cron=str(cron),
+                name=body.name or wf.name,
+                workspace_id=body.workspace_id,
+                timezone_str=str(cfg.get("timezone") or "UTC"),
+                created_by=user.id,
+            )
+        except ValueError as exc:
+            if str(exc) == "Workspace not found":
+                raise HTTPException(404, "Workspace not found") from exc
+            raise
         await db.commit()
         return {
             "kind": "automation",
@@ -1034,20 +1172,28 @@ async def create_binding(
         except ValueError as exc:
             raise HTTPException(409, str(exc))
 
-    binding = await svc.create_workflow_binding(
-        db,
-        entity_id=user.entity_id,
-        workflow_id=body.workflow_id,
-        workspace_id=body.workspace_id,
-        business_line=body.business_line,
-        name=body.name or wf.name,
-        trigger_type=body.trigger_type,
-        trigger_config=body.trigger_config,
-        variables=body.variables,
-        config=body.config,
-    )
+    try:
+        binding = await svc.create_workflow_binding(
+            db,
+            entity_id=user.entity_id,
+            workflow_id=body.workflow_id,
+            workspace_id=body.workspace_id,
+            business_line=body.business_line,
+            name=body.name or wf.name,
+            trigger_type=body.trigger_type,
+            trigger_config=body.trigger_config,
+            variables=body.variables,
+            config=body.config,
+        )
+    except ValueError as exc:
+        if str(exc) == "Workspace not found":
+            raise HTTPException(404, "Workspace not found") from exc
+        raise
     await db.commit()
-    return {"kind": "binding", **_binding_to_dict(binding)}
+    return {
+        "kind": "binding",
+        **_binding_to_dict(binding, include_sensitive=True),
+    }
 
 
 @router.get("/bindings")
@@ -1058,6 +1204,9 @@ async def list_bindings(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
+    requested_real_workspace = await _persisted_workspace_id(db, user, workspace_id)
+    if requested_real_workspace:
+        await _require_binding_workspace_read(db, user, requested_real_workspace)
     items = await svc.list_bindings(
         db,
         user.entity_id,
@@ -1065,7 +1214,85 @@ async def list_bindings(
         business_line=business_line,
         workflow_id=workflow_id,
     )
-    return [_binding_to_dict(b) for b in items]
+    workspace_ids = {
+        str(binding.workspace_id)
+        for binding in items
+        if binding.workspace_id
+    }
+    persisted_workspace_ids = set((await db.execute(
+        select(Workspace.id).where(
+            Workspace.id.in_(workspace_ids),
+        )
+    )).scalars()) if workspace_ids else set()
+    readable_workspace_ids = await user_readable_workspace_ids(
+        db,
+        entity_id=user.entity_id,
+        user_id=user.id,
+        role=user.role,
+        workspace_ids={str(value) for value in persisted_workspace_ids},
+    )
+    workflows = list((await db.execute(
+        select(WorkflowDefinition).where(
+            WorkflowDefinition.entity_id == user.entity_id,
+            WorkflowDefinition.id.in_({binding.workflow_id for binding in items}),
+        )
+    )).scalars()) if items else []
+    workflows_by_id = {workflow.id: workflow for workflow in workflows}
+    access_cache: dict[tuple[str, str], bool] = {}
+
+    async def _can_access_workflow(workflow_id: str, capability: str) -> bool:
+        cache_key = (workflow_id, capability)
+        if cache_key in access_cache:
+            return access_cache[cache_key]
+        workflow = workflows_by_id.get(workflow_id)
+        allowed = bool(workflow) and await user_can_access_resource(
+            db,
+            descriptor=ResourceDescriptor.from_row(workflow, ResourceType.WORKFLOW),
+            entity_id=user.entity_id,
+            user_id=user.id,
+            role=getattr(user, "role", None),
+            capability=capability,
+        )
+        access_cache[cache_key] = allowed
+        return allowed
+
+    visible = []
+    for binding in items:
+        real_workspace = (
+            str(binding.workspace_id)
+            if binding.workspace_id
+            and str(binding.workspace_id) in persisted_workspace_ids
+            else None
+        )
+        if real_workspace:
+            if real_workspace in readable_workspace_ids:
+                visible.append(binding)
+            continue
+        if await _can_access_workflow(binding.workflow_id, Capability.VIEW):
+            visible.append(binding)
+
+    writable_workspace_ids = await user_writable_workspace_ids(
+        db,
+        entity_id=user.entity_id,
+        user_id=user.id,
+        role=user.role,
+        workspace_ids={str(value) for value in persisted_workspace_ids},
+    )
+    response = []
+    for binding in visible:
+        real_workspace = (
+            str(binding.workspace_id)
+            if binding.workspace_id
+            and str(binding.workspace_id) in persisted_workspace_ids
+            else None
+        )
+        include_sensitive = (
+            real_workspace in writable_workspace_ids
+            if real_workspace
+            else await _can_access_workflow(binding.workflow_id, Capability.EDIT)
+        )
+        response.append(_binding_to_dict(binding, include_sensitive=include_sensitive))
+    return response
 
 
 @router.put("/bindings/{binding_id}")
@@ -1080,10 +1307,28 @@ async def update_binding(
     current = await svc.get_binding(db, binding_id, user.entity_id)
     if not current:
         raise HTTPException(404, "Binding not found")
-    if body.workflow_id:
-        workflow = await svc.get_workflow(db, body.workflow_id, user.entity_id)
-        if not workflow:
-            raise HTTPException(404, "Workflow not found")
+    await _require_binding_write(
+        db,
+        user,
+        workflow_id=current.workflow_id,
+        workspace_id=current.workspace_id,
+    )
+    target_workspace_id = (
+        body.workspace_id
+        if "workspace_id" in body.model_fields_set
+        else current.workspace_id
+    )
+    target_workspace_scoped = await _require_binding_workspace_write(
+        db, user, target_workspace_id
+    )
+    if target_workspace_id and not target_workspace_scoped:
+        raise HTTPException(404, "Workspace not found")
+    await _require_workflow(
+        db,
+        user,
+        body.workflow_id or current.workflow_id,
+        Capability.VIEW if target_workspace_scoped else Capability.EDIT,
+    )
     effective_config = body.config if body.config is not None else current.config
     reference_id = (effective_config or {}).get("workspace_workflow_binding_id")
     if reference_id:
@@ -1097,16 +1342,21 @@ async def update_binding(
             )
         except ValueError as exc:
             raise HTTPException(409, str(exc))
-    binding = await svc.update_binding(
-        db,
-        binding_id,
-        user.entity_id,
-        **body.model_dump(exclude_unset=True),
-    )
+    try:
+        binding = await svc.update_binding(
+            db,
+            binding_id,
+            user.entity_id,
+            **body.model_dump(exclude_unset=True),
+        )
+    except ValueError as exc:
+        if str(exc) == "Workspace not found":
+            raise HTTPException(404, "Workspace not found") from exc
+        raise
     if not binding:
         raise HTTPException(404, "Binding not found")
     await db.commit()
-    return _binding_to_dict(binding)
+    return _binding_to_dict(binding, include_sensitive=True)
 
 
 @router.post("/bindings/{binding_id}/run", status_code=201)
@@ -1120,6 +1370,11 @@ async def run_binding(
     binding = await svc.get_binding(db, binding_id, user.entity_id)
     if not binding:
         raise HTTPException(404, "Binding not found")
+    workspace_scoped = await _require_binding_workspace_write(
+        db, user, binding.workspace_id
+    )
+    if not workspace_scoped:
+        await _require_workflow(db, user, binding.workflow_id, Capability.VIEW)
     try:
         execution_binding = await svc.execution_binding_for_automation(db, binding)
         trigger_data = dict(body.trigger_data if body and body.trigger_data else {"manual_test": True})
@@ -1157,6 +1412,12 @@ async def delete_binding(
     binding = await svc.get_binding(db, binding_id, user.entity_id)
     if not binding:
         raise HTTPException(404, "Binding not found")
+    await _require_binding_write(
+        db,
+        user,
+        workflow_id=binding.workflow_id,
+        workspace_id=binding.workspace_id,
+    )
     if binding.workspace_id and binding.trigger_type == "manual":
         references = await svc.binding_automation_references(db, binding)
         if references:
@@ -1176,6 +1437,11 @@ async def fire_trigger(
     db: AsyncSession = Depends(get_db),
 ):
     """Fire a trigger — start a run for every enabled binding that matches."""
+    workspace_scoped = await _require_binding_workspace_write(
+        db, user, body.workspace_id
+    )
+    if not workspace_scoped and not is_entity_admin_role(user.role):
+        raise HTTPException(403, "Entity-level workflow triggers require an administrator")
     runs = await svc.dispatch_trigger(
         db,
         user.entity_id,
@@ -1394,7 +1660,6 @@ async def execute_step(
     result = await svc.execute_workflow_step(db, run_id, user.entity_id)
     if "error" in result and result.get("error") and "status" not in result:
         raise HTTPException(400, result["error"])
-    await db.commit()
     return result
 
 
@@ -1424,9 +1689,16 @@ async def cancel_run(
     from packages.core.services.workflow_chat_projection import project_workflow_run_status
 
     if run.status == "cancelled":
+        mark_workflow_terminal_effects_pending(run)
         await project_workflow_run_status(db, run=run)
         await db.commit()
-        return _run_to_dict(run, can_control=True)
+        response = _run_to_dict(run, can_control=True)
+        await finalize_workflow_terminal_effects_best_effort(
+            run,
+            db,
+            context="API cancellation replay",
+        )
+        return response
     if run.status == "completed" and not actionable_completed:
         raise HTTPException(400, "Run already completed")
     from packages.core.services.workflow_run_control import cancel_run as cancel_workflow_run
@@ -1439,9 +1711,16 @@ async def cancel_run(
         )
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
+    mark_workflow_terminal_effects_pending(run)
     await project_workflow_run_status(db, run=run)
     await db.commit()
-    return _run_to_dict(run, can_control=True)
+    response = _run_to_dict(run, can_control=True)
+    await finalize_workflow_terminal_effects_best_effort(
+        run,
+        db,
+        context="API cancellation",
+    )
+    return response
 
 
 @router.post("/runs/{run_id}/pause")
@@ -1501,6 +1780,11 @@ async def resume_run(
         raise HTTPException(400, "Approval resume requires a valid decision from the run owner")
     if outcome == "definition_changed":
         raise HTTPException(409, "Workflow definition changed since this run started")
+    if outcome == "continuation_required":
+        raise HTTPException(
+            409,
+            "This workflow pause is controlled by an active child continuation",
+        )
     await db.refresh(run)
     return _run_to_dict(run)
 
@@ -1532,7 +1816,12 @@ async def retry_run(
             404
             if "not found" in normalized
             else 409
-            if "changed since" in normalized
+            if (
+                "changed since" in normalized
+                or "retry is blocked" in normalized
+                or "workflow preflight" in normalized
+                or "requires an active workspace" in normalized
+            )
             else 400
         )
         raise HTTPException(status_code, message) from exc
@@ -1582,10 +1871,18 @@ async def update_workflow(
     db: AsyncSession = Depends(get_db),
 ):
     await _require_workflow(db, user, workflow_id, Capability.EDIT)
-    wf = await svc.update_workflow(
-        db, workflow_id, user.entity_id,
-        **body.model_dump(exclude_none=True),
-    )
+    changes = body.model_dump(exclude_none=True)
+    require_valid_steps = bool(changes.pop("validate_steps", False))
+    try:
+        wf = await svc.update_workflow(
+            db,
+            workflow_id,
+            user.entity_id,
+            require_valid_steps=require_valid_steps,
+            **changes,
+        )
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
     if not wf:
         raise HTTPException(404, "Workflow not found")
     await db.commit()
@@ -1599,7 +1896,17 @@ async def delete_workflow(
     db: AsyncSession = Depends(get_db),
 ):
     await _require_workflow(db, user, workflow_id, Capability.DELETE)
-    deleted = await svc.delete_workflow(db, workflow_id, user.entity_id)
+    try:
+        deleted = await svc.delete_workflow(db, workflow_id, user.entity_id)
+    except svc.WorkflowInUseError as exc:
+        raise HTTPException(
+            409,
+            {
+                "message": str(exc),
+                "binding_ids": exc.binding_ids,
+                "scheduled_job_ids": exc.scheduled_job_ids,
+            },
+        ) from exc
     if not deleted:
         raise HTTPException(404, "Workflow not found")
     await db.commit()

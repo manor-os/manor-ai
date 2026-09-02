@@ -6,6 +6,7 @@ from packages.core.models.base import generate_ulid
 from packages.core.models.document import Document, DocumentFolder
 from packages.core.models.workspace import Workspace
 from packages.core.services.workspace_artifacts import (
+    artifact_folder_id_from_entity_storage_path,
     artifact_folder_id_from_storage_path,
     ensure_workspace_artifact_directory,
     ensure_workspace_artifact_folder,
@@ -20,6 +21,12 @@ def test_storage_path_exposes_one_canonical_folder_id() -> None:
         "/mnt/manor/entity/Workspaces/_by_id/01KQ9FOLDER8WJQC7KW18NYGR/images/hero.png"
     ) == "01KQ9FOLDER8WJQC7KW18NYGR"
     assert artifact_folder_id_from_storage_path("Workspaces/Legacy Name/hero.png") is None
+    assert artifact_folder_id_from_entity_storage_path(
+        "Workspaces/_by_id/01KQ9FOLDER8WJQC7KW18NYGR/images/hero.png"
+    ) == "01KQ9FOLDER8WJQC7KW18NYGR"
+    assert artifact_folder_id_from_entity_storage_path(
+        "shared/Workspaces/_by_id/01KQ9FOLDER8WJQC7KW18NYGR/hero.png"
+    ) is None
 
 
 @pytest.mark.asyncio
@@ -74,11 +81,12 @@ async def _register(client: AsyncClient) -> dict[str, str]:
 
 
 @pytest.mark.asyncio
-async def test_deleted_workspace_folder_is_hidden_deletable_and_recreated(
+async def test_deleted_workspace_folder_is_hidden_preserved_and_restored(
     client: AsyncClient,
     db_session,
 ) -> None:
     from packages.core.services.document_service import create_document
+    from packages.core.services.workspace_artifacts import contains_workspace_artifact_root
 
     headers = await _register(client)
     active = (await client.post(
@@ -106,13 +114,14 @@ async def test_deleted_workspace_folder_is_hidden_deletable_and_recreated(
         folder_id=active["artifact_folder_id"],
         file_size=100,
     )
-    await create_document(
+    deleted_document = await create_document(
         db_session,
         active["entity_id"],
         name="shared-deleted.md",
         folder_id=deleted["artifact_folder_id"],
         file_size=900,
     )
+    deleted_document_id = deleted_document.id
     await db_session.commit()
 
     removed = await client.delete(
@@ -120,6 +129,16 @@ async def test_deleted_workspace_folder_is_hidden_deletable_and_recreated(
         headers=headers,
     )
     assert removed.status_code == 204
+    assert await contains_workspace_artifact_root(
+        db_session,
+        entity_id=active["entity_id"],
+        folder_ids={active["artifact_folder_id"]},
+    ) is True
+    assert await contains_workspace_artifact_root(
+        db_session,
+        entity_id=deleted["entity_id"],
+        folder_ids={deleted["artifact_folder_id"]},
+    ) is True
 
     tree = (await client.get(
         "/api/v1/documents/folder-tree",
@@ -153,19 +172,20 @@ async def test_deleted_workspace_folder_is_hidden_deletable_and_recreated(
     )
     assert protected.status_code == 409
 
-    cleaned = await client.delete(
+    protected_deleted = await client.delete(
         f"/api/v1/documents/folders/{deleted['artifact_folder_id']}",
         headers=headers,
     )
-    assert cleaned.status_code == 204, cleaned.text
+    assert protected_deleted.status_code == 404, protected_deleted.text
 
     db_session.expire_all()
     deleted_workspace = (await db_session.execute(
         select(Workspace).where(Workspace.id == deleted["id"])
     )).scalar_one()
     assert deleted_workspace.deleted_at is not None
-    assert deleted_workspace.artifact_folder_id is None
-    assert await db_session.get(DocumentFolder, deleted["artifact_folder_id"]) is None
+    assert deleted_workspace.artifact_folder_id == deleted["artifact_folder_id"]
+    assert await db_session.get(DocumentFolder, deleted["artifact_folder_id"]) is not None
+    assert await db_session.get(Document, deleted_document_id) is not None
 
     restored = await client.post(
         f"/api/v1/workspaces/{deleted['id']}/restore",
@@ -174,7 +194,7 @@ async def test_deleted_workspace_folder_is_hidden_deletable_and_recreated(
     assert restored.status_code == 200, restored.text
     restored_folder_id = restored.json()["artifact_folder_id"]
     assert restored_folder_id
-    assert restored_folder_id != deleted["artifact_folder_id"]
+    assert restored_folder_id == deleted["artifact_folder_id"]
     assert await db_session.get(DocumentFolder, restored_folder_id) is not None
 
 
@@ -308,8 +328,11 @@ async def test_manor_folder_actions_preserve_workspace_binding_and_id_storage(
     import json
 
     import packages.core.database as db_module
+    from sqlalchemy import select
+
     from packages.core.ai.tools.manor_tool import _dispatch_action
     from packages.core.config import get_settings
+    from packages.core.models.user import User
     from packages.core.services.document_service import create_document, get_document
 
     settings = get_settings()
@@ -330,6 +353,12 @@ async def test_manor_folder_actions_preserve_workspace_binding_and_id_storage(
     source.write_text("incoming", encoding="utf-8")
 
     async with db_module.async_session() as db:
+        user_id = await db.scalar(select(User.id).where(
+            User.entity_id == workspace["entity_id"],
+            User.status == "active",
+            User.deleted_at.is_(None),
+        ).limit(1))
+        assert user_id
         document = await create_document(
             db,
             workspace["entity_id"],
@@ -339,6 +368,8 @@ async def test_manor_folder_actions_preserve_workspace_binding_and_id_storage(
             file_type="md",
             mime_type="text/markdown",
             source="upload",
+            created_by=user_id,
+            owner_id=user_id,
         )
         await db.commit()
         document_id = document.id
@@ -347,8 +378,9 @@ async def test_manor_folder_actions_preserve_workspace_binding_and_id_storage(
         "move_documents_to_folder",
         {"document_ids": [document_id], "folder_id": folder_id},
         workspace["entity_id"],
+        user_id=user_id,
     ))
-    assert moved["moved_count"] == 1
+    assert moved["moved_count"] == 1, moved
     expected_prefix = f"Workspaces/_by_id/{folder_id}/"
     assert moved["documents"][0]["fs_path"].startswith(expected_prefix)
     assert (entity_root / moved["documents"][0]["fs_path"]).is_file()

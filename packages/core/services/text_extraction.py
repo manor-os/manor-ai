@@ -3,9 +3,8 @@
 Supports: plain text, markdown, HTML, PDF, CSV, JSON.
 Each extractor returns the text content as a string.
 """
-import csv
 import asyncio
-import io
+import csv
 import json
 import logging
 import os
@@ -53,7 +52,7 @@ async def extract_text(file_path: str, mime_type: str = None, file_type: str = N
             return _extract_docx(file_path)
         elif effective_type in ("doc",):
             return await _extract_legacy_doc(file_path)
-        elif effective_type in ("xlsx", "xls", "et"):
+        elif effective_type in ("xlsx", "xlsm", "xls", "et"):
             return _extract_xlsx(file_path)
         elif effective_type in ("pptx", "ppt", "dps"):
             return _extract_pptx(file_path)
@@ -242,20 +241,29 @@ def _extract_legacy_doc_sync(path: str) -> str:
 
 
 def _extract_xlsx(path: str) -> str:
-    """Extract text from .xlsx/.et files using openpyxl."""
+    """Extract bounded text from OOXML workbooks, including macro-enabled ones."""
     try:
         from openpyxl import load_workbook
-        wb = load_workbook(path, read_only=True, data_only=True)
-        text_parts = []
-        for ws in wb.worksheets[:20]:  # cap at 20 sheets
-            text_parts.append(f"[Sheet: {ws.title}]")
-            for row in ws.iter_rows(max_row=MAX_SPREADSHEET_ROWS_PER_SHEET, values_only=True):
-                cells = [str(c) if c is not None else "" for c in row]
-                if any(cells):
-                    text_parts.append(" | ".join(cells))
-            if sum(len(t) for t in text_parts) > MAX_SPREADSHEET_EXTRACT_CHARS:
-                break
-        wb.close()
+        # ``openpyxl`` validates filename extensions when given a path. The
+        # legacy aliases and descriptor paths may not have a supported suffix;
+        # pass the binary stream so the declared type chooses the extractor.
+        with open(path, "rb") as source:
+            wb = load_workbook(source, read_only=True, data_only=True)
+            try:
+                text_parts = []
+                for ws in wb.worksheets[:20]:  # cap at 20 sheets
+                    text_parts.append(f"[Sheet: {ws.title}]")
+                    for row in ws.iter_rows(
+                        max_row=MAX_SPREADSHEET_ROWS_PER_SHEET,
+                        values_only=True,
+                    ):
+                        cells = [str(c) if c is not None else "" for c in row]
+                        if any(cells):
+                            text_parts.append(" | ".join(cells))
+                    if sum(len(t) for t in text_parts) > MAX_SPREADSHEET_EXTRACT_CHARS:
+                        break
+            finally:
+                wb.close()
         return "\n".join(text_parts)[:MAX_SPREADSHEET_EXTRACT_CHARS]
     except ImportError:
         logger.warning("openpyxl not installed. Install it for .xlsx/.et extraction.")

@@ -6,6 +6,8 @@ import json
 import math
 from collections.abc import Mapping
 from datetime import date, datetime, timezone
+from copy import deepcopy
+from types import SimpleNamespace
 from typing import Any
 
 from packages.core.models.workflow import WorkflowRun
@@ -40,6 +42,8 @@ _ARTIFACT_FIELDS = (
     "status",
 )
 _HISTORY_SUMMARY_KEY = "_workflow_history_summary"
+WORKFLOW_IMPORT_SOURCE_TAG_PREFIX = "imported:"
+WORKFLOW_IMPORT_PROOF_TAG_PREFIX = "manor-import-proof:"
 
 
 def workflow_definition_fingerprint(workflow: Any) -> str:
@@ -57,6 +61,53 @@ def workflow_definition_fingerprint(workflow: Any) -> str:
             default=str,
         ).encode("utf-8")
     ).hexdigest()
+
+
+def workflow_import_provenance_tags(workflow: Any, source: str) -> list[str]:
+    """Return server-owned tags binding an importer source to this graph."""
+
+    normalized_source = str(source or "").strip().lower()
+    if not normalized_source:
+        return []
+    fingerprint = workflow_definition_fingerprint(workflow)
+    return [
+        f"{WORKFLOW_IMPORT_SOURCE_TAG_PREFIX}{normalized_source}",
+        f"{WORKFLOW_IMPORT_PROOF_TAG_PREFIX}{normalized_source}:{fingerprint}",
+    ]
+
+
+def visible_workflow_tags(tags: Any) -> list[str]:
+    """Hide server-owned provenance proofs from API and portable exports."""
+
+    return [
+        str(tag)
+        for tag in (tags if isinstance(tags, list) else [])
+        if not str(tag).strip().lower().startswith(
+            WORKFLOW_IMPORT_PROOF_TAG_PREFIX
+        )
+    ]
+
+
+def trusted_workflow_import_source(workflow: Any) -> str | None:
+    """Return importer source only when its server proof matches this graph."""
+
+    tags = {
+        str(tag).strip().lower()
+        for tag in (getattr(workflow, "tags", None) or [])
+        if str(tag).strip()
+    }
+    fingerprint = workflow_definition_fingerprint(workflow)
+    trusted_sources: list[str] = []
+    for tag in sorted(tags):
+        if not tag.startswith(WORKFLOW_IMPORT_SOURCE_TAG_PREFIX):
+            continue
+        source = tag.removeprefix(WORKFLOW_IMPORT_SOURCE_TAG_PREFIX)
+        if not source:
+            continue
+        proof = f"{WORKFLOW_IMPORT_PROOF_TAG_PREFIX}{source}:{fingerprint}"
+        if proof in tags:
+            trusted_sources.append(source)
+    return trusted_sources[0] if len(trusted_sources) == 1 else None
 
 
 def _targets(value: Any) -> list[str]:
@@ -119,8 +170,84 @@ def build_definition_snapshot(
     }
 
 
+def build_execution_snapshot(
+    workflow: Any,
+    *,
+    fingerprint: str | None = None,
+) -> dict[str, Any]:
+    """Retain the private, immutable execution definition for one attempt."""
+    import_source = trusted_workflow_import_source(workflow)
+    return {
+        "workflow_id": str(getattr(workflow, "id", "")),
+        "version": int(getattr(workflow, "version", 1) or 1),
+        "fingerprint": fingerprint or workflow_definition_fingerprint(workflow),
+        "steps": deepcopy(getattr(workflow, "steps", None) or []),
+        "variables": deepcopy(getattr(workflow, "variables", None) or {}),
+        **({"import_source": import_source} if import_source else {}),
+    }
+
+
+def execution_snapshot_for_run(workflow: Any | None, run: WorkflowRun) -> dict[str, Any] | None:
+    """Return a valid private execution snapshot, or ``None`` for legacy runs."""
+    snapshot = getattr(run, "execution_snapshot", None)
+    if not isinstance(snapshot, dict):
+        return None
+    expected_workflow_id = str(
+        getattr(workflow, "id", None)
+        or getattr(run, "workflow_id", "")
+    )
+    if str(snapshot.get("workflow_id") or "") != expected_workflow_id:
+        return None
+    steps = snapshot.get("steps")
+    variables = snapshot.get("variables")
+    version = snapshot.get("version")
+    fingerprint = str(snapshot.get("fingerprint") or "")
+    if (
+        not isinstance(steps, list)
+        or not all(isinstance(step, dict) for step in steps)
+        or not isinstance(variables, dict)
+        or not isinstance(version, int)
+        or not fingerprint
+    ):
+        return None
+    frozen_definition = SimpleNamespace(
+        id=snapshot["workflow_id"],
+        version=version,
+        steps=steps,
+    )
+    if fingerprint != workflow_definition_fingerprint(frozen_definition):
+        return None
+    return snapshot
+
+
+def workflow_execution_view(workflow: Any | None, run: WorkflowRun) -> Any | None:
+    """Return the immutable definition used to execute this run when available."""
+    snapshot = execution_snapshot_for_run(workflow, run)
+    if snapshot is None:
+        return workflow
+    definition_snapshot = (
+        run.definition_snapshot
+        if isinstance(run.definition_snapshot, dict)
+        else {}
+    )
+    return SimpleNamespace(
+        id=getattr(workflow, "id", None) or snapshot["workflow_id"],
+        entity_id=getattr(workflow, "entity_id", None) or run.entity_id,
+        name=(
+            getattr(workflow, "name", None)
+            or definition_snapshot.get("name")
+            or snapshot["workflow_id"]
+        ),
+        version=snapshot["version"],
+        steps=deepcopy(snapshot["steps"]),
+        variables=deepcopy(snapshot["variables"]),
+    )
+
+
 def workflow_definition_changed(workflow: Any, run: WorkflowRun) -> bool:
-    """Return whether a run's immutable graph differs from the live definition."""
+    """Return drift only for an unsnapshotted legacy run."""
+    if execution_snapshot_for_run(workflow, run) is not None:
+        return False
     snapshot = (
         run.definition_snapshot
         if isinstance(run.definition_snapshot, dict)

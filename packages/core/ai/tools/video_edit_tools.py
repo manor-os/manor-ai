@@ -11,7 +11,6 @@ import asyncio
 import base64
 import hashlib
 import json
-import mimetypes
 import os
 import posixpath
 import re
@@ -1210,48 +1209,18 @@ async def _register_artifact(
     artifact_role: str,
     generation: dict[str, Any],
 ) -> dict[str, Any]:
-    from packages.core.ai.tools.media_tools import (
-        _bind_artifact_to_workspace,
-        _register_file_artifact,
+    from packages.core.ai.runtime.tool_adapters import (
+        runtime_register_video_edit_artifact,
     )
 
-    rel_path = abs_path.relative_to(entity_root).as_posix()
-    mime_type = mimetypes.guess_type(abs_path.name)[0] or "application/octet-stream"
-    file_type = abs_path.suffix.lower().lstrip(".") or "file"
-    document_id = await _register_file_artifact(
+    return await runtime_register_video_edit_artifact(
+        abs_path=abs_path,
+        entity_root=entity_root,
         entity_id=entity_id,
-        user_id=context.user_id or "",
-        filename=abs_path.name,
-        rel_path=rel_path,
-        file_size=abs_path.stat().st_size,
-        file_type=file_type,
-        mime_type=mime_type,
-        workspace_id=context.workspace_id,
-        task_id=context.task_id,
-        agent_id=context.agent_id,
-        conversation_id=context.conversation_id,
-        tool_name="video_edit",
+        context=context,
         artifact_role=artifact_role,
         generation=generation,
     )
-    await _bind_artifact_to_workspace(
-        entity_id=entity_id,
-        document_id=document_id,
-        workspace_id=context.workspace_id,
-        task_id=context.task_id,
-        agent_id=context.agent_id,
-        conversation_id=context.conversation_id,
-        user_id=context.user_id or "",
-        tool_name="video_edit",
-    )
-    return {
-        "document_id": document_id,
-        "name": abs_path.name,
-        "fs_path": rel_path,
-        "url": f"/api/v1/fs/{entity_id}/{rel_path}",
-        "mime_type": mime_type,
-        "size_bytes": abs_path.stat().st_size,
-    }
 
 
 async def _review_project(

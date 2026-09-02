@@ -1,14 +1,16 @@
 """Workspace Stat CRUD, deterministic collectors, and observation writes."""
 from __future__ import annotations
 
+import logging
 import re
 from datetime import datetime, timedelta, timezone
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from typing import Any, Optional
 
 from sqlalchemy import delete, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from packages.core.constants.goals import GoalStatus
 from packages.core.constants.task import TaskStatus
 from packages.core.models.base import generate_ulid
 from packages.core.models.document import (
@@ -32,6 +34,9 @@ from packages.core.stats.integration_keys import (
 from packages.core.stats.library import get_library_entry
 
 
+logger = logging.getLogger(__name__)
+
+
 STAT_KEY_RE = re.compile(r"^[a-z][a-z0-9_.-]{1,119}$")
 SUPPORTED_VALUE_TYPES = {"number", "percent", "currency", "duration"}
 SUPPORTED_COLLECTOR_TYPES = {"manual", "workspace_internal", "integration"}
@@ -40,10 +45,28 @@ SUPPORTED_WINDOWS = {
     "calendar_week", "calendar_month",
 }
 _LIBRARY_DEFAULT_CADENCE = object()
+_STAT_NUMBER_QUANTUM = Decimal("0.000001")
+_MAX_ABS_STAT_NUMBER = Decimal("1000000000000000000")
 
 
 class StatError(ValueError):
     pass
+
+
+def _normalize_stat_number(value: object) -> Decimal:
+    """Return the exact value that fits the persisted NUMERIC(24, 6)."""
+    if isinstance(value, bool):
+        raise StatError("stat value must be a finite number")
+    try:
+        number = value if isinstance(value, Decimal) else Decimal(str(value))
+        normalized = number.quantize(_STAT_NUMBER_QUANTUM, rounding=ROUND_HALF_UP)
+    except (ArithmeticError, InvalidOperation, TypeError, ValueError):
+        raise StatError("stat value must be a finite number") from None
+    if not normalized.is_finite():
+        raise StatError("stat value must be a finite number")
+    if abs(normalized) >= _MAX_ABS_STAT_NUMBER:
+        raise StatError("stat value exceeds the supported numeric range")
+    return normalized
 
 
 def _utcnow() -> datetime:
@@ -287,7 +310,7 @@ async def record_observation(
     if existing:
         return existing
 
-    value_dec = Decimal(str(value))
+    value_dec = _normalize_stat_number(value)
     observation = WorkspaceStatObservation(
         stat_id=stat.id,
         entity_id=stat.entity_id,
@@ -309,20 +332,52 @@ async def record_observation(
     await db.flush()
 
     from packages.core.goals.service import record_measurement as record_goal_measurement
+    from packages.core.goals.numbers import project_stat_value_to_goal_number
     linked_goals = list((await db.execute(select(Goal).where(
         Goal.stat_id == stat.id,
         Goal.entity_id == stat.entity_id,
-        Goal.status == "active",
+        Goal.status == GoalStatus.ACTIVE.value,
     ))).scalars().all())
+    projection_errors: list[dict[str, str]] = []
     for goal in linked_goals:
+        try:
+            goal_value = project_stat_value_to_goal_number(value_dec)
+        except ValueError as exc:
+            projection_errors.append({
+                "goal_id": goal.id,
+                "goal_key": goal.goal_key,
+                "reason": str(exc),
+            })
+            logger.warning(
+                "Stat %s value %s cannot be represented by linked Goal %s: %s",
+                stat.id,
+                value_dec,
+                goal.id,
+                exc,
+            )
+            continue
         await record_goal_measurement(
             db,
             goal,
-            value=value_dec,
+            value=goal_value,
             source=f"workspace_stat:{stat.key}",
             meta={"stat_id": stat.id, "observation_id": observation.id},
             measured_at=observed_at,
         )
+    if projection_errors:
+        stat.last_collection_status = "error"
+        stat.last_collection_error = (
+            "Goal measurement projection failed for "
+            + ", ".join(
+                f"{item['goal_id']} ({item['reason']})"
+                for item in projection_errors
+            )
+        )[:2000]
+        observation.evidence = {
+            **(observation.evidence or {}),
+            "goal_projection_errors": projection_errors,
+        }
+        await db.flush()
     return observation
 
 

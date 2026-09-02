@@ -1,10 +1,15 @@
 from __future__ import annotations
 
+import inspect
 from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass, replace
 from typing import Any
 
-from packages.core.ai.runtime.approvals import RuntimeApprovalMiddleware, RuntimeApprovalRequest
+from packages.core.ai.runtime.approvals import (
+    RuntimeApprovalDecision,
+    RuntimeApprovalMiddleware,
+    RuntimeApprovalRequest,
+)
 from packages.core.ai.runtime.artifacts import (
     runtime_artifact_tracking_scope,
     runtime_record_tool_result_artifacts,
@@ -108,10 +113,9 @@ class RuntimeHarness:
         workspace_id: str | None,
         conversation_id: str | None,
         task_id: str | None = None,
-        step_id: str | None = None,
     ) -> str | None:
         """Run approval middleware and record any blocking result."""
-        decision = await self.approval_middleware.guard_request(
+        decision = await self.guard_tool_request(
             RuntimeApprovalRequest(
                 tool_name=tool_name,
                 arguments=arguments,
@@ -120,13 +124,21 @@ class RuntimeHarness:
                 workspace_id=workspace_id,
                 conversation_id=conversation_id,
                 task_id=task_id,
-                step_id=step_id,
                 envelope=self.envelope,
             )
         )
+        return decision.blocked_result
+
+    async def guard_tool_request(
+        self,
+        request: RuntimeApprovalRequest,
+    ) -> RuntimeApprovalDecision:
+        """Authorize one request and retain its exact typed classification."""
+
+        decision = await self.approval_middleware.guard_request(request)
         if decision.event is not None:
             self.record_event(decision.event.type, **decision.event.data)
-        return decision.blocked_result
+        return decision
 
     def wrap_tool_executor(self, executor: ToolExecutor) -> ToolExecutor:
         async def _wrapped(name: str, args: dict[str, Any]) -> str:
@@ -226,10 +238,12 @@ async def runtime_execute_agentic_loop(
     step_id: str | None = None,
     active_user_message: str | None = None,
     manual_skill_selected: bool = False,
+    manual_skill_ids: Iterable[str] | None = None,
     manual_skill_slugs: Iterable[str] | None = None,
     tool_profile: str | None = None,
     allowed_tool_names: Iterable[str] | None = None,
     model: str | None = None,
+    final_model: str | None = None,
     temperature: float | None = None,
     max_tokens: int | None = None,
     billing_source: str = RUNTIME_AGENTIC_LOOP_SOURCE,
@@ -241,21 +255,28 @@ async def runtime_execute_agentic_loop(
     on_llm_call_before: Callable[..., Any] | None = None,
     on_llm_usage_settled: Callable[..., Any] | None = None,
     stream_handler: Callable[..., Any] | None = None,
+    is_cancelled: Callable[[], Any] | None = None,
     metadata: dict[str, Any] | None = None,
     forced_tool_calls: list[dict[str, Any]] | None = None,
     terminal_tool_result_policy: dict[str, Any] | None = None,
     output_schema: dict[str, Any] | None = None,
-    is_cancelled: Callable[[], Any] | None = None,
     dynamic_tool_handlers: Mapping[str, RuntimeDynamicToolHandler] | None = None,
     runtime_tool_context: Mapping[str, Any] | None = None,
     tool_executor: ToolExecutor | None = None,
     tool_schema_resolver: Callable[[str], dict[str, Any] | None] | None = None,
+    runtime_run_id: str | None = None,
+    runtime_checkpoint: dict[str, Any] | None = None,
+    runtime_cancel_checker: Callable[[], Any] | None = None,
 ) -> Any:
     """Run an agentic loop with Runtime-owned tool execution plumbing."""
 
-    from packages.core.ai.agentic_loop import agentic_loop
+    from packages.core.ai.agentic_loop import _add_usage, agentic_loop
     from packages.core.ai.runtime.billing import runtime_ensure_billing_context
     from packages.core.ai.runtime.completions import runtime_resolve_text_completion_route
+    from packages.core.ai.runtime.nested_usage import (
+        runtime_begin_nested_usage_collection,
+        runtime_finish_nested_usage_collection,
+    )
     from packages.core.ai.runtime.tool_execution import runtime_execute_scoped_dynamic_tool_handler
     from packages.core.ai.runtime.tool_registry import runtime_execute_tool, runtime_tool_schema
     from packages.core.ai.runtime.tool_schema import runtime_tool_schema_resolver
@@ -267,6 +288,20 @@ async def runtime_execute_agentic_loop(
         model=model,
         metadata=metadata,
     )
+    resolved_final_model: str | None = None
+    resolved_final_metadata: dict[str, Any] | None = None
+    if final_model:
+        (
+            resolved_final_model,
+            resolved_final_metadata,
+            _,
+        ) = await runtime_resolve_text_completion_route(
+            entity_id=entity_id,
+            user_id=user_id,
+            source=billing_source,
+            model=final_model,
+            metadata=metadata,
+        )
     billing_kwargs: dict[str, Any] = {
         "user_id": user_id,
         "agent_id": agent_id,
@@ -325,6 +360,14 @@ async def runtime_execute_agentic_loop(
                 arguments=arguments,
                 handler=handler,
                 runtime_envelope=runtime_envelope,
+                entity_id=entity_id,
+                user_id=user_id,
+                agent_id=agent_id,
+                workspace_id=workspace_id,
+                conversation_id=conversation_id,
+                task_id=task_id,
+                active_user_message=tool_context_message,
+                allowed_tool_names=allowed_tool_set,
             )
         registered_arguments = dict(arguments)
         registered_arguments.update(registered_tool_context)
@@ -340,6 +383,7 @@ async def runtime_execute_agentic_loop(
             step_id=step_id,
             active_user_message=tool_context_message,
             manual_skill_selected=manual_skill_selected,
+            manual_skill_ids=list(manual_skill_ids or []),
             manual_skill_slugs=list(manual_skill_slugs or []),
             tool_profile=tool_profile,
             allowed_tool_names=allowed_tool_set,
@@ -350,10 +394,22 @@ async def runtime_execute_agentic_loop(
 
     base_tool_executor = tool_executor or _runtime_tool_executor
 
-    async def _artifact_tracking_tool_executor(name: str, args: dict[str, Any]) -> str:
+    async def _artifact_tracking_tool_executor(name: str, args: dict[str, Any]) -> Any:
         result = await base_tool_executor(name, args)
-        runtime_record_tool_result_artifacts(result)
+        from packages.core.ai.runtime.control import is_runtime_tool_suspension
+
+        if not is_runtime_tool_suspension(result):
+            runtime_record_tool_result_artifacts(result)
         return result
+
+    agentic_loop_parameters = inspect.signature(agentic_loop).parameters
+    accepts_agentic_loop_kwargs = any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in agentic_loop_parameters.values()
+    )
+
+    def _agentic_loop_accepts_keyword(name: str) -> bool:
+        return accepts_agentic_loop_kwargs or name in agentic_loop_parameters
 
     loop_kwargs: dict[str, Any] = {
         "system_prompt": system_prompt,
@@ -361,6 +417,8 @@ async def runtime_execute_agentic_loop(
         "tools": tools,
         "tool_executor": _artifact_tracking_tool_executor,
         "model": resolved_model,
+        "final_model": resolved_final_model,
+        "final_metadata": resolved_final_metadata,
         "initial_messages": initial_messages,
         "on_tool_start": on_tool_start,
         "on_tool_end": on_tool_end,
@@ -368,22 +426,60 @@ async def runtime_execute_agentic_loop(
         "on_llm_call_before": on_llm_call_before,
         "on_llm_usage_settled": on_llm_usage_settled,
         "stream_handler": stream_handler,
+        "is_cancelled": is_cancelled,
         "metadata": resolved_metadata,
         "tool_schema_resolver": resolved_tool_schema,
         "forced_tool_calls": forced_tool_calls,
         "terminal_tool_result_policy": terminal_tool_result_policy,
         "output_schema": output_schema,
     }
-    if is_cancelled is not None:
-        loop_kwargs["is_cancelled"] = is_cancelled
+    # Keep the runtime boundary compatible with older agentic_loop builds.
+    # Runtime-only keywords are optional, but passing an unknown keyword aborts
+    # the whole Chat turn before the model gets a chance to respond.
+    for keyword, value in {
+        "runtime_run_id": runtime_run_id,
+        "resume_checkpoint": runtime_checkpoint,
+        "runtime_cancel_checker": runtime_cancel_checker,
+    }.items():
+        if _agentic_loop_accepts_keyword(keyword):
+            loop_kwargs[keyword] = value
     if temperature is not None:
         loop_kwargs["temperature"] = temperature
     if max_tokens is not None:
         loop_kwargs["max_tokens"] = max_tokens
     if max_rounds is not None:
         loop_kwargs["max_rounds"] = max_rounds
-    with runtime_artifact_tracking_scope():
-        return await agentic_loop(**loop_kwargs)
+    nested_usage_token = runtime_begin_nested_usage_collection()
+    try:
+        with runtime_artifact_tracking_scope():
+            result = await agentic_loop(**loop_kwargs)
+    finally:
+        nested_usages = runtime_finish_nested_usage_collection(nested_usage_token)
+
+    if nested_usages and isinstance(getattr(result, "usage", None), dict):
+        nested_summary = {
+            "prompt": 0,
+            "completion": 0,
+            "total": 0,
+            "calls": len(nested_usages),
+        }
+        for child_usage in nested_usages:
+            _add_usage(result.usage, child_usage)
+            nested_summary["prompt"] += int(
+                child_usage.get("prompt") or child_usage.get("prompt_tokens") or 0
+            )
+            nested_summary["completion"] += int(
+                child_usage.get("completion")
+                or child_usage.get("completion_tokens")
+                or 0
+            )
+            nested_summary["total"] += int(
+                child_usage.get("total")
+                or child_usage.get("total_tokens")
+                or 0
+            )
+        result.usage["nested_usage"] = nested_summary
+    return result
 
 
 async def runtime_execute_channel_agent_loop(**loop_kwargs: Any) -> Any:
@@ -457,6 +553,7 @@ async def runtime_execute_subagent_loop(
     terminal_tool_result_policy: dict[str, Any] | None = None,
     on_tool_start: Callable[[str, dict[str, Any]], Any] | None = None,
     on_tool_end: Callable[..., Any] | None = None,
+    forced_tool_calls: list[dict[str, Any]] | None = None,
 ) -> RuntimeSubAgentLoopResult:
     """Run a bounded subagent loop through the Runtime Harness adapters."""
 
@@ -486,6 +583,7 @@ async def runtime_execute_subagent_loop(
         billing_source=billing_source,
         dynamic_tool_handlers=dynamic_tool_handlers,
         terminal_tool_result_policy=terminal_tool_result_policy,
+        forced_tool_calls=forced_tool_calls,
         on_tool_start=on_tool_start,
         on_tool_end=on_tool_end,
     )

@@ -6,13 +6,19 @@ import re
 from collections.abc import Iterable
 from dataclasses import dataclass
 
+from packages.core.ai.runtime.integration_setup_links import runtime_integration_setup_link
+
 logger = logging.getLogger(__name__)
 
 
 GENERIC_WEB_TOOLS = frozenset({"web_search", "web_fetch", "browse_web"})
 LOCAL_CODING_BLOCKED_FIRST_PARTY_TOOLS = GENERIC_WEB_TOOLS | frozenset({
     "bash",
+    "sandbox",
     "sandbox_exec",
+    "sandbox_status",
+    "sandbox_respond",
+    "sandbox_cancel",
     "sandbox_create",
     "sandbox_read_file",
     "sandbox_write_file",
@@ -21,6 +27,16 @@ LOCAL_CODING_BLOCKED_FIRST_PARTY_TOOLS = GENERIC_WEB_TOOLS | frozenset({
 
 SENSITIVE_FIRST_PARTY_PREFIXES = ("delete_", "cancel_", "remove_", "send_", "publish_")
 DEFAULT_DEFERRED_TOOL_HINT_LIMIT = 12
+SOCIAL_MCP_PROVIDERS = frozenset({
+    "chrome",
+    "facebook",
+    "instagram",
+    "linkedin",
+    "reddit",
+    "tiktok",
+    "twitter_x",
+    "youtube",
+})
 
 MCP_PROVIDER_ALIASES: dict[str, tuple[str, ...]] = {
     "email": ("email", "e-mail", "mail", "imap", "smtp", "邮箱", "邮件", "垃圾邮件"),
@@ -297,6 +313,8 @@ def runtime_mcp_provider_options(matches: Iterable[dict]) -> list[dict]:
         if match.get("account_options"):
             option["account_options"] = list(match.get("account_options") or [])
             option["default_account_id"] = match.get("default_account_id")
+            if match.get("requires_explicit_account"):
+                option["requires_explicit_account"] = True
         if match.get("available"):
             option["ready"] = True
             option["available"] = True
@@ -305,6 +323,8 @@ def runtime_mcp_provider_options(matches: Iterable[dict]) -> list[dict]:
         if not option.get("account_options") and match.get("account_options"):
             option["account_options"] = list(match.get("account_options") or [])
             option["default_account_id"] = match.get("default_account_id")
+            if match.get("requires_explicit_account"):
+                option["requires_explicit_account"] = True
         if name:
             option["matched_tools"].append(name)
     return list(grouped.values())
@@ -313,6 +333,8 @@ def runtime_mcp_provider_options(matches: Iterable[dict]) -> list[dict]:
 def runtime_apply_integration_account_options_to_schema(
     schema: dict,
     account_options: Iterable[dict] | None,
+    *,
+    requires_explicit_account: bool = False,
 ) -> dict:
     """Add user-scoped connected-account choices to one MCP tool schema."""
     options = [option for option in (account_options or []) if option.get("id")]
@@ -335,15 +357,69 @@ def runtime_apply_integration_account_options_to_schema(
         + (" (default)" if option.get("is_default") else "")
         for option in options
     )
+    tool_name = str(fn.get("name") or "")
+    supports_all_accounts = (
+        runtime_mcp_tool_supports_all_accounts(tool_name)
+        and not requires_explicit_account
+    )
+    all_accounts_hint = (
+        " For a read-only query across every account, set "
+        "integration_account_selection to 'all'."
+        if supports_all_accounts
+        else ""
+    )
+    selection_requirement = (
+        " The account registry is incomplete, so you must select one exact "
+        "listed account; omitting this argument is blocked."
+        if requires_explicit_account
+        else (
+            " Every listed account is callable; the default only controls "
+            "which account is used when this argument is omitted."
+        )
+    )
     properties["integration_account_id"] = {
         "type": "string",
         "enum": [str(option["id"]) for option in options],
         "description": (
-            "Connected account to use for this operation. Omit it to use the "
-            f"default account. Available accounts: {labels}"
+            "Connected account to use for this operation."
+            f"{selection_requirement}"
+            f"{all_accounts_hint} "
+            f"Available accounts: {labels}"
         ),
     }
+    if requires_explicit_account:
+        required = parameters.setdefault("required", [])
+        if isinstance(required, list) and "integration_account_id" not in required:
+            required.append("integration_account_id")
+    if supports_all_accounts:
+        properties["integration_account_selection"] = {
+            "type": "string",
+            "enum": ["default", "all"],
+            "default": "default",
+            "description": (
+                "Use 'default' for one prioritized or explicitly selected account. "
+                "Use 'all' to execute this read-only tool against every listed "
+                "account and return one combined result."
+            ),
+        }
+    else:
+        properties.pop("integration_account_selection", None)
     return out
+
+
+def runtime_mcp_tool_supports_all_accounts(tool_name: str) -> bool:
+    """Use the governance classifier as the canonical ALL-mode capability."""
+    if not str(tool_name or "").startswith("mcp__"):
+        return False
+    from packages.core.ai.runtime.approval_classifier import (
+        RuntimeToolEffect,
+        classify_runtime_tool,
+    )
+
+    return (
+        classify_runtime_tool(str(tool_name), {}).effect
+        is RuntimeToolEffect.READ_ONLY
+    )
 
 
 def runtime_mark_match_available(match: dict) -> dict:
@@ -379,6 +455,8 @@ def runtime_apply_mcp_availability(
     match["execution_mode"] = runtime_mcp_execution_mode(provider, metadata)
     match["scope"] = status.get("scope")
     match["reason"] = status.get("reason")
+    if status.get("requires_explicit_account"):
+        match["requires_explicit_account"] = True
     if metadata.get("coming_soon"):
         match["coming_soon"] = True
     return match
@@ -462,18 +540,44 @@ def runtime_search_tools_payload(
     suppressed_mcp: list[dict] | None = None,
     total_tool_count: int | None = None,
     servers: list[dict] | None = None,
+    total_skill_count: int | None = None,
 ) -> dict:
     suppressed_mcp = list(suppressed_mcp or [])
     if not matches:
+        tool_count = total_tool_count or 0
+        hint = (
+            f"No tools matched. {tool_count} tools available."
+            if total_skill_count is None
+            else (
+                "No capabilities matched. "
+                f"{tool_count} {'tool' if tool_count == 1 else 'tools'} and "
+                f"{total_skill_count} "
+                f"{'skill' if total_skill_count == 1 else 'skills'} available."
+            )
+        )
         payload: dict = {
             "matches": [],
             "query": query,
             "loaded_tools": [],
-            "hint": f"No tools matched. {total_tool_count or 0} tools available.",
+            "hint": hint,
         }
+        if query.casefold().startswith("select:"):
+            payload["hint"] = (
+                f"{hint} Exact selectors do not use fuzzy matching; search by "
+                "capability terms or use browse_server:<provider_key>."
+            )
         if suppressed_mcp:
             payload["suppressed_mcp"] = suppressed_mcp
             payload["hint"] = _runtime_empty_matches_suppression_hint(suppressed_mcp)
+            setup_links = [
+                runtime_integration_setup_link(provider)
+                for provider in dict.fromkeys(
+                    str(item.get("server_key") or "")
+                    for item in suppressed_mcp if item.get("reason") == "not_usable"
+                )
+            ]
+            if any(setup_links):
+                payload["integration_setup"] = [link for link in setup_links if link]
         return payload
 
     unavailable = [
@@ -494,7 +598,9 @@ def runtime_search_tools_payload(
         "loaded_tools": [
             match.get("name")
             for match in matches
-            if match.get("name") and match.get("available") is not False
+            if match.get("name")
+            and match.get("kind") != "skill"
+            and match.get("available") is not False
         ],
     }
     if suppressed_mcp:
@@ -512,6 +618,15 @@ def runtime_search_tools_payload(
         )
     if unavailable:
         payload["unavailable_mcp"] = unavailable
+        setup_links = [
+            runtime_integration_setup_link(provider)
+            for provider in dict.fromkeys(
+                str(item.get("server_key") or runtime_mcp_provider_from_tool_name(item.get("name") or "") or "")
+                for item in unavailable
+            )
+        ]
+        if any(setup_links):
+            payload["integration_setup"] = [link for link in setup_links if link]
         hints.append(
             "MCP candidates without connected credentials are listed for transparency "
             "but are not loaded or callable. Connect the integration under Settings \u2192 "
@@ -668,7 +783,8 @@ class RuntimeToolSearchScope:
         return not provider or not self.enforce_active_scope or self.active_provider_scores.get(provider, 0) > 0
 
     def mcp_tool_allowed(self, tool_name: str) -> bool:
-        if self.restrict_social_tools and tool_name.startswith("mcp__"):
+        provider = runtime_mcp_provider_from_tool_name(tool_name)
+        if self.restrict_social_tools and provider in SOCIAL_MCP_PROVIDERS:
             return tool_name in self.allowed_social_tool_names
         return True
 
@@ -707,10 +823,15 @@ def runtime_tool_search_scope(
     from packages.core.ai.runtime.chrome_routing import (
         detect_chrome_local_browser_route,
     )
-    from packages.core.ai.runtime.skill_routing import local_coding_provider_route
+    from packages.core.ai.runtime.skill_routing import (
+        local_coding_provider_route,
+        social_platform_action_intent,
+    )
+
+    available_tool_names = tuple(str(name) for name in tool_names)
 
     active_scores = runtime_mcp_active_provider_scores(
-        tool_names=tool_names,
+        tool_names=available_tool_names,
         active_user_message=active_user_message,
     )
     chrome_local_route = next(
@@ -745,11 +866,36 @@ def runtime_tool_search_scope(
             },
         }
 
+    social_intent = social_platform_action_intent(active_user_message) or (
+        social_platform_action_intent(query)
+        and any(
+            runtime_mcp_provider_from_tool_name(name) == "chrome"
+            for name in available_tool_names
+        )
+    )
+    if social_intent and not active_scores:
+        # Browser-only networks such as Xiaohongshu use the local Chrome
+        # provider. Do not let an unrelated social connector win merely
+        # because it happens to be installed.
+        if any(
+            runtime_mcp_provider_from_tool_name(name) == "chrome"
+            for name in available_tool_names
+        ):
+            active_scores = {"chrome": 100}
+    allowed_social_tool_names = frozenset(
+        name
+        for name in available_tool_names
+        if (
+            provider := runtime_mcp_provider_from_tool_name(name)
+        ) is not None
+        and active_scores.get(provider, 0) > 0
+    )
+
     return RuntimeToolSearchScope(
         active_provider_scores=active_scores,
         local_coding_providers=tuple(local_coding_providers),
-        restrict_social_tools=False,
-        allowed_social_tool_names=frozenset(),
+        restrict_social_tools=social_intent,
+        allowed_social_tool_names=allowed_social_tool_names,
         chrome_local_browser=bool(chrome_local_route),
         preferred_chrome_tool_names=preferred_chrome_tool_names,
     )

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Manor Coding Guardrails"
+  short_description: "Prevent speculative Manor code changes"
+  default_prompt: "Use $manor-coding-guardrails to implement or review this Manor code change."

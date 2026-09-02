@@ -206,6 +206,18 @@ async def test_record_workspace_metrics_writes_daily_idempotent_observations(
             goal_eligible=False,
             install_schedule=False,
         )
+    stats["daily_published_videos"] = await create_stat(
+        db_session,
+        entity_id="entity-1",
+        workspace_id="workspace-1",
+        key=module.YOUTUBE_WORKSPACE_DAILY_PUBLICATIONS_STAT_KEY,
+        name="daily_published_videos",
+        unit="videos",
+        window="rolling_24h",
+        collector_type="manual",
+        goal_eligible=False,
+        install_schedule=False,
+    )
 
     receipt = {"source_task_id": "publish-task-1"}
     first = await module._record_workspace_metric_observations(
@@ -215,6 +227,7 @@ async def test_record_workspace_metrics_writes_daily_idempotent_observations(
         receipt=receipt,
         metrics=_metrics(),
         published_video_count=3,
+        daily_published_video_count=1,
     )
     second = await module._record_workspace_metric_observations(
         db_session,
@@ -223,15 +236,17 @@ async def test_record_workspace_metrics_writes_daily_idempotent_observations(
         receipt=receipt,
         metrics=_metrics(),
         published_video_count=3,
+        daily_published_video_count=1,
     )
 
     expected = {
         module.YOUTUBE_WORKSPACE_STAT_KEYS[name]
         for name in ("published_videos", "views", "subscribers", "likes")
-    }
+    } | {module.YOUTUBE_WORKSPACE_DAILY_PUBLICATIONS_STAT_KEY}
     assert set(first) == expected
     assert set(second) == expected
     assert stats["published_videos"].current_value == 3
+    assert stats["daily_published_videos"].current_value == 1
     assert stats["views"].current_value == 0
     assert stats["subscribers"].current_value == 42
     assert stats["likes"].current_value == 0

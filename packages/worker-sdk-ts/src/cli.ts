@@ -110,6 +110,7 @@ async function cmdRegister(flags: Flags): Promise<number> {
     capabilities: {
       handles: capabilities.handles,
       uses_manor_credentials: flags["uses-manor-credentials"] === true,
+      protocol_version: 2,
     },
     trust_level: stringFlag(flags, "trust-level") ?? "standard",
   };

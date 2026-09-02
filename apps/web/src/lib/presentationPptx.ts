@@ -37,7 +37,7 @@ export interface PresentationTableCell {
 
 export interface PresentationShape {
   id: string;
-  type?: "shape" | "table" | "image";
+  type?: "shape" | "table" | "image" | "graphic";
   x: number;
   y: number;
   w: number;
@@ -59,7 +59,7 @@ export interface PresentationShape {
   texts: PresentationTextRun[];
   imgUrl?: string;
   hyperlink?: string;
-  imageFit?: "cover" | "contain";
+  imageFit?: "cover" | "contain" | "fill";
   tableRows?: PresentationTableCell[][];
   tableColWidths?: number[];
 }
@@ -283,7 +283,9 @@ async function addShapeToSlide(
     slide.addImage({
       data,
       ...common,
-      sizing: { type: model.imageFit || (model.imgCrop ? "cover" : "contain"), w: rect.w, h: rect.h },
+      ...(model.imageFit === "fill"
+        ? {}
+        : { sizing: { type: model.imageFit || (model.imgCrop ? "cover" : "contain"), w: rect.w, h: rect.h } }),
       transparency: Math.round((1 - Math.max(0, Math.min(1, model.opacity ?? 1))) * 100),
       rounding: model.presetGeom === "ellipse" || model.presetGeom === "oval",
       hyperlink: model.hyperlink ? { url: model.hyperlink } : undefined,
@@ -355,10 +357,4 @@ export async function buildPresentationBlob(slides: PresentationSlide[], title =
   if (typeof output === "string") return new Blob([output], { type: PPTX_MIME });
   if (output instanceof ArrayBuffer) return new Blob([output], { type: PPTX_MIME });
   return new Blob([new Uint8Array(output).buffer], { type: PPTX_MIME });
-}
-
-export async function buildPresentationFile(slides: PresentationSlide[], fileName: string): Promise<File> {
-  const safeName = fileName.toLowerCase().endsWith(".pptx") ? fileName : `${fileName.replace(/\.ppt$/i, "")}.pptx`;
-  const blob = await buildPresentationBlob(slides, safeName);
-  return new File([blob], safeName, { type: PPTX_MIME, lastModified: Date.now() });
 }

@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 from xml.etree import ElementTree as ET
+from defusedxml import ElementTree as SafeET
 
 BACKGROUND_MODES = {"light", "dark", "split", "image", "gradient"}
 DOMINANT_VISUALS = {
@@ -149,7 +150,7 @@ def _validate_regions(
 
 def _root_metadata(svg_path: Path) -> dict[str, str]:
     try:
-        root = ET.parse(svg_path).getroot()
+        root = SafeET.parse(svg_path).getroot()
     except (OSError, ET.ParseError) as exc:
         raise ValueError(f"Cannot parse {svg_path}: {exc}") from exc
     return {

@@ -3,9 +3,13 @@ from __future__ import annotations
 from typing import Any, Literal
 
 from sqlalchemy import select
-from sqlalchemy.orm.attributes import flag_modified
 
+from packages.core.governance.approval_scope import (
+    approval_scope_candidates,
+    approval_scope_key,
+)
 from packages.core.models.user import User
+from packages.core.services.settings_service import update_user_preferences
 
 
 RuntimeApprovalPreferenceMode = Literal["always_approve", "approval", "deny"]
@@ -38,24 +42,31 @@ async def runtime_approval_preference_mode(
     *,
     user_id: str | None,
     action_key: str | None,
+    resource_id: str | None = None,
     capability_id: str | None = None,
 ) -> RuntimeApprovalPreferenceMode | None:
-    """Direct-chat-only standing preference. Workspace conversations have no
-    user-preference layer — their one standing store is the workspace policy
-    auto-approve set (see the unified approval core)."""
+    """Direct-chat-only standing preference.
+
+    Workspace conversations have no user-preference layer — their one standing
+    store is the workspace policy auto-approve set (see the unified approval
+    core). ``resource_id`` narrows an action grant when the caller knows one.
+    """
     if not user_id:
         return None
-    row = (await db.execute(select(User).where(User.id == user_id))).scalar_one_or_none()
-    if row is None:
+    preferences = (
+        await db.execute(select(User.preferences).where(User.id == user_id))
+    ).scalar_one_or_none()
+    if preferences is None:
         return None
-    policy = _policy_from_preferences(row.preferences)
+    policy = _policy_from_preferences(preferences)
     scoped = policy.get("global")
     if isinstance(scoped, dict):
         actions = scoped.get("actions")
-        if action_key and isinstance(actions, dict):
-            mode = _mode(actions.get(str(action_key)))
-            if mode:
-                return mode
+        if isinstance(actions, dict):
+            for scope_key in approval_scope_candidates(action_key, resource_id):
+                mode = _mode(actions.get(scope_key))
+                if mode:
+                    return mode
         capabilities = scoped.get("capabilities")
         if capability_id and isinstance(capabilities, dict):
             mode = _mode(capabilities.get(str(capability_id)))
@@ -70,13 +81,14 @@ async def set_runtime_approval_preference(
     user_id: str,
     mode: RuntimeApprovalPreferenceMode,
     action_key: str | None = None,
+    resource_id: str | None = None,
     capability_id: str | None = None,
 ) -> bool:
     if not user_id or mode not in {"always_approve", "approval", "deny"}:
         return False
-    action_key = str(action_key or "").strip()
+    scope_key = approval_scope_key(action_key, resource_id)
     capability_id = str(capability_id or "").strip()
-    if not action_key and not capability_id:
+    if not scope_key and not capability_id:
         return False
 
     row = (await db.execute(select(User).where(User.id == user_id))).scalar_one_or_none()
@@ -87,9 +99,9 @@ async def set_runtime_approval_preference(
     scope = "global"
     scoped = dict(policy.get(scope) or {})
 
-    if action_key:
+    if scope_key:
         actions = dict(scoped.get("actions") or {})
-        actions[action_key] = mode
+        actions[scope_key] = mode
         scoped["actions"] = actions
     if capability_id:
         capabilities = dict(scoped.get("capabilities") or {})
@@ -97,7 +109,9 @@ async def set_runtime_approval_preference(
         scoped["capabilities"] = capabilities
 
     policy[scope] = scoped
-    prefs[RUNTIME_APPROVAL_PREF_KEY] = policy
-    row.preferences = prefs
-    flag_modified(row, "preferences")
+    await update_user_preferences(
+        db,
+        user_id,
+        {RUNTIME_APPROVAL_PREF_KEY: policy},
+    )
     return True

@@ -8,7 +8,7 @@ Three pieces:
   installer.py  blueprint payload → new workspace (simulate or live mode).
                 Returns an InstallResult with a todo list of unmet
                 requirements (channels to pair, sessions to capture).
-  promote.py    sandbox workspace → live workspace, with preflight
+  promote.py    Workspace simulation → live Workspace, with preflight
                 check that all required channels / sessions are bound.
 """
 from packages.core.blueprints.exporter import (

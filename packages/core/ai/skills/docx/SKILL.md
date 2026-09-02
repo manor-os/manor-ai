@@ -55,7 +55,8 @@ python scripts/accept_changes.py input.docx output.docx
 
 ## Creating New Documents
 
-Generate .docx files with JavaScript, then validate. Install: `npm install -g docx`
+Generate .docx files with JavaScript, then validate. The sandbox installs the
+bundled `docx` dependency automatically before execution.
 
 ### Setup
 ```javascript
@@ -585,6 +586,6 @@ After running `comment.py` (see Step 2), add markers to document.xml. For replie
 ## Dependencies
 
 - **pandoc**: Text extraction
-- **docx**: `npm install -g docx` (new documents)
+- **docx**: bundled and installed automatically for new documents
 - **LibreOffice**: PDF conversion (auto-configured for sandboxed environments via `scripts/office/soffice.py`)
 - **Poppler**: `pdftoppm` for images

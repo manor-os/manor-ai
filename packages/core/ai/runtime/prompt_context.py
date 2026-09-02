@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 from dataclasses import dataclass, field
 from typing import Any
@@ -155,6 +156,22 @@ def runtime_workspace_context_prompt(workspace: Any) -> str | None:
     description = getattr(workspace, "description", None)
     if description:
         parts.append(f"- Description: {description}")
+    settings = getattr(workspace, "settings", None)
+    personalization = (
+        settings.get("blueprint_personalization")
+        if isinstance(settings, dict)
+        else None
+    )
+    if isinstance(personalization, dict) and personalization:
+        parts.append(
+            "- Blueprint personalization: "
+            + json.dumps(
+                personalization,
+                ensure_ascii=False,
+                sort_keys=True,
+                default=str,
+            )[:4000]
+        )
     return "\n".join(parts)
 
 

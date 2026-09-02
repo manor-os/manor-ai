@@ -17,8 +17,20 @@
     "mcp__google_drive__rename_file",
     "mcp__google_drive__copy_file",
     "mcp__google_drive__share_file",
+    "mcp__google_drive__get_about",
     "mcp__google_drive__list_permissions",
+    "mcp__google_drive__update_permission",
+    "mcp__google_drive__delete_permission",
     "mcp__google_drive__delete_file",
-    "mcp__google_drive__restore_file"
+    "mcp__google_drive__restore_file",
+    "mcp__google_drive__delete_file_permanent",
+    "mcp__google_drive__list_revisions",
+    "mcp__google_drive__get_revision",
+    "mcp__google_drive__delete_revision",
+    "mcp__google_drive__list_comments",
+    "mcp__google_drive__create_comment",
+    "mcp__google_drive__resolve_comment",
+    "mcp__google_drive__delete_comment",
+    "mcp__google_drive__create_reply"
   ]
 }

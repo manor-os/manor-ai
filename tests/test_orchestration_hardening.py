@@ -26,6 +26,7 @@ from __future__ import annotations
 import asyncio
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
+from types import SimpleNamespace
 
 import pytest
 from sqlalchemy import text
@@ -33,7 +34,7 @@ from sqlalchemy import text
 from packages.core.celery_app import celery_app
 from packages.core.models.base import generate_ulid
 from packages.core.models.execution import ExecutionPlan, ExecutionStep
-from packages.core.models.worker import WorkLease, Worker
+from packages.core.models.worker import WorkLease, Worker, WorkerActivityLog
 from packages.core.queues import (
     CELERY_BUILTIN_TASK_QUEUES,
     TASK_QUEUES,
@@ -80,6 +81,64 @@ def test_visibility_timeout_outranks_the_celery_limits_and_the_step_ceiling():
     )
 
 
+@pytest.mark.asyncio
+async def test_stale_external_workers_become_offline_without_touching_live_workers(
+    db_session,
+):
+    from sqlalchemy import select
+
+    from packages.core.workers import mark_stale_external_workers_offline
+
+    now = datetime.now(timezone.utc)
+    stale = Worker(
+        id=generate_ulid(),
+        entity_id=generate_ulid(),
+        kind="custom_http",
+        display_name="Stale external worker",
+        capabilities={},
+        status="active",
+        last_heartbeat_at=now - timedelta(minutes=10),
+    )
+    fresh = Worker(
+        id=generate_ulid(),
+        entity_id=generate_ulid(),
+        kind="custom_http",
+        display_name="Fresh external worker",
+        capabilities={},
+        status="active",
+        last_heartbeat_at=now,
+    )
+    internal_worker = Worker(
+        id=generate_ulid(),
+        entity_id=generate_ulid(),
+        kind="internal",
+        display_name="Internal worker",
+        capabilities={},
+        status="active",
+        last_heartbeat_at=now - timedelta(minutes=10),
+    )
+    db_session.add_all([stale, fresh, internal_worker])
+    await db_session.flush()
+
+    changed = await mark_stale_external_workers_offline(
+        db_session,
+        now=now,
+    )
+
+    activity = await db_session.scalar(
+        select(WorkerActivityLog).where(
+            WorkerActivityLog.worker_id == stale.id,
+            WorkerActivityLog.event == "offline",
+        )
+    )
+    assert changed == 1
+    assert stale.status == "offline"
+    assert fresh.status == "active"
+    assert internal_worker.status == "active"
+    assert activity is not None
+    assert activity.payload_summary == {"reason": "heartbeat_stale"}
+
+
 def test_celery_app_actually_applies_the_visibility_timeout():
     """The constant is worthless unless the transport is configured with it.
 
@@ -96,6 +155,11 @@ def test_celery_app_actually_applies_the_visibility_timeout():
         result_options.get("visibility_timeout")
         == CELERY_BROKER_VISIBILITY_TIMEOUT_SECONDS
     )
+
+
+def test_celery_result_ttl_bounds_periodic_task_retention():
+    """Beat runs frequently, so result rows cannot use Celery's one-day default."""
+    assert celery_app.conf.result_expires == 3600
 
 
 # ══ Hazard 2 — work and control plane are different queues ════════════
@@ -143,10 +207,26 @@ def test_control_plane_beats_and_execute_lease_land_in_different_queues():
         "scheduler.tick",
     )
 
-    assert execute_lease_queue is CeleryQueue.WORK
+    assert execute_lease_queue is CeleryQueue.HEAVY
     for beat in control_beats:
         assert queue_for_task(beat) is CeleryQueue.CONTROL
         assert queue_for_task(beat) is not execute_lease_queue
+
+
+def test_settlement_tasks_use_versioned_recovery_queue():
+    """Pre-upgrade workers must never consume the new settlement wire."""
+
+    for task_name in (
+        "scheduler.settle_scheduled_agent_run",
+        "scheduler.settle_scheduled_run",
+    ):
+        assert queue_for_task(task_name) is CeleryQueue.RECOVERY_V2
+
+    assert (
+        queue_for_task("packages.core.tasks.ai_tasks.run_agent_task")
+        is CeleryQueue.HEAVY
+    )
+    assert queue_for_task("run_workflow") is CeleryQueue.HEAVY
 
 
 def test_every_beat_entry_names_a_declared_task():
@@ -158,27 +238,27 @@ def test_every_beat_entry_names_a_declared_task():
     assert scheduled <= declared
 
 
-def test_a_task_without_a_queue_declaration_falls_back_to_work():
-    """Policy for the gap: fail the suite, and meanwhile run it on WORK.
+def test_a_task_without_a_queue_declaration_falls_back_to_heavy():
+    """Policy for the gap: fail the suite, and meanwhile run it on HEAVY.
 
     The registry is mandatory — the coverage test above fails on any missing
     entry. But between "someone added a task" and "someone declared it", the
-    runtime still has to route it somewhere, and WORK is the safe side: an
+    runtime still has to route it somewhere, and HEAVY is the safe side: an
     undeclared *heavy* task on the control plane is exactly the stall this
-    module exists to prevent, whereas an undeclared *control* task on the work
+    module exists to prevent, whereas an undeclared *control* task on the heavy
     queue merely runs with normal work latency.
     """
     unknown = "packages.core.tasks.some_future_module.brand_new_task"
     assert unknown not in TASK_QUEUES
-    assert UNDECLARED_TASK_QUEUE is CeleryQueue.WORK
-    assert queue_for_task(unknown) is CeleryQueue.WORK
-    assert route_task(unknown) == {"queue": CeleryQueue.WORK.value}
+    assert UNDECLARED_TASK_QUEUE is CeleryQueue.HEAVY
+    assert queue_for_task(unknown) is CeleryQueue.HEAVY
+    assert route_task(unknown) == {"queue": CeleryQueue.HEAVY.value}
 
 
 def test_declared_queues_are_wired_into_the_app_with_distinct_routing_keys():
     """Redis resolves a direct-exchange message by ROUTING KEY, not queue name.
 
-    Celery's default routing key is "celery"; a ``Queue("work")`` declared
+    Celery's default routing key is "celery"; a ``Queue("heavy")`` declared
     without an explicit routing key would therefore deliver every work task
     straight back into the control plane's list. This asserts the queues are
     declared, and that the router hands each task a queue whose routing key is
@@ -193,7 +273,7 @@ def test_declared_queues_are_wired_into_the_app_with_distinct_routing_keys():
         {}, "packages.core.tasks.ai_tasks.execute_lease",
     )["queue"]
     assert (routed.name, routed.routing_key) == (
-        CeleryQueue.WORK.value, CeleryQueue.WORK.value,
+        CeleryQueue.HEAVY.value, CeleryQueue.HEAVY.value,
     )
 
 
@@ -202,7 +282,7 @@ def test_default_queue_is_the_control_plane_so_a_bare_worker_still_ticks():
 
     Keeping that pointed at the historical queue name means an un-flagged
     worker keeps running the orchestration loop after this change; only the
-    work tasks moved, and the deploy that consumes ``work`` ships with them.
+    heavy tasks moved, and the deploy that consumes ``heavy`` ships with them.
     """
     assert celery_app.conf.task_default_queue == CeleryQueue.CONTROL.value
     assert CeleryQueue.CONTROL.value == "celery"
@@ -359,6 +439,34 @@ async def test_the_skipped_delivery_leaves_a_failing_step_untouched(
 
 
 @pytest.mark.asyncio
+async def test_fresh_mcp_write_effect_reenters_dispatcher_approval_gate(
+    db_session,
+    monkeypatch,
+):
+    seeded = await _seed_lease(db_session)
+
+    async def _body(_snapshot):
+        raise internal._FreshMCPApprovalRequired(
+            provider="stripe",
+            action_key="future_payment_action",
+            effect="write",
+        )
+
+    monkeypatch.setattr(internal, "_execute_by_kind", _body)
+
+    outcome = await internal.execute_lease_inproc(seeded["lease_id"])
+    step, lease = await _reload(db_session, seeded)
+
+    assert outcome["outcome"] == "approval_required"
+    assert step.step_status == "pending"
+    assert step.risk_level == "high"
+    assert step.requires_approval is True
+    assert step.attempt_count == 0
+    assert step.error["type"] == "_FreshMCPApprovalRequired"
+    assert lease.status == "failed"
+
+
+@pytest.mark.asyncio
 async def test_a_claim_whose_heartbeat_lapsed_is_reclaimable_and_runs_once(
     db_session, monkeypatch,
 ):
@@ -450,6 +558,93 @@ async def test_the_claim_is_released_on_every_exit_path(
     _step, lease = await _reload(db_session, seeded)
     assert lease.execution_claim_id is None
     assert lease.execution_claimed_at is None
+
+
+@pytest.mark.asyncio
+async def test_rate_limited_step_releases_lease_with_provider_backoff(
+    db_session, monkeypatch,
+):
+    """A cooperative 429 must not strand an active lease until TTL expiry."""
+    from packages.core.ai.llm_client import LLMRateLimited
+    from packages.core.services.retry_policy import retry_not_before
+
+    seeded = await _seed_lease(db_session)
+
+    async def _rate_limited(_snapshot):
+        raise LLMRateLimited(45)
+
+    monkeypatch.setattr(internal, "_execute_by_kind", _rate_limited)
+    before = datetime.now(timezone.utc)
+    outcome = await internal.execute_lease_inproc(seeded["lease_id"])
+
+    step, lease = await _reload(db_session, seeded)
+    assert outcome["outcome"] == "retry"
+    assert outcome["error"]["type"] == "LLMRateLimited"
+    assert lease.status == "failed"
+    assert lease.execution_claim_id is None
+    assert step.step_status == "pending"
+    assert step.attempt_count == 0, "a provider 429 performed no business work"
+    assert step.last_execution_error["transient_retry"]["count"] == 1
+    retry_at = retry_not_before(step.error)
+    assert retry_at is not None
+    assert retry_at >= before + timedelta(seconds=44)
+
+
+@pytest.mark.asyncio
+async def test_credit_exhaustion_terminates_step_without_blind_retries(
+    db_session, monkeypatch,
+):
+    """Credits cannot recover inside a worker retry loop."""
+    from packages.core.ai.llm_client import CreditExhaustedError
+
+    seeded = await _seed_lease(db_session)
+
+    async def _credits_exhausted(_snapshot):
+        raise CreditExhaustedError("no credits")
+
+    monkeypatch.setattr(internal, "_execute_by_kind", _credits_exhausted)
+    outcome = await internal.execute_lease_inproc(seeded["lease_id"])
+
+    step, lease = await _reload(db_session, seeded)
+    assert outcome["outcome"] == "failed"
+    assert outcome["error"]["type"] == "CreditExhaustedError"
+    assert lease.status == "failed"
+    assert lease.execution_claim_id is None
+    assert step.step_status == "failed"
+    assert step.attempt_count == 1
+
+
+@pytest.mark.asyncio
+async def test_one_shot_provider_error_keeps_real_failure_and_retries_transiently(
+    db_session, monkeypatch,
+):
+    """A 503 usage error is not an empty model response."""
+    seeded = await _seed_lease(
+        db_session,
+        params={"prompt": "Produce the next chain result."},
+    )
+
+    async def _provider_error(**_kwargs):
+        return SimpleNamespace(
+            content="",
+            usage={"error": "HTTP 503: service temporarily unavailable"},
+        )
+
+    monkeypatch.setattr(
+        internal,
+        "runtime_execute_internal_worker_llm_step",
+        _provider_error,
+    )
+    outcome = await internal.execute_lease_inproc(seeded["lease_id"])
+
+    step, lease = await _reload(db_session, seeded)
+    assert outcome["outcome"] == "failed"
+    assert lease.status == "failed"
+    assert step.step_status == "pending"
+    assert step.attempt_count == 0
+    assert "HTTP 503" in step.error["message"]
+    assert "empty" not in step.error["message"].lower()
+    assert step.last_execution_error["transient_retry"]["count"] == 1
 
 
 @pytest.mark.asyncio

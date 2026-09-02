@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect, useId, type ReactNode } from "react";
+import { useState, useRef, useEffect, useId, type KeyboardEvent, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 import { t } from "../../lib/i18n";
 
@@ -61,6 +61,7 @@ export default function Select({
 }: SelectProps) {
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState("");
+  const [activeIndex, setActiveIndex] = useState(-1);
   const ref = useRef<HTMLDivElement>(null);
   const triggerRef = useRef<HTMLButtonElement>(null);
   const menuRef = useRef<HTMLDivElement>(null);
@@ -86,6 +87,71 @@ export default function Select({
     ? normalizedOptions.filter((o) => o.label.toLowerCase().includes(query.toLowerCase()))
     : normalizedOptions;
   const safeDropdownStyle = nonPositionalDropdownStyle(dropdownStyle);
+
+  const optionId = (index: number) => `${menuId}-option-${index}`;
+  const openMenu = () => {
+    const selectedIndex = normalizedOptions.findIndex((option) => option.value === value);
+    setQuery("");
+    setActiveIndex(selectedIndex >= 0 ? selectedIndex : normalizedOptions.length ? 0 : -1);
+    setOpen(true);
+  };
+  const closeMenu = (restoreFocus = false) => {
+    setOpen(false);
+    setQuery("");
+    if (restoreFocus) window.requestAnimationFrame(() => triggerRef.current?.focus());
+  };
+  const chooseOption = (option: SelectOption) => {
+    onChange(option.value);
+    closeMenu(true);
+  };
+  const moveActiveOption = (direction: 1 | -1) => {
+    if (!filtered.length) return;
+    setActiveIndex((current) => {
+      const start = current >= 0 && current < filtered.length ? current : direction > 0 ? -1 : 0;
+      return (start + direction + filtered.length) % filtered.length;
+    });
+  };
+  const handleListKeyDown = (event: KeyboardEvent<HTMLElement>) => {
+    if (event.key === "Escape") {
+      event.preventDefault();
+      event.stopPropagation();
+      closeMenu(true);
+      return;
+    }
+    if (event.key === "Tab") {
+      closeMenu();
+      return;
+    }
+    if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+      event.preventDefault();
+      moveActiveOption(event.key === "ArrowDown" ? 1 : -1);
+      return;
+    }
+    if (event.key === "Home" || event.key === "End") {
+      event.preventDefault();
+      setActiveIndex(event.key === "Home" ? 0 : filtered.length - 1);
+      return;
+    }
+    if (event.key === "Enter" && activeIndex >= 0 && filtered[activeIndex]) {
+      event.preventDefault();
+      chooseOption(filtered[activeIndex]);
+    }
+  };
+  const handleTriggerKeyDown = (event: KeyboardEvent<HTMLButtonElement>) => {
+    if (!open) {
+      if (["Enter", " ", "ArrowDown", "ArrowUp"].includes(event.key)) {
+        event.preventDefault();
+        openMenu();
+      }
+      return;
+    }
+    if (event.key === " ") {
+      event.preventDefault();
+      if (activeIndex >= 0 && filtered[activeIndex]) chooseOption(filtered[activeIndex]);
+      return;
+    }
+    handleListKeyDown(event);
+  };
 
   // Position the portaled menu on the side with enough room; keep it tracking on scroll/resize.
   useEffect(() => {
@@ -144,6 +210,14 @@ export default function Select({
     return () => document.removeEventListener("mousedown", handler);
   }, [open]);
 
+  useEffect(() => {
+    if (!open) return;
+    setActiveIndex((current) => {
+      if (!filtered.length) return -1;
+      return current >= 0 && current < filtered.length ? current : 0;
+    });
+  }, [open, filtered.length]);
+
   // Focus input on open
   useEffect(() => {
     if (open && filterable && inputRef.current) inputRef.current.focus();
@@ -160,10 +234,13 @@ export default function Select({
         aria-haspopup="listbox"
         aria-expanded={open}
         aria-controls={open ? menuId : undefined}
+        aria-activedescendant={open && activeIndex >= 0 ? optionId(activeIndex) : undefined}
+        data-manor-popup-open={open ? "true" : undefined}
+        onKeyDown={handleTriggerKeyDown}
         onClick={() => {
           if (disabled) return;
-          setOpen(!open);
-          setQuery("");
+          if (open) closeMenu();
+          else openMenu();
         }}
         className={`manor-input manor-select-trigger${disabled ? " is-disabled" : ""}${open ? " is-open" : ""}`}
         style={{
@@ -197,6 +274,8 @@ export default function Select({
           className="manor-select-menu"
           role="listbox"
           aria-label={ariaLabel || placeholder}
+          data-manor-popup-open="true"
+          onKeyDown={handleListKeyDown}
           style={{
           position: "fixed", top: coords.top, left: coords.left, width: coords.width, zIndex: 100000,
           background: "var(--surface-panel)", backdropFilter: "blur(28px) saturate(140%)",
@@ -217,6 +296,8 @@ export default function Select({
                 value={query}
                 onChange={(e) => setQuery(e.target.value)}
                 placeholder={t("component.select.search")}
+                aria-controls={menuId}
+                aria-activedescendant={activeIndex >= 0 ? optionId(activeIndex) : undefined}
                 style={{
                   width: "100%", height: 32, padding: "0 10px", fontSize: 13, fontWeight: 500,
                   border: "none", borderRadius: 8, outline: "none", color: "var(--text-default)",
@@ -230,26 +311,29 @@ export default function Select({
           {filtered.length === 0 && (
             <div style={{ padding: "12px 14px", fontSize: 13, color: "var(--text-faint)", textAlign: "center" }}>{t("component.select.no_results")}</div>
           )}
-          {filtered.map((o) => {
+          {filtered.map((o, index) => {
             const isSelected = o.value === value;
+            const isActive = index === activeIndex;
             return (
               <button
                 key={o.value}
+                id={optionId(index)}
                 type="button"
                 role="option"
                 aria-selected={isSelected}
+                tabIndex={-1}
                 className={`manor-select-option${isSelected ? " is-selected" : ""}`}
-                onClick={() => { onChange(o.value); setOpen(false); setQuery(""); }}
+                onClick={() => chooseOption(o)}
                 style={{
                   display: "flex", alignItems: "center", justifyContent: "space-between",
                   width: "100%", padding: "0 14px", height: 36, fontSize: 13, fontWeight: isSelected ? 600 : 400,
-                  color: isSelected ? selectedOptionColor : "var(--text-default)", background: "transparent",
+                  color: isSelected ? selectedOptionColor : "var(--text-default)",
+                  background: isActive ? "var(--surface-muted)" : "transparent",
                   border: "none", borderRadius: 8, cursor: "pointer", textAlign: "left",
                   transition: "background 0.1s",
                   ...optionStyle,
                 }}
-                onMouseEnter={(e) => { (e.currentTarget).style.background = "var(--surface-muted)"; }}
-                onMouseLeave={(e) => { (e.currentTarget).style.background = "transparent"; }}
+                onMouseEnter={() => setActiveIndex(index)}
               >
                 <span style={{ display: "inline-flex", alignItems: "center", gap: 8, minWidth: 0 }}>
                   {o.icon && (

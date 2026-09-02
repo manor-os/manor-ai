@@ -18,8 +18,9 @@ redeploy of unchanged configs writes nothing and moves no version.
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Mapping
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -44,6 +45,94 @@ PUBLISHED = BlueprintStatus.PUBLISHED.value
 
 def platform_blueprint_id(slug: str) -> str:
     return f"{PLATFORM_BLUEPRINT_ID_PREFIX}{slug}"
+
+
+@dataclass(frozen=True)
+class BlueprintRowReference:
+    """Durable Blueprint identity plus its historical platform fallback."""
+
+    blueprint_id: str | None = None
+    blueprint_slug: str | None = None
+
+
+async def resolve_blueprint_rows(
+    db: AsyncSession,
+    references: Mapping[str, BlueprintRowReference],
+) -> dict[str, WorkspaceBlueprint]:
+    """Resolve Blueprint rows in two batched queries.
+
+    ``blueprint_slug`` is used only for the historical platform shapes that
+    predate durable ids (null id or ``builtin:<slug>`` alias). Any other exact
+    id is authoritative even when the row is archived or another Marketplace
+    item has the same slug.
+    """
+    normalized = {
+        key: BlueprintRowReference(
+            blueprint_id=str(ref.blueprint_id or "").strip() or None,
+            blueprint_slug=str(ref.blueprint_slug or "").strip() or None,
+        )
+        for key, ref in references.items()
+    }
+    candidate_ids = {
+        candidate_id
+        for ref in normalized.values()
+        for candidate_id in (
+            ref.blueprint_id,
+            platform_blueprint_id(ref.blueprint_slug) if ref.blueprint_slug else None,
+        )
+        if candidate_id
+    }
+    rows_by_id: dict[str, WorkspaceBlueprint] = {}
+    if candidate_ids:
+        rows = (await db.execute(
+            select(WorkspaceBlueprint).where(
+                WorkspaceBlueprint.id.in_(candidate_ids),
+            )
+        )).scalars().all()
+        rows_by_id = {row.id: row for row in rows}
+
+    resolved: dict[str, WorkspaceBlueprint] = {}
+    unresolved_slugs: set[str] = set()
+    for key, ref in normalized.items():
+        exact_row = rows_by_id.get(ref.blueprint_id or "")
+        row = exact_row
+        allows_platform_alias = (
+            ref.blueprint_id is None
+            or str(ref.blueprint_id).startswith(PLATFORM_BLUEPRINT_ID_PREFIX)
+        )
+        if row is None and ref.blueprint_slug and allows_platform_alias:
+            row = rows_by_id.get(platform_blueprint_id(ref.blueprint_slug))
+        if row is not None:
+            resolved[key] = row
+        elif ref.blueprint_slug and allows_platform_alias:
+            unresolved_slugs.add(ref.blueprint_slug)
+
+    if unresolved_slugs:
+        legacy_rows = (await db.execute(
+            select(WorkspaceBlueprint).where(
+                WorkspaceBlueprint.entity_id.is_(None),
+                WorkspaceBlueprint.slug.in_(unresolved_slugs),
+            )
+        )).scalars().all()
+        legacy_by_slug = {row.slug: row for row in legacy_rows}
+        for key, ref in normalized.items():
+            if key not in resolved and ref.blueprint_slug in legacy_by_slug:
+                resolved[key] = legacy_by_slug[ref.blueprint_slug]
+
+    return resolved
+
+
+async def resolve_blueprint_row(
+    db: AsyncSession,
+    *,
+    blueprint_id: str | None = None,
+    blueprint_slug: str | None = None,
+) -> WorkspaceBlueprint | None:
+    resolved = await resolve_blueprint_rows(
+        db,
+        {"row": BlueprintRowReference(blueprint_id, blueprint_slug)},
+    )
+    return resolved.get("row")
 
 
 def _manifest(payload: dict[str, Any]) -> dict[str, Any]:
@@ -96,13 +185,29 @@ async def seed_platform_blueprints(db: AsyncSession) -> dict[str, str]:
         )
 
         tags = manifest.get("tags")
+        showcase_assets = manifest.get("showcase_assets")
+        author = manifest.get("author")
+        if not isinstance(author, dict):
+            author = {}
         fields = {
             "slug": slug,
             "title": str(manifest.get("title") or slug),
             "summary": manifest.get("summary"),
             "description": manifest.get("description"),
             "cover_image_url": manifest.get("cover_image_url"),
+            "showcase_assets": [
+                dict(asset)
+                for asset in showcase_assets
+                if isinstance(asset, dict)
+            ] if isinstance(showcase_assets, list) else [],
             "tags": [str(tag) for tag in tags] if isinstance(tags, list) else [],
+            "author_handle": str(author.get("handle") or "").strip() or None,
+            "author_display_name": (
+                str(author.get("display_name") or "").strip() or None
+            ),
+            "remixed_from_id": (
+                str(manifest.get("forked_from_id") or "").strip() or None
+            ),
             "payload": payload,
             "payload_version": detect_version(payload),
             "status": PUBLISHED,

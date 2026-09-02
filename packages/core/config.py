@@ -43,7 +43,10 @@ class Settings:
     DATABASE_URL_SYNC: str = os.getenv(
         "DATABASE_URL_SYNC", "postgresql://manor:manor_secret@localhost:5434/manor"
     )
+    DATABASE_DIRECT_URL: str
+    DATABASE_DIRECT_URL_SYNC: str
     DATABASE_ECHO: bool = os.getenv("DATABASE_ECHO", "false").lower() == "true"
+    DATABASE_POOL_MODE: str
     DATABASE_POOL_SIZE: int
     DATABASE_MAX_OVERFLOW: int
     DATABASE_POOL_TIMEOUT: int
@@ -97,9 +100,46 @@ class Settings:
 
     # Sandbox Service — external Docker-based skill execution sandbox
     SANDBOX_SERVICE_URL: str = os.getenv("SANDBOX_SERVICE_URL", "http://localhost:8000")
+    SANDBOX_API_TOKEN: str = os.getenv("SANDBOX_API_TOKEN", "")
+    SANDBOX_COORDINATION_MODE: str = os.getenv("SANDBOX_COORDINATION_MODE", "local").lower()
+    SANDBOX_RUNNERS_JSON: str = os.getenv("SANDBOX_RUNNERS_JSON", "")
+    # Positive values cap observed runner capacity; zero leaves it uncapped.
+    SANDBOX_RUNNER_ACTIVE_LIMIT: int = int(
+        os.getenv("SANDBOX_RUNNER_ACTIVE_LIMIT", "5")
+    )
+    SANDBOX_RUNNER_EXECUTING_LIMIT: int = int(
+        os.getenv("SANDBOX_RUNNER_EXECUTING_LIMIT", "2")
+    )
+    SANDBOX_QUEUE_MAX_PENDING: int = int(os.getenv("SANDBOX_QUEUE_MAX_PENDING", "100"))
+    SANDBOX_QUEUE_MAX_PENDING_PER_USER: int = int(
+        os.getenv("SANDBOX_QUEUE_MAX_PENDING_PER_USER", "3")
+    )
+    SANDBOX_QUEUE_MAX_WAIT_SECONDS: int = int(
+        os.getenv("SANDBOX_QUEUE_MAX_WAIT_SECONDS", "300")
+    )
+    SANDBOX_QUEUE_POLL_SECONDS: int = int(os.getenv("SANDBOX_QUEUE_POLL_SECONDS", "5"))
+    SANDBOX_RUNNER_HEALTH_INTERVAL_SECONDS: int = int(
+        os.getenv("SANDBOX_RUNNER_HEALTH_INTERVAL_SECONDS", "15")
+    )
+    SANDBOX_ALLOCATION_LEASE_SECONDS: int = int(
+        os.getenv("SANDBOX_ALLOCATION_LEASE_SECONDS", "240")
+    )
 
     # Deployment
     DEPLOYMENT_MODE: str = os.getenv("DEPLOYMENT_MODE", "oss")  # oss | cloud
+    MANOR_SERVICE_ROLE: str = os.getenv("MANOR_SERVICE_ROLE", "api")
+    MANOR_AUTOSCALING_METRICS_ENABLED: bool = _env_bool(
+        "MANOR_AUTOSCALING_METRICS_ENABLED"
+    )
+    MANOR_RUNTIME_EXECUTION_MODE: str = os.getenv(
+        "MANOR_RUNTIME_EXECUTION_MODE", "inline"
+    ).lower()
+    RUNTIME_EVENT_STREAM_TTL_SECONDS: int = int(
+        os.getenv("RUNTIME_EVENT_STREAM_TTL_SECONDS", "3600")
+    )
+    RUNTIME_EVENT_STREAM_MAX_EVENTS: int = int(
+        os.getenv("RUNTIME_EVENT_STREAM_MAX_EVENTS", "2000")
+    )
     APP_URL: str = os.getenv("APP_URL", "")
     CLI_PUBLIC_API_URL: str = os.getenv("CLI_PUBLIC_API_URL", "")
 
@@ -138,6 +178,13 @@ class Settings:
         self.API_LIMIT_CONCURRENCY = int(os.getenv("API_LIMIT_CONCURRENCY", "120"))
         self.API_BACKLOG = int(os.getenv("API_BACKLOG", "256"))
         self.API_TIMEOUT_KEEP_ALIVE = int(os.getenv("API_TIMEOUT_KEEP_ALIVE", "5"))
+        self.DATABASE_URL = os.getenv("DATABASE_URL", self.DATABASE_URL)
+        self.DATABASE_URL_SYNC = os.getenv("DATABASE_URL_SYNC", self.DATABASE_URL_SYNC)
+        self.DATABASE_DIRECT_URL = os.getenv("DATABASE_DIRECT_URL", self.DATABASE_URL)
+        self.DATABASE_DIRECT_URL_SYNC = os.getenv(
+            "DATABASE_DIRECT_URL_SYNC", self.DATABASE_URL_SYNC
+        )
+        self.DATABASE_POOL_MODE = os.getenv("DATABASE_POOL_MODE", "sqlalchemy").strip().lower()
         self.DATABASE_POOL_SIZE = int(os.getenv("DATABASE_POOL_SIZE", "5"))
         self.DATABASE_MAX_OVERFLOW = int(os.getenv("DATABASE_MAX_OVERFLOW", "2"))
         self.DATABASE_POOL_TIMEOUT = int(os.getenv("DATABASE_POOL_TIMEOUT", "10"))

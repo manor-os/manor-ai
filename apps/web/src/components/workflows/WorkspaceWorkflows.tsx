@@ -156,7 +156,10 @@ export default function WorkspaceWorkflows({ workspaceId, canManage = false }: W
         workspace_id: workspaceId,
         name: workflow?.name || "Workspace workflow",
         trigger_type: "manual",
-        config: { workspace_attached: true },
+        config: {
+          workspace_attached: true,
+          chat_entrypoint: { enabled: true },
+        },
       });
     },
     onSuccess: () => {
@@ -312,7 +315,7 @@ export default function WorkspaceWorkflows({ workspaceId, canManage = false }: W
                           variant="ghost"
                           size="sm"
                           loading={running || (runMutation.isPending && runMutation.variables === binding.id)}
-                          disabled={!binding.enabled || binding.status !== "active"}
+                          disabled={!canManage || !binding.enabled || binding.status !== "active"}
                           onClick={() => runMutation.mutate(binding.id)}
                           ariaLabel={`Run ${binding.name || workflow?.name || "workflow"}`}
                           title="Run in this workspace"

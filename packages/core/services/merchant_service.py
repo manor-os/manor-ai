@@ -18,6 +18,8 @@ async def get_merchant_account(
     )).scalar_one_or_none()
 
 
+
+
 async def ensure_merchant_account(
     db: AsyncSession, *, entity_id: str, stripe: Any,
 ) -> MerchantAccount:
@@ -55,11 +57,17 @@ async def ensure_merchant_account(
         raise
 
 
-def create_onboarding_link(*, stripe: Any, stripe_account_id: str, app_url: str) -> str:
+def create_onboarding_link(
+    *,
+    stripe: Any,
+    stripe_account_id: str,
+    app_url: str,
+    return_path: str = "/merchant",
+) -> str:
     link = stripe.AccountLink.create(
         account=stripe_account_id,
-        refresh_url=f"{app_url}/merchant?onboard=refresh",
-        return_url=f"{app_url}/merchant?onboard=return",
+        refresh_url=f"{app_url}{return_path}?onboard=refresh",
+        return_url=f"{app_url}{return_path}?onboard=return",
         type="account_onboarding",
     )
     return link.url
@@ -79,7 +87,12 @@ async def apply_account_update(db: AsyncSession, account: dict) -> bool:
     row.payouts_enabled = bool(account.get("payouts_enabled", False))
     if account.get("country"):
         row.country = account["country"]
-    if account.get("details_submitted") and row.charges_enabled:
-        row.onboarding_status = "complete"
+    row.onboarding_status = (
+        "complete"
+        if account.get("details_submitted")
+        and row.charges_enabled
+        and row.payouts_enabled
+        else "pending"
+    )
     await db.flush()
     return True

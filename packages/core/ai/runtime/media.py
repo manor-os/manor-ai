@@ -219,7 +219,7 @@ async def runtime_resolve_video_generation_credentials(
         if not api_key.startswith("sk-or-"):
             api_key, _openrouter_base_url = await _platform_native_media_credential_async("openrouter")
             is_byok = False
-            base_url_override = _openrouter_base_url
+        base_url_override = ""
     else:
         if not is_byok and catalog_provider in {"bytedance", "kwaivgi"}:
             native_key, native_base_url = await _platform_native_media_credential_async(catalog_provider)

@@ -1,0 +1,1282 @@
+{
+  "manifest": {
+    "blueprint_version": "1.1",
+    "slug": "solo-creator-fundraising-room-v1",
+    "title": "Creator Fundraising Room",
+    "summary": "A demo workspace that takes a creator business from raise readiness through investor materials, diligence, decision, simulated close, and the first post-investment update.",
+    "use_when": "Use this demo to show creators and investors how Manor turns operating evidence into a controlled fundraising and post-investment reporting loop.",
+    "description": "Runs a fictional creator-business raise from an approved financing goal to a pitch deck, KPI model, data room, investor diligence, term-sheet decision, simulated close receipt, and 90-day investor update. It does not sign an agreement, contact a real investor, or move money.",
+    "tags": [
+      "creator",
+      "fundraising",
+      "investor-room",
+      "demo"
+    ],
+    "kind": "one_person_company",
+    "category": "solo.creator_fundraising",
+    "author": {
+      "handle": "manor",
+      "display_name": "Manor AI"
+    },
+    "cover_image_url": null,
+    "forked_from_id": null,
+    "changelog": "Frozen on 2026-08-09: first end-to-end creator fundraising demo with readiness, data room, diligence, decision, close receipt, and post-investment update stages."
+  },
+  "contract": {
+    "variables": [
+      {
+        "key": "business_name",
+        "label": "Business name",
+        "required": false,
+        "default": "Luma Creator Studio"
+      },
+      {
+        "key": "operator_timezone",
+        "label": "Operator timezone",
+        "required": false,
+        "default": "America/Los_Angeles"
+      }
+    ],
+    "channels": [
+      {
+        "channel_type": "telegram",
+        "purpose": "approval alerts for investor materials, diligence answers, and financing decisions",
+        "required": false
+      }
+    ],
+    "sessions": [
+      {
+        "provider": "gmail",
+        "label": "main",
+        "purpose": "Approved investor communication when paired.",
+        "required": false
+      },
+      {
+        "provider": "google_drive",
+        "label": "main",
+        "purpose": "Published data-room material sync when paired.",
+        "required": false
+      },
+      {
+        "provider": "stripe",
+        "label": "main",
+        "purpose": "Revenue evidence and payment trend review when paired.",
+        "required": false
+      }
+    ],
+    "requires": {
+      "manor_min_version": "1.0",
+      "tools": [
+        "read_finance_ledger",
+        "record_finance_ledger",
+        "read_relationship_ledger",
+        "record_relationship_ledger"
+      ],
+      "mcp_servers": [],
+      "skills": [],
+      "agents": []
+    }
+  },
+  "embedded": {
+    "skills": [
+      {
+        "slug": "creator-fundraising-room-playbook-v1",
+        "name": "Creator Fundraising Room Playbook",
+        "display_name": "Creator Fundraising Room Playbook",
+        "description": "Builds an evidence-backed financing narrative, controls disclosure, manages diligence, and connects capital decisions to post-close milestones.",
+        "system_prompt": "Operate a creator-business fundraising room from readiness to post-investment reporting. Separate verified facts, manual data, assumptions, and unknowns. Read the relationship ledger before investor follow-up and append only confirmed investor interactions with stable identity keys and evidence references. Use the finance ledger for validated receipts, invoices, payments, and financing entries, citing Knowledge documents as evidence. Tie the financing ask to measurable use of funds and milestones. Require operator approval before sharing investor materials, answering diligence, accepting terms, signing, or moving money. Do not provide legal, tax, securities, or investment advice.",
+        "tools": [
+          "read_finance_ledger",
+          "record_finance_ledger",
+          "read_relationship_ledger",
+          "record_relationship_ledger"
+        ],
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "request": {
+              "type": "string"
+            },
+            "workspace_context": {
+              "type": "object"
+            }
+          }
+        },
+        "output_format": "markdown",
+        "category": "one-person-company",
+        "tags": [
+          "workspace-blueprint",
+          "solo-creator-fundraising-room-v1"
+        ],
+        "version": "1.0.0",
+        "config": {
+          "frozen_at": "2026-08-09"
+        },
+        "status": "active"
+      }
+    ],
+    "agents": [
+      {
+        "slug": "creator-raise-strategist-v1",
+        "name": "Raise Strategist",
+        "description": "Defines raise readiness, financing narrative, ask, use of funds, and investor fit.",
+        "system_prompt": "Own financing readiness for a creator business. Ground the story in verified audience, revenue, retention, operating capacity, and milestones. State why capital is needed now, what it buys, and what evidence is missing. Never turn assumptions into facts.",
+        "config": {
+          "model_mode": "inherit",
+          "temperature": 0.2
+        },
+        "category": "one-person-company",
+        "tags": [
+          "workspace-blueprint",
+          "solo-creator-fundraising-room-v1"
+        ],
+        "version": "1.0",
+        "tool_bindings": [],
+        "mcp_bindings": [],
+        "skill_bindings": [
+          "creator-fundraising-room-playbook-v1"
+        ],
+        "starter_memory": [
+          {
+            "memory_type": "instruction",
+            "scope": "evidence_standard",
+            "content": "Every investor-facing metric must show its definition, period, source, freshness, and whether it is verified, manually entered, simulated, or unknown.",
+            "importance": 10,
+            "confidence": 1.0
+          }
+        ]
+      },
+      {
+        "slug": "creator-data-room-operator-v1",
+        "name": "Data Room Operator",
+        "description": "Builds the pitch deck, KPI model, data-room index, access scope, and freshness checks.",
+        "system_prompt": "Own the investor data room. Prepare concise materials, label every source, keep sensitive drafts private, expose only operator-approved versions, and surface missing, stale, inconsistent, or over-broad disclosures before publication.",
+        "config": {
+          "model_mode": "inherit",
+          "temperature": 0.1
+        },
+        "category": "one-person-company",
+        "tags": [
+          "workspace-blueprint",
+          "solo-creator-fundraising-room-v1"
+        ],
+        "version": "1.0",
+        "tool_bindings": [],
+        "mcp_bindings": [],
+        "skill_bindings": [
+          "creator-fundraising-room-playbook-v1"
+        ],
+        "starter_memory": []
+      },
+      {
+        "slug": "creator-diligence-coordinator-v1",
+        "name": "Diligence Coordinator",
+        "description": "Turns investor questions into owned requests, verified answers, evidence, risks, and decision-ready comparisons.",
+        "system_prompt": "Own investor diligence. For every request record the question, owner, due date, answer status, evidence, disclosure scope, risk, and unresolved point. Never improvise legal conclusions, financial facts, signatures, or external receipts.",
+        "config": {
+          "model_mode": "inherit",
+          "temperature": 0.1
+        },
+        "category": "one-person-company",
+        "tags": [
+          "workspace-blueprint",
+          "solo-creator-fundraising-room-v1"
+        ],
+        "version": "1.0",
+        "tool_bindings": [],
+        "mcp_bindings": [],
+        "skill_bindings": [
+          "creator-fundraising-room-playbook-v1"
+        ],
+        "starter_memory": []
+      },
+      {
+        "slug": "creator-investor-update-operator-v1",
+        "name": "Investor Update Operator",
+        "description": "Connects use of funds to milestones, budget variance, risks, asks, and recurring investor updates.",
+        "system_prompt": "Own post-investment operating updates. Compare promised milestones with actual progress, use of funds, budget variance, risks, learning, and asks. Preserve metric definitions across periods and never invent real financial or operating results.",
+        "config": {
+          "model_mode": "inherit",
+          "temperature": 0.1
+        },
+        "category": "one-person-company",
+        "tags": [
+          "workspace-blueprint",
+          "solo-creator-fundraising-room-v1"
+        ],
+        "version": "1.0",
+        "tool_bindings": [],
+        "mcp_bindings": [],
+        "skill_bindings": [
+          "creator-fundraising-room-playbook-v1"
+        ],
+        "starter_memory": []
+      }
+    ],
+    "knowledge_packs": [
+      {
+        "slug": "creator-fundraising-demo-room",
+        "title": "Creator Fundraising Demo Room",
+        "purpose": "Store the fictional company snapshot, metric definitions, use-of-funds plan, data-room index, and risk register used by the demo.",
+        "mode": "inline_text",
+        "folder_structure": [
+          "company/",
+          "metrics/",
+          "financials/",
+          "data-room/",
+          "diligence/",
+          "updates/",
+          "relationship-ledger/",
+          "finance-ledger/"
+        ],
+        "starter_documents": [
+          {
+            "path": "company/luma-company-snapshot.md",
+            "body_md": "# Luma Creator Studio — Demo Company Snapshot\n\n> All values are fictional sandbox data for product demonstration only.\n\n## Business\nLuma turns a trusted creator audience into education, memberships, and paid partnerships for independent creative professionals.\n\n## Fictional operating snapshot\n- Audience: 185,000 total followers; manual demo value.\n- Newsletter: 42,000 subscribers; manual demo value.\n- Trailing-12-month revenue: $720,000; simulated.\n- Gross margin: 68%; simulated.\n- Paid membership retention: 86% at 6 months; simulated.\n\n## Raise thesis\nCapital would fund two production hires, a member-learning product, and a measured distribution program so revenue growth depends less on the Creator's personal weekly capacity.\n"
+          },
+          {
+            "path": "metrics/investor-kpi-definitions.md",
+            "body_md": "# Investor KPI Definitions\n\nEvery published number must include period, source, freshness, and verification status.\n\n- Revenue: cash or recognized revenue must be labelled; never mix them.\n- Gross margin: revenue less direct fulfillment, platform, and contractor costs.\n- Active paid members: paying accounts not cancelled at period end.\n- Six-month retention: cohort members still active six months after first payment.\n- Audience-to-email conversion: new email subscribers divided by measured landing-page visitors for the same period.\n- Creator dependency: share of weekly critical-path hours that only the Creator can perform.\n"
+          },
+          {
+            "path": "financials/use-of-funds-and-milestones.md",
+            "body_md": "# Demo Use of Funds and Milestones\n\n> Fictional scenario; not an offering or forecast.\n\nProposed raise: $500,000.\n\n- $210,000 — production and operations team. Milestone: reduce Creator-only critical-path work by 40%.\n- $160,000 — member product and curriculum. Milestone: ship the first cohort and measure 90-day retention.\n- $90,000 — measured distribution experiments. Milestone: identify one repeatable acquisition channel below the approved payback threshold.\n- $40,000 — legal, finance, and contingency. Milestone: monthly close and investor reporting delivered on schedule.\n"
+          },
+          {
+            "path": "data-room/published-data-room-index.md",
+            "body_md": "# Published Data Room Index\n\nOnly operator-approved snapshots are investor-visible. Drafts and restricted personal data remain private.\n\n1. Company snapshot and financing narrative.\n2. Pitch deck.\n3. KPI definitions and period snapshots.\n4. Historical financial summary.\n5. Use of funds and milestone plan.\n6. Audience and product evidence.\n7. Risk register.\n8. Diligence requests and approved responses.\n9. Financing decision record.\n10. Post-investment updates.\n"
+          },
+          {
+            "path": "diligence/risk-register.md",
+            "body_md": "# Demo Risk Register\n\n## Creator dependency\nHigh current concentration in creative direction and distribution. Mitigation: document formats, hire a production lead, and track Creator-only hours.\n\n## Platform concentration\nAudience reach depends on two social platforms. Mitigation: grow owned email and membership channels.\n\n## Revenue concentration\nCampaign revenue can be uneven. Mitigation: increase recurring membership and education revenue.\n\n## Data quality\nSeveral demo metrics are manual or simulated. Mitigation: connect source systems and publish metric freshness on every investor view.\n"
+          },
+          {
+            "path": "relationship-ledger/README.md",
+            "body_md": "# Relationship Ledger\n\nUse `read_relationship_ledger` before investor outreach or diligence follow-up. Record confirmed investor and partner interactions with `record_relationship_ledger`; keep identity keys stable and attach Knowledge evidence references when available. Never infer a commitment, term, or relationship status from an unverified note.\n"
+          },
+          {
+            "path": "finance-ledger/README.md",
+            "body_md": "# Finance Ledger\n\nUse `read_finance_ledger` for validated financing entries. Record receipts, invoices, payments, and financing decisions with `record_finance_ledger`, referencing the supporting Knowledge receipt, bill, or agreement as evidence. The ledger is not tax or legal advice.\n"
+          }
+        ],
+        "external_source": null
+      }
+    ]
+  },
+  "recipe": {
+    "operating_model": {
+      "kind": "one_person_company",
+      "context": "A fictional audience-backed creator business is preparing a $500,000 financing process and needs one controlled operating room for evidence, disclosure, diligence, decision, and post-investment reporting.",
+      "primary_work": "Approve the raise thesis, publish an evidence-backed investor room, close diligence requests, record the financing decision, and connect use of funds to the first 90-day investor update.",
+      "settings": {
+        "timezone": "America/Los_Angeles",
+        "blueprint_frozen": true,
+        "frozen_at": "2026-08-09",
+        "install_expectation": "simulate_first_then_promote",
+        "ledger_contracts": [
+          {
+            "contract_id": "manor.relationship_ledger/v1",
+            "schema_version": 1,
+            "directory": "relationship-ledger",
+            "knowledge_path": "relationship-ledger/README.md",
+            "subject_types": ["person", "organization", "investor", "partner", "prospect", "lead"]
+          },
+          {
+            "contract_id": "manor.finance_ledger/v1",
+            "schema_version": 1,
+            "directory": "finance-ledger",
+            "knowledge_path": "finance-ledger/README.md"
+          }
+        ]
+      },
+      "services": [
+        {
+          "key": "fundraising.strategy",
+          "name": "Raise strategy and readiness",
+          "description": "Define the financing narrative, ask, investor fit, use of funds, and readiness gaps."
+        },
+        {
+          "key": "fundraising.data_room",
+          "name": "Investor materials and data room",
+          "description": "Build versioned investor materials with metric sources, freshness, and controlled disclosure."
+        },
+        {
+          "key": "fundraising.diligence",
+          "name": "Diligence and financing decision",
+          "description": "Own questions, evidence, risks, term comparisons, and the operator decision record."
+        },
+        {
+          "key": "fundraising.updates",
+          "name": "Post-investment milestones and updates",
+          "description": "Track use of funds, milestones, variance, risks, learning, and investor asks."
+        }
+      ],
+      "rules": [
+        "Every investor-facing metric must show definition, period, source, freshness, and verification status.",
+        "Publishing materials, answering diligence, accepting terms, signing, or moving money requires explicit operator approval.",
+        "A financing loop is not complete at a decision: use of funds must map to owned milestones and the first investor update."
+      ],
+      "review_cadence": {
+        "daily": "Review active diligence requests, disclosure blockers, and decisions waiting on the operator.",
+        "weekly": "Review pipeline, material freshness, risks, financing movement, and the next investor action.",
+        "monthly": "Publish an approved milestone, budget, risk, and ask update after close."
+      }
+    },
+    "strategist": {
+      "business_model": {
+        "model_type": "community",
+        "primary_metric": "capital_committed",
+        "secondary_metrics": [
+          "data_room_readiness",
+          "diligence_turnaround_days",
+          "post_close_milestones_on_track"
+        ],
+        "revenue_model": "Audience-backed education, membership, and brand-partnership revenue."
+      },
+      "cadence": {
+        "schedule": "weekly",
+        "trigger_conditions": [
+          "data_room_item_stale",
+          "diligence_request_overdue",
+          "financing_decision_waiting",
+          "post_close_milestone_at_risk"
+        ]
+      },
+      "proposal_shape": "next_financing_or_milestone_decision",
+      "priors": [
+        "A credible raise is an operating evidence loop, not a pitch-deck project.",
+        "The best post-close update begins with the milestones promised before close."
+      ],
+      "evaluation_rubric": {
+        "weights": {
+          "evidence_quality": 0.35,
+          "capital_to_milestone_fit": 0.3,
+          "decision_speed": 0.2,
+          "risk": 0.15
+        }
+      },
+      "do_not_propose": [
+        "Investor claims that rely on unlabeled simulated or stale metrics.",
+        "Signing, securities, tax, legal, or bank actions without qualified human review."
+      ],
+      "voice": "investor-ready, evidence-first, direct"
+    },
+    "prompts": [
+      {
+        "key": "weekly_raise_review",
+        "title": "Weekly raise review",
+        "body": "Summarize material freshness, investor pipeline, diligence requests, evidence gaps, risks, and the single financing decision required next."
+      },
+      {
+        "key": "monthly_investor_update",
+        "title": "Monthly investor update",
+        "body": "Compare current metrics, milestones, use of funds, budget variance, risks, learning, and asks with the prior approved update."
+      }
+    ],
+    "subscriptions": [
+      {
+        "service_key": "fundraising.strategy",
+        "agent_slug": "creator-raise-strategist-v1",
+        "custom_prompt": "Run raise readiness in sandbox-first mode. Keep fictional values labelled and request operator decisions before fixing the ask or financing narrative.",
+        "config": {
+          "workspace_blueprint_slug": "solo-creator-fundraising-room-v1",
+          "primary_service": "fundraising.strategy",
+          "service_name": "Raise strategy and readiness"
+        }
+      },
+      {
+        "service_key": "fundraising.data_room",
+        "agent_slug": "creator-data-room-operator-v1",
+        "custom_prompt": "Build investor materials in sandbox-first mode. Keep drafts private and publish only exact operator-approved snapshots.",
+        "config": {
+          "workspace_blueprint_slug": "solo-creator-fundraising-room-v1",
+          "primary_service": "fundraising.data_room",
+          "service_name": "Investor materials and data room"
+        }
+      },
+      {
+        "service_key": "fundraising.diligence",
+        "agent_slug": "creator-diligence-coordinator-v1",
+        "custom_prompt": "Run diligence in sandbox-first mode. Separate answer, evidence, disclosure scope, unresolved point, and risk; do not contact investors or accept terms.",
+        "config": {
+          "workspace_blueprint_slug": "solo-creator-fundraising-room-v1",
+          "primary_service": "fundraising.diligence",
+          "service_name": "Diligence and financing decision"
+        }
+      },
+      {
+        "service_key": "fundraising.updates",
+        "agent_slug": "creator-investor-update-operator-v1",
+        "custom_prompt": "Prepare post-close milestone updates in sandbox-first mode. Do not invent actual progress, spending, or investor communication.",
+        "config": {
+          "workspace_blueprint_slug": "solo-creator-fundraising-room-v1",
+          "primary_service": "fundraising.updates",
+          "service_name": "Post-investment milestones and updates"
+        }
+      }
+    ],
+    "scheduled_jobs": [
+      {
+        "job_id": "creator-fundraising-weekly-review",
+        "name": "Weekly fundraising room review",
+        "job_type": "cron",
+        "schedule_kind": "cron",
+        "cron_expr": "0 9 * * 1",
+        "timezone": "America/Los_Angeles",
+        "execution_type": "agent",
+        "execution_target": {
+          "service_key": "fundraising.diligence",
+          "max_turns": 6,
+          "deliverable": "Inline markdown fundraising review in workspace_chat. Include material freshness, investor pipeline, open diligence, evidence gaps, risk, and the next operator decision. No file attachment is required.",
+          "done_when": "The workspace_chat response identifies the next financing decision, labels simulated, manual, stale, and unknown facts, and does not require or claim any investor message, signature, bank, payment, or file side effect.",
+          "delivery_mode": "workspace_chat"
+        },
+        "payload_message": "Prepare the weekly fundraising room review in workspace_chat. Do not contact investors, publish materials, accept terms, sign agreements, move money, or modify external systems. Label every unverified value.",
+        "default_delivery_mode": "workspace_chat"
+      },
+      {
+        "job_id": "creator-fundraising-monthly-update",
+        "name": "Monthly investor update draft",
+        "job_type": "cron",
+        "schedule_kind": "cron",
+        "cron_expr": "0 10 1 * *",
+        "timezone": "America/Los_Angeles",
+        "execution_type": "agent",
+        "execution_target": {
+          "service_key": "fundraising.updates",
+          "max_turns": 6,
+          "deliverable": "Inline markdown investor update in workspace_chat. Include metric deltas, milestone status, use-of-funds variance, risks, learning, asks, and source freshness. No file attachment is required.",
+          "done_when": "The workspace_chat response separates actual evidence from simulated or unknown values and does not require or claim any investor send, financial transaction, signature, or file side effect.",
+          "delivery_mode": "workspace_chat"
+        },
+        "payload_message": "Prepare the monthly investor update draft in workspace_chat. Do not send it, invent operating results, claim money moved, or modify external systems. Preserve metric definitions and show Unknown where evidence is missing.",
+        "default_delivery_mode": "workspace_chat"
+      }
+    ],
+    "workflows": [
+      {
+        "slug": "creator-fundraising-readiness-to-data-room-v1",
+        "description": "Turn an approved financing goal into a review-ready pitch deck, KPI model, and controlled data-room snapshot.",
+        "trigger_type": "manual",
+        "variables": [
+          {
+            "key": "raise_amount",
+            "default": "$500,000 fictional demo raise"
+          }
+        ],
+        "steps": [
+          {
+            "id": "readiness",
+            "name": "Assess raise readiness",
+            "kind": "agent_call",
+            "service_key": "fundraising.strategy",
+            "input": "Assess narrative, verified metrics, use of funds, milestones, risks, and missing evidence."
+          },
+          {
+            "id": "materials",
+            "name": "Build investor materials",
+            "kind": "agent_call",
+            "depends_on": [
+              "readiness"
+            ],
+            "service_key": "fundraising.data_room",
+            "input": "Prepare the pitch deck, KPI model, data-room index, and disclosure checklist."
+          },
+          {
+            "id": "publish_review",
+            "name": "Operator approves published snapshot",
+            "kind": "hitl_approval",
+            "depends_on": [
+              "materials"
+            ],
+            "channel": "workspace_chat",
+            "timeout_minutes": 1440
+          }
+        ]
+      },
+      {
+        "slug": "creator-fundraising-diligence-to-decision-v1",
+        "description": "Turn investor diligence requests into verified answers, a risk register, and an operator-controlled financing decision.",
+        "trigger_type": "manual",
+        "variables": [
+          {
+            "key": "investor_name",
+            "default": "Harbor Ventures (fictional demo investor)"
+          }
+        ],
+        "steps": [
+          {
+            "id": "triage",
+            "name": "Triage diligence requests",
+            "kind": "agent_call",
+            "service_key": "fundraising.diligence",
+            "input": "Assign owner, due date, evidence, disclosure scope, risk, and unresolved points."
+          },
+          {
+            "id": "answer",
+            "name": "Prepare verified responses",
+            "kind": "agent_call",
+            "depends_on": [
+              "triage"
+            ],
+            "service_key": "fundraising.diligence",
+            "input": "Prepare response packet and term comparison without giving legal advice."
+          },
+          {
+            "id": "decision",
+            "name": "Operator records financing decision",
+            "kind": "hitl_approval",
+            "depends_on": [
+              "answer"
+            ],
+            "channel": "workspace_chat",
+            "timeout_minutes": 1440
+          }
+        ]
+      },
+      {
+        "slug": "creator-fundraising-close-to-first-update-v1",
+        "description": "Convert the financing decision into owned 90-day milestones and the first investor update.",
+        "trigger_type": "manual",
+        "variables": [
+          {
+            "key": "close_date",
+            "default": "simulated close date"
+          }
+        ],
+        "steps": [
+          {
+            "id": "milestones",
+            "name": "Map capital to milestones",
+            "kind": "agent_call",
+            "service_key": "fundraising.updates",
+            "input": "Convert approved use of funds into owners, dates, measures, budget lines, and risks."
+          },
+          {
+            "id": "update",
+            "name": "Prepare first investor update",
+            "kind": "agent_call",
+            "depends_on": [
+              "milestones"
+            ],
+            "service_key": "fundraising.updates",
+            "input": "Prepare the 90-day plan and first update template with metric definitions and source freshness."
+          },
+          {
+            "id": "update_review",
+            "name": "Operator approves the update snapshot",
+            "kind": "hitl_approval",
+            "depends_on": [
+              "update"
+            ],
+            "channel": "workspace_chat",
+            "timeout_minutes": 1440
+          }
+        ]
+      }
+    ],
+    "goals": [
+      {
+        "title": "Secure $500,000 in verified financing commitments",
+        "description": "Run an evidence-backed creator-business financing process from readiness to recorded commitment and post-close milestone plan.",
+        "metric_key": "capital_committed",
+        "target_value": 500000,
+        "baseline_value": 0,
+        "deadline": "2027-03-31",
+        "measurement_source": {
+          "type": "manual",
+          "metric": "verified_capital_commitment_usd"
+        },
+        "measurement_cadence": "weekly",
+        "priority": 1
+      },
+      {
+        "title": "Close investor diligence requests within three business days",
+        "description": "Keep requests owned, evidence-backed, reviewable, and visibly blocked when data is missing.",
+        "metric_key": "diligence_turnaround_days",
+        "target_value": 3,
+        "baseline_value": 7,
+        "deadline": "2027-03-31",
+        "measurement_source": {
+          "type": "manual",
+          "metric": "average_diligence_close_days"
+        },
+        "measurement_cadence": "weekly",
+        "priority": 2
+      }
+    ],
+    "task_categories": [],
+    "custom_fields": [
+      {
+        "name": "fundraising_stage",
+        "display_name": "Fundraising stage",
+        "field_type": "select",
+        "target": "task",
+        "options": [
+          "readiness",
+          "materials",
+          "outreach",
+          "diligence",
+          "decision",
+          "closing",
+          "post_close"
+        ],
+        "sort_order": 10
+      },
+      {
+        "name": "evidence_status",
+        "display_name": "Evidence status",
+        "field_type": "select",
+        "target": "task",
+        "options": [
+          "missing",
+          "manual",
+          "simulated",
+          "verified",
+          "stale"
+        ],
+        "sort_order": 20
+      },
+      {
+        "name": "disclosure_scope",
+        "display_name": "Disclosure scope",
+        "field_type": "select",
+        "target": "task",
+        "options": [
+          "private",
+          "approved_investors",
+          "all_room_viewers"
+        ],
+        "sort_order": 30
+      }
+    ],
+    "sla_policies": [],
+    "escalation_rules": [],
+    "simulation_experience": {
+      "schema_version": "1.0",
+      "title": "Creator fundraising: readiness to first investor update",
+      "sample_prompt": "Prepare Luma Creator Studio for a $500,000 raise, publish an approved investor room, close diligence, record the financing decision, and create the first 90-day investor update.",
+      "artifacts": [
+        {
+          "id": "pitch-deck",
+          "kind": "presentation",
+          "title": "Creator business pitch deck",
+          "filename": "luma-creator-business-pitch-deck.pptx",
+          "mime_type": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+          "summary": "A fictional investor-ready narrative covering audience trust, business model, evidence, raise ask, use of funds, milestones, and risk.",
+          "stage": "materials"
+        },
+        {
+          "id": "kpi-model",
+          "kind": "spreadsheet",
+          "title": "KPI and use-of-funds model",
+          "filename": "creator-business-kpi-model.xlsx",
+          "mime_type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+          "summary": "Fictional KPI snapshots, source labels, use-of-funds allocation, milestone measures, and freshness fields.",
+          "stage": "materials"
+        },
+        {
+          "id": "data-room-index",
+          "kind": "document",
+          "title": "Published investor room index",
+          "filename": "published-investor-room-index.md",
+          "mime_type": "text/markdown",
+          "summary": "The exact operator-approved disclosure snapshot and its access scope.",
+          "stage": "data_room"
+        },
+        {
+          "id": "diligence-packet",
+          "kind": "document",
+          "title": "Diligence response packet",
+          "filename": "diligence-response-packet.md",
+          "mime_type": "text/markdown",
+          "summary": "Owned requests, evidence-backed answers, disclosure scope, risks, and unresolved points.",
+          "stage": "diligence"
+        },
+        {
+          "id": "term-comparison",
+          "kind": "spreadsheet",
+          "title": "Term and milestone comparison",
+          "filename": "term-and-milestone-comparison.xlsx",
+          "mime_type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+          "summary": "A non-legal comparison of fictional financing options and their capital-to-milestone implications.",
+          "stage": "decision"
+        },
+        {
+          "id": "first-investor-update",
+          "kind": "document",
+          "title": "First 90-day investor update",
+          "filename": "first-90-day-investor-update.md",
+          "mime_type": "text/markdown",
+          "summary": "Owned milestones, use-of-funds budget, source-aware KPI template, risks, learning, and asks after the simulated close.",
+          "stage": "post_close"
+        }
+      ],
+      "stages": [
+        {
+          "id": "raise-request",
+          "kind": "request",
+          "title": "Creator starts the financing process",
+          "author": "user",
+          "body": "Prepare **Luma Creator Studio** for a **$500,000 fictional raise**. Keep readiness, source-labelled metrics, disclosure approval, investor diligence, financing decision, and the first post-close update visible in Workspace Chat."
+        },
+        {
+          "id": "readiness-plan",
+          "kind": "proposal",
+          "title": "Raise readiness plan",
+          "author": "agent",
+          "service_key": "fundraising.strategy",
+          "body": "I broke the raise into evidence, materials, controlled disclosure, diligence, decision, and post-close milestones. Approve the readiness work before investor materials are prepared.",
+          "pending_action": {
+            "kind": "approve_proposals",
+            "review_id": "simulation-fundraising-readiness-plan",
+            "items": [
+              {
+                "item_id": "audit-evidence",
+                "kind": "task",
+                "risk_level": "low",
+                "summary": "Audit the business narrative, KPI definitions, source freshness, use of funds, and risk register."
+              },
+              {
+                "item_id": "build-materials",
+                "kind": "task",
+                "risk_level": "low",
+                "summary": "Build a review-ready pitch deck, KPI model, and investor-room index from approved Workspace facts."
+              }
+            ],
+            "options": [
+              "approve",
+              "always_approve",
+              "reject"
+            ]
+          }
+        },
+        {
+          "id": "fundraising-context",
+          "kind": "context",
+          "title": "Operating evidence and disclosure rules retrieved",
+          "author": "agent",
+          "service_key": "fundraising.strategy",
+          "body": "Workspace Knowledge supplied the fictional company snapshot, KPI definitions, use-of-funds plan, data-room index, and risk register. All values remain labelled as simulated or manual demo data."
+        },
+        {
+          "id": "choose-raise-shape",
+          "kind": "input",
+          "title": "Creator confirms the raise shape",
+          "author": "agent",
+          "service_key": "fundraising.strategy",
+          "body": "Choose the amount and the milestone that should anchor the financing narrative before materials are built.",
+          "pending_action": {
+            "kind": "needs_input",
+            "title": "Confirm the financing goal",
+            "context_summary": "The decision will be recorded in the deck, model, diligence responses, and post-close milestone plan.",
+            "questions": [
+              {
+                "key": "raise_amount",
+                "label": "Raise amount",
+                "type": "select",
+                "required": true,
+                "options": [
+                  {
+                    "label": "$500,000 — focused 18-month plan",
+                    "value": "500000"
+                  },
+                  {
+                    "label": "$750,000 — wider hiring plan",
+                    "value": "750000"
+                  }
+                ]
+              },
+              {
+                "key": "milestone",
+                "label": "Primary milestone",
+                "type": "select",
+                "required": true,
+                "options": [
+                  {
+                    "label": "Reduce Creator-only critical-path work by 40%",
+                    "value": "creator_dependency"
+                  },
+                  {
+                    "label": "Launch and measure the member-learning product",
+                    "value": "member_product"
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "id": "materials-workflow",
+          "kind": "workflow",
+          "title": "Investor materials built from one evidence model",
+          "author": "agent",
+          "service_key": "fundraising.data_room",
+          "message_kind": "workflow_activity",
+          "body": "The approved ask and milestone were carried into the narrative, KPI model, use-of-funds plan, and disclosure index. Every metric includes a source and verification label.",
+          "meta": {
+            "workflow_title": "Readiness to investor room",
+            "workflow_status": "completed",
+            "workflow_business_outcome": "awaiting_publication_approval",
+            "workflow_attempt_number": 1,
+            "workflow_current_step_id": "room_ready",
+            "workflow_steps": [
+              {
+                "id": "readiness",
+                "name": "Assess readiness",
+                "status": "completed"
+              },
+              {
+                "id": "build_deck",
+                "name": "Build pitch and KPI model",
+                "status": "completed"
+              },
+              {
+                "id": "room_ready",
+                "name": "Prepare disclosure snapshot",
+                "status": "completed"
+              }
+            ]
+          }
+        },
+        {
+          "id": "materials-artifacts",
+          "kind": "artifact",
+          "title": "Pitch, KPI model, and investor-room index ready",
+          "author": "agent",
+          "service_key": "fundraising.data_room",
+          "body": "The review packet includes the fictional pitch deck, source-labelled KPI and use-of-funds model, and exact list of files intended for approved investors.",
+          "artifact_ids": [
+            "pitch-deck",
+            "kpi-model",
+            "data-room-index"
+          ]
+        },
+        {
+          "id": "approve-investor-room",
+          "kind": "approval",
+          "title": "Creator approves the exact investor-room snapshot",
+          "author": "agent",
+          "service_key": "fundraising.data_room",
+          "body": "Drafts remain private. Approve, revise, or reject the exact snapshot before the simulated investor receives access.",
+          "pending_action": {
+            "kind": "governance_approval",
+            "hitl_type": "review",
+            "prompt": "Approve this exact simulated investor-room snapshot?",
+            "review_title": "Luma Creator Studio investor room",
+            "review": {
+              "summary": "$500,000 fictional raise · deck + KPI model + data-room index · approved-investor scope",
+              "checks": [
+                "Every metric shows a source and verification label",
+                "Use of funds maps to owned milestones",
+                "Risks and missing evidence are visible",
+                "No restricted personal data is exposed",
+                "No real investor receives access in simulation"
+              ]
+            },
+            "options": [
+              "approve",
+              "revise",
+              "reject"
+            ]
+          }
+        },
+        {
+          "id": "investor-access-receipt",
+          "kind": "receipt",
+          "title": "Simulated investor access receipt",
+          "author": "system",
+          "body": "Sandbox receipt: **Harbor Ventures** received access to the exact approved investor-room snapshot. No real invitation, email, share permission, or external file was created."
+        },
+        {
+          "id": "diligence-request",
+          "kind": "proposal",
+          "title": "Investor diligence requests arrive",
+          "author": "agent",
+          "service_key": "fundraising.diligence",
+          "body": "The fictional investor asks about Creator dependency, six-month retention, platform concentration, and the hiring milestone. Approve the request plan before answers are prepared.",
+          "pending_action": {
+            "kind": "approve_proposals",
+            "review_id": "simulation-fundraising-diligence-plan",
+            "items": [
+              {
+                "item_id": "verify-retention",
+                "kind": "task",
+                "risk_level": "low",
+                "summary": "Verify the six-month retention definition, source status, cohort period, and limitations."
+              },
+              {
+                "item_id": "explain-creator-dependency",
+                "kind": "task",
+                "risk_level": "low",
+                "summary": "Explain current Creator dependency and connect the mitigation plan to use of funds and a measurable milestone."
+              },
+              {
+                "item_id": "update-risk-register",
+                "kind": "task",
+                "risk_level": "low",
+                "summary": "Update platform and revenue concentration risks with owners, mitigations, and unresolved evidence."
+              }
+            ],
+            "options": [
+              "approve",
+              "always_approve",
+              "reject"
+            ]
+          }
+        },
+        {
+          "id": "diligence-workflow",
+          "kind": "workflow",
+          "title": "Diligence responses grounded in evidence",
+          "author": "agent",
+          "service_key": "fundraising.diligence",
+          "message_kind": "workflow_activity",
+          "body": "Each request now has an owner, answer, evidence reference, disclosure scope, risk, and unresolved point. Simulated metrics remain labelled instead of being presented as verified facts.",
+          "meta": {
+            "workflow_title": "Investor diligence response",
+            "workflow_status": "completed",
+            "workflow_business_outcome": "response_ready",
+            "workflow_attempt_number": 1,
+            "workflow_current_step_id": "response_ready",
+            "workflow_steps": [
+              {
+                "id": "triage",
+                "name": "Triage requests",
+                "status": "completed"
+              },
+              {
+                "id": "verify",
+                "name": "Verify evidence and risks",
+                "status": "completed"
+              },
+              {
+                "id": "response_ready",
+                "name": "Prepare response packet",
+                "status": "completed"
+              }
+            ]
+          }
+        },
+        {
+          "id": "diligence-artifact",
+          "kind": "artifact",
+          "title": "Diligence response packet ready",
+          "author": "agent",
+          "service_key": "fundraising.diligence",
+          "body": "The packet answers the four requests, exposes the evidence limitations, updates the risk register, and lists the two points that still require operator confirmation.",
+          "artifact_ids": [
+            "diligence-packet"
+          ]
+        },
+        {
+          "id": "diligence-operator-input",
+          "kind": "input",
+          "title": "Creator confirms the key diligence answer",
+          "author": "agent",
+          "service_key": "fundraising.diligence",
+          "body": "The remaining decision is how to frame current Creator dependency without overstating the hiring plan.",
+          "pending_action": {
+            "kind": "needs_input",
+            "title": "Confirm the Creator-dependency disclosure",
+            "context_summary": "The selected wording will be recorded in the diligence response and carried into the 90-day milestone plan.",
+            "questions": [
+              {
+                "key": "dependency_disclosure",
+                "label": "Disclosure",
+                "type": "select",
+                "required": true,
+                "options": [
+                  {
+                    "label": "State current concentration and target a 40% reduction",
+                    "value": "state_and_target"
+                  },
+                  {
+                    "label": "State concentration; do not commit to a percentage yet",
+                    "value": "state_only"
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "id": "term-comparison-workflow",
+          "kind": "workflow",
+          "title": "Diligence closes into a financing comparison",
+          "author": "agent",
+          "service_key": "fundraising.diligence",
+          "message_kind": "workflow_activity",
+          "body": "The approved disclosure was inserted into the response. Manor prepared a non-legal comparison of two fictional financing options and their impact on the milestone plan.",
+          "meta": {
+            "workflow_title": "Diligence to financing decision",
+            "workflow_status": "completed",
+            "workflow_business_outcome": "decision_ready",
+            "workflow_attempt_number": 1,
+            "workflow_current_step_id": "comparison_ready",
+            "workflow_steps": [
+              {
+                "id": "record_disclosure",
+                "name": "Record operator disclosure",
+                "status": "completed"
+              },
+              {
+                "id": "compare",
+                "name": "Compare financing paths",
+                "status": "completed"
+              },
+              {
+                "id": "comparison_ready",
+                "name": "Prepare decision packet",
+                "status": "completed"
+              }
+            ]
+          }
+        },
+        {
+          "id": "term-comparison-artifact",
+          "kind": "artifact",
+          "title": "Financing decision packet ready",
+          "author": "agent",
+          "service_key": "fundraising.diligence",
+          "body": "The comparison covers amount, dilution input, governance input, timing, milestone funding, major risks, and questions for qualified legal and financial advisers. It is not legal or investment advice.",
+          "artifact_ids": [
+            "term-comparison"
+          ]
+        },
+        {
+          "id": "decision-approval",
+          "kind": "approval",
+          "title": "Creator records the financing decision",
+          "author": "agent",
+          "service_key": "fundraising.diligence",
+          "body": "This gate records the business decision only. It does not sign documents, accept securities terms, or move money.",
+          "pending_action": {
+            "kind": "governance_approval",
+            "hitl_type": "review",
+            "prompt": "Approve the fictional $500,000 financing path for the simulated close and milestone-planning steps?",
+            "review_title": "Harbor Ventures financing decision",
+            "review": {
+              "summary": "$500,000 fictional commitment · use of funds mapped to 90-day and 18-month milestones",
+              "checks": [
+                "Diligence answers and limitations are visible",
+                "Capital maps to owned milestones",
+                "Major risks remain in the record",
+                "Qualified legal and financial review is still required",
+                "No signature or money movement occurs in simulation"
+              ]
+            },
+            "options": [
+              "approve",
+              "revise",
+              "reject"
+            ]
+          }
+        },
+        {
+          "id": "freshness-failure",
+          "kind": "failure",
+          "title": "One KPI source is stale before close",
+          "author": "agent",
+          "service_key": "fundraising.diligence",
+          "body": "The simulated close check found that the newsletter subscriber snapshot is older than the investor-room freshness policy.",
+          "pending_action": {
+            "kind": "workflow_retry",
+            "hitl_type": "error",
+            "title": "Refresh only the stale KPI branch",
+            "payload": {
+              "what_happened": "The newsletter KPI snapshot failed the freshness check.",
+              "why": "The approved investor-room snapshot requires current source timestamps before a close receipt can be recorded.",
+              "action_to_take": "Retry only the KPI refresh and verification branch; preserve completed diligence and the financing decision."
+            }
+          }
+        },
+        {
+          "id": "freshness-retry",
+          "kind": "workflow",
+          "title": "Stale KPI branch refreshed without repeating diligence",
+          "author": "agent",
+          "service_key": "fundraising.data_room",
+          "message_kind": "workflow_activity",
+          "body": "Only the simulated KPI freshness branch was retried. The approved narrative, diligence answers, risk register, and financing decision were preserved.",
+          "meta": {
+            "workflow_title": "Refresh and verify investor snapshot",
+            "workflow_status": "completed",
+            "workflow_business_outcome": "freshness_restored",
+            "workflow_attempt_number": 2,
+            "workflow_current_step_id": "verify_freshness",
+            "workflow_steps": [
+              {
+                "id": "refresh_metric",
+                "name": "Refresh simulated metric timestamp",
+                "status": "completed"
+              },
+              {
+                "id": "verify_freshness",
+                "name": "Verify disclosure snapshot",
+                "status": "completed"
+              }
+            ]
+          }
+        },
+        {
+          "id": "close-receipt",
+          "kind": "receipt",
+          "title": "Verified simulated financing close receipt",
+          "author": "system",
+          "body": "Sandbox receipt: the fictional $500,000 commitment is recorded as closed for demo purposes. No real investor was contacted, no agreement was signed, no securities transaction occurred, and no money moved."
+        },
+        {
+          "id": "post-close-workflow",
+          "kind": "workflow",
+          "title": "Financing decision becomes an operating plan",
+          "author": "agent",
+          "service_key": "fundraising.updates",
+          "message_kind": "workflow_activity",
+          "body": "Use of funds now maps to owners, due dates, measures, budget lines, risks, and update fields. The first post-investment report begins with the promises made before the simulated close.",
+          "meta": {
+            "workflow_title": "Close to first investor update",
+            "workflow_status": "completed",
+            "workflow_business_outcome": "post_close_plan_ready",
+            "workflow_attempt_number": 1,
+            "workflow_current_step_id": "update_ready",
+            "workflow_steps": [
+              {
+                "id": "map_capital",
+                "name": "Map capital to milestones",
+                "status": "completed"
+              },
+              {
+                "id": "assign_owners",
+                "name": "Assign owners and measures",
+                "status": "completed"
+              },
+              {
+                "id": "update_ready",
+                "name": "Prepare first update",
+                "status": "completed"
+              }
+            ]
+          }
+        },
+        {
+          "id": "first-update-artifact",
+          "kind": "artifact",
+          "title": "First 90-day investor update is ready",
+          "author": "agent",
+          "service_key": "fundraising.updates",
+          "body": "The update links each fictional budget line to a milestone, owner, due date, metric definition, source field, variance field, risk, learning, and investor ask. Actual future results remain blank rather than invented.",
+          "artifact_ids": [
+            "first-investor-update"
+          ]
+        },
+        {
+          "id": "fundraising-goal-completed",
+          "kind": "goal",
+          "title": "Financing and post-close loop completed",
+          "author": "system",
+          "message_kind": "goal_alert",
+          "body": "**Goal completed (simulation)**\n\nThe creator business moved through raise readiness → operator-selected financing goal → source-labelled materials → approved investor-room snapshot → diligence → operator financing decision → stale-data recovery → simulated close receipt → owned 90-day milestones → first investor update. Every decision and artifact remains attributable in Workspace Chat."
+        }
+      ],
+      "completion_summary": "The fundraising demo completes readiness, controlled disclosure, diligence, operator decision, recovery, simulated close, and the first post-investment update inside Workspace Chat. All companies, investors, values, commitments, and receipts are fictional sandbox data; no external system is changed."
+    }
+  },
+  "policy": {
+    "governance": {
+      "never_allow_actions": [
+        "contract.sign_*",
+        "securities.*",
+        "bank.*",
+        "payments.capture_*",
+        "billing.*"
+      ],
+      "hitl_required_actions": [
+        "email.send_*",
+        "document.share_*",
+        "investor.respond_*",
+        "workspace.file.modify"
+      ],
+      "auto_approve_actions": [
+        "workspace.task.create",
+        "workspace.search"
+      ],
+      "max_risk_level": "medium",
+      "budget_caps_per_kind": {
+        "llm": 300,
+        "action": 100
+      }
+    },
+    "post_install_checks": [
+      {
+        "kind": "agent_callable",
+        "service_key": "fundraising.strategy"
+      },
+      {
+        "kind": "agent_callable",
+        "service_key": "fundraising.data_room"
+      },
+      {
+        "kind": "agent_callable",
+        "service_key": "fundraising.diligence"
+      },
+      {
+        "kind": "agent_callable",
+        "service_key": "fundraising.updates"
+      },
+      {
+        "kind": "cron_scheduled",
+        "job_id": "creator-fundraising-weekly-review"
+      },
+      {
+        "kind": "cron_scheduled",
+        "job_id": "creator-fundraising-monthly-update"
+      },
+      {
+        "kind": "workflow_present",
+        "workflow_slug": "creator-fundraising-readiness-to-data-room-v1"
+      },
+      {
+        "kind": "workflow_present",
+        "workflow_slug": "creator-fundraising-diligence-to-decision-v1"
+      },
+      {
+        "kind": "workflow_present",
+        "workflow_slug": "creator-fundraising-close-to-first-update-v1"
+      }
+    ],
+    "expected_baseline": {
+      "maturity_level": "Demo-ready closed loop",
+      "validation_summary": "Validated as a deterministic creator fundraising sandbox that shows readiness, source-labelled materials, controlled disclosure, diligence, operator decision, recovery, simulated close, and post-investment reporting without external side effects.",
+      "runnable_in_simulation": true,
+      "blocking_todos_expected": 0,
+      "first_week_outputs": [
+        "Creator-approved financing goal",
+        "pitch deck and source-labelled KPI model",
+        "approved investor-room snapshot",
+        "diligence response and financing comparison",
+        "simulated close receipt",
+        "first 90-day investor update"
+      ],
+      "validation_evidence": [
+        "Blueprint v1.1 validation passes with an authored simulation experience.",
+        "Every disclosure and financing decision is represented by a Workspace Chat approval or input gate.",
+        "The walkthrough demonstrates branch retry while preserving completed diligence and decisions.",
+        "The final Goal event includes post-close milestones and the first investor update, not only the raise decision."
+      ],
+      "acceptance_criteria": [
+        "Install in simulation with zero blocking todos.",
+        "Walkthrough pauses for financing-goal selection, investor-room publication, diligence disclosure, financing decision, and stale-data recovery.",
+        "Pitch, KPI model, data-room index, diligence packet, financing comparison, receipt, and first update remain visible in Workspace Chat.",
+        "All fictional, manual, simulated, stale, and unknown values are labelled.",
+        "No investor is contacted and no document is shared, signed, transacted, or paid externally."
+      ],
+      "not_included": [
+        "No real investor, bank, cap table, accounting system, or data room is connected by default.",
+        "No legal, tax, securities, valuation, or investment advice.",
+        "No real financing commitment, signature, securities transaction, or money movement.",
+        "No invented future operating progress or investor update metrics."
+      ]
+    }
+  }
+}

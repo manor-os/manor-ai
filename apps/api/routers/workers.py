@@ -57,10 +57,12 @@ from packages.core.constants.execution import (
     coerce_step_status,
 )
 from packages.core.database import get_db
+from packages.core.contracts.task_output import TaskOutputValueKind
 from packages.core.dispatcher import (
     Dispatcher,
     DispatchError,
     LeaseNotActive,
+    MISSING_RESULT,
 )
 from packages.core.models.execution import ExecutionPlan, ExecutionStep
 from packages.core.models.user import User
@@ -70,10 +72,15 @@ from packages.core.models.worker import (
     WorkerActivityLog,
 )
 from packages.core.workers import (
+    CURRENT_WORKER_PROTOCOL_VERSION,
     INTERNAL_WORKER_KIND,
+    WORKER_PROTOCOL_HEADER,
+    WorkerProtocolVersion,
+    require_current_worker_protocol,
     register_external_worker,
     rotate_worker_secret,
     update_worker_status,
+    worker_protocol_header_value,
 )
 from packages.core.services.local_worker_targeting import (
     local_worker_display_name,
@@ -98,7 +105,7 @@ class WorkerCapabilities(BaseModel):
     max_risk_level: Literal["low", "medium", "high"] = "low"
     uses_manor_credentials: bool = True
     deployment: Literal["local", "remote", "cloud"] = "local"
-    protocol_version: int = 1
+    protocol_version: WorkerProtocolVersion
 
 
 class RegisterRequest(BaseModel):
@@ -128,6 +135,7 @@ class RegisterResponse(BaseModel):
     expires_at: Optional[datetime]
     heartbeat_endpoint: str = "/api/v1/workers/heartbeat"
     next_heartbeat_in_seconds: int = 2
+    protocol_version: WorkerProtocolVersion = CURRENT_WORKER_PROTOCOL_VERSION
 
 
 class WorkerResponse(BaseModel):
@@ -165,10 +173,14 @@ class HeartbeatActiveLease(BaseModel):
 class HeartbeatCompletedLease(BaseModel):
     lease_id: str
     status: Literal["done", "failed"]
-    result: Optional[dict] = None
+    # Worker outputs are JSON values, not necessarily objects. Presence is
+    # retained through ``model_fields_set`` so explicit null is not confused
+    # with an omitted result at the dispatcher boundary.
+    result: Any = None
     error: Optional[dict] = None
     cost: Optional[dict] = None
     evidence_refs: Optional[list[str]] = None
+    task_output_value_kind: TaskOutputValueKind
 
 
 class HeartbeatCapacity(BaseModel):
@@ -225,9 +237,10 @@ class HeartbeatResponse(BaseModel):
 # ── Lease lifecycle schemas ──────────────────────────────────────────
 
 class CompleteLeaseRequest(BaseModel):
-    result: Optional[dict] = None
+    result: Any = None
     cost: Optional[dict] = None
     evidence_refs: Optional[list[str]] = None
+    task_output_value_kind: TaskOutputValueKind
 
 
 class FailLeaseRequest(BaseModel):
@@ -260,16 +273,9 @@ def _merge_worker_capabilities(
     *,
     worker_id: str | None = None,
 ) -> dict:
-    """Merge heartbeat capabilities without erasing just-connected sessions.
-
-    Older local worker builds probe browser sessions only once at startup.
-    After a
-    user connects a local browser session from Integrations, the API writes the
-    connected platform into worker.capabilities immediately; the next heartbeat
-    from an older daemon can otherwise shallow-merge an empty browser session
-    list over that fresh state.
-    """
+    """Merge heartbeat capabilities and normalize Chrome-only browser state."""
     merged = dict(stored or {})
+    merged.pop("local_browser", None)
     incoming = dict(reported or {})
     for key, value in incoming.items():
         if key != "browser":
@@ -291,80 +297,17 @@ def _merge_worker_capabilities(
     browser = dict(current_browser)
     browser.update(reported_browser)
 
-    current_statuses = (
-        dict(current_browser.get("session_statuses") or {})
-        if isinstance(current_browser.get("session_statuses"), dict)
-        else {}
-    )
-    reported_statuses = (
-        dict(reported_browser.get("session_statuses") or {})
-        if isinstance(reported_browser.get("session_statuses"), dict)
-        else {}
-    )
-    session_statuses = {**current_statuses, **reported_statuses}
-    if session_statuses:
-        browser["session_statuses"] = session_statuses
-
-    saved_sessions_authoritative = reported_browser.get("saved_sessions_authoritative") is True
-    for key in ("saved_sessions", "active_sessions"):
-        reported_sessions = _string_list(reported_browser.get(key))
-        if reported_sessions:
-            if key == "saved_sessions" and saved_sessions_authoritative:
-                # Modern local workers report saved_sessions from the local cookie
-                # files on every heartbeat. Treat that as the source of truth
-                # so reconnecting after a prior explicit disconnect works.
-                browser[key] = reported_sessions
-                for platform in reported_sessions:
-                    session_statuses[platform] = "connected"
-                last_action = (
-                    dict(browser.get("last_session_action") or {})
-                    if isinstance(browser.get("last_session_action"), dict)
-                    else {}
-                )
-                if (
-                    last_action.get("platform") in reported_sessions
-                    and last_action.get("status") == "disconnected"
-                ):
-                    browser["last_session_action"] = {
-                        **last_action,
-                        "status": "connected",
-                    }
-            else:
-                # For non-authoritative or active-session lists, do not let a
-                # stale heartbeat resurrect a platform that a stop_session
-                # action has already marked disconnected.
-                browser[key] = [
-                    platform
-                    for platform in reported_sessions
-                    if session_statuses.get(platform) != "disconnected"
-                ]
-            continue
-        if key == "saved_sessions" and saved_sessions_authoritative:
-            browser[key] = []
-            continue
-        if key in reported_browser:
-            preserved = [
-                platform
-                for platform in _string_list(current_browser.get(key))
-                if session_statuses.get(platform) == "connected"
-            ]
-            browser[key] = preserved
-
-    disconnected = {
-        platform
-        for platform, status in session_statuses.items()
-        if status == "disconnected"
-    }
-    if disconnected:
-        for key in ("saved_sessions", "active_sessions"):
-            if key in browser:
-                browser[key] = [
-                    platform
-                    for platform in _string_list(browser.get(key))
-                    if platform not in disconnected
-                ]
-    if session_statuses:
-        browser["session_statuses"] = session_statuses
+    for legacy_key in (
+        "playwright_available",
+        "browser_use_available",
+        "legacy_backend",
+        "active_sessions",
+        "saved_sessions",
+        "saved_sessions_authoritative",
+        "session_statuses",
+        "last_session_action",
+    ):
+        browser.pop(legacy_key, None)
 
     gateway = browser.get("gateway")
     if isinstance(gateway, dict):
@@ -883,9 +826,14 @@ async def _heartbeat_inner(
             if c.status == "done":
                 completed_lease = await dispatcher.complete_lease(
                     db, c.lease_id,
-                    result=c.result,
+                    result=(
+                        c.result
+                        if "result" in getattr(c, "model_fields_set", set())
+                        else MISSING_RESULT
+                    ),
                     cost=c.cost,
                     evidence_refs=c.evidence_refs,
+                    task_output_value_kind=c.task_output_value_kind,
                 )
                 if completed_lease.plan_id:
                     wake_plan_ids.add(completed_lease.plan_id)
@@ -944,11 +892,12 @@ async def _heartbeat_inner(
     worker.last_heartbeat_at = now
     if req.version:
         worker.version = req.version
-    if worker.status == WorkerStatus.PAIRING:
+    if worker.status in {WorkerStatus.PAIRING, WorkerStatus.OFFLINE}:
+        was_offline = worker.status == WorkerStatus.OFFLINE
         worker.status = WorkerStatus.ACTIVE.value
         db.add(WorkerActivityLog(
             worker_id=worker.id,
-            event="paired",
+            event="reconnected" if was_offline else "paired",
             payload_summary={"source": "heartbeat"},
             ip=None,
         ))
@@ -1027,7 +976,14 @@ async def lease_complete(
     try:
         completed_lease = await Dispatcher().complete_lease(
             db, lease_id,
-            result=req.result, cost=req.cost, evidence_refs=req.evidence_refs,
+            result=(
+                req.result
+                if "result" in getattr(req, "model_fields_set", set())
+                else MISSING_RESULT
+            ),
+            cost=req.cost,
+            evidence_refs=req.evidence_refs,
+            task_output_value_kind=req.task_output_value_kind,
         )
     except LeaseNotActive as exc:
         raise HTTPException(409, str(exc))

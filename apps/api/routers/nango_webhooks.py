@@ -15,86 +15,62 @@ Nango forwards two flavours of events to a single configured webhook URL:
      ``dispatch_inbound_task``) so message events end up in the same
      code path as native webhooks.
 
-Signature verification: Nango HMAC-signs the request body with the
-admin secret. We accept either ``NANGO_WEBHOOK_SECRET`` (recommended,
-isolates webhook auth from the API secret) or fall back to
-``NANGO_SECRET_KEY``. Header: ``X-Nango-Signature`` (hex SHA-256).
+Nango 0.36 sends bare webhook POSTs without a signature header. Manor
+authenticates the derived ``nango_webhook_token`` query parameter that
+bootstrap adds to the configured webhook URL.
 """
 from __future__ import annotations
 
-import hashlib
 import hmac
 import json
 import logging
-import os
 from typing import Any, Optional
 
 from fastapi import APIRouter, HTTPException, Request
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 
 from packages.core.database import async_session
-from packages.core.models.channel import ChannelConfig
+from packages.core.models.channel import ChannelConfig, MessageLog
 from packages.core.models.document import Integration
 from packages.core.models.nango_webhook_event import NangoWebhookEvent
 from packages.core.services.channel_service import handle_inbound_message
+from packages.core.services.nango_bootstrap import _derive_webhook_token
 from packages.core.tasks.channel_tasks import dispatch_inbound_task
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/v1/nango", tags=["nango"])
 
 
-def _resolve_webhook_secret() -> Optional[str]:
-    """Resolve the secret Nango signs outbound webhooks with.
-
-    Nango 0.36 signs every outbound webhook with the environment's
-    ``secret_key`` (it has no separate webhook-secret field), so
-    ``NANGO_SECRET_KEY`` is what we verify against. Future Nango
-    versions that add a dedicated webhook secret can be wired by
-    setting ``NANGO_WEBHOOK_SECRET`` — when present it takes priority.
-    """
-    return (
-        os.environ.get("NANGO_WEBHOOK_SECRET", "").strip()
-        or os.environ.get("NANGO_SECRET_KEY", "").strip()
-        or None
-    )
-
-
-def _verify_signature(body: bytes, header_sig: Optional[str]) -> bool:
-    """Constant-time HMAC compare. Nango docs: ``X-Nango-Signature`` is
-    a hex-encoded HMAC-SHA-256 of the raw body using the admin secret."""
-    secret = _resolve_webhook_secret()
-    if not secret:
-        # No secret configured — accept (dev-only). Production should
-        # always set one; we log a loud warning per request so this
-        # state is visible.
-        logger.warning("Nango webhook received but NANGO_WEBHOOK_SECRET not set — accepting unverified")
-        return True
-    if not header_sig:
+def _verify_webhook_token(token: Optional[str]) -> bool:
+    """Verify the query token without accepting a body-signature fallback."""
+    expected = _derive_webhook_token()
+    if not expected:
+        logger.warning(
+            "Nango webhook rejected because no NANGO_CONNECT_HMAC_KEY or NANGO_SECRET_KEY is set"
+        )
         return False
-    expected = hmac.new(secret.encode("utf-8"), body, hashlib.sha256).hexdigest()
-    return hmac.compare_digest(expected, header_sig.lower().strip())
+    if not token or not token.isascii():
+        return False
+    return hmac.compare_digest(expected, token)
 
 
 @router.post("/webhook")
 async def nango_webhook(request: Request) -> dict:
     body = await request.body()
-    sig_header = (
-        request.headers.get("X-Nango-Signature")
-        or request.headers.get("x-nango-signature")
-    )
 
-    if not _verify_signature(body, sig_header):
-        # Log the rejection too so admins can see signature mismatches
+    if not _verify_webhook_token(request.query_params.get("nango_webhook_token")):
+        # Log the rejection too so admins can see token mismatches
         # while debugging webhook setup.
         async with async_session() as db:
             db.add(NangoWebhookEvent(
                 nango_type="unknown",
                 processing_status="rejected",
-                processing_detail="Signature verification failed",
+                processing_detail="Webhook URL token verification failed",
                 payload={"raw_len": len(body)},
             ))
             await db.commit()
-        raise HTTPException(403, "Bad signature")
+        raise HTTPException(403, "Bad webhook token")
 
     try:
         envelope: dict[str, Any] = json.loads(body.decode("utf-8"))
@@ -156,7 +132,7 @@ async def nango_webhook(request: Request) -> dict:
         return {"ok": True, "type": nango_type, "matched": False, "event_id": evt_id}
 
     handled = await _try_dispatch_to_channel(
-        provider=str(provider or ""),
+        provider=str(provider or provider_config_key or ""),
         entity_id=entity_id,
         inner_payload=inner_payload,
         envelope=envelope,
@@ -217,16 +193,16 @@ async def _try_dispatch_to_channel(
     if not channel_type:
         return {"ok": False, "reason": f"No channel adapter for provider={provider!r}"}
 
-    # Lazy import to avoid a hard dependency on the channels package
-    # at module load time.
-    from packages.core.services.channels.registry import get_adapter
+    # Import from the package facade so the adapter registry stays aligned
+    # with the rest of the channel gateway.
+    from packages.core.services.channels import get_adapter
     adapter = get_adapter(channel_type)
     if adapter is None:
         return {"ok": False, "reason": f"Channel adapter {channel_type!r} not registered"}
 
-    # Find the matching ChannelConfig for this entity + provider.
-    # If multiple exist (multi-workspace), prefer the one whose
-    # ``config.nango.connection_id`` matches the envelope's connection_id.
+    # Find the matching ChannelConfig for this entity + provider. A Nango
+    # connection id is a security/routing key: when present, it must match
+    # exactly and may never fall back to whichever row happens to sort first.
     target_cc: Optional[ChannelConfig] = None
     async with async_session() as db:
         rows = (await db.execute(
@@ -236,17 +212,70 @@ async def _try_dispatch_to_channel(
                 ChannelConfig.status == "active",
             )
         )).scalars().all()
-        connection_id = envelope.get("connectionId")
-        for cc in rows:
-            cfg = (cc.config or {}) if isinstance(cc.config, dict) else {}
-            nango_meta = cfg.get("nango") if isinstance(cfg.get("nango"), dict) else {}
-            if connection_id and nango_meta.get("connection_id") == connection_id:
-                target_cc = cc
-                break
-        if target_cc is None and rows:
-            target_cc = rows[0]  # Fallback: first active channel of this type
+        raw_connection_id = envelope.get("connectionId")
+        connection_id = str(raw_connection_id).strip() if raw_connection_id is not None else ""
+
+        # ChannelConfig rows mirrored from an Integration store the
+        # Integration id as ``config.connection_id``. Resolve that source
+        # back to its Nango connection so webhook routing remains exact after
+        # the OAuth/channel bridge is materialized.
+        source_ids = {
+            str(cc.credential_source_id)
+            for cc in rows
+            if cc.credential_source_kind == "integration" and cc.credential_source_id
+        }
+        source_connections: dict[str, str] = {}
+        if source_ids:
+            integrations = (await db.execute(
+                select(Integration).where(Integration.id.in_(source_ids))
+            )).scalars().all()
+            for integration in integrations:
+                cfg = integration.config if isinstance(integration.config, dict) else {}
+                nango_meta = cfg.get("nango") if isinstance(cfg.get("nango"), dict) else {}
+                nango_connection_id = nango_meta.get("connection_id")
+                if nango_connection_id:
+                    source_connections[integration.id] = str(nango_connection_id)
+
+        if connection_id:
+            for cc in rows:
+                cfg = (cc.config or {}) if isinstance(cc.config, dict) else {}
+                nango_meta = cfg.get("nango") if isinstance(cfg.get("nango"), dict) else {}
+                candidate_ids = {
+                    str(value).strip()
+                    for value in (
+                        nango_meta.get("connection_id"),
+                        cfg.get("nango_connection_id"),
+                        cfg.get("connection_id"),
+                        source_connections.get(str(cc.credential_source_id)),
+                    )
+                    if value
+                }
+                if connection_id in candidate_ids:
+                    target_cc = cc
+                    break
+        elif len(rows) == 1:
+            # A legacy sender may omit the envelope id. A unique active row
+            # is still deterministic; multiple rows are intentionally
+            # rejected below rather than routed across accounts.
+            target_cc = rows[0]
 
     if target_cc is None:
+        if connection_id and rows:
+            return {
+                "ok": False,
+                "reason": (
+                    f"No ChannelConfig for {channel_type} on entity {entity_id} "
+                    f"matched connection_id={connection_id}"
+                ),
+            }
+        if len(rows) > 1:
+            return {
+                "ok": False,
+                "reason": (
+                    f"Multiple ChannelConfigs for {channel_type} on entity {entity_id}; "
+                    "connectionId is required"
+                ),
+            }
         return {"ok": False, "reason": f"No ChannelConfig for {channel_type} on entity {entity_id}"}
 
     # Build the body the adapter expects — the inner payload re-encoded
@@ -266,10 +295,13 @@ async def _try_dispatch_to_channel(
     if not parsed:
         return {"ok": False, "reason": f"{channel_type} adapter rejected payload"}
 
-    # Mirror the canonical pipeline: log → dispatch.
+    # Mirror the canonical pipeline: log → dispatch. Keep both operations in
+    # one transaction so a broker failure rolls the receipt back and lets the
+    # provider retry the event instead of treating it as already handled.
+    inbound_log = None
     try:
         async with async_session() as db:
-            await handle_inbound_message(
+            inbound_log = await handle_inbound_message(
                 db,
                 entity_id=target_cc.entity_id,
                 channel_config_id=target_cc.id,
@@ -286,19 +318,46 @@ async def _try_dispatch_to_channel(
                     },
                 },
             )
+            try:
+                dispatch_inbound_task.delay(
+                    entity_id=target_cc.entity_id,
+                    channel_config_id=target_cc.id,
+                    channel_type=channel_type,
+                    sender_id=parsed.source_id,
+                    sender_name=parsed.sender_name,
+                    chat_id=parsed.reply_to,
+                    content=parsed.content,
+                    inbound_message_log_id=inbound_log.id if inbound_log is not None else None,
+                )
+            except Exception:  # noqa: BLE001
+                await db.rollback()
+                logger.exception("nango webhook: failed to enqueue inbound %s", channel_type)
+                return {"ok": False, "reason": "failed to enqueue inbound dispatch"}
             await db.commit()
+    except IntegrityError:
+        # Provider retries are acknowledged after the durable receipt already
+        # exists; only the original receipt may enqueue an agent turn.
+        async with async_session() as db:
+            duplicate_id = await db.scalar(
+                select(MessageLog.id).where(
+                    MessageLog.channel_config_id == target_cc.id,
+                    MessageLog.direction == "inbound",
+                    MessageLog.channel_type == channel_type,
+                    MessageLog.external_id == parsed.external_message_id,
+                )
+            )
+        if duplicate_id is not None:
+            return {
+                "ok": True,
+                "channel_type": channel_type,
+                "channel_config_id": target_cc.id,
+                "duplicate": True,
+            }
+        logger.exception("nango webhook: failed to log inbound %s", channel_type)
+        return {"ok": False, "reason": "failed to persist inbound receipt"}
     except Exception:  # noqa: BLE001
         logger.exception("nango webhook: failed to log inbound %s", channel_type)
-
-    dispatch_inbound_task.delay(
-        entity_id=target_cc.entity_id,
-        channel_config_id=target_cc.id,
-        channel_type=channel_type,
-        sender_id=parsed.source_id,
-        sender_name=parsed.sender_name,
-        chat_id=parsed.reply_to,
-        content=parsed.content,
-    )
+        return {"ok": False, "reason": "failed to persist inbound receipt"}
 
     return {
         "ok": True,

@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 from xml.etree import ElementTree as ET
+from defusedxml import ElementTree as SafeET
 
 from .drawingml_utils import SVG_NS
 
@@ -57,7 +58,7 @@ def is_chrome_id(elem_id: str | None) -> bool:
 
 def scan_svg_targets(svg_path: Path) -> tuple[list[GroupTarget], list[str]]:
     """Scan one SVG for top-level visible group ids and anonymous groups."""
-    root = ET.parse(str(svg_path)).getroot()
+    root = SafeET.parse(str(svg_path)).getroot()
     targets: list[GroupTarget] = []
     anonymous_groups: list[str] = []
     visual_index = 0

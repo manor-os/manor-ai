@@ -20,7 +20,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Optional
 
-from sqlalchemy import DateTime, Index, String, Text, UniqueConstraint, func
+from sqlalchemy import CheckConstraint, DateTime, ForeignKey, Index, String, Text, UniqueConstraint
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -105,6 +105,34 @@ class MCPServer(Base, TimestampMixin):
         uselist=False,
         cascade="all, delete-orphan",
     )
+
+
+class MCPAccountToolCatalog(Base, TimestampMixin):
+    """Credential-free tools/list snapshot for one connected account."""
+
+    __tablename__ = "mcp_account_tool_catalogs"
+    __table_args__ = (
+        CheckConstraint(
+            "(oauth_account_id IS NOT NULL AND integration_id IS NULL) OR "
+            "(oauth_account_id IS NULL AND integration_id IS NOT NULL)",
+            name="ck_mcp_account_tool_catalogs_one_source",
+        ),
+        UniqueConstraint("provider", "oauth_account_id", name="uq_mcp_account_tool_catalogs_oauth"),
+        UniqueConstraint("provider", "integration_id", name="uq_mcp_account_tool_catalogs_integration"),
+        Index("ix_mcp_account_tool_catalogs_provider", "provider"),
+    )
+
+    id: Mapped[str] = mapped_column(String(26), primary_key=True, default=generate_ulid)
+    provider: Mapped[str] = mapped_column(String(64), nullable=False)
+    oauth_account_id: Mapped[Optional[str]] = mapped_column(
+        String(26), ForeignKey("oauth_accounts.id", ondelete="CASCADE")
+    )
+    integration_id: Mapped[Optional[str]] = mapped_column(
+        String(26), ForeignKey("integrations.id", ondelete="CASCADE")
+    )
+    endpoint: Mapped[str] = mapped_column(String(500), nullable=False)
+    tools_cached: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default="{}")
+    tools_cached_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
 
 
 class AgentMCPBinding(Base, TimestampMixin):

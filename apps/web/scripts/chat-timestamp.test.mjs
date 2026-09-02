@@ -38,7 +38,8 @@ test("chat timestamps keep the compact time and reveal the full recorded date", 
 test("all chat surfaces share the expandable timestamp", () => {
   assert.match(floatingSource, /<ChatTimestamp timestamp=\{msg\.timestamp\} \/>/);
   assert.match(embeddedSource, /<ChatTimestamp timestamp=\{msg\.timestamp\} \/>/);
-  assert.match(workspaceSource, /<ChatTimestamp timestamp=\{msg\.created_at\} className="chat-message-time" \/>/);
+  assert.match(workspaceSource, /<ChatTimestamp timestamp=\{msg\.timestamp\} \/>/);
+  assert.match(workspaceSource, /<ChatTimestamp timestamp=\{msg\.created_at\} \/>/);
 });
 
 test("expandable timestamp controls are localized", () => {

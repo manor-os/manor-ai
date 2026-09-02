@@ -14,7 +14,7 @@ import os
 import re
 import secrets
 from html import unescape
-from collections.abc import Iterable
+from collections.abc import Awaitable, Callable, Iterable
 from typing import TYPE_CHECKING, Any
 from urllib.parse import unquote, urlsplit
 
@@ -53,6 +53,7 @@ from packages.core.services.audio_conversion import (
 from packages.core.ai.runtime import (
     RUNTIME_GENERATE_AUDIO_TOOL_SOURCE,
     RUNTIME_GENERATE_IMAGE_TOOL_SOURCE,
+    RUNTIME_GENERATE_VIDEO_TOOL_SOURCE,
     runtime_execute_extract_data_tool_completion,
     runtime_assert_credit_available,
 )
@@ -61,6 +62,7 @@ from packages.core.ai.runtime.tool_context import (
     runtime_tool_call_context_from_kwargs,
 )
 from packages.core.ai.runtime.artifacts import runtime_reference_allowed_by_artifacts
+from packages.core.services.voice.speech_request import begin_speech_provider_request
 
 logger = logging.getLogger(__name__)
 
@@ -367,14 +369,12 @@ async def _resolve_media_task_user_id(
     """Fill missing media tool user context from the owning task when available."""
 
     user_text = str(user_id or "").strip()
-    if user_text and user_text != "ai-agent":
-        return user_text
     task_text = str(task_id or "").strip()
     entity_text = str(entity_id or "").strip()
     if not task_text or not entity_text:
-        return ""
+        return user_text if user_text != "ai-agent" else ""
     try:
-        from packages.core.ai.runtime import runtime_task_billable_user_id
+        from packages.core.ai.runtime import runtime_resolve_task_billable_user_id
         from packages.core.database import async_session
         from packages.core.models.task import Task
         from sqlalchemy import select
@@ -388,8 +388,23 @@ async def _resolve_media_task_user_id(
                     )
                 )
             ).scalar_one_or_none()
-            return runtime_task_billable_user_id(task) or ""
-    except Exception:
+            if task is None:
+                from packages.core.services.task_requester_identity import (
+                    TaskRequesterIdentityError,
+                )
+
+                raise TaskRequesterIdentityError(
+                    task_text,
+                    "the media Task does not exist in the requested entity scope",
+                )
+            return await runtime_resolve_task_billable_user_id(db, task) or ""
+    except Exception as exc:
+        from packages.core.services.task_requester_identity import (
+            TaskRequesterIdentityError,
+        )
+
+        if isinstance(exc, TaskRequesterIdentityError):
+            raise
         logger.debug("media task user lookup failed", exc_info=True)
         return ""
 
@@ -1035,7 +1050,11 @@ async def _deliver_image_to_sandbox(
         sandbox_url = (get_settings().SANDBOX_SERVICE_URL or "").strip()
         if not sandbox_url:
             return False
-        client = SandboxClient(base_url=sandbox_url, timeout=120.0)
+        client = SandboxClient(
+            base_url=sandbox_url,
+            timeout=120.0,
+            api_token=get_settings().SANDBOX_API_TOKEN,
+        )
         try:
             await client.write_file_base64(
                 sandbox_id=sandbox_id,
@@ -1079,7 +1098,8 @@ async def _save_generated_image_bytes(
 
     ext = _image_mime_to_ext(mime)
 
-    from packages.core.services.entity_fs import get_entity_root, write_entity_file_atomic
+    from packages.core.ai.runtime.file_actions import runtime_write_entity_file_atomic
+    from packages.core.services.entity_fs import get_entity_root
     from packages.core.services.generated_media_naming import (
         build_generated_media_target,
         resolve_workspace_artifact_base_dir,
@@ -1106,7 +1126,7 @@ async def _save_generated_image_bytes(
         entity_root=entity_root,
     )
     filename = target.filename
-    filepath = write_entity_file_atomic(
+    filepath = runtime_write_entity_file_atomic(
         entity_id,
         target.rel_path,
         image_bytes,
@@ -1646,7 +1666,8 @@ async def _save_generated_audio_bytes(
 
     ext = _audio_format_to_ext(audio_format)
 
-    from packages.core.services.entity_fs import get_entity_root, write_entity_file_atomic
+    from packages.core.ai.runtime.file_actions import runtime_write_entity_file_atomic
+    from packages.core.services.entity_fs import get_entity_root
     from packages.core.services.generated_media_naming import (
         build_generated_media_target,
         resolve_workspace_artifact_base_dir,
@@ -1673,7 +1694,7 @@ async def _save_generated_audio_bytes(
         entity_root=entity_root,
     )
     filename = target.filename
-    filepath = write_entity_file_atomic(
+    filepath = runtime_write_entity_file_atomic(
         entity_id,
         target.rel_path,
         audio_bytes,
@@ -1817,6 +1838,13 @@ def _vercel_speech_model_supported(model: str) -> bool:
     } or model_id.startswith("fish-audio/")
 
 
+def _speech_model_supports_instructions(model: str) -> bool:
+    """Return whether the speech model accepts delivery instructions."""
+
+    native_model = str(model or "").strip().lower().split("/", 1)[-1]
+    return native_model not in {"tts-1", "tts-1-hd"}
+
+
 async def _vercel_speech_bytes(
     *,
     api_key: str,
@@ -1849,10 +1877,11 @@ async def _vercel_speech_bytes(
         "voice": voice,
         "outputFormat": output_format,
     }
-    if voice_instructions:
+    if voice_instructions and _speech_model_supports_instructions(model):
         payload["instructions"] = voice_instructions
 
     async with httpx.AsyncClient(timeout=180.0) as client:
+        begin_speech_provider_request()
         response = await client.post(
             _vercel_speech_endpoint(base_url),
             headers=headers,
@@ -1935,12 +1964,17 @@ async def _openrouter_speech_bytes(
         payload["voice"] = voice
     if voice_instructions and model.lower().startswith("google/"):
         payload["input"] = _directed_speech_prompt(prompt, voice_instructions)
-    elif voice_instructions and model.lower().startswith("openai/"):
+    elif (
+        voice_instructions
+        and model.lower().startswith("openai/")
+        and _speech_model_supports_instructions(model)
+    ):
         payload["instructions"] = voice_instructions
     max_attempts = 3
     async with httpx.AsyncClient(timeout=180.0) as client:
         for attempt in range(1, max_attempts + 1):
             try:
+                begin_speech_provider_request()
                 resp = await client.post(
                     "https://openrouter.ai/api/v1/audio/speech",
                     headers={
@@ -2129,9 +2163,10 @@ async def _openai_compatible_speech_bytes(
     }
     if voice:
         payload["voice"] = voice
-    if voice_instructions:
+    if voice_instructions and _speech_model_supports_instructions(model):
         payload["instructions"] = voice_instructions
     async with httpx.AsyncClient(timeout=180.0) as client:
+        begin_speech_provider_request()
         resp = await client.post(
             f"{(base_url or 'https://api.openai.com/v1').rstrip('/')}/audio/speech",
             headers={
@@ -2237,6 +2272,7 @@ async def _discover_openai_compatible_chat_audio_model(
 ) -> str:
     endpoint = (base_url or "https://api.openai.com/v1").rstrip("/")
     headers = {"Authorization": f"Bearer {api_key}"}
+    begin_speech_provider_request()
     resp = await client.get(f"{endpoint}/models", headers=headers)
     if resp.status_code >= 300:
         raise _OpenAICompatibleAudioProviderBlocker(
@@ -2374,6 +2410,7 @@ async def _openai_compatible_chat_audio_bytes(
             base_url=endpoint,
             requested_model=model,
         )
+        begin_speech_provider_request()
         async with client.stream(
             "POST",
             f"{endpoint}/chat/completions",
@@ -2508,6 +2545,7 @@ async def _google_speech_bytes(
         },
     }
     async with httpx.AsyncClient(timeout=180.0) as client:
+        begin_speech_provider_request()
         resp = await client.post(
             f"{endpoint}/models/{native_model}:generateContent",
             headers={
@@ -2667,6 +2705,7 @@ async def _zyphra_speech_bytes(
         payload["default_voice_name" if legacy_api else "voice"] = selected_voice
 
     async with httpx.AsyncClient(timeout=180.0) as client:
+        begin_speech_provider_request()
         resp = await client.post(
             endpoint,
             headers=(
@@ -2704,6 +2743,7 @@ async def _openrouter_audio_output_bytes(
     }
     chunks: list[str] = []
     async with httpx.AsyncClient(timeout=360.0) as client:
+        begin_speech_provider_request()
         async with client.stream(
             "POST",
             "https://openrouter.ai/api/v1/chat/completions",
@@ -2797,6 +2837,7 @@ def _audio_prompt_for_purpose(prompt: str, purpose: str, duration_seconds: float
 async def _generate_audio_handler(
     entity_id: str = "",
     user_id: str = "",
+    _deliver_audio: Callable[..., Awaitable[str]] | None = None,
     **kwargs: Any,
 ) -> str:
     """Generate an audio file through the selected managed/native route."""
@@ -2932,10 +2973,18 @@ async def _generate_audio_handler(
         role,
         requested_audio_format,
     )
+    call_voice = None
+    if kwargs.get("_call_voice_profile"):
+        # Chat calls pass a provider-neutral profile because the effective
+        # media model can differ from the preliminary account selection. Map
+        # it only after the final model (including narration overrides) is set.
+        from packages.core.services.voice.profiles import speech_voice
+
+        call_voice = speech_voice(kwargs["_call_voice_profile"], model)
     voice = str(
         narration_profile["voice"]
         if narration_profile is not None
-        else kwargs.get("voice") or _default_openrouter_voice(model)
+        else kwargs.get("voice") or call_voice or _default_openrouter_voice(model)
     ).strip()
     native_google_music = bool(
         role == AudioGenerationRole.AUDIO
@@ -3266,7 +3315,10 @@ async def _generate_audio_handler(
             storage_format = requested_artifact_format
         if narration_profile is not None:
             output_name = _task_narrator_audio_output_name(output_name, voice)
-        audio_url = await _save_generated_audio_bytes(
+        # Chat playback uses the same provider/credit path without creating a
+        # Knowledge artifact. Only an internal Python callable can select it.
+        deliver_audio = _deliver_audio if callable(_deliver_audio) else _save_generated_audio_bytes
+        audio_url = await deliver_audio(
             entity_id=entity_id,
             user_id=user_id,
             prompt=prompt,
@@ -3281,9 +3333,9 @@ async def _generate_audio_handler(
             language=audio_language,
             output_name=output_name,
             workspace_id=workspace_id or None,
-            task_id=kwargs.get("task_id"),
-            agent_id=kwargs.get("agent_id"),
-            conversation_id=kwargs.get("conversation_id"),
+            task_id=runtime_context.task_id,
+            agent_id=runtime_context.agent_id,
+            conversation_id=runtime_context.conversation_id,
         )
         payload: AudioGenerationCompletedResult = {
             "kind": GenerateFileKind.AUDIO,
@@ -4186,7 +4238,7 @@ async def _generate_image_handler(
                 usage=data.get("usage") or {},
                 workspace_id=runtime_context.workspace_id,
                 task_id=runtime_context.task_id,
-                agent_id=kwargs.get("agent_id") or runtime_context.agent_id,
+                agent_id=runtime_context.agent_id,
                 conversation_id=runtime_context.conversation_id,
                 save_to_knowledge=save_to_knowledge,
                 sandbox_path=sandbox_path,
@@ -4274,7 +4326,7 @@ async def _generate_image_handler(
                 usage=usage,
                 workspace_id=runtime_context.workspace_id,
                 task_id=runtime_context.task_id,
-                agent_id=kwargs.get("agent_id") or runtime_context.agent_id,
+                agent_id=runtime_context.agent_id,
                 conversation_id=runtime_context.conversation_id,
                 save_to_knowledge=save_to_knowledge,
                 sandbox_path=sandbox_path,
@@ -4380,7 +4432,7 @@ async def _generate_image_handler(
                 usage=data.get("usage") or {},
                 workspace_id=runtime_context.workspace_id,
                 task_id=runtime_context.task_id,
-                agent_id=kwargs.get("agent_id") or runtime_context.agent_id,
+                agent_id=runtime_context.agent_id,
                 conversation_id=runtime_context.conversation_id,
                 save_to_knowledge=save_to_knowledge,
                 sandbox_path=sandbox_path,
@@ -4467,7 +4519,7 @@ async def _generate_image_handler(
                     usage={},
                     workspace_id=runtime_context.workspace_id,
                     task_id=runtime_context.task_id,
-                    agent_id=kwargs.get("agent_id") or runtime_context.agent_id,
+                    agent_id=runtime_context.agent_id,
                     conversation_id=runtime_context.conversation_id,
                     save_to_knowledge=save_to_knowledge,
                     sandbox_path=sandbox_path,
@@ -4553,10 +4605,11 @@ GENERATE_VIDEO_SCHEMA = {
             "image or video reference so the model has a visual subject/environment. Seedance "
             "reference_video_urls, audio_reference_urls, and generate_audio require Manor's "
             "native Volcengine/Seedance route; do not use OpenRouter for those inputs. "
-            "These media references are sent to external video providers, so local "
-            "/api/v1/fs/... URLs only work when PUBLIC_BASE_URL is an externally "
-            "reachable https:// base URL that can create signed public URLs. "
-            "Without that, omit local references and use a self-contained text prompt. "
+            "For Vercel and OpenRouter routes, local image references may be sent inline "
+            "as Base64 data, so they do not normally need PUBLIC_BASE_URL. If an image "
+            "cannot fit the provider's inline size limit, Manor falls back to a signed "
+            "public URL. Native Seedance routes, reference video, and reference audio "
+            "always require a provider-readable HTTPS URL from PUBLIC_BASE_URL. "
             "The selected video model's capabilities are validated before generation: "
             "unsupported last frames, reference images/video/audio, or native audio requests fail "
             "fast instead of being silently ignored. For narration, dialogue, BGM, "
@@ -4573,20 +4626,20 @@ GENERATE_VIDEO_SCHEMA = {
                 },
                 "first_frame_url": {
                     "type": "string",
-                    "description": "First frame image URL. Use an externally reachable https:// URL, or a local /api/v1/fs/... URL only when PUBLIC_BASE_URL is configured for signed public URLs.",
+                    "description": "First frame image URL. Vercel/OpenRouter can send local /api/v1/fs/... image files inline; other routes require an externally reachable https:// URL or PUBLIC_BASE_URL for a signed URL.",
                 },
                 "last_frame_url": {
                     "type": "string",
-                    "description": "Last frame image URL. Use an externally reachable https:// URL, or a local /api/v1/fs/... URL only when PUBLIC_BASE_URL is configured for signed public URLs.",
+                    "description": "Last frame image URL. Vercel/OpenRouter can send local /api/v1/fs/... image files inline; other routes require an externally reachable https:// URL or PUBLIC_BASE_URL for a signed URL.",
                 },
                 "reference_urls": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "Reference image URLs for style/character consistency. Use externally reachable https:// URLs, or local /api/v1/fs/... URLs only when PUBLIC_BASE_URL is configured for signed public URLs. Seedance supports up to 9.",
+                    "description": "Reference image URLs for style/character consistency. Vercel/OpenRouter can send local /api/v1/fs/... image files inline; other routes require externally reachable https:// URLs or PUBLIC_BASE_URL. Seedance supports up to 9.",
                 },
                 "reference_url": {
                     "type": "string",
-                    "description": "Single reference image URL. Alias for reference_urls. Use an externally reachable https:// URL, or a local /api/v1/fs/... URL only when PUBLIC_BASE_URL is configured for signed public URLs.",
+                    "description": "Single reference image URL. Alias for reference_urls. Vercel/OpenRouter can send local /api/v1/fs/... image files inline; other routes require externally reachable https:// URLs or PUBLIC_BASE_URL.",
                 },
                 "reference_video_urls": {
                     "type": "array",
@@ -5439,6 +5492,43 @@ async def _validate_video_reference_urls_fetchable(
         )
 
 
+def _video_references_requiring_public_urls(
+    adapter: Any,
+    *,
+    model: str,
+    first_frame_url: str = "",
+    last_frame_url: str = "",
+    reference_urls: list[str] | None = None,
+    reference_video_urls: list[str] | None = None,
+    audio_reference_urls: list[str] | None = None,
+) -> list[str]:
+    """Return only media kinds that the selected route cannot inline."""
+    refs = [
+        first_frame_url,
+        last_frame_url,
+        *(reference_urls or []),
+        *(reference_video_urls or []),
+        *(audio_reference_urls or []),
+    ]
+    resolver = getattr(adapter, "references_requiring_public_urls", None)
+    if callable(resolver):
+        return resolver(
+            model,
+            first_frame_url=first_frame_url,
+            last_frame_url=last_frame_url,
+            reference_urls=reference_urls,
+            reference_video_urls=reference_video_urls,
+            audio_reference_urls=audio_reference_urls,
+        )
+
+    # Compatibility for test doubles and third-party adapters that implement
+    # only the older all-or-nothing inline-reference contract.
+    supports_inline = getattr(adapter, "supports_inline_local_references", None)
+    if callable(supports_inline) and supports_inline():
+        return []
+    return [str(ref or "") for ref in refs if str(ref or "").strip()]
+
+
 async def _generate_video_handler(
     entity_id: str = "",
     user_id: str = "",
@@ -5641,6 +5731,11 @@ async def _generate_video_handler(
         is_byok = False
     if not api_key:
         return _video_error_result("No video generation API key configured", prompt=raw_prompt, model=model)
+    if entity_id and not is_byok:
+        await runtime_assert_credit_available(
+            entity_id,
+            source=RUNTIME_GENERATE_VIDEO_TOOL_SOURCE,
+        )
     # Atlas Cloud models are BYOK-only: Manor holds no platform key and does
     # not proxy or bill these calls. Without a user-supplied Atlas key the
     # resolved credential would be Manor's OpenRouter default, which cannot
@@ -5690,12 +5785,43 @@ async def _generate_video_handler(
         route_warnings.append(native_audio_downgrade)
         generate_audio = False
 
-    reference_error = _video_reference_public_base_error(
-        [first_frame_url, last_frame_url, *reference_urls, *reference_video_urls, *audio_reference_urls],
-        entity_id,
+    from packages.core.tasks.video_adapters import (
+        select_video_generation_adapter,
+        video_adapter_metadata,
     )
-    if reference_error:
-        return _video_error_result(reference_error, prompt=raw_prompt, model=model)
+
+    adapter = select_video_generation_adapter(
+        model=model,
+        provider=route_provider,
+        api_key=api_key,
+    )
+    if not adapter:
+        return _video_error_result(
+            (
+                f"No video adapter for {provider or 'this'} model. "
+                "Use an OpenRouter key or choose a Seedance/Kling video model."
+            ),
+            prompt=raw_prompt,
+            model=model,
+        )
+    adapter_meta = video_adapter_metadata(model, route_provider, api_key)
+
+    public_url_references = _video_references_requiring_public_urls(
+        adapter,
+        model=model,
+        first_frame_url=first_frame_url,
+        last_frame_url=last_frame_url,
+        reference_urls=reference_urls,
+        reference_video_urls=reference_video_urls,
+        audio_reference_urls=audio_reference_urls,
+    )
+    if public_url_references:
+        reference_error = _video_reference_public_base_error(
+            public_url_references,
+            entity_id,
+        )
+        if reference_error:
+            return _video_error_result(reference_error, prompt=raw_prompt, model=model)
 
     capability_error = _video_capability_error(
         model=model,
@@ -5728,26 +5854,6 @@ async def _generate_video_handler(
         generate_audio=generate_audio,
         audio_reference_urls=audio_reference_urls,
     )
-    from packages.core.tasks.video_adapters import (
-        select_video_generation_adapter,
-        video_adapter_metadata,
-    )
-
-    adapter = select_video_generation_adapter(
-        model=model,
-        provider=route_provider,
-        api_key=api_key,
-    )
-    if not adapter:
-        return _video_error_result(
-            (
-                f"No video adapter for {provider or 'this'} model. "
-                "Use an OpenRouter key or choose a Seedance/Kling video model."
-            ),
-            prompt=raw_prompt,
-            model=model,
-        )
-    adapter_meta = video_adapter_metadata(model, route_provider, api_key)
 
     # Estimate credits only for platform-routed calls. BYOK is billed by the
     # vendor directly and should show zero Manor credits.
@@ -5764,8 +5870,8 @@ async def _generate_video_handler(
         except Exception:
             pass
 
-    # Prefer explicit chat context, then fall back to billing context.
-    conversation_id = kwargs.get("conversation_id") or None
+    # Prefer trusted runtime chat context, then fall back to billing context.
+    conversation_id = runtime_context.conversation_id
     try:
         from packages.core.ai.runtime import runtime_current_billing_context
 
@@ -5802,21 +5908,25 @@ async def _generate_video_handler(
         return _video_error_result(str(exc), prompt=raw_prompt, model=model)
 
     public_base_url = _runtime_https_public_base_url()
-    try:
-        await _validate_video_reference_urls_fetchable(
-            entity_id=entity_id,
-            references=[
-                first_frame_url or "",
-                last_frame_url or "",
-                *reference_urls,
-                *reference_video_urls,
-                *audio_reference_urls,
-            ],
-            public_base_url=public_base_url,
-        )
-    except Exception as exc:
-        logger.warning("generate_video reference URL validation failed: %s", exc, exc_info=True)
-        return _video_error_result(str(exc), prompt=raw_prompt, model=model)
+    public_url_references = _video_references_requiring_public_urls(
+        adapter,
+        model=model,
+        first_frame_url=first_frame_url,
+        last_frame_url=last_frame_url,
+        reference_urls=reference_urls,
+        reference_video_urls=reference_video_urls,
+        audio_reference_urls=audio_reference_urls,
+    )
+    if public_url_references:
+        try:
+            await _validate_video_reference_urls_fetchable(
+                entity_id=entity_id,
+                references=public_url_references,
+                public_base_url=public_base_url,
+            )
+        except Exception as exc:
+            logger.warning("generate_video reference URL validation failed: %s", exc, exc_info=True)
+            return _video_error_result(str(exc), prompt=raw_prompt, model=model)
 
     async with async_session() as db:
         video_params = {
@@ -5843,10 +5953,10 @@ async def _generate_video_handler(
             video_params["requested_resolution"] = requested_resolution
         if output_name:
             video_params["output_name"] = output_name
-        if kwargs.get("workspace_id"):
-            video_params["workspace_id"] = kwargs.get("workspace_id")
-        if kwargs.get("task_id"):
-            video_params["task_id"] = kwargs.get("task_id")
+        if runtime_context.workspace_id:
+            video_params["workspace_id"] = runtime_context.workspace_id
+        if runtime_context.task_id:
+            video_params["task_id"] = runtime_context.task_id
         if inferred_inline_references:
             video_params["inferred_inline_references"] = inferred_inline_references
         if prompt != raw_prompt:
@@ -5879,7 +5989,7 @@ async def _generate_video_handler(
             id=job_id,
             entity_id=entity_id,
             user_id=user_id or None,
-            agent_id=kwargs.get("agent_id") or runtime_context.agent_id,
+            agent_id=runtime_context.agent_id,
             conversation_id=conversation_id,
             kind="video",
             status="pending",
@@ -5906,8 +6016,8 @@ async def _generate_video_handler(
                     source_kind="media_job",
                     source_id=job_id,
                     reason="video generation estimate",
-                    workspace_id=kwargs.get("workspace_id") or runtime_context.workspace_id,
-                    agent_id=kwargs.get("agent_id") or runtime_context.agent_id,
+                    workspace_id=runtime_context.workspace_id,
+                    agent_id=runtime_context.agent_id,
                     conversation_id=conversation_id,
                     user_id=user_id or None,
                     metadata={

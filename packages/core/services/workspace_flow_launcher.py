@@ -29,6 +29,7 @@ from packages.core.services.workspace_workflow_router import (
 
 
 StarterPolicy = Literal["always_review", "only_missing"]
+TransactionOwner = Literal["launcher", "caller"]
 
 
 @dataclass(frozen=True)
@@ -261,9 +262,9 @@ async def launch_workspace_flow(
     starter_policy: StarterPolicy = "always_review",
     proposal_context: dict[str, Any] | None = None,
     origin_metadata: dict[str, Any] | None = None,
+    transaction_owner: TransactionOwner = "launcher",
 ) -> WorkspaceFlowLaunch:
     """Create or reuse one validated, conversation-projected Flow run."""
-    from packages.core.ai.workflow_runner import WorkflowRunner
     from packages.core.services.conversation_messages import add_message
     from packages.core.services.workflow_chat_projection import (
         workflow_progress_steps,
@@ -481,8 +482,37 @@ async def launch_workspace_flow(
             },
         )
 
+    launched = WorkspaceFlowLaunch(
+        run=run,
+        conversation=conversation,
+        origin_message=origin_message,
+        activity_message=activity_message,
+        starter_message=starter_message,
+        created=True,
+    )
+    if transaction_owner == "caller":
+        await db.flush()
+        return launched
+    if transaction_owner != "launcher":
+        raise ValueError(f"Unsupported Flow transaction owner: {transaction_owner}")
+
     await db.commit()
-    if not requires_input and WorkflowRunner.enqueue(run.id) is False:
+    await enqueue_workspace_flow_launch(db, launched)
+    return launched
+
+
+async def enqueue_workspace_flow_launch(
+    db: AsyncSession,
+    launched: WorkspaceFlowLaunch,
+) -> bool:
+    """Publish a committed Flow run, preserving the launcher's failure projection."""
+
+    if not launched.created or launched.starter_message is not None:
+        return True
+    run = launched.run
+    from packages.core.ai.workflow_runner import WorkflowRunner
+
+    if WorkflowRunner.enqueue(run.id) is False:
         run.status = "failed"
         run.error = "Workflow could not be queued. Please start it again."
         run.completed_at = datetime.now(timezone.utc)
@@ -497,12 +527,5 @@ async def launch_workspace_flow(
 
         await project_workflow_run_status(db, run=run)
         await db.commit()
-
-    return WorkspaceFlowLaunch(
-        run=run,
-        conversation=conversation,
-        origin_message=origin_message,
-        activity_message=activity_message,
-        starter_message=starter_message,
-        created=True,
-    )
+        return False
+    return True

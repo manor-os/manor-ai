@@ -22,6 +22,7 @@ from packages.core.ai.runtime.file_actions import (
 from packages.core.models.base import generate_ulid
 from packages.core.services.workspace_artifacts import (
     ensure_workspace_artifact_directory,
+    resolve_workspace_artifact_directory,
 )
 
 
@@ -82,13 +83,15 @@ async def _ledger_location(
     *,
     entity_id: str,
     workspace_id: str,
+    create: bool = True,
 ) -> tuple[Any, str, str]:
     if not entity_id or not workspace_id:
         raise StickmanTopicLedgerError(
             "missing_workspace_context",
             "Entity and Workspace context are required",
         )
-    directory = await ensure_workspace_artifact_directory(
+    resolver = ensure_workspace_artifact_directory if create else resolve_workspace_artifact_directory
+    directory = await resolver(
         entity_id=entity_id,
         workspace_id=workspace_id,
         directory_path=LEDGER_DIRECTORY,
@@ -106,7 +109,8 @@ async def _ledger_location(
             "invalid_ledger_path",
             "Topic Ledger path escaped the Workspace filesystem",
         )
-    os.makedirs(ledger_root, exist_ok=True)
+    if create:
+        os.makedirs(ledger_root, exist_ok=True)
     return directory, ledger_root, root
 
 
@@ -241,9 +245,12 @@ async def read_topic_ledger(
 ) -> dict[str, Any]:
     """Read exact used Topics and recent append-only records from Knowledge."""
 
+    # Document renderers already hold Workspace policy locks. A read must not
+    # open a second mutation transaction to initialize its artifact directory.
     _, ledger_root, _ = await _ledger_location(
         entity_id=entity_id,
         workspace_id=workspace_id,
+        create=False,
     )
     reservations = _reservation_records(ledger_root)
     records = [_read_json_file(path) for path in _record_files(ledger_root)]

@@ -8,11 +8,14 @@ integration credential.
 """
 from __future__ import annotations
 
+from decimal import Decimal, InvalidOperation
 from typing import Optional
 
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from packages.core.constants.goals import GoalStatus
+from packages.core.constants.review import ConsolidationReportStatus
 from packages.core.consolidators.base import SnapshotContext, evidence_ids
 from packages.core.consolidators.contract import (
     ConsolidationReportModel,
@@ -21,15 +24,17 @@ from packages.core.consolidators.contract import (
     Uncertainty,
 )
 from packages.core.ledger import event_types as et
+from packages.core.goals.numbers import goal_number_to_json
 from packages.core.models.document import Integration
 from packages.core.models.goal import Goal, GoalMeasurement
 
 
-def _float(value) -> Optional[float]:
+def _decimal(value: object) -> Optional[Decimal]:
     try:
-        return float(value) if value is not None else None
-    except (TypeError, ValueError):
+        number = value if isinstance(value, Decimal) else Decimal(str(value))
+    except (ArithmeticError, InvalidOperation, TypeError, ValueError):
         return None
+    return number if number.is_finite() else None
 
 
 class GoalConsolidator:
@@ -42,7 +47,7 @@ class GoalConsolidator:
         goals = list((await db.execute(
             select(Goal).where(
                 Goal.workspace_id == review.workspace_id,
-                Goal.status == "active",
+                Goal.status == GoalStatus.ACTIVE.value,
             ).order_by(Goal.priority.asc(), Goal.id.asc())
         )).scalars().all())
 
@@ -63,17 +68,28 @@ class GoalConsolidator:
         for goal in goals:
             own_events = events_by_goal.get(goal.id, [])
             measured = [e for e in own_events if e.event_type == et.GOAL_MEASURED]
-            values = [v for v in (_float((e.payload or {}).get("value")) for e in measured) if v is not None]
-            window_delta = (values[-1] - values[0]) if len(values) >= 2 else 0.0
+            values = [
+                value
+                for value in (
+                    _decimal((event.payload or {}).get("value"))
+                    for event in measured
+                )
+                if value is not None
+            ]
+            window_delta = (
+                values[-1] - values[0]
+                if len(values) >= 2
+                else Decimal("0")
+            )
 
             digests.append({
                 "goal_id": goal.id,
                 "title": goal.title,
                 "metric_key": goal.metric_key,
-                "current": _float(goal.current_value),
-                "target": _float(goal.target_value),
+                "current": goal_number_to_json(_decimal(goal.current_value)),
+                "target": goal_number_to_json(_decimal(goal.target_value)),
                 "pace_status": goal.pace_status,
-                "window_delta": window_delta,
+                "window_delta": goal_number_to_json(window_delta),
                 "measurement_count": len(measured),
                 "last_measured_at": (
                     goal.current_value_updated_at.isoformat()
@@ -134,7 +150,7 @@ class GoalConsolidator:
                     ))
 
             # goal_stalled — execution happened, metric did not move.
-            if execution_happened and window_delta == 0.0 and len(values) >= 2:
+            if execution_happened and window_delta == 0 and len(values) >= 2:
                 observations.append(Observation(
                     type="goal_stalled",
                     description=(
@@ -172,7 +188,7 @@ class GoalConsolidator:
         }
         return ConsolidationReportModel(
             domain=self.domain,
-            status="complete",
+            status=ConsolidationReportStatus.COMPLETE,
             summary=(
                 f"{len(goals)} active goal(s); {len(goal_events)} goal event(s) "
                 f"in window; {goals_without_recent_measurement} measurement gap(s)"

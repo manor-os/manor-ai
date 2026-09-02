@@ -28,7 +28,11 @@ from typing import Any, Dict, Optional
 
 from packages.core.models.channel import ChannelConfig
 from packages.core.services.channels.base import (
-    ChannelAdapter, NormalizedInbound, register_adapter,
+    ChannelAdapter,
+    ChannelTextSendResultStatus,
+    NormalizedInbound,
+    channel_text_send_result,
+    register_adapter,
 )
 from packages.core.services.realtime import push_notification
 
@@ -44,6 +48,7 @@ class InAppChannelAdapter(ChannelAdapter):
         # ``to`` is the Manor user_id for in-app.
         await push_notification(
             user_id=to,
+            entity_id=cc.entity_id,
             notification={
                 "type": "agent_message",
                 "channel_config_id": cc.id,
@@ -51,7 +56,11 @@ class InAppChannelAdapter(ChannelAdapter):
                 "conversation_id": kwargs.get("conversation_id"),
             },
         )
-        return {"delivered_via": "websocket", "user_id": to}
+        return channel_text_send_result(
+            ChannelTextSendResultStatus.SENT,
+            delivered_via="websocket",
+            user_id=to,
+        )
 
     async def verify_inbound(self, cc: ChannelConfig, *, headers, query, body) -> bool:
         # Auth happens at the HTTP middleware layer — this path is only

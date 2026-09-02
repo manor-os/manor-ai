@@ -1,6 +1,6 @@
 """Internationalization — simple key-based translations.
 
-Supports: en, zh, es, ja (extensible).
+Supports: en, zh, es, fr, ja (extensible).
 Usage:
     from packages.core.i18n import t, set_locale, get_locale
 
@@ -82,6 +82,31 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "auth.registered": "Registro exitoso",
         "auth.login_success": "Inicio de sesión exitoso",
         "auth.password_changed": "Contraseña cambiada con éxito",
+    },
+    "fr": {
+        "error.not_found": "Introuvable",
+        "error.unauthorized": "Authentification requise",
+        "error.forbidden": "Permission refusée",
+        "error.rate_limited": "Trop de requêtes, veuillez réessayer plus tard",
+        "error.validation": "Erreur de validation",
+        "error.internal": "Erreur interne du serveur",
+        "task.created": "Tâche créée avec succès",
+        "task.updated": "Tâche mise à jour",
+        "task.deleted": "Tâche supprimée",
+        "task.status_changed": "Statut de la tâche modifié : {status}",
+        "doc.uploaded": "Document importé avec succès",
+        "doc.deleted": "Document supprimé",
+        "agent.created": "Agent créé",
+        "agent.subscribed": "Agent suivi",
+        "auth.registered": "Inscription réussie",
+        "auth.login_success": "Connexion réussie",
+        "auth.password_changed": "Mot de passe modifié avec succès",
+        "auth.reset_sent": "Si cette adresse existe, un lien de réinitialisation a été envoyé",
+        "notification.none": "Aucune notification",
+        "notification.marked_read": "Marqué comme lu",
+        "share.created": "Lien de partage créé",
+        "share.revoked": "Lien de partage révoqué",
+        "share.expired": "Ce lien de partage a expiré",
     },
     "ja": {
         "error.not_found": "見つかりません",

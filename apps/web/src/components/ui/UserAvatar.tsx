@@ -14,7 +14,8 @@
  */
 import { useState } from "react";
 import AgentAvatar from "./AgentAvatar";
-import { IconUser, IconManorLogo, IconWorkspace, IconShield } from "../icons";
+import ManorAvatar from "./ManorAvatar";
+import { IconUser, IconWorkspace, IconShield } from "../icons";
 
 type AvatarType = "user" | "agent" | "manor" | "workspace" | "governance" | "none";
 
@@ -36,16 +37,7 @@ export default function UserAvatar({ name, avatarUrl, type = "user", seed, size 
 
   // Manor AI — always the M logo
   if (type === "manor") {
-    return (
-      <div style={{
-        width: size, height: size, borderRadius: "50%", flexShrink: 0,
-        background: "linear-gradient(135deg, #5d7f77, #5f928a)",
-        display: "flex", alignItems: "center", justifyContent: "center",
-        border: "1.5px solid rgba(255,255,255,0.8)", ...style,
-      }}>
-        <IconManorLogo size={Math.round(size * 0.5)} style={{ color: "#fff" }} />
-      </div>
-    );
+    return <ManorAvatar size={size} style={style} />;
   }
 
   if (type === "agent") {

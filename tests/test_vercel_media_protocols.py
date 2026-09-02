@@ -3,8 +3,142 @@ import json
 from types import SimpleNamespace
 
 import pytest
+from PIL import Image
 
 from packages.core.services.model_gateway import ModelGatewayRoute
+
+
+@pytest.mark.asyncio
+async def test_oversized_local_image_is_compressed_for_inline_video_reference(
+    monkeypatch,
+    tmp_path,
+):
+    from packages.core.tasks import media_tasks
+    from packages.core.services import entity_fs
+
+    image_path = tmp_path / "images" / "scene.png"
+    image_path.parent.mkdir()
+    Image.effect_noise((1024, 1024), 100).convert("RGB").save(image_path, format="PNG")
+    assert image_path.stat().st_size > 32 * 1024
+
+    monkeypatch.setattr(entity_fs, "get_entity_root", lambda _entity_id: str(tmp_path))
+    monkeypatch.setattr(
+        media_tasks,
+        "_entity_rel_path_from_reference",
+        lambda *_args, **_kwargs: "images/scene.png",
+    )
+
+    data_url = await media_tasks._ensure_inline_data_url(
+        "/api/v1/fs/entity/images/scene.png",
+        "entity",
+        max_bytes=32 * 1024,
+    )
+    header, encoded = data_url.split(",", 1)
+
+    assert header == "data:image/jpeg;base64"
+    assert len(base64.b64decode(encoded)) <= 32 * 1024
+
+
+@pytest.mark.asyncio
+async def test_vercel_video_reference_uses_gateway_safe_inline_size_limit():
+    from packages.core.tasks import video_adapters
+
+    captured = {}
+
+    async def inline_data_url(value, _entity_id, **kwargs):
+        captured.update(value=value, **kwargs)
+        return "data:image/jpeg;base64,aW1hZ2U="
+
+    runtime = video_adapters.VideoAdapterRuntime(
+        http_client_cls=None,
+        media_api_timeout=None,
+        ensure_public_url=None,
+        public_url_kwargs=lambda _url: {},
+        remember_provider_poll=None,
+        poll_openrouter_generation=None,
+        poll_volcengine_task=None,
+        poll_generic_video_task=None,
+        download_and_save=None,
+        extract_video_url=None,
+        extract_task_id=None,
+        provider_error_message=None,
+        openrouter_api_url=None,
+        normalize_duration=None,
+        normalize_resolution=None,
+        ensure_inline_data_url=inline_data_url,
+    )
+
+    result = await video_adapters.materialize_video_reference(
+        "/api/v1/fs/entity/images/scene.png",
+        "entity",
+        media_kind="image",
+        capability=video_adapters.VERCEL_IMAGE_MEDIA_REFERENCE,
+        runtime=runtime,
+        public_base_url="",
+    )
+
+    assert captured == {
+        "value": "/api/v1/fs/entity/images/scene.png",
+        "max_bytes": video_adapters.VERCEL_VIDEO_INLINE_REFERENCE_MAX_BYTES,
+    }
+    assert result.as_vercel_file() == {
+        "type": "file",
+        "data": "aW1hZ2U=",
+        "mediaType": "image/jpeg",
+    }
+
+
+@pytest.mark.asyncio
+async def test_image_reference_falls_back_to_signed_url_when_inline_encoding_fails():
+    from packages.core.tasks import video_adapters
+
+    calls = []
+
+    async def inline_data_url(*_args, **_kwargs):
+        raise video_adapters.InlineMediaReferenceLimitError(
+            "Local image reference cannot be encoded below the inline limit."
+        )
+
+    async def ensure_public_url(value, entity_id, **kwargs):
+        calls.append((value, entity_id, kwargs))
+        return "https://media.example.test/public/scene.png"
+
+    runtime = video_adapters.VideoAdapterRuntime(
+        http_client_cls=None,
+        media_api_timeout=None,
+        ensure_public_url=ensure_public_url,
+        public_url_kwargs=lambda public_base_url: {"public_base_url": public_base_url},
+        remember_provider_poll=None,
+        poll_openrouter_generation=None,
+        poll_volcengine_task=None,
+        poll_generic_video_task=None,
+        download_and_save=None,
+        extract_video_url=None,
+        extract_task_id=None,
+        provider_error_message=None,
+        openrouter_api_url=None,
+        normalize_duration=None,
+        normalize_resolution=None,
+        ensure_inline_data_url=inline_data_url,
+    )
+
+    result = await video_adapters.materialize_video_reference(
+        "/api/v1/fs/entity/images/scene.png",
+        "entity",
+        media_kind="image",
+        capability=video_adapters.OPENROUTER_IMAGE_MEDIA_REFERENCE,
+        runtime=runtime,
+        public_base_url="https://manor.example.test",
+    )
+
+    assert result.as_data_url() == "https://media.example.test/public/scene.png"
+    assert calls == [
+        (
+            "/api/v1/fs/entity/images/scene.png",
+            "entity",
+            {"public_base_url": "https://manor.example.test"},
+        )
+    ]
 
 
 @pytest.mark.asyncio
@@ -293,7 +427,7 @@ async def test_video_adapter_uses_vercel_start_and_status_protocol(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_openrouter_video_adapter_uses_resolved_base_url(monkeypatch):
+async def test_openrouter_video_adapter_inlines_local_first_frame_as_base64():
     from packages.core.tasks import video_adapters
 
     captured = {}
@@ -328,10 +462,18 @@ async def test_openrouter_video_adapter_uses_resolved_base_url(monkeypatch):
     async def download(*_args, **_kwargs):
         return {"result_url": "/api/v1/fs/entity/videos/result.mp4"}
 
+    async def ensure_public_url(*_args, **_kwargs):
+        raise AssertionError("OpenRouter local image frames should not require a public URL")
+
+    async def inline_data_url(value, _entity_id, **kwargs):
+        assert value == "/api/v1/fs/entity/images/scene-01.png"
+        assert kwargs["max_bytes"] == video_adapters.OPENROUTER_VIDEO_INLINE_IMAGE_MAX_BYTES
+        return "data:image/png;base64,aW1hZ2U="
+
     runtime = video_adapters.VideoAdapterRuntime(
         http_client_cls=Client,
         media_api_timeout=None,
-        ensure_public_url=lambda value, *_args, **_kwargs: value,
+        ensure_public_url=ensure_public_url,
         public_url_kwargs=lambda _url: {},
         remember_provider_poll=remember,
         poll_openrouter_generation=poll,
@@ -345,12 +487,18 @@ async def test_openrouter_video_adapter_uses_resolved_base_url(monkeypatch):
         normalize_duration=lambda value: int(value),
         normalize_resolution=lambda _model, value: str(value),
     )
+    object.__setattr__(runtime, "ensure_inline_data_url", inline_data_url)
     job = SimpleNamespace(
         id="job-1",
         entity_id="entity",
         prompt="A short video",
         model="bytedance/seedance-2.0",
-        params={"duration": 5, "resolution": "720p", "aspect_ratio": "16:9"},
+        params={
+            "duration": 5,
+            "resolution": "720p",
+            "aspect_ratio": "16:9",
+            "first_frame_url": "/api/v1/fs/entity/images/scene-01.png",
+        },
     )
 
     await video_adapters.OpenRouterVideoAdapter().submit(
@@ -361,3 +509,10 @@ async def test_openrouter_video_adapter_uses_resolved_base_url(monkeypatch):
     )
 
     assert captured["url"] == "https://admin-openrouter.example/v1/videos"
+    assert captured["kwargs"]["json"]["frame_images"] == [
+        {
+            "type": "image_url",
+            "image_url": {"url": "data:image/png;base64,aW1hZ2U="},
+            "frame_type": "first_frame",
+        }
+    ]

@@ -219,17 +219,17 @@ def _parse_src_rect(elem: ET.Element | None) -> tuple[float, float, float, float
         return None
     if not (elem.attrib.keys() & {"l", "t", "r", "b"}):
         return None
-    l = _pct_attr(elem, "l")
-    t = _pct_attr(elem, "t")
-    r = _pct_attr(elem, "r")
-    b = _pct_attr(elem, "b")
+    left = _pct_attr(elem, "l")
+    top = _pct_attr(elem, "t")
+    right = _pct_attr(elem, "r")
+    bottom = _pct_attr(elem, "b")
     # All zero -> equivalent to no crop
-    if l == 0 and t == 0 and r == 0 and b == 0:
+    if left == 0 and top == 0 and right == 0 and bottom == 0:
         return None
-    vb_x = l
-    vb_y = t
-    vb_w = max(0.0, 1.0 - l - r)
-    vb_h = max(0.0, 1.0 - t - b)
+    vb_x = left
+    vb_y = top
+    vb_w = max(0.0, 1.0 - left - right)
+    vb_h = max(0.0, 1.0 - top - bottom)
     if vb_w <= 0 or vb_h <= 0:
         return None
     return vb_x, vb_y, vb_w, vb_h
@@ -271,7 +271,7 @@ def _apply_blip_image_effects(
         save_kwargs = {"quality": 95} if save_format.upper() in {"JPEG", "JPG"} else {}
         image.save(out, format=save_format, **save_kwargs)
         effect_key = f"lum-{bright}-{contrast}".encode("ascii")
-        digest = hashlib.sha1(effect_key).hexdigest()[:8]
+        digest = hashlib.sha1(effect_key, usedforsecurity=False).hexdigest()[:8]
         return _effect_filename(filename, digest, save_format), out.getvalue()
     except Exception:
         return filename, img_bytes

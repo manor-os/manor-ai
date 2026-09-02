@@ -15,13 +15,16 @@ from decimal import Decimal
 from types import SimpleNamespace
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import select, text
 
 from packages.core.ledger import event_types as et
 from packages.core.models.base import generate_ulid
+from packages.core.models.product_growth import ProductGrowthEvent
 from packages.core.models.task import Task
+from packages.core.models.user import User
 from packages.core.models.workspace import Workspace
 from packages.core.models.workspace_event import WorkspaceEvent
+from packages.core.ledger.adapters import record_workflow_run_status
 from packages.core.services.task_state_machine import apply_task_status_transition
 
 
@@ -114,6 +117,52 @@ async def test_entity_level_task_without_workspace_writes_nothing(db_session):
     assert await _events(db_session, entity_id=entity_id) == []
 
 
+@pytest.mark.parametrize(
+    ("trigger_source", "trigger_data", "started_by", "expected_causation"),
+    [
+        ("manual", {}, "user_1", None),
+        ("workspace_chat", {}, "user_1", None),
+        ("schedule", {"scheduled_job_id": "job_1"}, None, "job_1"),
+        ("workspace_event", {}, "user_1", "synthetic"),
+        ("webhook", {}, "user_1", "synthetic"),
+        ("manual", {"parent_run_id": "parent_1"}, "user_1", "parent_1"),
+    ],
+)
+async def test_workflow_completion_marks_every_automated_origin_as_caused(
+    db_session,
+    trigger_source,
+    trigger_data,
+    started_by,
+    expected_causation,
+):
+    ws = _mk_workspace(db_session)
+    run = SimpleNamespace(
+        id=generate_ulid(),
+        entity_id=ws.entity_id,
+        workspace_id=ws.id,
+        binding_id="binding_1",
+        workflow_id="workflow_1",
+        trigger_source=trigger_source,
+        trigger_data=trigger_data,
+        started_by=started_by,
+        status="completed",
+        error=None,
+    )
+
+    await record_workflow_run_status(db_session, run)
+
+    [event] = await _events(
+        db_session,
+        entity_id=ws.entity_id,
+        event_type=et.WORKFLOW_RUN_COMPLETED,
+    )
+    if expected_causation == "synthetic":
+        assert event.causation_id is not None
+        assert trigger_source in event.causation_id
+    else:
+        assert event.causation_id == expected_causation
+
+
 async def test_reapplied_terminal_transition_is_idempotent(db_session):
     ws = _mk_workspace(db_session)
     task = _mk_task(db_session, ws)
@@ -150,6 +199,23 @@ async def test_approval_lifecycle_events(db_session):
     )
 
     ws = _mk_workspace(db_session)
+    await db_session.flush()
+    db_session.add_all([
+        User(
+            id="user_1",
+            entity_id=ws.entity_id,
+            email="ledger-user-1@example.com",
+            password_hash="x",
+            role="owner",
+        ),
+        User(
+            id="user_2",
+            entity_id=ws.entity_id,
+            email="ledger-user-2@example.com",
+            password_hash="x",
+            role="owner",
+        ),
+    ])
     await db_session.flush()
     step_id = generate_ulid()
     subject = ApprovalSubject(
@@ -229,7 +295,7 @@ async def test_goal_measurement_and_achievement_events(db_session):
     assert measured[0].source_kind == "goal"
     assert measured[0].source_id == goal.id
     assert measured[0].goal_refs == [goal.id]
-    assert measured[0].payload == {"value": 5.0, "source": "manual"}
+    assert measured[0].payload == {"value": 5, "source": "manual"}
     assert measured[0].status is None
     assert await _events(db_session, entity_id=ws.entity_id, event_type=et.GOAL_ACHIEVED) == []
 
@@ -238,9 +304,45 @@ async def test_goal_measurement_and_achievement_events(db_session):
 
     assert len(await _events(db_session, entity_id=ws.entity_id, event_type=et.GOAL_MEASURED)) == 2
     [achieved] = await _events(db_session, entity_id=ws.entity_id, event_type=et.GOAL_ACHIEVED)
-    assert achieved.payload == {"value": 10.0}
+    assert achieved.payload == {"value": 10}
     pace_changes = await _events(db_session, entity_id=ws.entity_id, event_type=et.GOAL_PACE_CHANGED)
     assert pace_changes and pace_changes[-1].payload["new_pace"] == "achieved"
+
+
+async def test_goal_measurement_event_preserves_exact_decimal_value(db_session):
+    from packages.core.goals.service import record_measurement
+    from packages.core.models.goal import Goal
+
+    ws = _mk_workspace(db_session)
+    goal = Goal(
+        id=generate_ulid(),
+        entity_id=ws.entity_id,
+        workspace_id=ws.id,
+        title="Exact revenue units",
+        metric_key="revenue_units",
+        target_value=Decimal("9999999999999999.9999"),
+        baseline_value=Decimal("0"),
+        status="active",
+    )
+    db_session.add(goal)
+    await db_session.flush()
+
+    measured_at = datetime(2026, 7, 22, 8, 0, tzinfo=timezone.utc)
+    value = Decimal("9007199254740992.0001")
+    await record_measurement(
+        db_session,
+        goal,
+        value=value,
+        source="manual",
+        measured_at=measured_at,
+    )
+
+    [event] = await _events(
+        db_session,
+        entity_id=ws.entity_id,
+        event_type=et.GOAL_MEASURED,
+    )
+    assert event.payload == {"value": "9007199254740992.0001", "source": "manual"}
 
 
 # ── Strategist proposals ───────────────────────────────────────────
@@ -302,6 +404,115 @@ async def test_reject_proposal_emits_item_rejected_with_reason(db_session):
     # proposed → cancelled is also an execution fact.
     [cancelled_event] = await _events(db_session, entity_id=ws.entity_id, event_type=et.EXECUTION_CANCELLED)
     assert cancelled_event.source_id == task.id
+
+
+# ── Automation milestone activity ──────────────────────────────────
+
+async def test_automation_growth_milestones_survive_job_delete(db_session):
+    from packages.core.constants.analytics import ProductGrowthMilestone
+    from packages.core.ledger.adapters import record_automation_run_finished
+    from packages.core.services.scheduler_service import (
+        create_scheduled_job,
+        delete_scheduled_job,
+    )
+
+    ws = _mk_workspace(db_session)
+    user = User(
+        id=generate_ulid(),
+        entity_id=ws.entity_id,
+        email=f"automation-growth-{generate_ulid()}@example.com",
+        password_hash="not-used",
+        role="owner",
+    )
+    db_session.add(user)
+    await db_session.flush()
+
+    job = await create_scheduled_job(
+        db_session,
+        ws.entity_id,
+        f"growth-history:{generate_ulid()}",
+        "Growth history",
+        workspace_id=ws.id,
+        user_id=user.id,
+    )
+    run_id = generate_ulid()
+    await record_automation_run_finished(
+        db_session,
+        job,
+        run_id=run_id,
+        status="completed",
+    )
+    await record_automation_run_finished(
+        db_session,
+        job,
+        run_id=run_id,
+        status="completed",
+    )
+
+    events = list((await db_session.execute(
+        select(ProductGrowthEvent)
+        .where(ProductGrowthEvent.user_id == user.id)
+        .order_by(ProductGrowthEvent.occurred_at)
+    )).scalars().all())
+    assert [event.milestone for event in events] == [
+        ProductGrowthMilestone.AUTOMATION_CREATED.value,
+        ProductGrowthMilestone.AUTOMATION_SUCCEEDED.value,
+    ]
+    assert [(event.source_kind, event.source_id) for event in events] == [
+        ("scheduled_job", job.id),
+        ("scheduled_job_run", run_id),
+    ]
+
+    assert await delete_scheduled_job(db_session, job.id, ws.entity_id) is True
+    remaining = list((await db_session.execute(
+        select(ProductGrowthEvent).where(ProductGrowthEvent.user_id == user.id)
+    )).scalars().all())
+    assert len(remaining) == 2
+
+
+async def test_product_growth_failure_rolls_back_only_its_savepoint(
+    db_session,
+    monkeypatch,
+):
+    from packages.core.ledger.adapters import record_automation_run_finished
+    from packages.core.services import product_growth
+
+    ws = _mk_workspace(db_session)
+    await db_session.flush()
+    job = SimpleNamespace(
+        id=generate_ulid(),
+        job_id=f"savepoint-growth:{generate_ulid()}",
+        entity_id=ws.entity_id,
+        workspace_id=ws.id,
+        user_id=generate_ulid(),
+        execution_target={},
+    )
+
+    async def abort_statement(db, **_kwargs):
+        await db.execute(text("SELECT * FROM missing_product_growth_relation"))
+
+    monkeypatch.setattr(
+        product_growth,
+        "record_product_growth_milestone",
+        abort_statement,
+    )
+    run_id = generate_ulid()
+    await record_automation_run_finished(
+        db_session,
+        job,
+        run_id=run_id,
+        status="completed",
+    )
+
+    # The host transaction remains usable and the canonical Workspace ledger
+    # fact still records even though optional product analytics failed.
+    await db_session.flush()
+    [event] = await _events(
+        db_session,
+        entity_id=ws.entity_id,
+        event_type=et.AUTOMATION_RUN_COMPLETED,
+    )
+    assert event.run_id == run_id
 
 
 # ── Automation period key (pure mapping) ───────────────────────────

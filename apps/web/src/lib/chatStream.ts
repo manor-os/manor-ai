@@ -5,8 +5,14 @@
  */
 import { useState, useEffect } from "react";
 import { useUpgradeStore } from "../stores/upgrade";
-import { api, normalizePlanLimitDetail, type PlanLimitDetail } from "./api";
+import {
+  api,
+  type PlanLimitDetail,
+  type WorkspaceLedgerOverview,
+  type WorkspaceLedgerQueryVisualization,
+} from "./api";
 import { t } from "./i18n";
+import type { ManualSkillReference } from "./manualSkillRefs";
 
 /* ── Types ── */
 
@@ -15,6 +21,10 @@ export interface ToolCall {
   args?: unknown;
   arguments?: string;
   result?: string;
+  /** Full persisted Workspace Draft output. Live SSE keeps using the compact
+   *  `result`; this is retained after history hydration only when the draft
+   *  artifact JSON would otherwise be parsed from a truncated preview. */
+  rawResult?: string;
   status?: "pending" | "success" | "error";
   startedAt?: number;
   duration?: string;
@@ -64,7 +74,112 @@ export interface AssistantProcessBlock {
   steps: AssistantProcessStep[];
 }
 
-export type AssistantBlock = AssistantTextBlock | AssistantProcessBlock;
+export interface AssistantLedgerOverviewVisualizationBlock {
+  id: string;
+  type: "visualization";
+  kind: "workspace_ledger_overview";
+  data: WorkspaceLedgerOverview;
+}
+
+export interface AssistantLedgerQueryVisualizationBlock {
+  id: string;
+  type: "visualization";
+  kind: "ledger_query_result";
+  data: WorkspaceLedgerQueryVisualization;
+}
+
+export type AssistantVisualizationBlock =
+  | AssistantLedgerOverviewVisualizationBlock
+  | AssistantLedgerQueryVisualizationBlock;
+
+export interface AssistantResponseSurfaceAction {
+  id: string;
+  label: string;
+  intent: "submit";
+}
+
+export interface AssistantTemplateSurfaceRender {
+  kind: "template";
+  template_id:
+    | "learning.code_lab"
+    | "response.choice"
+    | "workspace.ledger.overview"
+    | "workspace.ledger.query";
+  template_version: 1;
+  props: Record<string, unknown>;
+}
+
+export interface AssistantGeneratedSurfaceRender {
+  kind: "sandboxed_html";
+  code: {
+    version: 1;
+    runtime: "sandboxed_html";
+    html: string;
+    css: string;
+    javascript: string;
+  };
+  data: Record<string, unknown>;
+  validation: {
+    policy: "response_surface.v1" | "response_surface.v2";
+    code_hash: string;
+  };
+}
+
+export interface AssistantResponseSurfaceBlock {
+  id: string;
+  type: "surface";
+  version: 1;
+  title: string;
+  description?: string;
+  render: AssistantTemplateSurfaceRender | AssistantGeneratedSurfaceRender;
+  display: {
+    preferred: "inline" | "focus";
+    inline_height: number;
+    focusable: boolean;
+  };
+  actions: AssistantResponseSurfaceAction[];
+  fallback_markdown: string;
+}
+
+export interface ResponseSurfaceSubmission {
+  sourceMessageId: string;
+  surfaceId: string;
+  title: string;
+  action: string;
+  actionLabel: string;
+  payload: Record<string, unknown>;
+  context?: {
+    templateId?: AssistantTemplateSurfaceRender["template_id"];
+    instructions?: string;
+    checks?: string[];
+  };
+}
+
+export interface ResponseSurfaceSubmissionReceipt extends ResponseSurfaceSubmission {
+  version: 1;
+  eventId: string;
+  recordedAt: string;
+  /** UI projection only; never required by the submission API. */
+  outcome?: "failed" | "interrupted";
+  /** UI projection only; true after the receipt is read from durable history. */
+  durable?: boolean;
+  /** UI projection only; derived from the assistant message linked to this receipt. */
+  status?: "pending" | "succeeded" | "failed" | "interrupted";
+}
+
+export interface ResponseSurfaceSubmissionResult {
+  status: "succeeded" | "failed" | "cancelled";
+  /** Whether the server durably accepted this event. */
+  serverAccepted: boolean;
+  /** Whether a determinate business outcome, not only a persistence failure, was observed. */
+  terminalObserved: boolean;
+}
+
+export type AssistantBlock =
+  | AssistantTextBlock
+  | AssistantProcessBlock
+  | AssistantVisualizationBlock
+  | AssistantResponseSurfaceBlock;
 
 // Tools that internally spawn nested agentic loops. While one of these
 // is pending, sub-tool events that arrive should update the parent's
@@ -161,6 +276,44 @@ export interface WorkflowResultReference {
   } | null;
 }
 
+export type WorkspaceRecommendationAction =
+  | "create_new"
+  | "open_existing"
+  | "add_to_existing";
+
+export interface WorkspaceRecommendation {
+  action: WorkspaceRecommendationAction;
+  reason: string;
+  request: string;
+  workspace_id?: string;
+  workspace_name?: string;
+}
+
+export function normalizeWorkspaceRecommendation(
+  value: unknown,
+): WorkspaceRecommendation | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const item = value as Record<string, unknown>;
+  const action = String(item.action || "") as WorkspaceRecommendationAction;
+  const reason = String(item.reason || "").trim();
+  const request = String(item.request || "").trim();
+  const workspaceId = String(item.workspace_id || "").trim();
+  const workspaceName = String(item.workspace_name || "").trim();
+  if (!(["create_new", "open_existing", "add_to_existing"] as string[]).includes(action)) {
+    return null;
+  }
+  if (!reason || !request) return null;
+  if (action === "create_new" && workspaceId) return null;
+  if (action !== "create_new" && !workspaceId) return null;
+  return {
+    action,
+    reason,
+    request,
+    ...(workspaceId ? { workspace_id: workspaceId } : {}),
+    ...(workspaceName ? { workspace_name: workspaceName } : {}),
+  };
+}
+
 export interface ChatMessage {
   id?: string;
   conversation_id?: string;
@@ -174,7 +327,7 @@ export interface ChatMessage {
   timestamp?: string;
   attachments?: {
     name: string;
-    id?: string;
+    document_id?: string;
     type?: string;
     fileType?: string;
     mimeType?: string;
@@ -188,6 +341,7 @@ export interface ChatMessage {
     name: string;
     subtitle?: string;
     avatarUrl?: string | null;
+    avatarSeed?: string;
   }[];
   manualSkills?: { id: string; name: string; slug?: string }[];
   chatMode?: string;
@@ -199,8 +353,10 @@ export interface ChatMessage {
     agentId?: string;
     workspaceId?: string;
     manualSkillIds?: string[];
+    manualSkillRefs?: ManualSkillReference[];
     chatMode?: string;
     chatModePayload?: Record<string, unknown>;
+    responseSurfaceSubmission?: ResponseSurfaceSubmissionReceipt;
   };
   stream_error?: boolean;
   stop_reason?: string;
@@ -222,11 +378,6 @@ export function hasActivePersistedChatStream(messages: ChatMessage[]): boolean {
   return status === "running" || status === "streaming";
 }
 
-/**
- * A chat run can outlive the browser's SSE connection. Keep visual running
- * state separate from transport state so navigation or a reconnect does not
- * make an active backend turn look complete.
- */
 export function isChatRunActive(
   messages: ChatMessage[],
   transportStreaming: boolean,
@@ -234,14 +385,6 @@ export function isChatRunActive(
   return transportStreaming || hasActivePersistedChatStream(messages);
 }
 
-/**
- * In-progress reply pushed over the WebSocket for a turn this tab is not
- * streaming (`chat_stream_snapshot`, published by chat_service).
- *
- * A personal conversation streams over the SSE body of the POST that started
- * it, so a reloaded page has no connection to a turn that is still running.
- * These carry the reply itself rather than a "go refetch" ping.
- */
 export interface ChatStreamSnapshot {
   conversation_id?: string;
   message_id?: string;
@@ -256,15 +399,6 @@ export function isTerminalStreamSnapshot(snapshot: ChatStreamSnapshot): boolean 
   return snapshot.status !== "streaming";
 }
 
-/**
- * Which row of a transcript a snapshot is describing, or -1 for none of them.
- *
- * The persisted id is the only trustworthy answer. "The last assistant row" is
- * not: a turn started from another tab has an id this transcript has never
- * seen, and treating it as the tail row overwrites the previous turn's finished
- * answer — dragging that answer's attachments and approval card onto a reply
- * that is still being written.
- */
 function streamSnapshotTargetIndex(
   messages: ChatMessage[],
   snapshot: ChatStreamSnapshot,
@@ -273,19 +407,11 @@ function streamSnapshotTargetIndex(
     const byId = messages.findIndex((message) => message.id === snapshot.message_id);
     if (byId >= 0) return byId;
   }
-  // No id match. Only a trailing assistant row that carries no id of its own can
-  // still be this turn — an optimistic placeholder, never a persisted reply.
   const tailIndex = messages.length - 1;
   const tail = messages[tailIndex];
   return tail && tail.role === "assistant" && !tail.id ? tailIndex : -1;
 }
 
-/**
- * Whether this snapshot describes a turn the transcript does not contain.
- *
- * True when a turn was started somewhere else: the reader is missing that
- * turn's user message, so the transcript needs a reload rather than a merge.
- */
 export function streamSnapshotNeedsHistory(
   messages: ChatMessage[],
   snapshot: ChatStreamSnapshot,
@@ -293,19 +419,6 @@ export function streamSnapshotNeedsHistory(
   return streamSnapshotTargetIndex(messages, snapshot) < 0;
 }
 
-/**
- * Fold a snapshot into a transcript loaded from the API.
- *
- * The in-progress assistant row is normally already in that transcript — the
- * history endpoint only hides a running placeholder once a newer finished reply
- * exists — so this replaces in place. It appends only for a turn the transcript
- * has never seen, where the alternative is destroying a finished reply.
- *
- * A snapshot is a projection of the live turn, not of the stored row: it has no
- * attachments, hitl_requests, pending_action or message_kind. Those only settle
- * when the turn ends, which is why callers refetch on a terminal snapshot
- * instead of trusting it — see `isTerminalStreamSnapshot`.
- */
 export function mergeChatStreamSnapshot(
   messages: ChatMessage[],
   snapshot: ChatStreamSnapshot,
@@ -315,7 +428,6 @@ export function mergeChatStreamSnapshot(
   const blocks = Array.isArray(snapshot.assistant_blocks)
     ? (snapshot.assistant_blocks as AssistantBlock[])
     : undefined;
-
   const targetIndex = streamSnapshotTargetIndex(messages, snapshot);
   const previous = targetIndex >= 0 ? messages[targetIndex] : undefined;
   const merged: ChatMessage = {
@@ -335,6 +447,41 @@ export function mergeChatStreamSnapshot(
   const updated = [...messages];
   updated[targetIndex] = merged;
   return updated;
+}
+
+export interface RuntimeQueueState {
+  ticket: string;
+  position?: number;
+  etaSeconds?: number;
+  pollAfterSeconds: number;
+  deadlineAt?: string;
+}
+
+export interface RuntimeStreamState {
+  runId: string;
+  status: string;
+  queue?: RuntimeQueueState;
+  pollAfterSeconds: number;
+  lastEventId?: string;
+}
+
+export function formatRuntimeQueueStatus(queue: RuntimeQueueState): string {
+  const parts = [t("component.chat_runtime_queue.waiting")];
+  if (Number.isFinite(queue.position) && Number(queue.position) > 0) {
+    parts.push(
+      t("component.chat_runtime_queue.position", {
+        position: Math.floor(Number(queue.position)),
+      }),
+    );
+  }
+  if (Number.isFinite(queue.etaSeconds) && Number(queue.etaSeconds) > 0) {
+    parts.push(
+      t("component.chat_runtime_queue.eta", {
+        minutes: Math.max(1, Math.ceil(Number(queue.etaSeconds) / 60)),
+      }),
+    );
+  }
+  return parts.join(" · ");
 }
 
 export function mergeSubAgentEvents(
@@ -393,6 +540,7 @@ export type SetConvId = React.Dispatch<React.SetStateAction<string | undefined>>
 export interface SSEHandlers {
   setMessages: SetMessages;
   setCurrentConvId: SetConvId;
+  onRuntimeState?: (state: RuntimeStreamState) => void;
 }
 
 export interface StreamProcessResult {
@@ -403,8 +551,14 @@ export interface StreamProcessResult {
   };
   messageId?: string;
   persisted?: boolean;
+  streamEnded?: boolean;
   stopReason?: string;
   limitDetail?: PlanLimitDetail;
+  runtimeRunId?: string;
+  runtimeStatus?: string;
+  runtimeQueue?: RuntimeQueueState;
+  pollAfterSeconds?: number;
+  lastEventId?: string;
 }
 
 const INTERNAL_FILE_PERMISSION_RE = /^\[File permission(?:\s+[^\]]*)?\]$/i;
@@ -495,7 +649,7 @@ export async function resolveGlobalWorkflowMessageAction(
     ? await Promise.all(files.map(async (file) => {
         const document = await api.documents.upload(file);
         if (!document?.id) throw new Error(`Failed to upload ${file.name}`);
-        return { name: file.name, id: document.id, type: "knowledge" };
+        return { name: file.name, document_id: document.id, type: "knowledge" };
       }))
     : [];
   const existingAttachments = Array.isArray(payload?.attachments)
@@ -539,13 +693,84 @@ export function normalizeToolResult(result: unknown): string | undefined {
   }
 }
 
+const INTERNAL_TOOL_CONTRACT_ERROR_RE =
+  /(?:\b(?:unknown|unrecognized|unsupported|unregistered)\s+(?:runtime\s+)?(?:tool|function)(?:\s+(?:name|key))?\b|\b(?:tool|function)(?:\s+(?:name|key|id))?\b[\s\S]{0,100}?(?:not\s+(?:found|registered)|unregistered|mismatch|misalign(?:ed|ment)?|does\s+not\s+match|missing\s+(?:handler|executor))\b|\b(?:no|missing)\s+(?:registered\s+)?(?:handler|executor)\s+for\s+(?:tool|function)\b|\b(?:no|missing)\s+(?:(?:matching|registered)\s+)?(?:handler|executor)\s+for\b|\b(?:tool|function)\s+(?:name|key|id)\b[\s\S]{0,100}?(?:failed?|failure|error)\b|\bmcp__[a-z0-9_.-]+(?:__[a-z0-9_.-]+)+\b[\s\S]{0,100}?(?:failed?|failure|unavailable|error)\b)/i;
+const TOOL_ERROR_PREFIX_RE =
+  /\btool\s+error\s*\([^\)\r\n]{1,160}\)\s*:\s*/i;
+const INTERNAL_ERROR_DETAIL_RE =
+  /(?:\bsqlalchemy\b|\basyncpg\b|\bpsycopg\b|InFailedSQLTransactionError|current\s+transaction\s+is\s+aborted|Traceback\s+\(most\s+recent\s+call\s+last\)|\[SQL:|\[parameters?:)/i;
+const INTERNAL_ERROR_FAILURE_SIGNAL_RE =
+  /\b(?:error|failed|failure|exception|aborted)\b|Traceback\s+\(most\s+recent\s+call\s+last\)|\[SQL:|\[parameters?:/i;
+const PUBLIC_ACTIONABLE_EXECUTOR_ERROR_RE =
+  /^(?:(?:permission denied|authentication required|authorization required)\.?(?:\s+(?:reconnect|connect|sign in to|log in to) your [a-z0-9][a-z0-9 ._-]{0,79} account\.?)?|(?:rate limit|quota|usage limit) (?:exceeded|reached)\.?(?:\s+(?:try again later|upgrade your plan(?: or try again later)?)\.?)?|credits? exhausted\.?(?:\s+(?:add credits|upgrade your plan)(?: or try again later)?\.?)?)$/i;
+const PUBLIC_TOOL_FAILURE_MESSAGE =
+  "This operation is temporarily unavailable. Please try again.";
+const PUBLIC_REDACTED_TOOL_NAME = "operation";
+const REDACTED_SENSITIVE_VALUE = "<redacted>";
+
+function redactSensitiveText(value: string): string {
+  return value
+    .replace(
+      /(proxy[-_]authorization\s*[:=]\s*)(?:(?:bearer|basic|token)\s+)?([^\s,;]+)/gi,
+      `$1${REDACTED_SENSITIVE_VALUE}`,
+    )
+    .replace(
+      /(authorization\s*[:=]\s*(?:bearer\s+)?)([^\s,;]+)/gi,
+      `$1${REDACTED_SENSITIVE_VALUE}`,
+    )
+    .replace(
+      /(x[-_]?api[-_]?key\s*[:=]\s*)([^\s,;]+)/gi,
+      `$1${REDACTED_SENSITIVE_VALUE}`,
+    )
+    .replace(
+      /([?&](?:api_key|access_token|refresh_token|token|secret)=)([^&#\s]+)/gi,
+      `$1${REDACTED_SENSITIVE_VALUE}`,
+    )
+    .replace(
+      /\b(?:sk-(?:or|ant|proj|live|test)?-?[A-Za-z0-9._-]{8,}|ark-[A-Za-z0-9._-]{8,})\b/g,
+      REDACTED_SENSITIVE_VALUE,
+    );
+}
+
+function isPublicActionableToolExecutorFailure(detail: string): boolean {
+  return PUBLIC_ACTIONABLE_EXECUTOR_ERROR_RE.test(detail.trim());
+}
+
+function localizedRequestFailure() {
+  return t("lib.chat_stream.request_failed_with_detail").split("\n\n", 1)[0];
+}
+
+export function formatPublicToolResult(result: unknown): string | undefined {
+  const normalized = normalizeToolResult(result);
+  const text = normalized ? redactSensitiveText(normalized) : normalized;
+  if (!text) return text;
+  const hadExecutorPrefix = TOOL_ERROR_PREFIX_RE.test(text);
+  const publicText = text.replace(TOOL_ERROR_PREFIX_RE, "").trim();
+  if (hadExecutorPrefix) {
+    return isPublicActionableToolExecutorFailure(publicText)
+      ? publicText
+      : localizedRequestFailure();
+  }
+  if (
+    text !== PUBLIC_TOOL_FAILURE_MESSAGE
+    && !INTERNAL_TOOL_CONTRACT_ERROR_RE.test(publicText)
+    && !(
+      INTERNAL_ERROR_DETAIL_RE.test(publicText)
+      && INTERNAL_ERROR_FAILURE_SIGNAL_RE.test(publicText)
+    )
+  ) return text;
+  return localizedRequestFailure();
+}
+
 function normalizeMessageAttachments(value: unknown): ChatMessage["attachments"] | undefined {
   if (!Array.isArray(value)) return undefined;
   const attachments = value
     .filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === "object" && !Array.isArray(item))
     .map((item) => ({
       name: String(item.name || item.filename || item.title || "").trim(),
-      id: item.id == null ? undefined : String(item.id),
+      document_id: item.document_id == null
+        ? undefined
+        : String(item.document_id),
       type: item.type == null ? undefined : String(item.type),
       fileType: item.fileType == null ? undefined : String(item.fileType),
       mimeType: item.mimeType == null ? undefined : String(item.mimeType),
@@ -679,19 +904,80 @@ export function markAssistantProcessBlocksStopped(blocks: AssistantBlock[] | und
 export function settlePendingAssistantProcess(messages: ChatMessage[]): ChatMessage[] {
   const withSettledTools = settlePendingAssistantToolCalls(messages, "error");
   const updated = [...withSettledTools];
-  const last = updated[updated.length - 1];
-  if (!last || last.role !== "assistant" || !last.assistant_blocks?.length) {
+  const lastIndex = updated.length - 1;
+  const last = updated[lastIndex];
+  if (!last || last.role !== "assistant") {
     return withSettledTools;
   }
+  let nextLast = last;
   const assistant_blocks = markAssistantProcessBlocksStopped(last.assistant_blocks);
-  if (assistant_blocks === last.assistant_blocks) return withSettledTools;
-  updated[updated.length - 1] = { ...last, assistant_blocks };
+  if (assistant_blocks !== last.assistant_blocks) {
+    nextLast = { ...nextLast, assistant_blocks };
+  }
+  const streamStatus = String(last.meta?.stream_status || "").toLowerCase();
+  if (streamStatus === "running" || streamStatus === "streaming") {
+    nextLast = {
+      ...nextLast,
+      meta: {
+        ...(nextLast.meta || {}),
+        stream_status: "interrupted",
+        stream_interrupted: true,
+      },
+    };
+  }
+  if (nextLast === last) return withSettledTools;
+  updated[lastIndex] = nextLast;
   return updated;
 }
 
 export function formatPersistedStreamErrorMessage(message: unknown): string {
-  const detail = normalizeToolResult(message)?.trim() || t("lib.chat_stream.unknown_error");
-  return t("lib.chat_stream.request_failed_with_detail").replace("{detail}", detail);
+  const detail = redactSensitiveText(
+    normalizeToolResult(message)?.trim() || t("lib.chat_stream.unknown_error"),
+  );
+  const publicDetail = formatPublicToolResult(detail) || detail;
+  if (
+    /(?:sqlalchemy|asyncpg|psycopg|InFailedSQLTransactionError|current\s+transaction\s+is\s+aborted|Traceback\s+\(most\s+recent\s+call\s+last\)|\[SQL:|\[parameters?:)/i
+      .test(detail)
+    || publicDetail === localizedRequestFailure()
+    || /^[a-z][a-z0-9]*(?:_[a-z0-9]+)+$/.test(publicDetail)
+  ) {
+    return localizedRequestFailure();
+  }
+  if (publicDetail === "Sorry, the request failed. Please try again.") {
+    return localizedRequestFailure();
+  }
+  const failurePrefixes = [
+    `${localizedRequestFailure()}\n\nError detail: `,
+    "Sorry, the request failed. Please try again.\n\nError detail: ",
+  ];
+  const matchedPrefix = failurePrefixes.find((prefix) =>
+    publicDetail.startsWith(prefix),
+  );
+  const candidateDetail = matchedPrefix
+    ? publicDetail.slice(matchedPrefix.length).trim()
+    : publicDetail;
+  if (!isPublicActionableToolExecutorFailure(candidateDetail)) {
+    return localizedRequestFailure();
+  }
+  return t("lib.chat_stream.request_failed_with_detail").replace("{detail}", candidateDetail);
+}
+
+function normalizePlanLimitDetail(detail: unknown, fallback: string): PlanLimitDetail {
+  if (detail && typeof detail === "object") {
+    const d = detail as Record<string, unknown>;
+    return {
+      message: String(d.message || fallback),
+      limit: typeof d.limit === "number" ? d.limit : null,
+      current: typeof d.current === "number" ? d.current : null,
+      plan: String(d.plan || "current"),
+    };
+  }
+  return {
+    message: typeof detail === "string" && detail ? detail : fallback,
+    limit: null,
+    current: null,
+    plan: "current",
+  };
 }
 
 function formatCreditLimitMessage(detail: PlanLimitDetail): string {
@@ -703,10 +989,10 @@ function formatCreditLimitMessage(detail: PlanLimitDetail): string {
 // slow enough to read along. It used to be 18ms with slices that GREW with
 // the backlog, so a long reply painted at ~1300 chars/sec: the answers that
 // most need reading arrived fastest.
-const TYPEWRITER_TICK_MS = 36;
+export const TYPEWRITER_TICK_MS = 36;
 const TOOL_START_DISPLAY_DELAY_MS = 180;
 
-function nextTypewriterSlice(text: string): [string, string] {
+export function nextTypewriterSlice(text: string): [string, string] {
   const chars = Array.from(text);
   if (chars.length === 0) return ["", ""];
 
@@ -742,18 +1028,67 @@ export function parseToolCalls(raw: any): ToolCall[] | undefined {
     }
     return undefined;
   };
+  const WORKSPACE_DRAFT_PUBLIC_KEYS = [
+    "artifact_kind",
+    "draft_id",
+    "status",
+    "ready",
+    "missing",
+    "fields",
+    "assistant_reply",
+    "title",
+    "next_step",
+  ] as const;
+  const workspaceDraftPublicResult = (tc: any): string | undefined => {
+    const toolName = String(tc?.name || "").toLowerCase();
+    const canCreateDraftArtifact = [
+      "manor",
+      "start_workspace_draft",
+      "continue_workspace_draft",
+    ].includes(toolName);
+    const status = String(tc?.status || "").toLowerCase();
+    if (
+      !canCreateDraftArtifact
+      || ["blocked", "error", "failed", "timeout"].includes(status)
+    ) {
+      return undefined;
+    }
+    const candidates = [tc?.raw_result, tc?.rawResult, tc?.result];
+    for (const candidate of candidates) {
+      let parsed = candidate;
+      if (typeof candidate === "string") {
+        try {
+          parsed = JSON.parse(candidate);
+        } catch {
+          continue;
+        }
+      }
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) continue;
+      if (parsed.artifact_kind !== "workspace_draft") continue;
+      if (typeof parsed.draft_id !== "string" || !parsed.draft_id.trim()) continue;
+      const projected: Record<string, unknown> = {};
+      for (const key of WORKSPACE_DRAFT_PUBLIC_KEYS) {
+        if (Object.prototype.hasOwnProperty.call(parsed, key)) {
+          projected[key] = parsed[key];
+        }
+      }
+      return JSON.stringify(projected);
+    }
+    return undefined;
+  };
   if (Array.isArray(raw)) {
     return raw.map((tc: any) => ({
       name: tc.name || "tool",
       arguments: normalizeToolArguments(tc.arguments ?? tc.args),
-      result: normalizeToolResult(tc.result),
+      result: formatPublicToolResult(tc.result),
+      rawResult: workspaceDraftPublicResult(tc),
       status: tc.status || inferToolStatus(tc.result),
       duration: persistedDuration(tc),
     }));
   }
   return Object.entries(raw).map(([name, result]) => ({
     name,
-    result: normalizeToolResult(result),
+    result: formatPublicToolResult(result),
     status: inferToolStatus(result),
   }));
 }
@@ -765,19 +1100,23 @@ export function parseToolCalls(raw: any): ToolCall[] | undefined {
  */
 export async function processSSEStream(
   response: Response,
-  { setMessages, setCurrentConvId }: SSEHandlers,
+  { setMessages, setCurrentConvId, onRuntimeState }: SSEHandlers,
   currentConvId: string | undefined,
   signal?: AbortSignal,
 ): Promise<StreamProcessResult> {
   const reader = response.body?.getReader();
   if (!reader) throw new Error("No reader available");
 
-  // If aborted, cancel the reader so the connection closes immediately.
-  signal?.addEventListener("abort", () => reader.cancel(), { once: true });
+  // Cancelling the reader tears down a pending read even when no new SSE frame arrives.
+  const cancelReader = () => {
+    void reader.cancel().catch(() => undefined);
+  };
+  signal?.addEventListener("abort", cancelReader, { once: true });
 
   const decoder = new TextDecoder();
   let buffer = "";
   let currentEvent = "";
+  let currentEventId: string | undefined;
   let resetBeforeNextText = false;
   let summaryStarted = false;
   const result: StreamProcessResult = {};
@@ -786,10 +1125,7 @@ export async function processSSEStream(
   let queuedText = "";
   let typewriterTimer: ReturnType<typeof setTimeout> | undefined;
   let typewriterIdleResolve: (() => void) | undefined;
-  let pendingToolSeq = 0;
   type PendingToolStart = {
-    id: number;
-    key: string;
     tc: any;
     timer: ReturnType<typeof setTimeout>;
     startedAt: number;
@@ -862,19 +1198,53 @@ export async function processSSEStream(
     });
   };
 
-  const toolEventKey = (tc: any) =>
-    `${tc?.name || "tool"}\u0000${normalizeToolArguments(tc?.arguments) || ""}`;
+  const isRedactedToolFailure = (tc: any) =>
+    tc?.status === "error" && tc?.name === PUBLIC_REDACTED_TOOL_NAME;
+
+  const findPendingToolIndex = <T,>(
+    items: T[],
+    tc: any,
+    toolCallFor: (item: T) => any,
+    isPending: (item: T) => boolean,
+  ): number => {
+    const incomingArguments = normalizeToolArguments(tc?.arguments);
+    const lastMatchingIndex = (matches: (toolCall: any) => boolean) => {
+      for (let index = items.length - 1; index >= 0; index--) {
+        if (isPending(items[index]) && matches(toolCallFor(items[index]))) return index;
+      }
+      return -1;
+    };
+
+    let index = incomingArguments
+      ? lastMatchingIndex((candidate) => (
+          candidate?.name === tc?.name
+          && normalizeToolArguments(candidate?.arguments) === incomingArguments
+        ))
+      : -1;
+    if (index < 0) {
+      index = lastMatchingIndex((candidate) => candidate?.name === tc?.name);
+    }
+    if (index >= 0 || !isRedactedToolFailure(tc)) return index;
+    if (incomingArguments) {
+      index = lastMatchingIndex((candidate) => (
+        normalizeToolArguments(candidate?.arguments) === incomingArguments
+      ));
+    }
+    return index >= 0 ? index : lastMatchingIndex(() => true);
+  };
 
   const findPendingToolStart = (tc: any) => {
-    const key = toolEventKey(tc);
-    return (
-      pendingToolStarts.find((entry) => entry.key === key) ||
-      pendingToolStarts.find((entry) => entry.tc?.name === tc?.name)
+    const index = findPendingToolIndex(
+      pendingToolStarts,
+      tc,
+      (entry) => entry.tc,
+      () => true,
     );
+    return index >= 0 ? pendingToolStarts[index] : undefined;
   };
 
   const removePendingToolStart = (entry: PendingToolStart) => {
-    const idx = pendingToolStarts.findIndex((item) => item.id === entry.id);
+    const idx = pendingToolStarts.indexOf(entry);
     if (idx >= 0) pendingToolStarts.splice(idx, 1);
   };
 
@@ -883,9 +1253,10 @@ export async function processSSEStream(
     statusOverride?: ToolCall["status"],
     startedAtOverride?: number,
   ) => {
-    const resultText = normalizeToolResult(tc.result);
+    const rawResultText = normalizeToolResult(tc.result);
     const status =
-      statusOverride || tc.status || (resultText ? "success" : "pending");
+      statusOverride || tc.status || (rawResultText ? "success" : "pending");
+    const resultText = formatPublicToolResult(tc.result);
     const incomingArguments = normalizeToolArguments(tc.arguments);
     setMessages((prev) => {
       const updated = [...prev];
@@ -918,23 +1289,12 @@ export async function processSSEStream(
           pendingWrapperIdx >= 0 && !WRAPPER_TOOLS.has(tc.name);
 
         if (status === "success" || status === "error") {
-          let idx = -1;
-          if (incomingArguments) {
-            for (let k = existing.length - 1; k >= 0; k--) {
-              if (
-                existing[k].name === tc.name &&
-                existing[k].status === "pending" &&
-                existing[k].arguments === incomingArguments
-              ) {
-                idx = k;
-                break;
-              }
-            }
-          }
-          for (let k = existing.length - 1; k >= 0; k--) {
-            if (idx >= 0) break;
-            if (existing[k].name === tc.name && existing[k].status === "pending") { idx = k; break; }
-          }
+          let idx = findPendingToolIndex(
+            existing,
+            tc,
+            (item) => item,
+            (item) => item.status === "pending",
+          );
           if (idx < 0 && WRAPPER_TOOLS.has(tc.name)) {
             for (let k = existing.length - 1; k >= 0; k--) {
               const candidate = existing[k];
@@ -962,6 +1322,7 @@ export async function processSSEStream(
           if (idx >= 0) {
             existing[idx] = {
               ...existing[idx],
+              name: tc.name || existing[idx].name,
               arguments: incomingArguments || existing[idx].arguments,
               result: resultText,
               status,
@@ -1060,8 +1421,6 @@ export async function processSSEStream(
 
   const queueToolStart = (tc: any) => {
     const entry: PendingToolStart = {
-      id: ++pendingToolSeq,
-      key: toolEventKey(tc),
       tc,
       startedAt: Date.now(),
       visible: false,
@@ -1138,6 +1497,32 @@ export async function processSSEStream(
     return false;
   };
 
+  const applyStreamErrorMessage = (message: unknown, persisted: boolean) => {
+    const content = persisted || INTERNAL_TOOL_CONTRACT_ERROR_RE.test(String(message))
+      ? formatPersistedStreamErrorMessage(message)
+      : String(message);
+    setMessages((prev) => {
+      const updated = [...prev];
+      const last = updated[updated.length - 1];
+      if (!last || last.role !== "assistant") {
+        updated.push({
+          role: "assistant",
+          content,
+          stream_error: true,
+          timestamp: new Date().toISOString(),
+        });
+      } else {
+        updated[updated.length - 1] = {
+          ...last,
+          content,
+          stream_error: true,
+          assistant_blocks: undefined,
+        };
+      }
+      return updated;
+    });
+  };
+
   while (true) {
     if (signal?.aborted) break;
     const { done, value } = await reader.read();
@@ -1148,6 +1533,10 @@ export async function processSSEStream(
     buffer = lines.pop() || "";
 
     for (const line of lines) {
+      if (line.startsWith("id: ")) {
+        currentEventId = line.slice(4).trim() || undefined;
+        continue;
+      }
       if (line.startsWith("event: ")) {
         currentEvent = line.slice(7).trim();
         continue;
@@ -1157,6 +1546,7 @@ export async function processSSEStream(
       if (data === "[DONE]") continue;
       try {
         const parsed = JSON.parse(data);
+        if (currentEventId) result.lastEventId = currentEventId;
 
         if (isForeignStreamEvent(parsed)) {
           continue;
@@ -1164,31 +1554,15 @@ export async function processSSEStream(
 
         if (currentEvent === "error") {
           const message = parsed.message || parsed.error || "Chat stream failed";
-          const persisted = Boolean(parsed.persisted || parsed.message_id);
+          const persisted = typeof parsed.persisted === "boolean"
+            ? parsed.persisted
+            : Boolean(parsed.message_id);
           result.error = {
             message: String(message),
             persisted,
             messageId: parsed.message_id,
           };
-          setMessages((prev) => {
-            const updated = [...prev];
-            const last = updated[updated.length - 1];
-            if (!last || last.role !== "assistant") {
-              updated.push({
-                role: "assistant",
-                content: persisted ? formatPersistedStreamErrorMessage(message) : String(message),
-                stream_error: true,
-                timestamp: new Date().toISOString(),
-              });
-            } else {
-              updated[updated.length - 1] = {
-                ...last,
-                content: persisted ? formatPersistedStreamErrorMessage(message) : String(message),
-                stream_error: true,
-              };
-            }
-            return updated;
-          });
+          applyStreamErrorMessage(message, persisted);
           continue;
         }
 
@@ -1202,6 +1576,57 @@ export async function processSSEStream(
 
         if (Array.isArray(parsed.assistant_blocks)) {
           applyAssistantBlocks(parsed.assistant_blocks);
+        }
+
+        if (
+          currentEvent === "runtime_run" ||
+          currentEvent === "runtime_waiting" ||
+          currentEvent === "runtime_status" ||
+          currentEvent === "runtime_cancelled"
+        ) {
+          const runId = normalizeEventId(parsed.run_id) || result.runtimeRunId;
+          if (!runId) continue;
+          const rawQueue =
+            parsed.queue && typeof parsed.queue === "object"
+              ? (parsed.queue as Record<string, unknown>)
+              : undefined;
+          const pollAfterSeconds = Math.max(
+            1,
+            Number(rawQueue?.poll_after_seconds || parsed.poll_after_seconds || result.pollAfterSeconds || 5),
+          );
+          const queue = rawQueue?.ticket
+            ? {
+                ticket: String(rawQueue.ticket),
+                position:
+                  rawQueue.position == null ? undefined : Number(rawQueue.position),
+                etaSeconds:
+                  rawQueue.eta_seconds == null ? undefined : Number(rawQueue.eta_seconds),
+                pollAfterSeconds,
+                deadlineAt:
+                  rawQueue.deadline_at == null ? undefined : String(rawQueue.deadline_at),
+              }
+            : undefined;
+          const status = String(
+            parsed.status ||
+              (currentEvent === "runtime_waiting"
+                ? "waiting_resource"
+                : currentEvent === "runtime_cancelled"
+                  ? "cancelled"
+                  : result.runtimeStatus || "queued"),
+          );
+          result.runtimeRunId = runId;
+          result.runtimeStatus = status;
+          result.runtimeQueue = status === "waiting_resource" ? queue : undefined;
+          result.pollAfterSeconds = pollAfterSeconds;
+          if (currentEventId) result.lastEventId = currentEventId;
+          onRuntimeState?.({
+            runId,
+            status,
+            queue: result.runtimeQueue,
+            pollAfterSeconds,
+            lastEventId: currentEventId || result.lastEventId,
+          });
+          continue;
         }
 
         if (currentEvent === "stream_start") {
@@ -1229,10 +1654,29 @@ export async function processSSEStream(
         }
 
         if (currentEvent === "stream_end") {
+          result.streamEnded = true;
           streamMessageId = normalizeEventId(parsed.message_id) || streamMessageId;
           if (parsed.message_id) result.messageId = String(parsed.message_id);
           if (typeof parsed.persisted === "boolean") result.persisted = parsed.persisted;
           tagLastAssistantMessage(parsed.message_id);
+          const workspaceRecommendation = normalizeWorkspaceRecommendation(
+            parsed.workspace_recommendation,
+          );
+          if (workspaceRecommendation) {
+            setMessages((prev) => {
+              const updated = [...prev];
+              const last = updated[updated.length - 1];
+              if (!last || last.role !== "assistant") return prev;
+              updated[updated.length - 1] = {
+                ...last,
+                meta: {
+                  ...(last.meta || {}),
+                  workspace_recommendation: workspaceRecommendation,
+                },
+              };
+              return updated;
+            });
+          }
           const attachments = normalizeMessageAttachments(parsed.attachments);
           if (attachments) {
             setMessages((prev) => {
@@ -1281,19 +1725,20 @@ export async function processSSEStream(
               }
               return updated;
             });
+          } else if (parsed.error) {
+            const persisted = typeof parsed.persisted === "boolean"
+              ? parsed.persisted
+              : Boolean(parsed.message_id);
+            result.error = {
+              message: String(parsed.error),
+              persisted,
+              messageId: parsed.message_id ? String(parsed.message_id) : undefined,
+            };
+            applyStreamErrorMessage(parsed.error, persisted);
+          } else if (stopReason === "error") {
+            result.stopReason = stopReason;
           }
-          // stream_end is the protocol terminal event. Some deployments keep
-          // the HTTP response open briefly after it, so waiting for EOF leaves
-          // the composer disabled despite a completed assistant turn.
-          flushPendingToolStarts();
-          setMessages((prev) => settlePendingAssistantToolCalls(
-            prev,
-            stopReason ? "error" : "success",
-          ));
-          markSummaryStarted();
-          void reader.cancel();
-          await waitForTypewriterIdle();
-          return result;
+          continue;
         }
 
         const token = normalizeToolResult(parsed.text_delta ?? parsed.token ?? parsed.content) || "";
@@ -1391,6 +1836,7 @@ export async function processSSEStream(
       }
     }
   }
+  signal?.removeEventListener("abort", cancelReader);
   if (signal?.aborted) {
     clearPendingToolStarts();
     clearQueuedText();

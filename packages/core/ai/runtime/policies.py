@@ -13,11 +13,14 @@ from packages.core.ai.runtime.surfaces import ChatSurface
 
 
 _ALWAYS_DENIED_FOR_EXTERNAL = {
+    "render_response_surface",
     "bash",
     "read_file",
     "write_file",
     "edit_file",
+    "patch_file",
     "delete_file",
+    "inspect_file_engine",
     "list_files",
     "glob_files",
     "grep_files",
@@ -38,7 +41,11 @@ _ALWAYS_DENIED_FOR_EXTERNAL = {
     "toggle_scheduled_job",
     "run_scheduled_job_now",
     "sandbox_create",
+    "sandbox",
     "sandbox_exec",
+    "sandbox_status",
+    "sandbox_respond",
+    "sandbox_cancel",
     "sandbox_write_file",
     "sandbox_save_result",
     "sandbox_destroy",
@@ -136,6 +143,7 @@ def filter_runtime_tools(
     profile: RuntimeProfile,
     tools: Iterable[dict[str, Any]],
     allowed_tool_names: Iterable[str],
+    profile_extra_allowed_tool_names: Iterable[str] = (),
 ) -> tuple[list[dict[str, Any]], set[str], set[str]]:
     """Apply Manor surface/profile tool visibility limits.
 
@@ -146,6 +154,12 @@ def filter_runtime_tools(
 
     del surface
     profile_allowed = allowed_tools_for_profile(profile)
+    if profile_allowed is not None:
+        profile_allowed = set(profile_allowed) | {
+            str(name).strip()
+            for name in profile_extra_allowed_tool_names
+            if str(name or "").strip()
+        }
     incoming_allowed = {str(name) for name in allowed_tool_names if str(name or "").strip()}
     if profile_allowed is None:
         filtered_tools = [
@@ -231,7 +245,20 @@ def check_runtime_tool_policy(
         # the deliverable of every subagent step on some surfaces.
         return RuntimeToolPolicyDecision(True, tool_name=name)
 
-    allowed = set(envelope.allowed_tool_names or ())
+    if name in set(getattr(envelope, "blocked_tool_names", None) or ()):
+        return RuntimeToolPolicyDecision(
+            False,
+            code=RuntimeToolPolicyCode.BLOCKED_BY_RUNTIME_POLICY.value,
+            reason=f"`{name}` is blocked for this Runtime turn.",
+            tool_name=name,
+        )
+
+    effective_allowed = getattr(envelope, "effective_allowed_tool_names", None)
+    allowed = (
+        effective_allowed()
+        if callable(effective_allowed)
+        else set(getattr(envelope, "allowed_tool_names", None) or ())
+    )
     if allowed and name not in allowed:
         return RuntimeToolPolicyDecision(
             False,
@@ -260,13 +287,19 @@ def check_runtime_tool_policy(
 
     if envelope.profile == RuntimeProfile.FILE_EDITOR_PATCH:
         allowed_file_tools = allowed_tools_for_profile(RuntimeProfile.FILE_EDITOR_PATCH) or set()
-        if name not in allowed_file_tools:
+        editor_image_generation = (
+            name == "generate_file"
+            and bool((envelope.metadata or {}).get("editor_image_generation"))
+            and str((arguments or {}).get("kind") or "").strip().lower() == "image"
+        )
+        if name not in allowed_file_tools and not editor_image_generation:
             return RuntimeToolPolicyDecision(
                 False,
                 code=RuntimeToolPolicyCode.FILE_EDITOR_TOOL_DENIED.value,
                 reason=(
-                    "File editor chat can only inspect context and propose patches; "
-                    "it cannot execute business side-effect, shell, sandbox, or write tools."
+                    "File editor chat can only inspect its mounted context or use the "
+                    "approval-gated native patch tool; business side effects, shell, "
+                    "sandbox, and unrestricted write tools are blocked."
                 ),
                 tool_name=name,
             )

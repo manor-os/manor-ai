@@ -16,8 +16,11 @@ Layout:
 from packages.core.plans.schema import Plan, PlanStep
 from packages.core.plans.refs import resolve_refs, ReferenceError
 from packages.core.plans.service import (
+    ActiveTaskPlanError,
+    PlanContractError,
     create_plan_from_dag,
     materialize_plan_steps,
+    persisted_plan_contract_gaps,
     get_plan,
     get_step,
     list_plan_steps,
@@ -31,7 +34,10 @@ __all__ = [
     "resolve_refs",
     "ReferenceError",
     "create_plan_from_dag",
+    "ActiveTaskPlanError",
+    "PlanContractError",
     "materialize_plan_steps",
+    "persisted_plan_contract_gaps",
     "get_plan",
     "get_step",
     "list_plan_steps",

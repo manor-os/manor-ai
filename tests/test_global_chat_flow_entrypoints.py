@@ -7,6 +7,7 @@ from httpx import AsyncClient
 @pytest.mark.asyncio
 async def test_personal_chat_lists_and_directly_starts_percent_flow(
     client: AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     registration = (await client.post("/api/v1/auth/register", json={
         "username": "personal_percent_flow",
@@ -73,6 +74,26 @@ async def test_personal_chat_lists_and_directly_starts_percent_flow(
         }],
     }]
 
+    outsider = (await client.post("/api/v1/auth/register", json={
+        "username": "personal_percent_flow_outsider",
+        "email": "personal_percent_flow_outsider@test.com",
+        "password": "pass123",
+        "entity_name": "Personal Percent Flow Outsider",
+    })).json()
+    outsider_headers = {"Authorization": f"Bearer {outsider['access_token']}"}
+    outsider_list = await client.get(
+        "/api/v1/chat/flow-entrypoints",
+        headers=outsider_headers,
+    )
+    outsider_start = await client.post(
+        f"/api/v1/chat/flow-entrypoints/{binding['id']}/stream",
+        headers=outsider_headers,
+        data={"message": "Try another tenant's Flow."},
+    )
+    assert outsider_list.status_code == 200
+    assert outsider_list.json() == []
+    assert outsider_start.status_code == 404
+
     started = await client.post(
         f"/api/v1/chat/flow-entrypoints/{binding['id']}/stream",
         headers=headers,
@@ -109,3 +130,30 @@ async def test_personal_chat_lists_and_directly_starts_percent_flow(
     assert runs[0]["binding_id"] == binding["id"]
     assert runs[0]["status"] == "paused"
     assert runs[0]["trigger_source"] == "global_chat"
+
+    from apps.api.routers import chat as chat_router
+    from packages.core.services import workspace_flow_launcher
+
+    release_calls = 0
+
+    class FailingFlowLease:
+        async def release(self):
+            nonlocal release_calls
+            release_calls += 1
+
+    async def acquire_failing_flow_lease(*, scope: str):
+        assert scope == "chat"
+        return FailingFlowLease()
+
+    async def fail_flow_launch(*_args, **_kwargs):
+        raise RuntimeError("simulated Flow launch failure")
+
+    monkeypatch.setattr(chat_router, "acquire_chat_stream_lease", acquire_failing_flow_lease)
+    monkeypatch.setattr(workspace_flow_launcher, "launch_workspace_flow", fail_flow_launch)
+    with pytest.raises(RuntimeError, match="simulated Flow launch failure"):
+        await client.post(
+            f"/api/v1/chat/flow-entrypoints/{binding['id']}/stream",
+            headers=headers,
+            data={"message": "Exercise the failure path."},
+        )
+    assert release_calls == 1

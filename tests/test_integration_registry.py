@@ -9,6 +9,7 @@ from packages.core.integrations.registry import (
     integration_key_aliases,
 )
 from packages.core.services import integration_health
+from packages.core.services.integration_health import classify_nango_health
 from packages.core.services.mcp_seed import _MCP_CATALOG
 from packages.core.stats.library import list_library_entries
 
@@ -79,3 +80,18 @@ async def test_health_status_distinguishes_known_unsupported_and_unknown() -> No
     assert unknown["ok"] is None
     assert unknown["monitoring_status"] == "unknown_provider"
     assert unknown["provider_key"] == "provider_typo"
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "expected"),
+    [
+        ({"disabled": True}, "disabled"),
+        ({"provider_config_present": False}, "provider_config_missing"),
+        ({"webhook_configured": False}, "webhook_config_missing"),
+        ({"permission_denied": True}, "permission_denied"),
+        ({"detail": "401 — token rejected; reconnect."}, "credentials_rejected"),
+        ({"ok": True}, "healthy"),
+    ],
+)
+def test_nango_health_reason_is_actionable(kwargs, expected):
+    assert classify_nango_health(**kwargs) == expected

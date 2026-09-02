@@ -43,6 +43,194 @@ def _truthy(value: Any) -> bool:
     return str(value or "").strip().lower() in {"1", "true", "yes", "y", "start", "run", "execute", "now"}
 
 
+def _pending_hitl_id(pending_action: dict[str, Any]) -> str:
+    operation = (
+        pending_action.get("operation")
+        if isinstance(pending_action.get("operation"), dict)
+        else {}
+    )
+    return str(
+        pending_action.get("draft_id")
+        or pending_action.get("approval_token")
+        or pending_action.get("review_id")
+        or pending_action.get("step_id")
+        or operation.get("draft_id")
+        or ""
+    ).strip()
+
+
+def _normalise_hitl_action(action: Any) -> str:
+    raw = str(action or "").strip().lower()
+    if raw in {"approve", "approved", "yes", "accept", "confirm", "confirmed", "ok"}:
+        return "approve"
+    if raw in {
+        "reject",
+        "rejected",
+        "no",
+        "deny",
+        "decline",
+        "cancel",
+        "cancelled",
+        "canceled",
+        "stop",
+    }:
+        return "reject"
+    return raw
+
+
+async def runtime_workspace_resolve_hitl_action(
+    *,
+    entity_id: str,
+    workspace_id: str,
+    conversation_id: str,
+    user_id: str | None,
+    params: dict[str, Any] | None = None,
+) -> str:
+    """Resolve one Workspace operation review behind the Runtime boundary."""
+
+    raw_params = dict(params or {})
+    message_id = str(raw_params.get("message_id") or "").strip()
+    hitl_id = str(raw_params.get("hitl_id") or "").strip()
+    action = _normalise_hitl_action(raw_params.get("action"))
+    note = str(raw_params.get("note") or "").strip()
+    if not conversation_id or not workspace_id or not entity_id:
+        return _dumps({
+            "error": "workspace_resolve_hitl requires workspace conversation context",
+        })
+    if not user_id:
+        return _dumps({"error": "workspace_resolve_hitl requires a user_id"})
+    if action not in {"approve", "reject"}:
+        return _dumps({
+            "error": "unsupported_hitl_action",
+            "message": (
+                "This tool currently supports approve/reject workspace operation reviews."
+            ),
+            "action": action,
+        })
+
+    from sqlalchemy import select
+
+    from packages.core.constants.pending_actions import PendingActionKind
+    from packages.core.database import async_session
+    from packages.core.models.task import Message
+    from packages.core.services.workspace_operation_service import (
+        resolve_workspace_operation_review,
+    )
+    from packages.core.workspace_chat import service as workspace_chat_service
+
+    async with async_session() as db:
+        rows = list((await db.execute(
+            select(Message)
+            .where(
+                Message.conversation_id == conversation_id,
+                Message.pending_action.isnot(None),
+                Message.resolved_at.is_(None),
+            )
+            .order_by(Message.created_at.desc())
+            .limit(25)
+        )).scalars().all())
+        candidates = [
+            row
+            for row in rows
+            if isinstance(row.pending_action, dict)
+            and row.pending_action.get("kind")
+            == PendingActionKind.WORKSPACE_OPERATION_REVIEW
+        ]
+        if not candidates:
+            return _dumps({
+                "resolved": False,
+                "reason": "no_open_workspace_operation_review",
+            })
+
+        primary = next((row for row in candidates if row.id == message_id), None)
+        if primary is None and hitl_id:
+            primary = next(
+                (
+                    row
+                    for row in candidates
+                    if _pending_hitl_id(row.pending_action or {}) == hitl_id
+                ),
+                None,
+            )
+        if primary is None:
+            return _dumps({
+                "resolved": False,
+                "reason": "target_not_found",
+                "available": [
+                    {
+                        "message_id": row.id,
+                        "hitl_id": _pending_hitl_id(row.pending_action or {}),
+                    }
+                    for row in candidates[:10]
+                ],
+            })
+
+        primary_hitl_id = _pending_hitl_id(primary.pending_action or {})
+        targets = [
+            row
+            for row in candidates
+            if primary_hitl_id
+            and _pending_hitl_id(row.pending_action or {}) == primary_hitl_id
+        ] or [primary]
+
+        result = await resolve_workspace_operation_review(
+            db,
+            conversation_id=conversation_id,
+            entity_id=entity_id,
+            user_id=user_id,
+            workspace_id=workspace_id,
+            hitl_id=primary_hitl_id,
+            action=action,
+        )
+        if result is None:
+            await db.rollback()
+            return _dumps({
+                "resolved": False,
+                "reason": "workspace_operation_review_rejected_by_service",
+            })
+
+        resolution = {"choice": str(result.get("action") or action)}
+        if note:
+            resolution["note"] = note
+        resolved_message_ids: list[str] = []
+        for target in targets:
+            resolved = await workspace_chat_service.resolve_pending_action(
+                db,
+                message_id=target.id,
+                user_id=user_id,
+                resolution=resolution,
+            )
+            if resolved is not None:
+                resolved_message_ids.append(target.id)
+
+        db.add(Message(
+            conversation_id=conversation_id,
+            role="system",
+            content=str(
+                result.get("message")
+                or "Workspace operation review resolved."
+            ),
+            author_kind="system",
+            message_kind="system",
+            refs=[
+                {"type": "message", "id": primary.id},
+                {
+                    "type": "workspace_operation_draft",
+                    "id": result.get("draft_id"),
+                },
+            ],
+        ))
+        await db.commit()
+        return _dumps({
+            "resolved": True,
+            "kind": PendingActionKind.WORKSPACE_OPERATION_REVIEW.value,
+            "action": resolution["choice"],
+            "draft_id": result.get("draft_id") or primary_hitl_id,
+            "message_ids": resolved_message_ids,
+            "message": result.get("llm_message") or result.get("message"),
+        })
+
+
 def _operation_review_payload(
     draft_data: dict[str, Any],
     *,

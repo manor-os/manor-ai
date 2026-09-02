@@ -16,18 +16,23 @@ from packages.core.ai.runtime.tool_context import runtime_tool_call_context_from
 
 async def _invoke_skill_handler(
     entity_id: str = "",
-    skill: str = "",
+    skill_id: str = "",
     input: str = "",
     params=None,
     conversation_id: str = "",
     user_id: str = "",
     **kwargs,
 ):
-    """Invoke a skill by name or slug."""
+    """Invoke a runtime-visible skill by ID.
+
+    ``skill`` remains accepted through ``kwargs`` for callers using the
+    pre-runtime tool shape; new schema-generated calls use ``skill_id``.
+    """
+    resolved_skill_id = skill_id or str(kwargs.get("skill") or "")
     runtime_context = runtime_tool_call_context_from_kwargs(kwargs)
     return await runtime_invoke_skill_action(
         entity_id=entity_id,
-        skill=skill,
+        skill_id=resolved_skill_id,
         input_text=input,
         skill_params=params,
         runtime_context=runtime_context,
@@ -98,11 +103,12 @@ def get_tools():
                 "function": {
                     "name": "invoke_skill",
                     "description": (
-                        "Invoke a reusable skill by name. Skills are pre-built prompt+tool "
+                        "Invoke a reusable skill by ID. Skills are pre-built prompt+tool "
                         "chains or sandboxed script workflows for specialized tasks like "
                         "'write_email', 'research_topic', document generation, or complex "
-                        "file editing. Use this when a matching entry appears in Available "
-                        "Skills; use generate_document_file only for direct conversion of "
+                        "file editing. Use this when a matching Skill appears in search_tools "
+                        "or was explicitly selected for the turn; use "
+                        "generate_file(kind='document') for direct conversion of "
                         "already-supplied text/Markdown into a simple document. For external "
                         "social platform operations, invoke a subscribed social operations "
                         "skill when one is available; otherwise use search_tools to load the "
@@ -112,7 +118,11 @@ def get_tools():
                     "parameters": {
                         "type": "object",
                         "properties": {
-                            "skill": {"type": "string", "description": "Skill name or slug to invoke"},
+                            "skill_id": {"type": "string", "description": "Runtime skill ID to invoke"},
+                            "skill": {
+                                "type": "string",
+                                "description": "Legacy alias for skill_id.",
+                            },
                             "input": {"type": "string", "description": "Input text/instructions for the skill"},
                             "params": {
                                 "type": "object",
@@ -123,7 +133,11 @@ def get_tools():
                                 "additionalProperties": True,
                             },
                         },
-                        "required": ["skill", "input"],
+                        "required": ["input"],
+                        "anyOf": [
+                            {"required": ["skill_id"]},
+                            {"required": ["skill"]},
+                        ],
                     },
                 },
             },

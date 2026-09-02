@@ -41,6 +41,8 @@ from typing import Any, Optional
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from packages.core.constants.proposal import ProposalItemKind, ProposalItemStatus
+from packages.core.constants.agents import is_master_agent
 from packages.core.models.base import generate_ulid
 from packages.core.models.goal import Goal
 from packages.core.models.proposal import ProposalItemRecord
@@ -48,7 +50,17 @@ from packages.core.models.scheduler import ScheduledJob
 from packages.core.models.workflow import WorkflowBinding, WorkflowDefinition
 from packages.core.models.workspace import Workspace
 from packages.core.proposals.constants import change_patch_whitelist
+from packages.core.constants.goals import GoalStatus
 from packages.core.revisions import StaleRevisionError, assert_revision, bump_revision
+from packages.core.services.reusable_resource_locks import (
+    RESOURCE_WORKFLOW,
+    lock_reusable_resource_lifecycle,
+    lock_reusable_resource_payload_reference_delta,
+    lock_reusable_resource_reference,
+    lock_reusable_resource_payload_references,
+    lock_reusable_resource_references,
+    reusable_resource_ids_from_payload,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -286,8 +298,9 @@ async def _load_for_update(db: AsyncSession, model: type, target_id: str):
     )).scalar_one_or_none()
 
 
-def _apply_scheduled_job_patch(job: ScheduledJob, patch: dict) -> dict:
-    applied: dict = {}
+def _scheduled_job_updates(job: ScheduledJob, patch: dict) -> dict:
+    """Normalize a proposal patch without mutating the unlocked ORM row."""
+    updates: dict = {}
     for key, value in patch.items():
         if key == "execution_target":
             if not isinstance(value, dict):
@@ -295,20 +308,16 @@ def _apply_scheduled_job_patch(job: ScheduledJob, patch: dict) -> dict:
                     "execution_target patch must be an object", code="INVALID_PATCH",
                 )
             merged = {**(job.execution_target or {}), **value}
-            job.execution_target = merged
-            applied["execution_target"] = value
+            updates["execution_target"] = merged
             continue
         if key == "enabled":
-            job.enabled = _as_bool(value)
-            applied["enabled"] = job.enabled
+            updates["enabled"] = _as_bool(value)
             continue
         if key == "every_seconds":
-            job.every_seconds = float(value) if value is not None else None
-            applied["every_seconds"] = job.every_seconds
+            updates["every_seconds"] = float(value) if value is not None else None
             continue
-        setattr(job, key, value)
-        applied[key] = value
-    return applied
+        updates[key] = value
+    return updates
 
 
 def _apply_binding_patch(binding: WorkflowBinding, patch: dict) -> dict:
@@ -356,13 +365,76 @@ async def _apply_automation_or_workflow(
         revision = int(getattr(row, "revision", 1) or 1)
         return {"target_id": row.id, "revision": revision, "applied": patch}
 
+    if operation == "update" and (
+        (target_kind == "scheduled_job" and "execution_target" in patch)
+        or (target_kind == "workflow_definition" and "steps" in patch)
+    ):
+        await lock_reusable_resource_lifecycle(db, entity_id=item.entity_id)
+
     row = await _load_for_update(db, model, str(target_id))
     if row is None:
         raise ChangeApplyError(
             f"{target_kind} {target_id} no longer exists", code="INSUFFICIENT_DATA",
         )
+    if operation == "update":
+        if target_kind == "scheduled_job" and "execution_target" in patch:
+            if not isinstance(patch["execution_target"], dict):
+                raise ChangeApplyError(
+                    "execution_target patch must be an object",
+                    code="INVALID_PATCH",
+                )
+            next_target = {
+                **(row.execution_target or {}),
+                **patch["execution_target"],
+            }
+            await lock_reusable_resource_payload_reference_delta(
+                db,
+                entity_id=item.entity_id,
+                before=row.execution_target,
+                after=next_target,
+            )
+        elif target_kind == "workflow_definition" and "steps" in patch:
+            await lock_reusable_resource_payload_reference_delta(
+                db,
+                entity_id=item.entity_id,
+                before=row.steps,
+                after=patch["steps"],
+            )
     # Authoritative CAS — raises StaleRevisionError on a concurrent edit.
     await assert_revision(row, expected_revision)
+
+    if target_kind == "scheduled_job" and operation in {
+        "pause",
+        "resume",
+        "update",
+    }:
+        from packages.core.services.scheduler_service import (
+            ScheduledJobMutationFactory,
+        )
+
+        updates = (
+            {"enabled": operation == "resume"}
+            if operation in {"pause", "resume"}
+            else _scheduled_job_updates(row, patch)
+        )
+        result = await ScheduledJobMutationFactory.apply(
+            db,
+            row,
+            updates,
+            expected_revision=expected_revision,
+            changed_by_kind="agent",
+            causation_id=item.id,
+        )
+        if result is None:
+            raise ChangeApplyError(
+                f"scheduled_job {target_id} no longer exists",
+                code="INSUFFICIENT_DATA",
+            )
+        return {
+            "target_id": str(target_id),
+            "revision": int(result.job.revision or 1),
+            "applied": result.applied,
+        }
 
     if operation in ("pause", "resume"):
         enabled = operation == "resume"
@@ -374,9 +446,7 @@ async def _apply_automation_or_workflow(
             row.enabled = enabled
             applied = {"enabled": enabled}
     elif operation == "update":
-        if target_kind == "scheduled_job":
-            applied = _apply_scheduled_job_patch(row, patch)
-        elif target_kind == "workflow_binding":
+        if target_kind == "workflow_binding":
             applied = _apply_binding_patch(row, patch)
         else:
             applied = _apply_definition_patch(row, patch)
@@ -440,6 +510,19 @@ async def _create_row(
             )
         execution_target = dict(patch.get("execution_target") or {})
         execution_target.setdefault("workspace_id", item.workspace_id)
+        agent_ids, skill_ids, workflow_ids = reusable_resource_ids_from_payload(
+            execution_target
+        )
+        agent_id = patch.get("agent_id")
+        if agent_id and not is_master_agent(agent_id):
+            agent_ids.add(str(agent_id))
+        await lock_reusable_resource_references(
+            db,
+            entity_id=item.entity_id,
+            agent_ids=agent_ids,
+            skill_ids=skill_ids,
+            workflow_ids=workflow_ids,
+        )
         row = ScheduledJob(
             id=generate_ulid(),
             job_id=str(patch.get("job_id") or f"job_{generate_ulid()}"),
@@ -456,7 +539,7 @@ async def _create_row(
             timezone=patch.get("timezone") or "UTC",
             payload_message=patch.get("payload_message"),
             execution_type=patch.get("execution_type") or "agent",
-            agent_id=patch.get("agent_id"),
+            agent_id=agent_id,
             execution_target=execution_target,
             enabled=_as_bool(patch.get("enabled", True)),
         )
@@ -467,6 +550,12 @@ async def _create_row(
                 "creating a workflow_binding requires patch.workflow_id",
                 code="INSUFFICIENT_PATCH",
             )
+        await lock_reusable_resource_reference(
+            db,
+            entity_id=item.entity_id,
+            resource_type=RESOURCE_WORKFLOW,
+            resource_id=str(workflow_id),
+        )
         row = WorkflowBinding(
             id=generate_ulid(),
             entity_id=item.entity_id,
@@ -485,6 +574,11 @@ async def _create_row(
                 "creating a workflow_definition requires patch.name and patch.steps",
                 code="INSUFFICIENT_PATCH",
             )
+        await lock_reusable_resource_payload_references(
+            db,
+            entity_id=item.entity_id,
+            payload=patch["steps"],
+        )
         row = WorkflowDefinition(
             id=generate_ulid(),
             entity_id=item.entity_id,
@@ -498,15 +592,23 @@ async def _create_row(
         raise ChangeApplyError(
             f"cannot create target_kind {target_kind!r}", code="INVALID_CHANGE",
         )
-    db.add(row)
-    await db.flush()
+    if isinstance(row, ScheduledJob):
+        from packages.core.services.product_growth import persist_scheduled_job
+
+        await persist_scheduled_job(db, row)
+    else:
+        db.add(row)
+        await db.flush()
     return row
 
 
 # ── goals ─────────────────────────────────────────────────────────────
 
 
-_GOAL_STATUS_BY_OPERATION = {"pause": "paused", "archive": "abandoned"}
+_GOAL_STATUS_BY_OPERATION = {
+    "pause": GoalStatus.PAUSED.value,
+    "archive": GoalStatus.ABANDONED.value,
+}
 
 
 async def _apply_goal_change(
@@ -551,7 +653,13 @@ async def _apply_goal_change(
             "applied": patch,
         }
 
-    goal = await _load_for_update(db, Goal, str(target_id))
+    from packages.core.goals.locking import lock_goal_for_mutation
+
+    goal = await lock_goal_for_mutation(
+        db,
+        str(target_id),
+        entity_id=item.entity_id,
+    )
     if goal is None:
         raise ChangeApplyError(
             f"goal {target_id} no longer exists", code="INSUFFICIENT_DATA",
@@ -629,7 +737,7 @@ async def apply_change_item(db: AsyncSession, item: ProposalItemRecord) -> dict:
             )
         patch = _clean_patch(target_kind, operation, payload.get("patch"))
         async with db.begin_nested():
-            if item.kind == "goal_change":
+            if item.kind == ProposalItemKind.GOAL_CHANGE:
                 result = await _apply_goal_change(
                     db, item,
                     operation=operation,
@@ -678,9 +786,9 @@ async def apply_change_item(db: AsyncSession, item: ProposalItemRecord) -> dict:
     item.finished_at = now
     item.execution_root_id = item.id  # M10: change items are their own root
     if digest["ok"]:
-        item.status = "succeeded"
+        item.status = ProposalItemStatus.SUCCEEDED
     else:
-        item.status = "failed"
+        item.status = ProposalItemStatus.FAILED
         decision = dict(item.decision or {})
         decision["error"] = digest["error"]
         decision["error_code"] = digest["error_code"]

@@ -44,9 +44,43 @@ AGENT_CONTENT_REVISION_FIELDS: frozenset[str] = frozenset(
 SKILL_CONTENT_REVISION_FIELDS: frozenset[str] = frozenset(
     {"system_prompt", "tools", "input_schema", "output_format", "config", "status"}
 )
+SCHEDULED_JOB_SCHEDULE_REVISION_FIELDS: frozenset[str] = frozenset(
+    {
+        "schedule_kind",
+        "cron_expr",
+        "every_seconds",
+        "run_at",
+        "timezone",
+        "delete_after_run",
+    }
+)
+SCHEDULED_JOB_CONTENT_REVISION_FIELDS: frozenset[str] = (
+    SCHEDULED_JOB_SCHEDULE_REVISION_FIELDS
+    | frozenset(
+        {
+            "job_type",
+            "payload_message",
+            "agent_id",
+            "execution_type",
+            "execution_target",
+            "execution_script",
+            "conversation_id",
+            "default_delivery_mode",
+            "goal_id",
+            "goal_step_id",
+            "enabled",
+        }
+    )
+)
 
 
-def content_patch_for(row: Any, updates: dict, fields: frozenset[str]) -> dict:
+def content_patch_for(
+    row: Any,
+    updates: dict,
+    fields: frozenset[str],
+    *,
+    include_none: bool = False,
+) -> dict:
     """Return the subset of ``updates`` that actually CHANGES a
     behavior-affecting field of ``row``.
 
@@ -56,7 +90,7 @@ def content_patch_for(row: Any, updates: dict, fields: frozenset[str]) -> dict:
     """
     patch: dict = {}
     for key, value in updates.items():
-        if key not in fields or value is None:
+        if key not in fields or (value is None and not include_none):
             continue
         if not hasattr(row, key):
             continue

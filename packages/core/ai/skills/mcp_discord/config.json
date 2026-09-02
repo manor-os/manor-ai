@@ -1,0 +1,15 @@
+{
+  "id": "mcp_discord",
+  "name": "mcp_discord",
+  "type": "runtime_guidance",
+  "description": "Inspect the connected Discord Server, list its channels, send messages, and add reactions within that Server.",
+  "category": "messaging",
+  "output_format": "guidance",
+  "tags": ["discord", "messaging", "bot", "runtime-guidance", "builtin", "mcp"],
+  "tools": [
+    "mcp__discord__get_connection_info",
+    "mcp__discord__list_channels",
+    "mcp__discord__send_message",
+    "mcp__discord__add_reaction"
+  ]
+}

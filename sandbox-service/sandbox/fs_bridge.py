@@ -11,7 +11,6 @@ import logging
 import shlex
 
 from .docker_backend import DockerSandbox
-from .models import ExecResponse
 
 logger = logging.getLogger(__name__)
 

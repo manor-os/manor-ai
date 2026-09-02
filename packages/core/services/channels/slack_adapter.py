@@ -1,11 +1,8 @@
 """Slack channel adapter — Events API inbound + chat.postMessage outbound.
 
-Credentials in ChannelConfig.credentials:
-    {
-      "bot_token":      "xoxb-…"            (required — chat.write scope)
-      "signing_secret": "…"                  (required for inbound verify)
-      "app_id":         "A…"                 (optional)
-    }
+OAuth-backed ChannelConfigs lease the owner's Slack access token from the
+linked OAuthAccount. The Slack signing secret remains deployment App
+configuration, because it authenticates webhook delivery for that App.
 
 Signing: Slack signs every inbound request with the signing_secret as
 ``v0=<sha256 hmac of 'v0:' + ts + ':' + body>``. The signature is in the
@@ -24,7 +21,11 @@ from typing import Any, Dict, Optional
 
 from packages.core.models.channel import ChannelConfig
 from packages.core.services.channels.base import (
-    ChannelAdapter, NormalizedInbound, register_adapter,
+    ChannelAdapter,
+    ChannelTextSendError,
+    ChannelTextSendRetryMode,
+    NormalizedInbound,
+    register_adapter,
 )
 
 logger = logging.getLogger(__name__)
@@ -38,25 +39,53 @@ _SLACK_API = "https://slack.com/api"
 _MAX_TS_SKEW = 60 * 5
 
 
+def verify_slack_request(*, headers: dict, body: bytes) -> bool:
+    """Verify a Slack request before its payload is trusted or routed."""
+    secret = os.getenv("SLACK_SIGNING_SECRET", "").strip()
+    if not secret:
+        return False
+    normalized_headers = {str(key).lower(): value for key, value in headers.items()}
+    ts = normalized_headers.get("x-slack-request-timestamp", "")
+    sig = normalized_headers.get("x-slack-signature", "")
+    if not (ts and sig):
+        return False
+    try:
+        if abs(time.time() - int(ts)) > _MAX_TS_SKEW:
+            return False
+    except ValueError:
+        return False
+    base = f"v0:{ts}:".encode() + body
+    mac = hmac.new(secret.encode(), base, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(f"v0={mac}", sig)
+
+
 class SlackChannelAdapter(ChannelAdapter):
     channel_type = "slack"
+    text_send_retry_mode = ChannelTextSendRetryMode.PROVIDER_IDEMPOTENT
+
+    def webhook_path(self, cc: ChannelConfig) -> str:
+        return "/api/v1/channels/slack/events"
 
     async def send_text(
         self, cc: ChannelConfig, to: str, text: str, **kwargs: Any,
     ) -> Dict[str, Any]:
         if httpx is None:
-            raise RuntimeError("httpx is required — pip install httpx")
-        # Prefer the workspace-scoped token captured during OAuth; fall
-        # back to the deployment-level env token for dev setups that
-        # haven't completed the OAuth flow yet.
-        token = (cc.credentials or {}).get("bot_token", "") \
-            or os.getenv("SLACK_BOT_TOKEN", "").strip()
+            raise ChannelTextSendError.determinate(
+                "httpx is required — pip install httpx"
+            )
+        credentials = await self.credentials(cc, reason="channel.slack.send_text")
+        token = credentials.get("bot_token") or credentials.get("access_token")
         if not token:
-            raise RuntimeError("Slack bot_token not configured (env or ChannelConfig)")
+            raise ChannelTextSendError.determinate(
+                "Slack credential source has no bot token"
+            )
         thread_ts = kwargs.get("thread_ts")
         payload: Dict[str, Any] = {"channel": to, "text": text}
         if thread_ts:
             payload["thread_ts"] = thread_ts
+        idempotency_key = str(kwargs.get("idempotency_key") or "").strip()
+        if idempotency_key:
+            payload["client_msg_id"] = idempotency_key
         async with httpx.AsyncClient(timeout=15) as client:
             resp = await client.post(
                 f"{_SLACK_API}/chat.postMessage",
@@ -65,9 +94,21 @@ class SlackChannelAdapter(ChannelAdapter):
                 json=payload,
             )
         data = resp.json()
+        if not resp.is_success:
+            raise ChannelTextSendError.from_http_status(
+                f"Slack API error {resp.status_code}: {data.get('error')}",
+                status_code=resp.status_code,
+            )
         if not data.get("ok"):
-            raise RuntimeError(f"Slack API error: {data.get('error')}")
-        return {"channel": to, "ts": data.get("ts"), "status": "sent"}
+            raise ChannelTextSendError.determinate(
+                f"Slack API error: {data.get('error')}"
+            )
+        return {
+            "channel": to,
+            "ts": data.get("ts"),
+            "external_id": data.get("ts"),
+            "status": "sent",
+        }
 
     async def send_attachment(
         self, cc: ChannelConfig, to: str, *, url=None, data=None,
@@ -80,10 +121,10 @@ class SlackChannelAdapter(ChannelAdapter):
             raise RuntimeError("httpx is required — pip install httpx")
         if not url and not data:
             raise RuntimeError("send_attachment needs url or data")
-        token = (cc.credentials or {}).get("bot_token", "") \
-            or os.getenv("SLACK_BOT_TOKEN", "").strip()
+        credentials = await self.credentials(cc, reason="channel.slack.send_attachment")
+        token = credentials.get("bot_token") or credentials.get("access_token")
         if not token:
-            raise RuntimeError("Slack bot_token not configured")
+            raise RuntimeError("Slack credential source has no bot token")
 
         # Pull the file bytes if only url given
         async with httpx.AsyncClient(timeout=30) as client:
@@ -131,27 +172,9 @@ class SlackChannelAdapter(ChannelAdapter):
     async def verify_inbound(
         self, cc: ChannelConfig, *, headers, query, body,
     ) -> bool:
-        # Deployment-level signing secret (one Slack app per deployment)
-        # takes precedence; per-ChannelConfig override only for multi-app
-        # OSS deployments.
-        secret = (
-            os.getenv("SLACK_SIGNING_SECRET", "").strip()
-            or (cc.credentials or {}).get("signing_secret", "")
-        )
-        if not secret:
-            return False
-        ts = headers.get("X-Slack-Request-Timestamp", "")
-        sig = headers.get("X-Slack-Signature", "")
-        if not (ts and sig):
-            return False
-        try:
-            if abs(time.time() - int(ts)) > _MAX_TS_SKEW:
-                return False
-        except ValueError:
-            return False
-        base = f"v0:{ts}:".encode() + body
-        mac = hmac.new(secret.encode(), base, hashlib.sha256).hexdigest()
-        return hmac.compare_digest(f"v0={mac}", sig)
+        # Incoming Events API requests are signed by the deployment's Slack
+        # App, rather than by a user-owned OAuth token.
+        return verify_slack_request(headers=headers, body=body)
 
     async def parse_inbound(
         self, cc: ChannelConfig, *, headers, query, body,
@@ -167,10 +190,15 @@ class SlackChannelAdapter(ChannelAdapter):
             return None
 
         event = payload.get("event") or {}
-        if event.get("type") not in ("message", "app_mention"):
+        event_type = event.get("type")
+        if event_type not in ("message", "app_mention"):
+            return None
+        # The product contract is explicit mentions in channels plus direct
+        # messages. Ordinary channel traffic must never trigger an Agent.
+        if event_type == "message" and event.get("channel_type") != "im":
             return None
         # Skip messages the bot itself sent
-        if event.get("subtype") in ("bot_message", "channel_join"):
+        if event.get("subtype"):
             return None
         if event.get("bot_id"):
             return None
@@ -179,6 +207,10 @@ class SlackChannelAdapter(ChannelAdapter):
         channel = event.get("channel", "")
         if not (user and channel):
             return None
+
+        thread_ts = event.get("thread_ts")
+        if event_type == "app_mention" and not thread_ts:
+            thread_ts = event.get("ts")
 
         return NormalizedInbound(
             channel_type="slack",
@@ -189,6 +221,7 @@ class SlackChannelAdapter(ChannelAdapter):
             content=event.get("text", "") or "",
             message_type="text",
             external_message_id=event.get("ts"),
+            thread_ts=thread_ts,
             raw=payload,
         )
 

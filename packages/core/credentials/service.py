@@ -244,7 +244,7 @@ class CredentialService:
     # Many GUI-only platforms (douyin operator, kuaishou,
     # boss-zhipin, ...) don't expose an OAuth or API-key flow. The
     # operator stores their login as a password_pair Integration, then
-    # the Playwright MCP server leases it just-in-time to log in,
+    # an approved integration runtime leases it just-in-time to log in,
     # extracts a session, and persists that session under an
     # IntegrationSession (cookie_jar) so subsequent runs reuse cookies.
     #

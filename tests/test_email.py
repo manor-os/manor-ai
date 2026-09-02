@@ -47,17 +47,50 @@ async def test_send_email_disabled():
         assert result is True
 
 
+def test_smtp_config_accepts_kubernetes_username_alias(monkeypatch):
+    """Older DOKS runtime files used SMTP_USERNAME instead of SMTP_USER."""
+    from packages.core.services.email_service import _get_smtp_config
+
+    monkeypatch.delenv("SMTP_USER", raising=False)
+    monkeypatch.setenv("SMTP_USERNAME", "k8s-smtp-user")
+
+    assert _get_smtp_config()["username"] == "k8s-smtp-user"
+
+
 @pytest.mark.asyncio
-async def test_invite_email_template():
-    """Invite email calls aiosmtplib.send with correct content when enabled."""
-    from types import SimpleNamespace
+async def test_send_email_blocks_local_fixture_domains():
+    """Synthetic ``.local`` accounts must never reach a configured SMTP relay."""
     import packages.core.services.email_service as email_mod
+    from packages.core.services import smtp_transport
 
     mock_send = AsyncMock()
-    fake_smtp = SimpleNamespace(send=mock_send)
-    original = email_mod.aiosmtplib
+    original = getattr(smtp_transport, "send_message_async", None)
+    smtp_transport.send_message_async = mock_send  # type: ignore[attr-defined]
+    try:
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setenv("EMAIL_ENABLED", "true")
+            mp.delenv("PYTEST_CURRENT_TEST", raising=False)
+            result = await email_mod.send_email(
+                "newsletter-e2e@manor.local", "Test", "<p>Hello</p>",
+            )
+        assert result is True
+        mock_send.assert_not_awaited()
+    finally:
+        if original is None:
+            delattr(smtp_transport, "send_message_async")
+        else:
+            smtp_transport.send_message_async = original
 
-    email_mod.aiosmtplib = fake_smtp  # type: ignore[assignment]
+
+@pytest.mark.asyncio
+async def test_invite_email_template():
+    """Invite email delegates the MIME message to the shared transport."""
+    import packages.core.services.email_service as email_mod
+    from packages.core.services import smtp_transport
+
+    mock_send = AsyncMock()
+    original_transport = getattr(smtp_transport, "send_message_async", None)
+    smtp_transport.send_message_async = mock_send  # type: ignore[attr-defined]
     try:
         with patch.dict(os.environ, {"EMAIL_ENABLED": "true"}, clear=False):
             result = await email_mod.send_invite_email(
@@ -68,14 +101,17 @@ async def test_invite_email_template():
             )
 
             assert result is True
-            mock_send.assert_called_once()
+            mock_send.assert_awaited_once()
 
             call_args = mock_send.call_args
             msg = call_args.args[0] if call_args.args else call_args.kwargs.get("message")
             assert msg["To"] == "newuser@example.com"
             assert "Acme Corp" in msg["Subject"]
     finally:
-        email_mod.aiosmtplib = original
+        if original_transport is None:
+            delattr(smtp_transport, "send_message_async")
+        else:
+            smtp_transport.send_message_async = original_transport
 
 
 # ── Password reset e2e tests (use real DB via client fixture) ──

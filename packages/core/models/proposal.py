@@ -29,6 +29,12 @@ from sqlalchemy import DateTime, Index, Integer, String, Text, UniqueConstraint,
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
+from packages.core.constants.proposal import (
+    ProposalItemKind,
+    ProposalItemStatus,
+    ProposalStatus,
+)
+
 from .base import Base, generate_ulid
 
 
@@ -49,7 +55,9 @@ class ProposalRecord(Base):
     notes: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
     # open | resolved | expired
-    status: Mapped[str] = mapped_column(String(16), nullable=False, default="open")
+    status: Mapped[ProposalStatus] = mapped_column(
+        String(16), nullable=False, default=ProposalStatus.OPEN
+    )
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
@@ -76,7 +84,7 @@ class ProposalItemRecord(Base):
     # Stable key within the proposal; dependency references use it.
     item_key: Mapped[str] = mapped_column(String(40), nullable=False)
     # task | human_request | automation_change | workflow_change | goal_change | experiment
-    kind: Mapped[str] = mapped_column(String(24), nullable=False)
+    kind: Mapped[ProposalItemKind] = mapped_column(String(24), nullable=False)
     # Per-kind pydantic model dump (see packages.core.proposals.schema).
     # For kind="task" this is the ProposedTask dump + {"task_id": <Task.id>}.
     payload: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
@@ -90,7 +98,9 @@ class ProposalItemRecord(Base):
     depends_on_item_keys: Mapped[Optional[list]] = mapped_column(JSONB, nullable=True)
 
     # proposed | approved | rejected | expired | executing | succeeded | failed | cancelled
-    status: Mapped[str] = mapped_column(String(16), nullable=False, default="proposed")
+    status: Mapped[ProposalItemStatus] = mapped_column(
+        String(16), nullable=False, default=ProposalItemStatus.PROPOSED
+    )
     approval_request_id: Mapped[Optional[str]] = mapped_column(String(26), nullable=True)
     # {decided_by, decision, reason_code, comment, decided_at}
     decision: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)

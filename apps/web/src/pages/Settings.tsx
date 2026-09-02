@@ -5,6 +5,8 @@ import { api, type BillingPayment } from "../lib/api";
 import { useToastStore } from "../stores/toast";
 import { useAuthStore } from "../stores/auth";
 import Modal from "../components/ui/Modal";
+import Button from "../components/ui/Button";
+import EmptyState from "../components/ui/EmptyState";
 import PageHeader from "../components/ui/PageHeader";
 import { ListRowsSkeleton, PanelLoading } from "../components/ui/Skeleton";
 import DeveloperTab from "../components/settings/DeveloperTab";
@@ -80,13 +82,31 @@ function DailyUsageBar({
    Shared components
    ═══════════════════════════════════════════════════════════════════ */
 
-function NeonToggle({ checked, onChange }: { checked: boolean; onChange: (v: boolean) => void }) {
+function NeonToggle({
+  checked,
+  onChange,
+  disabled = false,
+  ariaLabel,
+}: {
+  checked: boolean;
+  onChange: (v: boolean) => void;
+  disabled?: boolean;
+  ariaLabel?: string;
+}) {
   return (
-    <button type="button" onClick={() => onChange(!checked)} style={{
-      position: "relative", width: 48, height: 26, borderRadius: 9999, border: "none", cursor: "pointer", flexShrink: 0, transition: "all 0.3s",
+    <button
+      type="button"
+      role="switch"
+      aria-checked={checked}
+      aria-label={ariaLabel}
+      disabled={disabled}
+      onClick={() => onChange(!checked)}
+      style={{
+      position: "relative", width: 48, height: 26, borderRadius: 9999, border: "none", cursor: disabled ? "wait" : "pointer", flexShrink: 0, transition: "all 0.3s", opacity: disabled ? 0.6 : 1,
       background: checked ? "#4f7d75" : "#e7e5e4",
       boxShadow: checked ? "0 0 12px rgba(79,125,117,0.4)" : "inset 0 1px 2px rgba(0,0,0,0.06)",
-    }}>
+    }}
+    >
       <span style={{ position: "absolute", top: 3, left: checked ? 25 : 3, width: 20, height: 20, background: "#fff", borderRadius: "50%", boxShadow: "0 1px 3px rgba(0,0,0,0.12)", transition: "left 0.3s cubic-bezier(0.4,0,0.2,1)" }} />
     </button>
   );
@@ -97,7 +117,6 @@ const CHANNEL_LABELS: Record<string, string> = {
   email: "Email",
   telegram: "Telegram",
   wechat: "WeChat",
-  whatsapp: "WhatsApp",
   slack: "Slack",
   discord: "Discord",
   twilio_sms: "SMS",
@@ -132,14 +151,17 @@ function ChannelCheckbox({
   );
 }
 
-function ConnectTelegramButton() {
-  // Modal-style inline flow for "Connect Telegram":
+type ClaimableChannel = "telegram" | "discord";
+
+function ConnectChannelButton({ channelType }: { channelType: ClaimableChannel }) {
+  // Modal-style inline flow for explicitly binding a channel identity:
   //   1. POST /preferences/link/start → token + deep link
-  //   2. Show the user the deep link (or fallback command)
+  //   2. Show the user the provider deep link (or fallback command)
   //   3. Poll /preferences/link/<token> until it flips to "claimed"
   //   4. Invalidate the prefs query so Connected Channels refreshes
   const queryClient = useQueryClient();
   const toast = useToastStore();
+  const label = channelLabel(channelType);
   const [open, setOpen] = useState(false);
   const [link, setLink] = useState<null | {
     token: string;
@@ -151,7 +173,7 @@ function ConnectTelegramButton() {
   const [status, setStatus] = useState<"pending" | "claimed" | "expired" | "not_found" | null>(null);
 
   const startMutation = useMutation({
-    mutationFn: () => api.notifications.startChannelLink("telegram"),
+    mutationFn: () => api.notifications.startChannelLink(channelType),
     onSuccess: (data) => {
       setLink({
         token: data.token,
@@ -206,11 +228,11 @@ function ConnectTelegramButton() {
       >
         {startMutation.isPending
           ? t("status.loading")
-          : t("page.settings.connect_telegram")}
+          : t("page.settings.connect_channel", { channel: label })}
       </button>
 
       {open && link && (
-        <Modal open={open} onClose={close} title={t("page.settings.connect_telegram")}>
+        <Modal open={open} onClose={close} title={t("page.settings.connect_channel", { channel: label })}>
           <div style={{ display: "flex", flexDirection: "column", gap: 12, padding: 4 }}>
             {status === "claimed" ? (
               <div style={{
@@ -243,7 +265,7 @@ function ConnectTelegramButton() {
                     className="btn-manor"
                     style={{ textAlign: "center" }}
                   >
-                    {t("page.settings.open_telegram")}
+                    {t("page.settings.open_channel", { channel: label })}
                   </a>
                 )}
                 <div style={{
@@ -255,7 +277,7 @@ function ConnectTelegramButton() {
                   /start {link.token}
                 </div>
                 <div style={{ fontSize: 11, color: "#a8a29e" }}>
-                  {t("page.settings.link_polling")}
+                  {t("page.settings.link_polling_channel", { channel: label })}
                 </div>
               </>
             )}
@@ -304,7 +326,9 @@ function NotificationsTab() {
   const linkableChannels = supported.filter(
     (ct) => ct !== "inapp" && configuredTypes.has(ct) && !connectedTypes.has(ct),
   );
-  const canLinkTelegram = linkableChannels.includes("telegram");
+  const claimableChannels = linkableChannels.filter(
+    (channel): channel is ClaimableChannel => channel === "telegram" || channel === "discord",
+  );
   const configuredLabels = configuredChannels.length
     ? configuredChannels.map(channelLabel).join(", ")
     : t("page.settings.none_configured");
@@ -415,13 +439,16 @@ function NotificationsTab() {
         </div>
       </section>
 
+
       {/* Connected channels */}
       <section>
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: 4 }}>
           <h3 className="manor-section-title" style={{ margin: 0 }}>
             {t("page.settings.connected_channels")}
           </h3>
-          {connected.length > 0 && canLinkTelegram && <ConnectTelegramButton />}
+          {connected.length > 0 && claimableChannels.map((channel) => (
+            <ConnectChannelButton key={channel} channelType={channel} />
+          ))}
         </div>
         <p style={{ margin: "0 0 12px", fontSize: 12, color: "#78716c" }}>
           {t("page.settings.connected_channels_desc")}
@@ -432,9 +459,11 @@ function NotificationsTab() {
             background: "rgba(250,250,249,0.5)", color: "#78716c", fontSize: 13,
           }}>
             {t("page.settings.no_channels_connected")}
-            {canLinkTelegram && (
-              <div style={{ marginTop: 10 }}>
-                <ConnectTelegramButton />
+            {claimableChannels.length > 0 && (
+              <div style={{ marginTop: 10, display: "flex", gap: 8, flexWrap: "wrap" }}>
+                {claimableChannels.map((channel) => (
+                  <ConnectChannelButton key={channel} channelType={channel} />
+                ))}
               </div>
             )}
           </div>
@@ -707,7 +736,7 @@ const PERSONAL_SETTINGS: SettingsNavItem[] = [
   {
     key: "appearance",
     label: t("page.account.appearance"),
-    description: "Theme, display mode, and interface preference.",
+    description: "Theme, AI Edit display, and interface preferences.",
     icon: IconPalette,
   },
   {
@@ -821,6 +850,7 @@ export default function Settings() {
     if (tab === "developer" && isAdmin && SHOW_DEVELOPER_TAB) return <DeveloperTab />;
     return null;
   })();
+
 
   return (
     <div

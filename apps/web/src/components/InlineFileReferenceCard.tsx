@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useLocation, useNavigate } from "react-router-dom";
 import { api } from "../lib/api";
 import type { Document } from "../lib/types";
@@ -10,6 +10,7 @@ import {
   fileReferenceKind,
   fileReferenceTypeLabel,
   isOpenableFileReference,
+  legacyViewerFileCandidates,
   looksLikeFileReference,
   viewerPathForDocumentId,
   type FileReferenceKind,
@@ -89,10 +90,9 @@ function getDocumentsFromResponse(response: any): Document[] {
 
 function sameOriginViewerPath(reference: string): string | null {
   const validViewerPath = (path: string) => {
-    const match = path.match(/^\/viewer\/([^?#]+)/);
+    const match = path.match(/^\/viewer\/([^/?#]+)(?:[?#].*)?$/);
     if (!match?.[1]) return false;
-    const decoded = decodeUrlPathPart(match[1]);
-    return !(decoded.includes("/") && looksLikeFileReference(decoded));
+    return Boolean(viewerPathForDocumentId(decodeUrlPathPart(match[1])));
   };
   if (/^\/viewer\//.test(reference)) return validViewerPath(reference) ? reference : null;
   try {
@@ -116,6 +116,11 @@ function displayNameFromReference(referenceName: string, label?: string): string
   return cleaned || referenceName;
 }
 
+function routeWithAnchor(route: string, anchorId?: string): string {
+  if (!anchorId) return route;
+  return `${route.split("#")[0]}#${encodeURIComponent(anchorId)}`;
+}
+
 function FileTypeIcon({ kind, size }: { kind: FileReferenceKind; size: number }) {
   const Icon = getFileReferenceIcon(kind);
   return <Icon size={size} />;
@@ -132,6 +137,7 @@ export default function InlineFileReferenceCard({
   fileType,
   mimeType,
   navigationState,
+  sourceAnchorId,
 }: {
   reference: string;
   label?: string;
@@ -145,13 +151,21 @@ export default function InlineFileReferenceCard({
   mimeType?: string;
   /** Additional viewer state, such as an unsynced Task output preview. */
   navigationState?: Record<string, unknown>;
+  /** Stable element id used to restore the exact source position on return. */
+  sourceAnchorId?: string;
 }) {
   const navigate = useNavigate();
   const location = useLocation();
+  const sourceRef = useRef<HTMLElement | null>(null);
   const [isResolving, setIsResolving] = useState(false);
   const [unresolved, setUnresolved] = useState(false);
+  const [legacyLookupFailed, setLegacyLookupFailed] = useState(false);
+  const unavailableDetail = t(legacyLookupFailed
+    ? "component.inline_file_reference.legacy_unresolved"
+    : "component.inline_file_reference.not_in_knowledge");
   const decoded = decodeFileReferenceHref(reference) || reference;
-  const currentReturnTo = returnTo || `${location.pathname}${location.search}${location.hash}`;
+  const returnRoute = returnTo || `${location.pathname}${location.search}${location.hash}`;
+  const currentReturnTo = routeWithAnchor(returnRoute, sourceAnchorId);
   const isExternal = useMemo(() => /^https?:\/\//i.test(decoded), [decoded]);
   const decodedFsPath = useMemo(() => fsPathFromReference(decoded), [decoded]);
   const fileName = useMemo(() => fileNameFromReference(decodedFsPath || decoded), [decoded, decodedFsPath]);
@@ -174,6 +188,27 @@ export default function InlineFileReferenceCard({
     chatReturnTo: currentReturnTo,
   };
 
+  useEffect(() => {
+    if (!sourceAnchorId || typeof window === "undefined") return;
+    let activeHash = window.location.hash.slice(1);
+    try {
+      activeHash = decodeURIComponent(activeHash);
+    } catch {
+      // Keep the raw hash when it is not valid percent-encoded text.
+    }
+    if (activeHash !== sourceAnchorId) return;
+    const frame = window.requestAnimationFrame(() => {
+      const source = sourceRef.current;
+      if (!source) return;
+      source.scrollIntoView({ block: "center", inline: "nearest" });
+      const focusTarget = source.matches("button, a, [role='button']")
+        ? source
+        : source.querySelector<HTMLElement>("button, a, [role='button']");
+      focusTarget?.focus({ preventScroll: true });
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [sourceAnchorId]);
+
   async function openReference() {
     const viewerPath = sameOriginViewerPath(decoded);
     if (viewerPath) {
@@ -182,10 +217,51 @@ export default function InlineFileReferenceCard({
       return;
     }
 
+    // Never send a historical filename to documents.get, or fall back to a
+    // raw FS read (which could bypass the selected Document's access policy).
+    let internalUrl: URL | null = null;
+    try { internalUrl = new URL(decoded, window.location.origin); } catch { /* Not a URL. */ }
+    if (internalUrl?.origin === window.location.origin && internalUrl.pathname.startsWith("/viewer/")) {
+      const candidates = legacyViewerFileCandidates(internalUrl.pathname);
+      const workspaceId = currentReturnTo.match(/^\/workspaces\/([^/?#]+)(?:[/?#]|$)/)?.[1];
+      setUnresolved(false);
+      setLegacyLookupFailed(true);
+      setIsResolving(true);
+      try {
+        if (workspaceId && candidates.length) {
+          const matches = new Map<string, Document>();
+          const names = [...new Set(candidates.map((candidate) => candidate.split("/").pop()!))];
+          for (const search of names) {
+            const response = await api.documents.listAll({ search, workspace_id: workspaceId, include_generated_assets: true });
+            // An incomplete page set cannot prove uniqueness.
+            if (response.items.length < response.total) throw new Error("Incomplete document lookup");
+            for (const doc of response.items) {
+              if (viewerPathForDocumentId(doc.id) && candidates.some((candidate) => (
+                candidate.includes("/") ? doc.fs_path === candidate : doc.name === candidate
+              ))) matches.set(doc.id, doc);
+            }
+          }
+          if (matches.size === 1) {
+            const doc = [...matches.values()][0];
+            preserveReturnToInHistory(currentReturnTo);
+            navigate(viewerPathForDocumentId(doc.id)!, { state: viewerNavigationState });
+            return;
+          }
+        }
+        setUnresolved(true);
+      } catch {
+        setUnresolved(true);
+      } finally {
+        setIsResolving(false);
+      }
+      return;
+    }
+
     const idMatch = decoded.match(/\/documents\/([^/]+)/) || decoded.match(/^([0-9A-HJKMNP-TV-Z]{26})(?:$|[?#])/i);
-    if (!isExternal && idMatch?.[1]) {
+    const documentPath = idMatch?.[1] ? viewerPathForDocumentId(decodeUrlPathPart(idMatch[1])) : null;
+    if (!isExternal && documentPath) {
       preserveReturnToInHistory(currentReturnTo);
-      navigate(viewerPathForDocumentId(idMatch[1])!, { state: viewerNavigationState });
+      navigate(documentPath, { state: viewerNavigationState });
       return;
     }
 
@@ -209,7 +285,7 @@ export default function InlineFileReferenceCard({
         try {
           const result = await api.fs.read(decodedFsPath);
           preserveReturnToInHistory(currentReturnTo);
-          navigate(viewerPathForDocumentId(`fs-preview:${fileName}`)!, {
+          navigate(`/viewer/${encodeURIComponent(`fs-preview:${fileName}`)}`, {
             state: {
               ...viewerNavigationState,
               taskOutputPreview: {
@@ -258,7 +334,7 @@ export default function InlineFileReferenceCard({
   }
 
   if (display === "card") {
-    return (
+    const card = (
       <CompactCard
         className={`inline-file-reference-card-surface inline-file-reference-card-surface--${kind}${isResolving ? " is-loading" : ""} ${className}`}
         icon={(
@@ -268,16 +344,23 @@ export default function InlineFileReferenceCard({
         )}
         title={resolvedFileName}
         subtitle={unresolved
-          ? t("component.inline_file_reference.not_in_knowledge")
+          ? unavailableDetail
           : (decodedFsPath || decoded)}
         meta={isResolving ? "…" : typeLabel}
         onClick={() => void openReference()}
       />
     );
+    return sourceAnchorId ? (
+      <div id={sourceAnchorId} ref={(node) => { sourceRef.current = node; }}>
+        {card}
+      </div>
+    ) : card;
   }
 
   return (
     <button
+      id={sourceAnchorId}
+      ref={(node) => { sourceRef.current = node; }}
       type="button"
       className={`inline-file-reference-card inline-file-reference-card--${kind}${compact ? " inline-file-reference-card--compact" : ""}${isResolving ? " inline-file-reference-card--loading" : ""} ${className}`}
       disabled={isResolving}
@@ -286,7 +369,7 @@ export default function InlineFileReferenceCard({
         event.stopPropagation();
         void openReference();
       }}
-      title={unresolved ? t("component.inline_file_reference.not_in_knowledge") : (decodedFsPath || decoded)}
+      title={unresolved ? unavailableDetail : (decodedFsPath || decoded)}
       aria-disabled={unresolved}
     >
       <span className="inline-file-reference-card__icon" aria-hidden="true">
@@ -296,7 +379,7 @@ export default function InlineFileReferenceCard({
       <span className="inline-file-reference-card__type">{typeLabel}</span>
       {unresolved && (
         <span className="inline-file-reference-card__unresolved">
-          {t("component.inline_file_reference.not_available")}
+          {t(legacyLookupFailed ? "component.inline_file_reference.link_unavailable" : "component.inline_file_reference.not_available")}
         </span>
       )}
       {isExternal && <IconExternalLink size={10} className="inline-file-reference-card__external" />}

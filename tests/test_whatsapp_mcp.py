@@ -115,6 +115,33 @@ async def test_send_text_dispatches_to_cloud_adapter(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
+async def test_send_text_explains_when_an_approved_template_is_required(
+    monkeypatch,
+) -> None:
+    from packages.core.ai.mcp import whatsapp
+    from packages.core.services.channels.base import ChannelTextSendError
+
+    async def _send_text(self, to, text):
+        raise ChannelTextSendError.determinate(
+            "The customer-service window has expired.",
+            reason_code="whatsapp_template_required",
+        )
+
+    monkeypatch.setattr(whatsapp.WhatsAppAdapter, "send_text", _send_text)
+
+    result = await whatsapp.call_tool(
+        "send_text",
+        {"to": "+14155550123", "text": "Late follow-up"},
+        _credentials(),
+    )
+
+    assert result["isError"] is True
+    detail = result["content"][0]["text"]
+    assert "whatsapp_template_required" in detail
+    assert "send_template" in detail
+
+
+@pytest.mark.asyncio
 async def test_create_template_uses_waba_and_json_body(monkeypatch) -> None:
     from packages.core.ai.mcp import whatsapp
 

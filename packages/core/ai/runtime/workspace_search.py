@@ -16,15 +16,26 @@ async def runtime_workspace_search(
     """Execute workspace-scoped search through the Runtime boundary."""
 
     from packages.core.ai.runtime.tool_context import (
+        RuntimeToolContextConflictError,
         runtime_tool_call_context_from_kwargs,
         runtime_tool_call_context_is_external_customer,
         runtime_tool_call_context_is_public_customer,
     )
 
-    context = runtime_tool_call_context_from_kwargs(kwargs)
-    workspace_id = str(workspace_id or context.workspace_id or "").strip()
+    try:
+        context = runtime_tool_call_context_from_kwargs(
+            kwargs,
+            entity_id=entity_id,
+            workspace_id=workspace_id,
+        )
+    except RuntimeToolContextConflictError as exc:
+        return json.dumps({"error": str(exc)})
+    entity_id = context.entity_id or ""
+    workspace_id = context.workspace_id or ""
     if not workspace_id:
         return json.dumps({"error": "No workspace context — this tool only works inside a workspace chat."})
+    if not entity_id:
+        return json.dumps({"error": "No entity context — workspace search cannot run."})
 
     query = kwargs.get("query", "")
     category = kwargs.get("category")

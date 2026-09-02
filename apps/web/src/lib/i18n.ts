@@ -1,11 +1,13 @@
 import en from "./i18n/en";
 import zh from "./i18n/zh";
 import es from "./i18n/es";
+import fr from "./i18n/fr";
 
 const translations = {
   en,
   zh,
   es,
+  fr,
 } satisfies Record<string, Record<string, string>>;
 
 type Locale = keyof typeof translations;
@@ -65,4 +67,5 @@ export const SUPPORTED_LOCALES: { code: Locale; name: string; flag: string }[] =
   { code: "en", name: "English", flag: "\uD83C\uDDFA\uD83C\uDDF8" },
   { code: "zh", name: "\u4E2D\u6587", flag: "\uD83C\uDDE8\uD83C\uDDF3" },
   { code: "es", name: "Espa\u00F1ol", flag: "\uD83C\uDDEA\uD83C\uDDF8" },
+  { code: "fr", name: "Fran\u00E7ais", flag: "\uD83C\uDDEB\uD83C\uDDF7" },
 ];

@@ -15,6 +15,7 @@ export type ChatScrollRailMarkerTone =
 
 export interface ChatScrollRailMarker {
   id: string;
+  sourceIndex?: number;
   tone?: ChatScrollRailMarkerTone;
   title?: string;
   excerpt?: string;
@@ -31,6 +32,7 @@ interface ChatScrollRailProps {
 interface SampledRailMarker {
   marker: ChatScrollRailMarker;
   sourceIndex: number;
+  markerIndex: number;
 }
 
 const MAX_MARKERS = 72;
@@ -49,20 +51,32 @@ function cssAttributeEscape(value: string) {
 
 function sampleMarkers(markers: ChatScrollRailMarker[]): SampledRailMarker[] {
   if (markers.length <= MAX_MARKERS) {
-    return markers.map((marker, sourceIndex) => ({ marker, sourceIndex }));
+    return markers.map((marker, markerIndex) => ({
+      marker,
+      markerIndex,
+      sourceIndex: marker.sourceIndex ?? markerIndex,
+    }));
   }
   const sampled: SampledRailMarker[] = [];
   const last = markers.length - 1;
   for (let i = 0; i < MAX_MARKERS; i += 1) {
-    const sourceIndex = Math.round((i / (MAX_MARKERS - 1)) * last);
-    const marker = markers[sourceIndex];
+    const markerIndex = Math.round((i / (MAX_MARKERS - 1)) * last);
+    const marker = markers[markerIndex];
     if (marker && sampled[sampled.length - 1]?.marker.id !== marker.id) {
-      sampled.push({ marker, sourceIndex });
+      sampled.push({
+        marker,
+        markerIndex,
+        sourceIndex: marker.sourceIndex ?? markerIndex,
+      });
     }
   }
   const finalMarker = markers[last];
   if (finalMarker && sampled[sampled.length - 1]?.marker.id !== finalMarker.id) {
-    sampled.push({ marker: finalMarker, sourceIndex: last });
+    sampled.push({
+      marker: finalMarker,
+      markerIndex: last,
+      sourceIndex: finalMarker.sourceIndex ?? last,
+    });
   }
   return sampled;
 }
@@ -176,6 +190,15 @@ export default function ChatScrollRail({
     availableRailHeight,
     desiredRailHeight,
   );
+  const naturalMarkerClusterHeight = Math.max(
+    0,
+    (sampledMarkers.length - 1) * MARKER_GAP_PX,
+  );
+  const useCompactMarkerCluster = naturalMarkerClusterHeight <= railHeight;
+  const markerClusterStartPx =
+    useCompactMarkerCluster
+      ? (railHeight - naturalMarkerClusterHeight) / 2
+      : 0;
   const progress =
     maxScroll > 0
       ? Math.max(0, Math.min(1, snapshot.scrollTop / maxScroll))
@@ -216,7 +239,7 @@ export default function ChatScrollRail({
       }
     }
     const ratio = entry
-      ? entry.sourceIndex / Math.max(1, markers.length - 1)
+      ? entry.markerIndex / Math.max(1, markers.length - 1)
       : sampledMarkers.length <= 1
         ? 0
         : index / (sampledMarkers.length - 1);
@@ -243,7 +266,14 @@ export default function ChatScrollRail({
       />
       {sampledMarkers.map(({ marker }, index) => {
         const denominator = Math.max(1, sampledMarkers.length - 1);
-        const top = denominator > 0 ? (index / denominator) * 100 : 0;
+        const markerTopPercent =
+          sampledMarkers.length <= 1
+            ? 50
+            : useCompactMarkerCluster
+              ? ((markerClusterStartPx + index * MARKER_GAP_PX) /
+                  Math.max(1, railHeight)) *
+                100
+              : (index / denominator) * 100;
         const markerTitle =
           marker.title ||
           marker.fileLabel ||
@@ -261,7 +291,7 @@ export default function ChatScrollRail({
           <div
             key={`${marker.id}-${index}`}
             className="chat-scroll-rail__item"
-            style={{ top: `${top}%` }}
+            style={{ top: `${markerTopPercent}%` }}
             onMouseEnter={() => setActiveHoverIndex(index)}
             onMouseLeave={() =>
               setActiveHoverIndex((current) =>

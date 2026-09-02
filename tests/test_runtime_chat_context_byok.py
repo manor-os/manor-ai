@@ -124,6 +124,115 @@ async def test_runtime_chat_context_resolves_active_tenant_llm_route(monkeypatch
 
 
 @pytest.mark.asyncio
+async def test_workspace_ledger_tool_scope_keeps_the_tenant_byok_route(monkeypatch):
+    from packages.core.ai.runtime.prompt_adapter import ChatContext
+    from packages.core.ai.runtime.surfaces import ChatSurface
+    from packages.core.services import runtime_chat_context as module
+
+    ledger_tools = {
+        "read_finance_ledger",
+        "query_ledger",
+        "visualize_workspace_ledgers",
+    }
+
+    async def fake_resolve_workspace_runtime(*_args, **kwargs):
+        assert kwargs["workspace_id"] == "ws_ledger"
+        assert kwargs["agent_id"] == "agent_finance"
+        return SimpleNamespace(
+            workspace_id="ws_ledger",
+            tool_profile="workspace_agent",
+            is_master=False,
+            task_id=None,
+            thread_ref_kind=None,
+            thread_ref_id=None,
+            bound_tool_names=ledger_tools,
+            mcp_allowed_names=set(),
+            extra_context=None,
+        )
+
+    async def fake_assemble_prompt(_db, *, request, **kwargs):
+        assert kwargs["bound_tool_names"] == ledger_tools
+        assert kwargs["visible_tool_names"] == (
+            "read_content_ledger",
+            "read_finance_ledger",
+            "read_recruiting_ledger",
+            "read_relationship_ledger",
+            "query_ledger",
+            "manor",
+        )
+        assert request.metadata["turn_execution_plan"]["tool_catalog_mode"] == (
+            "ledger_query"
+        )
+        ctx = ChatContext(
+            db=_db,
+            entity_id=request.entity_id,
+            user_id=request.user_id,
+            agent_id=request.agent_id,
+            workspace_id=request.workspace_id,
+        )
+        ctx.agent = SimpleNamespace(config={"model_mode": "inherit"})
+        return SimpleNamespace(
+            context=ctx,
+            tool_schemas=[],
+            prompt="system prompt",
+        )
+
+    async def fake_resolve_model(role, **kwargs):
+        assert role == "primary"
+        assert kwargs["user_id"] == "user_owner"
+        assert kwargs["entity_id"] == "entity_owner"
+        return "deepseek/deepseek-chat"
+
+    async def fake_resolve_metadata(role, **kwargs):
+        assert role == "primary"
+        assert kwargs["user_id"] == "user_owner"
+        assert kwargs["entity_id"] == "entity_owner"
+        return {
+            "llm_api_key": "sk-test-native-key-1234567890",
+            "llm_base_url": "https://api.deepseek.com/v1",
+        }
+
+    async def fake_auto_skill_forced_tool_calls(*_args, **_kwargs):
+        return []
+
+    monkeypatch.setattr(
+        "packages.core.services.workspace_runtime.resolve_workspace_runtime",
+        fake_resolve_workspace_runtime,
+    )
+    monkeypatch.setattr(module, "runtime_assemble_prompt_for_turn", fake_assemble_prompt)
+    monkeypatch.setattr(
+        module,
+        "runtime_auto_skill_forced_tool_calls",
+        fake_auto_skill_forced_tool_calls,
+    )
+    monkeypatch.setattr(
+        "packages.core.services.model_resolver.resolve_model_for_user",
+        fake_resolve_model,
+    )
+    monkeypatch.setattr(
+        "packages.core.services.model_resolver.resolve_llm_metadata_for_user",
+        fake_resolve_metadata,
+    )
+
+    _prompt, _tools, _history, ctx = await module.resolve_runtime_chat_context(
+        object(),
+        "花了多少钱了",
+        entity_id="entity_owner",
+        user_id="user_owner",
+        agent_id="agent_finance",
+        workspace_id="ws_ledger",
+        runtime_surface=ChatSurface.WORKSPACE_CHAT,
+    )
+
+    assert ctx.model == "deepseek/deepseek-chat"
+    assert ctx.llm_metadata == {
+        "llm_api_key": "sk-test-native-key-1234567890",
+        "llm_base_url": "https://api.deepseek.com/v1",
+        "_resolved_model": "deepseek/deepseek-chat",
+    }
+
+
+@pytest.mark.asyncio
 async def test_runtime_chat_context_prefers_fixed_agent_config(monkeypatch):
     from packages.core.ai.runtime.prompt_adapter import ChatContext
     from packages.core.services import runtime_chat_context as module

@@ -18,6 +18,11 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any
 
+from packages.core.services.sensitive_data import (
+    sanitize_approval_credentials,
+    sanitize_sensitive_payload,
+)
+
 logger = logging.getLogger("manor.chat")
 
 CHAT_TOOL_CALL_SOURCE = "chat"
@@ -30,8 +35,13 @@ def safe_tool_args(tool_args: dict[str, Any] | None) -> dict[str, Any] | None:
     """Drop internal context kwargs and truncate large values for storage."""
     if not tool_args:
         return None
+    sanitized_args = sanitize_sensitive_payload(
+        sanitize_approval_credentials(tool_args)
+    )
+    if not isinstance(sanitized_args, dict):
+        return None
     safe: dict[str, Any] = {}
-    for key, value in tool_args.items():
+    for key, value in sanitized_args.items():
         if str(key).startswith("_"):
             continue  # skip internal context keys
         rendered = str(value)

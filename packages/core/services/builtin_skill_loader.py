@@ -24,6 +24,9 @@ from typing import Optional
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from packages.core.ai.runtime.skill_capability_companion import (
+    SkillCapabilityCompanion,
+)
 from packages.core.ai.runtime.skill_invocation_policy import SkillInvocationPolicy
 from packages.core.models.base import generate_ulid
 from packages.core.models.skill import Skill
@@ -40,10 +43,6 @@ _AGENT_SKILLS_ROOT = _REPO_ROOT / ".agents" / "skills"
 _PLATFORM_GUIDE_SKILL_NAMES = ("cloud-intro", "intro")
 _RETIRED_BUILTIN_SKILL_SLUGS = frozenset({
     "mcp_desktop_recording",
-    # Retired until packages/core/ai/mcp/discord.py exists — the pack
-    # instructed agents to call mcp__discord__* tools that had no
-    # dispatchable module behind them.
-    "mcp_discord",
 })
 
 # Parent tools that script-backed built-in skills need after `invoke_skill`
@@ -52,11 +51,7 @@ _DEFAULT_SKILL_TOOLS = [
     "invoke_skill",
     "search_tools",
     "generate_file",
-    "sandbox_exec",
-    "sandbox_read_file",
-    "sandbox_write_file",
-    "sandbox_save_result",
-    "sandbox_destroy",
+    "sandbox",
 ]
 
 
@@ -132,18 +127,17 @@ def _builtin_skill_dirs(
 async def _retire_removed_builtin_skills(db: AsyncSession) -> None:
     """Deactivate packaged Skills retained only for migration compatibility."""
     for slug in _RETIRED_BUILTIN_SKILL_SLUGS:
-        existing = (
+        existing_rows = list((
             await db.execute(
                 select(Skill).where(
                     Skill.entity_id.is_(None),
                     Skill.slug == slug,
                 )
             )
-        ).scalar_one_or_none()
-        if existing is None:
-            continue
-        existing.status = "inactive"
-        existing.is_public = False
+        ).scalars().all())
+        for existing in existing_rows:
+            existing.status = "inactive"
+            existing.is_public = False
 
 
 def _skill_source_sha256(skill_dir: Path) -> str:
@@ -279,13 +273,29 @@ async def seed_builtin_skills(db: AsyncSession) -> list[Skill]:
             "allowed_surfaces",
             "public_allowed_surfaces",
             "runtime_surfaces",
+            "ledger_contracts",
+            "execution_mode",
+            "discoverable_provider_keys",
+            "discoverable_tool_prefixes",
+            "capability_companion",
             "invocation_policy",
             "max_rounds",
             "temperature",
             "model",
         ):
             if key in skill_config:
-                if key == "invocation_policy":
+                if key == "capability_companion":
+                    try:
+                        companion = SkillCapabilityCompanion.from_config(
+                            skill_config[key]
+                        )
+                    except ValueError as exc:
+                        raise ValueError(
+                            f"Invalid capability_companion in "
+                            f"{skill_dir / 'config.json'}: {exc}"
+                        ) from exc
+                    expected_config[key] = companion.to_dict()
+                elif key == "invocation_policy":
                     try:
                         policy = SkillInvocationPolicy.from_config(skill_config[key])
                     except ValueError as exc:
@@ -293,6 +303,31 @@ async def seed_builtin_skills(db: AsyncSession) -> list[Skill]:
                             f"Invalid invocation_policy in {skill_dir / 'config.json'}: {exc}"
                         ) from exc
                     expected_config[key] = policy.to_dict()
+                elif key == "ledger_contracts":
+                    raw_contracts = skill_config[key]
+                    if (
+                        not isinstance(raw_contracts, list)
+                        or not raw_contracts
+                        or not all(
+                            isinstance(contract_id, str) and contract_id.strip()
+                            for contract_id in raw_contracts
+                        )
+                    ):
+                        raise ValueError(
+                            f"ledger_contracts in {skill_dir / 'config.json'} "
+                            "must be an array of non-empty contract ids"
+                        )
+                    expected_config[key] = list(dict.fromkeys(
+                        contract_id.strip() for contract_id in raw_contracts
+                    ))
+                elif key == "execution_mode":
+                    execution_mode = str(skill_config[key] or "").strip()
+                    if execution_mode != "instructions_only":
+                        raise ValueError(
+                            f"execution_mode in {skill_dir / 'config.json'} "
+                            "must be 'instructions_only'"
+                        )
+                    expected_config[key] = execution_mode
                 else:
                     expected_config[key] = skill_config[key]
         if is_runtime_guidance:
@@ -327,7 +362,7 @@ async def seed_builtin_skills(db: AsyncSession) -> list[Skill]:
                 select(Skill).where(
                     Skill.entity_id.is_(None),
                     Skill.slug == slug,
-                )
+                ).order_by(Skill.created_at.asc().nulls_last(), Skill.id.asc()).limit(1)
             )
         ).scalar_one_or_none()
 

@@ -9,13 +9,16 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import dataclass, field
+from typing import Any
 
 from sqlalchemy import and_, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from packages.core.constants.task import TaskLogType
+from packages.core.constants.task import TaskLogType, TaskType
 from packages.core.ai.runtime import (
     ChatSurface,
+    RuntimeMCPProviderToolScope,
+    RuntimeMCPProviderToolScopeFactory,
     RuntimeProfile,
     runtime_agent_tool_scope,
     runtime_workspace_turn_profile_names,
@@ -28,13 +31,32 @@ from packages.core.ai.runtime.task_requirements import (
     task_runtime_capabilities_from_context,
     task_runtime_capability_tools,
 )
+from packages.core.ai.runtime.tool_visibility import (
+    WORKSPACE_LEDGER_VISUALIZATION_TOOL,
+    runtime_expand_workspace_ledger_tools,
+)
 from packages.core.constants.agents import is_master_agent
 from packages.core.models.task import Conversation, Message, Task
 from packages.core.models.workspace import AgentSubscription, Workspace
+from packages.core.services.workspace_autonomy import (
+    WorkspaceAutonomyState,
+    workspace_autonomy_state,
+)
+from packages.core.services.ledger_query_service import (
+    workspace_ledger_runtime_tools,
+    workspace_queryable_ledger_configs,
+)
+from packages.core.services.workspace_access import user_can_write_workspace_artifacts
 
 logger = logging.getLogger(__name__)
 
 WORKSPACE_CHAT_SCOPES = {"workspace_main", "workspace_thread"}
+
+
+def _settings_declare_ledger(value: object) -> bool:
+    """Detect an installed ledger contract with a registered query adapter."""
+
+    return bool(workspace_queryable_ledger_configs(value))
 
 
 def is_workspace_chat_conversation(conv: Conversation) -> bool:
@@ -57,6 +79,8 @@ class WorkspaceRuntimeEnvelope:
     is_master: bool = False
     bound_tool_names: set[str] | None = None
     mcp_allowed_names: set[str] | None = None
+    mcp_provider_scopes: tuple[RuntimeMCPProviderToolScope, ...] = ()
+    mcp_scope_unrestricted: bool = False
     capability_ids: set[str] = field(default_factory=set)
     service_agent_ids: list[str] = field(default_factory=list)
 
@@ -85,9 +109,28 @@ def _task_extra_context(task: Task, *, workspace_scoped: bool | None = None) -> 
         f"- task_type: {task.task_type}",
     ]
     if task.description:
-        lines.append(f"- description: {str(task.description)[:500]}")
+        description_limit = (
+            4000 if task.task_type == TaskType.INTERACTIVE.value else 500
+        )
+        lines.append(f"- description: {str(task.description)[:description_limit]}")
     if runtime_context:
         lines.append("- runtime_context: " + compact_runtime_json(runtime_context))
+    if task.task_type == TaskType.INTERACTIVE.value:
+        session_config = details.get("session")
+        lines.extend([
+            "## Interactive Task Session",
+            "The conversation is the task's execution surface. Conduct the "
+            "session as the assigned Host Agent: pursue the Task objective, "
+            "adapt the dialogue structure to the user and domain, teach or "
+            "assess when the Task calls for it, and make progress visible in "
+            "the conversation. Do not turn it into a background job unless "
+            "the user explicitly creates separate work.",
+        ])
+        if isinstance(session_config, dict) and session_config:
+            lines.append(
+                "- session_config: "
+                + compact_runtime_json(session_config, max_chars=3000)
+            )
     if is_workspace_task:
         lines.append(
             "When the latest user message adds requirements, constraints, "
@@ -253,13 +296,16 @@ async def load_conversation_runtime_context(
         select(Conversation).where(*conv_filters)
     )).scalar_one_or_none()
     if not conv:
-        return {}
+        raise LookupError("Conversation not found")
 
     workspace_scoped = is_workspace_chat_conversation(conv)
     runtime: dict = {
         "workspace_id": conv.workspace_id if workspace_scoped else None,
         "thread_ref_kind": conv.thread_ref_kind if workspace_scoped else None,
         "thread_ref_id": conv.thread_ref_id if workspace_scoped else None,
+        "agent_subscription_id": (
+            conv.agent_subscription_id if workspace_scoped else None
+        ),
     }
 
     task = None
@@ -283,7 +329,11 @@ async def _resolve_agent_tool_scope(
     *,
     agent_id: str | None,
     is_master: bool,
-) -> tuple[set[str] | None, set[str] | None]:
+) -> tuple[
+    set[str] | None,
+    set[str] | None,
+    tuple[RuntimeMCPProviderToolScope, ...],
+]:
     """Resolve first-party and MCP tool scope for a non-master agent.
 
     ``None`` preserves the existing master semantics in ``ToolPool``. Custom
@@ -294,7 +344,12 @@ async def _resolve_agent_tool_scope(
         agent_id=agent_id,
         is_master=is_master,
     )
-    return scope.mutable_pair()
+    bound_tool_names, mcp_allowed_names = scope.mutable_pair()
+    return (
+        bound_tool_names,
+        mcp_allowed_names,
+        tuple(getattr(scope, "mcp_provider_scopes", ()) or ()),
+    )
 
 
 async def _agent_has_visible_skills(
@@ -330,6 +385,21 @@ async def _agent_has_visible_skills(
         .limit(1)
     )).scalar_one_or_none()
     return bool(visible_skill)
+
+
+async def agent_has_visible_skills(
+    db: AsyncSession | None,
+    *,
+    entity_id: str | None,
+    agent_id: str | None,
+) -> bool:
+    """Public narrow resolver shared by runtime assembly and authorization."""
+
+    return await _agent_has_visible_skills(
+        db,
+        entity_id=entity_id,
+        agent_id=agent_id,
+    )
 
 
 def _task_service_keys(task: Task) -> list[str]:
@@ -373,9 +443,12 @@ async def _resolve_workspace_operation_tool_scope(
     *,
     workspace_id: str | None,
     agent_id: str | None,
+    agent_subscription_id: str | None,
     is_master: bool,
     task: Task | None,
-) -> tuple[set[str], set[str], set[str]]:
+    inherit_workspace_ledger_tools: bool = True,
+    allow_workspace_ledger_writes: bool = True,
+) -> tuple[set[str], set[str], set[str], bool]:
     """Overlay workspace-scoped operation bindings onto the turn scope.
 
     AgentToolBinding is agent-global today. Operation bindings are workspace
@@ -383,14 +456,15 @@ async def _resolve_workspace_operation_tool_scope(
     capabilities in other workspaces.
     """
     if not db or not workspace_id:
-        return set(), set(), set()
+        return set(), set(), set(), False
 
     workspace = (await db.execute(
         select(Workspace).where(Workspace.id == workspace_id)
     )).scalar_one_or_none()
     if not workspace:
-        return set(), set(), set()
+        return set(), set(), set(), False
 
+    workspace_has_ledger = _settings_declare_ledger(workspace.settings)
     operating_model = _as_dict(workspace.operating_model)
     bindings = [
         dict(row)
@@ -402,15 +476,66 @@ async def _resolve_workspace_operation_tool_scope(
         for row in _as_list(operating_model.get("skill_bindings"))
         if isinstance(row, dict) and row.get("enabled") is not False
     ]
-    if not bindings and not skill_bindings:
-        return set(), set(), set()
-
-    subs = list((await db.execute(
-        select(AgentSubscription).where(
-            AgentSubscription.workspace_id == workspace_id,
-            AgentSubscription.status == "active",
+    needs_subscriptions = bool(bindings or skill_bindings) or bool(
+        workspace_has_ledger
+        and inherit_workspace_ledger_tools
+        and not is_master
+        and agent_id
+    )
+    subs = (
+        list((await db.execute(
+            select(AgentSubscription).where(
+                AgentSubscription.workspace_id == workspace_id,
+                AgentSubscription.status == "active",
+            )
+        )).scalars().all())
+        if needs_subscriptions
+        else []
+    )
+    active_agent_ids = {
+        str(sub.agent_id)
+        for sub in subs
+        if str(sub.agent_id or "").strip()
+    }
+    current_subscription = next(
+        (
+            sub for sub in subs
+            if agent_subscription_id
+            and sub.id == agent_subscription_id
+            and str(sub.agent_id or "") == str(agent_id or "")
+        ),
+        None,
+    )
+    subscription_scope_supplied = bool(agent_subscription_id)
+    inherits_workspace_ledgers = bool(
+        workspace_has_ledger
+        and inherit_workspace_ledger_tools
+        and (
+            is_master
+            or (
+                agent_id
+                and str(agent_id) in active_agent_ids
+                and (
+                    not subscription_scope_supplied
+                    or current_subscription is not None
+                )
+            )
         )
-    )).scalars().all())
+    )
+    # Ledger contracts are Workspace capabilities. Internal subscribed service
+    # agents inherit read/query/visualization access; only the master inherits
+    # write tools. Public and external surfaces never receive this inheritance.
+    ledger_tools = (
+        workspace_ledger_runtime_tools(
+            workspace.settings,
+            include_write=is_master and allow_workspace_ledger_writes,
+        )
+        if inherits_workspace_ledgers
+        else set()
+    )
+    if not bindings and not skill_bindings:
+        return ledger_tools, set(), set(), workspace_has_ledger
+
     services_by_agent: dict[str, set[str]] = {}
     for sub in subs:
         service_key = str(sub.service_key or "").strip()
@@ -418,9 +543,18 @@ async def _resolve_workspace_operation_tool_scope(
             services_by_agent.setdefault(str(sub.agent_id), set()).add(service_key)
     subscription_agent_ids_by_id = {sub.id: sub.agent_id for sub in subs}
     task_service_keys = set(_task_service_keys(task)) if task else set()
-    current_service_keys = services_by_agent.get(str(agent_id or ""), set())
+    current_service_keys = (
+        {
+            str(current_subscription.service_key).strip()
+        }
+        if current_subscription
+        and str(current_subscription.service_key or "").strip()
+        else set()
+        if subscription_scope_supplied
+        else services_by_agent.get(str(agent_id or ""), set())
+    )
 
-    tool_names: set[str] = set()
+    tool_names: set[str] = set(ledger_tools)
     mcp_tool_names: set[str] = set()
     capability_ids: set[str] = set()
 
@@ -433,6 +567,13 @@ async def _resolve_workspace_operation_tool_scope(
             current_service_keys=current_service_keys,
             task_service_keys=task_service_keys,
             subscription_agent_ids_by_id=subscription_agent_ids_by_id,
+            current_subscription_id=(
+                current_subscription.id
+                if current_subscription
+                else ""
+                if subscription_scope_supplied
+                else None
+            ),
         )
 
     for binding in bindings:
@@ -449,7 +590,7 @@ async def _resolve_workspace_operation_tool_scope(
         tool_names.add("invoke_skill")
         capability_ids.add("skill.invoke")
 
-    return tool_names, mcp_tool_names, capability_ids
+    return tool_names, mcp_tool_names, capability_ids, workspace_has_ledger
 
 
 async def _load_task_service_agent_ids(
@@ -487,12 +628,17 @@ async def _load_task_service_agent_ids(
 async def _resolve_service_agent_tool_scope(
     db: AsyncSession,
     service_agent_ids: list[str],
-) -> tuple[set[str], set[str]]:
+) -> tuple[
+    set[str],
+    set[str],
+    tuple[RuntimeMCPProviderToolScope, ...],
+]:
     """Union tool scopes from all service agents accountable for a task."""
     bound_tool_names: set[str] = set()
     mcp_allowed_names: set[str] = set()
+    provider_scope_groups: list[tuple[RuntimeMCPProviderToolScope, ...]] = []
     for service_agent_id in service_agent_ids:
-        service_bound, service_mcp = await _resolve_agent_tool_scope(
+        service_bound, service_mcp, service_provider_scopes = await _resolve_agent_tool_scope(
             db,
             agent_id=service_agent_id,
             is_master=False,
@@ -501,15 +647,21 @@ async def _resolve_service_agent_tool_scope(
             bound_tool_names.update(service_bound)
         if service_mcp:
             mcp_allowed_names.update(service_mcp)
-    return bound_tool_names, mcp_allowed_names
+        provider_scope_groups.append(service_provider_scopes)
+    return (
+        bound_tool_names,
+        mcp_allowed_names,
+        RuntimeMCPProviderToolScopeFactory.merge(*provider_scope_groups),
+    )
 
 
 async def resolve_workspace_runtime(
     db: AsyncSession | None,
     *,
     entity_id: str | None = None,
-    user_id: str | None = None,  # reserved for future per-user policy scopes
+    user_id: str | None = None,
     agent_id: str | None = None,
+    agent_subscription_id: str | None = None,
     conversation_id: str | None = None,
     workspace_id: str | None = None,
     task_id: str | None = None,
@@ -517,6 +669,7 @@ async def resolve_workspace_runtime(
     thread_ref_id: str | None = None,
     is_master: bool | None = None,
     runtime_surface: ChatSurface | str | None = None,
+    include_prompt_context: bool = True,
 ) -> WorkspaceRuntimeEnvelope:
     """Resolve one shared runtime envelope for a turn.
 
@@ -524,24 +677,29 @@ async def resolve_workspace_runtime(
     which workspace/task context exists and which tool surface should be
     visible before an LLM turn starts.
     """
-    del user_id  # currently informational; keep the signature stable.
-
     runtime_context = await load_conversation_runtime_context(
         db,
         conversation_id=conversation_id,
         entity_id=entity_id,
     )
     workspace_id = workspace_id or runtime_context.get("workspace_id")
+    agent_subscription_id = (
+        agent_subscription_id
+        or runtime_context.get("agent_subscription_id")
+    )
     task_id = task_id or runtime_context.get("task_id")
     thread_ref_kind = thread_ref_kind or runtime_context.get("thread_ref_kind")
     thread_ref_id = thread_ref_id or runtime_context.get("thread_ref_id")
-    extra_context = runtime_context.get("extra_context")
-    pending_hitl_context = await _pending_hitl_extra_context(
-        db,
-        conversation_id=conversation_id,
-    )
-    if pending_hitl_context:
-        extra_context = "\n\n".join(part for part in [extra_context, pending_hitl_context] if part)
+    extra_context = runtime_context.get("extra_context") if include_prompt_context else None
+    if include_prompt_context:
+        pending_hitl_context = await _pending_hitl_extra_context(
+            db,
+            conversation_id=conversation_id,
+        )
+        if pending_hitl_context:
+            extra_context = "\n\n".join(
+                part for part in [extra_context, pending_hitl_context] if part
+            )
 
     task: Task | None = None
     if db and task_id:
@@ -555,18 +713,19 @@ async def resolve_workspace_runtime(
             workspace_id = workspace_id or task.workspace_id
             thread_ref_kind = thread_ref_kind or "task"
             thread_ref_id = thread_ref_id or task.id
-            if not extra_context:
+            if include_prompt_context and not extra_context:
                 extra_context = _task_extra_context(task)
 
-    task_blocker_context = await _open_task_blockers_extra_context(
-        db,
-        entity_id=entity_id,
-        workspace_id=workspace_id,
-    )
-    if task_blocker_context:
-        extra_context = "\n\n".join(
-            part for part in [extra_context, task_blocker_context] if part
+    if include_prompt_context:
+        task_blocker_context = await _open_task_blockers_extra_context(
+            db,
+            entity_id=entity_id,
+            workspace_id=workspace_id,
         )
+        if task_blocker_context:
+            extra_context = "\n\n".join(
+                part for part in [extra_context, task_blocker_context] if part
+            )
 
     resolved_is_master = (
         bool(is_master)
@@ -576,21 +735,21 @@ async def resolve_workspace_runtime(
     turn_profiles = runtime_workspace_turn_profile_names(workspace_id)
     runtime_profile = turn_profiles.runtime_profile
     tool_profile = turn_profiles.tool_profile
-    bound_tool_names, mcp_allowed_names = await _resolve_agent_tool_scope(
+    bound_tool_names, mcp_allowed_names, mcp_provider_scopes = await _resolve_agent_tool_scope(
         db,
         agent_id=agent_id,
         is_master=resolved_is_master,
     )
     agent_capabilities: set[str] = set()
+    normalized_surface: ChatSurface | None = None
+    if isinstance(runtime_surface, ChatSurface):
+        normalized_surface = runtime_surface
+    elif runtime_surface:
+        try:
+            normalized_surface = ChatSurface(str(runtime_surface))
+        except ValueError:
+            normalized_surface = None
     if not resolved_is_master:
-        normalized_surface: ChatSurface | None = None
-        if isinstance(runtime_surface, ChatSurface):
-            normalized_surface = runtime_surface
-        elif runtime_surface:
-            try:
-                normalized_surface = ChatSurface(str(runtime_surface))
-            except ValueError:
-                normalized_surface = None
         has_visible_skills = await _agent_has_visible_skills(
             db,
             entity_id=entity_id,
@@ -629,35 +788,98 @@ async def resolve_workspace_runtime(
             workspace_id=workspace_id,
             task=task,
         )
-        service_bound, service_mcp = await _resolve_service_agent_tool_scope(
+        service_bound, service_mcp, service_provider_scopes = await _resolve_service_agent_tool_scope(
             db,
             service_agent_ids,
         )
+        # The presence of accountable service Agents closes the Host's MCP
+        # scope even when their current union is empty. Otherwise revoking the
+        # last service-Agent MCP binding would turn ``None`` back into the
+        # master's legacy global wildcard.
+        if mcp_allowed_names is None:
+            mcp_allowed_names = set()
         if service_bound:
             bound_tool_names = set(bound_tool_names or set())
             bound_tool_names.update(service_bound)
         if service_mcp:
             mcp_allowed_names = set(mcp_allowed_names or set())
             mcp_allowed_names.update(service_mcp)
+        mcp_provider_scopes = RuntimeMCPProviderToolScopeFactory.merge(
+            mcp_provider_scopes,
+            service_provider_scopes,
+        )
 
     task_bound, task_capabilities = _task_runtime_capability_scope(task)
     if task_bound:
         bound_tool_names = set(bound_tool_names or set())
         bound_tool_names.update(task_bound)
 
-    operation_bound, operation_mcp, operation_capabilities = await _resolve_workspace_operation_tool_scope(
+    allow_workspace_ledger_writes = True
+    if (
+        db
+        and workspace_id
+        and resolved_is_master
+        and normalized_surface not in {
+            ChatSurface.SCHEDULED_AGENT_RUN,
+            ChatSurface.WORKFLOW_AGENT_STEP,
+        }
+        and (user_id is not None or normalized_surface is not None)
+    ):
+        allow_workspace_ledger_writes = bool(
+            user_id
+            and await user_can_write_workspace_artifacts(
+                db,
+                workspace_id=workspace_id,
+                user_id=user_id,
+            )
+        )
+
+    operation_scope = await _resolve_workspace_operation_tool_scope(
         db,
         workspace_id=workspace_id,
         agent_id=agent_id,
+        agent_subscription_id=agent_subscription_id,
         is_master=resolved_is_master,
         task=task,
+        inherit_workspace_ledger_tools=normalized_surface not in {
+            ChatSurface.PUBLIC_CUSTOMER_CHAT,
+            ChatSurface.EXTERNAL_CHANNEL_CHAT,
+        },
+        allow_workspace_ledger_writes=allow_workspace_ledger_writes,
     )
+    # Keep compatibility with older test/integration adapters that still
+    # return the pre-ledger three-tuple while they are being upgraded.
+    if len(operation_scope) == 3:
+        operation_bound, operation_mcp, operation_capabilities = operation_scope
+        workspace_has_ledger = False
+    else:
+        operation_bound, operation_mcp, operation_capabilities, workspace_has_ledger = operation_scope
     if operation_bound:
         bound_tool_names = set(bound_tool_names or set())
         bound_tool_names.update(operation_bound)
     if operation_mcp:
         mcp_allowed_names = set(mcp_allowed_names or set())
         mcp_allowed_names.update(operation_mcp)
+    if workspace_has_ledger:
+        bound_tool_names = runtime_expand_workspace_ledger_tools(bound_tool_names)
+    elif (
+        resolved_is_master
+        and workspace_id
+        and normalized_surface == ChatSurface.WORKSPACE_CHAT
+    ):
+        # Keep manual Ledger setup reachable through the conversation even
+        # before the Workspace has an installed contract. The visualization
+        # tool returns an empty overview whose host-owned action opens config.
+        bound_tool_names = set(bound_tool_names or set())
+        bound_tool_names.add(WORKSPACE_LEDGER_VISUALIZATION_TOOL)
+
+    # ``is_master`` identifies the Host; it is not an MCP permission. Once a
+    # Task/service Agent contributes semantic provider authority, close the
+    # legacy exact-name channel even when that provider currently has no
+    # registered schemas. Dynamic discovery can then add only names admitted
+    # by ``mcp_provider_scopes`` instead of inheriting every global MCP tool.
+    if mcp_provider_scopes and mcp_allowed_names is None:
+        mcp_allowed_names = set()
 
     return WorkspaceRuntimeEnvelope(
         workspace_id=workspace_id,
@@ -670,6 +892,12 @@ async def resolve_workspace_runtime(
         is_master=resolved_is_master,
         bound_tool_names=bound_tool_names,
         mcp_allowed_names=mcp_allowed_names,
+        mcp_provider_scopes=mcp_provider_scopes,
+        mcp_scope_unrestricted=(
+            resolved_is_master
+            and mcp_allowed_names is None
+            and not mcp_provider_scopes
+        ),
         capability_ids=agent_capabilities | set(operation_capabilities) | set(task_capabilities),
         service_agent_ids=service_agent_ids,
     )
@@ -694,6 +922,9 @@ async def ensure_workspace_task_conversation(
         thread_ref_id=task_id,
         title=title,
     )
+    from packages.core.services.task_session import bind_task_session_conversation
+
+    await bind_task_session_conversation(db, conv)
     return conv
 
 
@@ -741,7 +972,14 @@ async def process_workspace_task_comment(
                 return
 
             workspace_id = task.workspace_id
-            if responding_agent_id is None:
+            from packages.core.services.task_session import resolve_task_session_host
+
+            task_session_host = await resolve_task_session_host(db, task)
+            if task_session_host:
+                # Interactive sessions are always conducted by their Task Host;
+                # mentions do not transfer the turn to another Agent.
+                responding_agent_id = task_session_host.agent_id
+            elif responding_agent_id is None:
                 # Not just task.agent_id: plan-driven work resolves an agent
                 # per step and never copies it up, so a reply would land on
                 # the master agent instead of the one that produced the work.
@@ -899,7 +1137,13 @@ async def install_workspace_runtime_schedules(
     *,
     cadence: str | None = None,
 ) -> None:
-    """Install/refresh all built-in workspace runtime schedules."""
+    """Install/refresh all built-in workspace runtime schedules.
+
+    Workspace heartbeat is the single autonomous-runtime switch.  Goal
+    measurement jobs are derived from Goal rows, so they are refreshed here
+    alongside the Strategist/evolution jobs instead of being left running
+    independently of the Workspace switch.
+    """
     effective_cadence = cadence or workspace.heartbeat_cadence or "daily"
     workspace.heartbeat_cadence = effective_cadence
 
@@ -908,18 +1152,42 @@ async def install_workspace_runtime_schedules(
 
     await install_strategist_schedule(db, workspace, cadence=effective_cadence)
     await install_evolution_schedules(db, workspace)
+    await _sync_workspace_goal_schedules(db, workspace, enabled=True)
 
 
 async def remove_workspace_runtime_schedules(
     db: AsyncSession,
     workspace_id: str,
+    *,
+    entity_id: str | None = None,
 ) -> None:
-    """Remove all built-in workspace runtime schedules."""
+    """Remove all built-in workspace runtime schedules.
+
+    ``entity_id`` is optional for compatibility with existing callers.  When
+    supplied, automatic Goal measurement jobs are removed with the Strategist
+    jobs so disabling the Workspace runtime cannot leave goal polling active.
+    """
     from packages.core.strategist.evolution_scheduling import remove_evolution_schedules
     from packages.core.strategist.scheduling import remove_strategist_schedule
 
     await remove_strategist_schedule(db, workspace_id)
     await remove_evolution_schedules(db, workspace_id)
+    if entity_id:
+        from sqlalchemy import select
+        from packages.core.models.goal import Goal
+
+        goals = list((await db.execute(
+            select(Goal).where(
+                Goal.entity_id == entity_id,
+                Goal.workspace_id == workspace_id,
+            )
+        )).scalars().all())
+        await _sync_workspace_goal_schedules(
+            db,
+            workspace=None,
+            goals=goals,
+            enabled=False,
+        )
 
 
 async def sync_workspace_runtime_schedules(
@@ -927,7 +1195,8 @@ async def sync_workspace_runtime_schedules(
     workspace: Workspace,
 ) -> None:
     """Make scheduler rows match the workspace's runtime state."""
-    if workspace.deleted_at is None and workspace.status == "paused":
+    autonomy_state = workspace_autonomy_state(workspace)
+    if autonomy_state is WorkspaceAutonomyState.PAUSED:
         # Keep automation definitions visible and restorable while making the
         # paused state explicit in the Automations UI. This also covers the
         # built-in Strategist/evolution jobs instead of deleting them.
@@ -935,11 +1204,71 @@ async def sync_workspace_runtime_schedules(
 
         await pause_workspace_automations(db, workspace.id, workspace.entity_id)
         return
-    if (
-        workspace.deleted_at is None
-        and workspace.status == "active"
-        and bool(workspace.heartbeat_enabled)
-    ):
+    if autonomy_state is WorkspaceAutonomyState.RUNNING:
         await install_workspace_runtime_schedules(db, workspace)
     else:
-        await remove_workspace_runtime_schedules(db, workspace.id)
+        await remove_workspace_runtime_schedules(
+            db,
+            workspace.id,
+            entity_id=workspace.entity_id,
+        )
+
+
+async def _sync_workspace_goal_schedules(
+    db: AsyncSession,
+    workspace: Workspace | None,
+    *,
+    enabled: bool,
+    goals: list[Any] | None = None,
+) -> None:
+    """Make automatic Goal measurement jobs follow the Workspace runtime.
+
+    Manual goals never get a job. Disabling removes derived ``gm:`` jobs
+    and linked Stat collectors; user-authored automations remain untouched.
+    """
+    from packages.core.goals.scheduling import (
+        install_measurement_schedule,
+        remove_measurement_schedule,
+        should_install_measurement_schedule,
+    )
+    if goals is None:
+        if workspace is None:
+            return
+        from sqlalchemy import select
+        from packages.core.models.goal import Goal
+
+        goals = list((await db.execute(
+            select(Goal).where(
+                Goal.entity_id == workspace.entity_id,
+                Goal.workspace_id == workspace.id,
+            )
+        )).scalars().all())
+
+    for goal in goals:
+        if enabled and should_install_measurement_schedule(goal):
+            await install_measurement_schedule(db, goal)
+        else:
+            await remove_measurement_schedule(db, goal)
+
+    # A Goal measured by a Stat has no separate gm: job. Keep its collector
+    # on the same runtime switch, including off -> on and pause -> resume.
+    stat_ids = {goal.stat_id for goal in goals if getattr(goal, "stat_id", None)}
+    if stat_ids:
+        from sqlalchemy import select
+        from packages.core.models.workspace_stat import WorkspaceStat
+        from packages.core.stats.scheduling import (
+            remove_stat_collection_schedule,
+            sync_stat_collection_schedule,
+        )
+
+        scopes = {(goal.stat_id, goal.entity_id, goal.workspace_id) for goal in goals if getattr(goal, "stat_id", None)}
+        stats = (await db.execute(select(WorkspaceStat).where(
+            WorkspaceStat.id.in_(stat_ids),
+        ))).scalars().all()
+        for stat in stats:
+            if (stat.id, stat.entity_id, stat.workspace_id) not in scopes:
+                continue
+            if enabled:
+                await sync_stat_collection_schedule(db, stat)
+            else:
+                await remove_stat_collection_schedule(db, stat)

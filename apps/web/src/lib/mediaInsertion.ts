@@ -87,9 +87,9 @@ function collectMediaCandidates(value: unknown, output: MediaCandidate[], depth 
     : undefined;
   const candidate: MediaCandidate = {
     url: firstString(record, ["result_url", "image_url", "video_url", "media_url", "file_url", "download_url", "url"]),
-    documentId: firstString(record, ["result_document_id", "document_id", "documentId", "doc_id"])
-      || (documentRecord ? firstString(documentRecord, ["id", "document_id"]) : undefined)
-      || (params ? firstString(params, ["result_document_id", "document_id"]) : undefined),
+    documentId: firstString(record, ["document_id"])
+      || (documentRecord ? firstString(documentRecord, ["document_id"]) : undefined)
+      || (params ? firstString(params, ["document_id"]) : undefined),
     jobId: firstString(record, ["job_id", "media_job_id"]),
     name: firstString(record, ["name", "filename", "title"])
       || (documentRecord ? firstString(documentRecord, ["name", "filename", "title"]) : undefined),

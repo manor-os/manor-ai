@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Optional
 
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from packages.core.constants.task import (
@@ -47,6 +48,15 @@ async def apply_task_approval_decision(
     note: Optional[str] = None,
 ) -> TaskApprovalDecisionResult:
     """Apply one approval decision without committing the caller's transaction."""
+    locked_task = (await db.execute(
+        select(Task)
+        .where(Task.id == task.id, Task.entity_id == task.entity_id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )).scalar_one_or_none()
+    if locked_task is None:
+        raise TaskApprovalDecisionError(404, "Task not found")
+    task = locked_task
     if task.task_type != TaskType.APPROVAL.value:
         raise TaskApprovalDecisionError(400, "Task is not an approval task")
     if task.status in TERMINAL_STATUSES:

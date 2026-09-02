@@ -1,3 +1,4 @@
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -22,47 +23,47 @@ def _run(*, variables=None, step_results=None):
 
 
 def test_orchestration_nodes_are_canonical():
-    assert {"workflow_project", "workflow_action_grant", "browser_effect", "stage"} <= (
-        CANONICAL_NODE_TYPES
-    )
+    assert {"workflow_project", "workflow_action_grant", "browser_effect", "stage"} <= (CANONICAL_NODE_TYPES)
 
 
 def test_stage_config_accepts_local_operations_and_declared_external_routes():
-    result = validate_workflow_steps([
-        {
-            "id": "start",
-            "type": "trigger",
-            "next": ["prepare"],
-        },
-        {
-            "id": "prepare",
-            "type": "stage",
-            "config": {
-                "entry_operation_id": "normalize",
-                "operations": [
-                    {
-                        "id": "normalize",
-                        "type": "transform",
-                        "config": {"mapping": {"ready": True}},
-                        "next": ["check"],
-                    },
-                    {
-                        "id": "check",
-                        "type": "condition",
-                        "config": {"field": "ready", "operator": "eq", "value": True},
-                        "true_next": ["continue"],
-                        "false_next": ["needs_input"],
-                    },
-                ],
-                "routes": {
-                    "continue": "done",
-                    "needs_input": None,
-                },
+    result = validate_workflow_steps(
+        [
+            {
+                "id": "start",
+                "type": "trigger",
+                "next": ["prepare"],
             },
-            "next": ["done"],
-        },
-        {"id": "done", "type": "end", "next": []},
-    ])
+            {
+                "id": "prepare",
+                "type": "stage",
+                "config": {
+                    "entry_operation_id": "normalize",
+                    "operations": [
+                        {
+                            "id": "normalize",
+                            "type": "transform",
+                            "config": {"mapping": {"ready": True}},
+                            "next": ["check"],
+                        },
+                        {
+                            "id": "check",
+                            "type": "condition",
+                            "config": {"field": "ready", "operator": "eq", "value": True},
+                            "true_next": ["continue"],
+                            "false_next": ["needs_input"],
+                        },
+                    ],
+                    "routes": {
+                        "continue": "done",
+                        "needs_input": None,
+                    },
+                },
+                "next": ["done"],
+            },
+            {"id": "done", "type": "end", "next": []},
+        ]
+    )
 
     assert result["valid"] is True
     assert result["errors"] == []
@@ -77,36 +78,39 @@ def test_stage_config_requires_all_contract_fields(missing_field):
     }
     config.pop(missing_field)
 
-    result = validate_workflow_steps([
-        {"id": "start", "type": "trigger", "next": ["stage"]},
-        {"id": "stage", "type": "stage", "config": config, "next": []},
-    ])
+    result = validate_workflow_steps(
+        [
+            {"id": "start", "type": "trigger", "next": ["stage"]},
+            {"id": "stage", "type": "stage", "config": config, "next": []},
+        ]
+    )
 
     assert result["valid"] is False
     assert any(
-        error["code"] == "invalid_node_config"
-        and f"config.{missing_field}" in error["message"]
+        error["code"] == "invalid_node_config" and f"config.{missing_field}" in error["message"]
         for error in result["errors"]
     )
 
 
 def test_stage_config_rejects_duplicate_operation_ids():
-    result = validate_workflow_steps([
-        {"id": "start", "type": "trigger", "next": ["stage"]},
-        {
-            "id": "stage",
-            "type": "stage",
-            "config": {
-                "entry_operation_id": "work",
-                "operations": [
-                    {"id": "work", "type": "transform", "next": []},
-                    {"id": "work", "type": "notify", "next": []},
-                ],
-                "routes": {},
+    result = validate_workflow_steps(
+        [
+            {"id": "start", "type": "trigger", "next": ["stage"]},
+            {
+                "id": "stage",
+                "type": "stage",
+                "config": {
+                    "entry_operation_id": "work",
+                    "operations": [
+                        {"id": "work", "type": "transform", "next": []},
+                        {"id": "work", "type": "notify", "next": []},
+                    ],
+                    "routes": {},
+                },
+                "next": [],
             },
-            "next": [],
-        },
-    ])
+        ]
+    )
 
     assert result["valid"] is False
     assert any(error["code"] == "duplicate_stage_operation_id" for error in result["errors"])
@@ -114,40 +118,44 @@ def test_stage_config_rejects_duplicate_operation_ids():
 
 @pytest.mark.parametrize("nested_type", ["stage", "subworkflow", "foreach_subworkflow"])
 def test_stage_config_rejects_nested_orchestration_nodes(nested_type):
-    result = validate_workflow_steps([
-        {"id": "start", "type": "trigger", "next": ["stage"]},
-        {
-            "id": "stage",
-            "type": "stage",
-            "config": {
-                "entry_operation_id": "nested",
-                "operations": [{"id": "nested", "type": nested_type, "next": []}],
-                "routes": {},
+    result = validate_workflow_steps(
+        [
+            {"id": "start", "type": "trigger", "next": ["stage"]},
+            {
+                "id": "stage",
+                "type": "stage",
+                "config": {
+                    "entry_operation_id": "nested",
+                    "operations": [{"id": "nested", "type": nested_type, "next": []}],
+                    "routes": {},
+                },
+                "next": [],
             },
-            "next": [],
-        },
-    ])
+        ]
+    )
 
     assert result["valid"] is False
     assert any(error["code"] == "invalid_stage_operation_type" for error in result["errors"])
 
 
 def test_stage_config_rejects_undeclared_external_edges():
-    result = validate_workflow_steps([
-        {"id": "start", "type": "trigger", "next": ["stage"]},
-        {
-            "id": "stage",
-            "type": "stage",
-            "config": {
-                "entry_operation_id": "work",
-                "operations": [
-                    {"id": "work", "type": "transform", "next": ["undeclared"]},
-                ],
-                "routes": {},
+    result = validate_workflow_steps(
+        [
+            {"id": "start", "type": "trigger", "next": ["stage"]},
+            {
+                "id": "stage",
+                "type": "stage",
+                "config": {
+                    "entry_operation_id": "work",
+                    "operations": [
+                        {"id": "work", "type": "transform", "next": ["undeclared"]},
+                    ],
+                    "routes": {},
+                },
+                "next": [],
             },
-            "next": [],
-        },
-    ])
+        ]
+    )
 
     assert result["valid"] is False
     assert any(error["code"] == "undeclared_stage_route" for error in result["errors"])
@@ -385,12 +393,8 @@ async def test_workflow_project_node_atomically_updates_owned_list_items(db_sess
                 "project_id": "{{project.project_id}}",
                 "expected_revision": "{{project.revision}}",
                 "patch": {},
-                "list_upserts": [
-                    {"path": "scenes", "key": "scene_id", "item": "{{scene_result}}"}
-                ],
-                "list_appends": [
-                    {"path": "artifacts", "key": "artifact_id", "items": "{{artifacts}}"}
-                ],
+                "list_upserts": [{"path": "scenes", "key": "scene_id", "item": "{{scene_result}}"}],
+                "list_appends": [{"path": "artifacts", "key": "artifact_id", "items": "{{artifacts}}"}],
             },
         },
         dict(run.variables),
@@ -398,9 +402,7 @@ async def test_workflow_project_node_atomically_updates_owned_list_items(db_sess
         db_session,
     )
 
-    assert updated["output"]["state"]["scenes"] == [
-        {"scene_id": "scene-1", "status": "completed"}
-    ]
+    assert updated["output"]["state"]["scenes"] == [{"scene_id": "scene-1", "status": "completed"}]
     assert updated["output"]["state"]["artifacts"] == [
         {"artifact_id": "artifact-1", "kind": "video"},
         {"artifact_id": "artifact-2", "kind": "image"},
@@ -658,14 +660,8 @@ async def test_browser_effect_node_never_retries_unknown_effect():
 
 
 @pytest.mark.asyncio
-async def test_wait_timer_resolves_duration_from_workflow_variables(monkeypatch):
+async def test_wait_timer_resolves_duration_from_workflow_variables():
     runner = WorkflowRunner()
-    scheduled = {}
-    monkeypatch.setattr(
-        runner,
-        "enqueue_resume",
-        lambda run_id, delay: scheduled.update(run_id=run_id, delay=delay) or True,
-    )
     run = _run(variables={"capture": {"wait_seconds": 120}})
 
     result = await runner._execute_step(
@@ -683,7 +679,10 @@ async def test_wait_timer_resolves_duration_from_workflow_variables(monkeypatch)
 
     assert result["status"] == "paused"
     assert result["duration_seconds"] == 120
-    assert scheduled == {"run_id": "run-1", "delay": 120.0}
+    assert result["auto_resume_scheduled"] is True
+    assert run.continuation_token
+    assert run.continuation_due_at is not None
+    assert run.continuation_next_attempt_at == run.continuation_due_at
 
 
 @pytest.mark.asyncio
@@ -779,6 +778,339 @@ async def test_tool_step_converts_structured_tool_error_to_node_failure(monkeypa
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("tool_output", "expected_error"),
+    [
+        ("Error: provider unavailable", "Error: provider unavailable"),
+        (
+            '{"error":"credentials_unavailable","reason":"Connect Stripe"}',
+            "credentials_unavailable",
+        ),
+    ],
+)
+async def test_tool_step_rejects_default_text_tool_errors(
+    monkeypatch,
+    tool_output,
+    expected_error,
+):
+    from packages.core.ai import workflow_runner as runner_module
+
+    async def fake_execute(**_kwargs):
+        return SimpleNamespace(
+            output=tool_output,
+            envelope=None,
+        )
+
+    async def fake_attach(result, _envelope):
+        return result
+
+    monkeypatch.setattr(runner_module, "runtime_execute_workflow_tool_step", fake_execute)
+    monkeypatch.setattr(
+        runner_module,
+        "runtime_attach_and_persist_workflow_runner_result",
+        fake_attach,
+    )
+
+    result = await WorkflowRunner()._execute_tool_step(
+        {
+            "id": "connector_error",
+            "type": "connector",
+            "config": {
+                "tool": "mcp__stripe__list_customers",
+            },
+        },
+        {},
+        "entity-1",
+        "user-1",
+        {},
+    )
+
+    assert result["status"] == "failed"
+    assert expected_error in result["error"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("fanout_status", "expected_status"),
+    [("partial", "paused"), ("failed", "failed")],
+)
+async def test_tool_step_keeps_incomplete_account_fanout_nonterminal(
+    monkeypatch,
+    fanout_status,
+    expected_status,
+):
+    from packages.core.ai import workflow_runner as runner_module
+
+    async def fake_execute(**_kwargs):
+        return SimpleNamespace(
+            output=json.dumps(
+                {
+                    "integration_account_selection": "all",
+                    "status": fanout_status,
+                    "total_account_count": 2,
+                    "account_count": 1,
+                    "failed_count": 1 if fanout_status == "failed" else 0,
+                    "result_truncated_count": 0,
+                    "omitted_account_count": 1 if fanout_status == "partial" else 0,
+                    "continuation": (
+                        {
+                            "mode": "all",
+                            "cursor_account_id": "account-2",
+                            "remaining_account_count": 1,
+                        }
+                        if fanout_status == "partial"
+                        else None
+                    ),
+                    "results": [],
+                }
+            ),
+            envelope=None,
+        )
+
+    async def fake_attach(result, _envelope):
+        return result
+
+    monkeypatch.setattr(runner_module, "runtime_execute_workflow_tool_step", fake_execute)
+    monkeypatch.setattr(
+        runner_module,
+        "runtime_attach_and_persist_workflow_runner_result",
+        fake_attach,
+    )
+
+    result = await WorkflowRunner()._execute_tool_step(
+        {
+            "id": "fanout",
+            "type": "connector",
+            "config": {
+                "tool": "mcp__stripe__list_customers",
+                "args": {"integration_account_selection": "all"},
+            },
+        },
+        {},
+        "entity-1",
+        "user-1",
+        {},
+    )
+
+    assert result["status"] == expected_status
+    assert result["code"] == f"tool_fanout_{fanout_status}"
+    if fanout_status == "partial":
+        assert result["resume_strategy"] == "reexecute"
+        assert result["auto_resume"] is True
+    else:
+        assert result["partial"] is False
+
+
+@pytest.mark.asyncio
+async def test_tool_step_routes_nonresumable_account_partial_through_failure_retry(
+    monkeypatch,
+):
+    from packages.core.ai import workflow_runner as runner_module
+
+    async def fake_execute(**_kwargs):
+        return SimpleNamespace(
+            output=json.dumps(
+                {
+                    "integration_account_selection": "all",
+                    "status": "partial",
+                    "total_account_count": 2,
+                    "account_count": 2,
+                    "failed_count": 1,
+                    "result_truncated_count": 0,
+                    "omitted_account_count": 0,
+                    "continuation": None,
+                    "results": [
+                        {
+                            "integration_account_id": "account-1",
+                            "ok": True,
+                            "result": {"id": "one"},
+                        },
+                        {
+                            "integration_account_id": "account-2",
+                            "ok": False,
+                            "result": {"error": "provider_unavailable"},
+                        },
+                    ],
+                }
+            ),
+            envelope=None,
+        )
+
+    async def fake_attach(result, _envelope):
+        return result
+
+    monkeypatch.setattr(runner_module, "runtime_execute_workflow_tool_step", fake_execute)
+    monkeypatch.setattr(
+        runner_module,
+        "runtime_attach_and_persist_workflow_runner_result",
+        fake_attach,
+    )
+
+    result = await WorkflowRunner()._execute_tool_step(
+        {
+            "id": "fanout",
+            "type": "connector",
+            "config": {
+                "tool": "mcp__stripe__list_customers",
+                "args": {"integration_account_selection": "all"},
+            },
+        },
+        {},
+        "entity-1",
+        "user-1",
+        {},
+    )
+
+    assert result["status"] == "failed"
+    assert result["code"] == "tool_fanout_partial"
+    assert result["partial"] is True
+    assert "resume_strategy" not in result
+
+
+@pytest.mark.asyncio
+async def test_tool_step_resumes_and_merges_account_fanout_cursor(monkeypatch):
+    from packages.core.ai import workflow_runner as runner_module
+    from packages.core.constants.integrations import (
+        INTEGRATION_ACCOUNT_CONTINUATION_ARGUMENT,
+    )
+
+    captured = {}
+
+    async def fake_execute(**kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(
+            output=json.dumps(
+                {
+                    "integration_account_selection": "all",
+                    "status": "complete",
+                    "total_account_count": 2,
+                    "account_count": 1,
+                    "failed_count": 0,
+                    "result_truncated_count": 0,
+                    "omitted_account_count": 0,
+                    "continuation": None,
+                    "results": [
+                        {
+                            "integration_account_id": "account-2",
+                            "ok": True,
+                            "result_truncated": False,
+                            "result": {"id": "cus_2"},
+                        }
+                    ],
+                }
+            ),
+            envelope=None,
+        )
+
+    async def fake_attach(result, _envelope):
+        return result
+
+    monkeypatch.setattr(runner_module, "runtime_execute_workflow_tool_step", fake_execute)
+    monkeypatch.setattr(
+        runner_module,
+        "runtime_attach_and_persist_workflow_runner_result",
+        fake_attach,
+    )
+    previous = {
+        "status": "paused",
+        "resume_strategy": "reexecute",
+        "output": {
+            "integration_account_selection": "all",
+            "status": "partial",
+            "total_account_count": 2,
+            "account_count": 1,
+            "failed_count": 0,
+            "result_truncated_count": 0,
+            "omitted_account_count": 1,
+            "continuation": {
+                "mode": "all",
+                "cursor_account_id": "account-2",
+            },
+            "results": [
+                {
+                    "integration_account_id": "account-1",
+                    "ok": True,
+                    "result_truncated": False,
+                    "result": {"id": "cus_1"},
+                }
+            ],
+        },
+    }
+
+    result = await WorkflowRunner()._execute_tool_step(
+        {
+            "id": "fanout",
+            "type": "connector",
+            "config": {
+                "tool": "mcp__stripe__list_customers",
+                "args": {"integration_account_selection": "all"},
+            },
+        },
+        {},
+        "entity-1",
+        "user-1",
+        {},
+        previous_result=previous,
+    )
+
+    assert captured["arguments"][INTEGRATION_ACCOUNT_CONTINUATION_ARGUMENT] == "account-2"
+    assert result["status"] == "completed"
+    assert [item["integration_account_id"] for item in result["output"]["results"]] == ["account-1", "account-2"]
+
+
+@pytest.mark.asyncio
+async def test_tool_step_uses_schema_backed_structured_output(monkeypatch):
+    from packages.core.ai import workflow_runner as runner_module
+
+    structured_output = {
+        "customer_id": "cus_structured",
+        "created": True,
+    }
+
+    async def fake_execute(**_kwargs):
+        return SimpleNamespace(
+            output="Error: stale display text",
+            structured_output=structured_output,
+            envelope=None,
+        )
+
+    async def fake_attach(result, _envelope):
+        return result
+
+    monkeypatch.setattr(runner_module, "runtime_execute_workflow_tool_step", fake_execute)
+    monkeypatch.setattr(
+        runner_module,
+        "runtime_attach_and_persist_workflow_runner_result",
+        fake_attach,
+    )
+
+    result = await WorkflowRunner()._execute_tool_step(
+        {
+            "id": "create_customer",
+            "type": "connector",
+            "config": {
+                "tool": "mcp__stripe__create_customer",
+                "output_schema": {
+                    "type": "object",
+                    "required": ["customer_id", "created"],
+                    "properties": {
+                        "customer_id": {"type": "string"},
+                        "created": {"type": "boolean"},
+                    },
+                },
+            },
+        },
+        {},
+        "entity-1",
+        "user-1",
+        {},
+    )
+
+    assert result["status"] == "completed"
+    assert result["output"] == structured_output
+
+
+@pytest.mark.asyncio
 async def test_agent_step_includes_declared_output_schema_in_model_prompt(monkeypatch):
     from packages.core.ai import workflow_runner as runner_module
 
@@ -868,9 +1200,7 @@ async def test_agent_step_includes_declared_output_schema_in_model_prompt(monkey
     ]
     assert "Output contract:" in captured["user_message"]
     assert '"start_url"' in captured["user_message"]
-    assert "Return ONLY a value that conforms to this JSON Schema" in captured[
-        "user_message"
-    ]
+    assert "Return ONLY a value that conforms to this JSON Schema" in captured["user_message"]
 
 
 @pytest.mark.asyncio
@@ -952,3 +1282,131 @@ async def test_skill_agent_step_forwards_resolved_forced_tool_calls(monkeypatch)
             },
         }
     ]
+
+
+@pytest.mark.asyncio
+async def test_skill_agent_terminal_stop_parent_is_not_reparsed_as_json(monkeypatch):
+    from packages.core.ai import workflow_runner as runner_module
+
+    class FakeSessionContext:
+        async def __aenter__(self):
+            return object()
+
+        async def __aexit__(self, *_args):
+            return None
+
+    async def fake_invoke_skill(_db, _skill, _entity_id, _input_text, **kwargs):
+        return {
+            "content": "Local Chrome control is unavailable.",
+            "usage": {},
+            "tools_used": ["mcp__chrome__read_page"],
+            "rounds": 1,
+            "stop_reason": "chrome_cli_worker_unavailable",
+            "stop_parent": True,
+            "control": {
+                "terminal_failure": True,
+                "retryable": False,
+            },
+        }
+
+    async def fake_attach(result, _envelope):
+        return result
+
+    monkeypatch.setattr(runner_module, "async_session", FakeSessionContext)
+    monkeypatch.setattr(runner_module, "runtime_invoke_skill", fake_invoke_skill)
+    monkeypatch.setattr(
+        runner_module,
+        "runtime_prepare_trace_envelope_for_turn",
+        lambda _request: None,
+    )
+    monkeypatch.setattr(
+        runner_module,
+        "runtime_attach_and_persist_workflow_runner_result",
+        fake_attach,
+    )
+
+    result = await WorkflowRunner()._execute_agent_step(
+        {
+            "id": "browser-skill",
+            "type": "agent",
+            "config": {
+                "skill": "chrome",
+                "input": "Inspect YouTube Studio.",
+                "output_format": "json",
+                "output_schema": {"type": "object"},
+            },
+        },
+        {},
+        "entity-1",
+        "user-1",
+        {"workspace_id": "workspace-1"},
+    )
+
+    assert result == {
+        "status": "failed",
+        "error": "Local Chrome control is unavailable.",
+        "stop_reason": "chrome_cli_worker_unavailable",
+        "usage": {},
+        "tools_used": ["mcp__chrome__read_page"],
+    }
+
+
+@pytest.mark.asyncio
+async def test_skill_agent_successful_stop_parent_is_not_treated_as_failure(monkeypatch):
+    from packages.core.ai import workflow_runner as runner_module
+
+    class FakeSessionContext:
+        async def __aenter__(self):
+            return object()
+
+        async def __aexit__(self, *_args):
+            return None
+
+    async def fake_invoke_skill(_db, _skill, _entity_id, _input_text, **kwargs):
+        return {
+            "content": "The remote coding task has been dispatched.",
+            "usage": {},
+            "tools_used": ["mcp__codex_cli__run"],
+            "rounds": 1,
+            "stop_reason": "local_coding_dispatched",
+            "stop_parent": True,
+            "control": {
+                "terminal": True,
+                "stop_parent": True,
+            },
+        }
+
+    async def fake_attach(result, _envelope):
+        return result
+
+    monkeypatch.setattr(runner_module, "async_session", FakeSessionContext)
+    monkeypatch.setattr(runner_module, "runtime_invoke_skill", fake_invoke_skill)
+    monkeypatch.setattr(
+        runner_module,
+        "runtime_prepare_trace_envelope_for_turn",
+        lambda _request: None,
+    )
+    monkeypatch.setattr(
+        runner_module,
+        "runtime_attach_and_persist_workflow_runner_result",
+        fake_attach,
+    )
+
+    result = await WorkflowRunner()._execute_agent_step(
+        {
+            "id": "coding-skill",
+            "type": "agent",
+            "config": {
+                "skill": "local-coding-operations",
+                "input": "Update the project.",
+                "output_format": "text",
+            },
+        },
+        {},
+        "entity-1",
+        "user-1",
+        {"workspace_id": "workspace-1"},
+    )
+
+    assert result["status"] == "completed"
+    assert result["output"] == "The remote coding task has been dispatched."

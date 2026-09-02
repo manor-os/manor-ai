@@ -6,7 +6,7 @@ pip package whenever we want — or copy-pasted into a user's repo.
 
 Quickstart:
 
-    from manor_worker_sdk import ManorWorker, Lease
+    from manor_worker_sdk import ManorWorker, Lease, LeaseResult
 
     worker = ManorWorker(
         endpoint="https://manor.example.com",
@@ -15,14 +15,14 @@ Quickstart:
     )
 
     @worker.handle(kind="action", provider="shopify")
-    async def handle_shopify(lease: Lease, ctx) -> dict:
+    async def handle_shopify(lease: Lease, ctx) -> LeaseResult:
         action = lease.action_key
         creds = lease.credentials[0]["value"]
         ...
-        return {
-            "result": {"order_id": "..."},
-            "cost": {"api_calls": 1, "usd": 0.0},
-        }
+        return LeaseResult(
+            result={"order_id": "..."},
+            cost={"api_calls": 1, "usd": 0.0},
+        )
 
     worker.run_forever()
 
@@ -33,9 +33,11 @@ from packages.worker_sdk.client import ManorClient, WorkerClientError
 from packages.worker_sdk.types import (
     Lease,
     LeaseResult,
+    LeaseResultFactory,
     NeedHumanInput,
     HeartbeatRequest,
     HeartbeatResponse,
+    TaskOutputValueKind,
 )
 from packages.worker_sdk.worker import (
     ManorWorker,
@@ -48,10 +50,12 @@ __all__ = [
     "ManorWorker",
     "Lease",
     "LeaseResult",
+    "LeaseResultFactory",
     "LeaseContext",
     "NeedHumanInput",
     "HeartbeatRequest",
     "HeartbeatResponse",
+    "TaskOutputValueKind",
     "WorkerClientError",
     "NoHandlerError",
 ]

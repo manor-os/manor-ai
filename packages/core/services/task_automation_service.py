@@ -5,7 +5,7 @@ import logging
 from datetime import datetime, timezone, timedelta
 from typing import Optional
 
-from sqlalchemy import select, func, and_
+from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from packages.core.constants.task import TaskLogType, TaskStatus
@@ -91,10 +91,16 @@ async def check_sla_deadlines(db: AsyncSession, entity_id: str | None = None) ->
                     "priority": task.priority, "sla_breached": True,
                     "event": "sla_breached",
                 }
-                await push_task_update_multi(
-                    [task.creator_id, task.assignee_id], summary,
+                if not task.workspace_id:
+                    await push_task_update_multi(
+                        [task.creator_id, task.assignee_id], summary,
+                        entity_id=task.entity_id,
+                    )
+                await broadcast_task_update(
+                    task.entity_id,
+                    summary,
+                    workspace_id=task.workspace_id,
                 )
-                await broadcast_task_update(task.entity_id, summary)
             except Exception:
                 logger.debug("realtime push failed for SLA breach", exc_info=True)
 

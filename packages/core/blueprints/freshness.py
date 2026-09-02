@@ -32,6 +32,10 @@ from typing import Any, Optional
 BLUEPRINT_SETTINGS_KEY = "_blueprint"
 CONTENT_FINGERPRINT_KEY = "content_fingerprint"
 SECTION_FINGERPRINTS_KEY = "section_fingerprints"
+UPGRADE_UNSUPPORTED_FINGERPRINT_KEY = "upgrade_unsupported_fingerprint"
+MATERIALIZED_UPGRADE_UNSUPPORTED_FINGERPRINT_KEY = (
+    "materialized_upgrade_unsupported_fingerprint"
+)
 
 #: Payload sections that decide what a workspace actually gets. Anything
 #: outside these (presentation copy, marketplace pricing) can change without
@@ -95,6 +99,96 @@ def blueprint_section_fingerprints(payload: dict[str, Any] | None) -> dict[str, 
         encoded = json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
         out[section] = hashlib.sha256(encoded.encode("utf-8")).hexdigest()[:16]
     return out
+
+
+def blueprint_upgrade_unsupported_fingerprint(
+    payload: dict[str, Any] | None,
+    *,
+    include_channels: bool = False,
+) -> str:
+    """Fingerprint portable content the surgical upgrader cannot reconcile.
+
+    Agent/Skill behavioral fields, Workflow graph/variables, and live setup
+    channel requirements have explicit upgrade paths. Everything else must
+    stay unchanged or the operator needs a reinstall/reconfiguration path;
+    marking it current would be a false parity claim.
+
+    ``include_channels`` reproduces the legacy digest only for verifying
+    persisted baselines from before channel upgrades were supported.
+    """
+
+    if not isinstance(payload, dict):
+        return ""
+
+    agent_supported = {"system_prompt", "config", "status"}
+    skill_supported = {
+        "system_prompt", "tools", "input_schema", "output_format", "config", "status",
+    }
+    workflow_supported = {"steps", "variables"}
+
+    def unsupported_components(
+        values: Any,
+        *,
+        supported_fields: set[str],
+    ) -> list[Any]:
+        out: list[Any] = []
+        for value in values or []:
+            if not isinstance(value, dict):
+                out.append(value)
+                continue
+            out.append({
+                key: item
+                for key, item in value.items()
+                if key not in supported_fields
+            })
+        return out
+
+    embedded = payload.get("embedded") or {}
+    recipe = payload.get("recipe") or {}
+    contract = dict(payload.get("contract") or {})
+    if not include_channels:
+        contract.pop("channels", None)
+    material = {
+        "contract": contract,
+        "policy": payload.get("policy") or {},
+        "embedded": {
+            "skills": unsupported_components(
+                embedded.get("skills"), supported_fields=skill_supported,
+            ),
+            "agents": unsupported_components(
+                embedded.get("agents"), supported_fields=agent_supported,
+            ),
+            "knowledge_packs": embedded.get("knowledge_packs") or [],
+        },
+        "recipe": {
+            **{
+                key: value
+                for key, value in recipe.items()
+                if key != "workflows"
+            },
+            "workflows": unsupported_components(
+                recipe.get("workflows"), supported_fields=workflow_supported,
+            ),
+        },
+    }
+    encoded = json.dumps(material, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()[:32]
+
+
+def normalize_blueprint_upgrade_unsupported_fingerprint(
+    fingerprint: str,
+    comparison_payload: dict[str, Any] | None,
+) -> str:
+    """Convert a legacy baseline only when its exact old digest is proven.
+
+    A mismatch must remain a mismatch: today's source or personalization
+    cannot stand in for unknown installed content. This helper writes nothing.
+    """
+    if fingerprint and fingerprint == blueprint_upgrade_unsupported_fingerprint(
+        comparison_payload, include_channels=True,
+    ):
+        return blueprint_upgrade_unsupported_fingerprint(comparison_payload)
+    return fingerprint
 
 
 #: Where an install records the blueprint identity it came from. Both are

@@ -49,6 +49,24 @@ def _is_sandbox(workspace: Workspace) -> bool:
     return settings.get("sandbox") is True or workspace.kind == "sandbox"
 
 
+async def _lock_workspace_settings(
+    db: AsyncSession,
+    workspace: Workspace,
+) -> Workspace:
+    from packages.core.services.workspace_access import (
+        lock_workspace_access_boundary,
+    )
+
+    locked_workspace = await lock_workspace_access_boundary(
+        db,
+        workspace_id=workspace.id,
+        entity_id=workspace.entity_id,
+    )
+    if locked_workspace is None or locked_workspace.deleted_at is not None:
+        raise SimulationRuntimeError("workspace no longer exists")
+    return locked_workspace
+
+
 async def _source_payload(
     db: AsyncSession,
     workspace: Workspace,
@@ -122,8 +140,14 @@ async def ensure_simulation_experience(
     exists.
     """
     if not _is_sandbox(workspace):
-        raise SimulationRuntimeError("workspace is not a simulation sandbox")
+        raise SimulationRuntimeError("workspace is not in Workspace simulation mode")
 
+    settings = dict(_record(workspace.settings))
+    current = _record(settings.get("simulation_experience"))
+    if isinstance(current.get("stages"), list) and current["stages"]:
+        return deepcopy(current)
+
+    workspace = await _lock_workspace_settings(db, workspace)
     settings = dict(_record(workspace.settings))
     current = _record(settings.get("simulation_experience"))
     if isinstance(current.get("stages"), list) and current["stages"]:
@@ -243,6 +267,7 @@ async def start_simulation_run(
     user_id: str | None = None,
     restart: bool = False,
 ) -> dict[str, Any]:
+    workspace = await _lock_workspace_settings(db, workspace)
     experience = await ensure_simulation_experience(db, workspace=workspace)
     settings = dict(_record(workspace.settings))
     existing = _record(settings.get(SIMULATION_RUN_STATE_KEY))
@@ -290,6 +315,7 @@ async def advance_simulation_run(
     user_id: str | None = None,
     experience: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    workspace = await _lock_workspace_settings(db, workspace)
     resolved_experience = experience or await ensure_simulation_experience(
         db, workspace=workspace,
     )
@@ -415,6 +441,7 @@ async def resolve_simulation_action(
     note: str | None = None,
     payload: dict[str, Any] | None = None,
 ) -> Message:
+    workspace = await _lock_workspace_settings(db, workspace)
     action = _record(message.pending_action)
     if action.get("simulation_runtime") is not True:
         raise SimulationRuntimeError("message is not a simulation action")

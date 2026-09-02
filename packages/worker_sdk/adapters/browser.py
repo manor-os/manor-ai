@@ -43,7 +43,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
 from typing import Any, Awaitable, Callable, Optional
 
 from packages.worker_sdk.types import Lease, LeaseResult, NeedHumanInput
@@ -96,24 +95,24 @@ def register_browser_adapter(
     """Wire up a `kind=action, provider=<provider>` handler that routes
     by ``lease.action_key`` into one of ``actions``."""
 
-    async def handle(lease: Lease, ctx: LeaseContext) -> dict:
+    async def handle(lease: Lease, ctx: LeaseContext) -> LeaseResult:
         action_key = lease.action_key
         if not action_key or action_key not in actions:
-            return {
-                "result": {
+            return LeaseResult(
+                result={
                     "ok": False,
                     "error": f"unknown action_key: {action_key!r}",
                     "available": sorted(actions.keys()),
                 },
-            }
+            )
         fn = actions[action_key]
 
         if lease.execution_mode == "dry_run":
             logger.info("browser adapter: dry_run %s — skipping navigation", action_key)
-            return {
-                "result": {"dry_run": True, "action": action_key, "params": lease.params},
-                "cost": {"api_calls": 0, "usd": 0},
-            }
+            return LeaseResult(
+                result={"dry_run": True, "action": action_key, "params": lease.params},
+                cost={"api_calls": 0, "usd": 0},
+            )
 
         storage_state = await resolve_storage_state(lease)
         if storage_state is None:
@@ -142,7 +141,10 @@ def register_browser_adapter(
                 await on_success(lease, result)
             except Exception:
                 logger.warning("browser adapter on_success hook raised", exc_info=True)
-        return {"result": result, "cost": {"api_calls": 1, "usd": 0}}
+        return LeaseResult(
+            result=result,
+            cost={"api_calls": 1, "usd": 0},
+        )
 
     worker.handle(kind="action", provider=provider)(handle)
 

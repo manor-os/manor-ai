@@ -1,5 +1,7 @@
 """E2E tests: audit logs, entity settings, user preferences."""
 
+import asyncio
+
 import pytest
 from httpx import AsyncClient
 
@@ -12,7 +14,7 @@ async def _auth(client: AsyncClient, username: str = "adminuser") -> dict:
         json={
             "username": username,
             "email": f"{username}@test.com",
-            "password": "pass123",
+            "password": "pass123-long",
             "entity_name": f"{username} Corp",
         },
     )
@@ -157,6 +159,141 @@ async def test_settings_merge(client: AsyncClient):
     assert settings["language"] == "en"  # preserved
     assert settings["notifications"] is True  # added
     assert settings["theme"] == "light"  # overwritten
+
+
+@pytest.mark.asyncio
+async def test_entity_settings_reject_billing_runtime_branches(client: AsyncClient):
+    headers = await _auth(client, "reservedbillingsettings")
+
+    resp = await client.put(
+        "/api/v1/admin/settings",
+        headers=headers,
+        json={
+            "theme": "dark",
+            "pending_plan_checkout": {
+                "unit_amount": 1,
+                "plan_snapshot_metadata": {"plan_credit_amount": "999999999"},
+            },
+        },
+    )
+
+    assert resp.status_code == 200
+    assert resp.json()["settings"]["theme"] == "dark"
+    assert "pending_plan_checkout" not in resp.json()["settings"]
+    persisted = await client.get("/api/v1/admin/settings", headers=headers)
+    assert "pending_plan_checkout" not in persisted.json()["settings"]
+
+
+@pytest.mark.asyncio
+async def test_entity_settings_preserve_existing_billing_runtime_state(db_session):
+    from packages.core.models.base import generate_ulid
+    from packages.core.models.user import Entity
+    from packages.core.services.settings_service import update_entity_settings
+
+    pending = {"attempt_id": "server-owned-attempt", "signature": "signed"}
+    entity = Entity(
+        id=generate_ulid(),
+        name="Reserved Billing Settings Org",
+        settings={"pending_plan_checkout": pending},
+    )
+    db_session.add(entity)
+    await db_session.commit()
+
+    merged = await update_entity_settings(
+        db_session,
+        entity.id,
+        {"pending_plan_checkout": None, "theme": "dark"},
+    )
+
+    assert merged["pending_plan_checkout"] == pending
+    assert merged["theme"] == "dark"
+
+
+@pytest.mark.asyncio
+async def test_entity_settings_merge_serializes_with_billing_runtime_write(
+    db_session,
+):
+    import packages.core.database as db_module
+    from packages.core.models.base import generate_ulid
+    from packages.core.models.user import Entity
+    from packages.core.services.settings_service import update_entity_settings
+
+    entity = Entity(
+        id=generate_ulid(),
+        name="Concurrent Billing Settings Org",
+        settings={"language": "en"},
+    )
+    db_session.add(entity)
+    await db_session.commit()
+    entity_id = entity.id
+    pending = {"attempt_id": "concurrent-attempt", "signature": "signed"}
+
+    async with (
+        db_module.async_session() as billing_db,
+        db_module.async_session() as settings_db,
+    ):
+        billing_entity = await billing_db.get(Entity, entity_id)
+        assert billing_entity is not None
+        billing_entity.settings = {
+            **dict(billing_entity.settings or {}),
+            "pending_plan_checkout": pending,
+        }
+        await billing_db.flush()
+
+        async def update_public_settings() -> dict:
+            merged = await update_entity_settings(
+                settings_db,
+                entity_id,
+                {"theme": "dark"},
+            )
+            await settings_db.commit()
+            return merged
+
+        update_task = asyncio.create_task(update_public_settings())
+        await asyncio.sleep(0.05)
+        assert update_task.done() is False
+        await billing_db.commit()
+        merged = await asyncio.wait_for(update_task, timeout=2)
+
+    assert merged == {
+        "language": "en",
+        "pending_plan_checkout": pending,
+        "theme": "dark",
+    }
+
+
+@pytest.mark.asyncio
+async def test_entity_settings_are_read_from_the_transaction_not_cache(
+    db_session,
+    monkeypatch,
+):
+    from packages.core.models.base import generate_ulid
+    from packages.core.models.user import Entity
+    from packages.core.services import settings_service
+
+    entity = Entity(
+        id=generate_ulid(),
+        name="Transaction-local Settings Org",
+        settings={"fresh": "database"},
+    )
+    db_session.add(entity)
+    await db_session.commit()
+
+    async def _cache_must_not_be_read(*_args, **_kwargs):
+        raise AssertionError("entity settings must not read the shared cache")
+
+    async def _cache_must_not_be_written(*_args, **_kwargs):
+        raise AssertionError("entity settings must not write the shared cache")
+
+    monkeypatch.setattr(settings_service.cache, "get", _cache_must_not_be_read)
+    monkeypatch.setattr(settings_service.cache, "set", _cache_must_not_be_written)
+
+    settings = await settings_service.get_entity_settings(
+        db_session,
+        entity.id,
+    )
+
+    assert settings == {"fresh": "database"}
 
 
 # ── User preferences ──

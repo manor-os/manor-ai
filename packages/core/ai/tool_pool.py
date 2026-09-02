@@ -11,10 +11,25 @@ Ported from manor-multi-agent's pool.py. Key concepts:
 from __future__ import annotations
 
 import copy
+import json
 import logging
+import time
 from collections.abc import Iterable
 from typing import Any, Optional
 
+from packages.core.ai.runtime.dynamic_mcp import (
+    RuntimeDynamicMCPRehydrationResult,
+    RuntimeDynamicMCPRehydrationStatus,
+    RuntimeDynamicMCPToolBinding,
+    RuntimeDynamicMCPToolBindingFactory,
+    RuntimeDynamicMCPToolGrantFactory,
+    runtime_discover_official_remote_mcp_tools,
+    runtime_dynamic_mcp_binding_is_current,
+    runtime_dynamic_mcp_failure_result,
+    runtime_dynamic_mcp_result_is_stale,
+    runtime_dynamic_mcp_tool_handler,
+    runtime_rehydrate_dynamic_mcp_tool_binding,
+)
 from packages.core.ai.runtime.tool_search import (
     runtime_execute_search_tools_handler,
     runtime_search_tools_schema,
@@ -22,12 +37,25 @@ from packages.core.ai.runtime.tool_search import (
 )
 from packages.core.ai.runtime.tool_execution import (
     runtime_execute_registered_tool,
+    runtime_preflight_tool_resolution,
+    runtime_settle_provider_approval_preflight_failure,
+)
+from packages.core.ai.runtime.tool_input_validation import (
+    runtime_tool_input_validation_result,
 )
 from packages.core.ai.runtime.tool_visibility import (
     runtime_tool_is_deferred,
 )
 
 logger = logging.getLogger(__name__)
+
+_DYNAMIC_MCP_HANDLER_TTL_SECONDS = 15 * 60
+
+# Compatibility aliases for existing tests and process-local diagnostics. The
+# implementation and factory live under Runtime so ToolPool remains a registry.
+_DynamicMCPToolBinding = RuntimeDynamicMCPToolBinding
+_DynamicMCPToolBindingFactory = RuntimeDynamicMCPToolBindingFactory
+
 
 def is_deferred(name: str, auto_pass: set | None = None) -> bool:
     """Check if a tool should be deferred (schema withheld)."""
@@ -39,6 +67,10 @@ class ToolPool:
 
     def __init__(self):
         self._tools: dict[str, dict] = {}  # name -> {schema, handler, deferred}
+        self._dynamic_mcp_tools: dict[
+            tuple[str, str, str],
+            _DynamicMCPToolBinding,
+        ] = {}
         self._initialized = False
 
     def initialize(self) -> None:
@@ -55,21 +87,58 @@ class ToolPool:
             sum(1 for n in self._tools if is_deferred(n)),
         )
 
-    def register(self, name: str, schema: dict, handler, deferred: bool = False):
-        self._tools[name] = {"schema": schema, "handler": handler, "deferred": deferred}
+    def register(
+        self,
+        name: str,
+        schema: dict,
+        handler,
+        deferred: bool = False,
+        *,
+        discoverable: bool = True,
+    ):
+        self._tools[name] = {
+            "schema": schema,
+            "handler": handler,
+            "deferred": deferred,
+            "discoverable": discoverable,
+        }
 
     @property
     def tool_count(self) -> int:
         return len(self._tools)
 
-    def registered_tool_names(self, *, prefix: str | None = None) -> tuple[str, ...]:
-        names = tuple(self._tools.keys())
+    def registered_tool_names(
+        self,
+        *,
+        prefix: str | None = None,
+        include_undiscoverable: bool = False,
+    ) -> tuple[str, ...]:
+        names = tuple(
+            name
+            for name, entry in self._tools.items()
+            if include_undiscoverable or entry.get("discoverable", True)
+        )
         if prefix is None:
             return names
         return tuple(name for name in names if name.startswith(prefix))
 
-    def registered_tool_schemas(self) -> tuple[tuple[str, dict], ...]:
-        return tuple((name, copy.deepcopy(entry.get("schema") or {})) for name, entry in self._tools.items())
+    def registered_tool_schemas(
+        self,
+        *,
+        include_undiscoverable: bool = False,
+    ) -> tuple[tuple[str, dict], ...]:
+        return tuple(
+            (name, copy.deepcopy(entry.get("schema") or {}))
+            for name, entry in self._tools.items()
+            if include_undiscoverable or entry.get("discoverable", True)
+        )
+
+    def _prune_dynamic_mcp_tools(self, *, now: float | None = None) -> None:
+        """Remove expired actor-scoped handlers from the process-local cache."""
+        cutoff = time.monotonic() if now is None else now
+        for actor_key, binding in tuple(self._dynamic_mcp_tools.items()):
+            if binding.expires_at <= cutoff:
+                self._dynamic_mcp_tools.pop(actor_key, None)
 
     def get(self, name: str) -> Optional[dict]:
         return self._tools.get(name)
@@ -90,6 +159,39 @@ class ToolPool:
                 schemas.append(schema)
         return schemas
 
+    async def get_schema_for_actor(
+        self,
+        name: str,
+        *,
+        entity_id: str,
+        user_id: str,
+    ) -> Optional[dict]:
+        """Resolve the exact current schema at an actor-scoped runtime boundary.
+
+        Static tools come from the process registry. Dynamically discovered MCP
+        actions are rehydrated against the actor's current account registry, so
+        approval resolution never treats a stale or missing schema as valid.
+        """
+
+        registered = self.get_schema(name)
+        if registered is not None:
+            return registered
+        resolution = await self._ensure_dynamic_mcp_tool_binding(
+            name,
+            entity_id=entity_id,
+            user_id=user_id,
+            allowed_tool_names={name},
+            runtime_envelope=None,
+        )
+        if (
+            resolution is None
+            or resolution.status is not RuntimeDynamicMCPRehydrationStatus.BOUND
+            or resolution.binding is None
+            or not isinstance(resolution.binding.schema, dict)
+        ):
+            return None
+        return copy.deepcopy(resolution.binding.schema)
+
     async def execute(
         self,
         name: str,
@@ -105,37 +207,183 @@ class ToolPool:
         step_id: str | None = None,
         active_user_message: str | None = None,
         manual_skill_selected: bool = False,
+        manual_skill_ids: list[str] | None = None,
         manual_skill_slugs: list[str] | None = None,
         tool_profile: str | None = None,
         allowed_tool_names: set[str] | None = None,
         llm_metadata: dict[str, Any] | None = None,
         llm_model: str | None = None,
         runtime_envelope: Any | None = None,
-    ) -> str:
+    ) -> Any:
         """Execute a registered tool through the Runtime Harness."""
-        return await runtime_execute_registered_tool(
+        resolution_preflight = runtime_preflight_tool_resolution(
             tool_name=name,
             arguments=arguments,
-            handler_resolver=lambda tool_name: self._tools.get(tool_name, {}).get("handler"),
             entity_id=entity_id,
             user_id=user_id,
             agent_id=agent_id,
-            runtime_artifact_urls=runtime_artifact_urls,
-            dependency_artifact_urls=dependency_artifact_urls,
             workspace_id=workspace_id,
             conversation_id=conversation_id,
             task_id=task_id,
-            step_id=step_id,
-            active_user_message=active_user_message,
-            manual_skill_selected=manual_skill_selected,
-            manual_skill_slugs=manual_skill_slugs,
-            tool_profile=tool_profile,
-            allowed_tool_names=allowed_tool_names,
-            llm_metadata=llm_metadata,
-            llm_model=llm_model,
             runtime_envelope=runtime_envelope,
-            logger=logger,
         )
+
+        async def settle_early_failure(result: str) -> str:
+            """Close a provider grant before any handler or provider I/O runs."""
+
+            harness = resolution_preflight.harness
+            envelope = harness.envelope if harness is not None else runtime_envelope
+            context = resolution_preflight.context
+            return await runtime_settle_provider_approval_preflight_failure(
+                harness=harness,
+                tool_name=name,
+                arguments=arguments,
+                result=result,
+                entity_id=(
+                    getattr(envelope, "entity_id", None)
+                    or (context.entity_id if context is not None else None)
+                    or entity_id
+                    or ""
+                ),
+                conversation_id=(
+                    getattr(envelope, "conversation_id", None)
+                    or (context.conversation_id if context is not None else None)
+                    or conversation_id
+                ),
+            )
+
+        if resolution_preflight.blocked_result is not None:
+            return await settle_early_failure(resolution_preflight.blocked_result)
+        dynamic_resolution = await self._ensure_dynamic_mcp_tool_binding(
+            name,
+            entity_id=entity_id,
+            user_id=user_id,
+            allowed_tool_names=allowed_tool_names,
+            runtime_envelope=runtime_envelope,
+        )
+        def blocked_dynamic_result(
+            resolution: RuntimeDynamicMCPRehydrationResult | None,
+        ) -> str | None:
+            if resolution is None or resolution.status not in {
+                RuntimeDynamicMCPRehydrationStatus.OFFICIAL_UNAVAILABLE,
+                RuntimeDynamicMCPRehydrationStatus.DISCOVERY_FAILED,
+            }:
+                return None
+            blocked_result = runtime_dynamic_mcp_failure_result(
+                resolution
+            )
+            if resolution_preflight.harness is not None:
+                resolution_preflight.harness.record_tool_block_result(
+                    name,
+                    blocked_result,
+                )
+            return blocked_result
+
+        blocked_result = blocked_dynamic_result(dynamic_resolution)
+        if blocked_result is not None:
+            return await settle_early_failure(blocked_result)
+        dynamic_binding = (
+            dynamic_resolution.binding
+            if dynamic_resolution is not None
+            and dynamic_resolution.status is RuntimeDynamicMCPRehydrationStatus.BOUND
+            else None
+        )
+
+        selected_schema = (
+            dynamic_binding.schema
+            if dynamic_binding is not None
+            else self.get_schema(name)
+        )
+        validation_result = (
+            runtime_tool_input_validation_result(
+                tool_name=name,
+                arguments=arguments,
+                tool_schema=selected_schema,
+            )
+            if selected_schema is not None
+            else None
+        )
+        if validation_result is not None:
+            if resolution_preflight.harness is not None:
+                resolution_preflight.harness.record_tool_block_result(
+                    name,
+                    validation_result,
+                )
+            return await settle_early_failure(validation_result)
+
+        async def execute_registered(
+            binding: RuntimeDynamicMCPToolBinding | None,
+        ) -> Any:
+            return await runtime_execute_registered_tool(
+                tool_name=name,
+                arguments=arguments,
+                handler_resolver=lambda tool_name: self._handler_for_actor(
+                    tool_name,
+                    entity_id=entity_id,
+                    user_id=user_id,
+                ),
+                entity_id=entity_id,
+                user_id=user_id,
+                agent_id=agent_id,
+                runtime_artifact_urls=runtime_artifact_urls,
+                dependency_artifact_urls=dependency_artifact_urls,
+                workspace_id=workspace_id,
+                conversation_id=conversation_id,
+                task_id=task_id,
+                active_user_message=active_user_message,
+                manual_skill_selected=manual_skill_selected,
+                manual_skill_ids=manual_skill_ids,
+                manual_skill_slugs=manual_skill_slugs,
+                tool_profile=tool_profile,
+                allowed_tool_names=allowed_tool_names,
+                llm_metadata=llm_metadata,
+                llm_model=llm_model,
+                runtime_envelope=runtime_envelope,
+                discovered_tool_grant=(
+                    RuntimeDynamicMCPToolGrantFactory.from_binding(name, binding)
+                    if binding is not None
+                    else None
+                ),
+                logger=logger,
+            )
+
+        result = await execute_registered(dynamic_binding)
+        if dynamic_binding is None or not runtime_dynamic_mcp_result_is_stale(result):
+            return result
+
+        self._dynamic_mcp_tools.pop(
+            (str(entity_id or ""), str(user_id or ""), name),
+            None,
+        )
+        refreshed_resolution = await self._ensure_dynamic_mcp_tool_binding(
+            name,
+            entity_id=entity_id,
+            user_id=user_id,
+            allowed_tool_names=allowed_tool_names,
+            runtime_envelope=runtime_envelope,
+        )
+        blocked_result = blocked_dynamic_result(refreshed_resolution)
+        if blocked_result is not None:
+            return await settle_early_failure(blocked_result)
+        if (
+            refreshed_resolution is None
+            or refreshed_resolution.status is not RuntimeDynamicMCPRehydrationStatus.BOUND
+            or refreshed_resolution.binding is None
+        ):
+            return result
+        validation_result = runtime_tool_input_validation_result(
+            tool_name=name,
+            arguments=arguments,
+            tool_schema=refreshed_resolution.binding.schema,
+        )
+        if validation_result is not None:
+            if resolution_preflight.harness is not None:
+                resolution_preflight.harness.record_tool_block_result(
+                    name,
+                    validation_result,
+                )
+            return await settle_early_failure(validation_result)
+        return await execute_registered(refreshed_resolution.binding)
 
     def search(
         self,
@@ -177,16 +425,184 @@ class ToolPool:
             user_id: str = "",
             **kwargs,
         ) -> str:
-            return await runtime_execute_search_tools_handler(
+            discovered_bindings: dict[str, _DynamicMCPToolBinding] = {}
+
+            async def _load_live_schemas(
+                provider_keys: frozenset[str],
+            ) -> dict[str, list[Any]]:
+                discovered = await runtime_discover_official_remote_mcp_tools(
+                    provider_keys=provider_keys,
+                    entity_id=entity_id,
+                    user_id=user_id,
+                )
+                now = time.monotonic()
+                self._prune_dynamic_mcp_tools(now=now)
+                expires_at = now + _DYNAMIC_MCP_HANDLER_TTL_SECONDS
+                for tools in discovered.values():
+                    for tool in tools:
+                        discovered_bindings[tool.name] = (
+                            _DynamicMCPToolBindingFactory.from_discovered(
+                                tool,
+                                expires_at=expires_at,
+                            )
+                        )
+                return discovered
+
+            result = await runtime_execute_search_tools_handler(
                 arguments=kwargs,
                 entity_id=entity_id,
                 user_id=user_id,
                 tool_schemas=self.registered_tool_schemas(),
-                available_tool_names=self._tools.keys(),
-                total_tool_count=len(self._tools),
+                available_tool_names=self.registered_tool_names(),
+                total_tool_count=len(self.registered_tool_names()),
+                live_mcp_schema_loader=_load_live_schemas,
             )
+            try:
+                payload = json.loads(result)
+            except (TypeError, ValueError):
+                return result
+            if not isinstance(payload, dict):
+                return result
+            granted_names = {
+                str(name)
+                for name in payload.get("loaded_tools", [])
+                if str(name) in discovered_bindings
+            }
+            for name in granted_names:
+                self._dynamic_mcp_tools[(entity_id, user_id, name)] = (
+                    discovered_bindings[name]
+                )
+            return result
 
         self.register("search_tools", runtime_search_tools_schema(), _search_handler)
+
+    @staticmethod
+    def _grant_dynamic_mcp_tool_binding(
+        tool_name: str,
+        binding: RuntimeDynamicMCPToolBinding,
+        *,
+        runtime_envelope: Any | None,
+    ) -> None:
+        if runtime_envelope is None:
+            return
+        runtime_envelope.discovered_tool_grants.grant([
+            RuntimeDynamicMCPToolGrantFactory.from_binding(tool_name, binding)
+        ])
+
+    async def _ensure_dynamic_mcp_tool_binding(
+        self,
+        tool_name: str,
+        *,
+        entity_id: str | None,
+        user_id: str | None,
+        allowed_tool_names: set[str] | None,
+        runtime_envelope: Any | None,
+    ) -> RuntimeDynamicMCPRehydrationResult | None:
+        """Rehydrate a persisted Workflow/Task name after process restart."""
+
+        if not entity_id or not user_id:
+            return
+        if runtime_envelope is not None:
+            if tool_name in set(
+                getattr(runtime_envelope, "blocked_tool_names", ()) or ()
+            ):
+                return
+            effective_allowed = getattr(
+                runtime_envelope,
+                "effective_allowed_tool_names",
+                None,
+            )
+            allowed = (
+                effective_allowed()
+                if callable(effective_allowed)
+                else set(getattr(runtime_envelope, "allowed_tool_names", ()) or ())
+            )
+            if allowed and tool_name not in allowed:
+                return
+        elif allowed_tool_names is not None and tool_name not in allowed_tool_names:
+            return
+
+        cached_binding = self._dynamic_mcp_binding_for_actor(
+            tool_name,
+            entity_id=entity_id,
+            user_id=user_id,
+        )
+        if cached_binding is not None:
+            if await runtime_dynamic_mcp_binding_is_current(
+                cached_binding,
+                entity_id=str(entity_id),
+                user_id=str(user_id),
+            ):
+                self._grant_dynamic_mcp_tool_binding(
+                    tool_name,
+                    cached_binding,
+                    runtime_envelope=runtime_envelope,
+                )
+                return RuntimeDynamicMCPRehydrationResult(
+                    status=RuntimeDynamicMCPRehydrationStatus.BOUND,
+                    tool_name=tool_name,
+                    provider=cached_binding.provider,
+                    binding=cached_binding,
+                )
+            self._dynamic_mcp_tools.pop(
+                (str(entity_id), str(user_id), tool_name),
+                None,
+            )
+
+        resolution = await runtime_rehydrate_dynamic_mcp_tool_binding(
+            tool_name,
+            entity_id=entity_id,
+            user_id=user_id,
+            expires_at=time.monotonic() + _DYNAMIC_MCP_HANDLER_TTL_SECONDS,
+        )
+        if resolution.status is not RuntimeDynamicMCPRehydrationStatus.BOUND:
+            return resolution
+        binding = resolution.binding
+        if binding is None:
+            return RuntimeDynamicMCPRehydrationResult(
+                status=RuntimeDynamicMCPRehydrationStatus.OFFICIAL_UNAVAILABLE,
+                tool_name=tool_name,
+                provider=resolution.provider,
+            )
+        self._dynamic_mcp_tools[
+            (str(entity_id), str(user_id), tool_name)
+        ] = binding
+        self._grant_dynamic_mcp_tool_binding(
+            tool_name,
+            binding,
+            runtime_envelope=runtime_envelope,
+        )
+        return resolution
+
+    def _dynamic_mcp_binding_for_actor(
+        self,
+        tool_name: str,
+        *,
+        entity_id: str | None,
+        user_id: str | None,
+    ) -> _DynamicMCPToolBinding | None:
+        actor_key = (str(entity_id or ""), str(user_id or ""), tool_name)
+        binding = self._dynamic_mcp_tools.get(actor_key)
+        if binding is not None and binding.expires_at <= time.monotonic():
+            self._dynamic_mcp_tools.pop(actor_key, None)
+            binding = None
+        return binding
+
+    def _handler_for_actor(
+        self,
+        tool_name: str,
+        *,
+        entity_id: str | None,
+        user_id: str | None,
+    ):
+        binding = self._dynamic_mcp_binding_for_actor(
+            tool_name,
+            entity_id=entity_id,
+            user_id=user_id,
+        )
+        if binding is not None:
+            return runtime_dynamic_mcp_tool_handler(binding)
+        return self._tools.get(tool_name, {}).get("handler")
 
 
 # Global singleton

@@ -1,20 +1,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from enum import Enum
 from typing import Any
 
 from packages.core.ai.runtime.surfaces import ChatSurface
-
-
-class RuntimePrincipalKind(str, Enum):
-    OWNER = "owner"
-    WORKSPACE_MEMBER = "workspace_member"
-    AGENT = "agent"
-    EXTERNAL_CONTACT = "external_contact"
-    ANONYMOUS_PUBLIC = "anonymous_public"
-    SYSTEM_WORKER = "system_worker"
-    DELEGATED = "delegated"
+from packages.core.constants.runtime_principal import RuntimePrincipalKind
 
 
 @dataclass(frozen=True)

@@ -64,6 +64,7 @@ from packages.core.services.email_verification_service import (
 from packages.core.services.email_service import send_verification_email
 from packages.core.services.settings_service import update_user_preferences
 from packages.core.config import get_settings
+from apps.api.middleware.rate_limit import client_ip
 
 logger = logging.getLogger(__name__)
 
@@ -74,6 +75,8 @@ router = APIRouter(prefix="/api/v1/auth", tags=["auth"])
 
 
 # ── Schemas ──
+
+
 
 class RegisterRequest(BaseModel):
     username: str | None = None
@@ -104,6 +107,7 @@ class TokenResponse(BaseModel):
     user_id: str
     entity_id: str
     role: str
+    is_new: bool = False
 
 
 class MfaStepUpRequest(BaseModel):
@@ -273,6 +277,10 @@ async def _register_from_staff_invite(
 
 
 
+
+
+
+
 @router.post("/register")
 async def register(req: RegisterRequest, request: Request, db: AsyncSession = Depends(get_db)):
     """Register a new user + entity. If email verification is enabled, returns pending status.
@@ -299,6 +307,8 @@ async def register(req: RegisterRequest, request: Request, db: AsyncSession = De
     if (req.invite_token or "").strip():
         user, entity = await _register_from_staff_invite(db, req=req)
         mark_user_login(user, source="auth.register_invite")
+        # A following request must see the account before we issue its token.
+        await db.commit()
         token = create_access_token(
             user.id, entity.id, user.role, token_version=user.token_version,
         )
@@ -307,6 +317,7 @@ async def register(req: RegisterRequest, request: Request, db: AsyncSession = De
             user_id=user.id,
             entity_id=entity.id,
             role=user.role,
+            is_new=True,
         )
 
     # ── Invitation code gate (validate up front) ──────────────────────
@@ -341,8 +352,12 @@ async def register(req: RegisterRequest, request: Request, db: AsyncSession = De
     except ValueError as e:
         # If email already registered but pending verification, resend code
         if "already registered" in str(e) and _CLOUD_FEATURES_ENABLED:
-            from packages.core.services.auth_service import get_user_by_email, hash_password
-            existing = await get_user_by_email(db, req.email)
+            existing = (await db.execute(
+                select(User).where(
+                    User.email == req.email.strip().lower(),
+                    User.deleted_at.is_(None),
+                ).with_for_update().execution_options(populate_existing=True)
+            )).scalar_one_or_none()
             if existing and existing.status == "pending":
                 # Update password to whatever they typed this time
                 existing.password_hash = hash_password(req.password)
@@ -362,10 +377,17 @@ async def register(req: RegisterRequest, request: Request, db: AsyncSession = De
                             select(Entity).where(Entity.id == existing.entity_id)
                         )).scalar_one()
                         await redeem_invite(db, invite_row, user=existing, entity=entity)
-                code = await create_verification(existing.email, existing.id)
+                # Persist the new password before issuing a verifier bound to it.
+                await db.commit()
+                code = await create_verification(
+                    existing.email,
+                    existing.id,
+                    password_hash=existing.password_hash,
+                )
                 await send_verification_email(existing.email, code)
                 return {
                     "requires_verification": True,
+                    "is_new": False,
                     "email": existing.email,
                     "message": "Verification code resent to your email",
                 }
@@ -386,16 +408,24 @@ async def register(req: RegisterRequest, request: Request, db: AsyncSession = De
 
     if _CLOUD_FEATURES_ENABLED:
         user.status = "pending"
-        await db.flush()
-        code = await create_verification(user.email, user.id)
+        # Verification must not become usable before its account is committed.
+        await db.commit()
+        code = await create_verification(
+            user.email,
+            user.id,
+            password_hash=user.password_hash,
+        )
         await send_verification_email(user.email, code)
         return {
             "requires_verification": True,
+            "is_new": True,
             "email": user.email,
             "message": "Verification code sent to your email",
         }
 
     mark_user_login(user, source="auth.register")
+    # get_db's teardown can run after the success response has been sent.
+    await db.commit()
     token = create_access_token(
         user.id, entity.id, user.role, token_version=user.token_version,
     )
@@ -404,6 +434,7 @@ async def register(req: RegisterRequest, request: Request, db: AsyncSession = De
         user_id=user.id,
         entity_id=entity.id,
         role=user.role,
+        is_new=True,
     )
 
 
@@ -435,11 +466,13 @@ async def verify_email_endpoint(
     if not user:
         raise HTTPException(400, "User not found")
 
-    # Send welcome email
+    mark_user_login(user, source="auth.verify_email")
+    # Activation must be durable and visible before issuing a token or sending welcome.
+    await db.commit()
+
     from packages.core.services.email_service import send_welcome_email
     await send_welcome_email(req.email, user.display_name or req.email.split("@")[0])
 
-    mark_user_login(user, source="auth.verify_email")
     token = create_access_token(
         user.id, user.entity_id, user.role, token_version=user.token_version,
     )
@@ -462,7 +495,11 @@ async def resend_verification_endpoint(
     if not user or user.status != "pending":
         return {"message": "If that email is pending verification, a new code has been sent."}
 
-    code = await resend_verification(req.email, user.id)
+    code = await resend_verification(
+        req.email,
+        user.id,
+        password_hash=user.password_hash,
+    )
     if code:
         await send_verification_email(req.email, code)
     return {"message": "If that email is pending verification, a new code has been sent."}
@@ -482,12 +519,8 @@ async def login(req: LoginRequest, request: Request, db: AsyncSession = Depends(
     if not login_id:
         raise HTTPException(400, "Email or username is required")
 
-    client_ip = (
-        request.headers.get("cf-connecting-ip")
-        or request.headers.get("x-forwarded-for", "").split(",")[0].strip()
-        or (request.client.host if request.client else "unknown")
-    )
-    rate_decision = await check_login_allowed(login_id, client_ip)
+    resolved_client_ip = client_ip(request)
+    rate_decision = await check_login_allowed(login_id, resolved_client_ip)
     if not rate_decision.allowed:
         raise HTTPException(
             429,
@@ -497,7 +530,7 @@ async def login(req: LoginRequest, request: Request, db: AsyncSession = Depends(
 
     user = await authenticate_user(db, email=login_id, password=req.password)
     if not user:
-        failure_decision = await record_login_failure(login_id, client_ip)
+        failure_decision = await record_login_failure(login_id, resolved_client_ip)
         if not failure_decision.allowed:
             raise HTTPException(
                 429,
@@ -541,7 +574,11 @@ async def login(req: LoginRequest, request: Request, db: AsyncSession = Depends(
 
     # Check email verification
     if _CLOUD_FEATURES_ENABLED and user.status == "pending":
-        code = await create_verification(user.email, user.id)
+        code = await create_verification(
+            user.email,
+            user.id,
+            password_hash=user.password_hash,
+        )
         await send_verification_email(user.email, code)
         return {"requires_verification": True, "email": user.email}
 
@@ -550,7 +587,7 @@ async def login(req: LoginRequest, request: Request, db: AsyncSession = Depends(
         if not req.totp_code:
             return {"requires_2fa": True, "user_id": user.id}
         if not await verify_2fa_login(db, user.id, req.totp_code):
-            await record_login_failure(login_id, client_ip)
+            await record_login_failure(login_id, resolved_client_ip)
             raise HTTPException(401, "Invalid 2FA code")
 
     await clear_login_failures(login_id)
@@ -581,6 +618,45 @@ async def logout(
     await db.flush()
     return Response(status_code=204)
 
+
+@router.post("/renew", response_model=TokenResponse)
+async def renew_session(
+    request: Request,
+    user: User = Depends(get_current_user),
+):
+    """Slide an active user's short-lived access-token window.
+
+    The current bearer token must still be valid, so an idle/expired browser
+    cannot revive itself. ``get_current_user`` also re-checks account status,
+    membership, and ``token_version`` before this handler runs. Support
+    impersonation sessions keep their separate hard expiry and are never
+    renewable through this endpoint.
+    """
+    claims = getattr(request.state, "auth_claims", {}) or {}
+    if claims.get("typ") == "impersonation":
+        raise HTTPException(403, "Support sessions cannot be renewed")
+
+    # ``get_current_user`` resolves the membership carried by the token without
+    # mutating it, so these values reflect current server-side membership data
+    # rather than trusting possibly stale role claims during renewal.
+    entity_id = str(user.entity_id)
+    role = str(user.role)
+    mfa_authenticated = "mfa" in {
+        str(method).strip().lower() for method in claims.get("amr", [])
+    }
+    token = create_access_token(
+        user.id,
+        entity_id,
+        role,
+        token_version=user.token_version,
+        mfa_authenticated=mfa_authenticated,
+    )
+    return TokenResponse(
+        access_token=token,
+        user_id=user.id,
+        entity_id=entity_id,
+        role=role,
+    )
 
 @router.post("/mfa/step-up", response_model=TokenResponse)
 async def mfa_step_up(
@@ -688,6 +764,15 @@ async def update_profile(
     updates = req.model_dump(exclude_none=True)
     if not updates:
         raise HTTPException(400, "No fields to update")
+    if "timezone" in updates:
+        from packages.core.services.calendar_settings_lock import (
+            lock_calendar_settings_user,
+        )
+
+        locked_user = await lock_calendar_settings_user(db, user.id)
+        if not locked_user:
+            raise HTTPException(404, "User not found")
+        user = locked_user
     for key, value in updates.items():
         setattr(user, key, value)
     await db.flush()
@@ -813,7 +898,7 @@ async def get_my_models(
         "models": resolved,
         "user_models": {},
         "entity_models": (entity_settings.get("models") or {}),
-        "can_manage_byok": _can_manage_entity_byok(user),
+        "can_manage_byok": await _can_manage_entity_byok(db, user),
     }
 
 
@@ -894,8 +979,10 @@ async def update_my_models(
 
 # ── LLM API Key Config ──
 
-def _can_manage_entity_byok(user: User) -> bool:
-    return getattr(user, "role", None) == "owner"
+async def _can_manage_entity_byok(db: AsyncSession, user: User) -> bool:
+    from packages.core.permissions import effective_user_role_name
+
+    return await effective_user_role_name(db, user) == "owner"
 
 
 async def _load_current_entity(db: AsyncSession, user: User) -> Entity:
@@ -908,7 +995,7 @@ async def _load_current_entity(db: AsyncSession, user: User) -> Entity:
 
 
 async def _require_entity_byok_manager(db: AsyncSession, user: User) -> Entity:
-    if not _can_manage_entity_byok(user):
+    if not await _can_manage_entity_byok(db, user):
         raise HTTPException(status_code=403, detail="Only the organization owner can manage model provider keys.")
     return await _load_current_entity(db, user)
 
@@ -996,7 +1083,7 @@ async def get_llm_config(
         "role_api_key_models": role_api_key_models,
         "byok_allowed": byok_allowed,
         "byok_effective": byok_allowed and (has_key or bool(masked_role_keys)),
-        "can_manage_byok": _can_manage_entity_byok(user),
+        "can_manage_byok": await _can_manage_entity_byok(db, user),
         "scope": "entity",
     }
 
@@ -2366,6 +2453,10 @@ async def oauth_google(req: OAuthGoogleRequest, db: AsyncSession = Depends(get_d
     if team_invite_token:
         from packages.core.services.team_invite_service import accept_team_invite_with_oauth
 
+        existing_team_user_id = await db.scalar(
+            select(User.id).where(func.lower(User.email) == info.get("email", "").lower())
+        )
+
         accepted = await accept_team_invite_with_oauth(
             db,
             token=team_invite_token,
@@ -2392,6 +2483,7 @@ async def oauth_google(req: OAuthGoogleRequest, db: AsyncSession = Depends(get_d
             user_id=accepted.user.id,
             entity_id=accepted.user.entity_id,
             role=accepted.user.role,
+            is_new=existing_team_user_id is None,
         )
 
     # ── Invitation code gate (only for NEW users) ──────────────────
@@ -2474,6 +2566,7 @@ async def oauth_google(req: OAuthGoogleRequest, db: AsyncSession = Depends(get_d
         # Don't catch — if redemption fails, let the error propagate
         # so the user sees it and can retry. Silent failures = lost credits.
 
+
     if _is_new:
         # Welcome email for new OAuth users (verification is skipped)
         try:
@@ -2495,6 +2588,7 @@ async def oauth_google(req: OAuthGoogleRequest, db: AsyncSession = Depends(get_d
         user_id=user.id,
         entity_id=user.entity_id,
         role=user.role,
+        is_new=_is_new,
     )
 
 
@@ -2518,9 +2612,11 @@ class ChangePasswordRequest(BaseModel):
 
 # ── Helpers ──
 
-def _require_admin(user: User):
+async def _require_admin(db: AsyncSession, user: User):
     """Raise 403 if user is not owner or admin."""
-    if user.role not in ("owner", "admin"):
+    from packages.core.permissions import user_is_effective_entity_admin
+
+    if not await user_is_effective_entity_admin(db, user):
         raise HTTPException(403, "Requires owner or admin role")
 
 
@@ -2532,7 +2628,7 @@ async def get_users(
     db: AsyncSession = Depends(get_db),
 ):
     """List all users in the entity (owner/admin only)."""
-    _require_admin(user)
+    await _require_admin(db, user)
     users = await list_users(db, user.entity_id)
     return [
         _user_response(u)
@@ -2548,7 +2644,7 @@ async def invite_user_endpoint(
     db: AsyncSession = Depends(get_db),
 ):
     """Invite a new user by email (owner/admin only)."""
-    _require_admin(user)
+    await _require_admin(db, user)
     new_user = await invite_user(db, user.entity_id, req.email, req.role)
     return _user_response(new_user)
 
@@ -2561,7 +2657,7 @@ async def change_user_role(
     db: AsyncSession = Depends(get_db),
 ):
     """Change a user's role (owner/admin only)."""
-    _require_admin(user)
+    await _require_admin(db, user)
     updated = await update_user_role(db, user_id, user.entity_id, req.role)
     if not updated:
         raise HTTPException(404, "User not found")
@@ -2578,7 +2674,7 @@ async def delete_user(
 
     For full account deletion (soft-delete + 30-day grace + Stripe
     cancel + cascade), use ``DELETE /auth/me``."""
-    _require_admin(user)
+    await _require_admin(db, user)
     ok = await deactivate_user(db, user_id, user.entity_id)
     if not ok:
         raise HTTPException(404, "User not found")

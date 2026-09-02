@@ -4,7 +4,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Optional
 
-from sqlalchemy import BigInteger, Boolean, DateTime, Index, String, Text, func
+from sqlalchemy import BigInteger, Boolean, DateTime, Index, String, Text, func, text
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -44,6 +44,23 @@ class Document(Base, TimestampMixin):
         Index("ix_documents_entity", "entity_id"),
         Index("ix_documents_name", "entity_id", "name"),
         Index("ix_documents_fs_path", "fs_path"),
+        Index(
+            "uq_documents_upload_idempotency",
+            "entity_id",
+            "owner_id",
+            "upload_idempotency_key",
+            unique=True,
+            postgresql_where=text("upload_idempotency_key IS NOT NULL"),
+            sqlite_where=text("upload_idempotency_key IS NOT NULL"),
+        ),
+        Index(
+            "uq_documents_entity_fs_path_active",
+            "entity_id",
+            "fs_path",
+            unique=True,
+            postgresql_where=text("fs_path IS NOT NULL AND is_trashed = false"),
+            sqlite_where=text("fs_path IS NOT NULL AND is_trashed = 0"),
+        ),
     )
 
     id: Mapped[str] = mapped_column(String(26), primary_key=True, default=generate_ulid)
@@ -62,6 +79,10 @@ class Document(Base, TimestampMixin):
     metadata_: Mapped[dict] = mapped_column("metadata", JSONB, server_default="{}")
     created_by: Mapped[Optional[str]] = mapped_column(String(100))
     folder_id: Mapped[Optional[str]] = mapped_column(String(26))
+    # Stable browser-upload receipt. A retry with the same key and fingerprint
+    # returns this row instead of creating a second filesystem projection.
+    upload_idempotency_key: Mapped[Optional[str]] = mapped_column(String(128))
+    upload_request_fingerprint: Mapped[Optional[str]] = mapped_column(String(64))
 
     # Trash / soft-delete fields
     is_trashed: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
@@ -147,13 +168,12 @@ class DocumentGroupMember(Base):
 
 
 class Integration(Base, TimestampMixin):
-    """Entity-scope integration credentials (company-wide systems).
+    """User-owned non-OAuth integration credentials.
 
-    Used for integrations that live at the tenant level — Stripe, QuickBooks,
-    org-level GitHub — as opposed to personal OAuth which lives in
-    ``oauth_accounts``. Access is gated by ``required_permission``: before an
-    agent can use these credentials via MCP, the acting user's role must
-    include that permission.
+    ``entity_id`` bounds the connection to one Entity, but never grants
+    Entity-wide visibility. The owner may explicitly grant another member
+    ``use`` access; the owner remains the only user who can manage or share
+    the connection.
     """
     __tablename__ = "integrations"
     __table_args__ = (
@@ -162,11 +182,11 @@ class Integration(Base, TimestampMixin):
 
     id: Mapped[str] = mapped_column(String(26), primary_key=True, default=generate_ulid)
     entity_id: Mapped[str] = mapped_column(String(26), nullable=False)
-    # Who connected this integration. Provenance only — an integration stays
-    # shared entity-wide, and this never narrows who may use or edit it.
-    # Deliberately NOT named ``created_by``/``owner_user_id``: those are the
-    # ownership columns ResourceDescriptor.from_row() reads, and picking one
-    # up here would silently turn a shared integration into a personal one.
+    # Connections are private to the user who created them. Sharing is an
+    # explicit ResourceGrant, never an implicit Entity-wide fallback.
+    owner_user_id: Mapped[Optional[str]] = mapped_column(String(26))
+    # Historical provenance remains distinct from ownership so old rows can be
+    # migrated conservatively when their original owner is known.
     created_by_user_id: Mapped[Optional[str]] = mapped_column(String(26))
     provider: Mapped[str] = mapped_column(String(50), nullable=False)
     status: Mapped[str] = mapped_column(String(20), default="active")
@@ -200,6 +220,21 @@ class Channel(Base, TimestampMixin):
          keep working until the admin promotes the binding via the UI.
     """
     __tablename__ = "channels"
+    __table_args__ = (
+        Index(
+            "ux_channels_active_whatsapp_config",
+            text("(config ->> 'channel_config_id')"),
+            unique=True,
+            postgresql_where=text(
+                "type = 'whatsapp' AND status = 'active' "
+                "AND config ->> 'channel_config_id' IS NOT NULL"
+            ),
+            sqlite_where=text(
+                "type = 'whatsapp' AND status = 'active' "
+                "AND config ->> 'channel_config_id' IS NOT NULL"
+            ),
+        ),
+    )
 
     id: Mapped[str] = mapped_column(String(26), primary_key=True, default=generate_ulid)
     entity_id: Mapped[str] = mapped_column(String(26), nullable=False)

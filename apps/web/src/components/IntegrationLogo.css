@@ -1,0 +1,17 @@
+/* Monochrome marks use legible ink where their brand color disappears on the
+   current surface. Full-color provider assets retain their original artwork. */
+.integration-logo[data-bright-ink="true"] {
+  fill: var(--text-strong);
+}
+
+html[data-theme="dark"] .integration-logo[data-bright-ink="true"] {
+  fill: var(--integration-logo-color);
+}
+
+html[data-theme="dark"] .integration-logo[data-dark-ink="true"] {
+  fill: var(--text-strong);
+}
+
+html[data-theme="dark"] .integration-logo[data-monochrome="true"] {
+  filter: brightness(0) invert(1);
+}

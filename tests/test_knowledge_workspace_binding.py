@@ -9,7 +9,17 @@ from httpx import AsyncClient
 from packages.core.models.base import generate_ulid
 from packages.core.models.document import Document, DocumentFolder, DocumentGroup, DocumentGroupMember
 from packages.core.models.workspace import Workspace
-from packages.core.services import knowledge_sync
+from packages.core.services import artifact_knowledge, knowledge_sync
+
+
+@pytest.fixture(autouse=True)
+def canonical_entity_fs_root(monkeypatch, tmp_path):
+    from packages.core.config import get_settings
+
+    settings = get_settings()
+    monkeypatch.setattr(settings, "MANOR_FS_ENABLED", True)
+    monkeypatch.setattr(settings, "MANOR_FS_ROOT", str(tmp_path))
+    monkeypatch.setattr(settings, "DEPLOYMENT_MODE", "oss")
 
 
 @pytest.mark.asyncio
@@ -82,6 +92,53 @@ async def test_sync_file_to_knowledge_marks_generated_file_workspace_provenance(
         )
     ).scalar_one_or_none()
     assert existing_member is None
+
+
+@pytest.mark.asyncio
+async def test_task_projection_backfills_existing_document_provenance(
+    client: AsyncClient,
+    db_session,
+    monkeypatch,
+    tmp_path,
+):
+    import packages.core.database as db_module
+
+    monkeypatch.setattr(knowledge_sync, "async_session", db_module.async_session)
+    monkeypatch.setattr(artifact_knowledge, "get_entity_root", lambda _entity_id: str(tmp_path))
+
+    entity_id = generate_ulid()
+    workspace_id = generate_ulid()
+    task_id = generate_ulid()
+    document_id = generate_ulid()
+    db_session.add(Workspace(id=workspace_id, entity_id=entity_id, name="Launch Workspace"))
+    document = Document(
+        id=document_id,
+        entity_id=entity_id,
+        name="report.csv",
+        fs_path="Workspaces/Demo/report.csv",
+        source="agent",
+        metadata_={"origin": {"workspace_id": workspace_id}},
+    )
+    db_session.add(document)
+    await db_session.commit()
+
+    projection = await artifact_knowledge.project_artifact_refs_to_knowledge(
+        entity_id=entity_id,
+        workspace_id=workspace_id,
+        task_id=task_id,
+        refs=[{
+            "type": "file",
+            "name": "report.csv",
+            "document_id": document_id,
+            "url": f"/viewer/{document_id}",
+        }],
+    )
+
+    await db_session.refresh(document)
+    assert projection.refs[0]["document_id"] == document_id
+    assert projection.refs[0]["viewer_url"] == f"/viewer/{document_id}"
+    assert document.metadata_["origin"]["workspace_id"] == workspace_id
+    assert document.metadata_["origin"]["task_id"] == task_id
 
 
 @pytest.mark.asyncio

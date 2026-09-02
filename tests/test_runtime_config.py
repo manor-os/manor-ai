@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
 from sqlalchemy.pool import NullPool
 
 
@@ -19,6 +20,9 @@ def test_settings_keep_single_server_defaults(monkeypatch):
         "DATABASE_MAX_OVERFLOW",
         "DATABASE_POOL_TIMEOUT",
         "DATABASE_POOL_RECYCLE",
+        "DATABASE_POOL_MODE",
+        "DATABASE_DIRECT_URL",
+        "DATABASE_DIRECT_URL_SYNC",
         "REDIS_RATE_LIMIT_ENABLED",
         "DEGRADED_MODE",
     ):
@@ -35,6 +39,9 @@ def test_settings_keep_single_server_defaults(monkeypatch):
     assert settings.DATABASE_MAX_OVERFLOW == 2
     assert settings.DATABASE_POOL_TIMEOUT == 10
     assert settings.DATABASE_POOL_RECYCLE == 1800
+    assert settings.DATABASE_POOL_MODE == "sqlalchemy"
+    assert settings.DATABASE_DIRECT_URL == settings.DATABASE_URL
+    assert settings.DATABASE_DIRECT_URL_SYNC == settings.DATABASE_URL_SYNC
     assert settings.REDIS_RATE_LIMIT_ENABLED is False
     assert settings.DEGRADED_MODE is False
 
@@ -47,6 +54,9 @@ def test_settings_read_cloud_runtime_overrides(monkeypatch):
     monkeypatch.setenv("API_WORKERS", "2")
     monkeypatch.setenv("DATABASE_POOL_SIZE", "6")
     monkeypatch.setenv("DATABASE_MAX_OVERFLOW", "1")
+    monkeypatch.setenv("DATABASE_POOL_MODE", "pgbouncer")
+    monkeypatch.setenv("DATABASE_DIRECT_URL", "postgresql+asyncpg://direct/override")
+    monkeypatch.setenv("DATABASE_DIRECT_URL_SYNC", "postgresql://direct/override")
     monkeypatch.setenv("REDIS_RATE_LIMIT_ENABLED", "true")
     monkeypatch.setenv("DEGRADED_MODE", "1")
     get_settings.cache_clear()
@@ -56,8 +66,24 @@ def test_settings_read_cloud_runtime_overrides(monkeypatch):
     assert settings.API_WORKERS == 2
     assert settings.DATABASE_POOL_SIZE == 6
     assert settings.DATABASE_MAX_OVERFLOW == 1
+    assert settings.DATABASE_POOL_MODE == "pgbouncer"
+    assert settings.DATABASE_DIRECT_URL == "postgresql+asyncpg://direct/override"
+    assert settings.DATABASE_DIRECT_URL_SYNC == "postgresql://direct/override"
     assert settings.REDIS_RATE_LIMIT_ENABLED is True
     assert settings.DEGRADED_MODE is True
+
+    get_settings.cache_clear()
+
+
+def test_settings_reject_unknown_database_pool_mode_only_in_cloud(monkeypatch):
+    from packages.core.config import get_settings
+
+    monkeypatch.setenv("DATABASE_POOL_MODE", "mystery")
+    monkeypatch.setenv("DEPLOYMENT_MODE", "cloud")
+    get_settings.cache_clear()
+
+    with pytest.raises(RuntimeError, match="DATABASE_POOL_MODE"):
+        get_settings()
 
     get_settings.cache_clear()
 
@@ -67,6 +93,7 @@ def test_database_pool_kwargs_use_env_settings_for_non_test_database():
 
     settings = SimpleNamespace(
         DATABASE_ECHO=False,
+        DATABASE_POOL_MODE="sqlalchemy",
         DATABASE_POOL_SIZE=5,
         DATABASE_MAX_OVERFLOW=2,
         DATABASE_POOL_TIMEOUT=10,
@@ -90,6 +117,7 @@ def test_database_pool_kwargs_keep_nullpool_for_test_database():
 
     settings = SimpleNamespace(
         DATABASE_ECHO=True,
+        DATABASE_POOL_MODE="sqlalchemy",
         DATABASE_POOL_SIZE=5,
         DATABASE_MAX_OVERFLOW=2,
         DATABASE_POOL_TIMEOUT=10,

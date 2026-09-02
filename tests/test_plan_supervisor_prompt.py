@@ -95,6 +95,39 @@ def test_prompt_shows_instructions_results_and_artifact_receipts():
     assert "do not take the step's own prose as proof of delivery" in prompt
 
 
+def test_prompt_shows_the_same_task_and_step_contracts_used_by_runtime():
+    prompt = runtime_plan_supervisor_prompt(
+        task_title="Return a qualified shortlist",
+        task_description="Return exactly ten records.",
+        task_output_contract={
+            "type": "object",
+            "required": ["leads"],
+            "properties": {"leads": {"type": "array", "minItems": 10, "maxItems": 10}},
+        },
+        done_count=1,
+        failed_count=0,
+        skipped_count=0,
+        steps=[{
+            "key": "deliver_shortlist",
+            "kind": "subagent",
+            "status": "done",
+            "result": '{"leads": [{"name": "A"}]}',
+            "output_contract": {
+                "type": "object",
+                "required": ["leads"],
+                "properties": {"leads": {"type": "array", "minItems": 10, "maxItems": 10}},
+            },
+            "contract_check": "passed",
+        }],
+    )
+
+    assert "Task deliverable contract" in prompt
+    assert '"required": ["leads"]' in prompt
+    assert "must deliver" in prompt
+    assert "contract check: passed" in prompt
+    assert "cannot override a failed contract check" in prompt
+
+
 def test_prompt_carries_plan_context_when_present():
     prompt = runtime_plan_supervisor_prompt(
         task_title="T",

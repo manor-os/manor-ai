@@ -38,7 +38,7 @@ def runtime_document_markdown_link(name: Any, document_id: Any) -> str | None:
 def runtime_document_to_dict(doc: Any, *, detail: str = "summary") -> dict[str, Any]:
     viewer_url = runtime_document_viewer_url(getattr(doc, "id", None))
     data = {
-        "id": doc.id,
+        "document_id": doc.id,
         "name": doc.name,
         "file_type": doc.file_type,
         "file_size": doc.file_size,

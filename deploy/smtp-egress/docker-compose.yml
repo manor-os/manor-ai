@@ -1,0 +1,42 @@
+services:
+  danted:
+    image: ${SMTP_EGRESS_IMAGE:-manor-smtp-egress:local}
+    build:
+      context: ../..
+      dockerfile: deploy/smtp-egress/Dockerfile
+    command: ["danted"]
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=16m,uid=10001,gid=10001
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: [ALL]
+    volumes:
+      - ${SMTP_EGRESS_DANTE_CONFIG:?set SMTP_EGRESS_DANTE_CONFIG}:/etc/manor/danted/danted.conf:ro
+    networks: [smtp-egress]
+
+  stunnel:
+    image: ${SMTP_EGRESS_IMAGE:-manor-smtp-egress:local}
+    build:
+      context: ../..
+      dockerfile: deploy/smtp-egress/Dockerfile
+    command: ["stunnel-server"]
+    restart: unless-stopped
+    depends_on: [danted]
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=16m,uid=10001,gid=10001
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: [ALL]
+    ports:
+      - "${SMTP_EGRESS_BIND_ADDRESS:-0.0.0.0}:8443:8443"
+    volumes:
+      - ${SMTP_EGRESS_STUNNEL_CONFIG:?set SMTP_EGRESS_STUNNEL_CONFIG}:/etc/manor/stunnel/server.conf:ro
+      - ${SMTP_EGRESS_TLS_DIR:?set SMTP_EGRESS_TLS_DIR}:/etc/manor/tls:ro
+    networks: [smtp-egress]
+
+networks:
+  smtp-egress:
+    driver: bridge

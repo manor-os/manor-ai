@@ -14,6 +14,9 @@ interface ButtonProps {
   title?: string;
   ariaLabel?: string;
   ariaExpanded?: boolean;
+  ariaBusy?: boolean;
+  ariaPressed?: boolean;
+  ariaDescribedBy?: string;
 }
 
 const variantClass: Record<string, string> = {
@@ -44,6 +47,9 @@ export default function Button({
   title,
   ariaLabel,
   ariaExpanded,
+  ariaBusy,
+  ariaPressed,
+  ariaDescribedBy,
 }: ButtonProps) {
   const base = size === "lg" && variant === "primary" ? "btn-manor-lg" : variantClass[variant];
   const isDisabled = disabled || loading;
@@ -63,6 +69,9 @@ export default function Button({
       title={title}
       aria-label={ariaLabel}
       aria-expanded={ariaExpanded}
+      aria-busy={ariaBusy}
+      aria-pressed={ariaPressed}
+      aria-describedby={ariaDescribedBy}
     >
       {loading && <LoadingSpinner size={size === "sm" ? 14 : 16} />}
       {children}

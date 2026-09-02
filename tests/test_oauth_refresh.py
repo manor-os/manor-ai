@@ -21,9 +21,20 @@ from httpx import AsyncClient
 from sqlalchemy import select
 
 from packages.core.models.base import generate_ulid
+from packages.core.credentials import CredentialDecryptError
 from packages.core.models.document import Integration
 from packages.core.models.user import OAuthAccount
-from packages.core.services.oauth_account_credentials import lease_oauth_account_tokens
+from packages.core.services.oauth_account_credentials import (
+    lease_oauth_account_tokens,
+    oauth_account_is_runtime_usable_clause,
+    store_oauth_account_tokens,
+)
+from packages.core.services.integration_account_service import (
+    list_runtime_integration_accounts,
+)
+from packages.core.services.integration_resolution import (
+    connected_integration_provider_keys,
+)
 from packages.core.tasks import oauth_refresh as oauth_refresh_task
 from packages.core.tasks.oauth_refresh import (
     _refresh_integrations,
@@ -85,6 +96,60 @@ def _leased_tokens(account) -> dict[str, str]:
     )
 
 
+def test_reconnect_overwrites_unreadable_credentials_without_preserving_refresh(
+    monkeypatch,
+):
+    import packages.core.services.oauth_account_credentials as credential_helpers
+
+    account = OAuthAccount(
+        id=generate_ulid(),
+        user_id=generate_ulid(),
+        provider="facebook",
+        provider_user_id="fb-reconnect",
+        credential_ref="vault:v1:unreadable",
+        credential_scheme="vault_transit",
+        profile={
+            "oauth_refresh": {
+                "reauth_required": True,
+                "error": "credential_decrypt_failed",
+            },
+            "last_health_check": {"ok": False},
+        },
+    )
+    stored: dict[str, str] = {}
+
+    class FakeCredentialService:
+        def store_oauth_account(self, row, payload):
+            stored.update(payload)
+            row.credential_ref = "vault:v1:replacement"
+
+    def fail_if_leased(*args, **kwargs):
+        raise AssertionError("reconnect must not decrypt unreadable credentials")
+
+    monkeypatch.setattr(
+        credential_helpers,
+        "lease_oauth_account_tokens",
+        fail_if_leased,
+    )
+    monkeypatch.setattr(
+        credential_helpers,
+        "get_credential_service",
+        lambda: FakeCredentialService(),
+    )
+
+    store_oauth_account_tokens(
+        account,
+        access_token="fresh-access-token",
+        refresh_token=None,
+        requester_id=account.user_id,
+    )
+
+    assert stored == {"access_token": "fresh-access-token"}
+    assert account.credential_ref == "vault:v1:replacement"
+    assert "oauth_refresh" not in account.profile
+    assert "last_health_check" not in account.profile
+
+
 # ── User-scope refresh ──────────────────────────────────────────────────────
 
 
@@ -130,6 +195,119 @@ async def test_user_token_near_expiry_is_refreshed(client: AsyncClient):
     assert row.access_token is None
     assert _leased_tokens(row)["access_token"] == "NEW_TOKEN"
     assert row.token_expires_at > now + timedelta(minutes=30)
+
+
+@pytest.mark.asyncio
+async def test_youtube_user_token_near_expiry_is_refreshed(client: AsyncClient):
+    """YouTube OAuth accounts use the Google token endpoint for refresh."""
+    _, user_id, _ = await _register(client, "oauth_youtube_usr")
+
+    import packages.core.database as dbmod
+
+    now = datetime.now(timezone.utc)
+    async with dbmod.async_session() as db:
+        db.add(
+            OAuthAccount(
+                id=generate_ulid(),
+                user_id=user_id,
+                provider="youtube",
+                provider_user_id="yt-1",
+                access_token="OLD_YOUTUBE_TOKEN",
+                refresh_token="yt-rt-1",
+                token_expires_at=now + timedelta(minutes=2),
+            )
+        )
+        await db.commit()
+
+    calls: list[dict] = []
+
+    class _YouTubeRefreshClient(_MockHttpxClient):
+        async def post(self, url, data=None, headers=None):
+            calls.append({"url": url, "data": data, "headers": headers})
+            return await super().post(url, data=data, headers=headers)
+
+    def fake_client(*a, **kw):
+        return _YouTubeRefreshClient(
+            {
+                "access_token": "NEW_YOUTUBE_TOKEN",
+                "expires_in": 3600,
+            }
+        )
+
+    with patch.dict(
+        os.environ,
+        {"GOOGLE_CLIENT_ID": "cid", "GOOGLE_CLIENT_SECRET": "csec"},
+    ):
+        with patch("httpx.AsyncClient", fake_client):
+            async with dbmod.async_session() as db:
+                n = await _refresh_oauth_accounts(db)
+                await db.commit()
+
+    assert n == 1
+    assert calls[0]["url"] == "https://oauth2.googleapis.com/token"
+    assert calls[0]["data"]["refresh_token"] == "yt-rt-1"
+    async with dbmod.async_session() as db:
+        row = (
+            await db.execute(
+                select(OAuthAccount).where(OAuthAccount.user_id == user_id)
+            )
+        ).scalar_one()
+    assert _leased_tokens(row)["access_token"] == "NEW_YOUTUBE_TOKEN"
+    assert row.token_expires_at > now + timedelta(minutes=30)
+
+
+@pytest.mark.asyncio
+async def test_twitter_user_refresh_uses_basic_auth_without_client_credentials(
+    client: AsyncClient,
+):
+    """X refresh requests authenticate credentials only through Basic Auth."""
+    _, user_id, _ = await _register(client, "oauth_twitter_refresh")
+
+    import packages.core.database as dbmod
+
+    now = datetime.now(timezone.utc)
+    async with dbmod.async_session() as db:
+        db.add(
+            OAuthAccount(
+                id=generate_ulid(),
+                user_id=user_id,
+                provider="twitter_x",
+                provider_user_id="x-1",
+                access_token="OLD_X_TOKEN",
+                refresh_token="x-rt-1",
+                token_expires_at=now + timedelta(minutes=2),
+            )
+        )
+        await db.commit()
+
+    calls: list[dict] = []
+
+    class _TwitterRefreshClient(_MockHttpxClient):
+        async def post(self, url, data=None, headers=None):
+            calls.append({"url": url, "data": data, "headers": headers})
+            return await super().post(url, data=data, headers=headers)
+
+    def fake_client(*args, **kwargs):
+        return _TwitterRefreshClient(
+            {"access_token": "NEW_X_TOKEN", "expires_in": 7200}
+        )
+
+    with patch.dict(
+        os.environ,
+        {"X_CLIENT_ID": "x-cid", "X_CLIENT_SECRET": "x-csec"},
+    ):
+        with patch("httpx.AsyncClient", fake_client):
+            async with dbmod.async_session() as db:
+                n = await _refresh_oauth_accounts(db)
+                await db.commit()
+
+    assert n == 1
+    assert calls[0]["url"] == "https://api.x.com/2/oauth2/token"
+    assert calls[0]["data"] == {
+        "grant_type": "refresh_token",
+        "refresh_token": "x-rt-1",
+    }
+    assert calls[0]["headers"]["Authorization"].startswith("Basic ")
 
 
 @pytest.mark.asyncio
@@ -290,6 +468,107 @@ async def test_permanent_user_refresh_error_marks_reauth_required(
         n = await _refresh_oauth_accounts(db)
     assert n == 0
     assert calls == 1
+
+
+@pytest.mark.asyncio
+async def test_credential_decrypt_failure_marks_only_bad_account_for_reconnect(
+    client: AsyncClient,
+    monkeypatch,
+    caplog,
+):
+    """One stale Vault ciphertext must not abort other OAuth refreshes."""
+    _, bad_user_id, bad_entity_id = await _register(client, "oauth_usr_bad_cipher")
+    _, good_user_id, good_entity_id = await _register(client, "oauth_usr_good_cipher")
+
+    import packages.core.database as dbmod
+
+    now = datetime.now(timezone.utc)
+    bad_id = generate_ulid()
+    good_id = generate_ulid()
+    async with dbmod.async_session() as db:
+        db.add_all(
+            [
+                OAuthAccount(
+                    id=bad_id,
+                    user_id=bad_user_id,
+                    provider="gmail",
+                    provider_user_id="g-bad-cipher",
+                    credential_ref="vault:v1:test-unrecoverable",
+                    credential_scheme="vault_transit",
+                    token_expires_at=now + timedelta(minutes=1),
+                ),
+                OAuthAccount(
+                    id=good_id,
+                    user_id=good_user_id,
+                    provider="gmail",
+                    provider_user_id="g-good-cipher",
+                    access_token="GOOD_OLD",
+                    refresh_token="rt-good-cipher",
+                    token_expires_at=now + timedelta(minutes=1),
+                ),
+            ]
+        )
+        await db.commit()
+
+    original_lease = oauth_refresh_task.lease_oauth_account_tokens
+
+    def fake_lease(row, **kwargs):
+        if row.id == bad_id:
+            raise CredentialDecryptError("cipher: message authentication failed")
+        return original_lease(row, **kwargs)
+
+    async def fake_refresh(*args, **kwargs):
+        return {"access_token": "GOOD_NEW", "expires_in": 3600}
+
+    monkeypatch.setattr(oauth_refresh_task, "lease_oauth_account_tokens", fake_lease)
+    monkeypatch.setattr(oauth_refresh_task, "refresh_token_via_provider", fake_refresh)
+
+    with caplog.at_level("ERROR"):
+        async with dbmod.async_session() as db:
+            n = await _refresh_oauth_accounts(db)
+            await db.commit()
+
+    assert n == 1
+    assert not [record for record in caplog.records if record.levelno >= 40]
+    async with dbmod.async_session() as db:
+        bad = await db.get(OAuthAccount, bad_id)
+        good = await db.get(OAuthAccount, good_id)
+        runtime_usable_ids = set((await db.execute(
+            select(OAuthAccount.id).where(oauth_account_is_runtime_usable_clause())
+        )).scalars().all())
+        bad_accounts = await list_runtime_integration_accounts(
+            db,
+            user_id=bad_user_id,
+            entity_id=bad_entity_id,
+            provider="gmail",
+        )
+        good_accounts = await list_runtime_integration_accounts(
+            db,
+            user_id=good_user_id,
+            entity_id=good_entity_id,
+            provider="gmail",
+        )
+        bad_connected = await connected_integration_provider_keys(
+            db,
+            entity_id=bad_entity_id,
+            user_id=bad_user_id,
+        )
+        good_connected = await connected_integration_provider_keys(
+            db,
+            entity_id=good_entity_id,
+            user_id=good_user_id,
+        )
+    assert bad.credential_ref == "vault:v1:test-unrecoverable"
+    assert bad.token_expires_at is None
+    assert bad.profile["oauth_refresh"]["error"] == "credential_decrypt_failed"
+    assert bad.profile["last_health_check"]["ok"] is False
+    assert _leased_tokens(good)["access_token"] == "GOOD_NEW"
+    assert bad_id not in runtime_usable_ids
+    assert good_id in runtime_usable_ids
+    assert [account.id for account in bad_accounts] == []
+    assert [account.id for account in good_accounts] == [good_id]
+    assert "gmail" not in bad_connected
+    assert "gmail" in good_connected
 
 
 # ── Entity-scope refresh ────────────────────────────────────────────────────

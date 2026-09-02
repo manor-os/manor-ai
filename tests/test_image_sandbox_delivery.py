@@ -14,8 +14,9 @@ from packages.core.ai.tools.extended_tools import _deliver_image_to_sandbox  # n
 class _FakeClient:
     instances: list = []
 
-    def __init__(self, base_url, timeout=None):
+    def __init__(self, base_url, timeout=None, api_token=None):
         self.base_url = base_url
+        self.api_token = api_token
         self.calls: list = []
         self.closed = False
         _FakeClient.instances.append(self)
@@ -29,6 +30,7 @@ class _FakeClient:
 
 class _Settings:
     SANDBOX_SERVICE_URL = "http://sandbox:8000"
+    SANDBOX_API_TOKEN = "test-sandbox-token"
 
 
 def _patch(monkeypatch, *, sandbox_ctx):
@@ -55,6 +57,7 @@ async def test_delivers_bytes_as_base64(monkeypatch):
     assert ok is True
     client = _FakeClient.instances[-1]
     assert client.closed  # client always closed
+    assert client.api_token == "test-sandbox-token"
     sid, path, b64 = client.calls[0]
     assert sid == "sb1"
     assert path == "projects/p/images/page_01.png"

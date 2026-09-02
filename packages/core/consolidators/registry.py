@@ -26,6 +26,7 @@ import logging
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from packages.core.constants.review import ConsolidationReportStatus
 from packages.core.consolidators.artifact_knowledge import ArtifactKnowledgeConsolidator
 from packages.core.consolidators.automation_portfolio import AutomationPortfolioConsolidator
 from packages.core.consolidators.base import Consolidator, SnapshotContext
@@ -95,7 +96,7 @@ async def _reusable_report(
             ConsolidationReport.input_hash == input_hash,
         )
     )).scalar_one_or_none()
-    if report is None or report.status == "failed":
+    if report is None or report.status == ConsolidationReportStatus.FAILED:
         # Never propagate a failed report through the cache.
         return None
     return report
@@ -106,7 +107,7 @@ def _failed_report(
 ) -> ConsolidationReportModel:
     return ConsolidationReportModel(
         domain=domain,
-        status="failed",
+        status=ConsolidationReportStatus.FAILED,
         summary=str(exc)[:MAX_FAILURE_SUMMARY_CHARS] or exc.__class__.__name__,
         coverage=Coverage(records_examined=0, records_missing_details=0),
         analyzer_version=analyzer_version,

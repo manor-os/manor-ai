@@ -1,18 +1,28 @@
 from __future__ import annotations
 
+import asyncio
+from copy import deepcopy
+import json
+
 import pytest
 from sqlalchemy import select
+from sqlalchemy.orm import Session
 
 from packages.core.ai.workflow_runner import WorkflowRunner
 from packages.core.models.base import generate_ulid
 from packages.core.models.task import Conversation, Message
+from packages.core.models.user import User
 from packages.core.models.workflow import WorkflowDefinition, WorkflowRun
 from packages.core.services.chat_approvals import (
     chat_hitl_action_is_pending,
     parse_hitl_action,
     resolve_chat_approval_turn,
 )
-from packages.core.services.workflow_chat_projection import project_workflow_step
+from packages.core.services.workflow_chat_projection import (
+    _notify_update,
+    project_workflow_step,
+)
+from packages.core.services.workflow_run_trace import build_execution_snapshot
 from packages.core.services.workflow_service import create_workflow, start_workflow
 
 
@@ -36,6 +46,68 @@ def test_chat_revision_payload_preserves_revision_request() -> None:
         "revise",
         {"review": {"revision_request": "Shorten the opening."}},
     )
+
+
+@pytest.mark.asyncio
+async def test_personal_workflow_update_notification_carries_entity_scope(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    entity_id = generate_ulid()
+    user_id = generate_ulid()
+    conversation = Conversation(
+        id=generate_ulid(),
+        entity_id=entity_id,
+        user_id=user_id,
+        workspace_id=None,
+        title="Personal Workflow Chat",
+        scope="channel",
+    )
+    message = Message(
+        id=generate_ulid(),
+        conversation_id=conversation.id,
+        role="system",
+        content="Workflow is running.",
+        author_kind="system",
+        message_kind="workflow_activity",
+    )
+    class FakeResult:
+        def scalar_one_or_none(self):
+            return conversation
+
+    class FakeAsyncSession:
+        def __init__(self) -> None:
+            self.sync_session = Session()
+
+        async def execute(self, _statement):
+            return FakeResult()
+
+    db_session = FakeAsyncSession()
+
+    published: list[tuple[str, str]] = []
+
+    class FakeRedis:
+        async def publish(self, channel: str, payload: str) -> None:
+            published.append((channel, payload))
+
+    async def fake_get_redis():
+        return FakeRedis()
+
+    monkeypatch.setattr("packages.core.cache._get_redis", fake_get_redis)
+
+    await _notify_update(db_session, message)
+    db_session.sync_session.commit()
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+
+    assert len(published) == 1
+    channel, raw_payload = published[0]
+    assert channel == "manor:ws_broadcast"
+    payload = json.loads(raw_payload)
+    assert payload["target"] == "user"
+    assert payload["user_id"] == user_id
+    assert payload["entity_id"] == entity_id
+    assert payload["event"] == "conversation_message"
+    db_session.sync_session.close()
 
 
 @pytest.mark.asyncio
@@ -141,7 +213,7 @@ async def test_agent_tool_runner_projects_wait_card_to_personal_chat(
 
 
 @pytest.mark.asyncio
-async def test_personal_chat_origin_receives_and_resolves_workflow_approval(
+async def test_personal_chat_approval_uses_execution_snapshot_after_live_config_change(
     db_session,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -173,6 +245,14 @@ async def test_personal_chat_origin_receives_and_resolves_workflow_approval(
         workspace_id=None,
         title="Personal Workflow Chat",
         scope="channel",
+    )
+    user = User(
+        id=user_id,
+        entity_id=entity_id,
+        email=f"{user_id}@example.com",
+        password_hash="test-only",
+        role="owner",
+        status="active",
     )
     activity = Message(
         id=activity_id,
@@ -225,7 +305,8 @@ async def test_personal_chat_origin_receives_and_resolves_workflow_approval(
         variables={},
         tags=[],
     )
-    db_session.add_all([conversation, activity, workflow, run])
+    run.execution_snapshot = build_execution_snapshot(workflow)
+    db_session.add_all([user, conversation, activity, workflow, run])
     await db_session.commit()
 
     await project_workflow_step(
@@ -269,6 +350,11 @@ async def test_personal_chat_origin_receives_and_resolves_workflow_approval(
         "name": "Approve publication",
         "type": "wait",
     }
+
+    changed_steps = deepcopy(workflow.steps)
+    changed_steps[0]["config"]["review"] = "{{changed_packet}}"
+    workflow.steps = changed_steps
+    await db_session.commit()
 
     queued: list[str] = []
     monkeypatch.setattr(

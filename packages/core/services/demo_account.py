@@ -16,6 +16,7 @@ from packages.core.services.auth_service import (
     register_user,
     verify_password,
 )
+from packages.core.services.settings_service import update_user_preferences
 
 _TRUE_VALUES = {"1", "true", "yes", "on"}
 _FALSE_VALUES = {"0", "false", "no", "off"}
@@ -127,9 +128,7 @@ async def ensure_demo_account(db: AsyncSession) -> dict[str, Any]:
     user.status = "active"
     user.role = "owner"
     user.display_name = user.display_name or "Demo User"
-    preferences = dict(user.preferences or {})
-    preferences["demo_account"] = True
-    user.preferences = preferences
+    await update_user_preferences(db, user.id, {"demo_account": True})
     if not verify_password(password, user.password_hash):
         user.password_hash = hash_password(password)
 

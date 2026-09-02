@@ -163,3 +163,8 @@ register_integration(
     aliases=("twitter", "twitterx", "x", "x_twitter"),
     stat_measurer_key="twitter_x",
 )
+
+# ``wechat`` was the original storage key before the product split the
+# personal ClawBot and Official Account integrations. Keep legacy rows
+# addressable as the Official Account provider until operators re-save them.
+register_integration("wechat_official", aliases=("wechat",))

@@ -25,14 +25,15 @@ test("React Query does not retry terminal API client errors", () => {
   assert.match(mainSource, /retry: shouldRetryApiQuery/);
 });
 
-test("chat leaves a workspace that disappeared from the refreshed workspace list", () => {
+test("chat fails closed when a requested workspace disappeared from the refreshed workspace list", () => {
   assert.match(appLayoutSource, /isSuccess: workspaceListReady/);
   assert.match(
     appLayoutSource,
-    /workspaceListReady[\s\S]*?activeConvType !== "operation"[\s\S]*?workspaceList\.some\([\s\S]*?setActiveConvId\("manor-ai"\)[\s\S]*?setActiveConvType\("manor"\)/,
+    /const \[unavailableWorkspaceId, setUnavailableWorkspaceId\] = useState<string \| null>\(null\)/,
   );
   assert.match(
     appLayoutSource,
-    /const activeWorkspace = workspaceList\.find\([\s\S]*?if \(!activeWorkspace\)[\s\S]*?<InlineRowsSkeleton[\s\S]*?<WorkspaceChat/,
+    /workspaceListReady[\s\S]*?activeConvType !== "operation"[\s\S]*?setUnavailableWorkspaceId\(activeConvId\)[\s\S]*?navigate\("\/chat", \{ replace: true \}\)/,
   );
+  assert.match(appLayoutSource, /unavailableWorkspaceId === activeConvId[\s\S]*?page\.workspace_detail\.not_found/);
 });

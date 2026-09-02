@@ -27,8 +27,8 @@ from urllib.parse import urlencode, urlsplit
 import httpx
 
 from packages.core.services.dashboard_http import (
-    _resolve_public_host,
-    validate_dashboard_http_url,
+    create_public_https_transport,
+    resolve_public_https_target,
 )
 
 logger = logging.getLogger(__name__)
@@ -58,15 +58,23 @@ async def call_tool(
     handler = _HANDLERS.get(name)
     if not handler:
         return _error(f"Unknown tool: {name}")
+    if not isinstance(arguments, dict):
+        return _error("arguments must be an object")
+    arguments = dict(arguments)
 
     spec = _TOOLS.get(name, {})
-    missing = [p for p in spec.get("required", []) if arguments.get(p) in (None, "")]
+    missing = [p for p in spec.get("required", []) if _is_blank(arguments.get(p))]
     if missing:
         return _error(f"Missing required params: {', '.join(missing)}")
+    token = bearer_token.strip() if isinstance(bearer_token, str) else ""
+    if not token:
+        return _error("YouTube access token is missing. Connect Google/YouTube first.")
 
     try:
-        text = await handler(bearer_token, arguments)
+        text = await handler(token, arguments)
         return {"content": [{"type": "text", "text": text}], "isError": False}
+    except _YouTubeError as e:
+        return _error(str(e))
     except Exception as e:
         logger.exception("YouTube MCP tool %s failed", name)
         return _error(str(e))
@@ -74,6 +82,14 @@ async def call_tool(
 
 def _error(msg: str) -> Dict[str, Any]:
     return {"content": [{"type": "text", "text": msg}], "isError": True}
+
+
+def _is_blank(value: Any) -> bool:
+    return value is None or (isinstance(value, str) and not value.strip())
+
+
+class _YouTubeError(RuntimeError):
+    pass
 
 
 # ── YouTube API client ────────────────────────────────────────────────────────
@@ -99,13 +115,13 @@ async def _api(
         resp = await client.request(method, url, headers=headers, json=body)
 
     if resp.status_code == 401:
-        return "YouTube authentication failed. Reconnect Google/YouTube on the Integration page."
+        raise _YouTubeError("YouTube authentication failed. Reconnect Google/YouTube on the Integration page.")
     if resp.status_code == 403:
-        return f"YouTube forbidden (quota, scope, or permissions): {resp.text[:300]}"
+        raise _YouTubeError(f"YouTube forbidden (quota, scope, or permissions): {resp.text[:300]}")
     if resp.status_code == 404:
-        return "Not found."
+        raise _YouTubeError("Not found.")
     if not resp.is_success:
-        return f"YouTube API error ({resp.status_code}): {resp.text[:300]}"
+        raise _YouTubeError(f"YouTube API error ({resp.status_code}): {resp.text[:300]}")
 
     if not resp.text:
         return json.dumps({"ok": True})
@@ -157,7 +173,7 @@ async def _get_channel(token: str, args: Dict) -> str:
     elif args.get("channel_id"):
         params["id"] = args["channel_id"]
     else:
-        return "Provide channel_id, handle, or mine=true."
+        raise _YouTubeError("Provide channel_id, handle, or mine=true.")
     return await _api(token, "GET", "channels", params)
 
 
@@ -213,7 +229,7 @@ async def _delete_comment(token: str, args: Dict) -> str:
 async def _rate_video(token: str, args: Dict) -> str:
     rating = args.get("rating", "like")
     if rating not in ("like", "dislike", "none"):
-        return "rating must be one of: like, dislike, none."
+        raise _YouTubeError("rating must be one of: like, dislike, none.")
     res = await _api(token, "POST", "videos/rate", {"id": args["video_id"], "rating": rating})
     return _ok_or(res, f"Video {args['video_id']} rated '{rating}'.")
 
@@ -230,9 +246,9 @@ async def _update_video(token: str, args: Dict) -> str:
     try:
         items = json.loads(current).get("items", [])
     except (json.JSONDecodeError, AttributeError):
-        return current  # propagate the _api error string (auth/quota/etc.)
+        raise _YouTubeError("YouTube API returned an invalid response.") from None
     if not items:
-        return f"Video {args['video_id']} not found."
+        raise _YouTubeError(f"Video {args['video_id']} not found.")
     cur = items[0].get("snippet", {}) or {}
 
     # Seed from current writable fields only (drop read-only ones like
@@ -293,14 +309,11 @@ async def _stage_video_source(source_url: str) -> tuple[Path, int, str]:
     subsequent YouTube upload retry by chunk while keeping memory bounded.
     """
     try:
-        normalized = validate_dashboard_http_url(source_url)
+        target = await resolve_public_https_target(source_url)
     except Exception as exc:
         raise RuntimeError(f"video_url must be a public standard-port HTTPS URL: {exc}") from exc
 
-    hostname = urlsplit(normalized).hostname or ""
-    await _resolve_public_host(hostname)
-
-    suffix = Path(urlsplit(normalized).path).suffix[:16]
+    suffix = Path(urlsplit(target.url).path).suffix[:16]
     fd, raw_path = tempfile.mkstemp(prefix="manor-youtube-", suffix=suffix)
     os.close(fd)
     path = Path(raw_path)
@@ -311,10 +324,11 @@ async def _stage_video_source(source_url: str) -> tuple[Path, int, str]:
             timeout=_UPLOAD_TIMEOUT,
             follow_redirects=False,
             trust_env=False,
+            transport=create_public_https_transport(target),
         ) as client:
             async with client.stream(
                 "GET",
-                normalized,
+                target.url,
                 headers={"Accept": "video/*,application/octet-stream"},
             ) as response:
                 if response.is_redirect:
@@ -363,7 +377,7 @@ async def _upload_video(token: str, args: Dict) -> str:
     """Upload a public HTTPS video with YouTube's resumable upload protocol."""
     privacy = str(args.get("privacy", "private")).lower()
     if privacy not in {"private", "unlisted", "public"}:
-        return "privacy must be one of: private, unlisted, public."
+        raise _YouTubeError("privacy must be one of: private, unlisted, public.")
 
     tags = args.get("tags")
     if tags is not None and not isinstance(tags, list):
@@ -382,7 +396,9 @@ async def _upload_video(token: str, args: Dict) -> str:
         status["selfDeclaredMadeForKids"] = bool(args["made_for_kids"])
     if args.get("publish_at"):
         if privacy != "private":
-            return "publish_at requires privacy=private per the YouTube API."
+            raise _YouTubeError(
+                "publish_at requires privacy=private per the YouTube API."
+            )
         status["publishAt"] = args["publish_at"]
 
     path: Path | None = None
@@ -410,10 +426,12 @@ async def _upload_video(token: str, args: Dict) -> str:
                 json={"snippet": snippet, "status": status},
             )
             if not init_response.is_success:
-                return _upload_error(init_response)
+                raise _YouTubeError(_upload_error(init_response))
             session_url = init_response.headers.get("location")
             if not session_url:
-                return "YouTube upload error: resumable session URL was not returned."
+                raise _YouTubeError(
+                    "YouTube upload error: resumable session URL was not returned."
+                )
 
             uploaded = 0
             final_response: httpx.Response | None = None
@@ -421,7 +439,9 @@ async def _upload_video(token: str, args: Dict) -> str:
                 while uploaded < size:
                     chunk = source.read(min(_UPLOAD_CHUNK_BYTES, size - uploaded))
                     if not chunk:
-                        return "YouTube upload error: source ended before the declared size."
+                        raise _YouTubeError(
+                            "YouTube upload error: source ended before the declared size."
+                        )
                     end = uploaded + len(chunk) - 1
                     response = await client.request(
                         "PUT",
@@ -439,12 +459,14 @@ async def _upload_video(token: str, args: Dict) -> str:
                         uploaded = end + 1
                         continue
                     if not response.is_success:
-                        return _upload_error(response)
+                        raise _YouTubeError(_upload_error(response))
                     uploaded = end + 1
                     final_response = response
 
         if final_response is None:
-            return "YouTube upload error: upload completed without a final response."
+            raise _YouTubeError(
+                "YouTube upload error: upload completed without a final response."
+            )
         try:
             result = final_response.json()
         except Exception:

@@ -9,15 +9,20 @@ applications that need to run LLM-directed code in isolation.
 from __future__ import annotations
 
 import logging
+import os
+import secrets
 from contextlib import asynccontextmanager
 
 import uvicorn
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
 from api.routes import router, set_runner
-from config import config
+from sandbox_config import config
 from sandbox.skill_runner import SkillRunner
+
+BUILD_VERSION = os.getenv("MANOR_BUILD_VERSION", "dev")
 
 logging.basicConfig(
     level=logging.DEBUG if config.DEBUG else logging.INFO,
@@ -56,6 +61,24 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+@app.middleware("http")
+async def require_sandbox_api_token(request: Request, call_next):
+    token = config.API_TOKEN.strip()
+    if request.url.path.startswith("/api/v1/"):
+        if not token:
+            return JSONResponse(
+                {"detail": "Sandbox API token is not configured"},
+                status_code=503,
+            )
+        supplied = request.headers.get("X-Manor-Sandbox-Token", "")
+        if not secrets.compare_digest(supplied, token):
+            return JSONResponse(
+                {"detail": "Sandbox API token required"},
+                status_code=401,
+            )
+    return await call_next(request)
+
 app.include_router(router)
 
 
@@ -63,7 +86,7 @@ app.include_router(router)
 async def health():
     return {
         "status": "ok",
-        "active_sandboxes": len(runner.list_sandboxes()),
+        "build_version": BUILD_VERSION,
         **runner.runtime_status(),
     }
 

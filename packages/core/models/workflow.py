@@ -4,9 +4,11 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Optional
 
-from sqlalchemy import Boolean, DateTime, Index, Integer, String, Text, UniqueConstraint
+from sqlalchemy import Boolean, DateTime, Index, Integer, String, Text, UniqueConstraint, text
 from sqlalchemy.dialects.postgresql import ARRAY, JSONB
 from sqlalchemy.orm import Mapped, mapped_column, query_expression
+
+from packages.core.constants.workflow import WorkflowRunStatus
 
 from .base import Base, TimestampMixin, generate_ulid
 
@@ -24,7 +26,9 @@ class WorkflowDefinition(Base, TimestampMixin):
     # ``created_by`` doubles as the owner for resource_access.py — this table
     # already tracked its creator, so no separate owner column is needed.
     created_by: Mapped[Optional[str]] = mapped_column(String(26), index=True)
-    # NULL workspace = shared entity-wide rather than scoped to one workspace.
+    # workspace_id records the owning/home Workspace for access and lifecycle.
+    # Deployment is separate: WorkflowBindings may reuse this definition in
+    # other Workspaces, and NULL means it has no home Workspace.
     workspace_id: Mapped[Optional[str]] = mapped_column(String(26))
     visibility: Mapped[str] = mapped_column(
         String(20), nullable=False, server_default="entity"
@@ -149,8 +153,38 @@ class WorkflowRun(Base, TimestampMixin):
         Index("ix_workflow_runs_workflow", "workflow_id", "created_at"),
         Index("ix_workflow_runs_entity_status", "entity_id", "status"),
         Index("ix_workflow_runs_workspace", "workspace_id"),
+        Index(
+            "uq_workflow_runs_webchat_submission",
+            "binding_id",
+            "webchat_session_id",
+            "webchat_module_id",
+            "webchat_submission_id",
+            unique=True,
+            postgresql_where=text(
+                "trigger_source = 'public_webchat' "
+                "AND webchat_session_id IS NOT NULL "
+                "AND webchat_module_id IS NOT NULL "
+                "AND webchat_submission_id IS NOT NULL"
+            ),
+            sqlite_where=text(
+                "trigger_source = 'public_webchat' "
+                "AND webchat_session_id IS NOT NULL "
+                "AND webchat_module_id IS NOT NULL "
+                "AND webchat_submission_id IS NOT NULL"
+            ),
+        ),
         Index("ix_workflow_runs_retry_of_run_id", "retry_of_run_id"),
         Index("ix_workflow_runs_lineage_root_run_id", "lineage_root_run_id"),
+        Index(
+            "ix_workflow_runs_continuation_due",
+            "continuation_next_attempt_at",
+        ),
+        Index(
+            "ix_workflow_runs_terminal_effects_due",
+            "terminal_effects_completed_at",
+            "terminal_effects_next_attempt_at",
+            "id",
+        ),
     )
 
     id: Mapped[str] = mapped_column(String(26), primary_key=True, default=generate_ulid)
@@ -170,12 +204,25 @@ class WorkflowRun(Base, TimestampMixin):
         default=1,
         server_default="1",
     )
-    status: Mapped[str] = mapped_column(String(20), nullable=False, default="pending")
+    status: Mapped[str] = mapped_column(
+        String(20),
+        nullable=False,
+        default=WorkflowRunStatus.PENDING,
+    )
     current_step_id: Mapped[Optional[str]] = mapped_column(String(100))
     variables: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default="{}")
     step_results: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default="{}")
     trigger_data: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default="{}")
+    webchat_session_id: Mapped[Optional[str]] = mapped_column(String(128))
+    webchat_module_id: Mapped[Optional[str]] = mapped_column(String(80))
+    webchat_submission_id: Mapped[Optional[str]] = mapped_column(String(80))
     definition_snapshot: Mapped[dict] = mapped_column(
+        JSONB,
+        nullable=False,
+        default=dict,
+        server_default="{}",
+    )
+    execution_snapshot: Mapped[dict] = mapped_column(
         JSONB,
         nullable=False,
         default=dict,
@@ -191,6 +238,19 @@ class WorkflowRun(Base, TimestampMixin):
     started_by: Mapped[Optional[str]] = mapped_column(String(26))
     started_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    continuation_token: Mapped[Optional[str]] = mapped_column(String(26))
+    continuation_due_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True)
+    )
+    continuation_next_attempt_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True)
+    )
+    terminal_effects_completed_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True)
+    )
+    terminal_effects_next_attempt_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True)
+    )
     summary_workflow_name: Mapped[Optional[str]] = query_expression()
     summary_current_step_name: Mapped[Optional[str]] = query_expression()
     summary_history_state: Mapped[Optional[dict]] = query_expression()
@@ -297,16 +357,35 @@ class WorkflowActionGrant(Base, TimestampMixin):
     __table_args__ = (
         Index("ix_workflow_action_grants_project", "project_id", "grant_type"),
         Index("ix_workflow_action_grants_workspace", "workspace_id", "expires_at"),
+        Index(
+            "ix_workflow_action_grants_lineage",
+            "workflow_lineage_root_run_id",
+            "grant_type",
+        ),
+        Index(
+            "uq_workflow_action_grants_proposal_item",
+            "proposal_item_id",
+            unique=True,
+            postgresql_where=text("proposal_item_id IS NOT NULL"),
+            sqlite_where=text("proposal_item_id IS NOT NULL"),
+        ),
     )
 
     id: Mapped[str] = mapped_column(String(26), primary_key=True, default=generate_ulid)
     entity_id: Mapped[str] = mapped_column(String(26), nullable=False)
     workspace_id: Mapped[str] = mapped_column(String(26), nullable=False)
     workflow_run_id: Mapped[str] = mapped_column(String(26), nullable=False)
-    project_id: Mapped[str] = mapped_column(String(26), nullable=False)
+    project_id: Mapped[Optional[str]] = mapped_column(String(26), nullable=True)
+    proposal_item_id: Mapped[Optional[str]] = mapped_column(String(26), nullable=True)
+    workflow_lineage_root_run_id: Mapped[Optional[str]] = mapped_column(
+        String(26), nullable=True
+    )
+    action_key: Mapped[Optional[str]] = mapped_column(String(120), nullable=True)
     grant_type: Mapped[str] = mapped_column(String(80), nullable=False)
     scope: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
     granted_by: Mapped[str] = mapped_column(String(26), nullable=False)
     granted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     revoked_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    consumed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    consumed_by_run_id: Mapped[Optional[str]] = mapped_column(String(26), nullable=True)

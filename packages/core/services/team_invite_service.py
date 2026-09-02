@@ -4,7 +4,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from fastapi import HTTPException
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from packages.core.models.base import generate_ulid
@@ -129,24 +129,46 @@ async def _activate_staff_membership(
     for ws_id in workspace_ids:
         if ws_id not in valid_workspace_ids:
             continue
-        existing = (
-            await db.execute(
-                select(WorkspaceStaff).where(
-                    WorkspaceStaff.workspace_id == ws_id,
+        existing_rows = list((await db.execute(
+            select(WorkspaceStaff).where(
+                WorkspaceStaff.workspace_id == ws_id,
+                or_(
                     WorkspaceStaff.staff_id == staff.id,
-                )
+                    WorkspaceStaff.user_id == user.id,
+                ),
             )
-        ).scalar_one_or_none()
-        if existing:
+        )).scalars().all())
+        if existing_rows:
+            existing = next(
+                (row for row in existing_rows if row.user_id == user.id),
+                existing_rows[0],
+            )
+            role_rank = {"viewer": 0, "contributor": 1, "editor": 2, "owner": 3}
+            existing.role = max(
+                (
+                    str(row.role)
+                    for row in existing_rows
+                    if str(row.role) in role_rank
+                ),
+                key=role_rank.__getitem__,
+                default="viewer",
+            )
+            existing.staff_id = staff.id
             existing.user_id = user.id
             existing.status = "active"
+            # Accepting a fresh invite creates an indefinite membership. Do not
+            # carry an expired lease forward from a historical duplicate row.
+            existing.expires_at = None
+            for duplicate in existing_rows:
+                if duplicate is not existing:
+                    await db.delete(duplicate)
             continue
         db.add(WorkspaceStaff(
             id=generate_ulid(),
             workspace_id=ws_id,
             staff_id=staff.id,
             user_id=user.id,
-            role=None,
+            role="viewer",
             status="active",
         ))
 

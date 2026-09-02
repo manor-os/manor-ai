@@ -21,32 +21,49 @@ from __future__ import annotations
 import hashlib
 import logging
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from packages.core.constants.goals import GoalStatus
 from packages.core.constants.approvals import (
     APPROVAL_LIVE_STATUSES,
     ApprovalOriginKind,
     ApprovalStatus,
 )
 from packages.core.constants.pending_actions import PendingActionKind
+from packages.core.constants.proposal import ProposalItemKind, ProposalItemStatus
+from packages.core.constants.review import (
+    DEFAULT_REVIEW_LEASE_SECONDS,
+    ReviewRunStatus,
+    ReviewSkipReason,
+)
 from packages.core.constants.task import TaskStatus
+from packages.core.constants.workflow import WORKFLOW_RUN_OPEN_STATUSES
 from packages.core.models.base import generate_ulid
 from packages.core.models.goal import Goal
+from packages.core.models.review_run import ReviewRun
 from packages.core.models.task import Conversation, Message, Task
+from packages.core.models.workflow import WorkflowBinding, WorkflowRun
 from packages.core.models.workspace import Workspace
 from packages.core.ai.runtime import runtime_strategist_review_billing_context
 from packages.core.ai.runtime.task_requirements import merge_task_runtime_capabilities
 from packages.core.proposals.constants import strategist_action_label
 from packages.core.services.hitl_options import DEFAULT_APPROVAL_OPTIONS
+from packages.core.constants.runtime_principal import RuntimePrincipalKind
+from packages.core.services.runtime_authorization import authorize_runtime_action
+from packages.core.services.runtime_authorization.domain import RuntimeAuthorizationAccess
 from packages.core.services.task_dependencies import dependency_ids_from_details, details_with_dependency_state
 from packages.core.services.task_service import update_task
 from packages.core.services.workspace_work_reconciliation import (
     reconcile_active_work_batches,
     stale_reconciliation_results,
+)
+from packages.core.services.workspace_readiness import (
+    evaluate_workspace_blocking_setup,
+    normalize_workspace_setup_task_key,
 )
 from packages.core.strategist.context import gather_context
 from packages.core.strategist.prompt import generate_proposal
@@ -58,10 +75,252 @@ logger = logging.getLogger(__name__)
 
 _STRATEGIST_SETTINGS_KEY = "strategist"
 _AUTO_APPROVE_PROPOSALS_KEY = "auto_approve_proposals"
+_STRATEGIST_ACTIVITY_TERMINAL_STATES = frozenset({"completed", "skipped", "failed"})
+
+
+def _restrict_proposal_to_setup_work(
+    proposal: Proposal,
+    setup_status,
+) -> bool:
+    """Fail closed to Blueprint setup work at the persistence boundary.
+
+    Returns ``True`` when the setup gate was active. Model-authored Task keys
+    are never setup authorization: automated setup enters through the exact
+    Blueprint ScheduledJob admitted by the scheduler gate. Only matching human
+    requests may survive here.
+    """
+
+    if setup_status is None or not setup_status.blocks_work:
+        return False
+
+    allowed_keys = {
+        normalize_workspace_setup_task_key(value)
+        for value in setup_status.details.get("allowed_setup_task_keys") or []
+        if normalize_workspace_setup_task_key(value)
+    }
+    proposal.tasks = []
+    proposal.human_requests = [
+        request
+        for request in proposal.human_requests
+        if normalize_workspace_setup_task_key(request.request_key) in allowed_keys
+    ]
+    proposal.experiments = []
+    proposal.workflow_runs = []
+    proposal.automation_changes = []
+    proposal.workflow_changes = []
+    proposal.goal_changes = []
+    return True
+
+
+async def _post_strategist_activity(
+    workspace: Workspace,
+    *,
+    stage: str,
+    body: str,
+    review_id: str | None = None,
+) -> str | None:
+    """Best-effort progress receipt for the Workspace Chat timeline.
+
+    Strategist reviews can spend a meaningful amount of time assembling
+    evidence and waiting for the model.  Use a short-lived independent
+    session so each stage is committed and visible immediately without
+    committing the review transaction that owns the business result.
+    """
+    try:
+        from packages.core.database import async_session
+
+        async with async_session() as activity_db:
+            activity = await chat_service.post_message(
+                activity_db,
+                entity_id=workspace.entity_id,
+                workspace_id=workspace.id,
+                body=body,
+                message_kind="strategist_activity",
+                author_kind="agent",
+                refs=[{"type": "workspace", "id": workspace.id}],
+                meta={
+                    "strategist_activity": {
+                        "stage": stage,
+                        "state": "running",
+                        "started_at": datetime.now(timezone.utc).isoformat(),
+                        **({"review_id": review_id} if review_id else {}),
+                    },
+                },
+                publish_event=False,
+            )
+            await activity_db.commit()
+            await chat_service.publish_workspace_chat_message_event(
+                workspace.entity_id,
+                workspace_id=workspace.id,
+                message=activity,
+            )
+            return activity.id
+    except Exception:  # noqa: BLE001 — status must never fail the review
+        logger.debug(
+            "Strategist: failed to post activity stage=%s workspace=%s",
+            stage,
+            workspace.id,
+            exc_info=True,
+        )
+        return None
+
+
+def _mark_strategist_activity_terminal(message: Message, *, state: str) -> bool:
+    if state not in _STRATEGIST_ACTIVITY_TERMINAL_STATES:
+        return False
+    meta = dict(message.meta or {})
+    activity = meta.get("strategist_activity")
+    if not isinstance(activity, dict):
+        return False
+    current_state = activity.get("state")
+    if current_state != "running" and not (
+        state == "failed" and current_state == "skipped"
+    ):
+        return False
+    meta["strategist_activity"] = {
+        **activity,
+        "state": state,
+        "finished_at": datetime.now(timezone.utc).isoformat(),
+    }
+    message.meta = meta
+    return True
+
+
+async def _set_strategist_activity_terminal(
+    *,
+    entity_id: str,
+    workspace_id: str,
+    state: str,
+    message_id: str | None = None,
+    review_id: str | None = None,
+) -> bool:
+    """Persist and publish exact terminal activity transitions, best-effort."""
+    if state not in _STRATEGIST_ACTIVITY_TERMINAL_STATES:
+        return False
+    if (message_id is None) == (review_id is None):
+        return False
+    try:
+        from packages.core.database import async_session
+
+        async with async_session() as activity_db:
+            eligible_states = (
+                ("running", "skipped") if state == "failed" else ("running",)
+            )
+            query = (
+                select(Message)
+                .join(Conversation, Conversation.id == Message.conversation_id)
+                .where(
+                    Conversation.entity_id == entity_id,
+                    Conversation.workspace_id == workspace_id,
+                    Message.message_kind == "strategist_activity",
+                    Message.meta["strategist_activity"]["state"].astext.in_(
+                        eligible_states
+                    ),
+                )
+                # Recovery and the expired worker may finish the same row from
+                # independent sessions. Serialize them, then let ``failed``
+                # upgrade a stale worker's provisional ``skipped`` terminal.
+                .with_for_update(of=Message)
+            )
+            if message_id is not None:
+                query = query.where(Message.id == message_id)
+            else:
+                query = query.where(
+                    Message.meta["strategist_activity"]["review_id"].astext == review_id,
+                )
+            messages = list((await activity_db.execute(query)).scalars())
+            transitioned = [
+                message
+                for message in messages
+                if _mark_strategist_activity_terminal(message, state=state)
+            ]
+            if not transitioned:
+                return False
+            await activity_db.commit()
+            for message in transitioned:
+                await chat_service.publish_workspace_chat_message_event(
+                    entity_id,
+                    workspace_id=workspace_id,
+                    message=message,
+                )
+            return True
+    except Exception:  # noqa: BLE001 — status must never fail the review
+        logger.debug(
+            "Strategist: failed to finish activity state=%s workspace=%s message=%s review=%s",
+            state,
+            workspace_id,
+            message_id,
+            review_id,
+            exc_info=True,
+        )
+        return False
+
+
+async def _finish_strategist_activity(
+    workspace: Workspace,
+    *,
+    message_id: str | None,
+    state: str,
+) -> bool:
+    if message_id is None:
+        return False
+    return await _set_strategist_activity_terminal(
+        entity_id=workspace.entity_id,
+        workspace_id=workspace.id,
+        message_id=message_id,
+        state=state,
+    )
+
+
+async def finish_strategist_review_activity(
+    *,
+    entity_id: str,
+    workspace_id: str,
+    review_id: str,
+    state: str,
+) -> bool:
+    """Finish only activity rows owned by one Strategist review attempt."""
+    return await _set_strategist_activity_terminal(
+        entity_id=entity_id,
+        workspace_id=workspace_id,
+        review_id=review_id,
+        state=state,
+    )
 
 
 class StrategistError(Exception):
     pass
+
+
+class StrategistLeaseLost(StrategistError):
+    """Raised when a review can no longer fence its business transaction."""
+
+
+async def _strategist_permission_decision(
+    db: AsyncSession,
+    *,
+    workspace: Workspace,
+    action_key: str | None,
+    capability_id: str | None,
+    task_id: str | None = None,
+):
+    """Authorize the system strategist before entering governance/HITL.
+
+    Proposal governance is still subject to workspace policy and human
+    approval. This separate infra decision only verifies that the trusted
+    system-worker plane is allowed to evaluate the proposal in its workspace.
+    """
+    return await authorize_runtime_action(
+        db,
+        entity_id=workspace.entity_id,
+        user_id=None,
+        workspace_id=workspace.id,
+        action_key=action_key,
+        capability_id=capability_id,
+        access=RuntimeAuthorizationAccess.ACTION,
+        principal_kind=RuntimePrincipalKind.SYSTEM_WORKER,
+        task_id=task_id,
+    )
 
 
 # ── Main entry ────────────────────────────────────────────────────────
@@ -73,6 +332,9 @@ async def run_review(
     trigger: "ReviewTrigger | ReviewTriggerKind | str" = ReviewTriggerKind.SCHEDULED,
     briefing_markdown: Optional[str] = None,
     review_run=None,
+    review_lease_owner: str | None = None,
+    activity_review_id: str | None = None,
+    initial_activity_message_id: str | None = None,
 ) -> dict:
     """Run one Strategist review cycle. Caller commits.
 
@@ -99,7 +361,9 @@ async def run_review(
     """
     trigger = ReviewTrigger.coerce(trigger)
     workspace = (await db.execute(
-        select(Workspace).where(
+        select(Workspace)
+        .execution_options(populate_existing=True)
+        .where(
             Workspace.id == workspace_id,
             Workspace.deleted_at.is_(None),
         )
@@ -112,7 +376,34 @@ async def run_review(
     # Paused workspaces don't get reviews
     if workspace.status != "active":
         logger.info("Strategist: workspace %s is %s — skipping", workspace_id, workspace.status)
-        return {"workspace_id": workspace_id, "skipped": True, "reason": f"workspace_{workspace.status}"}
+        await _finish_strategist_activity(
+            workspace,
+            message_id=initial_activity_message_id,
+            state="skipped",
+        )
+        return {
+            "workspace_id": workspace_id,
+            "skipped": True,
+            "reason": ReviewSkipReason.WORKSPACE_INACTIVE,
+            "workspace_status": workspace.status,
+        }
+
+    review_id = (
+        review_run.id
+        if review_run is not None
+        else activity_review_id or "rv_" + generate_ulid()
+    )
+    activity_message_id = initial_activity_message_id
+    if activity_message_id is None:
+        activity_message_id = await _post_strategist_activity(
+            workspace,
+            stage="collecting_feedback",
+            body=(
+                "🧭 Manor AI is collecting workspace feedback, goals, tasks, "
+                "and recent evidence…"
+            ),
+            review_id=review_id,
+        )
 
     measurement_refresh = await _refresh_internal_goal_measurements_for_review(db, workspace)
     if measurement_refresh["measured"] or measurement_refresh["errors"]:
@@ -146,13 +437,29 @@ async def run_review(
                 fingerprint=_active_batch_fingerprint(active_batch),
                 body=_active_batch_skip_body(trigger, active_batch),
             )
+            await _finish_strategist_activity(
+                workspace,
+                message_id=activity_message_id,
+                state="skipped",
+            )
             return {
                 "workspace_id": workspace_id,
                 "skipped": True,
-                "reason": "active_work_batch",
+                "reason": ReviewSkipReason.ACTIVE_WORK_BATCH,
                 **active_batch,
             }
 
+    await _finish_strategist_activity(
+        workspace,
+        message_id=activity_message_id,
+        state="completed",
+    )
+    activity_message_id = await _post_strategist_activity(
+        workspace,
+        stage="analyzing_context",
+        body="🧭 Manor AI is analyzing workspace context and deciding what matters next…",
+        review_id=review_id,
+    )
     ctx = await gather_context(db, workspace, trigger=trigger.label)
     ctx.work_batch_reconciliation = stale_work_batches
     starter_cleanup = await _resolve_fulfilled_starter_document_proposals(
@@ -181,6 +488,11 @@ async def run_review(
             fingerprint=conflict["fingerprint"],
             body=_open_proposals_skip_body(trigger, conflict),
         )
+        await _finish_strategist_activity(
+            workspace,
+            message_id=activity_message_id,
+            state="skipped",
+        )
         if trigger.kind.suppressible:
             logger.info(
                 "Strategist: %d proposals from prior review still open; skipping",
@@ -189,7 +501,7 @@ async def run_review(
             return {
                 "workspace_id": workspace_id,
                 "skipped": True,
-                "reason": "open_proposals",
+                "reason": ReviewSkipReason.OPEN_PROPOSALS,
                 "open_count": conflict["open_count"],
             }
         # A person asked for this review and is waiting. Do not run it on
@@ -204,7 +516,7 @@ async def run_review(
             "workspace_id": workspace_id,
             "skipped": True,
             "needs_decision": True,
-            "reason": "open_proposals",
+            "reason": ReviewSkipReason.OPEN_PROPOSALS,
             "open_count": conflict["open_count"],
             "conflict": conflict,
         }
@@ -218,14 +530,29 @@ async def run_review(
             "Strategist: trigger_condition %r matched; skipping",
             matched,
         )
+        await _finish_strategist_activity(
+            workspace,
+            message_id=activity_message_id,
+            state="skipped",
+        )
         return {
             "workspace_id": workspace_id,
             "skipped": True,
-            "reason": "trigger_condition",
+            "reason": ReviewSkipReason.TRIGGER_CONDITION,
             "expression": matched,
         }
 
-    review_id = review_run.id if review_run is not None else "rv_" + generate_ulid()
+    await _finish_strategist_activity(
+        workspace,
+        message_id=activity_message_id,
+        state="completed",
+    )
+    activity_message_id = await _post_strategist_activity(
+        workspace,
+        stage="generating_plan",
+        body="🧭 Manor AI is generating the next execution plan from the reviewed evidence…",
+        review_id=review_id,
+    )
 
     # Only pass briefing_markdown on the v2 path so the legacy call shape
     # (and anything monkeypatching generate_proposal) stays untouched.
@@ -249,6 +576,93 @@ async def run_review(
     _suppress_meta_learning_proposals(proposal)
     _enforce_allowlists(proposal, ctx.allowed_service_keys)
     _enforce_proposal_shape(proposal, ctx)
+    await _suppress_active_workflow_run_proposals(db, workspace, proposal)
+
+    # A heartbeat is a liveness hint; this row lock is the fencing boundary.
+    # Keep it through Proposal/Task/governance persistence so an expired owner
+    # can never commit side effects after another worker has taken over.
+    if review_run is not None:
+        locked_review = (
+            await db.execute(
+                select(ReviewRun)
+                .execution_options(populate_existing=True)
+                .where(ReviewRun.id == review_run.id)
+                .with_for_update()
+            )
+        ).scalar_one_or_none()
+        lease_deadline = locked_review.lease_expires_at if locked_review else None
+        if lease_deadline is not None and lease_deadline.tzinfo is None:
+            lease_deadline = lease_deadline.replace(tzinfo=timezone.utc)
+        lease_now = datetime.now(timezone.utc)
+        if (
+            locked_review is None
+            or locked_review.status != ReviewRunStatus.RUNNING
+            or locked_review.lease_owner != review_lease_owner
+            or lease_deadline is None
+            or lease_deadline <= lease_now
+        ):
+            logger.warning(
+                "Strategist: review %s lost its execution lease before persistence",
+                review_run.id,
+            )
+            await _finish_strategist_activity(
+                workspace,
+                message_id=activity_message_id,
+                state="failed",
+            )
+            raise StrategistLeaseLost(
+                f"review {review_run.id} lost its execution lease"
+            )
+        locked_review.lease_expires_at = lease_now + timedelta(
+            seconds=DEFAULT_REVIEW_LEASE_SECONDS
+        )
+        review_run = locked_review
+
+    # The model call can outlive a concurrent pause/delete request. Serialize
+    # the final lifecycle check with that transition before creating Tasks,
+    # proposal items, approvals, Workflow runs, or Workspace changes. Whichever
+    # transaction obtains the Workspace row first defines the ordering.
+    locked_workspace = (
+        await db.execute(
+            select(Workspace)
+            .execution_options(populate_existing=True)
+            .where(
+                Workspace.id == workspace_id,
+                Workspace.deleted_at.is_(None),
+            )
+            .with_for_update()
+        )
+    ).scalar_one_or_none()
+    if locked_workspace is None or locked_workspace.status != "active":
+        workspace_status = (
+            locked_workspace.status if locked_workspace is not None else "deleted"
+        )
+        logger.info(
+            "Strategist: workspace %s became %s before proposal persistence — skipping",
+            workspace_id,
+            workspace_status,
+        )
+        await _finish_strategist_activity(
+            workspace,
+            message_id=activity_message_id,
+            state="skipped",
+        )
+        return {
+            "workspace_id": workspace_id,
+            "skipped": True,
+            "reason": ReviewSkipReason.WORKSPACE_INACTIVE,
+            "workspace_status": workspace_status,
+        }
+    workspace = locked_workspace
+
+    # Model instructions are guidance, not an authorization boundary. Re-read
+    # the live Blueprint setup state while holding the Workspace fence, then
+    # deterministically discard every model-authored Task and retain only
+    # explicitly allowlisted human setup requests. Automated setup is owned by
+    # the scheduler's exact Blueprint job gate, so a model label cannot mint
+    # normal work while setup is incomplete.
+    blocking_setup_status = await evaluate_workspace_blocking_setup(db, workspace)
+    _restrict_proposal_to_setup_work(proposal, blocking_setup_status)
 
     auto_approve_proposals = proposal_auto_approval_enabled(workspace)
 
@@ -327,12 +741,62 @@ async def run_review(
     if governance.get("proposal_id"):
         pending_items = await _pending_item_digests(db, review_id=review_id)
 
-    # Always commit before posting to chat — the chat post opens its
-    # own session and shouldn't see uncommitted tasks.
+    should_post_proposal_card = bool(
+        new_task_ids or pending_items or proposal.notes
+    )
+    auto_approved_action_key = (
+        governance.get("task_action_key") if standing_allow else None
+    )
+    proposal_message: Message | None = None
+    if should_post_proposal_card:
+        await _finish_strategist_activity(
+            workspace,
+            message_id=activity_message_id,
+            state="completed",
+        )
+        activity_message_id = await _post_strategist_activity(
+            workspace,
+            stage="finalizing_plan",
+            body="🧭 Manor AI is preparing the plan for your Workspace Chat…",
+            review_id=review_id,
+        )
+        if review_run is not None:
+            # The durable approval surface is part of the v2 business receipt.
+            # Realtime delivery and notifications remain post-commit best effort.
+            proposal_message = await _post_proposal_chat(
+                workspace,
+                proposal,
+                new_task_ids,
+                db=db,
+                auto_approved=bool(approved_task_ids),
+                policy_denied=policy_denied,
+                pending_items=pending_items,
+                auto_approved_action_key=auto_approved_action_key,
+            )
+
+    # ReviewRun success is the durable receipt for this exact cohort. Commit
+    # it with the Tasks/Proposal/governance effects and the approval card so
+    # lease recovery can never replay or hide a durable cohort.
+    if review_run is not None:
+        from packages.core.review import complete_review
+
+        await complete_review(db, review_run)
+
     await db.commit()
 
-    # Post the proposal card. Best-effort.
-    if new_task_ids or pending_items or proposal.notes:
+    if proposal_message is not None:
+        await _publish_proposal_chat_message(workspace, proposal_message)
+        await _notify_proposal_users(
+            workspace,
+            proposal,
+            new_task_ids,
+            items=pending_items,
+            auto_approved=bool(approved_task_ids),
+            auto_approved_action_key=auto_approved_action_key,
+        )
+    elif should_post_proposal_card:
+        # Legacy reviews have no durable ReviewRun receipt. Preserve their
+        # existing best-effort independent-session behavior.
         await _post_proposal_chat(
             workspace,
             proposal,
@@ -343,10 +807,14 @@ async def run_review(
             # Name the exact cohort action that authorised auto-execution.
             # External tasks use their dedicated high-risk standing grant;
             # the legacy workspace-wide boolean covers internal tasks only.
-            auto_approved_action_key=(
-                governance.get("task_action_key") if standing_allow else None
-            ),
+            auto_approved_action_key=auto_approved_action_key,
         )
+
+    await _finish_strategist_activity(
+        workspace,
+        message_id=activity_message_id,
+        state="completed",
+    )
 
     # Surface human requests in workspace chat (M10). Best-effort —
     # the commitments are already committed above.
@@ -478,6 +946,12 @@ async def _wire_proposal_governance(
                     "external_task_ids": [task.id for _, task in external_pairs],
                 },
             ),
+            permission_decision=await _strategist_permission_decision(
+                db,
+                workspace=workspace,
+                action_key=cohort_action_key,
+                capability_id=None,
+            ),
             intrinsic_rule="proposal.review",
             intrinsic_reason="Strategist proposals require operator approval before execution.",
         )
@@ -594,7 +1068,7 @@ async def _execute_human_request_items(
             causation_id=item.id,
         )
         item.execution_root_id = commitment.id
-        item.status = "executing"
+        item.status = ProposalItemStatus.EXECUTING
 
         await record_human_request_item_auto_approved(
             db, item, review_id=review_id, commitment_id=commitment.id,
@@ -635,7 +1109,9 @@ async def _execute_workflow_run_items(
     )
     from packages.core.services.proposal_workflow_runs import (
         ProposalWorkflowRunError,
+        ProposalWorkflowRunConflict,
         dispatch_workflow_run_item,
+        mark_workflow_run_item_conflict,
         resolve_proposal_workflow_binding,
     )
 
@@ -661,7 +1137,7 @@ async def _execute_workflow_run_items(
         try:
             await resolve_proposal_workflow_binding(db, item=item)
         except ProposalWorkflowRunError as exc:
-            item.status = "rejected"
+            item.status = ProposalItemStatus.REJECTED
             item.decided_at = now
             item.decision = {
                 "decided_by": None,
@@ -697,6 +1173,12 @@ async def _execute_workflow_run_items(
                     "workflow_ref": proposed_run.workflow_ref.model_dump(mode="json"),
                 },
             ),
+            permission_decision=await _strategist_permission_decision(
+                db,
+                workspace=workspace,
+                action_key=WORKFLOW_RUN_ACTION_KEY,
+                capability_id="workflow.run",
+            ),
             intrinsic_rule="proposal.workflow_run",
             intrinsic_reason=(
                 "Workspace Flow runs require approval before a new execution lineage is created."
@@ -707,7 +1189,7 @@ async def _execute_workflow_run_items(
             item.approval_request_id = decision.request.id
             digest["approval_request_id"] = decision.request.id
         if decision.outcome == "allow":
-            item.status = "approved"
+            item.status = ProposalItemStatus.APPROVED
             item.decided_at = now
             item.decision = {
                 "decided_by": None,
@@ -719,14 +1201,17 @@ async def _execute_workflow_run_items(
             try:
                 run = await dispatch_workflow_run_item(db, item_id=item.id)
                 digest["workflow_run_id"] = run.id
+            except ProposalWorkflowRunConflict as exc:
+                mark_workflow_run_item_conflict(item, exc)
+                digest.update({"outcome": "cancelled", "error": str(exc)})
             except ProposalWorkflowRunError as exc:
-                item.status = "failed"
+                item.status = ProposalItemStatus.FAILED
                 item.finished_at = datetime.now(timezone.utc)
                 digest["error"] = str(exc)
             if decision.request is not None:
                 await consume_approval(db, decision.request)
         elif decision.outcome == "deny":
-            item.status = "rejected"
+            item.status = ProposalItemStatus.REJECTED
             item.decided_at = now
             item.decision = {
                 "decided_by": None,
@@ -813,6 +1298,12 @@ async def _execute_experiment_items(
                     "max_cost": proposed_experiment.guardrails.max_cost,
                 },
             ),
+            permission_decision=await _strategist_permission_decision(
+                db,
+                workspace=workspace,
+                action_key=EXPERIMENT_ACTION_KEY,
+                capability_id=None,
+            ),
             intrinsic_rule="proposal.experiment",
             intrinsic_reason=(
                 "Experiments require operator approval before a config "
@@ -822,7 +1313,7 @@ async def _execute_experiment_items(
 
         experiment_id = None
         if decision.outcome == "allow":
-            item.status = "approved"
+            item.status = ProposalItemStatus.APPROVED
             item.decided_at = now
             item.decision = {
                 "decided_by": None,
@@ -834,7 +1325,7 @@ async def _execute_experiment_items(
             experiment = await _create_and_start_experiment_for_item(db, item)
             experiment_id = experiment.id if experiment is not None else None
         elif decision.outcome == "deny":
-            item.status = "rejected"
+            item.status = ProposalItemStatus.REJECTED
             item.decided_at = now
             item.decision = {
                 "decided_by": None,
@@ -931,7 +1422,7 @@ async def _execute_change_items(
             "applied": False,
             "approval_request_id": None,
         }
-        if item.status != "proposed":
+        if item.status != ProposalItemStatus.PROPOSED:
             # Validator already rejected it (and recorded the reason).
             digest["outcome"] = "rejected"
             digest["reason_code"] = (item.decision or {}).get("reason_code")
@@ -968,6 +1459,12 @@ async def _execute_change_items(
                     "rationale": proposed_change.rationale,
                 },
             ),
+            permission_decision=await _strategist_permission_decision(
+                db,
+                workspace=workspace,
+                action_key=item.action_key,
+                capability_id=None,
+            ),
             intrinsic_rule=f"proposal.{kind}",
             intrinsic_reason=(
                 "Configuration changes require operator approval before the "
@@ -979,7 +1476,7 @@ async def _execute_change_items(
             digest["approval_request_id"] = decision.request.id
 
         if decision.outcome == "allow":
-            item.status = "approved"
+            item.status = ProposalItemStatus.APPROVED
             item.decided_at = now
             item.decision = {
                 "decided_by": None,
@@ -996,7 +1493,7 @@ async def _execute_change_items(
             if decision.request is not None:
                 await consume_approval(db, decision.request)
         elif decision.outcome == "deny":
-            item.status = "rejected"
+            item.status = ProposalItemStatus.REJECTED
             item.decided_at = now
             item.decision = {
                 "decided_by": None,
@@ -1048,7 +1545,7 @@ async def _create_and_start_experiment_for_item(db: AsyncSession, item):
         logger.warning(
             "Strategist: experiment item %s failed to start: %s", item.id, exc,
         )
-        item.status = "failed"
+        item.status = ProposalItemStatus.FAILED
         item.finished_at = datetime.now(timezone.utc)
         decision = dict(item.decision or {})
         decision["start_error"] = str(exc)
@@ -1056,7 +1553,7 @@ async def _create_and_start_experiment_for_item(db: AsyncSession, item):
         experiment.status = "rolled_back"
         await db.flush()
         return None
-    item.status = "executing"
+    item.status = ProposalItemStatus.EXECUTING
     item.execution_root_id = experiment.id
     await db.flush()
     return experiment
@@ -1069,6 +1566,7 @@ async def _mirror_item_decisions(
     task_ids: list[str],
     approved: bool,
     actor_id: Optional[str] = None,
+    actor_kind: str = "user",
     batch_id: Optional[str] = None,
     reason: Optional[str] = None,
     reason_code: Optional[str] = None,
@@ -1136,7 +1634,13 @@ async def _mirror_item_decisions(
         for req in open_reqs:
             if approved:
                 if req.status == ApprovalStatus.PENDING:
-                    await grant_approval(db, req, by_user_id=actor_id, via="chat_card")
+                    await grant_approval(
+                        db,
+                        req,
+                        by_user_id=actor_id,
+                        via="chat_card",
+                        authority_prechecked=actor_kind == "system",
+                    )
                 if req.status == ApprovalStatus.GRANTED:
                     await consume_approval(db, req)
             elif req.status == ApprovalStatus.PENDING:
@@ -1151,6 +1655,7 @@ async def _mirror_item_decisions(
         record=record,
         approved=approved,
         actor_id=actor_id,
+        actor_kind=actor_kind,
         reason=reason,
         reason_code=reason_code,
         only_item_ids=only_item_ids,
@@ -1161,6 +1666,7 @@ async def _mirror_item_decisions(
         record=record,
         approved=approved,
         actor_id=actor_id,
+        actor_kind=actor_kind,
         reason=reason,
         reason_code=reason_code,
         only_item_ids=only_item_ids,
@@ -1172,6 +1678,7 @@ async def _mirror_item_decisions(
         record=record,
         approved=approved,
         actor_id=actor_id,
+        actor_kind=actor_kind,
         reason=reason,
         reason_code=reason_code,
         only_item_ids=only_item_ids,
@@ -1184,106 +1691,47 @@ async def _mirror_workflow_run_items_on_cohort_decision(
     record,
     approved: bool,
     actor_id: Optional[str] = None,
+    actor_kind: str = "user",
     reason: Optional[str] = None,
     reason_code: Optional[str] = None,
     only_item_ids: Optional[list[str]] = None,
 ) -> None:
-    from sqlalchemy import select as sa_select
-
-    from packages.core.governance.approvals import (
-        consume_approval,
-        deny_approval,
-        find_requests_by_dedup,
-        grant_approval,
-    )
-    from packages.core.models.proposal import ProposalItemRecord
+    from packages.core.proposals.lifecycle import apply_non_task_cohort_decision
     from packages.core.services.proposal_workflow_runs import (
         ProposalWorkflowRunError,
+        ProposalWorkflowRunConflict,
         dispatch_workflow_run_item,
+        mark_workflow_run_item_conflict,
     )
 
-    if only_item_ids is not None and not only_item_ids:
-        return
-    query = sa_select(ProposalItemRecord).where(
-        ProposalItemRecord.proposal_id == record.id,
-        ProposalItemRecord.kind == "workflow_run",
-        ProposalItemRecord.status == "proposed",
-    )
-    if only_item_ids is not None:
-        query = query.where(ProposalItemRecord.id.in_(list(only_item_ids)))
-    items = list((await db.execute(
-        query.order_by(ProposalItemRecord.created_at.asc(), ProposalItemRecord.id.asc())
-    )).scalars().all())
-    now = datetime.now(timezone.utc)
-    for item in items:
-        requests = [
-            request for request in await find_requests_by_dedup(
+    async def _dispatch(item) -> None:
+        try:
+            await dispatch_workflow_run_item(
                 db,
-                entity_id=record.entity_id,
-                dedup_key=f"proposal_item:{item.id}",
+                item_id=item.id,
+                actor_id=actor_id,
             )
-            if request.status in APPROVAL_LIVE_STATUSES
-        ]
-        if approved:
-            item.status = "approved"
-            item.decided_at = now
-            item.decision = {
-                "decided_by": actor_id or "user",
-                "decision": "approved",
-                "reason_code": None,
-                "decided_at": now.isoformat(),
-            }
-            for request in requests:
-                if request.status == ApprovalStatus.PENDING:
-                    await grant_approval(
-                        db,
-                        request,
-                        by_user_id=actor_id,
-                        via="chat_card",
-                    )
-                if request.status == ApprovalStatus.GRANTED:
-                    await consume_approval(db, request)
-            try:
-                await dispatch_workflow_run_item(
-                    db,
-                    item_id=item.id,
-                    actor_id=actor_id,
-                )
-            except ProposalWorkflowRunError as exc:
-                item.status = "failed"
-                item.finished_at = datetime.now(timezone.utc)
-                decision = dict(item.decision or {})
-                decision["dispatch_error"] = str(exc)
-                item.decision = decision
-        else:
-            item.status = "rejected"
-            item.decided_at = now
-            item.decision = {
-                "decided_by": actor_id or "user",
-                "decision": "rejected",
-                "reason_code": reason_code or "OTHER",
-                "comment": reason,
-                "decided_at": now.isoformat(),
-            }
-            for request in requests:
-                if request.status == ApprovalStatus.PENDING:
-                    await deny_approval(
-                        db,
-                        request,
-                        by_user_id=actor_id,
-                        via="chat_card",
-                        reason=reason,
-                    )
-    remaining = (await db.execute(
-        sa_select(ProposalItemRecord.id).where(
-            ProposalItemRecord.proposal_id == record.id,
-            ProposalItemRecord.status == "proposed",
-        ).limit(1)
-    )).scalar_one_or_none()
-    if remaining is None and record.status == "open":
-        record.status = "resolved"
-        record.resolved_at = now
-    await db.flush()
+        except ProposalWorkflowRunConflict as exc:
+            mark_workflow_run_item_conflict(item, exc)
+        except ProposalWorkflowRunError as exc:
+            item.status = ProposalItemStatus.FAILED
+            item.finished_at = datetime.now(timezone.utc)
+            decision = dict(item.decision or {})
+            decision["dispatch_error"] = str(exc)
+            item.decision = decision
+
+    await apply_non_task_cohort_decision(
+        db,
+        record=record,
+        kinds=(ProposalItemKind.WORKFLOW_RUN,),
+        approved=approved,
+        on_approved=_dispatch,
+        actor_id=actor_id,
+        actor_kind=actor_kind,
+        reason=reason,
+        reason_code=reason_code,
+        only_item_ids=only_item_ids,
+    )
 
 
 async def _mirror_experiment_items_on_cohort_decision(
@@ -1292,90 +1740,28 @@ async def _mirror_experiment_items_on_cohort_decision(
     record,
     approved: bool,
     actor_id: Optional[str] = None,
+    actor_kind: str = "user",
     reason: Optional[str] = None,
     reason_code: Optional[str] = None,
     only_item_ids: Optional[list[str]] = None,
 ) -> None:
-    from sqlalchemy import select as sa_select
+    from packages.core.proposals.lifecycle import apply_non_task_cohort_decision
 
-    from packages.core.governance.approvals import (
-        consume_approval,
-        deny_approval,
-        find_requests_by_dedup,
-        grant_approval,
+    async def _start(item) -> None:
+        await _create_and_start_experiment_for_item(db, item)
+
+    await apply_non_task_cohort_decision(
+        db,
+        record=record,
+        kinds=(ProposalItemKind.EXPERIMENT,),
+        approved=approved,
+        on_approved=_start,
+        actor_id=actor_id,
+        actor_kind=actor_kind,
+        reason=reason,
+        reason_code=reason_code,
+        only_item_ids=only_item_ids,
     )
-    from packages.core.models.proposal import ProposalItemRecord
-
-    if only_item_ids is not None and not only_item_ids:
-        return
-    query = sa_select(ProposalItemRecord).where(
-        ProposalItemRecord.proposal_id == record.id,
-        ProposalItemRecord.kind == "experiment",
-        ProposalItemRecord.status == "proposed",
-    )
-    if only_item_ids is not None:
-        query = query.where(ProposalItemRecord.id.in_(list(only_item_ids)))
-    items = list((await db.execute(
-        query.order_by(ProposalItemRecord.created_at.asc(), ProposalItemRecord.id.asc())
-    )).scalars().all())
-    if not items:
-        return
-
-    now = datetime.now(timezone.utc)
-    for item in items:
-        open_reqs = [
-            r for r in await find_requests_by_dedup(
-                db,
-                entity_id=record.entity_id,
-                dedup_key=f"proposal_item:{item.id}",
-            )
-            if r.status in APPROVAL_LIVE_STATUSES
-        ]
-        if approved:
-            item.status = "approved"
-            item.decided_at = now
-            item.decision = {
-                "decided_by": actor_id or "user",
-                "decision": "approved",
-                "reason_code": None,
-                "decided_at": now.isoformat(),
-            }
-            # The operator's card click IS the approval — grant + consume.
-            for req in open_reqs:
-                if req.status == ApprovalStatus.PENDING:
-                    await grant_approval(db, req, by_user_id=actor_id, via="chat_card")
-                if req.status == ApprovalStatus.GRANTED:
-                    await consume_approval(db, req)
-            await _create_and_start_experiment_for_item(db, item)
-        else:
-            item.status = "rejected"
-            item.decided_at = now
-            item.decision = {
-                "decided_by": actor_id or "user",
-                "decision": "rejected",
-                "reason_code": reason_code or "OTHER",
-                "comment": reason,
-                "decided_at": now.isoformat(),
-            }
-            for req in open_reqs:
-                if req.status == ApprovalStatus.PENDING:
-                    await deny_approval(
-                        db, req, by_user_id=actor_id, via="chat_card", reason=reason,
-                    )
-
-    # Resolve the parent proposal if these were its last open items
-    # (decide_items ran before experiment items were decided, so its own
-    # resolution pass may have seen them still ``proposed``).
-    remaining = (await db.execute(
-        sa_select(ProposalItemRecord.id).where(
-            ProposalItemRecord.proposal_id == record.id,
-            ProposalItemRecord.status == "proposed",
-        ).limit(1)
-    )).scalar_one_or_none()
-    if remaining is None and record.status == "open":
-        record.status = "resolved"
-        record.resolved_at = now
-    await db.flush()
 
 
 async def _mirror_change_items_on_cohort_decision(
@@ -1384,6 +1770,7 @@ async def _mirror_change_items_on_cohort_decision(
     record,
     approved: bool,
     actor_id: Optional[str] = None,
+    actor_kind: str = "user",
     reason: Optional[str] = None,
     reason_code: Optional[str] = None,
     only_item_ids: Optional[list[str]] = None,
@@ -1391,88 +1778,27 @@ async def _mirror_change_items_on_cohort_decision(
     """Approving the cohort card also applies its pending change items
     (granting + consuming their per-item requests); rejecting denies them.
 
-    Mirrors ``_mirror_experiment_items_on_cohort_decision`` exactly — the
-    operator's click IS the approval, so the request is granted and then
-    consumed at dispatch (consume-at-lease semantics).
+    The shared lifecycle owns decision + approval-request bookkeeping; this
+    kind family supplies only its CAS-protected change executor.
     """
-    from sqlalchemy import select as sa_select
-
-    from packages.core.governance.approvals import (
-        consume_approval,
-        deny_approval,
-        find_requests_by_dedup,
-        grant_approval,
-    )
-    from packages.core.models.proposal import ProposalItemRecord
     from packages.core.proposals import CHANGE_KINDS, apply_change_item
+    from packages.core.proposals.lifecycle import apply_non_task_cohort_decision
 
-    if only_item_ids is not None and not only_item_ids:
-        return
-    query = sa_select(ProposalItemRecord).where(
-        ProposalItemRecord.proposal_id == record.id,
-        ProposalItemRecord.kind.in_(CHANGE_KINDS),
-        ProposalItemRecord.status == "proposed",
+    async def _apply(item) -> None:
+        await apply_change_item(db, item)
+
+    await apply_non_task_cohort_decision(
+        db,
+        record=record,
+        kinds=CHANGE_KINDS,
+        approved=approved,
+        on_approved=_apply,
+        actor_id=actor_id,
+        actor_kind=actor_kind,
+        reason=reason,
+        reason_code=reason_code,
+        only_item_ids=only_item_ids,
     )
-    if only_item_ids is not None:
-        query = query.where(ProposalItemRecord.id.in_(list(only_item_ids)))
-    items = list((await db.execute(
-        query.order_by(ProposalItemRecord.created_at.asc(), ProposalItemRecord.id.asc())
-    )).scalars().all())
-    if not items:
-        return
-
-    now = datetime.now(timezone.utc)
-    for item in items:
-        open_reqs = [
-            r for r in await find_requests_by_dedup(
-                db,
-                entity_id=record.entity_id,
-                dedup_key=f"proposal_item:{item.id}",
-            )
-            if r.status in APPROVAL_LIVE_STATUSES
-        ]
-        if approved:
-            item.status = "approved"
-            item.decided_at = now
-            item.decision = {
-                "decided_by": actor_id or "user",
-                "decision": "approved",
-                "reason_code": None,
-                "decided_at": now.isoformat(),
-            }
-            for req in open_reqs:
-                if req.status == ApprovalStatus.PENDING:
-                    await grant_approval(db, req, by_user_id=actor_id, via="chat_card")
-                if req.status == ApprovalStatus.GRANTED:
-                    await consume_approval(db, req)
-            await apply_change_item(db, item)
-        else:
-            item.status = "rejected"
-            item.decided_at = now
-            item.decision = {
-                "decided_by": actor_id or "user",
-                "decision": "rejected",
-                "reason_code": reason_code or "OTHER",
-                "comment": reason,
-                "decided_at": now.isoformat(),
-            }
-            for req in open_reqs:
-                if req.status == ApprovalStatus.PENDING:
-                    await deny_approval(
-                        db, req, by_user_id=actor_id, via="chat_card", reason=reason,
-                    )
-
-    # Resolve the parent proposal if these were its last open items.
-    remaining = (await db.execute(
-        sa_select(ProposalItemRecord.id).where(
-            ProposalItemRecord.proposal_id == record.id,
-            ProposalItemRecord.status == "proposed",
-        ).limit(1)
-    )).scalar_one_or_none()
-    if remaining is None and record.status == "open":
-        record.status = "resolved"
-        record.resolved_at = now
-    await db.flush()
 
 
 # ── Approval ──────────────────────────────────────────────────────────
@@ -1566,6 +1892,7 @@ async def approve_proposal(
         task_ids=moved,
         approved=True,
         actor_id=actor_id,
+        actor_kind=actor_kind,
         batch_id=batch_id,
         only_item_ids=only_item_ids,
     )
@@ -1618,6 +1945,7 @@ async def reject_proposal(
         task_ids=cancelled,
         approved=False,
         actor_id=actor_id,
+        actor_kind=actor_kind,
         reason=reason,
         reason_code=reason_code,
         only_item_ids=only_item_ids,
@@ -2128,6 +2456,72 @@ def _append_note(existing: str | None, note: str, *, max_chars: int = 1500) -> s
 
 # ── Strategist template enforcement ───────────────────────────────────
 
+async def _suppress_active_workflow_run_proposals(
+    db: AsyncSession,
+    workspace: Workspace,
+    proposal: Proposal,
+) -> None:
+    """Drop fresh-run proposals for Flows that already have active work.
+
+    The prompt tells the Strategist not to duplicate an active run, but this
+    service-side guard makes the invariant deterministic when a model misses
+    the instruction. Terminal attempts intentionally do not match: recovery
+    or an explicitly justified rerun remains possible after work has settled.
+    """
+    proposed = list(getattr(proposal, "workflow_runs", None) or [])
+    if not proposed:
+        return
+
+    from packages.core.services.workspace_flow_catalog import (
+        workspace_blueprint_slug,
+        workspace_flow_slug,
+    )
+
+    rows = list((await db.execute(
+        select(WorkflowRun, WorkflowBinding)
+        .join(WorkflowBinding, WorkflowBinding.id == WorkflowRun.binding_id)
+        .where(
+            WorkflowRun.entity_id == workspace.entity_id,
+            WorkflowRun.workspace_id == workspace.id,
+            WorkflowRun.status.in_(WORKFLOW_RUN_OPEN_STATUSES),
+        )
+        .order_by(WorkflowRun.created_at.desc(), WorkflowRun.id.desc())
+    )).all())
+    active_by_slug: dict[str, tuple[str, str]] = {}
+    for run, binding in rows:
+        workflow_slug = workspace_flow_slug(binding)
+        if workflow_slug:
+            active_by_slug.setdefault(workflow_slug, (run.id, run.status))
+    if not active_by_slug:
+        return
+
+    installed_blueprint = workspace_blueprint_slug(workspace)
+    kept = []
+    suppressed: list[str] = []
+    for item in proposed:
+        ref = getattr(item, "workflow_ref", None)
+        blueprint_slug = str(getattr(ref, "blueprint_slug", "") or "").strip()
+        workflow_slug = str(getattr(ref, "workflow_slug", "") or "").strip()
+        active = active_by_slug.get(workflow_slug)
+        if (
+            active is not None
+            and installed_blueprint
+            and blueprint_slug == installed_blueprint
+        ):
+            run_id, status = active
+            suppressed.append(f"{workflow_slug} ({status} run {run_id})")
+            continue
+        kept.append(item)
+
+    if suppressed:
+        proposal.workflow_runs = kept
+        proposal.notes = _append_note(
+            proposal.notes,
+            "Suppressed duplicate Workflow run proposal(s) because work is "
+            "already active: " + "; ".join(suppressed) + ".",
+        )
+
+
 def _enforce_proposal_shape(proposal: Proposal, ctx) -> None:
     """Apply ``recipe.strategist.proposal_shape`` constraints to a fresh
     proposal cohort.
@@ -2617,7 +3011,7 @@ async def _refresh_internal_goal_measurements_for_review(
         select(Goal).where(
             Goal.workspace_id == workspace.id,
             Goal.entity_id == workspace.entity_id,
-            Goal.status == "active",
+            Goal.status == GoalStatus.ACTIVE.value,
         )
     )).scalars().all())
 
@@ -2628,7 +3022,11 @@ async def _refresh_internal_goal_measurements_for_review(
         if not is_workspace_internal_measurement_source(goal.measurement_source):
             continue
         try:
-            result = await measure_goal(goal.id, db=db)
+            result = await measure_goal(
+                goal.id,
+                db=db,
+                require_autonomous_runtime=False,
+            )
             if result.get("skipped"):
                 skipped += 1
             else:
@@ -2851,6 +3249,11 @@ async def _persist_tasks(
             expected_output=_task_expected_output_from_proposed(pt),
             creator_id=None,
         )
+        from packages.core.ai.runtime.task_requirements import (
+            apply_workspace_service_task_requirements,
+        )
+
+        apply_workspace_service_task_requirements(row, workspace)
         db.add(row)
         ids.append(row.id)
         rows_by_key[task_key] = row
@@ -3034,9 +3437,12 @@ _OPERATION_VERB: dict[str, str] = {
 
 # Non-task kinds that wait on the cohort card. human_request items never
 # do — they open a HumanCommitment answered from the Human queue.
-_CARD_ITEM_KINDS: tuple[str, ...] = (
-    "automation_change", "workflow_change", "goal_change", "experiment",
-    "workflow_run",
+_CARD_ITEM_KINDS: tuple[ProposalItemKind, ...] = (
+    ProposalItemKind.AUTOMATION_CHANGE,
+    ProposalItemKind.WORKFLOW_CHANGE,
+    ProposalItemKind.GOAL_CHANGE,
+    ProposalItemKind.EXPERIMENT,
+    ProposalItemKind.WORKFLOW_RUN,
 )
 
 
@@ -3060,7 +3466,7 @@ async def _pending_item_digests(db: AsyncSession, *, review_id: str) -> list[dic
         .join(ProposalRecord, ProposalItemRecord.proposal_id == ProposalRecord.id)
         .where(
             ProposalRecord.review_id == review_id,
-            ProposalItemRecord.status == "proposed",
+            ProposalItemRecord.status == ProposalItemStatus.PROPOSED,
             ProposalItemRecord.kind.in_(_CARD_ITEM_KINDS),
         )
         .order_by(ProposalItemRecord.created_at.asc(), ProposalItemRecord.id.asc())
@@ -3080,10 +3486,10 @@ async def _pending_item_digests(db: AsyncSession, *, review_id: str) -> list[dic
 async def _proposal_item_summary(db: AsyncSession, item) -> str:
     """One human-readable line for a non-task proposal item."""
     payload = item.payload if isinstance(item.payload, dict) else {}
-    if item.kind == "experiment":
+    if item.kind == ProposalItemKind.EXPERIMENT:
         text = str(payload.get("hypothesis") or "").strip()
         return _clip(text or str(payload.get("experiment_key") or "experiment"), 140)
-    if item.kind == "workflow_run":
+    if item.kind == ProposalItemKind.WORKFLOW_RUN:
         ref = payload.get("workflow_ref") if isinstance(payload.get("workflow_ref"), dict) else {}
         title = str(ref.get("workflow_slug") or payload.get("run_key") or "Flow")
         return _clip(f"Run {title}", 140)
@@ -3401,16 +3807,142 @@ def _proposal_task_body_line(entry: dict) -> str:
     return f"  • {entry['title']}{suffix}"
 
 
+async def _publish_proposal_chat_message(
+    workspace: Workspace,
+    message: Message,
+) -> None:
+    """Publish a committed Proposal message without weakening durability."""
+    try:
+        await chat_service.publish_workspace_chat_message_event(
+            workspace.entity_id,
+            workspace_id=workspace.id,
+            message=message,
+        )
+    except Exception:  # noqa: BLE001 — the committed card remains authoritative
+        logger.debug(
+            "Strategist: proposal realtime publish failed (non-blocking)",
+            exc_info=True,
+        )
+
+
+async def _notify_proposal_users(
+    workspace: Workspace,
+    proposal: Proposal,
+    task_ids: list[str],
+    *,
+    items: list[dict],
+    auto_approved: bool,
+    auto_approved_action_key: str | None,
+) -> None:
+    """Notify entity users after the Proposal card transaction commits."""
+    try:
+        from packages.core.database import async_session
+        from packages.core.models.user import User
+        from packages.core.permissions import resolve_effective_user_role_name
+        from packages.core.services.notification_service import create_notification
+        from packages.core.services.workspace_access import (
+            user_can_read_workspace_by_identity,
+        )
+
+        auto_approve_label = (
+            strategist_action_label(auto_approved_action_key)
+            if auto_approved_action_key
+            else None
+        )
+        auto_approve_reason = (
+            f"Auto-approved by your standing approval for “{auto_approve_label}”. "
+            "Manage this in Settings → Approval automation."
+            if auto_approve_label
+            else (
+                "Started automatically by workspace-wide auto-approval. "
+                "Manage this in Settings → Approval automation."
+            )
+        )
+        task_count = len(task_ids)
+        count_label = (
+            f"{task_count} task{'s' if task_count != 1 else ''}"
+            if task_count or not items
+            else f"{len(items)} change{'s' if len(items) != 1 else ''}"
+        )
+        raw_title = (
+            f"Proposal auto-approved: {proposal.summary or count_label}"
+            if auto_approved
+            else f"New proposal: {proposal.summary or count_label}"
+        )
+        notif_title = raw_title[:490] + "…" if len(raw_title) > 490 else raw_title
+        notif_body = (
+            f"{workspace.name} — started {count_label}. {auto_approve_reason}"
+            if auto_approved
+            else (
+                f"{workspace.name} — Strategist proposed {count_label}. "
+                "Review and approve to start execution."
+            )
+        )
+        async with async_session() as notification_db:
+            users = list((
+                await notification_db.execute(
+                    select(User).where(
+                        User.entity_id == workspace.entity_id,
+                        User.status == "active",
+                    )
+                )
+            ).scalars().all())
+            for user in users:
+                role = await resolve_effective_user_role_name(
+                    notification_db,
+                    user_id=user.id,
+                    entity_id=workspace.entity_id,
+                    legacy_role=user.role,
+                )
+                if not await user_can_read_workspace_by_identity(
+                    notification_db,
+                    workspace=workspace,
+                    entity_id=workspace.entity_id,
+                    user_id=user.id,
+                    role=role,
+                ):
+                    continue
+                await create_notification(
+                    notification_db,
+                    workspace.entity_id,
+                    user.id,
+                    type="proposal",
+                    title=notif_title,
+                    body=notif_body,
+                    link=f"/workspaces/{workspace.id}?tab=chat",
+                    workspace_id=workspace.id,
+                    idempotency_key=(
+                        f"proposal:{proposal.review_id}"
+                        if proposal.review_id
+                        else None
+                    ),
+                    meta={
+                        "workspace_id": workspace.id,
+                        "workspace_name": workspace.name,
+                        "review_id": proposal.review_id,
+                        "task_ids": task_ids,
+                        "task_count": task_count,
+                    },
+                )
+            await notification_db.commit()
+    except Exception:  # noqa: BLE001 — notification is not the Proposal receipt
+        logger.debug(
+            "Strategist: notification creation failed (non-blocking)",
+            exc_info=True,
+        )
+
+
 async def _post_proposal_chat(
     workspace: Workspace,
     proposal: Proposal,
     task_ids: list[str],
     *,
+    db: AsyncSession | None = None,
     auto_approved: bool = False,
     policy_denied: bool = False,
     pending_items: Optional[list[dict]] = None,
     auto_approved_action_key: Optional[str] = None,
-) -> None:
+) -> Message | None:
     """Single proposal card in the workspace_main conversation.
 
     Uses ``message_kind='proposal'`` + ``pending_action`` so the chat
@@ -3537,73 +4069,36 @@ async def _post_proposal_chat(
 
     refs = [{"type": "task", "id": t} for t in task_ids]
 
+    message_kwargs = {
+        "entity_id": workspace.entity_id,
+        "workspace_id": workspace.id,
+        "body": "\n".join(body_lines),
+        "message_kind": "proposal",
+        "author_kind": "agent",
+        "refs": refs,
+        "pending_action": pending_action,
+        "meta": meta,
+        "publish_event": False,
+    }
+    if db is not None:
+        return await chat_service.post_message(db, **message_kwargs)
+
     try:
         from packages.core.database import async_session
-        # Post the chat message first and commit — notifications must not
-        # poison the session and cause the proposal card to be lost.
-        async with async_session() as db:
-            await chat_service.post_message(
-                db,
-                entity_id=workspace.entity_id,
-                workspace_id=workspace.id,
-                body="\n".join(body_lines),
-                message_kind="proposal",
-                author_kind="agent",
-                refs=refs,
-                pending_action=pending_action,
-                meta=meta,
-            )
-            await db.commit()
 
-        # Notify all entity users (separate session so failures are isolated).
-        try:
-            from packages.core.services.notification_service import create_notification
-            from packages.core.models.user import User
-            from sqlalchemy import select
-
-            task_count = len(task_ids)
-            # An items-only cohort has no tasks to count — say "change"
-            # instead of lying about "0 tasks".
-            count_label = (
-                f"{task_count} task{'s' if task_count != 1 else ''}"
-                if task_count or not items
-                else f"{len(items)} change{'s' if len(items) != 1 else ''}"
-            )
-            raw_title = (
-                f"Proposal auto-approved: {proposal.summary or count_label}"
-                if auto_approved
-                else f"New proposal: {proposal.summary or count_label}"
-            )
-            notif_title = raw_title[:490] + "…" if len(raw_title) > 490 else raw_title
-            notif_body = (
-                f"{workspace.name} — started {count_label}. {auto_approve_reason}"
-                if auto_approved
-                else (
-                    f"{workspace.name} — Strategist proposed {count_label}. "
-                    "Review and approve to start execution."
-                )
-            )
-            async with async_session() as db2:
-                users = (await db2.execute(
-                    select(User.id).where(User.entity_id == workspace.entity_id, User.status == "active")
-                )).scalars().all()
-                for uid in users:
-                    await create_notification(
-                        db2, workspace.entity_id, uid,
-                        type="proposal",
-                        title=notif_title,
-                        body=notif_body,
-                        link=f"/workspaces/{workspace.id}?tab=chat",
-                        meta={
-                            "workspace_id": workspace.id,
-                            "workspace_name": workspace.name,
-                            "review_id": proposal.review_id,
-                            "task_ids": task_ids,
-                            "task_count": task_count,
-                        },
-                    )
-                await db2.commit()
-        except Exception:
-            logger.debug("Strategist: notification creation failed (non-blocking)", exc_info=True)
-    except Exception:
+        async with async_session() as card_db:
+            message = await chat_service.post_message(card_db, **message_kwargs)
+            await card_db.commit()
+        await _publish_proposal_chat_message(workspace, message)
+        await _notify_proposal_users(
+            workspace,
+            proposal,
+            task_ids,
+            items=items,
+            auto_approved=auto_approved,
+            auto_approved_action_key=auto_approved_action_key,
+        )
+        return message
+    except Exception:  # noqa: BLE001 — legacy reviews remain best effort
         logger.warning("Strategist: failed to post proposal card", exc_info=True)
+        return None

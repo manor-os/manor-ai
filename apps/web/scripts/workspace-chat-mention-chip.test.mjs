@@ -22,8 +22,14 @@ test("workspace agents use the shared inline mention token", () => {
     workspaceChat,
     /const mentionOptions = useMemo<MentionOption\[\]>/,
   );
-  assert.match(workspaceChat, /mentions=\{mentionOptions\}/);
-  assert.match(workspaceChat, /selectedMentions=\{selectedMentions\}/);
+  assert.match(
+    workspaceChat,
+    /mentions=\{isTaskSession \? \[\] : mentionOptions\}/,
+  );
+  assert.match(
+    workspaceChat,
+    /selectedMentions=\{isTaskSession \? \[\] : selectedMentions\}/,
+  );
   assert.match(workspaceChat, /onMentionSelect=\{handleMentionSelect\}/);
   assert.match(workspaceChat, /onMentionRemove=\{handleMentionRemove\}/);
 });
@@ -57,7 +63,7 @@ test("inline mention is one line with prefix, avatar, and name only", () => {
   assert.match(chatInputFooter, /const avatarRoot = createRoot\(badge\)/);
   assert.match(
     chatInputFooter,
-    /<UserAvatar[\s\S]*?name=\{part\.mention\.name\}[\s\S]*?type=\{part\.mention\.type\}[\s\S]*?seed=\{part\.mention\.id\}[\s\S]*?size=\{18\}/,
+    /<UserAvatar[\s\S]*?name=\{part\.mention\.name\}[\s\S]*?type=\{part\.mention\.type\}[\s\S]*?seed=\{part\.mention\.avatarSeed \|\| part\.mention\.id\}[\s\S]*?size=\{18\}/,
   );
   assert.doesNotMatch(
     chatInputFooter,
@@ -81,7 +87,7 @@ test("sent message mentions reuse the avatar and compact inline treatment", () =
   );
   assert.match(
     embeddedChat,
-    /<UserAvatar[\s\S]*?name=\{part\.mention\.name\}[\s\S]*?avatarUrl=\{part\.mention\.avatarUrl\}[\s\S]*?type=\{part\.mention\.type\}[\s\S]*?seed=\{part\.mention\.id\}[\s\S]*?size=\{18\}/,
+    /<UserAvatar[\s\S]*?name=\{part\.mention\.name\}[\s\S]*?avatarUrl=\{part\.mention\.avatarUrl\}[\s\S]*?type=\{part\.mention\.type\}[\s\S]*?seed=\{part\.mention\.avatarSeed \|\| part\.mention\.id\}[\s\S]*?size=\{18\}/,
   );
   assert.doesNotMatch(
     embeddedChat,

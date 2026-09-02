@@ -15,6 +15,7 @@ import pytest
 
 from packages.core.ai.agentic_loop import AgenticResult
 from packages.core.ai.runtime import ChatSurface
+from packages.core.ai.runtime.output_policy import runtime_public_transport_payload
 from packages.core.services import chat_service
 from packages.core.services.chat_service import (
     _tool_calls_for_snapshot,
@@ -217,6 +218,7 @@ async def test_personal_turn_pushes_snapshots_the_owner_can_resume_from():
         # reply text.
         assert payload["target"] == "user"
         assert payload["user_id"] == "user_1"
+        assert payload["entity_id"] == "ent_1"
         assert payload["data"]["conversation_id"] == "conv_1"
 
     seqs = [p["data"]["seq"] for p in snapshots]
@@ -346,6 +348,87 @@ def test_tool_calls_for_snapshot_drops_raw_result_and_keeps_the_card():
     ]
     # The source list is for the DB write and must not be mutated.
     assert "raw_result" in events[0]
+
+
+def test_tool_calls_for_snapshot_redacts_private_failed_tool_identity():
+    private_failure = (
+        "Tool error (mcp__private_server__private_action): "
+        "No registered executor for tool mcp__private_server__private_action"
+    )
+    events = [{
+        "name": "mcp__private_server__private_action",
+        "result": private_failure,
+        "raw_result": private_failure,
+        "status": "error",
+    }]
+
+    assert _tool_calls_for_snapshot(events) == [{
+        "name": "operation",
+        "result": "This operation is temporarily unavailable. Please try again.",
+        "status": "error",
+    }]
+    assert events[0]["name"] == "mcp__private_server__private_action"
+
+    draft_events = [{
+        "name": "continue_workspace_draft",
+        "result": '{"artifact_kind":"workspace_draft","draft_id":"draft-1"}',
+        "raw_result": (
+            '{"artifact_kind":"workspace_draft","draft_id":"draft-1",'
+            '"fields":{"name":"Draft"}}'
+        ),
+        "status": "success",
+    }]
+    assert "raw_result" not in _tool_calls_for_snapshot(draft_events)[0]
+
+
+def test_live_tool_event_projection_redacts_private_failed_tool_identity():
+    private_failure = (
+        "Tool error (mcp__private_server__private_action): "
+        "No registered executor for tool mcp__private_server__private_action"
+    )
+
+    event = runtime_public_transport_payload({
+        "tool_call": {
+            "name": "mcp__private_server__private_action",
+            "result": private_failure,
+            "status": "error",
+        },
+        "assistant_blocks": [{
+            "type": "process",
+            "steps": [{
+                "kind": "tool",
+                "name": "mcp__private_server__private_action",
+                "result_preview": private_failure,
+                "status": "error",
+            }],
+        }],
+    })
+
+    assert event["tool_call"]["name"] == "operation"
+    assert event["assistant_blocks"][0]["steps"][0]["name"] == "operation"
+    assert "mcp__" not in json.dumps(event)
+
+
+def test_live_sub_agent_event_projection_is_fail_closed():
+    event = runtime_public_transport_payload({
+        "sub_agent": {
+            "status": "failed",
+            "error": "ValueError('/srv/private/config.yaml')",
+            "tool_calls_made": ["mcp__private_server__private_action"],
+            "tool": {
+                "name": "mcp__private_server__private_action",
+                "status": "error",
+            },
+        },
+    })
+
+    assert event["sub_agent"]["error"] == (
+        "Sorry, the request failed. Please try again."
+    )
+    assert event["sub_agent"]["tool"]["name"] == "operation"
+    assert event["sub_agent"]["tool_calls_made"] == ["operation"]
+    assert "/srv/" not in json.dumps(event)
+    assert "mcp__" not in json.dumps(event)
 
 
 def test_messages_api_tells_a_reloaded_page_a_turn_is_still_running():

@@ -11,10 +11,8 @@ and "Always approve" in a workspace conversation writes the workspace policy
 auto-approve set that BOTH planes honor. Provider approvals live there too,
 carrying their continuation in ``request.context``.
 
-The legacy conversation-meta blob (``conv.meta.runtime_approvals``) is no
-longer read or written for decisions; a click on a card minted before the
-upgrade gets a tombstone reply telling the user to retry the action, which
-mints a fresh unified request.
+The old conversation-meta blob is no longer part of the runtime approval
+decision path.
 """
 from __future__ import annotations
 
@@ -26,16 +24,27 @@ from typing import Any, Iterable
 
 from sqlalchemy import select
 
-from packages.core.constants.approvals import ApprovalOriginKind, ApprovalStatus
-from packages.core.ai.runtime.approval_classifier import classify_runtime_tool_action
+from packages.core.constants.approvals import (
+    ApprovalOriginKind,
+    ApprovalOutcome,
+    ApprovalStatus,
+)
+from packages.core.ai.runtime.approval_classifier import (
+    RuntimeToolClassification,
+    RuntimeToolEffect,
+    classify_runtime_tool,
+)
 from packages.core.ai.runtime.approval_messages import (
+    RuntimeApprovalContinuationError,
     approval_args_hash,
     approval_content_preview,
     approval_paths,
     approval_preview_arguments,
     approval_public_content,
     runtime_approval_prompt,
+    runtime_approval_continuation,
     runtime_approval_rejected_message,
+    runtime_approval_runtime_metadata,
     runtime_approval_retry_message,
 )
 from packages.core.ai.runtime.approval_preferences import (
@@ -45,11 +54,7 @@ from packages.core.ai.runtime.approval_preferences import (
 from packages.core.ai.runtime.approval_store import (
     load_runtime_approval_conversation,
     mark_runtime_hitl_request_resolved,
-    mark_runtime_hitl_requests_resolved,
-    runtime_approval_now_iso,
     runtime_approval_workspace_context,
-    runtime_approvals,
-    set_runtime_approvals,
 )
 from packages.core.services.hitl_options import (
     APPROVAL_CHOICE_ALWAYS_APPROVE,
@@ -64,8 +69,14 @@ from packages.core.ai.runtime.approvals import (
     runtime_requires_baseline_approval,
 )
 from packages.core.ai.runtime.provider_approvals import (
+    freeze_provider_approval_request,
+    provider_approval_confirmation_receipt,
     provider_approval_is_expired,
     provider_approval_runtime_metadata,
+)
+from packages.core.services.runtime_authorization import (
+    AuthorizationRule,
+    PermissionDecision,
 )
 
 logger = logging.getLogger(__name__)
@@ -86,58 +97,9 @@ async def _set_direct_chat_always_approve_preference(db, *, req, user_id: str) -
         user_id=user_id,
         mode="always_approve",
         action_key=req.action_key,
-        capability_id=req.capability_id,
+        resource_id=req.resource_id,
+        capability_id=req.capability_id if not req.action_key else None,
     )
-
-
-def _step_scoped_provider_scope_allows(
-    *,
-    workspace_settings: dict[str, Any] | None,
-    step_owner_service_key: str | None,
-    step_key: str | None,
-    step_kind: str | None,
-    provider: str | None,
-    policy_category: str | None,
-) -> bool:
-    """Return true only for a blueprint scope explicitly promoted by Always.
-
-    The proposal card's standing decision is intentionally separate from the
-    normal workspace action policy.  A scope names the accountable service,
-    provider, and Chrome policy categories; it cannot authorize an arbitrary
-    Chrome action or a task owned by another service.
-    """
-    settings = workspace_settings if isinstance(workspace_settings, dict) else {}
-    owner = str(step_owner_service_key or "").strip()
-    key = str(step_key or "").strip().lower()
-    kind = str(step_kind or "").strip().lower()
-    provider_name = str(provider or "").strip().lower()
-    category = str(policy_category or "").strip().lower()
-    if not owner or not provider_name or not category:
-        return False
-    grants = settings.get("runtime_approval_scope_grants")
-    if not isinstance(grants, list):
-        return False
-    for raw in grants:
-        if not isinstance(raw, dict) or raw.get("enabled") is not True:
-            continue
-        if str(raw.get("owner_service_key") or "").strip() != owner:
-            continue
-        if str(raw.get("provider") or "").strip().lower() != provider_name:
-            continue
-        required_key = str(raw.get("step_key") or "").strip().lower()
-        if required_key and key != required_key:
-            continue
-        required_kind = str(raw.get("step_kind") or "").strip().lower()
-        if required_kind and kind != required_kind:
-            continue
-        categories = raw.get("policy_categories") or []
-        if isinstance(categories, str):
-            categories = [categories]
-        if category in {
-            str(value or "").strip().lower() for value in categories
-        }:
-            return True
-    return False
 
 
 async def activate_blueprint_provider_scopes_for_proposal(
@@ -147,18 +109,28 @@ async def activate_blueprint_provider_scopes_for_proposal(
     task_ids: Iterable[str],
     user_id: str | None,
 ) -> int:
-    """Promote only the Blueprint-declared provider scopes for a proposal.
+    """Promote only Blueprint-declared provider scopes for a proposal.
 
-    A scope may opt into proposal Always approval through
-    ``proposal_service_keys``.  This keeps the choice bounded to the
-    workspace Blueprint and avoids adding ``chrome.action`` to the workspace
-    policy for every task.
+    Proposal-level ``Always approve`` must remain bounded to the services and
+    providers declared by the workspace Blueprint; it must not create a
+    general provider grant for unrelated tasks.
     """
     from packages.core.models.task import Task
     from packages.core.models.workspace import Workspace
 
     workspace = await db.get(Workspace, workspace_id)
     if workspace is None:
+        return 0
+    from packages.core.services.workspace_access import (
+        lock_workspace_access_boundary,
+    )
+
+    workspace = await lock_workspace_access_boundary(
+        db,
+        workspace_id=workspace_id,
+        entity_id=workspace.entity_id,
+    )
+    if workspace is None or workspace.deleted_at is not None:
         return 0
     settings = dict(workspace.settings or {})
     scopes = settings.get("runtime_approval_scopes")
@@ -167,13 +139,16 @@ async def activate_blueprint_provider_scopes_for_proposal(
     ids = [str(value).strip() for value in task_ids if str(value).strip()]
     if not ids:
         return 0
+
     owner_keys = set((await db.execute(
         select(Task.owner_service_key).where(
-            Task.id.in_(ids), Task.workspace_id == workspace_id,
+            Task.id.in_(ids),
+            Task.workspace_id == workspace_id,
         )
     )).scalars().all())
     grants = [
-        dict(value) for value in (settings.get("runtime_approval_scope_grants") or [])
+        dict(value)
+        for value in (settings.get("runtime_approval_scope_grants") or [])
         if isinstance(value, dict)
     ]
     changed = 0
@@ -219,9 +194,10 @@ def _provider_supports_always_approve(provider: str | None) -> bool:
     their behalf. The provider keeps demanding per action — it just stops
     being the operator's problem.
 
-    The grant itself is recorded per provider AND per action
-    (``capability_id`` is ``"{provider}.action"``), so approving Chrome
-    form-fills never authorizes, say, a LinkedIn publish.
+    The grant itself is recorded on the canonical action scope, optionally
+    narrowed by a concrete resource id. That keeps Chrome form-fills,
+    uploads, and other provider-backed actions on the same semantic axis as
+    workspace approvals instead of inventing a separate provider namespace.
     """
     return bool(str(provider or "").strip())
 
@@ -237,7 +213,10 @@ async def runtime_auto_confirm_provider_approval(
     workspace_id: str | None,
     task_id: str | None = None,
     runtime_metadata: dict[str, Any] | None = None,
-    step_id: str | None = None,
+    workflow_run_id: str | None = None,
+    workflow_lineage_root_run_id: str | None = None,
+    workflow_action_grant_id: str | None = None,
+    workflow_step_id: str | None = None,
 ) -> str:
     """Answer a Manor-owned provider's approval gate from a standing grant.
 
@@ -284,7 +263,79 @@ async def runtime_auto_confirm_provider_approval(
         return result
 
     action_key = str(request.get("action_key") or f"{provider}.action")
+    resource_id = str(request.get("resource_id") or "").strip() or None
     capability_id = f"{provider}.action"
+
+    workflow_grant_id = str(workflow_action_grant_id or "").strip()
+    if workflow_grant_id:
+        from packages.core.database import async_session
+        from packages.core.models.workflow import WorkflowActionGrant
+        from packages.core.services.workflow_action_grant_service import (
+            YOUTUBE_PUBLICATION_GRANT_TYPE,
+            WorkflowActionGrantDenied,
+            consume_proposal_youtube_publication_grant,
+            validate_proposal_youtube_publication_grant,
+        )
+
+        async with async_session() as db:
+            stored_grant = await db.get(WorkflowActionGrant, workflow_grant_id)
+            if (
+                stored_grant is not None
+                and stored_grant.grant_type == YOUTUBE_PUBLICATION_GRANT_TYPE
+            ):
+                workflow_scope = {
+                    "grant_id": workflow_grant_id,
+                    "entity_id": entity_id,
+                    "user_id": str(user_id or ""),
+                    "workspace_id": str(workspace_id or ""),
+                    "workflow_run_id": str(workflow_run_id or ""),
+                    "workflow_lineage_root_run_id": str(
+                        workflow_lineage_root_run_id or ""
+                    ),
+                    "workflow_step_id": str(workflow_step_id or ""),
+                    "provider_request": request,
+                }
+                try:
+                    _grant, request_kind = (
+                        await validate_proposal_youtube_publication_grant(
+                            db,
+                            **workflow_scope,
+                        )
+                    )
+                    if request_kind == "publish":
+                        await consume_proposal_youtube_publication_grant(
+                            db,
+                            **workflow_scope,
+                        )
+                except WorkflowActionGrantDenied:
+                    await db.rollback()
+                    return result
+
+                try:
+                    confirmation = await execute(
+                        confirmation_tool,
+                        dict(confirmation_arguments),
+                    )
+                    token = _provider_approval_token(confirmation)
+                    if not token:
+                        await db.rollback()
+                        return result
+                    retried = await execute(
+                        retry_tool,
+                        {**retry_arguments, "approvalToken": token},
+                    )
+                except Exception:
+                    await db.rollback()
+                    logger.warning(
+                        "Proposal Workflow auto-confirm failed before execution was proven",
+                        exc_info=True,
+                    )
+                    return result
+                if not _provider_action_was_executed(retried):
+                    await db.rollback()
+                    return retried if isinstance(retried, str) and retried else result
+                await db.commit()
+                return retried if isinstance(retried, str) and retried else result
 
     proposal_authorization = (
         runtime_metadata.get("proposal_external_authorization")
@@ -440,16 +491,13 @@ async def runtime_auto_confirm_provider_approval(
             return retried if isinstance(retried, str) and retried else result
 
     async with async_session() as db:
-        granted = await _provider_standing_grant(
+        granted = await _standing_grant(
             db,
-            entity_id=entity_id,
             workspace_id=workspace_id,
             user_id=user_id,
             action_key=action_key,
+            resource_id=resource_id,
             capability_id=capability_id,
-            policy_category=str(request.get("policy_category") or "").strip() or None,
-            step_id=step_id,
-            provider=provider,
         )
     if not granted:
         return result
@@ -519,19 +567,16 @@ def _provider_approval_token(confirmation: Any) -> str | None:
     return None
 
 
-async def _provider_standing_grant(
+async def _standing_grant(
     db,
     *,
-    entity_id: str,
     workspace_id: str | None,
     user_id: str | None,
     action_key: str,
+    resource_id: str | None,
     capability_id: str,
-    policy_category: str | None = None,
-    step_id: str | None = None,
-    provider: str | None = None,
 ) -> bool:
-    """Did the operator already say "always" for this provider action?
+    """Did the operator already say "always" for this canonical action?
 
     Reads the same two standing stores the rest of the runtime guard honors:
     the workspace policy auto-approve set for workspace chats, and the user
@@ -539,27 +584,13 @@ async def _provider_standing_grant(
     never_allow still denies through the normal gate.
     """
     if workspace_id:
-        if step_id:
-            step_owner, step_key, step_kind = await _step_provider_scope_context(
-                db, step_id, workspace_id,
-            )
-            if _step_scoped_provider_scope_allows(
-                workspace_settings=(
-                    await _workspace_settings_for_provider_scope(db, workspace_id)
-                ),
-                step_owner_service_key=step_owner,
-                provider=provider or (action_key.split(".", 1)[0] if action_key else None),
-                policy_category=policy_category,
-                step_key=step_key,
-                step_kind=step_kind,
-            ):
-                return True
         from packages.core.governance.service import workspace_policy_auto_approves
 
         if await workspace_policy_auto_approves(
             db,
             workspace_id=workspace_id,
             action_key=action_key,
+            resource_id=resource_id,
             capability_id=capability_id,
         ):
             return True
@@ -567,30 +598,9 @@ async def _provider_standing_grant(
         db,
         user_id=user_id,
         action_key=action_key,
+        resource_id=resource_id,
         capability_id=capability_id,
     ) == "always_approve"
-
-
-async def _workspace_settings_for_provider_scope(db, workspace_id: str) -> dict[str, Any]:
-    from packages.core.models.workspace import Workspace
-
-    workspace = await db.get(Workspace, workspace_id)
-    return dict(workspace.settings or {}) if workspace else {}
-
-
-async def _step_provider_scope_context(
-    db, step_id: str, workspace_id: str,
-) -> tuple[str | None, str | None, str | None]:
-    from packages.core.models.execution import ExecutionStep
-
-    step = await db.get(ExecutionStep, step_id)
-    if step is None or str(step.workspace_id or "") != str(workspace_id):
-        return None, None, None
-    return (
-        str(step.service_key or "").strip() or None,
-        str(step.step_key or "").strip() or None,
-        str(step.kind or "").strip() or None,
-    )
 
 
 @dataclass(frozen=True)
@@ -669,6 +679,7 @@ async def _load_runtime_request(
     request_id: str,
     entity_id: str,
     conversation_id: str | None,
+    for_update: bool = False,
 ):
     """Load a HitlRequest ONLY if it is a runtime tool-call request for
     THIS conversation. Step-origin requests (dispatcher cards) and other
@@ -680,12 +691,18 @@ async def _load_runtime_request(
 
     from packages.core.models.hitl_request import HitlRequest
 
-    req = (await db.execute(
-        select(HitlRequest).where(
-            HitlRequest.id == request_id,
-            HitlRequest.entity_id == entity_id,
-        )
-    )).scalar_one_or_none()
+    query = select(HitlRequest).where(
+        HitlRequest.id == request_id,
+        HitlRequest.entity_id == entity_id,
+    )
+    if for_update:
+        # A compatibility lookup may already have loaded this row into the
+        # session identity map before we acquire the lock. Refresh from the
+        # locked database version so a concurrent consumer cannot keep using
+        # its stale in-memory GRANTED snapshot after the first transaction
+        # commits CONSUMED.
+        query = query.with_for_update().execution_options(populate_existing=True)
+    req = (await db.execute(query)).scalar_one_or_none()
     if req is None or req.origin_kind != _RUNTIME_ORIGIN_KIND:
         return None
     if req.origin_conversation_id != conversation_id:
@@ -706,6 +723,7 @@ def _runtime_request_item(req) -> dict[str, Any]:
         "args_hash": ctx.get("args_hash"),
         "args_preview": ctx.get("args_preview"),
         "retry_args": ctx.get("retry_args"),
+        "continuation": ctx.get("continuation"),
         "paths": ctx.get("paths"),
         "workspace": ctx.get("workspace"),
         "content": ctx.get("content"),
@@ -741,12 +759,32 @@ async def _runtime_render_context(
         "args_hash": approval_args_hash(arguments),
         "args_preview": args_preview,
         "retry_args": args_preview if not args_preview.get("truncated") else None,
+        "continuation": runtime_approval_continuation(tool_name, arguments),
         "paths": paths,
         "workspace": workspace,
         "content": content_preview,
         "requested_by": user_id,
         **confirmation_receipt,
     }
+
+
+def _runtime_continuation_error_result(
+    *,
+    tool_name: str,
+    error: RuntimeApprovalContinuationError,
+) -> str:
+    return json.dumps(
+        {
+            "error": "approval_continuation_unavailable",
+            "message": (
+                f"{error} Save large content as a Workspace document and retry "
+                "with its canonical reference."
+            ),
+            "tool": tool_name,
+            "retryable": True,
+        },
+        ensure_ascii=False,
+    )
 
 
 def _runtime_hitl_payload(
@@ -813,6 +851,7 @@ async def _runtime_block_payload(
     tool_name: str,
     arguments: dict[str, Any],
     action: RuntimeApprovalAction,
+    permission_decision: PermissionDecision,
     reason: str | None,
     matched_rule_hint: str | None,
 ) -> str | None:
@@ -828,38 +867,48 @@ async def _runtime_block_payload(
         resolve_approval,
     )
 
-    render = await _runtime_render_context(
-        db,
-        conversation_id=conversation_id,
-        entity_id=entity_id,
-        user_id=user_id,
-        tool_name=tool_name,
-        arguments=arguments,
-        action=action,
-    )
-    decision = await resolve_approval(
-        db,
-        subject=ApprovalSubject(
-            entity_id=entity_id,
-            workspace_id=workspace_id,
-            action_key=action.action_key,
-            capability_id=action.capability_id,
-            resource_kind=action.resource_kind,
-            risk_level=action.risk_level,
-            kind=action.kind,
-            requires_approval=True,
-        ),
-        origin=ApprovalOrigin(
-            kind=_RUNTIME_ORIGIN_KIND,
+    async def load_render_context() -> dict[str, Any]:
+        return await _runtime_render_context(
+            db,
             conversation_id=conversation_id,
-            args_hash=approval_args_hash(arguments),
-            context=render,
-        ),
-        reason=reason,
-        intrinsic_rule=matched_rule_hint or "approval_payload_changed",
-        intrinsic_reason=reason,
-    )
-    if decision.outcome == "allow":
+            entity_id=entity_id,
+            user_id=user_id,
+            tool_name=tool_name,
+            arguments=arguments,
+            action=action,
+        )
+
+    try:
+        decision = await resolve_approval(
+            db,
+            subject=ApprovalSubject(
+                entity_id=entity_id,
+                workspace_id=workspace_id,
+                action_key=action.action_key,
+                resource_id=action.resource_id,
+                capability_id=action.capability_id,
+                resource_kind=action.resource_kind,
+                risk_level=action.risk_level,
+                kind=action.kind,
+                requires_approval=True,
+            ),
+            origin=ApprovalOrigin(
+                kind=_RUNTIME_ORIGIN_KIND,
+                conversation_id=conversation_id,
+                args_hash=approval_args_hash(arguments),
+                context_loader=load_render_context,
+            ),
+            permission_decision=permission_decision,
+            reason=reason,
+            intrinsic_rule=matched_rule_hint or "approval_payload_changed",
+            intrinsic_reason=reason,
+        )
+    except RuntimeApprovalContinuationError as exc:
+        return _runtime_continuation_error_result(
+            tool_name=tool_name,
+            error=exc,
+        )
+    if decision.outcome is ApprovalOutcome.ALLOW:
         if decision.request is not None:
             from packages.core.governance.approvals import consume_approval
 
@@ -879,7 +928,7 @@ async def _runtime_block_payload(
         tool_name=tool_name,
         arguments=arguments,
         matched_rule=decision.matched_rule,
-        render=render,
+        render=dict(decision.request.context or {}),
     )
 
 
@@ -892,47 +941,148 @@ async def guard_runtime_tool_action(
     workspace_id: str | None,
     conversation_id: str | None,
     task_id: str | None = None,
-    step_id: str | None = None,
+    runtime_envelope: Any | None = None,
+    classification: RuntimeToolClassification | None = None,
 ) -> str | None:
     """Return a blocking tool result, or ``None`` when execution may continue.
 
-    One decision — ``resolve_approval`` — covers policy rules, standing
-    workspace grants, and the direct-chat safety baseline (expressed as the
-    subject's intrinsic requires_approval). The user-preference store is still
-    consulted as a read fallback exactly where the legacy guard consulted it
-    (workspace-less: before anything; workspace: only when a human would be
-    asked) — that shim goes away in step 5.
+    Every classified effect first crosses the non-approvable infra permission
+    boundary. READ/USE/CONTROL return after that decision; ACTION then enters
+    ``resolve_approval`` for policy rules, standing grants, direct-chat safety,
+    and HITL. Approval tokens and standing preferences therefore cannot survive
+    a role, membership, tenant-scope, or tool-binding revocation.
     """
-    action = classify_runtime_tool_action(
-        name,
-        arguments,
-        entity_id=entity_id,
-    )
-    if action is None:
-        return None
+    if classification is None:
+        from packages.core.ai.runtime.approval_classifier import (
+            resolve_runtime_workspace_file_scope,
+        )
 
-    approval_token = str(arguments.get("approval_token") or "").strip()
-    # Platform-scoped actions (resource_kind="platform") are not workspace-
-    # governed resources — no workspace policy can legitimately own or waive
-    # them — so the workspace plane must never lift their baseline safety
-    # requirement the way it can for ordinary workspace-owned capabilities.
-    # This is enforced from two sides: `platform_scoped` here keeps
-    # baseline_required True regardless of workspace_id, AND
-    # governance/approvals.py's resolve_approval separately refuses to let
-    # even an explicit workspace auto_approve_actions/capabilities rule
-    # (including a wildcard "*") short-circuit past that requirement for a
-    # resource_kind="platform" subject — so this claim is fully true, not
-    # just "usually". Everything else keeps the existing behavior: baseline
-    # only applies workspace-less, otherwise the workspace's own governance
-    # rules decide.
-    platform_scoped = getattr(action, "resource_kind", None) == "platform"
-    baseline_required = (
-        platform_scoped or not workspace_id
-    ) and runtime_requires_baseline_approval(action)
+        workspace_file_scope = await resolve_runtime_workspace_file_scope(
+            tool_name=name,
+            arguments=arguments,
+            entity_id=entity_id,
+            workspace_id=workspace_id,
+            task_id=task_id,
+        )
+        discovered_grants = getattr(
+            runtime_envelope,
+            "discovered_tool_grants",
+            None,
+        )
+        discovered = (
+            discovered_grants.metadata(name)
+            if discovered_grants is not None
+            else None
+        )
+        classification = classify_runtime_tool(
+            name,
+            arguments,
+            entity_id=entity_id,
+            workspace_id=workspace_id,
+            task_id=task_id,
+            workspace_file_scope=workspace_file_scope,
+            declared_effect=(discovered.effect if discovered is not None else None),
+        )
+    if classification.effect is RuntimeToolEffect.UNKNOWN:
+        return json.dumps({
+            "error": "blocked_by_authorization_configuration",
+            "message": classification.reason or (
+                "This tool has no declared execution-effect classification."
+            ),
+            "matched_rule": "permission.tool.classification",
+            "tool": name,
+        }, ensure_ascii=False)
+    authorization = classification.authorization
+    if authorization is None:
+        return json.dumps({
+            "error": "blocked_by_authorization_configuration",
+            "message": "Tool classification is missing hard-authorization metadata.",
+            "matched_rule": "permission.tool.classification",
+            "tool": name,
+        }, ensure_ascii=False)
 
     from packages.core.database import async_session
 
     async with async_session() as db:
+        from packages.core.services.runtime_authorization import (
+            authorize_runtime_action,
+        )
+
+        principal = getattr(runtime_envelope, "principal", None)
+        raw_kind = getattr(principal, "kind", None) if principal is not None else None
+        principal_kind = getattr(raw_kind, "value", raw_kind)
+        runtime_surface = getattr(runtime_envelope, "surface", None)
+        from packages.core.ai.runtime.envelope import runtime_effective_tool_scope
+
+        effective_scope = runtime_effective_tool_scope(
+            runtime_envelope=runtime_envelope,
+        )
+        bound_tool_names = effective_scope.searchable_tool_names() or set()
+        permission_decision = await authorize_runtime_action(
+            db,
+            entity_id=entity_id,
+            user_id=user_id or None,
+            workspace_id=workspace_id,
+            action_key=authorization.action_key,
+            capability_id=authorization.capability_id,
+            access=authorization.access,
+            principal_kind=principal_kind,
+            principal_agent_id=(
+                getattr(principal, "agent_id", None) if principal is not None else None
+            ),
+            principal_execution_user_id=(
+                getattr(principal, "execution_user_id", None)
+                if principal is not None
+                else None
+            ),
+            tool_name=name,
+            bound_tool_names=bound_tool_names,
+            conversation_id=conversation_id,
+            task_id=task_id,
+            runtime_surface=runtime_surface,
+        )
+        if not permission_decision.allowed:
+            return json.dumps({
+                "error": "blocked_by_permission",
+                "message": permission_decision.reason or "Runtime permission denied.",
+                "action_key": authorization.action_key,
+                "capability_id": authorization.capability_id,
+                "matched_rule": (
+                    permission_decision.matched_rule or AuthorizationRule.DENIED.value
+                ),
+                "tool": name,
+            }, ensure_ascii=False)
+
+        # Hard authorization is mandatory for every executable effect. Only
+        # calls with a direct side effect continue into governance/HITL.
+        if classification.effect in {
+            RuntimeToolEffect.READ_ONLY,
+            RuntimeToolEffect.ORCHESTRATOR,
+            RuntimeToolEffect.CONTROL,
+        }:
+            return None
+
+        action = classification.action
+        if action is None:  # Defensive exhaustiveness for malformed plugins.
+            return json.dumps({
+                "error": "blocked_by_authorization_configuration",
+                "message": "Action classification is missing approval metadata.",
+                "matched_rule": "permission.tool.classification",
+                "tool": name,
+            }, ensure_ascii=False)
+
+        approval_token = str(arguments.get("approval_token") or "").strip()
+        platform_scoped = getattr(action, "resource_kind", None) == "platform"
+        external_channel_reply = bool(
+            getattr(principal, "is_external", False)
+            and action.action_key == "channel.reply"
+        )
+        baseline_required = (
+            (platform_scoped or not workspace_id)
+            and not external_channel_reply
+            and runtime_requires_baseline_approval(action)
+        )
+
         if approval_token:
             result = await consume_runtime_approval(
                 db,
@@ -943,6 +1093,7 @@ async def guard_runtime_tool_action(
                 tool_name=name,
                 arguments=arguments,
                 action=action,
+                permission_decision=permission_decision,
             )
             await db.commit()
             if result is None:
@@ -954,13 +1105,15 @@ async def guard_runtime_tool_action(
             else:
                 return result
 
-        if not workspace_id:
+        if not workspace_id and not external_channel_reply:
             # Legacy parity: in direct chat the user preference is consulted
-            # for EVERY classified action, before any other gate.
+            # for every classified action after the infra permission boundary
+            # and before governance policy / HITL consent.
             preference = await runtime_approval_preference_mode(
                 db,
                 user_id=user_id,
                 action_key=action.action_key,
+                resource_id=action.resource_id,
                 capability_id=action.capability_id,
             )
             if preference == "deny":
@@ -987,46 +1140,55 @@ async def guard_runtime_tool_action(
 
             spent_credits_per_kind = await get_workspace_spent_credits_per_kind(db, workspace_id)
 
-        render = await _runtime_render_context(
-            db,
-            conversation_id=conversation_id,
-            entity_id=entity_id,
-            user_id=user_id,
-            tool_name=name,
-            arguments=arguments,
-            action=action,
-        )
-        decision = await resolve_approval(
-            db,
-            subject=ApprovalSubject(
-                entity_id=entity_id,
-                workspace_id=workspace_id,
-                action_key=action.action_key,
-                capability_id=action.capability_id,
-                resource_kind=action.resource_kind,
-                risk_level=action.risk_level,
-                kind=action.kind,
-                requires_approval=baseline_required,
-            ),
-            origin=ApprovalOrigin(
-                kind=_RUNTIME_ORIGIN_KIND,
+        async def load_render_context() -> dict[str, Any]:
+            return await _runtime_render_context(
+                db,
                 conversation_id=conversation_id,
-                # Thread the task so task-level runtime rules gate this plane
-                # too, and so task-terminal cleanup can expire these requests.
-                task_id=task_id,
-                step_id=step_id,
-                args_hash=approval_args_hash(arguments),
-                context=render,
-            ),
-            spent_credits=spent_credits_per_kind,
-            intrinsic_rule="direct_chat_baseline" if baseline_required else None,
-            intrinsic_reason=(
-                "Direct chat safety requires approval for destructive, publishing, "
-                "sending, or automation actions."
-            ) if baseline_required else None,
-        )
+                entity_id=entity_id,
+                user_id=user_id,
+                tool_name=name,
+                arguments=arguments,
+                action=action,
+            )
 
-        if decision.outcome == "allow":
+        try:
+            decision = await resolve_approval(
+                db,
+                subject=ApprovalSubject(
+                    entity_id=entity_id,
+                    workspace_id=workspace_id,
+                    action_key=action.action_key,
+                    resource_id=action.resource_id,
+                    capability_id=action.capability_id,
+                    resource_kind=action.resource_kind,
+                    risk_level=action.risk_level,
+                    kind=action.kind,
+                    requires_approval=baseline_required,
+                ),
+                origin=ApprovalOrigin(
+                    kind=_RUNTIME_ORIGIN_KIND,
+                    conversation_id=conversation_id,
+                    # Thread the task so task-level runtime rules gate this plane
+                    # too, and so task-terminal cleanup can expire these requests.
+                    task_id=task_id,
+                    args_hash=approval_args_hash(arguments),
+                    context_loader=load_render_context,
+                ),
+                permission_decision=permission_decision,
+                spent_credits=spent_credits_per_kind,
+                intrinsic_rule="direct_chat_baseline" if baseline_required else None,
+                intrinsic_reason=(
+                    "Direct chat safety requires approval for destructive, publishing, "
+                    "sending, or automation actions."
+                ) if baseline_required else None,
+            )
+        except RuntimeApprovalContinuationError as exc:
+            return _runtime_continuation_error_result(
+                tool_name=name,
+                error=exc,
+            )
+
+        if decision.outcome is ApprovalOutcome.ALLOW:
             # If the allow rests on a one-time operator grant, spend it NOW —
             # this return IS the point of irreversible proceed for the runtime
             # plane (the caller executes the tool next). Without this, a
@@ -1037,11 +1199,21 @@ async def guard_runtime_tool_action(
             await db.commit()
             return None
 
-        if decision.outcome == "deny":
-            # Hard governance block — never approvable.
+        if decision.outcome is ApprovalOutcome.DENY:
+            permission_denied = str(decision.matched_rule or "").startswith(
+                "permission."
+            )
             return json.dumps({
-                "error": "blocked_by_governance",
-                "message": decision.reason or "Workspace governance blocked this action.",
+                "error": (
+                    "blocked_by_permission"
+                    if permission_denied
+                    else "blocked_by_governance"
+                ),
+                "message": decision.reason or (
+                    "Runtime permission denied."
+                    if permission_denied
+                    else "Workspace governance blocked this action."
+                ),
                 "action_key": action.action_key,
                 "capability_id": action.capability_id,
                 "matched_rule": decision.matched_rule,
@@ -1086,7 +1258,7 @@ async def guard_runtime_tool_action(
             tool_name=name,
             arguments=arguments,
             matched_rule=decision.matched_rule,
-            render=render,
+            render=dict(decision.request.context or {}),
         )
         await db.commit()
         return payload
@@ -1126,12 +1298,33 @@ async def resolve_runtime_approval_turn(
     """Resolve a runtime approval and expose any deterministic continuation."""
     # ── unified store first: the token is a HitlRequest id ──
     req = await _load_runtime_request(
-        db, request_id=hitl_id, entity_id=entity_id, conversation_id=conversation_id,
+        db,
+        request_id=hitl_id,
+        entity_id=entity_id,
+        conversation_id=conversation_id,
+        for_update=True,
     )
     if req is not None:
         item = _runtime_request_item(req)
         is_provider = (req.context or {}).get("kind") == "provider"
-        if req.status != ApprovalStatus.PENDING:
+        normalized = normalize_approval_choice(action)
+        actionable_provider_grant = (
+            is_provider
+            and req.status == ApprovalStatus.GRANTED
+            and (
+                normalized in {
+                    APPROVAL_CHOICE_APPROVE,
+                    APPROVAL_CHOICE_ALWAYS_APPROVE,
+                }
+                or (
+                    normalized == APPROVAL_CHOICE_REJECT
+                    and not isinstance(
+                        (req.context or {}).get("provider_action_claim"), dict
+                    )
+                )
+            )
+        )
+        if req.status != ApprovalStatus.PENDING and not actionable_provider_grant:
             status_label = {"granted": "approved", "denied": "rejected"}.get(
                 req.status, req.status
             )
@@ -1139,7 +1332,27 @@ async def resolve_runtime_approval_turn(
                 f"Runtime approval {hitl_id} is already {status_label}. "
                 "Do not retry the blocked tool call."
             )
-        normalized = normalize_approval_choice(action)
+        if normalized in {
+            APPROVAL_CHOICE_APPROVE,
+            APPROVAL_CHOICE_ALWAYS_APPROVE,
+            APPROVAL_CHOICE_REJECT,
+            APPROVAL_CHOICE_REVISE,
+        }:
+            from packages.core.services.runtime_authorization import (
+                authorize_hitl_resolution,
+            )
+
+            authority = await authorize_hitl_resolution(
+                db,
+                request=req,
+                by_user_id=user_id,
+                standing=normalized == APPROVAL_CHOICE_ALWAYS_APPROVE,
+            )
+            if not authority.allowed:
+                return RuntimeApprovalResolution(
+                    authority.reason
+                    or "You do not have permission to resolve this approval."
+                )
         if normalized == APPROVAL_CHOICE_REVISE and is_provider:
             if not _provider_approval_supports_revision(
                 _provider_item_from_request(req)
@@ -1197,16 +1410,53 @@ async def resolve_runtime_approval_turn(
                         "The provider approval expired before it was confirmed. "
                         "Do not retry the blocked tool call."
                     )
+                provider_item = {
+                    **item,
+                    "kind": "provider",
+                    "provider": (req.context or {}).get("provider"),
+                    "provider_approval_id": (req.context or {}).get(
+                        "provider_approval_id"
+                    ),
+                    "continuation": continuation,
+                }
+                provider_runtime_metadata = provider_approval_runtime_metadata(
+                    provider_item
+                )
+                if provider_runtime_metadata is None:
+                    req.status = ApprovalStatus.EXPIRED.value
+                    req.resolved_reason = "approval_continuation_unavailable"
+                    req.decided_at = datetime.now(timezone.utc)
+                    await mark_runtime_hitl_request_resolved(
+                        db,
+                        conversation_id=conversation_id,
+                        hitl_id=hitl_id,
+                        choice="expired",
+                    )
+                    return RuntimeApprovalResolution(
+                        "The provider action could not be resumed because its "
+                        "exact continuation was not preserved. Please issue "
+                        "the action again."
+                    )
+                provider_runtime_metadata["provider_approval_execution"] = {
+                    "hitl_id": hitl_id,
+                    "confirmation_tool": str(
+                        continuation.get("confirmation_tool") or ""
+                    ).strip(),
+                    "retry_tool": str(
+                        continuation.get("retry_tool") or ""
+                    ).strip(),
+                }
                 provider_name = (req.context or {}).get("provider")
                 # For a provider Manor owns, "Always approve" is honored: the
                 # standing grant lands in the workspace policy auto-approve set
                 # (workspace chats) or the user preference (direct chat), and
                 # `register_provider_runtime_approval` auto-confirms future
                 # gates for the same action instead of asking again.
-                if (
+                wants_standing_grant = (
                     normalized == APPROVAL_CHOICE_ALWAYS_APPROVE
                     and _provider_supports_always_approve(provider_name)
-                ):
+                )
+                if wants_standing_grant:
                     if req.workspace_id:
                         await grant_approval(
                             db, req, by_user_id=user_id, via="chat_card_always",
@@ -1219,24 +1469,81 @@ async def resolve_runtime_approval_turn(
                         await grant_approval(
                             db, req, by_user_id=user_id, via="chat_card_always",
                         )
-                else:
-                    await grant_approval(db, req, by_user_id=user_id, via="chat_card")
+                elif req.status == ApprovalStatus.PENDING:
+                    await grant_approval(
+                        db, req, by_user_id=user_id, via="chat_card",
+                    )
+                # Keep the card actionable until the exact provider attempt
+                # reaches a durable terminal state. If storage fails before
+                # execution, another click can resume this same frozen grant;
+                # a persisted provider-action claim prevents duplicate I/O.
+                return RuntimeApprovalResolution(
+                    "[Runtime approval approved] Resume the exact provider action now.",
+                    provider_runtime_metadata,
+                )
+
+            runtime_metadata = runtime_approval_runtime_metadata(item, hitl_id)
+            if runtime_metadata is None:
+                req.status = ApprovalStatus.EXPIRED.value
+                req.resolved_reason = "approval_continuation_unavailable"
+                req.decided_at = datetime.now(timezone.utc)
                 await mark_runtime_hitl_request_resolved(
                     db,
                     conversation_id=conversation_id,
                     hitl_id=hitl_id,
-                    choice=normalized,
+                    choice="expired",
                 )
-                provider_item = {
-                    **item,
-                    "kind": "provider",
-                    "provider": (req.context or {}).get("provider"),
-                    "provider_approval_id": (req.context or {}).get("provider_approval_id"),
-                    "continuation": continuation,
-                }
                 return RuntimeApprovalResolution(
-                    "[Runtime approval approved] Resume the exact provider action now.",
-                    provider_approval_runtime_metadata(provider_item),
+                    "The approved action could not be resumed because its exact "
+                    "tool arguments were not preserved. Please issue the action again."
+                )
+
+            forced_call = runtime_metadata["forced_tool_calls"][0]
+            from packages.core.ai.runtime.tool_input_validation import (
+                validate_runtime_tool_arguments,
+            )
+            from packages.core.ai.runtime.tool_registry import (
+                runtime_tool_schema_for_actor,
+            )
+
+            registered_schema = await runtime_tool_schema_for_actor(
+                str(forced_call["name"]),
+                entity_id=entity_id,
+                user_id=user_id,
+            )
+            if registered_schema is None:
+                req.status = ApprovalStatus.EXPIRED.value
+                req.resolved_reason = "approved_tool_schema_unavailable"
+                req.decided_at = datetime.now(timezone.utc)
+                await mark_runtime_hitl_request_resolved(
+                    db,
+                    conversation_id=conversation_id,
+                    hitl_id=hitl_id,
+                    choice="expired",
+                )
+                return RuntimeApprovalResolution(
+                    "The action was not executed because its current tool schema "
+                    "is unavailable for this account. Please issue it again."
+                )
+            validation_failure = (
+                validate_runtime_tool_arguments(
+                    arguments=dict(forced_call["arguments"]),
+                    tool_schema=registered_schema,
+                )
+            )
+            if validation_failure is not None:
+                req.status = ApprovalStatus.EXPIRED.value
+                req.resolved_reason = "approved_tool_input_invalid"
+                req.decided_at = datetime.now(timezone.utc)
+                await mark_runtime_hitl_request_resolved(
+                    db,
+                    conversation_id=conversation_id,
+                    hitl_id=hitl_id,
+                    choice="expired",
+                )
+                return RuntimeApprovalResolution(
+                    "The action was not executed because its stored tool input is "
+                    f"invalid: {validation_failure.message} Please issue it again."
                 )
 
             if normalized == APPROVAL_CHOICE_ALWAYS_APPROVE:
@@ -1266,54 +1573,445 @@ async def resolve_runtime_approval_turn(
                 choice=normalized,
             )
             return RuntimeApprovalResolution(
-                runtime_approval_retry_message(item, hitl_id)
+                runtime_approval_retry_message(item, hitl_id),
+                runtime_metadata,
             )
         if normalized == APPROVAL_CHOICE_REJECT:
-            from packages.core.governance.approvals import deny_approval
+            if is_provider and req.status == ApprovalStatus.GRANTED:
+                await _reject_unclaimed_provider_runtime_approval(
+                    db,
+                    req,
+                    user_id=user_id,
+                )
+            else:
+                from packages.core.governance.approvals import deny_approval
 
-            await deny_approval(
-                db, req, by_user_id=user_id, via="chat_card",
-                reason="user rejected runtime approval",
-            )
-            await mark_runtime_hitl_request_resolved(
-                db,
-                conversation_id=conversation_id,
-                hitl_id=hitl_id,
-                choice=normalized,
-            )
+                await deny_approval(
+                    db, req, by_user_id=user_id, via="chat_card",
+                    reason="user rejected runtime approval",
+                )
+                await mark_runtime_hitl_request_resolved(
+                    db,
+                    conversation_id=conversation_id,
+                    hitl_id=hitl_id,
+                    choice=normalized,
+                )
             return RuntimeApprovalResolution(runtime_approval_rejected_message(item))
         return None
 
-    # ── tombstone: a card minted before the unified-store upgrade ──
-    # The legacy conv.meta blob is no longer a decision store. Mark the old
-    # item closed and tell the user to retry the action — the retry re-gates
-    # through resolve_approval and mints a fresh card with a request id.
-    conv = await load_runtime_approval_conversation(db, conversation_id, entity_id)
-    if not conv:
-        return None
-    approvals = runtime_approvals(conv)
-    item = approvals.get(hitl_id)
-    if not item:
-        return None
-    if item.get("status") == "pending":
-        item.update({
-            "status": "expired",
-            "expired_at": runtime_approval_now_iso(),
-            "expired_reason": "superseded_by_unified_approvals",
-        })
-        approvals[hitl_id] = item
-        set_runtime_approvals(conv, approvals)
-        await mark_runtime_hitl_request_resolved(
-            db,
-            conversation_id=conversation_id,
-            hitl_id=hitl_id,
-            choice="expired",
-        )
-    return RuntimeApprovalResolution(
-        "This approval card predates the approval-system upgrade and can no "
-        "longer be actioned. Ask the agent to retry the action — a fresh "
-        "approval card will be issued."
+    return None
+
+
+@dataclass(frozen=True)
+class ProviderRuntimeApprovalExecutionPreflight:
+    """Durable decision made immediately before provider execution."""
+
+    result: str | None = None
+    changed: bool = False
+
+
+def _provider_runtime_execution_metadata(
+    runtime_metadata: dict[str, Any] | None,
+) -> tuple[str, str, str] | None:
+    execution = (
+        runtime_metadata.get("provider_approval_execution")
+        if isinstance(runtime_metadata, dict)
+        else None
     )
+    if not isinstance(execution, dict):
+        return None
+    hitl_id = str(execution.get("hitl_id") or "").strip()
+    confirmation_tool = str(execution.get("confirmation_tool") or "").strip()
+    retry_tool = str(execution.get("retry_tool") or "").strip()
+    if not hitl_id or not confirmation_tool or not retry_tool:
+        return None
+    return hitl_id, confirmation_tool, retry_tool
+
+
+def _provider_execution_blocked_result(
+    *,
+    hitl_id: str,
+    status: str,
+    reason: str,
+) -> str:
+    return json.dumps(
+        {
+            "ok": False,
+            "error": "provider_approval_execution_blocked",
+            "status": status,
+            "approval_id": hitl_id,
+            "reason": reason,
+        },
+        ensure_ascii=False,
+    )
+
+
+async def _expire_provider_runtime_approval(
+    db,
+    req,
+    reason: str,
+    *,
+    card_choice: str = "expired",
+) -> None:
+    req.status = ApprovalStatus.EXPIRED.value
+    req.resolved_reason = reason
+    req.decided_at = datetime.now(timezone.utc)
+    req.consumed_at = None
+    from packages.core.ledger import adapters as ledger_adapters
+    from packages.core.ledger import event_types as ledger_et
+
+    await ledger_adapters.record_approval_event(
+        db,
+        req,
+        ledger_et.APPROVAL_EXPIRED,
+    )
+    await _resolve_provider_runtime_approval_card(
+        db,
+        req,
+        choice=card_choice,
+    )
+
+
+async def _reject_unclaimed_provider_runtime_approval(
+    db,
+    req,
+    *,
+    user_id: str,
+) -> None:
+    req.status = ApprovalStatus.DENIED.value
+    req.decided_by_user_id = user_id
+    req.decided_at = datetime.now(timezone.utc)
+    req.decided_via = "chat_card"
+    req.resolved_reason = "provider_approval_revoked"
+    req.consumed_at = None
+    req.reason = "user rejected runtime approval"
+    from packages.core.ledger import adapters as ledger_adapters
+    from packages.core.ledger import event_types as ledger_et
+
+    await ledger_adapters.record_approval_event(
+        db,
+        req,
+        ledger_et.APPROVAL_DENIED,
+        actor_id=user_id,
+    )
+    await _resolve_provider_runtime_approval_card(
+        db,
+        req,
+        choice=APPROVAL_CHOICE_REJECT,
+    )
+
+
+async def _resolve_provider_runtime_approval_card(
+    db,
+    req,
+    *,
+    choice: str,
+) -> None:
+    """Resolve the provider card in the same transaction as terminal state."""
+
+    conversation_id = str(req.origin_conversation_id or "").strip()
+    if not conversation_id:
+        return
+    from packages.core.services.hitl_requests import mark_hitl_request_resolved
+
+    await mark_hitl_request_resolved(
+        db,
+        conversation_id=conversation_id,
+        hitl_id=req.id,
+        choice=choice,
+    )
+
+
+def _provider_confirmation_receipt_matches(
+    receipt: Any,
+    *,
+    provider: Any,
+    provider_approval_id: Any,
+) -> bool:
+    return bool(
+        isinstance(receipt, dict)
+        and str(receipt.get("provider") or "").strip()
+        == str(provider or "").strip()
+        and str(receipt.get("provider_approval_id") or "").strip()
+        == str(provider_approval_id or "").strip()
+        and str(receipt.get("approval_token") or "").strip()
+    )
+
+
+async def prepare_provider_runtime_approval_execution(
+    db,
+    *,
+    runtime_metadata: dict[str, Any] | None,
+    entity_id: str,
+    conversation_id: str | None,
+    tool_name: str,
+    arguments: dict[str, Any] | None,
+) -> ProviderRuntimeApprovalExecutionPreflight:
+    """Persist or replay the exact provider continuation before provider I/O.
+
+    Confirmation receipts are durable, so a worker restart can reconstruct the
+    one-time provider token without confirming twice.  The external retry is
+    claimed under a row lock before its handler runs.  If the worker crashes
+    after provider I/O, that claim remains and all automatic replays fail
+    closed as an ambiguous outcome instead of repeating the side effect.
+    """
+
+    metadata = _provider_runtime_execution_metadata(runtime_metadata)
+    if metadata is None:
+        return ProviderRuntimeApprovalExecutionPreflight()
+    hitl_id, confirmation_tool, retry_tool = metadata
+    if tool_name not in {confirmation_tool, retry_tool}:
+        return ProviderRuntimeApprovalExecutionPreflight()
+
+    req = await _load_runtime_request(
+        db,
+        request_id=hitl_id,
+        entity_id=entity_id,
+        conversation_id=conversation_id,
+        for_update=True,
+    )
+    if req is None or (req.context or {}).get("kind") != "provider":
+        return ProviderRuntimeApprovalExecutionPreflight(
+            result=_provider_execution_blocked_result(
+                hitl_id=hitl_id,
+                status="invalid",
+                reason="The provider approval no longer exists in this conversation.",
+            )
+        )
+
+    context = dict(req.context or {})
+    continuation = freeze_provider_approval_request(context.get("continuation"))
+    if (
+        continuation is None
+        or str(continuation.get("confirmation_tool") or "").strip()
+        != confirmation_tool
+        or str(continuation.get("retry_tool") or "").strip() != retry_tool
+        or str(continuation.get("provider") or "").strip()
+        != str(context.get("provider") or "").strip()
+        or str(continuation.get("provider_approval_id") or "").strip()
+        != str(context.get("provider_approval_id") or "").strip()
+    ):
+        changed = False
+        if req.status == ApprovalStatus.GRANTED:
+            await _expire_provider_runtime_approval(
+                db,
+                req,
+                "provider_continuation_invalid_before_execution",
+            )
+            changed = True
+        return ProviderRuntimeApprovalExecutionPreflight(
+            result=_provider_execution_blocked_result(
+                hitl_id=hitl_id,
+                status="expired",
+                reason="The stored provider continuation is no longer valid.",
+            ),
+            changed=changed,
+        )
+
+    if req.status != ApprovalStatus.GRANTED:
+        return ProviderRuntimeApprovalExecutionPreflight(
+            result=_provider_execution_blocked_result(
+                hitl_id=hitl_id,
+                status=str(req.status),
+                reason="This provider approval is no longer executable.",
+            )
+        )
+
+    receipt = context.get("provider_confirmation_receipt")
+    receipt_matches = _provider_confirmation_receipt_matches(
+        receipt,
+        provider=context.get("provider"),
+        provider_approval_id=context.get("provider_approval_id"),
+    )
+    if tool_name == confirmation_tool:
+        if not receipt_matches:
+            return ProviderRuntimeApprovalExecutionPreflight()
+        return ProviderRuntimeApprovalExecutionPreflight(
+            result=json.dumps(
+                {
+                    "ok": True,
+                    "status": "approved",
+                    "approvalId": receipt["provider_approval_id"],
+                    "approvalToken": receipt["approval_token"],
+                },
+                ensure_ascii=False,
+            )
+        )
+
+    if not receipt_matches:
+        return ProviderRuntimeApprovalExecutionPreflight(
+            result=_provider_execution_blocked_result(
+                hitl_id=hitl_id,
+                status="unconfirmed",
+                reason="The provider confirmation receipt was not durably recorded.",
+            )
+        )
+
+    supplied_arguments = dict(arguments or {})
+    supplied_token = str(
+        supplied_arguments.pop("approvalToken", None)
+        or supplied_arguments.pop("approval_token", None)
+        or ""
+    ).strip()
+    expected_arguments = continuation.get("retry_arguments")
+    if (
+        supplied_token != str(receipt.get("approval_token") or "").strip()
+        or supplied_arguments != expected_arguments
+    ):
+        await _expire_provider_runtime_approval(
+            db,
+            req,
+            "provider_retry_payload_changed",
+        )
+        return ProviderRuntimeApprovalExecutionPreflight(
+            result=_provider_execution_blocked_result(
+                hitl_id=hitl_id,
+                status="expired",
+                reason="The provider retry no longer matches the approved action.",
+            ),
+            changed=True,
+        )
+
+    if isinstance(context.get("provider_action_claim"), dict):
+        return ProviderRuntimeApprovalExecutionPreflight(
+            result=_provider_execution_blocked_result(
+                hitl_id=hitl_id,
+                status="ambiguous",
+                reason=(
+                    "This provider action was already started. Its outcome must be "
+                    "reconciled before another attempt."
+                ),
+            )
+        )
+
+    context["provider_action_claim"] = {
+        "tool": retry_tool,
+        "args_hash": approval_args_hash(supplied_arguments),
+        "claimed_at": datetime.now(timezone.utc).isoformat(),
+    }
+    req.context = context
+    req.resolved_reason = "provider_action_claimed"
+    return ProviderRuntimeApprovalExecutionPreflight(changed=True)
+
+
+async def settle_provider_runtime_approval_execution(
+    db,
+    *,
+    runtime_metadata: dict[str, Any] | None,
+    entity_id: str,
+    conversation_id: str | None,
+    tool_name: str,
+    arguments: dict[str, Any] | None,
+    result: Any,
+) -> bool:
+    """Settle a provider HITL row at the Runtime tool boundary.
+
+    Provider-native approval is a two-call continuation: confirmation followed
+    by the exact external action.  The chat-card click grants consent, but the
+    grant is not spent until that second call actually completes.  A failed
+    confirmation or failed retry closes the one-time request so a stale grant
+    cannot be replayed.
+    """
+
+    metadata = _provider_runtime_execution_metadata(runtime_metadata)
+    if metadata is None:
+        return False
+    hitl_id, confirmation_tool, retry_tool = metadata
+    if tool_name not in {confirmation_tool, retry_tool}:
+        return False
+
+    req = await _load_runtime_request(
+        db,
+        request_id=hitl_id,
+        entity_id=entity_id,
+        conversation_id=conversation_id,
+        for_update=True,
+    )
+    if req is None or (req.context or {}).get("kind") != "provider":
+        return False
+    from packages.core.ai.runtime.streams import runtime_tool_status_for_chat
+
+    parsed_result = result if isinstance(result, dict) else None
+    result_text = (
+        result
+        if isinstance(result, str)
+        else json.dumps(result, ensure_ascii=False, default=str)
+    )
+    failed = runtime_tool_status_for_chat(result_text) == "error"
+    if parsed_result is None:
+        try:
+            parsed_result = json.loads(result_text)
+        except (TypeError, ValueError):
+            parsed_result = None
+    if isinstance(parsed_result, dict) and parsed_result.get("ok") is False:
+        failed = True
+
+    if tool_name == confirmation_tool:
+        if req.status != ApprovalStatus.GRANTED:
+            return False
+        receipt = provider_approval_confirmation_receipt(
+            tool_name,
+            arguments,
+            result,
+        )
+        context = dict(req.context or {})
+        if receipt is not None and not failed and _provider_confirmation_receipt_matches(
+            receipt,
+            provider=context.get("provider"),
+            provider_approval_id=context.get("provider_approval_id"),
+        ):
+            context["provider_confirmation_receipt"] = {
+                **receipt,
+                "confirmed_at": datetime.now(timezone.utc).isoformat(),
+            }
+            req.context = context
+            req.resolved_reason = "provider_confirmation_completed"
+            return True
+        await _expire_provider_runtime_approval(
+            db,
+            req,
+            "provider_confirmation_failed",
+        )
+        return True
+
+    if req.status != ApprovalStatus.GRANTED:
+        return False
+    context = dict(req.context or {})
+    if not isinstance(context.get("provider_action_claim"), dict):
+        if failed:
+            # Authorization, binding, or input validation can reject the
+            # continuation before the pre-I/O claim is created. Close that
+            # now-unresumable grant explicitly; no provider side effect ran.
+            await _expire_provider_runtime_approval(
+                db,
+                req,
+                "provider_action_blocked_before_execution",
+            )
+            return True
+        logger.error(
+            "Refusing to settle unclaimed provider action %s for approval %s",
+            tool_name,
+            hitl_id,
+        )
+        return False
+    if failed:
+        await _expire_provider_runtime_approval(db, req, "provider_action_failed")
+        return True
+
+    from packages.core.governance.approvals import consume_approval
+
+    await consume_approval(db, req)
+    req.resolved_reason = "provider_action_completed"
+    await _resolve_provider_runtime_approval_card(
+        db,
+        req,
+        choice=(
+            APPROVAL_CHOICE_ALWAYS_APPROVE
+            if req.decided_via == "chat_card_always"
+            else APPROVAL_CHOICE_APPROVE
+        ),
+    )
+    return True
 
 
 def _provider_hitl_data(
@@ -1412,7 +2110,8 @@ async def register_provider_runtime_approval(
     Dedup by (provider, provider_approval_id): a still-pending registration
     returns the same card; an already-decided one returns None (the provider
     approval was consumed/decided — re-registering must not re-ask)."""
-    if not isinstance(request, dict):
+    request = freeze_provider_approval_request(request)
+    if request is None:
         return None
     provider = str(request.get("provider") or "").strip()
     provider_approval_id = str(
@@ -1443,22 +2142,22 @@ async def register_provider_runtime_approval(
     )
 
     action_key = str(request.get("action_key") or f"{provider}.action")
+    resource_id = str(request.get("resource_id") or "").strip() or None
     capability_id = f"{provider}.action"
     workspace_id = getattr(conv, "workspace_id", None)
+
     # Standing grant from a previous "Always approve" on this Manor-owned
-    # provider: auto-confirm instead of asking the same question again. The
-    # provider's own per-action gate still fires — Manor just answers it with
-    # the decision the operator already made. Returning None means "no card";
-    # the caller proceeds with the provider continuation.
-    if _provider_supports_always_approve(provider) and await _provider_standing_grant(
+    # provider action: auto-confirm instead of asking the same question again.
+    # The provider's own per-action gate still fires — Manor just answers it
+    # with the decision the operator already made. Returning None means "no
+    # card"; the caller proceeds with the provider continuation.
+    if _provider_supports_always_approve(provider) and await _standing_grant(
         db,
-        entity_id=entity_id,
         workspace_id=workspace_id,
         user_id=user_id,
         action_key=action_key,
+        resource_id=resource_id,
         capability_id=capability_id,
-        policy_category=str(request.get("policy_category") or "").strip() or None,
-        provider=provider,
     ):
         return None
 
@@ -1478,6 +2177,7 @@ async def register_provider_runtime_approval(
             entity_id=entity_id,
             workspace_id=getattr(conv, "workspace_id", None),
             action_key=str(request.get("action_key") or f"{provider}.action"),
+            resource_id=resource_id,
             capability_id=f"{provider}.action",
             risk_level="high",
             kind="action",
@@ -1512,7 +2212,7 @@ async def cancel_pending_runtime_approvals(
     hitl_ids: Iterable[str] | None = None,
     reason: str = "request_stopped",
 ) -> int:
-    """Permanently close pending runtime approvals for a stopped request."""
+    """Close pending approvals and unclaimed provider grants for a stopped request."""
     wanted_ids = {
         str(item or "").strip()
         for item in (hitl_ids or [])
@@ -1531,30 +2231,56 @@ async def cancel_pending_runtime_approvals(
             HitlRequest.entity_id == entity_id,
             HitlRequest.origin_conversation_id == conversation_id,
             HitlRequest.origin_kind == _RUNTIME_ORIGIN_KIND,
-            HitlRequest.status == ApprovalStatus.PENDING,
-        )
+            HitlRequest.status.in_((
+                ApprovalStatus.PENDING.value,
+                ApprovalStatus.GRANTED.value,
+            )),
+        ).with_for_update()
     )).scalars().all()
     now_dt = datetime.now(timezone.utc)
     for row in rows:
         if wanted_ids and row.id not in wanted_ids:
             continue
+        unclaimed_provider_grant = False
+        if row.status == ApprovalStatus.GRANTED:
+            context = dict(row.context or {})
+            if (
+                context.get("kind") != "provider"
+                or isinstance(context.get("provider_action_claim"), dict)
+            ):
+                continue
+            unclaimed_provider_grant = True
         requested_by = (row.context or {}).get("requested_by")
         if user_id and requested_by and requested_by != user_id:
             continue
-        row.status = ApprovalStatus.EXPIRED.value
-        row.resolved_reason = reason
-        row.decided_at = now_dt
+        if unclaimed_provider_grant:
+            # A provider grant is still reversible until execution claims it.
+            # Reuse the strict terminal path so the ledger and visible card
+            # cannot disagree with the authorization state.
+            await _expire_provider_runtime_approval(
+                db,
+                row,
+                reason,
+                card_choice="cancelled",
+            )
+        else:
+            row.status = ApprovalStatus.EXPIRED.value
+            row.resolved_reason = reason
+            row.decided_at = now_dt
+            cancelled_ids.append(row.id)
         cancelled += 1
-        cancelled_ids.append(row.id)
 
     if not cancelled:
         return 0
-    await mark_runtime_hitl_requests_resolved(
-        db,
-        conversation_id=conversation_id,
-        hitl_ids=cancelled_ids,
-        choice="cancelled",
-    )
+    from packages.core.services.hitl_requests import mark_hitl_request_resolved
+
+    for hitl_id in cancelled_ids:
+        await mark_hitl_request_resolved(
+            db,
+            conversation_id=conversation_id,
+            hitl_id=hitl_id,
+            choice="cancelled",
+        )
     await db.flush()
     return cancelled
 
@@ -1608,28 +2334,6 @@ async def resolve_pending_runtime_approval_turn_from_reply(
         )
     )).scalars().all())
 
-    if not pending_ids:
-        # A reply may target a card minted before the unified-store upgrade
-        # (blob-only pending). Route it to the resolver so the user gets the
-        # explicit tombstone notice instead of their "approve" silently
-        # falling through to the model as free text.
-        conv = await load_runtime_approval_conversation(db, conversation_id, entity_id)
-        if conv:
-            blob_pending = [
-                hitl_id
-                for hitl_id, item in runtime_approvals(conv).items()
-                if isinstance(item, dict) and item.get("status") == "pending"
-            ]
-            if len(blob_pending) == 1:
-                return await resolve_runtime_approval_turn(
-                    db,
-                    conversation_id=conversation_id,
-                    entity_id=entity_id,
-                    user_id=user_id,
-                    hitl_id=blob_pending[0],
-                    action=choice,
-                )
-
     if len(pending_ids) != 1:
         return None
     return await resolve_runtime_approval_turn(
@@ -1652,13 +2356,18 @@ async def consume_runtime_approval(
     tool_name: str,
     arguments: dict[str, Any],
     action: RuntimeApprovalAction,
+    permission_decision: PermissionDecision,
 ) -> str | None:
     if not conversation_id:
         return json.dumps({"error": "approval_token_requires_conversation"})
 
     # ── unified store: the token is a HitlRequest id ──
     req = await _load_runtime_request(
-        db, request_id=hitl_id, entity_id=entity_id, conversation_id=conversation_id,
+        db,
+        request_id=hitl_id,
+        entity_id=entity_id,
+        conversation_id=conversation_id,
+        for_update=True,
     )
     if req is not None:
         ctx = dict(req.context or {})
@@ -1711,6 +2420,7 @@ async def consume_runtime_approval(
                 tool_name=tool_name,
                 arguments=arguments,
                 action=action,
+                permission_decision=permission_decision,
                 reason="The requested operation changed after approval. Please approve the updated content.",
                 matched_rule_hint=req.matched_rule or "approval_payload_changed",
             )
@@ -1742,9 +2452,38 @@ async def consume_runtime_approval(
         and (row.context or {}).get("args_hash") in accepted_hashes
     ]
     if len(matches) == 1:
+        # The compatibility lookup above deliberately avoids locking every
+        # granted request in the conversation. Lock the one exact candidate
+        # now and re-check it after the lock: two workers may have observed the
+        # same GRANTED snapshot, but only the first may spend it.
+        matched = await _load_runtime_request(
+            db,
+            request_id=matches[0].id,
+            entity_id=entity_id,
+            conversation_id=conversation_id,
+            for_update=True,
+        )
+        if matched is None:
+            return APPROVAL_TOKEN_IGNORED
+        matched_context = dict(matched.context or {})
+        payload_still_matches = (
+            matched.action_key == action.action_key
+            and matched_context.get("tool") == tool_name
+            and matched_context.get("args_hash") in accepted_hashes
+        )
+        if not payload_still_matches:
+            return APPROVAL_TOKEN_IGNORED
+        if matched.status != ApprovalStatus.GRANTED:
+            if matched.status == ApprovalStatus.CONSUMED:
+                return json.dumps({
+                    "error": "approval_not_granted",
+                    "status": "consumed",
+                    "approval_token": matched.id,
+                })
+            return APPROVAL_TOKEN_IGNORED
         from packages.core.governance.approvals import consume_approval
 
-        await consume_approval(db, matches[0])
+        await consume_approval(db, matched)
         return None
 
     # Unknown token, no payload match — ignore it and let the normal gate

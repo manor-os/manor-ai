@@ -84,7 +84,7 @@ async def resolve_runtime_context_blocks(
     if current_document_context:
         blocks.append(current_document_context)
 
-    voice_context = _voice_session_context_block(request)
+    voice_context = _voice_session_context_block(request, envelope)
     if voice_context:
         blocks.append(voice_context)
 
@@ -244,13 +244,10 @@ def _file_editor_current_document_context_block(
     return RuntimeContextBlock(
         kind="file_editor_current_document",
         title="Current Editor Document",
-        content="\n".join([
-            "<manor-current-document>",
-            content,
-            "</manor-current-document>",
-        ]),
+        content="Current editor document is supplied separately as untrusted user-turn data.",
         source="runtime.editor_context.current_document",
         key=str(key) if key else None,
+        include_in_prompt=False,
         metadata={
             "content_chars": len(content),
             "editor_type": editor_context.get("editor_type") or editor_context.get("editorType"),
@@ -259,15 +256,19 @@ def _file_editor_current_document_context_block(
     )
 
 
-def _voice_session_context_block(request: AIRuntimeRequest) -> RuntimeContextBlock | None:
-    if request.surface != ChatSurface.VOICE_CHAT:
+def _voice_session_context_block(
+    request: AIRuntimeRequest,
+    envelope: RuntimeEnvelope,
+) -> RuntimeContextBlock | None:
+    gateway_chat = envelope.metadata.get("voice_session_mode") == "chat_gateway"
+    if request.surface != ChatSurface.VOICE_CHAT and not gateway_chat:
         return None
     from packages.core.ai.runtime.prompt_guidance import runtime_voice_session_guidance
 
     return RuntimeContextBlock(
         kind="voice_session",
         title="Voice Session Runtime",
-        content=runtime_voice_session_guidance(),
+        content=runtime_voice_session_guidance(tool_bridge=gateway_chat),
         source="runtime.prompt_guidance.voice_session",
         key=request.conversation_id or request.user_id,
     )

@@ -17,6 +17,8 @@ from packages.core.review.service import (
     fail_review,
     latest_succeeded_review,
     mark_review_skipped,
+    renew_review_lease,
+    review_lease_is_expired,
 )
 
 __all__ = [
@@ -27,4 +29,6 @@ __all__ = [
     "fail_review",
     "latest_succeeded_review",
     "mark_review_skipped",
+    "renew_review_lease",
+    "review_lease_is_expired",
 ]

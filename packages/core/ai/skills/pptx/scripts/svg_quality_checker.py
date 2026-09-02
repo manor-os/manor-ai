@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import List, Dict, Tuple
 from collections import defaultdict
 from xml.etree import ElementTree as ET
+from defusedxml import ElementTree as SafeET
 
 try:
     from project_utils import CANVAS_FORMATS
@@ -332,7 +333,7 @@ class SVGQualityChecker:
         Returns True when the document is well-formed; False otherwise.
         """
         try:
-            ET.fromstring(content)
+            SafeET.fromstring(content)
             return True
         except ET.ParseError as e:
             result['errors'].append(
@@ -557,7 +558,7 @@ class SVGQualityChecker:
         diagrams and text without a geometric container remain untouched.
         """
         try:
-            root = ET.fromstring(content)
+            root = SafeET.fromstring(content)
         except ET.ParseError:
             return
 
@@ -706,7 +707,7 @@ class SVGQualityChecker:
         fill against the latest solid rect underneath it.
         """
         try:
-            root = ET.fromstring(content)
+            root = SafeET.fromstring(content)
         except ET.ParseError:
             return
 
@@ -1017,7 +1018,7 @@ class SVGQualityChecker:
     def _check_animation_group_ids(self, content: str, result: Dict):
         """Warn when visible top-level groups cannot be customized."""
         try:
-            root = ET.fromstring(content)
+            root = SafeET.fromstring(content)
         except ET.ParseError:
             return
 

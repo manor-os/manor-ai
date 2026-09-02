@@ -42,8 +42,6 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 
-from jsonschema import Draft202012Validator
-
 from packages.core.ai.llm_client import (
     EMPTY_USAGE,
     CreditExhaustedError,
@@ -58,13 +56,27 @@ from packages.core.ai.runtime.agentic_llm import (
     runtime_execute_agentic_round_tool_completion,
 )
 from packages.core.ai.runtime.policies import is_runtime_policy_denial
+from packages.core.ai.runtime.approval_classifier import classify_runtime_tool
+from packages.core.ai.runtime.control import (
+    RuntimeAgentCheckpoint,
+    RuntimeToolSuspension,
+    RuntimeTurnAborted,
+    is_runtime_tool_suspension,
+)
+from packages.core.ai.runtime.tool_effect_classification import RuntimeToolEffect
 from packages.core.ai.runtime.token_estimate import (
     runtime_estimate_tokens_for_text,
 )
-from packages.core.ai.runtime.streams import RUNTIME_TOOL_EXECUTOR_ERROR_PREFIX
+from packages.core.ai.runtime.streams import (
+    RUNTIME_TOOL_EXECUTOR_ERROR_PREFIX,
+    runtime_tool_allows_alternate_path,
+    runtime_tool_alternate_path_error_result,
+    runtime_tool_call_error,
+)
 from packages.core.ai.runtime.agentic_loop_prompts import (
     RUNTIME_AGENTIC_LLM_COMPACTION_PREFIX,
     runtime_agentic_auto_next_calls_message,
+    runtime_agentic_tool_error_final_prompt,
     runtime_agentic_empty_response_retry_message,
     runtime_agentic_is_structural_compaction_message,
     runtime_agentic_llm_compaction_prompt,
@@ -74,11 +86,19 @@ from packages.core.ai.runtime.agentic_loop_prompts import (
     runtime_agentic_structural_compaction_message,
     runtime_agentic_truncated_tool_call_retry_message,
 )
+from packages.core.contracts.json_schema import (
+    SchemaContractError,
+    SchemaContractValidatorFactory,
+)
+from packages.core.constants.integrations import (
+    INTEGRATION_ACCOUNT_CONTINUATION_ARGUMENT,
+    INTEGRATION_ACCOUNT_SELECTION_ARGUMENT,
+)
 
 logger = logging.getLogger(__name__)
 
 # Type for the tool executor callback
-ToolExecutor = Callable[[str, Dict[str, Any]], Awaitable[str]]
+ToolExecutor = Callable[[str, Dict[str, Any]], Awaitable[Any]]
 
 DEFAULT_MAX_ROUNDS = 200
 TOOL_RESULT_MAX_CHARS = 4000
@@ -95,8 +115,33 @@ _DUPLICATE_TOOL_RESULT_MAX_PREVIEW = 240
 _TOOL_CONTINUATION_KEY = "__manor_tool_continuation"
 _SERIAL_BROWSER_TOOL_PREFIXES = (
     "mcp__chrome__",
-    "mcp__local_browser__",
 )
+
+
+def _read_only_tools_for_alternate_path(
+    tools: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Keep only tools proven read-only after an approved route fails pre-I/O.
+
+    A different write route needs a fresh user approval.  The current turn may
+    still inspect state, search, and gather evidence instead of terminating.
+    Empty arguments intentionally make argument-dependent tools fail closed.
+    """
+
+    read_only: list[dict[str, Any]] = []
+    for schema in tools:
+        name = str(schema.get("function", {}).get("name") or "").strip()
+        if not name:
+            continue
+        try:
+            classification = classify_runtime_tool(name, {})
+        except Exception:
+            continue
+        if classification.effect is RuntimeToolEffect.READ_ONLY:
+            read_only.append(schema)
+    return read_only
+
+
 RECENT_CHAT_MESSAGES_TO_KEEP = int(
     os.environ.get("LOOP_RECENT_CHAT_MESSAGES_TO_KEEP", "12")
 )
@@ -302,12 +347,23 @@ def _with_final_response_sentinel_guidance(system_prompt: str) -> str:
 
 def _output_schema_validation_error(
     content: str | None,
-    output_schema: dict[str, Any] | None,
+    output_schema: Any,
+    *,
+    validator: Any = None,
 ) -> str | None:
     """Return a concise validation error for a final response, if any."""
 
-    if not isinstance(output_schema, dict):
+    if output_schema is None:
         return None
+    try:
+        if validator is None:
+            validator = SchemaContractValidatorFactory.build(output_schema)
+    except SchemaContractError as exc:
+        logger.error("[agentic_loop] Invalid output JSON Schema: %s", exc)
+        return f"$: invalid output contract ({exc})"
+    except Exception as exc:  # noqa: BLE001 - fail closed at the output boundary
+        logger.error("[agentic_loop] Output schema validation could not start: %s", exc)
+        return f"$: output schema validation could not run ({exc})"
     text = _strip_final_response_sentinel(content)
     schema_type = output_schema.get("type")
     accepts_plain_string = schema_type == "string" or (
@@ -323,12 +379,12 @@ def _output_schema_validation_error(
 
     try:
         errors = sorted(
-            Draft202012Validator(output_schema).iter_errors(value),
+            validator.iter_errors(value),
             key=lambda error: [str(part) for part in error.absolute_path],
         )
     except Exception as exc:
-        logger.error("[agentic_loop] Invalid output JSON Schema: %s", exc)
-        return None
+        logger.error("[agentic_loop] Output schema validation failed: %s", exc)
+        return f"$: output schema validation could not run ({exc})"
     if not errors:
         return None
 
@@ -373,6 +429,10 @@ from packages.core.ai.terminal_stops import (  # noqa: E402  (re-exported for ca
 )
 _CJK_RE = re.compile(r"[\u3400-\u9fff]")
 _MEDIA_GENERATION_KINDS = {"image", "video", "audio"}
+_KNOWN_STOP_PARENT_FAILURE_REASONS = frozenset({
+    "chrome_cli_worker_not_paired",
+    "chrome_cli_worker_unavailable",
+})
 
 
 @dataclass
@@ -431,6 +491,34 @@ def _tool_call_name(tool_call: dict[str, Any]) -> str:
 def _tool_call_args(tool_call: dict[str, Any]) -> dict[str, Any]:
     args = tool_call.get("arguments")
     return args if isinstance(args, dict) else {}
+
+
+def _strip_inapplicable_integration_continuations(
+    tool_calls: list[dict[str, Any]],
+) -> None:
+    """Drop model-invented MCP cursors from single-account reads.
+
+    Continuation tokens are meaningful only for an explicit all-account call.
+    Programmatic callers remain fail-closed in the MCP dispatcher; this narrow
+    normalization applies only to model-produced tool calls before execution.
+    """
+
+    for tool_call in tool_calls:
+        if not _tool_call_name(tool_call).startswith("mcp__"):
+            continue
+        arguments = tool_call.get("arguments")
+        if not isinstance(arguments, dict):
+            continue
+        continuation = str(
+            arguments.get(INTEGRATION_ACCOUNT_CONTINUATION_ARGUMENT) or ""
+        ).strip()
+        selection = str(
+            arguments.get(INTEGRATION_ACCOUNT_SELECTION_ARGUMENT) or ""
+        ).strip().lower()
+        if continuation and selection != "all":
+            normalized = dict(arguments)
+            normalized.pop(INTEGRATION_ACCOUNT_CONTINUATION_ARGUMENT, None)
+            tool_call["arguments"] = normalized
 
 
 def _json_object_from_tool_result(result: Any) -> dict[str, Any] | None:
@@ -535,6 +623,13 @@ def _detect_terminal_tool_result(
         for tool_call, result in results:
             if not _tool_call_matches_terminal_rule(tool_call, rule):
                 continue
+            if runtime_tool_call_error(str(result)) is not None:
+                logger.warning(
+                    "[agentic_loop] terminal policy matched failed tool %s; "
+                    "returning the error to the model instead of ending the loop",
+                    _tool_call_name(tool_call),
+                )
+                continue
             if is_runtime_policy_denial(result):
                 # The rule matches on the tool NAME, so a call the runtime
                 # refused used to end the loop as a success anyway — the
@@ -560,20 +655,154 @@ def _detect_stop_parent_tool_result(
         parsed = _json_object_from_tool_result(result)
         if not parsed or not parsed.get("stop_parent"):
             continue
-        content = str(parsed.get("content") or parsed.get("message") or "")
+        content = str(
+            parsed.get("content")
+            or parsed.get("message")
+            or parsed.get("error")
+            or parsed.get("summary")
+            or ""
+        )
         if not content:
             content = _localized_policy_text(parsed.get("notice"), user_message)
+        stop_reason = str(parsed.get("stop_reason") or SKILL_TERMINAL_STOP_REASON)
+        nested_control = (
+            parsed.get("control") if isinstance(parsed.get("control"), dict) else {}
+        )
+        nested_tool_error = nested_control.get("kind") == "tool_error"
+        nested_error_reason = str(
+            nested_control.get("error_reason") or ""
+        ).strip()
+        provider = (
+            "chrome"
+            if stop_reason in _KNOWN_STOP_PARENT_FAILURE_REASONS
+            else str(
+                nested_control.get("blocked_capability")
+                or parsed.get("server")
+                or ""
+            ).strip()
+        )
+        tool_error = runtime_tool_call_error(str(result))
+        is_failure = bool(
+            tool_error
+            or nested_tool_error
+            or parsed.get("terminal_failure")
+            or stop_reason in _KNOWN_STOP_PARENT_FAILURE_REASONS
+        )
+        setup_url = ""
+        requested_setup_url = str(
+            parsed.get("setup_url")
+            or nested_control.get("setup_url")
+            or ""
+        ).strip()
+        if provider and requested_setup_url:
+            from packages.core.ai.runtime.integration_setup_links import (
+                runtime_integration_setup_link,
+            )
+
+            expected_setup_url = runtime_integration_setup_link(provider).get(
+                "setup_url", ""
+            )
+            if requested_setup_url == expected_setup_url:
+                setup_url = expected_setup_url
         control = {
-            "terminal": True,
+            "terminal": not is_failure,
             "content": content,
-            "stop_reason": str(parsed.get("stop_reason") or SKILL_TERMINAL_STOP_REASON),
-            "stop_parent": True,
+            "stop_reason": stop_reason,
+            "stop_parent": not is_failure,
             "notice_key": parsed.get("notice_key"),
             "replace_visible_text": bool(parsed.get("replace_visible_text", True)),
             "source_tool": _tool_call_name(tool_call),
+            "provider": provider or None,
+            "blocked_capability": (
+                nested_control.get("blocked_capability")
+                or (provider if setup_url else None)
+            ),
+            "setup_url": setup_url or None,
         }
+        for key in ("terminal_failure", "retryable"):
+            if key in parsed:
+                control[key] = parsed[key]
+            elif key in nested_control:
+                control[key] = nested_control[key]
+        if is_failure:
+            control["tool_error"] = tool_error or content or stop_reason
+            control["tool_error_reason"] = nested_error_reason or stop_reason
+            if not (
+                control.get("terminal_failure") is True
+                and control.get("source_tool") == "invoke_skill"
+            ):
+                control["summarize_with_model"] = True
         return {key: value for key, value in control.items() if value is not None}
     return None
+
+
+def _terminal_control_error(control: dict[str, Any]) -> str | None:
+    """Return a concrete error only for an explicit terminal failure."""
+
+    if control.get("terminal_failure") is not True:
+        return None
+    return str(
+        control.get("content")
+        or control.get("stop_reason")
+        or "terminal_tool_failure"
+    )
+
+
+def _tool_error_final_content(
+    content: str,
+    control: dict[str, Any],
+    user_message: "str | list[dict]",
+) -> str:
+    """Keep the model summary while guaranteeing its trusted setup action."""
+
+    final_content = str(content or "").strip() or str(control.get("content") or "").strip()
+    setup_url = str(control.get("setup_url") or "").strip()
+    if setup_url and f"]({setup_url})" not in final_content:
+        provider = str(control.get("provider") or "integration").strip()
+        label = (
+            f"打开 {provider} 设置"
+            if _CJK_RE.search(_message_text(user_message))
+            else f"Open {provider} settings"
+        )
+        final_content = f"{final_content}\n\n[{label}]({setup_url})".strip()
+    return final_content
+
+
+def _tool_error_completion_control(
+    terminal_control: dict[str, Any],
+) -> dict[str, Any]:
+    """Expose a failed tool without propagating terminal child-loop control."""
+
+    control = {
+        "kind": "tool_error",
+        "blocked_capability": terminal_control.get("blocked_capability"),
+        "error_reason": (
+            terminal_control.get("tool_error_reason")
+            or terminal_control.get("stop_reason")
+        ),
+        "source_tool": terminal_control.get("source_tool"),
+        "source_tools": terminal_control.get("source_tools"),
+        "setup_url": terminal_control.get("setup_url"),
+        "replace_visible_text": bool(
+            terminal_control.get("replace_visible_text", True)
+        ),
+    }
+    return {key: value for key, value in control.items() if value is not None}
+
+
+def _consecutive_tool_error_summary_control(
+    results: list[tuple[dict[str, Any], Any]],
+) -> dict[str, Any]:
+    source_tools = [
+        _tool_call_name(tool_call)
+        for tool_call, result in results
+        if runtime_tool_call_error(str(result)) is not None
+    ]
+    return {
+        "stop_reason": "consecutive_tool_errors",
+        "source_tools": [name for name in source_tools if name],
+        "replace_visible_text": True,
+    }
 
 
 def _media_generation_default_notice(kind: str, user_message: "str | list[dict]") -> str:
@@ -596,6 +825,8 @@ def _detect_forced_media_generation_result(
     notices: list[str] = []
     for tool_call, result in results:
         if _tool_call_name(tool_call) != "generate_file":
+            return None
+        if runtime_tool_call_error(str(result)) is not None:
             return None
 
         args = _tool_call_args(tool_call)
@@ -636,9 +867,18 @@ def _detect_forced_media_generation_result(
 
 
 def _requires_serial_tool_execution(tool_name: str) -> bool:
-    """Stateful local browser tools share one visible page and must not race."""
+    """Stateful tools and suspendable skills must not race."""
     name = str(tool_name or "")
-    return name.startswith(_SERIAL_BROWSER_TOOL_PREFIXES) or name.endswith("__browser_action")
+    return (
+        name == "invoke_skill"
+        # Workspace Architect tools share one mutable WorkspaceDraft JSON
+        # document. Serializing the round prevents concurrent read/modify/write
+        # calls (especially multi-service semantic matching) from losing fields.
+        or name.startswith("ws_")
+        or name.startswith("sandbox_")
+        or name.startswith(_SERIAL_BROWSER_TOOL_PREFIXES)
+        or name.endswith("__browser_action")
+    )
 
 
 # Intent->tool-path memory (tool discovery v2, spec §A3): record which MCP
@@ -799,24 +1039,26 @@ def _credit_exhausted_result(
 
 
 def _billing_settlement_failed_result(
-    error: Exception,
+    _exc: Exception,
     *,
     messages: List[Dict[str, Any]],
     usage: Dict[str, Any],
     rounds: int,
     tool_calls_made: List[str],
 ) -> AgenticResult:
+    """Fail closed when completed LLM usage cannot be settled."""
     return AgenticResult(
         content=(
-            "We could not record the usage for this response safely. "
-            "Further AI work has been paused; please contact support."
+            "Sorry, this request completed but its credit usage could not be finalized. "
+            "Please try again shortly."
         ),
         messages=messages,
         usage=usage,
         rounds=rounds,
         tool_calls_made=tool_calls_made,
-        stop_reason="billing_settlement_failed",
-        error=str(error),
+        stop_reason="error",
+        error="billing_settlement_failed",
+        error_detail={"message": "Unable to finalize credit usage."},
     )
 
 
@@ -854,7 +1096,7 @@ def _auto_tool_calls_from_result(tool_result: dict[str, Any], loaded_tool_names:
         }]
     mode = str(tool_result.get("tool_mode") or "")
     ai_guided_recovery = (
-        mode == "ai_guided_local_browser"
+        mode == "ai_guided_browser"
         or status == "recovery_allowed"
         or tool_result.get("recovery_allowed") is True
     )
@@ -873,6 +1115,27 @@ def _auto_tool_calls_from_result(tool_result: dict[str, Any], loaded_tool_names:
             args = {}
         calls.append({"name": name, "arguments": args})
     return calls
+
+
+def _invoke_skill_schema_load_names(tool_result: dict[str, Any]) -> list[str]:
+    """Return the narrow schema handoff admitted by a Sandbox Skill result.
+
+    The Skill runtime emits this payload only after it creates a sandbox and
+    grants ``sandbox`` on the active Runtime envelope.  Keep the accepted set
+    fixed so a Skill result cannot load unrelated first-party tools.
+    """
+
+    if (
+        str(tool_result.get("status") or "") != "sandbox_ready"
+        or not str(tool_result.get("sandbox_id") or "").strip()
+    ):
+        return []
+    requested = {
+        str(name).strip()
+        for name in (tool_result.get("loaded_tools") or ())
+        if str(name or "").strip()
+    }
+    return ["sandbox"] if "sandbox" in requested else []
 
 
 def _pop_tool_continuation(args: dict[str, Any]) -> dict[str, Any] | None:
@@ -930,8 +1193,7 @@ def _retry_call_after_tool_continuation(
         else {}
     )
     retry_args = dict(args)
-    argument_token_key = str(continuation.get("argument_token_key"))
-    retry_args[argument_token_key] = token
+    retry_args[str(continuation.get("argument_token_key"))] = token
     return {"name": name, "arguments": retry_args}
 
 
@@ -1632,17 +1894,52 @@ def _compact_search_tools_result_for_context(search_result: dict, loaded_tool_na
     of prompt tokens, especially when search_tools returns 5+ matches.
     """
     matches = search_result.get("matches") or []
-    matched_names = [
+    matched_tool_names = [
         str(match.get("name") or "")
         for match in matches
-        if isinstance(match, dict) and match.get("name")
+        if isinstance(match, dict)
+        and match.get("name")
+        and match.get("kind") != "skill"
     ]
     compact: dict[str, Any] = {
         "query": search_result.get("query"),
-        "matched_tools": matched_names[:20],
+        "matched_tools": matched_tool_names[:20],
         "loaded_tools": loaded_tool_names[:20],
     }
-    # tool_discovery_v2 (B1): servers[] is already a compact summary
+    for key in (
+        "error",
+        "message",
+        "matched_rule",
+        "action_key",
+        "capability_id",
+        "tool",
+    ):
+        if key in search_result:
+            compact[key] = search_result[key]
+    matched_skills = [
+        {
+            key: match[key]
+            for key in (
+                "name",
+                "skill_id",
+                "slug",
+                "display_name",
+                "description",
+                "source",
+                "category",
+                "invoke_with",
+                "capability_role",
+                "companion_for",
+                "load_before_use",
+            )
+            if key in match
+        }
+        for match in matches
+        if isinstance(match, dict) and match.get("kind") == "skill"
+    ][:20]
+    if matched_skills:
+        compact["matched_skills"] = matched_skills
+    # Tool Discovery v2 (B1): servers[] is already a compact summary
     # ({key, name, matched_tools, top_tools}, <=8 servers) — keep it as-is
     # so the model sees which server groups matched, not just a flat tool
     # list. suppressed_mcp explains WHY a strongly-related server's tools
@@ -1677,11 +1974,25 @@ def _compact_search_tools_result_for_context(search_result: dict, loaded_tool_na
                 "execution_mode": option.get("execution_mode"),
                 "reason": option.get("reason"),
                 "default_account_id": option.get("default_account_id"),
+                "requires_explicit_account": bool(
+                    option.get("requires_explicit_account")
+                ),
                 "account_options": (option.get("account_options") or [])[:20],
                 "matched_tools": (option.get("matched_tools") or [])[:3],
             }
             for option in mcp_options[:8]
             if isinstance(option, dict)
+        ]
+    integration_setup = search_result.get("integration_setup") or []
+    if integration_setup:
+        compact["integration_setup"] = [
+            {
+                key: item[key]
+                for key in ("setup_url", "setup_hint")
+                if key in item
+            }
+            for item in integration_setup[:10]
+            if isinstance(item, dict)
         ]
     if search_result.get("hint"):
         compact["hint"] = search_result["hint"]
@@ -2257,16 +2568,6 @@ def _compact_chrome_browser_result_for_context(
     compacted_str = json.dumps(compacted, ensure_ascii=False, default=str)
     if len(compacted_str) <= max_chars:
         return compacted_str
-    if semantic_ref_floor > 0:
-        compacted = _build_minimal_chrome_browser_result(
-            tool_name,
-            parsed,
-            digest=digest,
-            semantic_ref_floor=0,
-        )
-        compacted_str = json.dumps(compacted, ensure_ascii=False, default=str)
-        if len(compacted_str) <= max_chars:
-            return compacted_str
     compacted = _build_ultra_minimal_chrome_action_result(tool_name, parsed, digest=digest)
     if compacted is not None:
         compacted_str = json.dumps(compacted, ensure_ascii=False, default=str)
@@ -2521,6 +2822,7 @@ def _compact_minimal_chrome_candidate_for_list(list_key: str, candidate: dict[st
         return _compact_chrome_candidate_with_keys(
             candidate,
             (
+                "ref",
                 "node_id",
                 "label",
                 "role",
@@ -2541,11 +2843,11 @@ def _compact_minimal_chrome_candidate_for_list(list_key: str, candidate: dict[st
     if list_key == "dialog_candidates":
         return _compact_minimal_chrome_dialog_candidate(candidate)
     if list_key == "upload_candidates":
-        return _compact_chrome_candidate_with_keys(candidate, ("node_id", "selector", "label", "supported"), string_chars=80)
+        return _compact_chrome_candidate_with_keys(candidate, ("ref", "node_id", "selector", "label", "supported"), string_chars=80)
     if list_key == "submit_candidates":
-        return _compact_chrome_candidate_with_keys(candidate, ("node_id", "label", "disabled"), string_chars=80)
+        return _compact_chrome_candidate_with_keys(candidate, ("ref", "node_id", "label", "disabled"), string_chars=80)
     if list_key == "node_candidates":
-        return _compact_chrome_candidate_with_keys(candidate, ("kind", "node_id", "label"), string_chars=80)
+        return _compact_chrome_candidate_with_keys(candidate, ("kind", "ref", "node_id", "label"), string_chars=80)
     if list_key == "next_actions":
         return _compact_chrome_candidate_with_keys(
             candidate,
@@ -2555,6 +2857,7 @@ def _compact_minimal_chrome_candidate_for_list(list_key: str, candidate: dict[st
                 "action",
                 "candidate_kind",
                 "blocker_kind",
+                "ref",
                 "node_id",
                 "selector",
                 "label",
@@ -2643,7 +2946,7 @@ def _compact_minimal_chrome_form_candidate(candidate: dict[str, Any]) -> dict[st
         compacted["invalid_fields"] = [
             _compact_chrome_candidate_with_keys(
                 item,
-                ("kind", "label", "node_id", "name", "validation_message", "validity_flags"),
+                ("kind", "label", "ref", "node_id", "name", "validation_message", "validity_flags"),
                 string_chars=120,
             )
             for item in invalid_fields[:1]
@@ -2652,7 +2955,7 @@ def _compact_minimal_chrome_form_candidate(candidate: dict[str, Any]) -> dict[st
     missing_required_fields = candidate.get("missing_required_fields")
     if isinstance(missing_required_fields, list):
         compacted["missing_required_fields"] = [
-            _compact_chrome_candidate_with_keys(item, ("kind", "label", "selector", "node_id", "name"), string_chars=90)
+            _compact_chrome_candidate_with_keys(item, ("kind", "label", "selector", "ref", "node_id", "name"), string_chars=90)
             for item in missing_required_fields[:1]
             if isinstance(item, dict)
         ]
@@ -2669,6 +2972,7 @@ def _compact_minimal_chrome_form_candidate(candidate: dict[str, Any]) -> dict[st
             _compact_chrome_candidate_with_keys(
                 item,
                 (
+                    "ref",
                     "node_id",
                     "label",
                     "name",
@@ -2706,7 +3010,7 @@ def _compact_minimal_chrome_dialog_candidate(candidate: dict[str, Any]) -> dict[
     upload_targets = candidate.get("upload_targets")
     if isinstance(upload_targets, list):
         compacted["upload_targets"] = [
-            _compact_chrome_candidate_with_keys(item, ("selector", "node_id", "label", "supported", "required"), string_chars=100)
+            _compact_chrome_candidate_with_keys(item, ("selector", "ref", "node_id", "label", "supported", "required"), string_chars=100)
             for item in upload_targets[:2]
             if isinstance(item, dict)
         ]
@@ -2715,7 +3019,7 @@ def _compact_minimal_chrome_dialog_candidate(candidate: dict[str, Any]) -> dict[
         compacted["next_actions"] = [
             _compact_chrome_candidate_with_keys(
                 item,
-                ("rank", "tool", "action", "candidate_kind", "node_id", "selector", "label", "reason"),
+                ("rank", "tool", "action", "candidate_kind", "ref", "node_id", "selector", "label", "reason"),
                 string_chars=100,
             )
             for item in next_actions[:3]
@@ -3012,12 +3316,26 @@ def _build_ultra_minimal_chrome_action_result(
             "candidate_sources",
         )
     )
-    if state_hint is None and not has_recovery:
+    has_actionable_candidates = any(
+        isinstance(parsed.get(key), list) and bool(parsed.get(key))
+        for key in (
+            "next_actions",
+            "input_candidates",
+            "dialog_candidates",
+            "submit_candidates",
+            "upload_candidates",
+        )
+    )
+    if state_hint is None and not has_recovery and not has_actionable_candidates:
         return None
 
     compacted: dict[str, Any] = {}
     for key in (
         "ok",
+        "status",
+        "snapshot_id",
+        "tabId",
+        "url",
         "tool",
         "reason",
         "missing_parameter",
@@ -3033,6 +3351,26 @@ def _build_ultra_minimal_chrome_action_result(
                 string_chars=80,
                 nested_count=6 if key == "candidate_sources" else 4 if key == "target_resolution" else 1,
             )
+    priority_identities = _chrome_context_priority_identities(parsed)
+    for key in (
+        "next_actions",
+        "input_candidates",
+        "dialog_candidates",
+        "submit_candidates",
+        "upload_candidates",
+    ):
+        value = parsed.get(key)
+        if not isinstance(value, list):
+            continue
+        selected = _select_chrome_candidates(
+            value,
+            limit=1,
+            priority_identities=priority_identities,
+        )
+        if selected:
+            compacted[key] = [
+                _compact_minimal_chrome_candidate_for_list(key, selected[0])
+            ]
     if state_hint is not None and "tool" not in compacted and "action" in state_hint:
         compacted["tool"] = _compact_chrome_value(state_hint.get("action"), string_chars=80, nested_count=1)
     post_action_state = parsed.get("post_action_page_state")
@@ -3314,6 +3652,8 @@ async def agentic_loop(
     tools: List[Dict[str, Any]],
     tool_executor: ToolExecutor,
     model: Optional[str] = None,
+    final_model: Optional[str] = None,
+    final_metadata: Optional[Dict[str, Any]] = None,
     temperature: float = 0.7,
     max_tokens: Optional[int] = None,
     max_rounds: int = DEFAULT_MAX_ROUNDS,
@@ -3330,6 +3670,9 @@ async def agentic_loop(
     terminal_tool_result_policy: Optional[Dict[str, Any]] = None,
     output_schema: Optional[Dict[str, Any]] = None,
     is_cancelled: Optional[Callable[[], Any]] = None,
+    runtime_run_id: Optional[str] = None,
+    resume_checkpoint: Optional[Dict[str, Any]] = None,
+    runtime_cancel_checker: Optional[Callable[[], Awaitable[bool]]] = None,
 ) -> AgenticResult:
     """
     Run an agentic loop: call the LLM with tools, execute any requested tools,
@@ -3350,6 +3693,10 @@ async def agentic_loop(
         dispatch (subsystem registry, file I/O, web search, etc.).
     model : str, optional
         LLM model override. Defaults to env config.
+    final_model : str, optional
+        Model used only by the forced tool-free synthesis after ``max_rounds``.
+        This supports bounded model cascades where evidence gathering uses a
+        value model and final composition uses a higher-quality model.
     temperature : float
         LLM temperature. Default 0.7.
     max_rounds : int
@@ -3386,22 +3733,34 @@ async def agentic_loop(
         metadata = dict(metadata)
         metadata.setdefault("_resolved_model", model)
 
-    # Build initial message list
-    messages: List[Dict[str, Any]] = []
-    messages.append({"role": "system", "content": system_prompt})
-    if initial_messages:
-        messages.extend(initial_messages)
-    messages.append({"role": "user", "content": user_message})
-
-    total_usage: Dict[str, Any] = dict(EMPTY_USAGE)
-    tool_calls_made: List[str] = []
-    rounds = 0
+    checkpoint = (
+        RuntimeAgentCheckpoint.from_dict(resume_checkpoint)
+        if isinstance(resume_checkpoint, dict)
+        else None
+    )
+    if checkpoint is None:
+        messages: List[Dict[str, Any]] = [{"role": "system", "content": system_prompt}]
+        if initial_messages:
+            messages.extend(initial_messages)
+        messages.append({"role": "user", "content": user_message})
+        total_usage: Dict[str, Any] = dict(EMPTY_USAGE)
+        tool_calls_made: List[str] = []
+        rounds = 0
+    else:
+        messages = [dict(message) for message in checkpoint.messages]
+        total_usage = dict(EMPTY_USAGE)
+        total_usage.update(checkpoint.usage)
+        tool_calls_made = list(checkpoint.tool_calls_made)
+        rounds = checkpoint.rounds
     consecutive_truncations = 0
     consecutive_tool_errors = 0
     consecutive_empty_llm_responses = 0
-    seen_tool_result_digests: dict[str, str] = {}
+    seen_tool_result_digests: dict[str, str] = (
+        dict(checkpoint.seen_tool_result_digests) if checkpoint is not None else {}
+    )
     seen_auto_tool_calls: set[str] = set()
     pending_browser_visual_observations: list[dict[str, Any]] = []
+    pending_tool_error_summary: dict[str, Any] | None = None
     output_schema_retries = 0
     force_output_schema_repair = False
     MAX_CONSECUTIVE_TOOL_ERRORS = 10
@@ -3410,6 +3769,37 @@ async def agentic_loop(
         if max_tokens is not None
         else {}
     )
+
+    output_validator = None
+    if output_schema is not None:
+        try:
+            output_validator = SchemaContractValidatorFactory.build(output_schema)
+        except SchemaContractError as exc:
+            validation_error = f"$: invalid output contract ({exc})"
+            logger.error("[agentic_loop] Invalid output JSON Schema: %s", exc)
+            return AgenticResult(
+                content="",
+                messages=messages,
+                usage=total_usage,
+                rounds=rounds,
+                tool_calls_made=tool_calls_made,
+                stop_reason="error",
+                error="output_schema_validation_failed",
+                error_detail={"validation_error": validation_error},
+            )
+        except Exception as exc:  # noqa: BLE001 - fail before provider effects
+            validation_error = f"$: output schema validation could not run ({exc})"
+            logger.error("[agentic_loop] Output schema validation could not start: %s", exc)
+            return AgenticResult(
+                content="",
+                messages=messages,
+                usage=total_usage,
+                rounds=rounds,
+                tool_calls_made=tool_calls_made,
+                stop_reason="error",
+                error="output_schema_validation_failed",
+                error_detail={"validation_error": validation_error},
+            )
 
     try:
         mark_byok_from_metadata(metadata)
@@ -3424,15 +3814,35 @@ async def agentic_loop(
             tool_calls_made=tool_calls_made,
         )
 
+    def _tool_executor_args(tool_call: dict[str, Any], attempt: int) -> dict[str, Any]:
+        public_args = tool_call.get("arguments")
+        arguments = dict(public_args) if isinstance(public_args, dict) else {}
+        if runtime_run_id:
+            arguments.update(
+                {
+                    "_runtime_run_id_from_context": runtime_run_id,
+                    "_runtime_tool_call_id_from_context": str(tool_call.get("id") or ""),
+                    "_runtime_tool_attempt_from_context": attempt,
+                }
+            )
+        return arguments
+
     async def _cancel_requested() -> bool:
-        if is_cancelled is None:
-            return False
-        try:
-            result = is_cancelled()
-            return bool(await result) if inspect.isawaitable(result) else bool(result)
-        except Exception:
-            logger.warning("[agentic_loop] cancellation check failed", exc_info=True)
-            return False
+        for checker, label in (
+            (is_cancelled, "Chat cancellation check failed"),
+            (runtime_cancel_checker, "Runtime cancellation check failed"),
+        ):
+            if checker is None:
+                continue
+            try:
+                result = checker()
+                if inspect.isawaitable(result):
+                    result = await result
+                if bool(result):
+                    return True
+            except Exception:
+                logger.warning(label, exc_info=True)
+        return False
 
     def _cancelled_result() -> AgenticResult:
         return AgenticResult(
@@ -3443,9 +3853,182 @@ async def agentic_loop(
             tool_calls_made=tool_calls_made,
             stop_reason="cancelled",
             error="chat_turn_cancelled",
+            control={"kind": "cancelled", "reason": "user_cancelled"},
         )
 
-    while rounds < max_rounds:
+    async def _execute_runtime_tool_call(
+        tool_call: dict[str, Any],
+        *,
+        attempt: int,
+    ) -> tuple[dict[str, Any], Any, float]:
+        name = str(tool_call.get("name") or "")
+        public_args = tool_call.get("arguments")
+        callback_args = dict(public_args) if isinstance(public_args, dict) else {}
+        if on_tool_start:
+            try:
+                on_tool_start(name, callback_args)
+            except Exception:
+                pass
+
+        t0 = time.perf_counter()
+        try:
+            result = await tool_executor(name, _tool_executor_args(tool_call, attempt))
+        except RuntimeTurnAborted as exc:
+            if not exc.allow_alternate_path:
+                raise
+            result = runtime_tool_alternate_path_error_result(str(exc))
+            logger.warning(
+                "[agentic_loop] Approved path %s failed before external I/O; "
+                "continuing with read-only alternate paths: %s",
+                name,
+                exc,
+            )
+        except Exception as exc:
+            result = f"{RUNTIME_TOOL_EXECUTOR_ERROR_PREFIX} ({name}): {exc}"
+            logger.warning("[agentic_loop] Tool %s raised: %s", name, exc)
+        duration_ms = (time.perf_counter() - t0) * 1000
+        if is_runtime_tool_suspension(result):
+            return tool_call, result, duration_ms
+
+        visual_observation, safe_result = _browser_screenshot_observation(name, result)
+        if visual_observation is None:
+            visual_observation, safe_result = _file_image_observation(name, result)
+        if visual_observation is not None:
+            pending_browser_visual_observations.append(visual_observation)
+        if on_tool_end:
+            try:
+                try:
+                    on_tool_end(name, safe_result, duration_ms, callback_args)
+                except TypeError:
+                    on_tool_end(name, safe_result)
+            except Exception:
+                pass
+        return tool_call, safe_result, duration_ms
+
+    def _append_checkpoint_tool_result(
+        tool_call: dict[str, Any],
+        result: Any,
+        *,
+        record_call: bool = True,
+    ) -> None:
+        if record_call:
+            tool_calls_made.append(str(tool_call.get("name") or ""))
+        result_str = _compact_tool_result_for_context(
+            str(tool_call.get("name") or ""),
+            str(result) if result is not None else "",
+            TOOL_RESULT_MAX_CHARS,
+        )
+        messages.append(
+            {
+                "role": "tool",
+                "tool_call_id": str(tool_call.get("id") or ""),
+                "content": result_str,
+            }
+        )
+
+    def _waiting_result(
+        suspension: RuntimeToolSuspension,
+        *,
+        pending_tool_call: dict[str, Any],
+        remaining_tool_calls: list[dict[str, Any]],
+        pending_attempt: int,
+        disable_followup_tools: bool = False,
+        tool_continuations: dict[str, dict[str, Any]] | None = None,
+    ) -> AgenticResult:
+        durable_checkpoint = RuntimeAgentCheckpoint(
+            messages=[dict(message) for message in messages],
+            usage=dict(total_usage),
+            rounds=rounds,
+            tool_calls_made=list(tool_calls_made),
+            pending_tool_call=dict(pending_tool_call),
+            remaining_tool_calls=[dict(item) for item in remaining_tool_calls],
+            pending_attempt=pending_attempt,
+            seen_tool_result_digests=dict(seen_tool_result_digests),
+            disable_followup_tools=disable_followup_tools,
+            tool_continuations=dict(tool_continuations or {}),
+        )
+        control = suspension.to_dict()
+        control["checkpoint"] = durable_checkpoint.to_dict()
+        return AgenticResult(
+            content="",
+            messages=messages,
+            usage=total_usage,
+            rounds=rounds,
+            tool_calls_made=tool_calls_made,
+            stop_reason="waiting_resource",
+            control=control,
+        )
+
+    if checkpoint is not None:
+        # The checkpoint already owns the pending and remaining calls from the
+        # original turn. Runtime metadata is rebuilt on every worker resume, so
+        # retaining its forced calls would execute the same request twice.
+        forced_tool_calls = None
+        resume_calls = [checkpoint.pending_tool_call, *checkpoint.remaining_tool_calls]
+        resumed_auto_tool_calls: list[dict[str, Any]] = []
+        resumed_calls_allow_alternate_path = bool(resume_calls)
+        loaded_tool_names = {t.get("function", {}).get("name") for t in tools}
+        for index, tool_call in enumerate(resume_calls):
+            if await _cancel_requested():
+                return _cancelled_result()
+            attempt = checkpoint.pending_attempt + 1 if index == 0 else 1
+            _, result, _ = await _execute_runtime_tool_call(tool_call, attempt=attempt)
+            if isinstance(result, RuntimeToolSuspension):
+                return _waiting_result(
+                    result,
+                    pending_tool_call=tool_call,
+                    remaining_tool_calls=resume_calls[index + 1 :],
+                    pending_attempt=attempt,
+                    disable_followup_tools=checkpoint.disable_followup_tools,
+                    tool_continuations=checkpoint.tool_continuations,
+                )
+            _append_checkpoint_tool_result(tool_call, result)
+            resumed_calls_allow_alternate_path = (
+                resumed_calls_allow_alternate_path
+                and runtime_tool_allows_alternate_path(str(result))
+            )
+            continuation = checkpoint.tool_continuations.get(
+                str(tool_call.get("id") or "")
+            )
+            result_text = str(result or "").lstrip()
+            if result_text.startswith("{"):
+                try:
+                    tool_result = json.loads(result_text)
+                except (json.JSONDecodeError, TypeError):
+                    tool_result = None
+                if isinstance(tool_result, dict):
+                    retry_call = _retry_call_after_tool_continuation(
+                        tool_result,
+                        continuation,
+                        loaded_tool_names,
+                    )
+                    if retry_call:
+                        resumed_auto_tool_calls.append(retry_call)
+                    resumed_auto_tool_calls.extend(
+                        _auto_tool_calls_from_result(tool_result, loaded_tool_names)
+                    )
+        if resumed_auto_tool_calls:
+            auto_calls = _dedupe_auto_tool_calls(
+                resumed_auto_tool_calls,
+                seen=seen_auto_tool_calls,
+            )
+            forced_tool_calls = (
+                [
+                    {**call, "disable_followup_tools": True}
+                    for call in auto_calls
+                ]
+                if checkpoint.disable_followup_tools
+                else auto_calls
+            )
+        elif checkpoint.disable_followup_tools:
+            tools = (
+                _read_only_tools_for_alternate_path(tools)
+                if resumed_calls_allow_alternate_path
+                else []
+            )
+        checkpoint = None
+
+    while rounds < max_rounds or pending_tool_error_summary is not None:
         if await _cancel_requested():
             return _cancelled_result()
         rounds += 1
@@ -3453,9 +4036,13 @@ async def agentic_loop(
         if forced_tool_calls:
             assistant_tool_calls = []
             forced_results = []
+            forced_tool_continuations: dict[str, dict[str, Any]] = {}
+            disable_followup_tools = any(
+                bool(forced.get("disable_followup_tools"))
+                for forced in forced_tool_calls
+                if isinstance(forced, dict)
+            )
             for idx, forced in enumerate(forced_tool_calls):
-                if await _cancel_requested():
-                    return _cancelled_result()
                 name = str(forced.get("name") or "").strip()
                 args = forced.get("arguments") or forced.get("args") or {}
                 if not name:
@@ -3466,10 +4053,15 @@ async def agentic_loop(
                     args = dict(args)
                 tool_continuation = _pop_tool_continuation(args)
                 tool_call = {
-                    "id": f"auto_{rounds}_{idx}_{hashlib.sha1(name.encode('utf-8'), usedforsecurity=False).hexdigest()[:10]}",
+                    "id": (
+                        f"auto_{rounds}_{idx}_"
+                        f"{hashlib.sha1(name.encode('utf-8'), usedforsecurity=False).hexdigest()[:10]}"
+                    ),
                     "name": name,
                     "arguments": args,
                 }
+                if tool_continuation is not None:
+                    forced_tool_continuations[tool_call["id"]] = tool_continuation
                 assistant_tool_calls.append({
                     "id": tool_call["id"],
                     "type": "function",
@@ -3491,31 +4083,61 @@ async def agentic_loop(
                         )
                     except Exception:
                         pass
-                if on_tool_start:
-                    try:
-                        on_tool_start(name, args)
-                    except Exception:
-                        pass
-                t0 = time.perf_counter()
-                try:
-                    result = await tool_executor(name, args)
-                except Exception as exc:
-                    result = f"{RUNTIME_TOOL_EXECUTOR_ERROR_PREFIX} ({name}): {exc}"
-                    logger.warning("[agentic_loop] Auto-followup tool %s raised: %s", name, exc)
-                duration_ms = (time.perf_counter() - t0) * 1000
-                visual_observation, safe_result = _browser_screenshot_observation(name, result)
-                if visual_observation is None:
-                    visual_observation, safe_result = _file_image_observation(name, result)
-                if visual_observation is not None:
-                    pending_browser_visual_observations.append(visual_observation)
-                if on_tool_end:
-                    try:
-                        try:
-                            on_tool_end(name, safe_result, duration_ms, args)
-                        except TypeError:
-                            on_tool_end(name, safe_result)
-                    except Exception:
-                        pass
+                _, safe_result, _ = await _execute_runtime_tool_call(tool_call, attempt=1)
+                if isinstance(safe_result, RuntimeToolSuspension):
+                    remaining_tool_calls: list[dict[str, Any]] = []
+                    for remaining_idx, remaining in enumerate(
+                        forced_tool_calls[idx + 1 :],
+                        start=idx + 1,
+                    ):
+                        remaining_name = str(remaining.get("name") or "").strip()
+                        remaining_args = remaining.get("arguments") or remaining.get("args") or {}
+                        if not remaining_name:
+                            continue
+                        remaining_args = (
+                            dict(remaining_args) if isinstance(remaining_args, dict) else {}
+                        )
+                        remaining_continuation = _pop_tool_continuation(remaining_args)
+                        remaining_call = {
+                            "id": (
+                                f"auto_{rounds}_{remaining_idx}_"
+                                f"{hashlib.sha1(remaining_name.encode('utf-8'), usedforsecurity=False).hexdigest()[:10]}"
+                            ),
+                            "name": remaining_name,
+                            "arguments": remaining_args,
+                        }
+                        remaining_tool_calls.append(remaining_call)
+                        if remaining_continuation is not None:
+                            forced_tool_continuations[remaining_call["id"]] = (
+                                remaining_continuation
+                            )
+                        assistant_tool_calls.append(
+                            {
+                                "id": remaining_call["id"],
+                                "type": "function",
+                                "function": {
+                                    "name": remaining_name,
+                                    "arguments": json.dumps(remaining_args, ensure_ascii=False),
+                                },
+                            }
+                        )
+                    messages.append(
+                        {"role": "assistant", "content": "", "tool_calls": assistant_tool_calls}
+                    )
+                    for completed_call, completed_result, _ in forced_results:
+                        _append_checkpoint_tool_result(
+                            completed_call,
+                            completed_result,
+                            record_call=False,
+                        )
+                    return _waiting_result(
+                        safe_result,
+                        pending_tool_call=tool_call,
+                        remaining_tool_calls=remaining_tool_calls,
+                        pending_attempt=1,
+                        disable_followup_tools=disable_followup_tools,
+                        tool_continuations=forced_tool_continuations,
+                    )
                 tool_calls_made.append(name)
                 forced_results.append((tool_call, safe_result, tool_continuation))
             forced_tool_calls = None
@@ -3560,6 +4182,21 @@ async def agentic_loop(
                     or _detect_stop_parent_tool_result(compact_forced_results, user_message)
                 )
                 if terminal_control:
+                    if terminal_control.get("summarize_with_model"):
+                        pending_tool_error_summary = terminal_control
+                        tools = []
+                        messages.append({
+                            "role": "user",
+                            "content": runtime_agentic_tool_error_final_prompt(
+                                setup_url=str(terminal_control.get("setup_url") or ""),
+                            ),
+                        })
+                        logger.info(
+                            "[agentic_loop] Returning a forced-tool error to the model "
+                            "for a final no-tools summary: %s",
+                            terminal_control.get("stop_reason"),
+                        )
+                        continue
                     final_content = str(terminal_control.get("content") or "")
                     messages.append({
                         "role": "assistant",
@@ -3576,11 +4213,36 @@ async def agentic_loop(
                         rounds=rounds,
                         tool_calls_made=tool_calls_made,
                         stop_reason=str(terminal_control.get("stop_reason") or SKILL_TERMINAL_STOP_REASON),
+                        error=_terminal_control_error(terminal_control),
                         control=terminal_control,
                     )
                 auto_calls = _dedupe_auto_tool_calls(pending_auto_tool_calls, seen=seen_auto_tool_calls)
                 if auto_calls:
-                    forced_tool_calls = auto_calls
+                    forced_tool_calls = (
+                        [
+                            {**call, "disable_followup_tools": True}
+                            for call in auto_calls
+                        ]
+                        if disable_followup_tools
+                        else auto_calls
+                    )
+                elif disable_followup_tools:
+                    alternate_path_allowed = bool(forced_results) and all(
+                        runtime_tool_allows_alternate_path(str(result))
+                        for _, result, _ in forced_results
+                    )
+                    # Approval continuations are single-attempt by contract.
+                    # A proven pre-I/O failure may keep gathering evidence via
+                    # read-only tools; every write path still requires a fresh
+                    # user approval. Results from the current provider I/O or a
+                    # successful action disable all tools so no duplicate side
+                    # effect can occur; an earlier ambiguous claim may only be
+                    # reconciled through this read-only set.
+                    tools = (
+                        _read_only_tools_for_alternate_path(tools)
+                        if alternate_path_allowed
+                        else []
+                    )
                 continue
 
         # Compact before the LLM call as well as after tool results. This
@@ -3705,18 +4367,41 @@ async def agentic_loop(
             except Exception:
                 pass
 
-        # An explicit Chat stop may arrive while the provider is completing
-        # this request. Do not turn that final provider response into a normal
-        # ``done`` row; the current LLM call is settled, then the turn stops.
-        if await _cancel_requested():
-            return _cancelled_result()
-
         # -- Truncation detection: finish_reason='length' with tool_calls --
         # When max_tokens truncates a tool call, the arguments JSON is incomplete
         # and the tool will fail. Detect this and circuit-break.
         finish_reason = usage.get("finish_reason", "")
         usage_error = str(usage.get("error") or "").strip()
         if usage_error and not tool_calls:
+            if (
+                pending_tool_error_summary is not None
+                and pending_tool_error_summary.get("terminal_failure") is True
+            ):
+                terminal_control = pending_tool_error_summary
+                final_content = _tool_error_final_content(
+                    "",
+                    terminal_control,
+                    user_message,
+                )
+                messages.append({"role": "assistant", "content": final_content})
+                logger.info(
+                    "[agentic_loop] Preserving terminal tool failure after final "
+                    "summary call failed: %s",
+                    terminal_control.get("stop_reason"),
+                )
+                return AgenticResult(
+                    content=final_content,
+                    messages=messages,
+                    usage=total_usage,
+                    rounds=rounds,
+                    tool_calls_made=tool_calls_made,
+                    stop_reason=str(
+                        terminal_control.get("stop_reason")
+                        or SKILL_TERMINAL_STOP_REASON
+                    ),
+                    error=_terminal_control_error(terminal_control),
+                    control=terminal_control,
+                )
             logger.warning(
                 "[agentic_loop] Round %d: LLM call failed before tool execution: %s",
                 rounds, usage_error[:300],
@@ -3820,7 +4505,52 @@ async def agentic_loop(
             }
             _attach_reasoning_content(assistant_msg, reasoning_content)
             messages.append(assistant_msg)
-            validation_error = _output_schema_validation_error(content, output_schema)
+            if pending_tool_error_summary is not None:
+                terminal_control = pending_tool_error_summary
+                final_content = _tool_error_final_content(
+                    content or "",
+                    terminal_control,
+                    user_message,
+                )
+                if final_content != (content or ""):
+                    assistant_msg["content"] = final_content
+                logger.info(
+                    "[agentic_loop] Completed final no-tools summary after tool error: %s",
+                    terminal_control.get("stop_reason"),
+                )
+                completion_control = _tool_error_completion_control(
+                    terminal_control
+                )
+                if output_schema is not None:
+                    return AgenticResult(
+                        content=final_content,
+                        messages=messages,
+                        usage=total_usage,
+                        rounds=rounds,
+                        tool_calls_made=tool_calls_made,
+                        stop_reason="error",
+                        error="tool_error",
+                        error_detail={
+                            "reason": completion_control.get("error_reason"),
+                            "source_tool": completion_control.get("source_tool"),
+                            "source_tools": completion_control.get("source_tools"),
+                        },
+                        control=completion_control,
+                    )
+                return AgenticResult(
+                    content=final_content,
+                    messages=messages,
+                    usage=total_usage,
+                    rounds=rounds,
+                    tool_calls_made=tool_calls_made,
+                    stop_reason="completed",
+                    control=completion_control,
+                )
+            validation_error = _output_schema_validation_error(
+                content,
+                output_schema,
+                validator=output_validator,
+            )
             if validation_error is not None:
                 if (
                     output_schema_retries < MAX_OUTPUT_SCHEMA_RETRIES
@@ -3872,6 +4602,8 @@ async def agentic_loop(
             )
 
         # -- Has tool calls -> execute and loop --
+        _strip_inapplicable_integration_continuations(tool_calls)
+
         # 1. Append assistant message with tool_calls (OpenAI format).
         # OpenAI tolerates content=null when tool_calls is present, but
         # several OpenRouter providers (Novita, some Anthropic routes)
@@ -3937,58 +4669,50 @@ async def agentic_loop(
             rounds, len(tool_calls), ", ".join(tool_summaries),
         )
 
-        # 2. Execute all tool calls concurrently. We time every tool so
+        # 2. Execute tool calls. Suspendable/stateful calls serialize the whole
+        # round so a later side effect cannot overtake a durable wait.
         # the chat log records real wall-clock — without this, bash and
         # invoke_skill all show ``duration_ms=0`` and operators can't tell
         # whether a slow turn is the LLM thinking or the tool itself.
-        async def _exec_one(tc_item: dict) -> tuple[dict, str, float]:
-            """Execute a single tool call, returning (tc, result_str, duration_ms)."""
-            t_name = tc_item["name"]
-            t_args = tc_item["arguments"] if isinstance(tc_item["arguments"], dict) else {}
-
-            if on_tool_start:
-                try:
-                    on_tool_start(t_name, t_args)
-                except Exception:
-                    pass
-
-            t0 = time.perf_counter()
-            try:
-                res = await tool_executor(t_name, t_args)
-            except Exception as exc:
-                res = f"{RUNTIME_TOOL_EXECUTOR_ERROR_PREFIX} ({t_name}): {exc}"
-                logger.warning("[agentic_loop] Tool %s raised: %s", t_name, exc)
-            duration_ms = (time.perf_counter() - t0) * 1000
-            visual_observation, safe_result = _browser_screenshot_observation(t_name, res)
-            if visual_observation is None:
-                visual_observation, safe_result = _file_image_observation(t_name, res)
-            if visual_observation is not None:
-                pending_browser_visual_observations.append(visual_observation)
-
-            if on_tool_end:
-                try:
-                    # Newer callbacks accept (name, result, duration_ms);
-                    # legacy ones only accept (name, result). Try both
-                    # so we don't break older wirings.
-                    try:
-                        on_tool_end(t_name, safe_result, duration_ms, t_args)
-                    except TypeError:
-                        on_tool_end(t_name, safe_result)
-                except Exception:
-                    pass
-
-            return tc_item, safe_result, duration_ms
-
+        if await _cancel_requested():
+            return _cancelled_result()
         if any(_requires_serial_tool_execution(tc.get("name", "")) for tc in tool_calls):
             exec_results = []
-            for tc in tool_calls:
-                if await _cancel_requested():
-                    return _cancelled_result()
-                exec_results.append(await _exec_one(tc))
+            for index, tc in enumerate(tool_calls):
+                executed = await _execute_runtime_tool_call(tc, attempt=1)
+                if isinstance(executed[1], RuntimeToolSuspension):
+                    for completed_tc, completed_result, _ in exec_results:
+                        _append_checkpoint_tool_result(completed_tc, completed_result)
+                    return _waiting_result(
+                        executed[1],
+                        pending_tool_call=tc,
+                        remaining_tool_calls=list(tool_calls[index + 1 :]),
+                        pending_attempt=1,
+                    )
+                exec_results.append(executed)
         else:
-            if await _cancel_requested():
-                return _cancelled_result()
-            exec_results = await asyncio.gather(*[_exec_one(tc) for tc in tool_calls])
+            exec_results = await asyncio.gather(
+                *[_execute_runtime_tool_call(tc, attempt=1) for tc in tool_calls]
+            )
+            suspension = next(
+                (
+                    (index, executed)
+                    for index, executed in enumerate(exec_results)
+                    if isinstance(executed[1], RuntimeToolSuspension)
+                ),
+                None,
+            )
+            if suspension is not None:
+                suspended_index, suspended = suspension
+                for index, (completed_tc, completed_result, _) in enumerate(exec_results):
+                    if index != suspended_index:
+                        _append_checkpoint_tool_result(completed_tc, completed_result)
+                return _waiting_result(
+                    suspended[1],
+                    pending_tool_call=suspended[0],
+                    remaining_tool_calls=[],
+                    pending_attempt=1,
+                )
         # Strip duration for downstream message-append loop — it only
         # needs (tc, result) for the messages array.
         results = [(tc, res) for tc, res, _ in exec_results]
@@ -4013,27 +4737,19 @@ async def agentic_loop(
         #    this round returned an error, increment the counter and
         #    circuit-break after MAX_CONSECUTIVE_TOOL_ERRORS rounds.
         all_errors = all(
-            ('"error"' in str(res) or str(res).startswith("Tool error"))
+            runtime_tool_call_error(str(res)) is not None
             for _, res in results
         )
+        tool_error_budget_exhausted = False
         if all_errors and results:
             consecutive_tool_errors += 1
             if consecutive_tool_errors >= MAX_CONSECUTIVE_TOOL_ERRORS:
                 logger.warning(
                     "[agentic_loop] Circuit breaker: %d consecutive rounds with all tool errors. "
-                    "Aborting loop to avoid wasting tokens.",
+                    "Forcing a final no-tools summary to avoid wasting tokens.",
                     consecutive_tool_errors,
                 )
-                return AgenticResult(
-                    content="I wasn't able to complete this task — my tool calls kept failing. "
-                            "This may be a permission or environment issue.",
-                    messages=messages,
-                    usage=total_usage,
-                    rounds=rounds,
-                    tool_calls_made=tool_calls_made,
-                    stop_reason="error",
-                    error="consecutive_tool_errors",
-                )
+                tool_error_budget_exhausted = True
         else:
             consecutive_tool_errors = 0
 
@@ -4092,6 +4808,11 @@ async def agentic_loop(
                             ),
                             None,
                         )
+                        if schema is None:
+                            for match in search_result.get("matches", []):
+                                if match.get("name") == name:
+                                    schema = match.get("schema")
+                                    break
                         if schema is not None and matching_manifest:
                             from packages.core.ai.runtime.tool_discovery import (
                                 runtime_apply_integration_account_options_to_schema,
@@ -4100,12 +4821,12 @@ async def agentic_loop(
                             schema = runtime_apply_integration_account_options_to_schema(
                                 schema,
                                 matching_manifest.get("account_options"),
+                                requires_explicit_account=bool(
+                                    matching_manifest.get(
+                                        "requires_explicit_account"
+                                    )
+                                ),
                             )
-                        if schema is None:
-                            for match in search_result.get("matches", []):
-                                if match.get("name") == name:
-                                    schema = match.get("schema")
-                                    break
                         loaded_name = (
                             schema.get("function", {}).get("name")
                             if isinstance(schema, dict)
@@ -4127,6 +4848,35 @@ async def agentic_loop(
                 try:
                     tool_result = json.loads(result_str.lstrip())
                     if isinstance(tool_result, dict):
+                        skill_load_names = (
+                            _invoke_skill_schema_load_names(tool_result)
+                            if tc["name"] == "invoke_skill"
+                            else []
+                        )
+                        if skill_load_names:
+                            schema_resolver = tool_schema_resolver
+                            try:
+                                from packages.core.ai.runtime.tool_registry import runtime_tool_schema
+                            except Exception:
+                                runtime_tool_schema = None
+                            for name in skill_load_names:
+                                schema = schema_resolver(name) if schema_resolver else None
+                                # The turn's original scoped resolver can only
+                                # see statically bound tools.  A verified
+                                # sandbox Skill handoff grants this one schema
+                                # after the turn starts, so resolve it from the
+                                # canonical registry when the scoped resolver
+                                # correctly returns no original binding.
+                                if schema is None and runtime_tool_schema is not None:
+                                    schema = runtime_tool_schema(name)
+                                loaded_name = (
+                                    schema.get("function", {}).get("name")
+                                    if isinstance(schema, dict)
+                                    else None
+                                )
+                                if loaded_name and loaded_name not in loaded_tool_names:
+                                    tools.append(schema)
+                                    loaded_tool_names.add(loaded_name)
                         next_calls = tool_result.get("recommended_next_calls") or []
                         load_names: list[str] = []
                         seen_next_tool_names: set[str] = set()
@@ -4194,6 +4944,21 @@ async def agentic_loop(
             or _detect_stop_parent_tool_result(results, user_message)
         )
         if terminal_control:
+            if terminal_control.get("summarize_with_model"):
+                pending_tool_error_summary = terminal_control
+                tools = []
+                messages.append({
+                    "role": "user",
+                    "content": runtime_agentic_tool_error_final_prompt(
+                        setup_url=str(terminal_control.get("setup_url") or ""),
+                    ),
+                })
+                logger.info(
+                    "[agentic_loop] Returning a tool error to the model for a final "
+                    "no-tools summary: %s",
+                    terminal_control.get("stop_reason"),
+                )
+                continue
             final_content = str(terminal_control.get("content") or "")
             messages.append({
                 "role": "assistant",
@@ -4210,8 +4975,20 @@ async def agentic_loop(
                 rounds=rounds,
                 tool_calls_made=tool_calls_made,
                 stop_reason=str(terminal_control.get("stop_reason") or SKILL_TERMINAL_STOP_REASON),
+                error=_terminal_control_error(terminal_control),
                 control=terminal_control,
             )
+
+        if tool_error_budget_exhausted:
+            pending_tool_error_summary = _consecutive_tool_error_summary_control(
+                results
+            )
+            tools = []
+            messages.append({
+                "role": "user",
+                "content": runtime_agentic_tool_error_final_prompt(),
+            })
+            continue
 
         if pending_auto_tool_calls:
             auto_calls = _dedupe_auto_tool_calls(pending_auto_tool_calls, seen=seen_auto_tool_calls)
@@ -4222,9 +4999,6 @@ async def agentic_loop(
                 })
                 forced_tool_calls = auto_calls
                 continue
-
-        if await _cancel_requested():
-            return _cancelled_result()
 
         # Context compaction check
         messages = await _compact_messages(messages, model, temperature)
@@ -4252,7 +5026,7 @@ async def agentic_loop(
             await _invoke_llm_callback(
                 on_llm_call_before,
                 rounds + 1,
-                model,
+                final_model or model,
                 final_llm_messages,
                 max_tokens,
             )
@@ -4278,8 +5052,8 @@ async def agentic_loop(
     final_content, final_usage = await runtime_execute_agentic_final_completion(
         final_llm_messages,
         temperature=temperature,
-        model=model,
-        metadata=metadata,
+        model=final_model or model,
+        metadata=final_metadata or metadata,
         **completion_overrides,
     )
     pending_browser_visual_observations.clear()

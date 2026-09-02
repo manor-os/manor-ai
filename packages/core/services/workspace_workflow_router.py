@@ -9,10 +9,10 @@ import re
 from dataclasses import dataclass
 from typing import Any, Iterable
 
-from jsonschema import Draft202012Validator, FormatChecker
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from packages.core.contracts.json_schema import SchemaContractValidatorFactory
 from packages.core.models.workflow import WorkflowBinding, WorkflowDefinition
 
 
@@ -96,7 +96,14 @@ def normalize_chat_entrypoint(
     config = _mapping(getattr(binding, "config", None))
     raw = _mapping(config.get("chat_entrypoint"))
     workspace_id = str(getattr(binding, "workspace_id", None) or "").strip()
-    if not raw.get("enabled") or not workspace_id:
+    # Older Workspace UI bindings predate the explicit chat_entrypoint block.
+    # Project only the unambiguous legacy marker; an explicit false remains a
+    # deliberate opt-out and entity-level bindings are never promoted.
+    if "enabled" in raw:
+        enabled = raw.get("enabled") is True
+    else:
+        enabled = config.get("workspace_attached") is True and bool(workspace_id)
+    if not enabled or not workspace_id:
         return None
 
     intent = _mapping(raw.get("intent"))
@@ -241,7 +248,7 @@ def workflow_run_inputs(workflow: Any) -> tuple[dict[str, Any], ...]:
                 target,
             ):
                 normalized["target"] = target
-            if isinstance(row.get("schema"), dict):
+            if "schema" in row:
                 normalized["schema"] = deepcopy(row["schema"])
             elif raw_type == "integer":
                 normalized["schema"] = {"type": "integer"}
@@ -416,14 +423,14 @@ def _merge_schema_draft(default: Any, proposed: Any, schema: Any) -> Any:
             if (child := _merge_schema_draft(_MISSING, value, item_schema)) is not _MISSING
         ]
         try:
-            Draft202012Validator(schema, format_checker=FormatChecker()).validate(normalized)
+            SchemaContractValidatorFactory.build(schema).validate(normalized)
         except Exception:
             return deepcopy(default) if isinstance(default, list) else _MISSING
         return normalized
 
     candidate = _clean_prefilled_uri(proposed) if schema.get("format") == "uri" else proposed
     try:
-        Draft202012Validator(schema, format_checker=FormatChecker()).validate(candidate)
+        SchemaContractValidatorFactory.build(schema).validate(candidate)
     except Exception:
         return deepcopy(default) if default is not _MISSING else _MISSING
     return deepcopy(candidate)
@@ -607,13 +614,10 @@ def validate_workspace_workflow_inputs(
             errors[key] = f"Enter a valid {input_type} value."
             continue
         schema = item.get("schema")
-        if isinstance(schema, dict):
+        if schema is not None:
             try:
                 validation_errors = sorted(
-                    Draft202012Validator(
-                        schema,
-                        format_checker=FormatChecker(),
-                    ).iter_errors(value),
+                    SchemaContractValidatorFactory.build(schema).iter_errors(value),
                     key=lambda error: (
                         tuple(str(part) for part in error.absolute_path),
                         str(error.message),
@@ -638,6 +642,7 @@ def auto_routing_allowed(
     message: str = "",
     agent_id: str | None = None,
     manual_skill_ids: str | None = None,
+    manual_skill_refs: str | None = None,
     chat_mode: str | None = None,
     ephemeral: bool = False,
     editor_context: str | None = None,
@@ -648,7 +653,11 @@ def auto_routing_allowed(
 ) -> bool:
     if not str(workspace_id or "").strip():
         return False
-    if agent_id or str(manual_skill_ids or "").strip():
+    if (
+        agent_id
+        or str(manual_skill_ids or "").strip()
+        or str(manual_skill_refs or "").strip()
+    ):
         return False
     if re.search(r"(^|\s)@\S", str(message or "")):
         return False
@@ -738,7 +747,23 @@ async def list_workspace_chat_entrypoints(
     entity_id: str,
     workspace_id: str,
     intent_only: bool = False,
+    user: Any | None = None,
+    require_control: bool = False,
 ) -> list[WorkspaceChatEntrypoint]:
+    if require_control:
+        from packages.core.services.workspace_access import (
+            user_can_write_workspace_artifacts,
+        )
+
+        if user is None or str(getattr(user, "entity_id", "") or "") != entity_id:
+            return []
+        if not await user_can_write_workspace_artifacts(
+            db,
+            workspace_id=workspace_id,
+            user_id=user.id,
+            entity_role=user.role,
+        ):
+            return []
     rows = (await db.execute(
         select(WorkflowBinding, WorkflowDefinition)
         .join(WorkflowDefinition, WorkflowDefinition.id == WorkflowBinding.workflow_id)
@@ -994,6 +1019,8 @@ async def start_workspace_chat_entrypoint(
     message: str,
     attachments: Any,
     conversation_id: str | None = None,
+    thread_ref_kind: str | None = None,
+    thread_ref_id: str | None = None,
     route_source: str,
     confidence: float | None = None,
     reason: str | None = None,
@@ -1009,6 +1036,8 @@ async def start_workspace_chat_entrypoint(
         user_id,
         workspace_id=workspace_id,
         conversation_id=conversation_id,
+        thread_ref_kind=thread_ref_kind,
+        thread_ref_id=thread_ref_id,
         title=message.splitlines()[0][:100].strip() or entrypoint.title,
     )
     saved_message = runtime_saved_message_with_file_references(message, attachments)
@@ -1017,6 +1046,7 @@ async def start_workspace_chat_entrypoint(
         conversation.id,
         role="user",
         content=saved_message,
+        attachments=workflow_attachment_descriptors(attachments) or None,
         meta={
             "author_user_id": user_id,
             "workflow_route_source": route_source,

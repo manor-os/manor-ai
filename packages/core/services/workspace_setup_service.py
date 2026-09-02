@@ -19,6 +19,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from packages.core.constants.document_groups import WorkspaceDocumentGroupKind
 from packages.core.constants.execution import (
     WorkerStatus,
 )
@@ -40,12 +41,22 @@ from packages.core.models.workspace import (
     WorkspaceActivity,
 )
 from packages.core.models.goal import Goal
+from packages.core.goals.factory import GoalIdentityFactory
+from packages.core.goals.numbers import validate_goal_number
 from packages.core.services.knowledge_starter import with_starter_document_settings
 from packages.core.services.provider_keys import canonical_provider_key
+from packages.core.services.reusable_resource_locks import (
+    RESOURCE_AGENT,
+    lock_reusable_resource_reference,
+)
 from packages.core.services.workspace_access import (
     ensure_workspace_owner_membership,
     settings_with_default_workspace_access,
 )
+from packages.core.services.workspace_ledger_matching import (
+    settings_with_business_ledgers,
+)
+from packages.core.workers.protocol import CURRENT_WORKER_PROTOCOL_VERSION
 # Task import previously used by the seeded starter task; removed
 # along with the seed in finalize_setup. Add back if any task creation
 # moves into setup again.
@@ -84,6 +95,7 @@ DEFAULT_FIELDS: Dict[str, Any] = {
     "services": [],
     "agent_mappings": [],
     "goals": [],
+    "stats": [],
     "rules": [],
     "automations": [],
     "evaluation": {
@@ -103,6 +115,9 @@ DEFAULT_FIELDS: Dict[str, Any] = {
         "channels": [],
         "notes": "",
     },
+    # Global autonomous runtime is independent from service-level autonomy
+    # and from whether the workspace tracks any Goals.
+    "heartbeat_enabled": True,
     "notes": "",
 }
 
@@ -160,9 +175,17 @@ SETUP_SYSTEM_PROMPT = runtime_workspace_setup_system_prompt(
 
 async def start_setup(entity_id: str) -> WorkspaceSetupSession:
     """Initialize a new workspace setup session."""
+    from packages.core.constants.workspace_drafts import (
+        CURRENT_WORKSPACE_DRAFT_SCHEMA_VERSION,
+        WORKSPACE_DRAFT_SCHEMA_VERSION_FIELD,
+    )
+
     return WorkspaceSetupSession(
         entity_id=entity_id,
-        fields=copy.deepcopy(DEFAULT_FIELDS),
+        fields={
+            **copy.deepcopy(DEFAULT_FIELDS),
+            WORKSPACE_DRAFT_SCHEMA_VERSION_FIELD: CURRENT_WORKSPACE_DRAFT_SCHEMA_VERSION,
+        },
         messages=[],
         ready=False,
         missing=sorted(REQUIRED_FIELDS),
@@ -192,7 +215,11 @@ async def process_setup_turn(
     tokens stream out incrementally in parallel.
     """
     # Build context block with available agents for the entity
-    context = await _build_setup_context(session.entity_id, db)
+    context = await _build_setup_context(
+        session.entity_id,
+        db,
+        user_id=session.user_id,
+    )
     enriched_message = runtime_workspace_setup_user_message(
         user_message=user_message,
         context=context,
@@ -214,9 +241,27 @@ async def process_setup_turn(
     # Parse status block from response
     status = _extract_status_block(response_text)
     if status:
+        from packages.core.constants.workspace_drafts import (
+            WORKSPACE_DRAFT_SCHEMA_VERSION_FIELD,
+            uses_ui_runtime_mode,
+        )
+        from packages.core.services.workspace_goal_measurements import resolve_draft_goal_measurements
+
+        schema_version = session.fields.get(WORKSPACE_DRAFT_SCHEMA_VERSION_FIELD)
+        runtime_mode = session.fields.get("heartbeat_enabled")
+        preserve_runtime_mode = uses_ui_runtime_mode(session.fields)
         session.fields = status.get("fields", session.fields)
+        if preserve_runtime_mode:
+            session.fields["heartbeat_enabled"] = runtime_mode
+        if schema_version is not None:
+            session.fields[WORKSPACE_DRAFT_SCHEMA_VERSION_FIELD] = schema_version
         session.ready = status.get("ready", False)
         session.missing = status.get("missing", [])
+        try:
+            resolve_draft_goal_measurements(session.fields)
+        except ValueError:
+            session.ready = False
+            session.missing = sorted(set(session.missing) | {"goals"})
 
     # Strip the status block from the visible response
     visible_response = _strip_status_block(response_text).strip()
@@ -371,19 +416,17 @@ async def resolve_agent_mappings(
     return mappings
 
 
-def _coerce_goal_number(value: Any) -> float:
+def _coerce_goal_number(value: Any) -> Decimal:
     """Convert loose goal targets like "10,000" or "5%" into a DB number."""
     if value is None:
-        return 0
-    if isinstance(value, (int, float, Decimal)):
-        return float(value)
-    text = str(value).strip()
-    if not text:
-        return 0
-    match = re.search(r"-?\d+(?:,\d{3})*(?:\.\d+)?|-?\d+(?:\.\d+)?", text)
-    if not match:
-        return 0
-    return float(match.group(0).replace(",", ""))
+        number: object = Decimal("0")
+    elif isinstance(value, (Decimal, int, float, bool)):
+        number = value
+    else:
+        text = str(value).strip()
+        match = re.search(r"-?\d+(?:,\d{3})*(?:\.\d+)?|-?\d+(?:\.\d+)?", text)
+        number = Decimal(match.group(0).replace(",", "")) if match else Decimal("0")
+    return validate_goal_number(number)
 
 
 def _custom_agent_design_cache_key(mapping: Dict[str, Any]) -> str:
@@ -399,8 +442,32 @@ def _custom_agent_design_cache_key(mapping: Dict[str, Any]) -> str:
         "tool_bindings": sorted(_unique_strings(draft.get("tool_bindings"))),
         "business_capabilities": sorted(_unique_strings(draft.get("business_capabilities"))),
         "skill_bindings": sorted(_unique_strings(draft.get("skill_bindings"))),
+        "skill_binding_refs": sorted(
+            (
+                {
+                    "marketplace_source": str(
+                        ref.get("marketplace_source") or "platform"
+                    ).strip(),
+                    "marketplace_id": str(
+                        ref.get("marketplace_id") or ""
+                    ).strip(),
+                }
+                for ref in draft.get("skill_binding_refs") or []
+                if isinstance(ref, dict)
+            ),
+            key=lambda ref: (
+                ref["marketplace_source"],
+                ref["marketplace_id"],
+            ),
+        ),
         "mcp_bindings": sorted(_unique_strings(draft.get("mcp_bindings"))),
         "missing_skill_specs": draft.get("missing_skill_specs") or [],
+        "source_blueprint_id": str(
+            draft.get("source_blueprint_id") or ""
+        ).strip(),
+        "source_blueprint_component_key": str(
+            draft.get("source_blueprint_component_key") or ""
+        ).strip(),
     }
     return json.dumps(design, ensure_ascii=False, sort_keys=True, default=str)
 
@@ -628,7 +695,7 @@ async def _install_workspace_draft_automations(
                 execution_target.pop(nonportable_key, None)
             if service_key:
                 execution_target["service_key"] = service_key
-            job = await create_scheduled_job(
+            await create_scheduled_job(
                 db,
                 entity_id,
                 job_id,
@@ -643,11 +710,11 @@ async def _install_workspace_draft_automations(
                 agent_id=agent_id,
                 execution_type=raw.get("execution_type") or "agent",
                 execution_target=execution_target,
+                execution_script=raw.get("execution_script"),
                 default_delivery_mode=raw.get("default_delivery_mode"),
                 workspace_id=workspace_id,
                 user_id=user_id,
             )
-            job.execution_script = raw.get("execution_script")
             created += 1
             continue
 
@@ -923,6 +990,11 @@ async def finalize_setup(
 
     fields = session.fields
 
+    from packages.core.constants.workspace_drafts import uses_ui_runtime_mode
+
+    if uses_ui_runtime_mode(fields) and not isinstance(fields.get("heartbeat_enabled"), bool):
+        raise WorkspaceProvisioningError("Choose Automatic or Manual mode before creating the Workspace")
+
     operating_rules = _enrich_operating_rules(fields.get("rules", []))
     raw_budget_policy = fields.get("budget_policy") if isinstance(fields.get("budget_policy"), dict) else {}
     monthly_budget_credits = _coerce_positive_int(raw_budget_policy.get("monthly_budget_credits"))
@@ -945,11 +1017,22 @@ async def finalize_setup(
     if not isinstance(blueprint_operating_model, dict):
         blueprint_operating_model = {}
 
+    from packages.core.services.workspace_goal_measurements import (
+        materialize_draft_stats,
+        resolve_draft_goal_measurements,
+    )
+
+    try:
+        measured_goals, stat_definitions = resolve_draft_goal_measurements(fields)
+    except ValueError as exc:
+        raise WorkspaceProvisioningError(str(exc)) from exc
+    normalized_goals = GoalIdentityFactory.normalize_records(measured_goals)
+
     # Build operating model
     operating_model: Dict[str, Any] = {
         **copy.deepcopy(blueprint_operating_model),
         "services": fields.get("services", []),
-        "goals": fields.get("goals", []),
+        "goals": normalized_goals,
         "rules": operating_rules,
         "automations": fields.get("automations", []),
         "evaluation": fields.get("evaluation", {}),
@@ -959,6 +1042,9 @@ async def finalize_setup(
     }
 
     # Create Workspace record
+    from packages.core.services.plan_gate import enforce_workspace_capacity
+
+    await enforce_workspace_capacity(db, session.entity_id)
     workspace_id = generate_ulid()
     workspace = Workspace(
         id=workspace_id,
@@ -972,9 +1058,20 @@ async def finalize_setup(
         monthly_budget_usd=monthly_budget_usd,
         auto_pause_on_budget=auto_pause_on_budget,
         budget_alert_state="normal",
-        settings=settings_with_default_workspace_access(
-            {"created_by_user_id": session.user_id} if session.user_id else None
-        ),
+        settings=settings_with_default_workspace_access(settings_with_business_ledgers(
+            {
+                **copy.deepcopy(fields.get("_blueprint_settings") or {}),
+                **({"created_by_user_id": session.user_id} if session.user_id else {}),
+            },
+            infer_if_absent=not bool(
+                fields.get("_blueprint_disable_business_ledger_matching")
+            ),
+            name=fields.get("name", ""),
+            kind=fields.get("kind", ""),
+            operating_context=fields.get("operating_context", ""),
+            primary_work=fields.get("primary_work", ""),
+            operating_model=operating_model,
+        )),
     )
     db.add(workspace)
     await db.flush()
@@ -1011,11 +1108,28 @@ async def finalize_setup(
     custom_count = sum(1 for m in agent_mappings if m.get("strategy") == "create_custom")
     _report("provisioning_agents_started", total=total_agents, custom=custom_count)
     for idx, mapping in enumerate(agent_mappings):
+        marketplace_agent_id = str(
+            mapping.get("marketplace_agent_id") or ""
+        ).strip()
         agent_id = (
             mapping.get("agent_id")
             or mapping.get("recommended_agent_id")
         )
         agent_name = mapping.get("agent_name") or mapping.get("recommended_agent_name") or "Agent"
+
+        if marketplace_agent_id:
+            from packages.core.services.marketplace_agent_service import (
+                ensure_marketplace_agent_installed,
+            )
+
+            installed_agent = await ensure_marketplace_agent_installed(
+                db,
+                entity_id=session.entity_id,
+                agent_id=marketplace_agent_id,
+                owner_user_id=session.user_id or None,
+            )
+            agent_id = installed_agent.id
+            agent_name = installed_agent.name
 
         design_cache_key = ""
         if not agent_id and mapping.get("strategy") == "create_custom":
@@ -1065,6 +1179,18 @@ async def finalize_setup(
             raise WorkspaceProvisioningError(
                 f"Agent {agent_id!r} for service {mapping.get('service_key')!r} is unavailable"
             )
+        if resolved_agent.entity_id is None:
+            from packages.core.services.marketplace_agent_service import (
+                ensure_marketplace_agent_installed,
+            )
+
+            resolved_agent = await ensure_marketplace_agent_installed(
+                db,
+                entity_id=session.entity_id,
+                agent_id=resolved_agent.id,
+                owner_user_id=session.user_id,
+            )
+            agent_id = resolved_agent.id
         agent_name = resolved_agent.name
 
         # AgentSubscription carries the workspace-specific framing so
@@ -1085,6 +1211,12 @@ async def finalize_setup(
         if rationale:
             ws_framing_parts.append(f"Why you were assigned: {rationale}")
 
+        await lock_reusable_resource_reference(
+            db,
+            entity_id=session.entity_id,
+            resource_type=RESOURCE_AGENT,
+            resource_id=agent_id,
+        )
         sub_id = generate_ulid()
         sub = AgentSubscription(
             id=sub_id,
@@ -1156,7 +1288,7 @@ async def finalize_setup(
                         "max_risk_level": "high",
                         "supported_providers": None,
                         "max_concurrent_leases": 4,
-                        "protocol_version": 1,
+                        "protocol_version": int(CURRENT_WORKER_PROTOCOL_VERSION),
                         "deployment": "local",
                         "uses_manor_credentials": True,
                     },
@@ -1164,6 +1296,10 @@ async def finalize_setup(
                 db.add(worker)
                 await db.flush()
                 logger.info("Auto-created internal worker %s for entity %s", worker.id, session.entity_id)
+            else:
+                capabilities = dict(worker.capabilities or {})
+                capabilities["protocol_version"] = int(CURRENT_WORKER_PROTOCOL_VERSION)
+                worker.capabilities = capabilities
 
             for sub_data in created_subs:
                 db.add(SubscriptionWorker(
@@ -1258,7 +1394,7 @@ async def finalize_setup(
                 settings = dict(existing.settings or {})
                 settings.pop("workspace_file_bucket", None)
                 settings.pop("default_collection", None)
-                settings["kind"] = "knowledge_net"
+                settings["kind"] = WorkspaceDocumentGroupKind.KNOWLEDGE_NET.value
                 settings["purpose"] = ka.get("purpose") or settings.get("purpose", "")
                 settings["linked_service_keys"] = list(ka.get("linked_service_keys") or settings.get("linked_service_keys") or [])
                 settings["auto_created"] = True
@@ -1326,7 +1462,7 @@ async def finalize_setup(
 
         group_settings = {
             **template_settings,
-            "kind": "knowledge_net",
+            "kind": WorkspaceDocumentGroupKind.KNOWLEDGE_NET.value,
             "purpose": ka.get("purpose", ""),
             "linked_service_keys": list(ka.get("linked_service_keys") or []),
             "auto_created": True,
@@ -1419,9 +1555,15 @@ async def finalize_setup(
         user_id=session.user_id,
     )
 
-    flagged = list(fields.get("flagged_integrations") or [])
-    flagged_providers = {(f or {}).get("provider") for f in flagged}
-    cc = (fields.get("channel_config") or {})
+    flagged = [
+        dict(item)
+        for item in (fields.get("flagged_integrations") or [])
+        if isinstance(item, dict)
+    ]
+    flagged_providers = {item.get("provider") for item in flagged}
+    cc = fields.get("channel_config") or {}
+    if not isinstance(cc, dict):
+        cc = {}
 
     # Index subscriptions by service_key so we can bind channels → agents
     sub_by_service: Dict[str, Dict[str, str]] = {}
@@ -1435,14 +1577,19 @@ async def finalize_setup(
     from packages.core.services.channels.base import registered_channel_types
     SUPPORTED_CHANNEL_TYPES = set(registered_channel_types())
     # Built-in channel types that don't need external integrations
-    BUILTIN_PROVIDERS = {"internal_chat", "webchat", "in_app"}
+    from packages.core.services.workspace_readiness import BUILT_IN_CHANNEL_TYPES
 
     created_channel_configs: list[tuple[str, str, str, str]] = []
     # (channel_config_id, ch_type, linked_service_key, public_token_or_empty)
 
     def _mk_channel(role: str, block: Dict[str, Any]) -> None:
-        ch_type = (block or {}).get("channel_type", "").strip()
+        ch_type = str((block or {}).get("channel_type") or "").strip()
         if not ch_type:
+            return
+
+        if isinstance(fields.get("_blueprint_account_contract"), dict) and ch_type not in BUILT_IN_CHANNEL_TYPES:
+            # Blueprint Drafts bind the user's preflight-selected account in
+            # finalize_draft. Do not create a duplicate credentialless config.
             return
 
         # Reject channel types that have no adapter implementation
@@ -1456,7 +1603,7 @@ async def finalize_setup(
         provider = (block or {}).get("provider") or ch_type
 
         # Skip channels without configured integrations (except built-ins)
-        if canonical_provider_key(provider) not in configured_providers and provider not in BUILTIN_PROVIDERS:
+        if canonical_provider_key(provider) not in configured_providers and provider not in BUILT_IN_CHANNEL_TYPES:
             resolved_provider = resolve_missing_integration_provider_key(
                 provider,
                 supported_provider_keys=supported_providers,
@@ -1522,16 +1669,37 @@ async def finalize_setup(
             })
             flagged_providers.add(provider)
 
+    def _channel_block(raw: Any) -> Dict[str, Any]:
+        if isinstance(raw, dict):
+            block = dict(raw)
+        elif isinstance(raw, str):
+            block = {"channel_type": raw, "provider": raw}
+        else:
+            return {}
+        channel_type = str(block.get("channel_type") or block.get("type") or "").strip().lower()
+        if channel_type in {"chat", "internal", "internal chat"}:
+            channel_type = "internal_chat"
+        if channel_type:
+            block["channel_type"] = channel_type
+        return block
+
+    def _materialize_channel(role: str, raw: Any) -> None:
+        block = _channel_block(raw)
+        if not block or block.get("channel_type") == "internal_chat":
+            return
+        _mk_channel(role, block)
+
     # New format: channels is a flat list
     for ch in (cc.get("channels") or []):
-        _mk_channel(ch.get("role", "channel"), ch)
+        block = _channel_block(ch)
+        _materialize_channel(str(block.get("role") or "channel"), block)
     # Legacy format support
     if cc.get("primary_external_channel"):
-        _mk_channel("primary_external", cc["primary_external_channel"])
-    if cc.get("internal_channel") and cc["internal_channel"].get("channel_type") != "internal_chat":
-        _mk_channel("internal", cc["internal_channel"])
+        _materialize_channel("primary_external", cc["primary_external_channel"])
+    if cc.get("internal_channel"):
+        _materialize_channel("internal", cc["internal_channel"])
     for sec in (cc.get("secondary_external_channels") or []):
-        _mk_channel("secondary_external", sec)
+        _materialize_channel("secondary_external", sec)
     if flagged:
         # Sync any newly-discovered missing creds back to fields so the
         # workspace.settings persistence step below picks them up.
@@ -1646,7 +1814,12 @@ async def finalize_setup(
 
     # ── Materialize Goal DB rows from operating_model.goals[] ──────────
     # Without real Goal rows, the Strategist has nothing to reason about.
-    goals_data = fields.get("goals") or operating_model.get("goals", [])
+    stats_by_key = await materialize_draft_stats(
+        db, entity_id=session.entity_id, workspace_id=workspace_id,
+        definitions=stat_definitions,
+        goal_stat_keys={goal["stat_key"] for goal in normalized_goals if goal.get("stat_key")},
+    )
+    goals_data = operating_model.get("goals", [])
     goals_created = 0
     for g in goals_data:
         if not isinstance(g, dict):
@@ -1659,11 +1832,18 @@ async def finalize_setup(
             raise WorkspaceProvisioningError(
                 "Workspace goals require a user-confirmed target and cadence"
             )
+        from packages.core.goals.scheduling import validate_measurement_cadence
+
+        try:
+            measurement_cadence = validate_measurement_cadence(measurement_cadence)
+        except ValueError as exc:
+            raise WorkspaceProvisioningError(str(exc)) from exc
         title = g.get("title") or g.get("goal_key", "Untitled Goal")
         metric_key = (
             g.get("metric_key")
             or g.get("goal_key", title).lower().replace(" ", "_").replace("-", "_")
         )
+        goal_key = str(g.get("goal_key") or "").strip()
         target_val = _coerce_goal_number(raw_target)
         baseline_val = None
         if g.get("baseline_value") is not None:
@@ -1673,7 +1853,8 @@ async def finalize_setup(
             is_workspace_internal_measurement_source,
         )
 
-        measurement_source = default_workspace_measurement_source(
+        linked_stat = stats_by_key.get(g.get("stat_key"))
+        measurement_source = None if linked_stat else default_workspace_measurement_source(
             g.get("measurement_source"),
             workspace_id=workspace_id,
         )
@@ -1684,13 +1865,15 @@ async def finalize_setup(
             id=generate_ulid(),
             entity_id=session.entity_id,
             workspace_id=workspace_id,
+            stat_id=linked_stat.id if linked_stat else None,
             title=title,
             description=g.get("description"),
+            goal_key=goal_key,
             metric_key=metric_key,
             target_value=target_val,
             baseline_value=baseline_val,
             measurement_source=measurement_source,
-            measurement_cadence=measurement_cadence,
+            measurement_cadence=None if linked_stat else measurement_cadence,
             priority=int(g.get("priority", 3)),
             status="active",
             pace_status="unknown",
@@ -1706,7 +1889,15 @@ async def finalize_setup(
                 install_measurement_schedule,
                 should_install_measurement_schedule,
             )
-            if should_install_measurement_schedule(goal):
+            # Goal measurement is governed by the same Workspace runtime
+            # switch as Strategist/evolution schedules.  Provisioning may
+            # still be in ``needs_setup`` here; the final runtime install
+            # below will create the job only once the Workspace is active.
+            if (
+                workspace.status == "active"
+                and bool(workspace.heartbeat_enabled)
+                and should_install_measurement_schedule(goal)
+            ):
                 await install_measurement_schedule(db, goal)
         except Exception:
             logger.exception(
@@ -1738,17 +1929,24 @@ async def finalize_setup(
     except Exception:
         logger.exception("Failed to seed workspace state/file caches for %s", workspace_id)
 
-    # ── Enable heartbeat only after executable services and goals exist ─
-    # Workspaces created through legacy/direct callers with incomplete runtime
-    # parts stay visible as needs_setup, but cannot run reviews accidentally.
+    # ── Apply the explicit autonomous-runtime choice ──────────────────
+    # A workspace can be active with or without Goals, and with or without
+    # autonomous Strategist scheduling.  Executable services remain the
+    # readiness boundary; Goals are optional direction/measurement metadata.
     heartbeat_cadence = (
         fields.get("heartbeat_cadence")
         or operating_model.get("heartbeat_cadence")
         or "0 9 * * *"  # daily at 9am
     )
-    runtime_ready = bool(declared_service_keys and created_subs and goals_created)
+    runtime_ready = bool(declared_service_keys and created_subs)
+    autonomous_enabled = bool(
+        fields.get(
+            "heartbeat_enabled",
+            operating_model.get("heartbeat_enabled", False),
+        )
+    )
     workspace.status = "active" if runtime_ready else "needs_setup"
-    workspace.heartbeat_enabled = runtime_ready
+    workspace.heartbeat_enabled = runtime_ready and autonomous_enabled
     workspace.heartbeat_cadence = heartbeat_cadence
     workspace_settings = dict(workspace.settings or {})
     workspace_settings["provisioning"] = {
@@ -1757,6 +1955,7 @@ async def finalize_setup(
         "materialized_service_count": len(materialized_service_keys),
         "worker_bound_subscription_count": len(created_subs),
         "goal_count": goals_created,
+        "stat_count": len(stats_by_key),
         "starter_document_count": len(starter_doc_requests),
         "post_commit_dispatch": "pending" if runtime_ready else "not_required",
     }
@@ -1765,7 +1964,7 @@ async def finalize_setup(
     # Install built-in runtime schedules. Without this the cadence is
     # set on the Workspace row but the recurring review/evolution loops
     # never actually fire.
-    if runtime_ready:
+    if workspace.heartbeat_enabled:
         try:
             from packages.core.services.workspace_runtime import install_workspace_runtime_schedules
             await install_workspace_runtime_schedules(db, workspace, cadence=heartbeat_cadence)
@@ -1778,12 +1977,10 @@ async def finalize_setup(
                 "Could not install the workspace runtime schedules"
             ) from exc
         _report("runtime_scheduled", heartbeat_cadence=heartbeat_cadence)
-    else:
+    elif not runtime_ready:
         missing_runtime_parts: list[str] = []
         if not declared_service_keys or not created_subs:
             missing_runtime_parts.append("executable_services")
-        if not goals_created:
-            missing_runtime_parts.append("confirmed_goals")
         _report("runtime_needs_setup", missing=missing_runtime_parts)
 
     # NOTE: previously this seeded a "Review and configure {workspace}"
@@ -1898,22 +2095,30 @@ async def dispatch_workspace_post_commit(
             AgentSubscription.workspace_id == workspace.id,
             AgentSubscription.entity_id == workspace.entity_id,
             AgentSubscription.status == "active",
-        ).order_by(AgentSubscription.created_at.asc())
+        ).order_by(AgentSubscription.created_at.asc(), AgentSubscription.id.asc())
     )).scalars().all())
-    agent_ids = [subscription.agent_id for subscription in subscriptions if subscription.agent_id]
+    # Chat membership is per Agent, even when that Agent serves several roles.
+    # Keep every deployment intact, but introduce each Agent only once.
+    subscriptions_by_agent: dict[str, list[AgentSubscription]] = {}
+    for subscription in subscriptions:
+        subscriptions_by_agent.setdefault(subscription.agent_id, []).append(subscription)
+    agent_ids = list(subscriptions_by_agent)
     agents = list((await db.execute(
         select(Agent).where(Agent.id.in_(agent_ids))
     )).scalars().all()) if agent_ids else []
     agents_by_id = {agent.id: agent for agent in agents}
     greeting_payload = [
         {
-            "subscription_id": subscription.id,
-            "agent_id": subscription.agent_id,
-            "agent_name": getattr(agents_by_id.get(subscription.agent_id), "name", None) or "Agent",
-            "service_key": subscription.service_key or "general",
-            "system_prompt": getattr(agents_by_id.get(subscription.agent_id), "system_prompt", None) or "",
+            "subscription_id": agent_subscriptions[0].id,
+            "agent_id": agent_id,
+            "agent_name": getattr(agents_by_id.get(agent_id), "name", None) or "Agent",
+            "service_key": ", ".join(dict.fromkeys(
+                subscription.service_key or "general"
+                for subscription in agent_subscriptions
+            )),
+            "system_prompt": getattr(agents_by_id.get(agent_id), "system_prompt", None) or "",
         }
-        for subscription in subscriptions
+        for agent_id, agent_subscriptions in subscriptions_by_agent.items()
     ]
     if greeting_payload:
         try:
@@ -1964,27 +2169,49 @@ async def dispatch_workspace_post_commit(
     if starter_documents_dispatched:
         _report("starter_documents_dispatched", count=starter_documents_dispatched)
 
-    try:
-        from packages.core.strategist import ReviewTrigger, ReviewTriggerKind
+    if workspace.heartbeat_enabled:
+        try:
+            from packages.core.strategist import ReviewTrigger, ReviewTriggerKind
 
-        run_strategist_review.apply_async(
-            args=[workspace.id],
-            kwargs=ReviewTrigger(
-                kind=ReviewTriggerKind.EVENT, detail="workspace created",
-            ).celery_kwargs(),
-            countdown=strategist_eta_s,
-        )
-        strategist_dispatched = True
-        _report("strategist_dispatched", eta_seconds=strategist_eta_s)
-    except Exception as exc:
-        logger.warning("Failed to dispatch first strategist review for %s", workspace.id, exc_info=True)
-        warnings.append(f"strategist_review: {exc}")
+            run_strategist_review.apply_async(
+                args=[workspace.id],
+                kwargs=ReviewTrigger(
+                    kind=ReviewTriggerKind.EVENT, detail="workspace created",
+                ).celery_kwargs(),
+                countdown=strategist_eta_s,
+            )
+            strategist_dispatched = True
+            _report("strategist_dispatched", eta_seconds=strategist_eta_s)
+        except Exception as exc:
+            logger.warning("Failed to dispatch first strategist review for %s", workspace.id, exc_info=True)
+            warnings.append(f"strategist_review: {exc}")
 
     # The idempotency claim above commits ``workspace.settings`` midway through
-    # this function. Rebuild the JSON value from the post-commit ORM state so
-    # SQLAlchemy sees a fresh assignment and persists the terminal status.
-    # Reusing the pre-commit ``settings`` dict can leave the row stuck at
-    # ``dispatching`` even though every Celery task was queued successfully.
+    # this function, and external dispatch leaves a window for another settings
+    # writer. Re-lock and reload before merging the terminal status so an access
+    # policy change made during dispatch cannot be restored from stale JSON.
+    from packages.core.services.workspace_access import (
+        lock_workspace_access_boundary,
+    )
+
+    locked_workspace = await lock_workspace_access_boundary(
+        db,
+        workspace_id=workspace_id,
+        entity_id=entity_id,
+    )
+    if locked_workspace is None or locked_workspace.deleted_at is not None:
+        return {
+            "workspace_id": workspace_id,
+            "dispatched": not warnings,
+            "warnings": warnings,
+            "agent_greetings_dispatched": greeting_dispatched,
+            "starter_documents_dispatched": starter_documents_dispatched,
+            "strategist_dispatched": strategist_dispatched,
+            "strategist_eta_seconds": (
+                strategist_eta_s if strategist_dispatched else None
+            ),
+        }
+    workspace = locked_workspace
     final_settings = dict(workspace.settings or {})
     final_provisioning = dict(final_settings.get("provisioning") or {})
     final_provisioning["post_commit_dispatch"] = "partial" if warnings else "dispatched"
@@ -2014,14 +2241,16 @@ async def record_workspace_post_commit_dispatch_failure(
     error: Exception,
 ) -> None:
     """Record an unexpected dispatcher failure without undoing creation."""
-    workspace = (await db.execute(
-        select(Workspace).where(
-            Workspace.id == workspace_id,
-            Workspace.entity_id == entity_id,
-            Workspace.deleted_at.is_(None),
-        )
-    )).scalar_one_or_none()
-    if workspace is None:
+    from packages.core.services.workspace_access import (
+        lock_workspace_access_boundary,
+    )
+
+    workspace = await lock_workspace_access_boundary(
+        db,
+        workspace_id=workspace_id,
+        entity_id=entity_id,
+    )
+    if workspace is None or workspace.deleted_at is not None:
         return
     settings = dict(workspace.settings or {})
     provisioning = dict(settings.get("provisioning") or {})
@@ -2060,7 +2289,10 @@ def _strip_status_block(text: str) -> str:
 
 
 async def _build_setup_context(
-    entity_id: str, db: AsyncSession
+    entity_id: str,
+    db: AsyncSession,
+    *,
+    user_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Build hidden context with available agents, channels, and integrations."""
     entity_agents = await _fetch_entity_agents(entity_id, db)
@@ -2068,7 +2300,7 @@ async def _build_setup_context(
 
     # ── Integration inventory (reusable service function) ──
     from packages.core.services.integration_service import get_integration_inventory
-    inventory = await get_integration_inventory(db, entity_id)
+    inventory = await get_integration_inventory(db, entity_id, user_id=user_id)
     channel_providers = inventory["channels"]
     configured_integrations = inventory["integrations"]
 
@@ -2144,7 +2376,7 @@ async def _fetch_entity_agents(
             pass
 
         try:
-            from sqlalchemy import or_
+            from sqlalchemy import and_, or_
             from packages.core.models.skill import AgentSkillBinding, Skill
 
             skill_rows = (await db.execute(
@@ -2154,7 +2386,13 @@ async def _fetch_entity_agents(
                     AgentSkillBinding.agent_id.in_(agent_ids),
                     AgentSkillBinding.status == "active",
                     Skill.status == "active",
-                    or_(Skill.entity_id == entity_id, Skill.is_public.is_(True)),
+                    or_(
+                        Skill.entity_id == entity_id,
+                        and_(
+                            Skill.entity_id.is_(None),
+                            Skill.is_public.is_(True),
+                        ),
+                    ),
                 )
             )).all()
             for agent_id, skill in skill_rows:
@@ -2283,6 +2521,7 @@ def _ensure_workspace_custom_agent_tool_bindings(create_draft: Dict[str, Any]) -
     """
     has_skills = bool(
         create_draft.get("skill_bindings")
+        or create_draft.get("skill_binding_refs")
         or create_draft.get("missing_skill_specs")
     )
     create_draft["tool_bindings"] = list(

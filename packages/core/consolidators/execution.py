@@ -19,6 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from packages.core.constants.execution import (
     ExecutionStepStatus,
 )
+from packages.core.constants.review import ConsolidationReportStatus
 from packages.core.consolidators import l1 as l1_layer
 from packages.core.consolidators.base import SnapshotContext, age_hours, evidence_ids
 from packages.core.consolidators.contract import (
@@ -267,7 +268,7 @@ class ExecutionConsolidator:
         }
         return ConsolidationReportModel(
             domain=self.domain,
-            status="complete",
+            status=ConsolidationReportStatus.COMPLETE,
             summary=(
                 f"{len(events)} execution event(s): {completed} completed, "
                 f"{failed} failed; {len(waiting_steps)} step(s) waiting on human"

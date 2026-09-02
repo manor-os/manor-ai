@@ -1,4 +1,7 @@
+import { useId } from "react";
+
 interface InputProps {
+  id?: string;
   label?: string;
   /** Persistent guidance under the field — unlike a placeholder it
    *  survives the user starting to type. */
@@ -16,13 +19,16 @@ interface InputProps {
   maxLength?: number;
   pattern?: string;
   onFocus?: (e: React.FocusEvent<HTMLInputElement>) => void;
+  onKeyDown?: (e: React.KeyboardEvent<HTMLInputElement>) => void;
   ariaLabel?: string;
+  required?: boolean;
   min?: number | string;
   max?: number | string;
   step?: number | string;
 }
 
 export default function Input({
+  id,
   label,
   hint,
   error,
@@ -38,19 +44,26 @@ export default function Input({
   maxLength,
   pattern,
   onFocus,
+  onKeyDown,
   ariaLabel,
+  required = false,
   min,
   max,
   step,
 }: InputProps) {
+  const generatedId = useId();
+  const inputId = id || `manor-input-${generatedId}`;
+  const hintId = `${inputId}-hint`;
+  const errorId = `${inputId}-error`;
   return (
     <div className={className}>
       {label && (
-        <label className="block text-xs font-semibold text-stone-500 uppercase tracking-wide mb-1.5">
+        <label htmlFor={inputId} className="block text-xs font-semibold text-stone-500 uppercase tracking-wide mb-1.5">
           {label}
         </label>
       )}
       <input
+        id={inputId}
         type={type}
         value={value}
         onChange={onChange}
@@ -62,7 +75,11 @@ export default function Input({
         maxLength={maxLength}
         pattern={pattern}
         onFocus={onFocus}
+        onKeyDown={onKeyDown}
         aria-label={ariaLabel}
+        aria-describedby={error ? errorId : hint ? hintId : undefined}
+        aria-invalid={error ? true : undefined}
+        required={required}
         min={min}
         max={max}
         step={step}
@@ -70,10 +87,10 @@ export default function Input({
         style={error ? { background: "var(--surface-panel)", boxShadow: "0 0 0 3px rgba(214,95,89,0.22)" } : undefined}
       />
       {hint && !error && (
-        <p className="mt-1.5 text-xs leading-relaxed text-stone-500">{hint}</p>
+        <p id={hintId} className="mt-1.5 text-xs leading-relaxed text-stone-500">{hint}</p>
       )}
       {error && (
-        <p className="mt-1 text-xs font-medium text-red-600">{error}</p>
+        <p id={errorId} className="mt-1 text-xs font-medium text-red-600">{error}</p>
       )}
     </div>
   );

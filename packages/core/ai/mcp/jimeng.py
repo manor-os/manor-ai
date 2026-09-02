@@ -141,7 +141,11 @@ async def call_tool(
     bearer_token: str,
 ) -> Dict[str, Any]:
     """``bearer_token`` here is the user's Jimeng sessionid cookie."""
-    if not bearer_token:
+    if not isinstance(arguments, dict):
+        return _error("arguments must be an object")
+    arguments = dict(arguments)
+    token = bearer_token.strip() if isinstance(bearer_token, str) else ""
+    if not token:
         return _error(
             "Jimeng sessionid is missing. Sign in at "
             "https://jimeng.jianying.com → DevTools → Cookies → "
@@ -153,7 +157,7 @@ async def call_tool(
         return _error(f"Unknown jimeng tool: {name}")
 
     try:
-        result = await handler(arguments, bearer_token)
+        result = await handler(arguments, token)
         return result if isinstance(result, dict) else _content(result)
     except httpx.HTTPStatusError as exc:
         body = exc.response.text[:500] if exc.response is not None else ""

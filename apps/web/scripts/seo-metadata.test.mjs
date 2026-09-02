@@ -15,11 +15,19 @@ test("authenticated web app publishes safe discovery metadata", () => {
   assert.match(html, /name="twitter:card"/);
 
   assert.match(robots, /^User-agent: \*$/m);
-  assert.doesNotMatch(robots, /^Disallow: \/$/m);
-  assert.match(robots, /^Allow: \/$/m);
-  assert.match(robots, /^Sitemap: https:\/\/manorai\.xyz\/sitemap\.xml$/m);
+  assert.match(robots, /^Allow: \/marketplace\/$/m);
+  assert.match(robots, /^Disallow: \/$/m);
+  assert.match(
+    robots,
+    /^Sitemap: https:\/\/app\.manorai\.xyz\/marketplace\/sitemap\.xml$/m,
+  );
 
   assert.match(llms, /^# Manor AI Application$/m);
+  assert.match(
+    llms,
+    /https:\/\/app\.manorai\.xyz\/marketplace\//,
+  );
+  assert.match(llms, /published Creator profile pages are intentionally public/);
   assert.match(llms, /https:\/\/github\.com\/manor-os\/manor-ai/);
   assert.match(llms, /source-available/);
 });

@@ -30,6 +30,8 @@ const GUIDANCE_KEYS = [
 test("the shared Input primitive can render guidance under a field", () => {
   assert.match(input, /hint\?: string/);
   assert.match(input, /\{hint &&/);
+  assert.match(input, /<label htmlFor=\{inputId\}/);
+  assert.match(input, /aria-describedby=\{error \? errorId : hint \? hintId : undefined\}/);
 });
 
 test("the email form explains the username must be a full address", () => {

@@ -374,6 +374,20 @@ Available actions depend on file type and user access.
 5. Ask a question based on a clear passage.
 6. Request a source reference.
 
+### Add an entire Knowledge folder to a Workspace
+
+1. Open Library → Knowledge.
+2. Open the folder menu and select Add folder to Workspace.
+3. Choose the destination Workspace.
+4. Wait for the confirmation showing how many documents were linked.
+5. Open Workspace → Configure → Knowledge and confirm that a same-named
+   Knowledge Net contains documents from the folder and its subfolders.
+
+Workspace Knowledge Nets are flat collections. The source folder and its
+subfolders are imported recursively into one Net without moving or copying the
+original documents. Repeating the action reuses the Net and adds newly available
+documents; it does not remove documents that were linked earlier.
+
 ### Use Wiki Map
 
 1. Create or open a Wiki page.

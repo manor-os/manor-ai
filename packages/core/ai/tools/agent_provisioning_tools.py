@@ -21,8 +21,10 @@ from typing import Any
 # new code from disk and survives the deploy version-skew window.
 from packages.core.ai.runtime.agent_provisioning import (
     runtime_provision_agent_action,
+    runtime_query_agent_capabilities_action,
     runtime_query_entity_agents_action,
 )
+from packages.core.constants.agent_capabilities import AGENT_CAPABILITY_SELECTION_LIMIT
 
 
 PROVISION_AGENT_SCHEMA = {
@@ -31,7 +33,9 @@ PROVISION_AGENT_SCHEMA = {
         "name": "provision_agent",
         "description": (
             "Create a custom Agent in the entity with full bindings: "
-            "tools, skills, and MCP servers. Auto-creates any "
+            "tools, skills, and MCP actions. Call query_agent_capabilities "
+            "first, semantically choose the smallest sufficient set, and pass "
+            "its exact ids unchanged in capability_ids. Auto-creates any "
             "``missing_skill_specs`` you list. Use this when the user "
             "asks for an agent to handle a specific job and no existing "
             "agent fits. Returns agent_id, agent_name, and a list of "
@@ -56,20 +60,57 @@ PROVISION_AGENT_SCHEMA = {
                 "description": {"type": "string"},
                 "category": {"type": "string"},
                 "tags": {"type": "array", "items": {"type": "string"}},
+                "capability_ids": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "maxItems": AGENT_CAPABILITY_SELECTION_LIMIT,
+                    "description": (
+                        "Exact ids returned by query_agent_capabilities. "
+                        "Never invent, shorten, or translate these ids."
+                    ),
+                },
                 "tool_bindings": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "Tool names from the platform tool pool.",
+                    "description": (
+                        "Legacy exact tool names. Prefer capability_ids from "
+                        "query_agent_capabilities. Unknown names fail before creation."
+                    ),
                 },
                 "skill_bindings": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "Skill ids OR slugs (entity + public).",
+                    "description": (
+                        "Legacy exact Skill ids only. Prefer capability_ids; "
+                        "slugs and fuzzy names are not accepted."
+                    ),
+                },
+                "skill_binding_refs": {
+                    "type": "array",
+                    "description": (
+                        "Exact Marketplace Skill identities. Prefer these over "
+                        "slugs when binding a Marketplace Skill."
+                    ),
+                    "items": {
+                        "type": "object",
+                        "required": ["marketplace_source", "marketplace_id"],
+                        "properties": {
+                            "marketplace_source": {
+                                "type": "string",
+                                "enum": ["platform", "manor"],
+                            },
+                            "marketplace_id": {"type": "string", "minLength": 1},
+                            "slug": {"type": "string"},
+                        },
+                    },
                 },
                 "mcp_bindings": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "MCP server ids or server_keys.",
+                    "description": (
+                        "Legacy exact MCP server_keys. Prefer action-level "
+                        "capability_ids from query_agent_capabilities."
+                    ),
                 },
                 "missing_skill_specs": {
                     "type": "array",
@@ -88,6 +129,21 @@ PROVISION_AGENT_SCHEMA = {
                 },
             },
         },
+    },
+}
+
+
+QUERY_AGENT_CAPABILITIES_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "query_agent_capabilities",
+        "description": (
+            "Return one actor-scoped catalog of exact Tool, Skill, BusinessCapability, "
+            "and MCP action ids. This catalog already accounts for resource visibility "
+            "and reports connection readiness. Use semantic reasoning over the returned "
+            "descriptions; do not keyword-match or invent ids."
+        ),
+        "parameters": {"type": "object", "properties": {}},
     },
 }
 
@@ -130,7 +186,11 @@ QUERY_ENTITY_AGENTS_SCHEMA = {
 async def _provision_agent_handler(
     entity_id: str = "", user_id: str = "", **kwargs: Any,
 ) -> str:
-    return await runtime_provision_agent_action(entity_id=entity_id, params=kwargs)
+    return await runtime_provision_agent_action(
+        entity_id=entity_id,
+        user_id=user_id,
+        params=kwargs,
+    )
 
 
 async def _query_entity_agents_handler(
@@ -145,8 +205,18 @@ async def _query_entity_agents_handler(
     )
 
 
+async def _query_agent_capabilities_handler(
+    entity_id: str = "", user_id: str = "", **_kwargs: Any,
+) -> str:
+    return await runtime_query_agent_capabilities_action(
+        entity_id=entity_id,
+        user_id=user_id,
+    )
+
+
 def get_tools():
     return [
+        (QUERY_AGENT_CAPABILITIES_SCHEMA, _query_agent_capabilities_handler),
         (PROVISION_AGENT_SCHEMA, _provision_agent_handler),
         (QUERY_ENTITY_AGENTS_SCHEMA, _query_entity_agents_handler),
     ]

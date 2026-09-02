@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from sqlalchemy import or_, select
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from packages.core.constants.execution import (
@@ -18,6 +18,9 @@ from packages.core.models.document import Integration
 from packages.core.models.mcp import MCPServer
 from packages.core.models.user import OAuthAccount
 from packages.core.services.integration_service import coming_soon_servers
+from packages.core.services.oauth_account_credentials import (
+    oauth_account_is_runtime_usable_clause,
+)
 from packages.core.services.provider_keys import canonical_provider_key
 
 
@@ -25,7 +28,6 @@ _BROWSER_PROVIDER = "chrome"
 _NON_USER_FACING_PROVIDER_KEYS = {
     "knowledge_local",
     "chrome_knowledge_local",
-    "local_browser",
     "nango",
 }
 
@@ -33,7 +35,6 @@ _BROWSER_COVERAGE_PROVIDER_KEYS = {
     "browser",
     "browser_use",
     "chrome_browser",
-    "local_browser",
     "web_browser",
     "instagram",
     "instagram_browser",
@@ -46,11 +47,6 @@ _BROWSER_COVERAGE_PROVIDER_KEYS = {
     "boss_zhipin",
     "boss",
 }
-
-_PREFERRED_PROVIDER_BY_DUPLICATE = {
-    "local_browser": _BROWSER_PROVIDER,
-}
-
 
 @dataclass(frozen=True)
 class MissingIntegrationResolution:
@@ -82,11 +78,35 @@ async def integration_provider_readiness(
     """Resolve runtime readiness without changing MCP capability bindings."""
     from packages.core.services.agent_permission_service import can_use_mcp_server
 
+    raw_providers = [
+        str(key or "").strip()
+        for key in provider_keys
+        if str(key or "").strip()
+    ]
     providers = list(dict.fromkeys(
-        canonical_provider_key(key) for key in provider_keys if canonical_provider_key(key)
+        canonical_provider_key(key) for key in raw_providers if canonical_provider_key(key)
     ))
+    account_free_provider_rows = list((await db.execute(
+        select(MCPServer.server_key).where(
+            MCPServer.server_key.in_([*raw_providers, *providers]),
+            MCPServer.status == "active",
+            MCPServer.auth_type.in_(("none", "no_auth")),
+        )
+    )).scalars().all()) if providers else []
+    account_free_providers = {
+        canonical_provider_key(provider)
+        for provider in account_free_provider_rows
+    }
     out: dict[str, IntegrationProviderReadiness] = {}
     for provider in providers:
+        if provider in account_free_providers:
+            out[provider] = IntegrationProviderReadiness(
+                provider=provider,
+                ready=True,
+                reason="Integration requires no account connection.",
+                scope="internal",
+            )
+            continue
         decision = await can_use_mcp_server(
             db,
             user_id=user_id or "",
@@ -142,10 +162,7 @@ async def connected_integration_provider_keys(
         oauth_rows = (await db.execute(
             select(OAuthAccount.provider).where(
                 OAuthAccount.user_id == user_id,
-                or_(
-                    OAuthAccount.credential_ref.is_not(None),
-                    OAuthAccount.access_token.is_not(None),
-                ),
+                oauth_account_is_runtime_usable_clause(),
             )
         )).scalars().all()
         keys.update(canonical_provider_key(provider) for provider in oauth_rows)
@@ -223,16 +240,6 @@ def resolve_missing_integration_provider_key(
     connected_provider_keys = connected_provider_keys or set()
     if original in connected_provider_keys:
         return None
-
-    preferred = _PREFERRED_PROVIDER_BY_DUPLICATE.get(original)
-    if preferred and preferred in supported_provider_keys:
-        if preferred in connected_provider_keys:
-            return None
-        return MissingIntegrationResolution(
-            provider=preferred,
-            original_provider=original,
-            covered_provider=original,
-        )
 
     if original in supported_provider_keys:
         return MissingIntegrationResolution(provider=original, original_provider=original)

@@ -1,4 +1,4 @@
-"""Document tools — search, list, and generate Knowledge documents."""
+"""Document tools — search and list Knowledge documents."""
 from __future__ import annotations
 
 from typing import Any
@@ -6,11 +6,10 @@ from typing import Any
 from packages.core.ai.runtime import (
     runtime_document_cache_key,
     runtime_document_to_dict,
-    runtime_generate_document_file,
     runtime_list_documents_action,
     runtime_search_documents_action,
 )
-from packages.core.ai.runtime.tool_context import runtime_tool_call_context_from_kwargs
+from packages.core.ai.runtime.tool_context import runtime_tool_call_context_from_handler
 
 # ---------------------------------------------------------------------------
 # Schemas
@@ -88,58 +87,6 @@ LIST_DOCUMENTS_SCHEMA = {
     },
 }
 
-GENERATE_DOCUMENT_FILE_SCHEMA = {
-    "type": "function",
-    "function": {
-        "name": "generate_document_file",
-        "description": (
-            "Generate a user-visible document file from text/Markdown content "
-            "and save it to Knowledge. Use this for final deliverables such as "
-            ".md, .txt, .csv, .json, .html, .docx, .pptx, or .pdf. For .pdf, "
-            ".docx, and .pptx this renders a real binary document, not a text "
-            "file with a misleading extension. For editable AI diagrams from a "
-            "prompt, use generate_file(kind='diagram') so a valid .diagram.json "
-            "canvas is created. For low-level filesystem writes or internal "
-            "notes, use write_file instead. For complex PDF editing such as "
-            "merge/split/forms/OCR/watermarks, use the pdf skill."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "name": {
-                    "type": "string",
-                    "description": (
-                        "Visible filename or relative Knowledge path, e.g. "
-                        "'融资/Manor AI intro.pdf' or 'notes/summary.md'. "
-                        "Hidden/system paths such as .ai/** are rejected."
-                    ),
-                },
-                "content": {
-                    "type": "string",
-                    "description": "Source text or Markdown content to render/save.",
-                },
-                "file_type": {
-                    "type": "string",
-                    "description": (
-                        "Output extension without dot when name has no extension "
-                        "(default 'txt'). Supported: md, txt, csv, json, html, "
-                        "diagram.json, docx, pptx, pdf."
-                    ),
-                },
-                "approval_token": {
-                    "type": "string",
-                    "description": "One-time token returned after the user approves creating/updating a user-visible document.",
-                },
-                "expected_sha256": {
-                    "type": "string",
-                    "description": "Optional previous source_sha256; refuses overwrite if target file changed.",
-                },
-            },
-            "required": ["name", "content"],
-        },
-    },
-}
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -156,40 +103,23 @@ async def _cache_key(action: str, entity_id: str, params: dict[str, Any]) -> str
 # Handlers
 # ---------------------------------------------------------------------------
 
-async def _search_documents(entity_id: str, **kwargs: Any) -> str:
-    runtime_context = runtime_tool_call_context_from_kwargs(kwargs)
+async def _search_documents(entity_id: str, user_id: str = "", **kwargs: Any) -> str:
+    runtime_context = runtime_tool_call_context_from_handler(kwargs, user_id=user_id)
     return await runtime_search_documents_action(
         entity_id=entity_id,
-        user_id=kwargs.get("user_id") or runtime_context.user_id,
-        workspace_id=kwargs.get("workspace_id") or runtime_context.workspace_id,
+        user_id=runtime_context.user_id,
+        workspace_id=runtime_context.workspace_id,
         params=kwargs,
     )
 
 
-async def _list_documents(entity_id: str, **kwargs: Any) -> str:
-    runtime_context = runtime_tool_call_context_from_kwargs(kwargs)
+async def _list_documents(entity_id: str, user_id: str = "", **kwargs: Any) -> str:
+    runtime_context = runtime_tool_call_context_from_handler(kwargs, user_id=user_id)
     return await runtime_list_documents_action(
         entity_id=entity_id,
-        user_id=kwargs.get("user_id") or runtime_context.user_id,
-        workspace_id=kwargs.get("workspace_id") or runtime_context.workspace_id,
+        user_id=runtime_context.user_id,
+        workspace_id=runtime_context.workspace_id,
         params=kwargs,
-    )
-
-
-async def _generate_document_file(entity_id: str, **kwargs: Any) -> str:
-    runtime_context = runtime_tool_call_context_from_kwargs(kwargs)
-    return await runtime_generate_document_file(
-        entity_id=entity_id,
-        user_id=kwargs.get("user_id") or runtime_context.user_id or "",
-        conversation_id=kwargs.get("conversation_id") or runtime_context.conversation_id or "",
-        name=kwargs.get("name") or "",
-        content=kwargs.get("content") or "",
-        file_type=kwargs.get("file_type") or "txt",
-        approval_token=kwargs.get("approval_token"),
-        expected_sha256=kwargs.get("expected_sha256"),
-        workspace_id=kwargs.get("workspace_id") or runtime_context.workspace_id,
-        task_id=kwargs.get("task_id") or runtime_context.task_id,
-        agent_id=kwargs.get("agent_id") or runtime_context.agent_id,
     )
 
 
@@ -201,5 +131,4 @@ def get_tools() -> list[tuple[dict, callable]]:
     return [
         (SEARCH_DOCUMENTS_SCHEMA, _search_documents),
         (LIST_DOCUMENTS_SCHEMA, _list_documents),
-        (GENERATE_DOCUMENT_FILE_SCHEMA, _generate_document_file),
     ]

@@ -75,6 +75,20 @@ docker compose logs worker --tail=100
 docker compose down
 ```
 
+## Compose 网络冲突 {#compose-network-conflicts}
+
+Manor 会在一个私有 `/24` 网络接近末尾的位置为 Caddy 和 Web 代理保留两个
+地址，并将它们排除在容器动态地址池之外。如果默认的 `172.30.0.0/24` 与
+其他本地网络或 VPN 网络重叠，请在 `.env` 中一次性修改前三个八位组：
+
+```bash
+MANOR_DOCKER_NETWORK_PREFIX=10.50.7
+```
+
+该设置会同时派生出 `10.50.7.0/24`、`10.50.7.0/25` 动态地址池，以及代理
+地址 `10.50.7.250` 和 `10.50.7.251`。请使用三个十进制八位组，不要附加
+CIDR 后缀。
+
 ## 重建单个服务 {#rebuilding-one-service}
 
 ```bash

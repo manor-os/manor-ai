@@ -16,12 +16,16 @@ RUNTIME_TOOL_CONTEXT_KEYS = frozenset(
         "_runtime_artifact_urls_from_context",
         "_dependency_artifact_urls_from_context",
         "_manual_skill_selected_from_context",
+        "_manual_skill_ids_from_context",
         "_manual_skill_slugs_from_context",
         "_tool_profile_from_context",
         "_runtime_envelope_from_context",
         "_allowed_tool_names_from_context",
         "_llm_metadata_from_context",
         "_llm_model_from_context",
+        "_runtime_run_id_from_context",
+        "_runtime_tool_call_id_from_context",
+        "_runtime_tool_attempt_from_context",
         "workspace_id",
         "conversation_id",
         "task_id",
@@ -30,6 +34,7 @@ RUNTIME_TOOL_CONTEXT_KEYS = frozenset(
         "_workflow_lineage_root_run_id_from_context",
         "_workflow_project_root_from_context",
         "_workflow_action_grant_id_from_context",
+        "_workflow_step_id_from_context",
         "_workflow_scene_id_from_context",
         "_workflow_batch_capture_from_context",
         "_approved_plan_version_from_context",
@@ -58,6 +63,10 @@ def runtime_manual_skill_slugs_from_context(kwargs: dict[str, Any]) -> set[str]:
     return {value.lower() for value in _string_set(kwargs.get("_manual_skill_slugs_from_context"))}
 
 
+def runtime_manual_skill_ids_from_context(kwargs: dict[str, Any]) -> set[str]:
+    return _string_set(kwargs.get("_manual_skill_ids_from_context"))
+
+
 def runtime_manual_skill_selected_from_context(kwargs: dict[str, Any]) -> bool:
     return bool(kwargs.get("_manual_skill_selected_from_context"))
 
@@ -69,12 +78,14 @@ def runtime_active_user_message_from_context(kwargs: dict[str, Any]) -> str | No
 
 @dataclass(frozen=True)
 class RuntimeToolCallContext:
+    entity_id: str | None = None
     agent_id: str | None = None
     user_id: str | None = None
     active_user_message: str | None = None
     runtime_artifact_urls: frozenset[str] = frozenset()
     dependency_artifact_urls: frozenset[str] = frozenset()
     manual_skill_selected: bool = False
+    manual_skill_ids: frozenset[str] = frozenset()
     manual_skill_slugs: frozenset[str] = frozenset()
     tool_profile: str | None = None
     runtime_envelope: Any | None = None
@@ -89,23 +100,73 @@ class RuntimeToolCallContext:
     workflow_lineage_root_run_id: str | None = None
     workflow_project_root: str | None = None
     workflow_action_grant_id: str | None = None
+    workflow_step_id: str | None = None
     workflow_scene_id: str | None = None
     workflow_batch_capture: str | None = None
     approved_plan_version: str | None = None
+    runtime_run_id: str | None = None
+    runtime_tool_call_id: str | None = None
+    runtime_tool_attempt: int = 1
 
 
-def runtime_tool_call_context_from_kwargs(kwargs: dict[str, Any]) -> RuntimeToolCallContext:
+class RuntimeToolContextConflictError(ValueError):
+    """Raised when trusted runtime scope sources disagree."""
+
+
+def _runtime_scope_value(name: str, *values: Any) -> str | None:
+    normalized = [str(value).strip() for value in values if str(value or "").strip()]
+    if len(set(normalized)) > 1:
+        raise RuntimeToolContextConflictError(f"Conflicting runtime scope for {name}.")
+    return normalized[0] if normalized else None
+
+
+def runtime_tool_call_context_from_kwargs(
+    kwargs: dict[str, Any],
+    *,
+    entity_id: str | None = None,
+    user_id: str | None = None,
+    agent_id: str | None = None,
+    workspace_id: str | None = None,
+    conversation_id: str | None = None,
+    task_id: str | None = None,
+    runtime_envelope: Any | None = None,
+) -> RuntimeToolCallContext:
+    """Build one tool context from explicit, injected, and envelope scope."""
+
+    injected_envelope = kwargs.get("_runtime_envelope_from_context")
+    envelope = runtime_envelope if runtime_envelope is not None else injected_envelope
+    envelopes = tuple(
+        candidate
+        for candidate in (runtime_envelope, injected_envelope)
+        if candidate is not None
+    )
+
+    def envelope_values(name: str) -> tuple[Any, ...]:
+        return tuple(getattr(candidate, name, None) for candidate in envelopes)
+
     allowed = runtime_allowed_tool_names_from_context(kwargs)
     return RuntimeToolCallContext(
-        agent_id=str(kwargs.get("_agent_id_from_context") or "") or None,
-        user_id=str(kwargs.get("_user_id_from_context") or "") or None,
+        entity_id=_runtime_scope_value("entity_id", entity_id, *envelope_values("entity_id")),
+        agent_id=_runtime_scope_value(
+            "agent_id",
+            agent_id,
+            kwargs.get("_agent_id_from_context"),
+            *envelope_values("agent_id"),
+        ),
+        user_id=_runtime_scope_value(
+            "user_id",
+            user_id,
+            kwargs.get("_user_id_from_context"),
+            *envelope_values("user_id"),
+        ),
         active_user_message=runtime_active_user_message_from_context(kwargs),
         runtime_artifact_urls=frozenset(_url_set(kwargs.get("_runtime_artifact_urls_from_context"))),
         dependency_artifact_urls=frozenset(_url_set(kwargs.get("_dependency_artifact_urls_from_context"))),
         manual_skill_selected=runtime_manual_skill_selected_from_context(kwargs),
+        manual_skill_ids=frozenset(runtime_manual_skill_ids_from_context(kwargs)),
         manual_skill_slugs=frozenset(runtime_manual_skill_slugs_from_context(kwargs)),
         tool_profile=str(kwargs.get("_tool_profile_from_context") or "") or None,
-        runtime_envelope=kwargs.get("_runtime_envelope_from_context"),
+        runtime_envelope=envelope,
         allowed_tool_names=frozenset(allowed) if allowed is not None else None,
         llm_metadata=(
             dict(kwargs["_llm_metadata_from_context"])
@@ -113,9 +174,24 @@ def runtime_tool_call_context_from_kwargs(kwargs: dict[str, Any]) -> RuntimeTool
             else None
         ),
         llm_model=str(kwargs.get("_llm_model_from_context") or "") or None,
-        workspace_id=str(kwargs.get("workspace_id") or "") or None,
-        conversation_id=str(kwargs.get("conversation_id") or "") or None,
-        task_id=str(kwargs.get("task_id") or "") or None,
+        workspace_id=_runtime_scope_value(
+            "workspace_id",
+            workspace_id,
+            kwargs.get("workspace_id"),
+            *envelope_values("workspace_id"),
+        ),
+        conversation_id=_runtime_scope_value(
+            "conversation_id",
+            conversation_id,
+            kwargs.get("conversation_id"),
+            *envelope_values("conversation_id"),
+        ),
+        task_id=_runtime_scope_value(
+            "task_id",
+            task_id,
+            kwargs.get("task_id"),
+            *envelope_values("task_id"),
+        ),
         workflow_project_id=str(kwargs.get("_workflow_project_id_from_context") or "") or None,
         workflow_run_id=str(kwargs.get("_workflow_run_id_from_context") or "") or None,
         workflow_lineage_root_run_id=(
@@ -127,6 +203,7 @@ def runtime_tool_call_context_from_kwargs(kwargs: dict[str, Any]) -> RuntimeTool
         workflow_action_grant_id=(
             str(kwargs.get("_workflow_action_grant_id_from_context") or "") or None
         ),
+        workflow_step_id=str(kwargs.get("_workflow_step_id_from_context") or "") or None,
         workflow_scene_id=str(kwargs.get("_workflow_scene_id_from_context") or "") or None,
         workflow_batch_capture=(
             str(kwargs.get("_workflow_batch_capture_from_context") or "") or None
@@ -134,7 +211,36 @@ def runtime_tool_call_context_from_kwargs(kwargs: dict[str, Any]) -> RuntimeTool
         approved_plan_version=(
             str(kwargs.get("_approved_plan_version_from_context") or "") or None
         ),
+        runtime_run_id=str(kwargs.get("_runtime_run_id_from_context") or "") or None,
+        runtime_tool_call_id=(
+            str(kwargs.get("_runtime_tool_call_id_from_context") or "") or None
+        ),
+        runtime_tool_attempt=max(
+            1,
+            int(kwargs.get("_runtime_tool_attempt_from_context") or 1),
+        ),
     )
+
+
+def runtime_tool_call_context_from_handler(
+    kwargs: dict[str, Any],
+    *,
+    user_id: str | None = None,
+) -> RuntimeToolCallContext:
+    """Preserve trusted direct-call identity without trusting model arguments.
+
+    Runtime execution injects an identity key (including for an anonymous
+    caller) or an envelope. In that case the injected scope wins and the
+    handler's top-level ``user_id`` is ignored. Trusted internal callers that
+    have no Runtime injection may still use the explicit handler parameter.
+    """
+    direct_user_id = (
+        user_id
+        if "_user_id_from_context" not in kwargs
+        and "_runtime_envelope_from_context" not in kwargs
+        else None
+    )
+    return runtime_tool_call_context_from_kwargs(kwargs, user_id=direct_user_id)
 
 
 def runtime_tool_call_context_is_external_customer(kwargs: dict[str, Any]) -> bool:
@@ -173,6 +279,7 @@ def runtime_injected_tool_context_args(
     runtime_artifact_urls: Iterable[str] | None = None,
     dependency_artifact_urls: Iterable[str] | None = None,
     manual_skill_selected: bool = False,
+    manual_skill_ids: Iterable[str] | None = None,
     manual_skill_slugs: Iterable[str] | None = None,
     tool_profile: str | None = None,
     runtime_envelope: Any | None = None,
@@ -188,6 +295,7 @@ def runtime_injected_tool_context_args(
         "_user_id_from_context": user_id,
         "_active_user_message_from_context": active_user_message,
         "_manual_skill_selected_from_context": manual_skill_selected,
+        "_manual_skill_ids_from_context": list(manual_skill_ids or []),
         "_manual_skill_slugs_from_context": list(manual_skill_slugs or []),
         "_tool_profile_from_context": tool_profile,
     }

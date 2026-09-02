@@ -9,7 +9,8 @@ Scopes used:
   - Chat.ReadWrite            — DMs / group chats
   - OnlineMeetings.ReadWrite  — schedule + read Teams meeting metadata
 
-Auth: Microsoft Graph access_token (resolved via ``_ms_auth``).
+Auth: Microsoft Graph access token resolved by the standard user-scoped MCP
+credential dispatcher.
 
 Coverage focuses on the 80% agent uses:
   * Find which teams + channels the user is in
@@ -45,6 +46,11 @@ def list_tools() -> List[Dict[str, Any]]:
 async def call_tool(
     name: str, arguments: Dict[str, Any], bearer_token: str,
 ) -> Dict[str, Any]:
+    if not str(bearer_token or "").strip():
+        return _error(
+            "Microsoft Graph access token is missing. Reconnect Microsoft on the Integration page."
+        )
+
     handler = _HANDLERS.get(name)
     if not handler:
         return _error(f"Unknown tool: {name}")
@@ -201,12 +207,19 @@ async def _send_chat_message(token: str, args: Dict) -> str:
 
 
 async def _create_chat(token: str, args: Dict) -> str:
-    """Start a new 1:1 or group chat. Manor's user must always be a
-    member — Graph adds them implicitly when you POST as them."""
+    """Start a new 1:1 or group chat with the delegated user as a member."""
     raw = args["recipients"]
     emails = raw if isinstance(raw, list) else [e.strip() for e in str(raw).split(",") if e.strip()]
     chat_type = args.get("chat_type") or ("group" if len(emails) > 1 else "oneOnOne")
-    members = [
+    try:
+        initiating_user_id = str(json.loads(await _api(token, "GET", "me"))["id"])
+    except (KeyError, TypeError, json.JSONDecodeError) as exc:
+        raise RuntimeError("Could not resolve the delegated Teams user") from exc
+    members = [{
+        "@odata.type": "#microsoft.graph.aadUserConversationMember",
+        "roles": ["owner"],
+        "user@odata.bind": f"https://graph.microsoft.com/v1.0/users('{initiating_user_id}')",
+    }] + [
         {
             "@odata.type": "#microsoft.graph.aadUserConversationMember",
             "roles": ["owner"],

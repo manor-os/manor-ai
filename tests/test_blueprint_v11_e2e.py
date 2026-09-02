@@ -19,13 +19,19 @@ and uses the returned access token.
 
 from __future__ import annotations
 
+import asyncio
+
 from httpx import AsyncClient
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from packages.core.models.base import generate_ulid
 from packages.core.models.blueprint import WorkspaceBlueprint
+from packages.core.models.channel import ChannelConfig
+from packages.core.models.document import Document, DocumentGroup, DocumentGroupMember
+from packages.core.models.marketplace_resource_link import MarketplaceResourceLink
 from packages.core.models.memory import AgentMemory
+from packages.core.models.integration_session import IntegrationSession
 from packages.core.models.skill import AgentSkillBinding, Skill
 from packages.core.models.workflow import WorkflowBinding, WorkflowDefinition
 from packages.core.models.workspace import (
@@ -35,6 +41,7 @@ from packages.core.models.workspace import (
     ToolDefinition,
     Workspace,
 )
+from packages.core.models.user import User
 from packages.core.blueprints.exporter import export_workspace
 
 
@@ -87,7 +94,7 @@ async def test_v11_full_export_install_roundtrip(
     db_session: AsyncSession,
 ):
     """Create a workspace, export it as a v1.1 blueprint, install the
-    blueprint as a fresh sandbox workspace, verify the new workspace
+    blueprint as a fresh Workspace simulation, verify the new workspace
     inherits the configured operating_model and that the WorkspaceBlueprint
     row records ``payload_version='1.1'``."""
     headers, _ = await _register(client, "v11rt")
@@ -177,6 +184,196 @@ async def test_v11_full_export_install_roundtrip(
     assert source_detail["remix_count"] == 1
 
 
+async def test_v11_business_ledger_settings_roundtrip(
+    client: AsyncClient,
+):
+    """Creation-time business matching remains portable through Blueprint install."""
+
+    headers, _ = await _register(client, "v11ledgerroundtrip")
+    source_response = await client.post(
+        "/api/v1/workspaces",
+        headers=headers,
+        json={
+            "name": "Talent Operations",
+            "kind": "operations",
+            "operating_context": "Recruit candidates and manage employee onboarding.",
+            "primary_work": "Run interviews and the hiring pipeline.",
+        },
+    )
+    assert source_response.status_code == 201, source_response.text
+    source_workspace = source_response.json()
+    expected_contracts = [{
+        "contract_id": "manor.recruiting_ledger/v1",
+        "schema_version": 1,
+        "directory": "recruiting-ledger",
+    }]
+    assert source_workspace["settings"]["ledger_contracts"] == expected_contracts
+
+    exported_response = await client.post(
+        f"/api/v1/workspaces/{source_workspace['id']}/export-blueprint",
+        headers=headers,
+        json={
+            "slug": "talent-operations-ledger-v1",
+            "title": "Talent Operations Ledger",
+        },
+    )
+    assert exported_response.status_code == 201, exported_response.text
+    exported = exported_response.json()
+    source_settings = exported["payload"]["recipe"]["operating_model"]["settings"]
+    assert source_settings["ledger_contracts"] == expected_contracts
+    assert "ledger_matching" not in source_settings
+
+    installed_response = await client.post(
+        f"/api/v1/blueprints/{exported['id']}/install",
+        headers=headers,
+        json={"mode": "simulate", "workspace_name": "Talent Operations Copy"},
+    )
+    assert installed_response.status_code == 201, installed_response.text
+    installed_workspace_id = installed_response.json()["workspace_id"]
+    installed_response = await client.get(
+        f"/api/v1/workspaces/{installed_workspace_id}",
+        headers=headers,
+    )
+    assert installed_response.status_code == 200, installed_response.text
+    assert installed_response.json()["settings"]["ledger_contracts"] == expected_contracts
+    assert "ledger_matching" not in installed_response.json()["settings"]
+
+    reexported_response = await client.post(
+        f"/api/v1/workspaces/{installed_workspace_id}/export-blueprint",
+        headers=headers,
+        json={
+            "slug": "talent-operations-ledger-remix-v1",
+            "title": "Talent Operations Ledger Remix",
+        },
+    )
+    assert reexported_response.status_code == 201, reexported_response.text
+    reexported_settings = (
+        reexported_response.json()["payload"]["recipe"]["operating_model"]["settings"]
+    )
+    assert reexported_settings["ledger_contracts"] == source_settings["ledger_contracts"]
+
+
+async def test_v11_export_selects_exact_safe_knowledge_starter_files(
+    client: AsyncClient,
+    db_session: AsyncSession,
+):
+    headers, _ = await _register(client, "v11knowledgeselect")
+    workspace_payload = await _create_workspace(
+        client,
+        headers,
+        "Knowledge Starter Source",
+    )
+    workspace = await db_session.get(Workspace, workspace_payload["id"])
+    assert workspace is not None
+
+    group = DocumentGroup(
+        id=generate_ulid(),
+        entity_id=workspace.entity_id,
+        workspace_id=workspace.id,
+        name="Portable Playbooks",
+        settings={"purpose": "Blueprint starter files"},
+    )
+    selected = Document(
+        id=generate_ulid(),
+        entity_id=workspace.entity_id,
+        name="selected.md",
+        mime_type="text/markdown",
+        metadata_={"content_text": "# Selected playbook"},
+        classification="public",
+        visibility="workspace",
+        pii_detected=False,
+        quarantine_status="clean",
+        is_trashed=False,
+    )
+    omitted = Document(
+        id=generate_ulid(),
+        entity_id=workspace.entity_id,
+        name="omitted.md",
+        mime_type="text/markdown",
+        metadata_={"content_text": "# Omitted playbook"},
+        classification="public",
+        visibility="workspace",
+        pii_detected=False,
+        quarantine_status="clean",
+        is_trashed=False,
+    )
+    private = Document(
+        id=generate_ulid(),
+        entity_id=workspace.entity_id,
+        name="private.md",
+        mime_type="text/markdown",
+        metadata_={"content_text": "Never export"},
+        classification="public",
+        visibility="private",
+        pii_detected=False,
+        quarantine_status="clean",
+        is_trashed=False,
+    )
+    db_session.add_all([group, selected, omitted, private])
+    await db_session.flush()
+    db_session.add_all([
+        DocumentGroupMember(document_id=document.id, group_id=group.id)
+        for document in (selected, omitted, private)
+    ])
+    await db_session.commit()
+
+    candidates_response = await client.get(
+        f"/api/v1/workspaces/{workspace.id}/blueprint-export/knowledge-documents",
+        headers=headers,
+    )
+    assert candidates_response.status_code == 200, candidates_response.text
+    assert [item["id"] for item in candidates_response.json()] == [
+        omitted.id,
+        selected.id,
+    ]
+    assert all("body_md" not in item for item in candidates_response.json())
+    page_response = await client.get(
+        f"/api/v1/workspaces/{workspace.id}/blueprint-export/knowledge-documents?limit=1&offset=1",
+        headers=headers,
+    )
+    assert page_response.status_code == 200, page_response.text
+    assert [item["id"] for item in page_response.json()] == [selected.id]
+    for query in ("limit=101", "limit=0", "offset=-1"):
+        invalid_page = await client.get(
+            f"/api/v1/workspaces/{workspace.id}/blueprint-export/knowledge-documents?{query}", headers=headers,
+        )
+        assert invalid_page.status_code == 422
+
+    export_response = await client.post(
+        f"/api/v1/workspaces/{workspace.id}/export-blueprint",
+        headers=headers,
+        json={
+            "slug": "knowledge-starter-selection-v1",
+            "title": "Knowledge starter selection",
+            "knowledge_pack_mode": "inline_text",
+            "include_memory_files": True,
+            "knowledge_document_ids": [selected.id],
+        },
+    )
+    assert export_response.status_code == 201, export_response.text
+    [pack] = export_response.json()["payload"]["embedded"]["knowledge_packs"]
+    assert len(pack["starter_documents"]) == 1
+    assert pack["starter_documents"][0]["path"] == "selected.md"
+    assert pack["starter_documents"][0]["body_md"] == "# Selected playbook"
+    assert pack["starter_documents"][0]["key"].startswith("selected-md-")
+    assert selected.id not in str(export_response.json()["payload"])
+
+    rejected_response = await client.post(
+        f"/api/v1/workspaces/{workspace.id}/export-blueprint",
+        headers=headers,
+        json={
+            "marketplace_blueprint_id": export_response.json()["id"],
+            "slug": "knowledge-starter-selection-v1",
+            "title": "Private starter must fail",
+            "knowledge_pack_mode": "inline_text",
+            "knowledge_document_ids": [private.id],
+            "replace_existing": True,
+        },
+    )
+    assert rejected_response.status_code == 400, rejected_response.text
+    assert "unavailable or ineligible" in rejected_response.text
+
+
 async def test_v11_refreeze_replaces_only_same_workspace_editable_draft(
     client: AsyncClient,
     db_session: AsyncSession,
@@ -188,10 +385,42 @@ async def test_v11_refreeze_replaces_only_same_workspace_editable_draft(
     first = await client.post(
         f"/api/v1/workspaces/{workspace_id}/export-blueprint",
         headers=headers,
-        json={"slug": "refreeze-v1", "title": "Refreeze v1"},
+        json={
+            "slug": "refreeze-v1",
+            "title": "Refreeze v1",
+            "install_variables": [{
+                "key": "review_limit",
+                "label": "Review limit",
+                "default": 7,
+                "required": False,
+                "materialize": False,
+            }],
+        },
     )
     assert first.status_code == 201, first.text
     first_payload = first.json()
+    assert first_payload["payload"]["contract"]["variables"] == [{
+        "key": "review_limit",
+        "label": "Review limit",
+        "required": False,
+        "default": 7,
+        "materialize": False,
+    }]
+
+    invalid_install = await client.post(
+        f"/api/v1/blueprints/{first_payload['id']}/install",
+        headers=headers,
+        json={
+            "mode": "simulate",
+            "variable_values": {"review_limit": "internal-tool-key"},
+        },
+    )
+    assert invalid_install.status_code == 400, invalid_install.text
+    assert invalid_install.json()["detail"] == (
+        "Blueprint configuration or personalization is invalid."
+    )
+    assert "review_limit" not in invalid_install.text
+    assert "internal-tool-key" not in invalid_install.text
 
     duplicate = await client.post(
         f"/api/v1/workspaces/{workspace_id}/export-blueprint",
@@ -209,19 +438,91 @@ async def test_v11_refreeze_replaces_only_same_workspace_editable_draft(
         f"/api/v1/workspaces/{workspace_id}/export-blueprint",
         headers=headers,
         json={
-            "slug": "refreeze-v1",
+            "marketplace_blueprint_id": first_payload["id"],
+            "slug": "refreeze-renamed-v1",
             "title": "Refreeze v2",
+            "install_variables": [],
             "replace_existing": True,
         },
     )
     assert replaced.status_code == 201, replaced.text
     replaced_payload = replaced.json()
     assert replaced_payload["id"] == first_payload["id"]
+    assert replaced_payload["slug"] == "refreeze-renamed-v1"
     assert replaced_payload["title"] == "Refreeze v2"
+    assert replaced_payload["payload"]["contract"]["variables"] == []
     assert (
         replaced_payload["payload"]["recipe"]["operating_model"]["context"]
         == "Updated portable context."
     )
+
+
+async def test_v11_deleted_export_can_be_recreated_for_same_workspace(
+    client: AsyncClient,
+    db_session: AsyncSession,
+):
+    headers, user = await _register(client, "v11reexportdeleted")
+    ws = await _create_workspace(client, headers, "Deleted Export Source")
+
+    first = await client.post(
+        f"/api/v1/workspaces/{ws['id']}/export-blueprint",
+        headers=headers,
+        json={"slug": "deleted-export-v1", "title": "Deleted Export v1"},
+    )
+    assert first.status_code == 201, first.text
+    first_id = first.json()["id"]
+
+    deleted = await client.delete(
+        f"/api/v1/blueprints/{first_id}",
+        headers=headers,
+    )
+    assert deleted.status_code == 204, deleted.text
+    stale_links = list((await db_session.execute(
+        select(MarketplaceResourceLink).where(
+            MarketplaceResourceLink.entity_id == user["entity_id"],
+            MarketplaceResourceLink.marketplace_resource_id == first_id,
+            MarketplaceResourceLink.relationship == "published_as",
+        )
+    )).scalars().all())
+    assert stale_links == []
+
+    second = await client.post(
+        f"/api/v1/workspaces/{ws['id']}/export-blueprint",
+        headers=headers,
+        json={"slug": "deleted-export-v2", "title": "Deleted Export v2"},
+    )
+    assert second.status_code == 201, second.text
+    assert second.json()["id"] != first_id
+
+
+async def test_v11_concurrent_first_exports_create_one_counterpart(
+    client: AsyncClient,
+    db_session: AsyncSession,
+):
+    headers, user = await _register(client, "v11concurrentexport")
+    ws = await _create_workspace(client, headers, "Concurrent Export Source")
+
+    responses = await asyncio.gather(
+        client.post(
+            f"/api/v1/workspaces/{ws['id']}/export-blueprint",
+            headers=headers,
+            json={"slug": "concurrent-export-a", "title": "Export A"},
+        ),
+        client.post(
+            f"/api/v1/workspaces/{ws['id']}/export-blueprint",
+            headers=headers,
+            json={"slug": "concurrent-export-b", "title": "Export B"},
+        ),
+    )
+
+    assert sorted(response.status_code for response in responses) == [201, 409]
+    rows = list((await db_session.execute(
+        select(WorkspaceBlueprint).where(
+            WorkspaceBlueprint.entity_id == user["entity_id"],
+            WorkspaceBlueprint.source_workspace_id == ws["id"],
+        )
+    )).scalars().all())
+    assert len(rows) == 1
 
 
 async def test_v11_workspace_workflow_export_install_roundtrip(
@@ -578,7 +879,14 @@ async def test_v11_v10_payload_auto_migrates_and_installs(
     used), POST it through ``install-payload``, and verify it installs
     OK — the auto-migrator should lift it to v1.1 and the installer
     should consume the migrated shape transparently."""
-    headers, _ = await _register(client, "v11compat")
+    headers, user = await _register(client, "v11compat")
+    db_session.add(IntegrationSession(
+        entity_id=user["entity_id"],
+        provider="x",
+        label="main",
+        status="active",
+    ))
+    await db_session.commit()
 
     v10_payload = {
         "blueprint_version": "1.0",
@@ -612,10 +920,48 @@ async def test_v11_v10_payload_auto_migrates_and_installs(
         ],
     }
 
-    resp = await client.post(
+    simulated = await client.post(
         "/api/v1/blueprints/install-payload",
         headers=headers,
         json={"payload": v10_payload, "mode": "simulate"},
+    )
+    assert simulated.status_code == 201, simulated.text
+
+    blocked = await client.post(
+        "/api/v1/blueprints/install-payload",
+        headers=headers,
+        json={"payload": v10_payload, "mode": "live"},
+    )
+    assert blocked.status_code == 409, blocked.text
+    assert blocked.json()["detail"]["code"] == "blueprint_setup_required"
+
+    installer = (await db_session.execute(
+        select(User).where(User.email == "v11compat@v11e2e.test")
+    )).scalar_one()
+    channel_config = ChannelConfig(
+        entity_id=user["entity_id"],
+        owner_user_id=installer.id,
+        workspace_id=None,
+        channel_type="telegram",
+        provider="telegram_bot",
+        name="Legacy alerts",
+        config={},
+        credentials={},
+        status="active",
+    )
+    db_session.add(channel_config)
+    await db_session.commit()
+
+    resp = await client.post(
+        "/api/v1/blueprints/install-payload",
+        headers=headers,
+        json={
+            "payload": v10_payload,
+            "mode": "live",
+            "channel_config_ids": {
+                "channel:0:telegram": channel_config.id,
+            },
+        },
     )
     assert resp.status_code == 201, resp.text
     install_data = resp.json()
@@ -628,10 +974,11 @@ async def test_v11_v10_payload_auto_migrates_and_installs(
     assert new_ws["operating_context"] == "Legacy context"
     assert new_ws["primary_work"] == "Legacy work"
 
-    # Channel + session requirements surfaced as todos
+    # Accounts are connected, but this legacy payload declares no Agent
+    # subscription. Keep the channel blocker until a real route can be bound.
     todo_kinds = {t["kind"] for t in install_data["todos"]}
     assert "channel" in todo_kinds
-    assert "browser_session" in todo_kinds
+    assert "browser_session" not in todo_kinds
 
 
 # ── Test 6: governance preset rejects bad embedded tool binding ───────
@@ -722,7 +1069,11 @@ async def test_v11_governance_rejects_embedded_blocked_tool(
     )
     # Installer raises InstallError → router returns 400
     assert resp.status_code == 400, resp.text
-    assert "governance" in resp.text.lower() or "blocked" in resp.text.lower()
+    assert resp.json()["detail"] == (
+        "Blueprint configuration or personalization is invalid."
+    )
+    assert "tool.x.delete_account" not in resp.text
+    assert "x.delete_*" not in resp.text
 
     # Critically: no Agent row got created (the check happens before the
     # row is added to the session).
@@ -790,6 +1141,7 @@ async def test_v11_strategist_template_installs(
                 },
                 "proposal_shape": {"max_tasks_per_cycle": 3},
                 "do_not_propose": ["No mass DMs"],
+                "use_goals": False,
                 "evaluation_rubric": {
                     "weights": {"goal_impact": 0.5, "cost_efficiency": 0.5},
                     "passing_score": 0.6,
@@ -831,6 +1183,7 @@ async def test_v11_strategist_template_installs(
     assert strat["business_model"]["model_type"] == "social_growth"
     assert strat["proposal_shape"]["max_tasks_per_cycle"] == 3
     assert strat["do_not_propose"] == ["No mass DMs"]
+    assert strat["use_goals"] is False
 
     exported = await export_workspace(
         db_session,
@@ -859,7 +1212,10 @@ async def test_v11_invalid_payload_returns_400(client: AsyncClient):
         json={"payload": bad_payload, "mode": "simulate"},
     )
     assert resp.status_code == 400, resp.text
-    assert "invalid blueprint" in resp.text.lower() or "unsupported" in resp.text.lower()
+    assert resp.json()["detail"] == (
+        "Blueprint setup requirements could not be evaluated."
+    )
+    assert "9.9" not in resp.text
 
 
 # ── Test 9: stored v1.0 blueprint row still installs via ID path ──────

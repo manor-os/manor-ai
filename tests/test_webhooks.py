@@ -51,6 +51,81 @@ async def test_create_webhook_endpoint(client: AsyncClient):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "url",
+    [
+        "example.com/webhook",
+        "ftp://example.com/webhook",
+        "https:///missing-host",
+        "http://",
+        "   ",
+    ],
+)
+async def test_create_rejects_non_http_webhook_urls(client: AsyncClient, url: str):
+    """Reject malformed/non-HTTP endpoint URLs before persisting an endpoint."""
+    headers = await _auth(client, f"hookuser_invalid_{abs(hash(url))}")
+
+    resp = await client.post(
+        "/api/v1/webhooks",
+        headers=headers,
+        json={"url": url},
+    )
+
+    assert 400 <= resp.status_code < 500
+
+
+@pytest.mark.asyncio
+async def test_update_rejects_invalid_url_without_changing_endpoint(client: AsyncClient):
+    headers = await _auth(client, "hookuser_invalid_update")
+
+    create_resp = await client.post(
+        "/api/v1/webhooks",
+        headers=headers,
+        json={"url": "https://example.com/original"},
+    )
+    endpoint_id = create_resp.json()["id"]
+
+    update_resp = await client.put(
+        f"/api/v1/webhooks/{endpoint_id}",
+        headers=headers,
+        json={"url": "not-a-url"},
+    )
+    assert 400 <= update_resp.status_code < 500
+
+    get_resp = await client.get(f"/api/v1/webhooks/{endpoint_id}", headers=headers)
+    assert get_resp.status_code == 200
+    assert get_resp.json()["url"] == "https://example.com/original"
+
+
+@pytest.mark.asyncio
+async def test_webhook_secret_is_only_returned_on_create(client: AsyncClient):
+    headers = await _auth(client, "hookuser_secret_visibility")
+
+    create_resp = await client.post(
+        "/api/v1/webhooks",
+        headers=headers,
+        json={"url": "https://example.com/secret"},
+    )
+    assert create_resp.status_code == 201
+    endpoint_id = create_resp.json()["id"]
+    assert create_resp.json().get("secret")
+
+    list_resp = await client.get("/api/v1/webhooks", headers=headers)
+    get_resp = await client.get(f"/api/v1/webhooks/{endpoint_id}", headers=headers)
+    update_resp = await client.put(
+        f"/api/v1/webhooks/{endpoint_id}",
+        headers=headers,
+        json={"description": "updated"},
+    )
+
+    for resp in (list_resp, get_resp, update_resp):
+        assert resp.status_code == 200
+        payload = resp.json()
+        entries = payload if isinstance(payload, list) else [payload]
+        assert all("secret" not in entry for entry in entries)
+
+
+@pytest.mark.asyncio
 async def test_list_endpoints(client: AsyncClient):
     """Create two endpoints and list them."""
     headers = await _auth(client, "hookuser_list")

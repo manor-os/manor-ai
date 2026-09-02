@@ -16,6 +16,7 @@ router (JWT auth, entity-scoped):
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import mimetypes
@@ -44,6 +45,16 @@ from packages.core.models.user import User
 from packages.core.models.workflow import WorkflowBinding, WorkflowDefinition
 from packages.core.models.workspace import Agent, AgentSubscription, Workspace
 from packages.core.services import site_publisher as sp
+from packages.core.permissions import effective_user_role_name, user_is_effective_entity_admin
+from packages.core.services.document_access import user_can_edit_document
+from packages.core.services.site_access import (
+    SitePublishAccessDenied,
+    require_site_publish_access,
+    user_can_manage_site,
+)
+from packages.core.services.workspace_access import (
+    user_can_manage_workspace,
+)
 
 public_router = APIRouter(tags=["sites-public"])
 router = APIRouter(prefix="/api/v1/sites", tags=["sites"])
@@ -570,13 +581,89 @@ async def _owned_site(db: AsyncSession, site_id: str, user: User) -> Site:
     )
     if site is None:
         raise HTTPException(status_code=404, detail="site not found")
-    return site
+    if await user_can_manage_site(db, user=user, site=site):
+        return site
+    raise HTTPException(status_code=403, detail="Site management access is required")
 
 
 def _target_entry_path(target: sp.PublishTarget) -> str:
     if target.kind == "file":
         return target.root_rel
     return f"{target.root_rel.rstrip('/')}/{target.entry}"
+
+
+async def _documents_for_paths(
+    db: AsyncSession,
+    *,
+    entity_id: str,
+    paths: set[str],
+) -> list[Document]:
+    if not paths:
+        return []
+    return list((await db.scalars(
+        select(Document).where(
+            Document.entity_id == entity_id,
+            Document.fs_path.in_(sorted(paths)),
+            Document.is_trashed.is_(False),
+        )
+    )).all())
+
+
+async def _can_edit_document(
+    db: AsyncSession,
+    *,
+    document: Document,
+    user: User,
+) -> bool:
+    return await user_can_edit_document(db, document, user=user)
+
+
+async def _can_edit_all_documents(
+    db: AsyncSession,
+    *,
+    documents: list[Document],
+    user: User,
+) -> bool:
+    if not documents:
+        return False
+    for document in documents:
+        if not await _can_edit_document(db, document=document, user=user):
+            return False
+    return True
+
+
+async def _can_edit_target_entry(
+    db: AsyncSession,
+    *,
+    user: User,
+    target: sp.PublishTarget,
+) -> bool:
+    if await user_is_effective_entity_admin(db, user):
+        return True
+    documents = await _documents_for_paths(
+        db,
+        entity_id=user.entity_id,
+        paths={_target_entry_path(target)},
+    )
+    return await _can_edit_all_documents(db, documents=documents, user=user)
+
+
+async def _require_target_publish_access(
+    db: AsyncSession,
+    *,
+    user: User,
+    target: sp.PublishTarget,
+    included_paths: set[str],
+) -> None:
+    try:
+        await require_site_publish_access(
+            db,
+            user=user,
+            target=target,
+            included_paths=included_paths,
+        )
+    except SitePublishAccessDenied as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
 
 
 async def _target_workspace(
@@ -587,16 +674,12 @@ async def _target_workspace(
     site: Site | None = None,
 ) -> Workspace | None:
     """Resolve the Workspace recorded when the generated entry file was saved."""
-    document = await db.scalar(
-        select(Document)
-        .where(
-            Document.entity_id == entity_id,
-            Document.fs_path == _target_entry_path(target),
-            Document.is_trashed.is_(False),
-        )
-        .order_by(Document.updated_at.desc())
-        .limit(1)
+    documents = await _documents_for_paths(
+        db,
+        entity_id=entity_id,
+        paths={_target_entry_path(target)},
     )
+    document = documents[0] if len(documents) == 1 else None
     metadata = dict(document.metadata_ or {}) if document else {}
     origin = metadata.get("origin") if isinstance(metadata.get("origin"), dict) else {}
     workspace_id = str(origin.get("workspace_id") or "").strip()
@@ -883,11 +966,21 @@ async def _site_connection_plan(
     *,
     entity_id: str,
     target: sp.PublishTarget,
+    user: User,
+    features: sp.SiteBridgeFeatures,
     site: Site | None = None,
 ) -> dict:
-    features = sp.inspect_site_bridge(entity_id, target)
     workspace = await _target_workspace(
         db, entity_id=entity_id, target=target, site=site
+    )
+    can_auto_connect = bool(
+        workspace is not None
+        and await user_can_manage_workspace(
+            db,
+            workspace_id=workspace.id,
+            user_id=user.id,
+            entity_role=await effective_user_role_name(db, user),
+        )
     )
     actions = {
         "customer_service": "not_available",
@@ -895,7 +988,7 @@ async def _site_connection_plan(
         "subscription_flow": "not_detected",
         "analytics": "enable",
     }
-    if workspace is not None:
+    if workspace is not None and can_auto_connect:
         actions["customer_service"] = (
             "reuse"
             if await _workspace_webchat(
@@ -927,11 +1020,18 @@ async def _site_connection_plan(
             )
     return {
         "eligible": workspace is not None,
-        "workspace_id": workspace.id if workspace else None,
-        "workspace_name": workspace.name if workspace else None,
+        "can_auto_connect": can_auto_connect,
+        "workspace_id": workspace.id if can_auto_connect else None,
+        "workspace_name": workspace.name if can_auto_connect else None,
         "features": features.as_dict(),
         "actions": actions,
-        "reason": None if workspace else "no_workspace_origin",
+        "reason": (
+            None
+            if can_auto_connect
+            else "workspace_manage_required"
+            if workspace
+            else "no_workspace_origin"
+        ),
     }
 
 
@@ -968,7 +1068,11 @@ async def _provision_site_connections(
 class PublishBody(BaseModel):
     path: str
     name: str
-    auto_connect: bool = True
+    auto_connect: bool = False
+    expected_snapshot_hash: str | None = Field(
+        default=None,
+        pattern=r"^[a-f0-9]{64}$",
+    )
 
 
 @router.post("/publish")
@@ -990,41 +1094,80 @@ async def publish_site(
                 "index.html, or a single .html file"
             ),
         )
-    existing_site = await db.scalar(
-        select(Site).where(
-            Site.entity_id == user.entity_id,
-            Site.source_path == target.root_rel,
+    try:
+        prepared = await asyncio.to_thread(
+            sp.prepare_publication,
+            user.entity_id,
+            target,
         )
-    )
-    workspace = None
-    connections = None
-    if body.auto_connect:
+    except (OSError, sp.SitePublishError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    try:
+        if (
+            body.expected_snapshot_hash is not None
+            and prepared.content_hash != body.expected_snapshot_hash
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="The site changed after confirmation; review the updated publish plan",
+            )
+        await _require_target_publish_access(
+            db,
+            user=user,
+            target=target,
+            included_paths=prepared.included_source_paths,
+        )
+        existing_site = await db.scalar(
+            select(Site).where(
+                Site.entity_id == user.entity_id,
+                Site.source_path == target.root_rel,
+            )
+        )
+        if existing_site is not None:
+            await _owned_site(db, existing_site.id, user)
         workspace = await _target_workspace(
             db,
             entity_id=user.entity_id,
             target=target,
             site=existing_site,
         )
-        if workspace is not None:
-            from apps.api.routers.workspaces import _require_workspace_manage
-
-            await _require_workspace_manage(db, workspace.id, user)
-            features = sp.inspect_site_bridge(user.entity_id, target)
+        connections = None
+        if body.auto_connect and workspace is not None:
+            if not await user_can_manage_workspace(
+                db,
+                workspace_id=workspace.id,
+                user_id=user.id,
+                entity_role=await effective_user_role_name(db, user),
+            ):
+                raise HTTPException(
+                    status_code=403,
+                    detail="Only a Workspace owner can auto-connect a published site",
+                )
+            features = sp.inspect_prepared_site_bridge(prepared)
             connections = await _provision_site_connections(
                 db, user=user, workspace=workspace, features=features
             )
-    try:
         result = await sp.publish(
             db,
             entity_id=user.entity_id,
-            rel_path=body.path,
+            rel_path=target.root_rel,
             name=body.name,
+            created_by_user_id=user.id,
+            manage_as_user=user,
             workspace_id=workspace.id if workspace else None,
             connections=connections,
+            prepared=prepared,
         )
+        prepared = None
+    except SitePublishAccessDenied as e:
+        await db.rollback()
+        raise HTTPException(status_code=403, detail=str(e)) from e
     except sp.SitePublishError as e:
         await db.rollback()
-        raise HTTPException(status_code=422, detail=str(e))
+        raise HTTPException(status_code=422, detail=str(e)) from e
+    finally:
+        if prepared is not None:
+            await asyncio.to_thread(prepared.cleanup)
     return {
         **_site_payload(result.site),
         "excluded": [{"path": f.rel, "sensitive": f.sensitive} for f in result.excluded],
@@ -1049,23 +1192,60 @@ async def site_for_path(
                 Site.entity_id == user.entity_id, Site.source_path == target.root_rel
             )
         )
-    auto_connection_plan = None
-    if target is not None:
+    can_edit_target = bool(
+        target is not None
+        and await _can_edit_target_entry(db, user=user, target=target)
+    )
+    can_view_site = can_edit_target
+    if site is not None and not can_view_site:
         try:
+            await _owned_site(db, site.id, user)
+            can_view_site = True
+        except HTTPException as exc:
+            if exc.status_code not in {403, 404}:
+                raise
+    if not can_view_site:
+        target = None
+        site = None
+    can_publish_target = False
+    auto_connection_plan = None
+    publish_snapshot_hash = None
+    prepared: sp.PreparedPublication | None = None
+    if target is not None and can_edit_target:
+        try:
+            prepared = await asyncio.to_thread(
+                sp.prepare_publication,
+                user.entity_id,
+                target,
+            )
+            await require_site_publish_access(
+                db,
+                user=user,
+                target=target,
+                included_paths=prepared.included_source_paths,
+            )
+            can_publish_target = True
+            publish_snapshot_hash = prepared.content_hash
             auto_connection_plan = await _site_connection_plan(
                 db,
                 entity_id=user.entity_id,
                 target=target,
+                user=user,
+                features=sp.inspect_prepared_site_bridge(prepared),
                 site=site,
             )
-        except (OSError, sp.SitePublishError):
+        except (OSError, sp.SitePublishError, SitePublishAccessDenied):
             auto_connection_plan = None
+        finally:
+            if prepared is not None:
+                await asyncio.to_thread(prepared.cleanup)
     return {
-        "publishable": target is not None,
-        "target": target.root_rel if target else None,
+        "publishable": target is not None and can_publish_target,
+        "target": target.root_rel if target and can_publish_target else None,
         "site": _site_payload(site) if site else None,
         "hosting_configured": bool(_sites_domain()),
         "auto_connection_plan": auto_connection_plan,
+        "publish_snapshot_hash": publish_snapshot_hash,
     }
 
 
@@ -1131,6 +1311,18 @@ async def update_site_connections(
     db: AsyncSession = Depends(get_db),
 ):
     site = await _owned_site(db, site_id, user)
+    current_workspace_id = str(site.workspace_id or "").strip() or None
+    if current_workspace_id and current_workspace_id != body.workspace_id:
+        if not await user_can_manage_workspace(
+            db,
+            workspace_id=current_workspace_id,
+            user_id=user.id,
+            entity_role=await effective_user_role_name(db, user),
+        ):
+            raise HTTPException(
+                status_code=403,
+                detail="Only a Workspace owner can disconnect or move this site",
+            )
     selected_ids = (
         body.customer_service_channel_config_id,
         body.subscription_workflow_binding_id,
@@ -1153,6 +1345,16 @@ async def update_site_connections(
         )
         if workspace is None:
             raise HTTPException(status_code=422, detail="invalid Workspace connection")
+        if not await user_can_manage_workspace(
+            db,
+            workspace_id=workspace.id,
+            user_id=user.id,
+            entity_role=await effective_user_role_name(db, user),
+        ):
+            raise HTTPException(
+                status_code=403,
+                detail="Only a Workspace owner can connect a site to this Workspace",
+            )
 
         if body.customer_service_channel_config_id:
             channel = await db.scalar(
@@ -1271,6 +1473,53 @@ async def set_status(
     site = await _owned_site(db, site_id, user)
     if body.status not in ("active", "offline"):
         raise HTTPException(status_code=422, detail="status must be active|offline")
+    if body.status == "active" and site.status != "active":
+        prepared: sp.PreparedPublication | None = None
+        try:
+            target = sp.resolve_publish_target(user.entity_id, site.source_path)
+            if target is None:
+                raise HTTPException(
+                    status_code=409,
+                    detail="The source is no longer publishable",
+                )
+            prepared = await asyncio.to_thread(
+                sp.prepare_publication,
+                user.entity_id,
+                target,
+            )
+            await _require_target_publish_access(
+                db,
+                user=user,
+                target=target,
+                included_paths=prepared.included_source_paths,
+            )
+            result = await sp.publish(
+                db,
+                entity_id=user.entity_id,
+                rel_path=target.root_rel,
+                name=site.name,
+                created_by_user_id=site.created_by_user_id or user.id,
+                manage_as_user=user,
+                workspace_id=site.workspace_id,
+                connections=dict(site.connections or {}),
+                prepared=prepared,
+            )
+            prepared = None
+            return _site_payload(result.site)
+        except HTTPException:
+            raise
+        except SitePublishAccessDenied as exc:
+            await db.rollback()
+            raise HTTPException(status_code=403, detail=str(exc)) from exc
+        except (OSError, sp.SitePublishError) as exc:
+            await db.rollback()
+            raise HTTPException(
+                status_code=409,
+                detail="The source is no longer publishable",
+            ) from exc
+        finally:
+            if prepared is not None:
+                await asyncio.to_thread(prepared.cleanup)
     site.status = body.status
     await db.commit()
     return _site_payload(site)

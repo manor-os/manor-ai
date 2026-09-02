@@ -9,13 +9,16 @@ sidebar pending-action badge (which counts unresolved cards) stays honest.
 from __future__ import annotations
 
 import pytest
-from sqlalchemy import select
 
 from packages.core.governance.approvals import (
     ApprovalOrigin,
     ApprovalSubject,
     count_open_requests_by_workspace,
-    resolve_approval,
+    resolve_approval as _resolve_approval,
+)
+from packages.core.services.runtime_authorization import (
+    AuthorizationRule,
+    PermissionDecision,
 )
 from packages.core.governance.service import resolve_stale_hitl_cards
 from packages.core.models.hitl_request import HitlRequest
@@ -23,6 +26,15 @@ from packages.core.models.base import generate_ulid
 from packages.core.models.execution import ExecutionPlan
 from packages.core.models.task import Conversation, Message
 from packages.core.models.workspace import Workspace
+
+
+async def resolve_approval(*args, **kwargs):
+    """Lifecycle tests model a dispatcher-authorized step."""
+    kwargs.setdefault(
+        "permission_decision",
+        PermissionDecision.allow(AuthorizationRule.DISPATCHER_WORKER),
+    )
+    return await _resolve_approval(*args, **kwargs)
 
 
 async def _ws_with_card(
@@ -129,6 +141,9 @@ async def test_task_terminal_cleanup_closes_stale_cards_and_requests(db_session)
             step_id=stale_step_id,
             plan_id=stale_plan_id,
             task_id=task_id,
+        ),
+        permission_decision=PermissionDecision.allow(
+            AuthorizationRule.DISPATCHER_WORKER
         ),
     )
     assert decision.outcome == "needs_human"

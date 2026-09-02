@@ -13,6 +13,7 @@ from packages.core.ai.agentic_loop import (
     _compact_tool_result_for_context,
     _context_compaction_token_threshold,
     _estimate_context_attribution,
+    _strip_inapplicable_integration_continuations,
     LOOP_COMPACT_RATIO,
     MAX_CONTEXT_TOKENS,
 )
@@ -221,6 +222,27 @@ def test_compact_search_tools_result_preserves_mcp_option_status():
     assert options["linkedin"]["ready"] is False
     assert options["linkedin"]["authorization_method"] == "oauth"
     assert options["linkedin"]["execution_mode"] == "official_api"
+
+
+def test_compact_search_tools_result_preserves_permission_failure():
+    compact = json.loads(
+        _compact_search_tools_result_for_context(
+            {
+                "error": "blocked_by_permission",
+                "message": "The delegated agent's current tool binding has been revoked.",
+                "matched_rule": "permission.agent_tool_binding",
+                "action_key": "runtime.discovery",
+                "capability_id": "runtime.discovery",
+                "tool": "search_tools",
+            },
+            [],
+        )
+    )
+
+    assert compact["error"] == "blocked_by_permission"
+    assert compact["matched_rule"] == "permission.agent_tool_binding"
+    assert compact["message"].endswith("revoked.")
+    assert compact["tool"] == "search_tools"
 
 
 def test_compact_search_tools_result_keeps_servers_and_bounded_suppressed_mcp():
@@ -635,6 +657,90 @@ async def test_agentic_loop_deduplicates_identical_tool_results(monkeypatch):
     assert duplicate_notice["tool"] == "read_file"
 
 
+@pytest.mark.asyncio
+async def test_agentic_loop_preserves_executor_failure_in_model_context_for_recovery(monkeypatch):
+    calls = 0
+    observed_tool_content = ""
+
+    async def fake_chat_completion_with_tools(messages, tools, **kwargs):
+        nonlocal calls, observed_tool_content
+        calls += 1
+        if calls == 1:
+            return (
+                "",
+                [{
+                    "id": "call_private",
+                    "name": "mcp__private_server__private_action",
+                    "arguments": {},
+                }],
+                {"prompt": 10, "completion": 1, "total": 11},
+            )
+        observed_tool_content = next(
+            str(message.get("content") or "")
+            for message in messages
+            if message.get("role") == "tool"
+        )
+        return "done", None, {"prompt": 10, "completion": 1, "total": 11}
+
+    async def failing_executor(_name, _args):
+        raise RuntimeError(
+            "Tool key mcp__private_server__private_action does not match "
+            "registered handler mcp__other__action"
+        )
+
+    loop_module = importlib.import_module("packages.core.ai.agentic_loop")
+    monkeypatch.setattr(
+        loop_module,
+        "runtime_execute_agentic_round_tool_completion",
+        fake_chat_completion_with_tools,
+    )
+
+    result = await loop_module.agentic_loop(
+        system_prompt="test",
+        user_message="run the operation",
+        tools=[{
+            "type": "function",
+            "function": {
+                "name": "mcp__private_server__private_action",
+                "parameters": {"type": "object"},
+            },
+        }],
+        tool_executor=failing_executor,
+        max_rounds=3,
+    )
+
+    assert result.content == "done"
+    assert observed_tool_content.startswith(
+        "Tool error (mcp__private_server__private_action):"
+    )
+    assert "mcp__other__action" in observed_tool_content
+    assert "registered handler" in observed_tool_content
+
+
+@pytest.mark.parametrize(
+    ("arguments", "expected"),
+    [
+        ({"integration_account_continuation": "invented"}, {}),
+        (
+            {
+                "integration_account_selection": "all",
+                "integration_account_continuation": "signed-token",
+            },
+            {
+                "integration_account_selection": "all",
+                "integration_account_continuation": "signed-token",
+            },
+        ),
+    ],
+)
+def test_agentic_loop_normalizes_model_integration_continuations(arguments, expected):
+    calls = [{"name": "mcp__email__list_folders", "arguments": arguments}]
+
+    _strip_inapplicable_integration_continuations(calls)
+
+    assert calls[0]["arguments"] == expected
+
+
 def test_prompt_cache_counts_reusable_history_prefix():
     payload = {
         "model": "anthropic/claude-sonnet-4.6",
@@ -716,33 +822,49 @@ async def test_anthropic_native_completion_adds_request_cache_control(monkeypatc
 @pytest.mark.asyncio
 async def test_anthropic_native_tool_completion_streams_text_before_tool_use(monkeypatch):
     events: list[tuple[str, dict]] = []
+    captured: dict = {}
 
-    class FakeResponse:
-        def json(self):
-            return {
-                "content": [
-                    {"type": "text", "text": "我先查看一下当前任务。"},
-                    {
-                        "type": "tool_use",
-                        "id": "toolu_123",
-                        "name": "manor",
-                        "input": {"action": "list_tasks"},
-                    },
-                ],
-                "usage": {"input_tokens": 10, "output_tokens": 5},
-                "stop_reason": "tool_use",
-                "model": "claude-sonnet-4-6",
-            }
+    stream_lines = [
+        'data: {"type":"message_start","message":{"model":"claude-sonnet-4-6","usage":{"input_tokens":10,"output_tokens":0}}}',
+        'data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}',
+        'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"我先查看"}}',
+        'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"一下当前任务。"}}',
+        'data: {"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_123","name":"manor","input":{}}}',
+        'data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\\"action\\":"}}',
+        'data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"\\"list_tasks\\"}"}}',
+        'data: {"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":5}}',
+        'data: {"type":"message_stop"}',
+    ]
 
-    async def fake_post_with_retry(url, headers, payload):
-        return FakeResponse()
+    class FakeStreamResponse:
+        def raise_for_status(self):
+            return None
+
+        async def aiter_lines(self):
+            for line in stream_lines:
+                yield line
+
+    class FakeStreamContext:
+        async def __aenter__(self):
+            return FakeStreamResponse()
+
+        async def __aexit__(self, *_args):
+            return False
+
+    class FakeClient:
+        def stream(self, method, url, *, headers, json):
+            captured.update(method=method, url=url, headers=headers, payload=json)
+            return FakeStreamContext()
+
+    async def fake_get_llm_client():
+        return FakeClient()
 
     async def stream_handler(event_name: str, payload: dict):
         events.append((event_name, payload))
 
     monkeypatch.setattr(
-        "packages.core.ai.llm_client._post_with_retry",
-        fake_post_with_retry,
+        "packages.core.ai.llm_client.get_llm_client",
+        fake_get_llm_client,
     )
 
     content, tool_calls, usage = await _anthropic_messages_completion(
@@ -768,7 +890,83 @@ async def test_anthropic_native_tool_completion_streams_text_before_tool_use(mon
     assert content == "我先查看一下当前任务。"
     assert tool_calls == [{"id": "toolu_123", "name": "manor", "arguments": {"action": "list_tasks"}}]
     assert usage["finish_reason"] == "tool_use"
-    assert events == [("text_delta", {"content": "我先查看一下当前任务。"})]
+    assert usage["total"] == 15
+    assert captured["payload"]["stream"] is True
+    assert events == [
+        ("text_delta", {"content": "我先查看"}),
+        ("text_delta", {"content": "一下当前任务。"}),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_anthropic_native_stream_resets_text_before_buffered_fallback(monkeypatch):
+    events: list[tuple[str, dict]] = []
+
+    class FailingStreamResponse:
+        def raise_for_status(self):
+            return None
+
+        async def aiter_lines(self):
+            yield 'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"old"}}'
+            raise TimeoutError("stream stalled")
+
+    class FakeStreamContext:
+        async def __aenter__(self):
+            return FailingStreamResponse()
+
+        async def __aexit__(self, *_args):
+            return False
+
+    class FakeClient:
+        def stream(self, *_args, **_kwargs):
+            return FakeStreamContext()
+
+    class FakeBufferedResponse:
+        def json(self):
+            return {
+                "content": [{"type": "text", "text": "new"}],
+                "usage": {"input_tokens": 2, "output_tokens": 1},
+                "stop_reason": "end_turn",
+                "model": "claude-sonnet-4-6",
+            }
+
+    async def fake_get_llm_client():
+        return FakeClient()
+
+    async def fake_post_with_retry(url, headers, payload):
+        del url, headers, payload
+        return FakeBufferedResponse()
+
+    async def stream_handler(event_name: str, payload: dict):
+        events.append((event_name, payload))
+
+    monkeypatch.setattr(
+        "packages.core.ai.llm_client.get_llm_client",
+        fake_get_llm_client,
+    )
+    monkeypatch.setattr(
+        "packages.core.ai.llm_client._post_with_retry",
+        fake_post_with_retry,
+    )
+
+    content, tool_calls, usage = await _anthropic_messages_completion(
+        api_key="sk-ant-api03-test-key-1234567890",
+        base_url="https://api.anthropic.com/v1",
+        model="anthropic/claude-sonnet-4.6",
+        messages=[{"role": "user", "content": "hello"}],
+        temperature=0,
+        max_tokens=16,
+        stream_handler=stream_handler,
+    )
+
+    assert content == "new"
+    assert tool_calls is None
+    assert usage["total"] == 3
+    assert events == [
+        ("text_delta", {"content": "old"}),
+        ("text_reset", {}),
+        ("text_delta", {"content": "new"}),
+    ]
 
 
 @pytest.mark.asyncio

@@ -159,6 +159,8 @@ def test_knowledge_document_payload_includes_canonical_viewer_markdown():
         )
     )
 
+    assert payload["document_id"] == "01KQDCA7E9E7G20HNYE51VJECQ"
+    assert "id" not in payload
     assert payload["viewer_url"] == "/viewer/01KQDCA7E9E7G20HNYE51VJECQ"
     assert payload["markdown_link"] == (
         r"[Q3 \[final\].pdf](/viewer/01KQDCA7E9E7G20HNYE51VJECQ)"
@@ -196,6 +198,27 @@ def test_every_generated_file_reference_gets_fixed_markdown_when_openable():
         "Videos/manor-video-contract-e2e-20260810/"
         "snapshots/manor-review/frame-05-at-16s.png)"
     )
+
+
+def test_artifact_reference_factory_accepts_only_canonical_document_id():
+    from packages.core.services.generated_file_refs import ArtifactReferenceFactory
+
+    factory = ArtifactReferenceFactory(entity_id="ent_1")
+    identity = factory.inspect({
+        "name": "legacy.csv",
+        "url": "/viewer/legacy.csv",
+    })
+    canonical = factory.create({
+        "name": "legacy.csv",
+        "url": "/viewer/legacy.csv",
+    })
+
+    assert identity.document_id == ""
+    assert "document_id" not in canonical
+    assert factory.inspect({"documentId": "alias"}).document_id == ""
+    assert factory.inspect({"doc_id": "alias"}).document_id == ""
+    assert factory.inspect({"id": "alias", "mime_type": "text/csv"}).document_id == ""
+    assert factory.inspect({"document_id": "doc_exact"}).document_id == "doc_exact"
 
 
 def test_the_guidance_section_is_wired_into_prompt_assembly():

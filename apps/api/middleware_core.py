@@ -25,7 +25,9 @@ from fastapi.responses import JSONResponse
 from pydantic import ValidationError
 from starlette.middleware.base import BaseHTTPMiddleware
 
+from apps.api.chat_stream_routes import is_chat_stream_path
 from packages.core.i18n import set_locale, SUPPORTED_LOCALES
+from packages.core.service_role import SERVICE_ROLE_API, SERVICE_ROLE_CHAT, normalize_service_role
 
 logger = logging.getLogger(__name__)
 
@@ -52,13 +54,81 @@ _HSTS_INCLUDE_SUBDOMAINS = os.getenv(
 ).strip().lower() in {"1", "true", "yes", "on"}
 _HEALTH_PATHS = {"/health", "/health/"}
 
-# Streaming endpoints — BaseHTTPMiddleware buffers StreamingResponse bodies,
-# so we must skip call_next wrapping for these paths.
-_STREAMING_PATHS = {"/api/v1/chat/stream"}
-
-
 def _is_streaming(request: Request) -> bool:
-    return request.url.path in _STREAMING_PATHS
+    # BaseHTTPMiddleware buffers StreamingResponse bodies when it wraps call_next.
+    # Keep this tied to the chat role guard so every manor-chat SSE path skips it.
+    return _is_chat_stream_role_guard_path(request.url.path)
+
+
+def _env_bool(name: str, default: str = "false") -> bool:
+    return os.getenv(name, default).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _is_chat_stream_role_guard_path(path: str) -> bool:
+    return is_chat_stream_path(path)
+
+
+class ChatStreamRoleGuardMiddleware:
+    """Reject K8s stream traffic if it reaches a non-chat service role.
+
+    This is pure ASGI middleware rather than BaseHTTPMiddleware so it can
+    short-circuit before auth dependencies without wrapping successful SSE
+    responses.
+    """
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        is_chat_stream = (
+            scope.get("type") == "http"
+            and _is_chat_stream_role_guard_path(scope.get("path") or "")
+        )
+        role = normalize_service_role(os.getenv("MANOR_SERVICE_ROLE"))
+        if (
+            is_chat_stream
+            and _env_bool("CHAT_STREAM_REQUIRE_CHAT_ROLE")
+            and role != SERVICE_ROLE_CHAT
+        ):
+            response = JSONResponse(
+                status_code=503,
+                content={
+                    "detail": "Chat stream endpoint must be served by manor-chat",
+                },
+                headers={"Retry-After": "1"},
+            )
+            await response(scope, receive, send)
+            return
+
+        smoke_role: bytes | None = None
+        if is_chat_stream and role == SERVICE_ROLE_CHAT and _has_header(scope, b"x-manor-smoke", b"chat-route"):
+            smoke_role = b"chat"
+        elif role == SERVICE_ROLE_API and _has_header(scope, b"x-manor-smoke", b"api-route"):
+            smoke_role = b"api"
+
+        if smoke_role:
+            await self.app(scope, receive, _send_with_role_header(send, smoke_role))
+            return
+
+        await self.app(scope, receive, send)
+
+
+def _has_header(scope, name: bytes, expected_value: bytes) -> bool:
+    for header_name, header_value in scope.get("headers") or []:
+        if header_name.lower() == name and header_value.lower() == expected_value:
+            return True
+    return False
+
+
+def _send_with_role_header(send, role: bytes):
+    async def send_with_role_header(message):
+        if message.get("type") == "http.response.start":
+            headers = list(message.get("headers") or [])
+            headers.append((b"x-manor-service-role", role))
+            message = {**message, "headers": headers}
+        await send(message)
+
+    return send_with_role_header
 
 # ---------------------------------------------------------------------------
 # Request ID Middleware
@@ -146,10 +216,9 @@ _CLEANUP_INTERVAL = 60.0  # seconds between full sweeps
 
 
 def _client_ip(request: Request) -> str:
-    forwarded = request.headers.get("x-forwarded-for")
-    if forwarded:
-        return forwarded.split(",")[0].strip()
-    return request.client.host if request.client else "unknown"
+    from apps.api.middleware.rate_limit import client_ip
+
+    return client_ip(request)
 
 
 def _cleanup_buckets(now: float, window: float = 60.0) -> None:
@@ -448,3 +517,9 @@ def setup_middleware(app: FastAPI) -> None:
     app.add_middleware(LocaleMiddleware)
     app.add_middleware(RequestLoggingMiddleware)
     app.add_middleware(RateLimitMiddleware)
+    setup_stream_role_guard(app)
+
+
+def setup_stream_role_guard(app: FastAPI) -> None:
+    """Register the stream role guard as the outermost HTTP middleware."""
+    app.add_middleware(ChatStreamRoleGuardMiddleware)

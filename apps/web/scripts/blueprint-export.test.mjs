@@ -18,13 +18,22 @@ test("Blueprint export exposes the portable workspace sections and re-freeze con
     "include_knowledge_packs",
     "include_starter_memory",
     "include_memory_files",
+    "knowledge_document_ids",
   ]) {
     assert.match(modalSource, new RegExp(`\\b${key}\\b`));
     assert.match(apiSource, new RegExp(`\\b${key}\\?`));
   }
   assert.match(modalSource, /replace_existing:\s*replaceExisting/);
+  assert.match(modalSource, /blueprint\.source_workspace_id === workspaceId/);
+  assert.match(modalSource, /marketplace_blueprint_id:\s*existingBlueprintQuery\.data\?\.id/);
+  assert.match(modalSource, /setPersonalizationFields\(personalizationFieldsFromBlueprint\(existing\)\)/);
+  assert.match(modalSource, /disabled=\{Boolean\(existingBlueprintQuery\.data\)\}/);
+  assert.match(modalSource, /install_variables:\s*personalizationFields\.map\(serializePersonalizationField\)/);
+  assert.doesNotMatch(modalSource, /install_variables:\s*personalizationFields\.length > 0/);
   assert.match(apiSource, /replace_existing\?:\s*boolean/);
-  assert.match(modalSource, /knowledge_pack_mode:\s*includes\.include_memory_files\s*\?\s*"inline_text"\s*:\s*"skeleton"/);
+  assert.match(modalSource, /knowledge_pack_mode:\s*includeKnowledgeBodies\s*\?\s*"inline_text"\s*:\s*"skeleton"/);
+  assert.match(modalSource, /knowledge_document_ids:\s*includeKnowledgeBodies[\s\S]*?selectedKnowledgeDocumentIds/);
+  assert.match(apiSource, /blueprintExportKnowledgeDocuments:[\s\S]*?blueprint-export\/knowledge-documents/);
 });
 
 test("Blueprint export uses the shared accessible checkbox and management gate", () => {

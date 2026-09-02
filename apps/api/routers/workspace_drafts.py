@@ -11,12 +11,13 @@ import asyncio
 import json
 import logging
 from datetime import datetime
-from typing import Any, AsyncGenerator, Optional
+from typing import Any, AsyncGenerator, Literal, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from packages.core.constants.blueprints import BlueprintStatus
@@ -25,13 +26,21 @@ from packages.core.models.blueprint import WorkspaceBlueprint
 from packages.core.models.user import User
 from packages.core.models.workspace_draft import WorkspaceDraft
 from packages.core.services import workspace_draft_service as draft_service
+from packages.core.services.marketplace_resource_links import (
+    MarketplaceIdentityConflictError,
+)
+from packages.core.services.marketplace_billing import MarketplacePaidPlanRequiredError
+from packages.core.services.plan_gate import WorkspacePlanLimitError
 from packages.core.services.sse_events import format_sse
-from apps.api.deps import get_current_user, require_plan
+from apps.api.deps import enforce_plan_resource, get_current_user, require_plan
+from apps.api.streaming_concurrency import acquire_chat_stream_lease
 
 logger = logging.getLogger(__name__)
 
 
 _sse = format_sse
+
+_DRAFT_STREAM_KEEPALIVE_SECONDS = 15.0
 
 
 class _HiddenBlockTokenFilter:
@@ -131,6 +140,10 @@ class DraftTurnResponse(BaseModel):
 
 class StartDraftRequest(BaseModel):
     initial_brief: Optional[str] = None
+    draft_id: Optional[str] = Field(
+        default=None,
+        pattern=r"^[0-9A-HJKMNP-TV-Z]{26}$",
+    )
 
 
 class DraftMessageRequest(BaseModel):
@@ -192,7 +205,10 @@ async def _hydrate_response(
         entity_id=draft.entity_id,
         user_id=draft.user_id,
         status=draft.status,
-        fields=dict(draft.fields or {}),
+        fields={
+            key: value for key, value in (draft.fields or {}).items()
+            if key != "_blueprint_source_payload"
+        },
         messages=visible_messages,
         missing=list(draft.missing or []),
         ready=bool(draft.ready),
@@ -258,6 +274,7 @@ async def create_draft(
 # Event names emitted:
 #   start    {draft_id, status}
 #   token    {content}            -- one or more deltas of assistant text
+#   keepalive {draft_id}           -- keeps quiet tool phases connected
 #   done     {reply, draft}       -- the full final reply + hydrated draft
 #   error    {message}
 
@@ -265,11 +282,11 @@ async def _stream_turn(
     *,
     entity_id: str,
     user_id: str,
-    existing_draft_id: Optional[str],
-    user_message: Optional[str],
-    initial_brief: Optional[str],
+    draft_id: str,
+    user_message: str,
+    mode: Literal["create", "message"],
 ) -> AsyncGenerator[str, None]:
-    """Run a draft turn (start or message) and stream tokens as SSE.
+    """Run one turn against a durable draft and stream tokens as SSE.
 
     Uses its own short-lived DB session so the long-lived SSE generator
     does not pin the request-scoped connection -- same pattern
@@ -347,26 +364,17 @@ async def _stream_turn(
     async def runner() -> None:
         try:
             async with async_session() as db:
-                if existing_draft_id is None:
-                    reply, draft = await draft_service.start_draft(
-                        db,
-                        entity_id=entity_id,
-                        user_id=user_id,
-                        initial_brief=initial_brief,
-                        stream_handler=on_event,
-                        on_tool_start=on_tool_start,
-                        on_tool_end=on_tool_end,
-                    )
-                else:
-                    reply, draft = await draft_service.process_draft_message(
-                        db,
-                        draft_id=existing_draft_id,
-                        entity_id=entity_id,
-                        user_message=user_message or "",
-                        stream_handler=on_event,
-                        on_tool_start=on_tool_start,
-                        on_tool_end=on_tool_end,
-                    )
+                reply, draft = await draft_service.process_draft_message(
+                    db,
+                    draft_id=draft_id,
+                    entity_id=entity_id,
+                    user_id=user_id,
+                    user_message=user_message,
+                    stream_handler=on_event,
+                    on_tool_start=on_tool_start,
+                    on_tool_end=on_tool_end,
+                    dedupe_opening=mode == "create",
+                )
                 await db.commit()
                 hydrated = await _hydrate_response(db, draft)
                 # Strip hidden blocks from the visible reply for the
@@ -386,16 +394,27 @@ async def _stream_turn(
         finally:
             await queue.put(DONE)
 
+    # The shell is already committed before this generator is created. Emit
+    # its exact recovery ID before acquiring another database connection, so
+    # pool exhaustion cannot hide the resumable draft from the client.
+    yield _sse("start", {"draft_id": draft_id, "mode": mode})
     task = asyncio.create_task(runner())
-
-    yield _sse("start", {
-        "draft_id": existing_draft_id,
-        "mode": "message" if existing_draft_id else "create",
-    })
 
     try:
         while True:
-            event_name, payload = await queue.get()
+            try:
+                event_name, payload = await asyncio.wait_for(
+                    queue.get(),
+                    timeout=_DRAFT_STREAM_KEEPALIVE_SECONDS,
+                )
+            except asyncio.TimeoutError:
+                # Capability matching can spend several minutes inside a
+                # single tool call without producing model deltas. Emit a
+                # small frame so proxies and browsers do not mistake that
+                # quiet period for an abandoned response and cancel runner
+                # before it can enqueue the terminal ``done`` event.
+                yield _sse("keepalive", {"draft_id": draft_id})
+                continue
             if (event_name, payload) == DONE:
                 break
             yield _sse(event_name, payload)
@@ -415,28 +434,168 @@ _SSE_HEADERS = {
 }
 
 
+async def _workspace_draft_streaming_response(
+    db: AsyncSession,
+    lease,
+    source: AsyncGenerator[str, None],
+    *,
+    status_code: int = 200,
+) -> StreamingResponse:
+    """Release the request transaction before a long-lived SSE response."""
+    try:
+        await db.commit()
+        await db.close()
+        return StreamingResponse(
+            lease.wrap(source),
+            status_code=status_code,
+            media_type="text/event-stream",
+            headers=_SSE_HEADERS,
+        )
+    except BaseException:
+        await lease.release()
+        raise
+
+
+async def _persist_stream_draft_shell(
+    *,
+    entity_id: str,
+    user_id: str,
+    initial_brief: str | None,
+    draft_id: str | None = None,
+    plan_user: User | None = None,
+) -> str:
+    """Commit or recover the exact shell before SSE can disconnect."""
+    async with async_session() as db:
+        draft = None
+        if draft_id:
+            draft = await draft_service.get_draft(
+                db,
+                draft_id,
+                entity_id,
+                user_id,
+            )
+            if draft is None:
+                if plan_user is not None:
+                    await _enforce_new_workspace_draft_plan(plan_user, db=db)
+                try:
+                    async with db.begin_nested():
+                        draft = await draft_service.create_draft_shell(
+                            db,
+                            entity_id=entity_id,
+                            user_id=user_id,
+                            initial_brief=initial_brief,
+                            draft_id=draft_id,
+                        )
+                except IntegrityError:
+                    draft = await draft_service.get_draft(
+                        db,
+                        draft_id,
+                        entity_id,
+                        user_id,
+                    )
+                    if draft is None:
+                        raise HTTPException(
+                            status_code=409,
+                            detail="Draft id is already in use",
+                        ) from None
+        else:
+            if plan_user is not None:
+                await _enforce_new_workspace_draft_plan(plan_user, db=db)
+            draft = await draft_service.create_draft_shell(
+                db,
+                entity_id=entity_id,
+                user_id=user_id,
+                initial_brief=initial_brief,
+            )
+        if draft.status not in {"active", "ready"}:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Draft is {draft.status} and cannot be changed",
+            )
+        await db.commit()
+        return draft.id
+
+
+async def _enforce_new_workspace_draft_plan(
+    user: User,
+    *,
+    db: AsyncSession,
+) -> None:
+    """Gate creation of a shell without gating recovery of an existing one."""
+    await enforce_plan_resource("workspaces", user=user, db=db)
+
+
+async def _resume_stream_draft_shell(
+    *,
+    entity_id: str,
+    user_id: str,
+    draft_id: str,
+) -> str:
+    """Load the stored opening prompt for an owned, resumable shell."""
+    async with async_session() as db:
+        draft = await draft_service.get_draft(
+            db,
+            draft_id,
+            entity_id,
+            user_id,
+        )
+        if draft is None:
+            raise HTTPException(status_code=404, detail="Draft not found")
+        if draft.status not in {"active", "ready"}:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Draft is {draft.status} and cannot be changed",
+            )
+        initial_brief = (draft.fields or {}).get("initial_brief")
+        return draft_service.opening_user_message(
+            initial_brief if isinstance(initial_brief, str) else None,
+        )
+
+
 @router.post("/stream", status_code=201)
 async def create_draft_stream(
     req: StartDraftRequest,
-    _gate=Depends(require_plan("workspaces")),
     user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
 ):
     """Start a new draft and stream the opening assistant turn as SSE.
 
-    Same plan-gate logic as ``create_draft`` -- fires upfront with
-    structured detail so the UI can render a clear "limit reached"
-    state instead of a vague toast.
+    New shells use the same structured plan gate as ``create_draft``.
+    Recovery of an already-persisted shell skips that creation gate so a
+    refresh remains resumable even when capacity was filled meanwhile.
     """
-    return StreamingResponse(
-        _stream_turn(
+    lease = await acquire_chat_stream_lease(scope="workspace-draft")
+    try:
+        draft_id = await _persist_stream_draft_shell(
             entity_id=user.entity_id,
             user_id=user.id,
-            existing_draft_id=None,
-            user_message=None,
             initial_brief=req.initial_brief,
-        ),
-        media_type="text/event-stream",
-        headers=_SSE_HEADERS,
+            draft_id=req.draft_id,
+            plan_user=user,
+        )
+        if req.draft_id:
+            opening_message = await _resume_stream_draft_shell(
+                entity_id=user.entity_id,
+                user_id=user.id,
+                draft_id=draft_id,
+            )
+        else:
+            opening_message = draft_service.opening_user_message(req.initial_brief)
+    except BaseException:
+        await lease.release()
+        raise
+    stream = _stream_turn(
+        entity_id=user.entity_id,
+        user_id=user.id,
+        draft_id=draft_id,
+        user_message=opening_message,
+        mode="create",
+    )
+    return await _workspace_draft_streaming_response(
+        db,
+        lease,
+        stream,
+        status_code=201,
     )
 
 
@@ -449,6 +608,7 @@ async def list_my_drafts(
     """List the caller's drafts. Filter by status (active/ready/finalized/abandoned)."""
     stmt = select(WorkspaceDraft).where(
         WorkspaceDraft.entity_id == user.entity_id,
+        WorkspaceDraft.user_id == user.id,
     )
     if status:
         stmt = stmt.where(WorkspaceDraft.status == status)
@@ -464,7 +624,9 @@ async def get_one_draft(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    draft = await draft_service.get_draft(db, draft_id, user.entity_id)
+    draft = await draft_service.get_draft(
+        db, draft_id, user.entity_id, user.id,
+    )
     if draft is None:
         raise HTTPException(404, "Draft not found")
     return await _hydrate_response(db, draft)
@@ -485,6 +647,7 @@ async def post_draft_message(
             db,
             draft_id=draft_id,
             entity_id=user.entity_id,
+            user_id=user.id,
             user_message=req.message,
         )
     except ValueError as exc:
@@ -498,20 +661,22 @@ async def post_draft_message_stream(
     draft_id: str,
     req: DraftMessageRequest,
     user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
 ):
     """Send a message and stream the assistant's reply token-by-token (SSE)."""
     if not req.message.strip():
         raise HTTPException(400, "Message cannot be empty")
-    return StreamingResponse(
+    lease = await acquire_chat_stream_lease(scope="workspace-draft")
+    return await _workspace_draft_streaming_response(
+        db,
+        lease,
         _stream_turn(
             entity_id=user.entity_id,
             user_id=user.id,
-            existing_draft_id=draft_id,
+            draft_id=draft_id,
             user_message=req.message,
-            initial_brief=None,
+            mode="message",
         ),
-        media_type="text/event-stream",
-        headers=_SSE_HEADERS,
     )
 
 
@@ -528,8 +693,11 @@ async def apply_blueprint_to_draft(
             db,
             draft_id=draft_id,
             entity_id=user.entity_id,
+            user_id=user.id,
             blueprint_id=req.blueprint_id,
         )
+    except MarketplacePaidPlanRequiredError as exc:
+        raise HTTPException(402, detail=exc.detail) from exc
     except PermissionError as exc:
         # Paid blueprint without a completed purchase.
         raise HTTPException(402, str(exc))
@@ -551,17 +719,37 @@ async def update_draft_fields(
     Body: {"knowledge_attachments": [...], "channel_config": {...}, ...}
     Only provided keys are merged; others left unchanged.
     """
-    draft = await draft_service.get_draft(db, draft_id, user.entity_id)
+    internal_fields = sorted(key for key in req if key.startswith("_"))
+    if internal_fields:
+        raise HTTPException(
+            400,
+            "Internal draft fields cannot be updated: "
+            + ", ".join(internal_fields),
+        )
+    if "heartbeat_enabled" in req and not isinstance(req["heartbeat_enabled"], bool):
+        raise HTTPException(400, "heartbeat_enabled must be a boolean")
+    if "blueprint_channel_config_ids" in req:
+        selections = req["blueprint_channel_config_ids"]
+        if not isinstance(selections, dict) or any(
+            not isinstance(key, str) or not isinstance(value, str)
+            for key, value in selections.items()
+        ):
+            raise HTTPException(400, "Blueprint channel selections must map keys to account IDs")
+    draft = await draft_service.get_draft(
+        db, draft_id, user.entity_id, user.id, for_update=True,
+    )
     if not draft:
         raise HTTPException(404, "Draft not found")
-    fields = dict(draft.fields or {})
-    for k, v in req.items():
-        fields[k] = v
-    draft.fields = fields
+    if draft.status not in {"active", "ready"}:
+        raise HTTPException(409, f"Draft is {draft.status} and cannot be changed")
+    draft_service.apply_public_field_updates(draft, req)
     await db.flush()
     await draft_service._refresh_missing_from_lint(db, draft)
+    await db.flush()
     await db.refresh(draft)
-    return await _hydrate_response(db, draft)
+    response = await _hydrate_response(db, draft)
+    await db.commit()
+    return response
 
 
 @router.post("/{draft_id}/finalize", response_model=FinalizeDraftResponse)
@@ -573,10 +761,22 @@ async def finalize(
     """Materialize the draft into a real Workspace (synchronous JSON variant)."""
     try:
         workspace_id, draft = await draft_service.finalize_draft(
-            db, draft_id=draft_id, entity_id=user.entity_id,
+            db,
+            draft_id=draft_id,
+            entity_id=user.entity_id,
+            user_id=user.id,
         )
+    except WorkspacePlanLimitError as exc:
+        raise HTTPException(402, detail=exc.detail)
+    except MarketplaceIdentityConflictError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except draft_service.WorkspaceDraftNotReadyError as exc:
+        # Finalize has not started materialization. Persist only the verified
+        # lint-derived readiness correction before the HTTP error rolls back.
+        await db.commit()
+        raise HTTPException(400, str(exc)) from exc
     except ValueError as exc:
-        raise HTTPException(400, str(exc))
+        raise HTTPException(400, str(exc)) from exc
     await db.commit()
     from packages.core.services.workspace_setup_service import (
         dispatch_workspace_post_commit,
@@ -617,6 +817,7 @@ async def finalize(
 async def finalize_stream(
     draft_id: str,
     user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
 ):
     """Materialize the draft and stream finalize progress as SSE events.
 
@@ -629,9 +830,9 @@ async def finalize_stream(
       - ``team_and_knowledge_done``  staff/knowledge/channel counts.
       - ``default_skills_seeded``
       - ``memory_seeded``
-      - ``runtime_scheduled``        heartbeat registered.
+      - ``runtime_scheduled``        heartbeat registered when autonomous mode is enabled.
       - ``post_commit_dispatch_pending`` durable materialization is ready to commit.
-      - ``strategist_dispatched``    emitted only after the materialization commit.
+      - ``strategist_dispatched``    emitted after commit only for autonomous mode.
       - ``complete``                 final committed workspace result.
       - ``error``                    if anything blew up.
     """
@@ -647,18 +848,27 @@ async def finalize_stream(
     async def runner() -> None:
         try:
             async with async_session() as db:
-                workspace_id, draft = await draft_service.finalize_draft(
-                    db,
-                    draft_id=draft_id,
-                    entity_id=user.entity_id,
-                    progress=progress,
-                )
+                try:
+                    workspace_id, draft = await draft_service.finalize_draft(
+                        db,
+                        draft_id=draft_id,
+                        entity_id=user.entity_id,
+                        user_id=user.id,
+                        progress=progress,
+                    )
+                except draft_service.WorkspaceDraftNotReadyError as exc:
+                    # The stream owns this session, so commit the same
+                    # readiness correction before returning its error event.
+                    await db.commit()
+                    await queue.put(("error", {"message": str(exc)}))
+                    return
                 await db.commit()
                 from packages.core.services.workspace_setup_service import (
                     dispatch_workspace_post_commit,
                     record_workspace_post_commit_dispatch_failure,
                 )
 
+                dispatch_warning: str | None = None
                 try:
                     dispatch = await dispatch_workspace_post_commit(
                         db,
@@ -668,6 +878,7 @@ async def finalize_stream(
                     )
                     await db.commit()
                 except Exception as dispatch_exc:  # noqa: BLE001
+                    dispatch_warning = "workspace_startup_dispatch_failed"
                     await db.rollback()
                     logger.exception(
                         "workspace %s was created but startup dispatch failed",
@@ -690,7 +901,7 @@ async def finalize_stream(
                         )
                     progress(
                         "dispatch_warning",
-                        {"workspace_id": workspace_id, "message": str(dispatch_exc)},
+                        {"workspace_id": workspace_id, "message": dispatch_warning},
                     )
                 progress(
                     "complete",
@@ -705,8 +916,17 @@ async def finalize_stream(
                     {
                         "workspace_id": workspace_id,
                         "draft": hydrated.model_dump(mode="json"),
+                        "strategist_eta_seconds": dispatch.get("strategist_eta_seconds"),
+                        "dispatch_warning": dispatch_warning,
                     },
                 ))
+        except WorkspacePlanLimitError as exc:
+            await queue.put(("error", exc.detail))
+        except MarketplaceIdentityConflictError as exc:
+            await queue.put(("error", {
+                "code": "marketplace_identity_conflict",
+                "message": str(exc),
+            }))
         except ValueError as exc:
             await queue.put(("error", {"message": str(exc)}))
         except Exception as exc:  # noqa: BLE001
@@ -715,11 +935,12 @@ async def finalize_stream(
         finally:
             await queue.put(DONE)
 
-    task = asyncio.create_task(runner())
+    lease = await acquire_chat_stream_lease(scope="workspace-draft-finalize")
 
     async def gen() -> AsyncGenerator[str, None]:
-        yield _sse("start", {"draft_id": draft_id})
+        task = asyncio.create_task(runner())
         try:
+            yield _sse("start", {"draft_id": draft_id})
             while True:
                 event_name, payload = await queue.get()
                 if (event_name, payload) == DONE:
@@ -743,10 +964,10 @@ async def finalize_stream(
 
                 task.add_done_callback(_consume_runner_result)
 
-    return StreamingResponse(
+    return await _workspace_draft_streaming_response(
+        db,
+        lease,
         gen(),
-        media_type="text/event-stream",
-        headers=_SSE_HEADERS,
     )
 
 
@@ -758,7 +979,10 @@ async def delete_draft(
 ):
     """Mark a draft abandoned. Finalized drafts cannot be abandoned."""
     ok = await draft_service.abandon_draft(
-        db, draft_id=draft_id, entity_id=user.entity_id,
+        db,
+        draft_id=draft_id,
+        entity_id=user.entity_id,
+        user_id=user.id,
     )
     if not ok:
         raise HTTPException(404, "Draft not found or already finalized")

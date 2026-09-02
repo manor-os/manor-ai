@@ -3,6 +3,7 @@ import sys
 import re
 import argparse
 from xml.etree import ElementTree as ET
+from defusedxml import ElementTree as SafeET
 
 
 SVG_NS = "http://www.w3.org/2000/svg"
@@ -573,7 +574,7 @@ def process_svg_file(
 ) -> bool:
     """Flatten eligible tspan lines in one SVG file."""
     try:
-        tree = ET.parse(src_path)
+        tree = SafeET.parse(src_path)
     except ET.ParseError as e:
         print(f"[WARN] Failed to parse {src_path}: {e}")
         return False

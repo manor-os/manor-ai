@@ -71,6 +71,7 @@ def _ensure_explicit_entry(graph: WorkflowGraph, report: ImportReport) -> None:
         targets.update(node.next or [])
         targets.update(node.true_next or [])
         targets.update(node.false_next or [])
+        targets.update(node.config.get("error_next") or [])
         if node.type == "switch":
             targets.update(node.config.get("default_next") or [])
             for case in node.config.get("cases") or []:

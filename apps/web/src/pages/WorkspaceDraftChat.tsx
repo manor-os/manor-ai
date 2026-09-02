@@ -18,11 +18,9 @@ import { ApiError } from "../lib/api";
 import PageHeader from "../components/ui/PageHeader";
 import GlassCard from "../components/ui/GlassCard";
 import Button from "../components/ui/Button";
+import EmptyState from "../components/ui/EmptyState";
 import LoadingSpinner from "../components/ui/LoadingSpinner";
 import { ChatMessagesSkeleton } from "../components/ui/Skeleton";
-import StatusBadge from "../components/ui/StatusBadge";
-import Chip from "../components/ui/Chip";
-import Toggle from "../components/ui/Toggle";
 import ChatMarkdown from "../components/ChatMarkdown";
 import MessageBubble from "../components/chat/MessageBubble";
 import ChatInputFooter, {
@@ -31,7 +29,7 @@ import ChatInputFooter, {
   type AttachedItem,
   type ManualSkillItem,
 } from "../components/ChatInputFooter";
-import { inferRuntimeRuleEnforcement } from "../lib/runtimeRules";
+import WorkspaceDraftConfigurationPanel from "../components/WorkspaceDraftConfigurationPanel";
 
 /* ── Visual tokens ─────────────────────────────────────────────────── */
 
@@ -39,11 +37,6 @@ const LABEL: CSSProperties = {
   fontSize: 10, fontWeight: 800, textTransform: "uppercase",
   letterSpacing: "0.12em", color: "var(--text-faint)", marginBottom: 6,
 };
-const VALUE: CSSProperties = {
-  fontSize: 13, fontWeight: 600, color: "var(--text-strong)", wordBreak: "break-word",
-};
-const SUBTLE: CSSProperties = { fontSize: 11, color: "var(--text-faint)" };
-
 /* ── Page-scoped CSS ───────────────────────────────────────────────── */
 
 const CHAT_STYLES = `
@@ -54,8 +47,17 @@ const CHAT_STYLES = `
     gap: 20px;
   }
   @media (max-width: 1080px) {
-    .draft-shell { grid-template-columns: 1fr; }
-    .draft-side  { display: none; }
+    .draft-shell {
+      grid-template-columns: 1fr;
+      grid-template-rows: minmax(520px, 1fr) auto;
+      overflow-y: auto;
+    }
+    .draft-side {
+      display: flex;
+      min-height: auto;
+      overflow: visible;
+      padding-right: 0;
+    }
   }
   .draft-chat {
     display: flex; flex-direction: column; min-height: 0;
@@ -108,15 +110,6 @@ const CHAT_STYLES = `
     background: rgba(250,250,249,0.9);
   }
   .draft-side  { display: flex; flex-direction: column; gap: 14px; min-height: 0; overflow-y: auto; padding-right: 4px; }
-  .draft-row   {
-    display: flex; justify-content: space-between; gap: 12px;
-    padding: 6px 0;
-    border-bottom: 1px dashed rgba(231,229,228,0.6);
-    font-size: 13px;
-  }
-  .draft-row:last-child { border-bottom: none; }
-  .draft-row .label { color: #78716c; flex-shrink: 0; }
-  .draft-row .value { color: #1c1917; text-align: right; overflow-wrap: anywhere; font-weight: 600; }
   .draft-typing {
     display: inline-flex; gap: 3px; align-items: center; color: #a8a29e;
   }
@@ -243,20 +236,6 @@ const CHAT_STYLES = `
   html[data-theme="dark"] .draft-chat .chat-composer-textarea::placeholder {
     color: rgba(255,255,255,0.58) !important;
   }
-  html[data-theme="dark"] .draft-side .glass-card {
-    background: rgba(255,255,255,0.055);
-    border-color: rgba(255,255,255,0.13);
-    box-shadow: inset 0 1px 0 rgba(255,255,255,0.05);
-  }
-  html[data-theme="dark"] .draft-side .glass-card :is(p, li, div, span) {
-    color: var(--text-default) !important;
-  }
-  html[data-theme="dark"] .draft-side .glass-card :is(.inline-flex, span[style*="inline-flex"]) {
-    color: #111111 !important;
-  }
-  html[data-theme="dark"] .draft-side .glass-card button {
-    color: #b7eee5 !important;
-  }
   .draft-side-surface,
   .draft-meta-panel {
     transition: background 0.15s ease, border-color 0.15s ease, color 0.15s ease;
@@ -270,27 +249,6 @@ const CHAT_STYLES = `
   html[data-theme="dark"] .draft-side-surface :where(div, p, span, li, strong),
   html[data-theme="dark"] .draft-meta-panel :where(div, p, span, strong) {
     color: var(--text-strong) !important;
-  }
-  html[data-theme="dark"] .draft-side-surface .draft-muted,
-  html[data-theme="dark"] .draft-meta-panel .draft-muted {
-    color: var(--text-muted) !important;
-  }
-  html[data-theme="dark"] .draft-side-surface .draft-remove,
-  html[data-theme="dark"] .draft-side-surface .draft-inline-action {
-    color: #b7eee5 !important;
-  }
-  html[data-theme="dark"] .draft-warning-surface {
-    background: rgba(147,96,39,0.13) !important;
-    border-color: rgba(229,184,96,0.26) !important;
-  }
-  html[data-theme="dark"] .draft-side .draft-row {
-    border-bottom-color: rgba(255,255,255,0.12);
-  }
-  html[data-theme="dark"] .draft-side .draft-row .label {
-    color: var(--text-muted);
-  }
-  html[data-theme="dark"] .draft-side .draft-row .value {
-    color: var(--text-strong);
   }
   html[data-theme="dark"] .draft-build-log {
     border-top-color: rgba(255,255,255,0.14);
@@ -332,23 +290,6 @@ function _humanize(key: string | null | undefined): string {
     .map((w) => (w.length > 0 ? w[0].toUpperCase() + w.slice(1).toLowerCase() : w))
     .join(" ");
 }
-const FIELD_LABELS: Record<string, string> = {
-  kind: t("page.workspace_draft_chat.field.workspace_type"),
-  name: t("page.workspace_draft_chat.field.workspace_name"),
-  operating_context: t("page.workspace_draft_chat.field.how_it_will_be_used"),
-  primary_work: t("page.workspace_draft_chat.field.main_work"),
-  services: t("page.workspace_draft_chat.field.services_to_run"),
-  goals: t("page.workspace_draft_chat.field.goals"),
-  agent_mappings: t("page.workspace_draft_chat.field.agent_assignments"),
-  staff_assignments: t("page.workspace_draft_chat.field.staff"),
-  knowledge_attachments: t("page.workspace_draft_chat.field.knowledge_sources"),
-  channel_config: t("page.workspace_draft_chat.field.channels"),
-  budget_policy: t("page.workspace_draft_chat.field.budget"),
-  rules: t("page.workspace_draft_chat.field.rules"),
-  automations: t("page.workspace_draft_chat.field.automations"),
-  flagged_integrations: t("page.workspace_draft_chat.field.integrations_to_connect"),
-  missing_integrations: t("page.workspace_draft_chat.field.integrations_to_connect"),
-};
 const VALUE_LABELS: Record<string, string> = {
   active: t("page.workspace_draft_chat.value.drafting"),
   ready: t("page.workspace_draft_chat.value.ready"),
@@ -371,26 +312,11 @@ const VALUE_LABELS: Record<string, string> = {
   email: t("page.workspace_draft_chat.value.email"),
   slack: t("page.workspace_draft_chat.value.slack"),
 };
-const ACTION_PATTERN_LABELS: Record<string, string> = {
-  "social_post.publish": t("page.workspace_draft_chat.action.publishing_social_posts"),
-  "social_post.delete": t("page.workspace_draft_chat.action.deleting_social_posts"),
-  "external_message.send": t("page.workspace_draft_chat.action.sending_customer_messages"),
-  "email.send": t("page.workspace_draft_chat.action.sending_email"),
-  "email.delete": t("page.workspace_draft_chat.action.deleting_email"),
-  "file.write": t("page.workspace_draft_chat.action.creating_or_editing_files"),
-  "file.delete": t("page.workspace_draft_chat.action.deleting_files"),
-  "file.move": t("page.workspace_draft_chat.action.moving_files"),
-  "document.export": t("page.workspace_draft_chat.action.exporting_documents"),
-};
 const STARTER_PROMPTS = [
   t("page.workspace_draft_chat.starter.coffee_popup"),
   t("page.workspace_draft_chat.starter.client_desk"),
   t("page.workspace_draft_chat.starter.manga_serial"),
 ];
-function _friendlyFieldLabel(key: string | null | undefined): string {
-  if (!key) return "";
-  return FIELD_LABELS[key] || _humanize(key);
-}
 function _friendlyValue(value: string | null | undefined): string {
   if (!value) return "";
   const raw = String(value);
@@ -401,18 +327,6 @@ function _friendlyValue(value: string | null | undefined): string {
     .replace(/\bId\b/g, "ID")
     .replace(/\bSop\b/g, "SOP")
     .replace(/\bCrm\b/g, "CRM");
-}
-function _friendlyActionPattern(pattern: string): string {
-  return ACTION_PATTERN_LABELS[pattern] || _friendlyValue(pattern.replace(/\./g, "_"));
-}
-function _serviceLabel(svc: any): string {
-  return svc?.name || _friendlyValue(svc?.service_key || svc?.key) || t("page.workspace_draft_chat.unnamed_service");
-}
-function _goalLabel(g: any): string {
-  return g?.title || g?.name || _friendlyValue(g?.goal_key || g?.key) || t("page.workspace_draft_chat.goal_fallback");
-}
-function _inferDraftRuleEnforcement(rule: any): { label: string; tone: "orange" | "red"; patterns: string[] } | null {
-  return inferRuntimeRuleEnforcement(rule);
 }
 function _toolLabel(name: string): string {
   // "ws_propose_service" → "Propose service"
@@ -441,21 +355,41 @@ function _formatTokens(n: number): string {
   if (n >= 1_000) return `${(n / 1_000).toFixed(1)}k`;
   return n.toString();
 }
-function _formatCredits(n: number): string {
-  return t("page.workspace_draft_chat.credit_amount", { count: Math.max(0, Math.round(n)).toLocaleString() });
-}
-function _optionalCreditValue(value: unknown): number | null {
-  if (value === null || value === undefined || value === "") return null;
-  const parsed = Number(String(value).replace(/,/g, ""));
-  if (!Number.isFinite(parsed) || parsed <= 0) return null;
-  return Math.floor(parsed);
-}
 function _formatMs(ms: number): string {
   if (ms < 1000) return `${ms}ms`;
   const s = ms / 1000;
   if (s < 60) return `${s.toFixed(1)}s`;
   const m = Math.floor(s / 60);
   return `${m}m ${(s - m * 60).toFixed(0)}s`;
+}
+
+function _hasCompletedDraftTurn(
+  messages: WorkspaceDraftMessage[],
+  userMessage: string,
+): boolean {
+  if (messages.length < 2) return false;
+  const assistant = messages[messages.length - 1];
+  const user = messages[messages.length - 2];
+  return (
+    user.role === "user" &&
+    user.content.trim() === userMessage.trim() &&
+    assistant.role === "assistant" &&
+    assistant.content.trim().length > 0
+  );
+}
+
+const DRAFT_ID_ALPHABET = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+
+function createClientDraftId(): string {
+  const random = globalThis.crypto.getRandomValues(new Uint8Array(10));
+  let value = BigInt(Date.now());
+  for (const byte of random) value = (value << 8n) | BigInt(byte);
+  let encoded = "";
+  for (let index = 0; index < 26; index += 1) {
+    encoded = DRAFT_ID_ALPHABET[Number(value & 31n)] + encoded;
+    value >>= 5n;
+  }
+  return encoded;
 }
 
 /* ── Page ──────────────────────────────────────────────────────────── */
@@ -467,12 +401,14 @@ export default function WorkspaceDraftChat() {
   const toast = useToastStore();
 
   const draftIdParam = searchParams.get("draft");
+  const resumingOpening = searchParams.get("opening") === "1" && !!draftIdParam;
   const initialBriefParam = searchParams.get("brief")?.trim() || "";
-  const [draftId, setDraftId] = useState<string | null>(draftIdParam);
+  const [draftId, setDraftId] = useState<string | null>(resumingOpening ? null : draftIdParam);
   const [input, setInput] = useState("");
   const msgsRef = useRef<HTMLDivElement>(null);
   const draftChatRef = useRef<HTMLDivElement>(null);
   const startedRef = useRef(false);
+  const openingDraftIdRef = useRef<string | null>(resumingOpening ? draftIdParam : null);
 
   /* Existing-draft fetch */
   const { data: existingDraft, isLoading: loadingExisting } = useQuery({
@@ -494,13 +430,13 @@ export default function WorkspaceDraftChat() {
    *  draft creation upfront. When set, the page renders a dedicated
    *  "limit reached" screen instead of an empty chat. */
   const [planLimit, setPlanLimit] = useState<PlanLimitDetail | null>(null);
+  const [startError, setStartError] = useState<string | null>(null);
   /** Tool events for the *currently streaming* assistant turn. */
   const liveEventsRef = useRef<WorkspaceArchitectToolEvent[]>([]);
   const [liveEvents, setLiveEvents] = useState<WorkspaceArchitectToolEvent[]>([]);
   /** Meta for the in-flight turn (filled at end-of-turn just before done). */
   const liveMetaRef = useRef<WorkspaceArchitectTurnMeta | null>(null);
   const [showAllLogs, setShowAllLogs] = useState<Record<string, boolean>>({});
-  const [budgetEditing, setBudgetEditing] = useState(false);
 
   useEffect(() => {
     if (existingDraft) {
@@ -569,24 +505,52 @@ export default function WorkspaceDraftChat() {
   /* ── Mutations ── */
   const createMutation = useMutation({
     mutationFn: async (initial_brief?: string) => {
+      setStartError(null);
       setStreaming(true);
       liveEventsRef.current = [];
       setLiveEvents([]);
       setMessages([{ role: "assistant", content: "" }]);
+      const requestedDraftId = openingDraftIdRef.current || createClientDraftId();
+      if (!openingDraftIdRef.current) {
+        openingDraftIdRef.current = requestedDraftId;
+        const openingParams = new URLSearchParams(searchParams);
+        openingParams.set("draft", requestedDraftId);
+        openingParams.set("opening", "1");
+        setSearchParams(openingParams, { replace: true });
+      }
       try {
         return await api.workspaceDrafts.createStream(
-          initial_brief ? { initial_brief } : {},
-          { onToken: appendToken, onReset: resetStreamBuffer, onToolStart, onToolEnd, onTurnMeta },
+          {
+            ...(initial_brief ? { initial_brief } : {}),
+            draft_id: requestedDraftId,
+          },
+          {
+            onStart: ({ draft_id: startedDraftId, mode }) => {
+              if (mode !== "create" || !startedDraftId) return;
+              openingDraftIdRef.current = startedDraftId;
+              const openingParams = new URLSearchParams(searchParams);
+              openingParams.set("draft", startedDraftId);
+              openingParams.set("opening", "1");
+              setSearchParams(openingParams, { replace: true });
+            },
+            onToken: appendToken,
+            onReset: resetStreamBuffer,
+            onToolStart,
+            onToolEnd,
+            onTurnMeta,
+          },
         );
       } finally {
         setStreaming(false);
       }
     },
     onSuccess: (turn) => {
+      setStartError(null);
       flushLiveEventsToLastAssistant();
       setDraft(turn.draft);
       setSearchParams({ draft: turn.draft.id }, { replace: true });
       setDraftId(turn.draft.id);
+      openingDraftIdRef.current = null;
     },
     onError: (err: Error) => {
       // 402 with structured detail = plan limit reached. Don't toast --
@@ -598,6 +562,7 @@ export default function WorkspaceDraftChat() {
         setLiveEvents([]);
         return;
       }
+      setStartError(err.message);
       toast.error(t("page.workspace_draft_chat.could_not_start_workspace_draft"), err.message);
       setMessages([]);
       liveEventsRef.current = [];
@@ -607,10 +572,15 @@ export default function WorkspaceDraftChat() {
 
   useEffect(() => {
     if (!draftId && !startedRef.current && !createMutation.isPending) {
-      startedRef.current = true;
-      createMutation.mutate(initialBriefParam || undefined);
+      // Let StrictMode finish replaying mount effects before starting the
+      // mutation; otherwise its observer can remain stuck in pending state.
+      const startTimer = window.setTimeout(() => {
+        startedRef.current = true;
+        createMutation.mutate(initialBriefParam || undefined);
+      }, 0);
+      return () => window.clearTimeout(startTimer);
     }
-  }, [draftId, initialBriefParam, createMutation]);
+  }, [draftId, initialBriefParam, createMutation.mutate, createMutation.isPending]);
 
   const sendMutation = useMutation({
     mutationFn: async ({ id, message }: { id: string; message: string }) => {
@@ -634,42 +604,52 @@ export default function WorkspaceDraftChat() {
       flushLiveEventsToLastAssistant();
       setDraft(turn.draft);
     },
-    onError: (err: Error) => {
+    onError: (err: Error, { id, message }) => {
       toast.error(t("page.workspace_draft_chat.send_failed"), err.message);
       setMessages((prev) => prev.slice(0, -2));
+      // The server did not acknowledge this turn with ``done``. Put the
+      // exact text back in the composer so a transport failure cannot make
+      // the user's input disappear, then reconcile any state that committed
+      // before the connection ended.
+      setInput((current) => current.trim() ? current : message);
+      void api.workspaceDrafts.get(id).then((freshDraft) => {
+        setDraft(freshDraft);
+        if (_hasCompletedDraftTurn(freshDraft.messages, message)) {
+          setMessages(freshDraft.messages.map((entry) => ({ ...entry })));
+          setInput((current) => current === message ? "" : current);
+        }
+      }).catch(() => {
+        // Keep the original send error and retryable composer text visible.
+      });
       liveEventsRef.current = [];
       setLiveEvents([]);
     },
-  });
-
-  const applyMutation = useMutation({
-    mutationFn: ({ id, blueprint_id }: { id: string; blueprint_id: string }) =>
-      api.workspaceDrafts.applyBlueprint(id, blueprint_id),
-    onSuccess: (updated) => {
-      setDraft(updated);
-      setMessages(updated.messages.map((m) => ({ ...m })));
-      toast.success(t("page.workspace_draft_chat.blueprint_applied"));
-    },
-    onError: (err: Error) => toast.error(t("page.workspace_draft_chat.could_not_apply_blueprint"), err.message),
   });
 
   /* ── Finalize progress ── */
   const [finalizeSteps, setFinalizeSteps] = useState<FinalizeProgressEvent[]>([]);
   const [finalizeWorkspaceId, setFinalizeWorkspaceId] = useState<string | null>(null);
   const [strategistEta, setStrategistEta] = useState<number | null>(null);
+  const [finalizeWarning, setFinalizeWarning] = useState<string | null>(null);
   const finalizeMutation = useMutation({
     mutationFn: async (id: string) => {
       setFinalizeSteps([]);
       setFinalizeWorkspaceId(null);
       setStrategistEta(null);
+      setFinalizeWarning(null);
       return await api.workspaceDrafts.finalizeStream(id, {
         onProgress: (e) => {
+          if (e.step === "dispatch_warning") {
+            const message = typeof e.payload.message === "string" ? e.payload.message.trim() : "";
+            setFinalizeWarning(message || "dispatch_warning");
+          }
           setFinalizeSteps((prev) => [...prev, e]);
         },
         onDone: (final) => {
           setFinalizeWorkspaceId(final.workspace_id);
-          const eta = (final as any).strategist_eta_seconds;
+          const eta = final.strategist_eta_seconds;
           if (typeof eta === "number") setStrategistEta(eta);
+          if (final.dispatch_warning?.trim()) setFinalizeWarning(final.dispatch_warning);
         },
       });
     },
@@ -678,12 +658,23 @@ export default function WorkspaceDraftChat() {
       toast.success(t("page.workspace_draft_chat.workspace_created"));
       // Hold the user on the progress UI for ~strategistEta seconds so
       // they see the Strategist countdown, then navigate.
-      const eta = strategistEta ?? 5;
+      const eta = res.strategist_eta_seconds ?? 5;
       setTimeout(() => {
         navigate(`/workspaces/${res.workspace_id}?created=1`);
       }, Math.max(2000, eta * 1000));
     },
-    onError: (err: Error) => toast.error(t("page.workspace_draft_chat.could_not_create_workspace"), err.message),
+    onError: (err: Error) => {
+      toast.error(t("page.workspace_draft_chat.could_not_create_workspace"), err.message);
+      if (draftId) {
+        void api.workspaceDrafts.get(draftId).then((updated) => {
+          queryClient.setQueryData(["workspace-draft", draftId], updated);
+          setDraft(updated);
+        }).catch(() => {
+          // Keep the original finalize failure visible; the Draft query can
+          // retry this background refresh later.
+        });
+      }
+    },
   });
 
   /* Auto-scroll */
@@ -725,27 +716,18 @@ export default function WorkspaceDraftChat() {
     attachments: AttachedItem[] = [],
     manualSkills: ManualSkillItem[] = [],
   ) {
-    if (!draftId) return;
     const v = formatComposerMessage(rawText, attachments, manualSkills);
-    if (!v || sendMutation.isPending || streaming) return;
+    if (!v || createMutation.isPending || sendMutation.isPending || streaming) return;
+    if (!draftId || !draft) {
+      setInput("");
+      startedRef.current = true;
+      createMutation.mutate(v);
+      return;
+    }
+    if (draft.status !== "active" && draft.status !== "ready") return;
     setInput("");
     sendMutation.mutate({ id: draftId, message: v });
   }
-
-  /* ── Sidebar field helpers ─────────────────────────────────────── */
-  const patchFields = async (patch: Record<string, any>) => {
-    if (!draftId) return;
-    try {
-      await api.workspaceDrafts.updateFields(draftId, patch);
-      const fresh = await api.workspaceDrafts.get(draftId);
-      setDraft(fresh);
-    } catch {}
-  };
-
-  const removeFromArray = (key: string, idx: number) => {
-    const arr = ((draft?.fields as any)?.[key] || []) as any[];
-    patchFields({ [key]: arr.filter((_: any, i: number) => i !== idx) });
-  };
 
   /* Derived */
   const lastIsAssistant = messages[messages.length - 1]?.role === "assistant";
@@ -754,35 +736,13 @@ export default function WorkspaceDraftChat() {
     (createMutation.isPending && !lastIsAssistant) ||
     (loadingExisting && !draft);
   const finalized = draft?.status === "finalized";
+  const editable = draft?.status === "active" || draft?.status === "ready";
   const showStarterPrompts =
-    !finalized &&
+    editable &&
     !streaming &&
     !sendMutation.isPending &&
     messages.length > 0 &&
     messages.every((m) => m.role !== "user");
-
-  const fields = (draft?.fields || {}) as Record<string, any>;
-  const services = (fields.services as any[]) || [];
-  const goals = (fields.goals as any[]) || [];
-  const agentMappings = (fields.agent_mappings as any[]) || [];
-  const rules = (fields.rules as any[]) || [];
-  const automations = (fields.automations as any[]) || [];
-  const channelConfig = (fields.channel_config as Record<string, any>) || {};
-  const budgetPolicy = (fields.budget_policy as Record<string, any>) || {};
-  const monthlyBudgetCredits = _optionalCreditValue(budgetPolicy.monthly_budget_credits);
-  const autoPauseOnBudget = budgetPolicy.auto_pause_on_budget !== false;
-  const identityDetails = [
-    fields.kind ? _friendlyValue(fields.kind) : null,
-    fields.primary_work ? String(fields.primary_work) : null,
-  ].filter(Boolean).join(" · ");
-  const budgetSummary = monthlyBudgetCredits
-    ? _formatCredits(monthlyBudgetCredits)
-    : t("page.workspace_draft_chat.no_monthly_credit_cap");
-
-  const mappingByService = new Map<string, any>();
-  for (const m of agentMappings) {
-    if (m?.service_key) mappingByService.set(m.service_key, m);
-  }
 
   // Plan-limit short-circuit -- swap the whole creation UI for a
   // friendly explanation so the user knows up-front WHY they can't
@@ -881,14 +841,14 @@ export default function WorkspaceDraftChat() {
         <Button
           variant="outline"
           onClick={() => {
-            if (draft && !finalized) {
+            if (draft && editable) {
               queryClient.invalidateQueries({ queryKey: ["workspace-drafts"] });
               toast.success(t("page.workspace_draft_chat.draft_saved"), t("page.workspace_draft_chat.resume_from_workspaces_page_anytime"));
             }
             navigate("/workspaces");
           }}
         >
-          {draft && !finalized ? t("page.workspace_draft_chat.save_and_exit") : t("action.cancel")}
+          {draft && editable ? t("page.workspace_draft_chat.save_and_exit") : t("action.cancel")}
         </Button>
       </PageHeader>
 
@@ -908,6 +868,23 @@ export default function WorkspaceDraftChat() {
                 </div>
                 <ChatMessagesSkeleton rows={3} />
               </div>
+            ) : startError && !draft ? (
+              <EmptyState
+                title={t("page.workspace_draft_chat.could_not_start_workspace_draft")}
+                description={startError}
+                action={(
+                  <Button
+                    variant="outline"
+                    disabled={createMutation.isPending}
+                    onClick={() => {
+                      startedRef.current = true;
+                      createMutation.mutate(initialBriefParam || undefined);
+                    }}
+                  >
+                    {t("component.chat_message_actions.retry")}
+                  </Button>
+                )}
+              />
             ) : (
               <>
                 {messages.map((m, i) => {
@@ -1036,577 +1013,32 @@ export default function WorkspaceDraftChat() {
             onChange={setInput}
             enterToSend
             streaming={sendMutation.isPending || streaming}
-            disabled={!draft || finalized}
+            disabled={Boolean(draftId) && (!draft || !editable)}
             showStopButton={false}
             onSend={send}
             onStop={() => {}}
             placeholder={
-              finalized ? t("page.workspace_draft_chat.workspace_already_created")
-                : t("page.workspace_draft_chat.describe_your_workspace")
+              finalized
+                ? t("page.workspace_draft_chat.workspace_already_created")
+                : draft?.status === "abandoned"
+                  ? t("page.workspace_draft_chat.draft_saved")
+                  : t("page.workspace_draft_chat.describe_your_workspace")
             }
           />
         </div>
 
         {/* ── Sidebar — live preview ── */}
         <div className="draft-side">
-          {/* Status + summary */}
-          <GlassCard hoverable={false}>
-            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
-              <span style={LABEL}>{t("page.workspace_draft_chat.draft_summary")}</span>
-              {draft && (
-                <StatusBadge
-                  type={
-                    draft.status === "finalized" ? "purple"
-                      : draft.status === "ready" ? "success"
-                        : draft.status === "abandoned" ? "danger"
-                          : "info"
-                  }
-                  dot
-                  pulse={draft.status === "active"}
-                >
-                  {_friendlyValue(draft.status)}
-                </StatusBadge>
-              )}
-            </div>
-
-            {fields.name || fields.kind || fields.operating_context || fields.primary_work ? (
-              <div
-                className="draft-side-surface"
-                style={{
-                  border: "1px solid rgba(231,229,228,0.75)",
-                  borderRadius: 12,
-                  background: "rgba(250,250,249,0.55)",
-                  padding: "12px 12px 11px",
-                }}
-              >
-                <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: 10 }}>
-                  <div style={{ minWidth: 0 }}>
-                    <div style={{ ...VALUE, fontSize: 15, fontWeight: 800 }}>
-                      {fields.name || t("page.workspace_draft_chat.identity")}
-                    </div>
-                    {identityDetails && (
-                      <div className="draft-muted" style={{ fontSize: 12, color: "#78716c", marginTop: 3, lineHeight: 1.45 }}>
-                        {identityDetails}
-                      </div>
-                    )}
-                  </div>
-                  {!finalized && (
-                    <button
-                      onClick={() => { setComposerPrompt(t("page.workspace_draft_chat.prompt.change_workspace_name")); }}
-                      className="draft-inline-action"
-                      style={{ background: "none", border: "none", cursor: "pointer", color: "#78716c", fontSize: 11, fontWeight: 700, padding: "1px 2px" }}
-                      title={t("page.workspace_draft_chat.edit_identity")}
-                    >{t("page.workspace_draft_chat.edit")}</button>
-                  )}
-                </div>
-                {fields.operating_context && (
-                  <div className="draft-muted" style={{ fontSize: 12, color: "#57534e", lineHeight: 1.45, marginTop: 8 }}>
-                    {fields.operating_context}
-                  </div>
-                )}
-              </div>
-            ) : (
-              <p style={{ fontSize: 13, color: "#57534e", margin: 0, lineHeight: 1.5 }}>
-                {t("page.workspace_draft_chat.tell_me_what_you_re_building_i_ll_fill_these_in")}
-              </p>
-            )}
-
-            {/* Missing chips */}
-            {draft?.missing && draft.missing.length > 0 && !finalized && (
-              <div style={{ marginTop: 14 }}>
-                <div style={LABEL}>{t("page.workspace_draft_chat.still_needed")}</div>
-                <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
-                  {draft.missing.map((m) => (
-                    <Chip key={m} variant="orange" size="sm">{_friendlyFieldLabel(m)}</Chip>
-                  ))}
-                </div>
-              </div>
-            )}
-          </GlassCard>
-
-          {/* Credit budget */}
-          {draft && (
-          <GlassCard hoverable={false}>
-            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
-              <span style={LABEL}>{t("page.workspace_draft_chat.budget")}</span>
-              {!finalized && (
-                <button
-                  onClick={() => setBudgetEditing((open) => !open)}
-                  className="draft-inline-action"
-                  style={{ background: "none", border: "none", cursor: "pointer", color: "#78716c", fontSize: 11, fontWeight: 700, padding: "0 4px" }}
-                  title={t("page.workspace_draft_chat.edit_budget")}
-                >{budgetEditing ? t("common.done") : t("page.workspace_draft_chat.edit")}</button>
-              )}
-            </div>
-            <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
-              <Chip variant="slate" size="sm">{budgetSummary}</Chip>
-              <Chip variant="slate" size="sm">
-                {autoPauseOnBudget
-                  ? t("page.workspace_draft_chat.auto_pause_on")
-                  : t("page.workspace_draft_chat.auto_pause_off")}
-              </Chip>
-            </div>
-            {!finalized && budgetEditing && (
-              <div style={{ marginTop: 10, display: "grid", gap: 8 }}>
-                <input
-                  className="manor-input"
-                  type="number"
-                  min="0"
-                  step="1"
-                  placeholder={t("page.workspace_draft_chat.monthly_credit_cap_placeholder")}
-                  defaultValue={monthlyBudgetCredits ?? ""}
-                  key={`draft-budget-${monthlyBudgetCredits ?? "none"}`}
-                  onBlur={(e) => {
-                    const value = e.currentTarget.value.trim();
-                    const parsed = value === "" ? null : Number(value);
-                    if (parsed !== null && (!Number.isFinite(parsed) || parsed < 0)) {
-                      toast.error(t("page.workspace_detail.invalid_amount"), t("page.workspace_detail.enter_non_negative_number_or_leave_empty"));
-                      e.currentTarget.value = monthlyBudgetCredits?.toString() ?? "";
-                      return;
-                    }
-                    const next = parsed === null || parsed <= 0 ? null : Math.floor(parsed);
-                    if (next === monthlyBudgetCredits) return;
-                    patchFields({
-                      budget_policy: {
-                        ...budgetPolicy,
-                        monthly_budget_credits: next,
-                        auto_pause_on_budget: autoPauseOnBudget,
-                      },
-                    });
-                  }}
-                />
-                <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12, fontSize: 12, color: "#57534e" }}>
-                  <span>{t("page.workspace_draft_chat.auto_pause_at_cap")}</span>
-                  <Toggle
-                    checked={autoPauseOnBudget}
-                    size="sm"
-                    aria-label={t("page.workspace_draft_chat.auto_pause_at_cap")}
-                    onChange={() => patchFields({
-                      budget_policy: {
-                        ...budgetPolicy,
-                        monthly_budget_credits: monthlyBudgetCredits,
-                        auto_pause_on_budget: !autoPauseOnBudget,
-                      },
-                    })}
-                  />
-                </div>
-              </div>
-            )}
-          </GlassCard>
+          {draft && draftId && (
+            <WorkspaceDraftConfigurationPanel
+              draftId={draftId}
+              draft={draft}
+              creating={finalizeMutation.isPending}
+              updating={sendMutation.isPending || streaming}
+              onCreate={() => finalizeMutation.mutateAsync(draftId).then(() => undefined)}
+              onDraftChange={setDraft}
+            />
           )}
-
-          {/* Services & Agents */}
-          {services.length > 0 && (
-            <GlassCard hoverable={false}>
-              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
-                <span style={LABEL}>{t("page.workspace_draft_chat.services_matched_agents")} {services.length}</span>
-                {!finalized && (
-                  <button
-                    onClick={() => { setComposerPrompt(t("page.workspace_draft_chat.prompt.add_new_service")); }}
-                    style={{ background: "none", border: "none", cursor: "pointer", color: "#436b65", fontSize: 18, fontWeight: 700, lineHeight: 1, padding: "0 4px" }}
-                    title={t("page.workspace_draft_chat.add_service")}
-                  >+</button>
-                )}
-              </div>
-              <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-                {services.map((svc, i) => {
-                  const sk = svc.service_key || svc.key;
-                  const m = sk ? mappingByService.get(sk) : null;
-                  const agentName = m?.recommended_agent_name || m?.agent_name;
-                  const isCustom = m?.strategy === "create_custom";
-                  return (
-                    <div
-                      className="draft-side-surface"
-                      key={sk || i}
-                      style={{
-                        padding: "10px 12px",
-                        borderRadius: 10,
-                        background: "rgba(250,250,249,0.6)",
-                        border: "1px solid rgba(28,25,23,0.06)",
-                        position: "relative",
-                      }}
-                    >
-                      {!finalized && (
-                        <button
-                          onClick={() => removeFromArray("services", i)}
-                          className="draft-remove"
-                          style={{ position: "absolute", top: 6, right: 8, background: "none", border: "none", cursor: "pointer", color: "#a8a29e", fontSize: 14, lineHeight: 1 }}
-                          title={t("page.workspace_draft_chat.remove_service")}
-                        >×</button>
-                      )}
-                      <div style={{ ...VALUE, fontWeight: 700, fontSize: 13 }}>{_serviceLabel(svc)}</div>
-                      {svc.description && (
-                        <div className="draft-muted" style={{ fontSize: 11, color: "#78716c", marginTop: 2, lineHeight: 1.4 }}>
-                          {svc.description}
-                        </div>
-                      )}
-                      <div style={{ marginTop: 6, display: "flex", alignItems: "center", gap: 6 }}>
-                        {agentName ? (
-                          <Chip variant={isCustom ? "purple" : "teal"} size="sm">
-                            {isCustom ? "↟ " : ""}{agentName}
-                          </Chip>
-                        ) : isCustom ? (
-                          <Chip variant="purple" size="sm">{t("page.workspace_draft_chat.custom_agent")}</Chip>
-                        ) : (
-                          <StatusBadge type="warning" dot>{t("page.workspace_draft_chat.unmapped")}</StatusBadge>
-                        )}
-                        {svc.autonomy_level && (
-                          <Chip variant="slate" size="sm">{_friendlyValue(svc.autonomy_level)}</Chip>
-                        )}
-                      </div>
-                    </div>
-                  );
-                })}
-              </div>
-            </GlassCard>
-          )}
-
-          {/* Staff assigned */}
-          {(() => {
-            const staff = ((fields.staff_assignments as any[]) || []).filter(Boolean);
-            if (staff.length === 0) return null;
-            return (
-              <GlassCard hoverable={false}>
-                <div style={LABEL}>{t("page.workspace_draft_chat.staff")} {staff.length}</div>
-                <ul style={{ margin: 0, padding: 0, listStyle: "none", display: "flex", flexDirection: "column", gap: 6 }}>
-                  {staff.map((s: any, i: number) => (
-                    <li key={i} style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8 }}>
-                      <span style={{ fontSize: 13, fontWeight: 600, color: "var(--text-strong)" }}>
-                        {s.staff_name || s.staff_id}
-                      </span>
-                      <span style={{ display: "flex", gap: 4 }}>
-                        {s.service_key && <Chip variant="slate" size="sm">{_friendlyValue(s.service_key)}</Chip>}
-                        <Chip variant="teal" size="sm">{_friendlyValue(s.role || "member")}</Chip>
-                      </span>
-                    </li>
-                  ))}
-                </ul>
-              </GlassCard>
-            );
-          })()}
-
-          {/* Knowledge groups — toggleable approval */}
-          {(() => {
-            const ks = ((fields.knowledge_attachments as any[]) || []).filter(Boolean);
-            if (ks.length === 0) return null;
-
-            const toggleKnowledge = async (idx: number) => {
-              const updated = ks.map((k: any, i: number) =>
-                i === idx ? { ...k, approved: !(k.approved !== false) } : k
-              );
-              try {
-                await api.workspaceDrafts.updateFields(draftId!, { knowledge_attachments: updated });
-                // Refetch draft to update sidebar
-                const fresh = await api.workspaceDrafts.get(draftId!);
-                setDraft(fresh);
-              } catch {}
-            };
-
-            return (
-              <GlassCard hoverable={false}>
-                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-                  <div style={LABEL}>{t("page.workspace_draft_chat.knowledge")} {ks.filter((k: any) => k.approved !== false).length}/{ks.length} {t("page.onboarding.selected")}</div>
-                  {!finalized && (
-                    <button
-                      onClick={() => { setComposerPrompt(t("page.workspace_draft_chat.prompt.add_knowledge_source")); }}
-                      style={{ background: "none", border: "none", cursor: "pointer", color: "#436b65", fontSize: 18, fontWeight: 700, lineHeight: 1, padding: "0 4px" }}
-                      title={t("page.workspace_draft_chat.add_knowledge")}
-                    >+</button>
-                  )}
-                </div>
-                <p style={{ ...SUBTLE, margin: "0 0 8px", lineHeight: 1.45 }}>
-                  {t("page.workspace_draft_chat.selected_sources_become_default_runtime_knowledg")}
-                </p>
-                <ul style={{ margin: 0, padding: 0, listStyle: "none", display: "flex", flexDirection: "column", gap: 6 }}>
-                  {ks.map((k: any, i: number) => {
-                    const approved = k.approved !== false;
-                    return (
-                      <li key={i}
-                        className="draft-side-surface"
-                        onClick={() => toggleKnowledge(i)}
-                        style={{
-                          padding: "6px 8px", borderRadius: 8, cursor: "pointer",
-                          background: approved ? "rgba(242,246,245,0.6)" : "rgba(250,250,249,0.4)",
-                          border: approved ? "1px solid rgba(67,107,101,0.2)" : "1px solid rgba(231,229,228,0.4)",
-                          opacity: approved ? 1 : 0.6,
-                          transition: "all 0.15s",
-                          display: "flex", alignItems: "flex-start", gap: 8,
-                        }}
-                      >
-                        <div style={{
-                          width: 18, height: 18, borderRadius: 4, flexShrink: 0, marginTop: 1,
-                          border: approved ? "2px solid #436b65" : "2px solid #d6d3d1",
-                          background: approved ? "#436b65" : "transparent",
-                          display: "flex", alignItems: "center", justifyContent: "center",
-                        }}>
-                          {approved && (
-                            <svg width="10" height="10" fill="none" viewBox="0 0 24 24" stroke="#fff" strokeWidth={3}><path strokeLinecap="round" d="M20 6L9 17l-5-5" /></svg>
-                          )}
-                        </div>
-                        <div style={{ flex: 1 }}>
-                          <div style={{ fontSize: 13, fontWeight: 600, color: "var(--text-strong)" }}>{k.name}</div>
-                          {k.purpose && (
-                            <div className="draft-muted" style={{ fontSize: 11, color: "#78716c", marginTop: 2, lineHeight: 1.4 }}>{k.purpose}</div>
-                          )}
-                        </div>
-                      </li>
-                    );
-                  })}
-                </ul>
-              </GlassCard>
-            );
-          })()}
-
-          {/* Goals */}
-          {goals.length > 0 && (
-            <GlassCard hoverable={false}>
-              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-                <div style={LABEL}>{t("page.workspace_draft_chat.goals")} {goals.length}</div>
-                {!finalized && (
-                  <button
-                    onClick={() => { setComposerPrompt(t("page.workspace_draft_chat.prompt.add_goal")); }}
-                    style={{ background: "none", border: "none", cursor: "pointer", color: "#436b65", fontSize: 18, fontWeight: 700, lineHeight: 1, padding: "0 4px" }}
-                    title={t("page.workspace_draft_chat.add_goal")}
-                  >+</button>
-                )}
-              </div>
-              <ul style={{ margin: 0, padding: 0, listStyle: "none", display: "flex", flexDirection: "column", gap: 8 }}>
-                {goals.map((g, i) => (
-                  <li key={i} className="draft-side-surface" style={{
-                    padding: "8px 10px",
-                    borderRadius: 10,
-                    background: "rgba(250,250,249,0.6)",
-                    border: "1px solid rgba(28,25,23,0.06)",
-                    position: "relative",
-                  }}>
-                    {!finalized && (
-                      <button
-                        onClick={() => removeFromArray("goals", i)}
-                        className="draft-remove"
-                        style={{ position: "absolute", top: 6, right: 8, background: "none", border: "none", cursor: "pointer", color: "#a8a29e", fontSize: 14, lineHeight: 1 }}
-                        title={t("page.workspace_draft_chat.remove_goal")}
-                      >×</button>
-                    )}
-                    <div style={{ ...VALUE, fontWeight: 700, fontSize: 13 }}>{_goalLabel(g)}</div>
-                    {g.description && _goalLabel(g) !== g.description && (
-                      <div className="draft-muted" style={{ fontSize: 11, color: "#78716c", marginTop: 2, lineHeight: 1.4 }}>
-                        {g.description}
-                      </div>
-                    )}
-                    <div style={{ marginTop: 6, display: "flex", flexWrap: "wrap", gap: 6 }}>
-                      {g.target && <Chip variant="green" size="sm">{t("page.workspace_draft_chat.target")} {g.target}</Chip>}
-                      {g.cadence && <Chip variant="blue" size="sm">{g.cadence}</Chip>}
-                      {g.metric_key && <Chip variant="slate" size="sm">{_friendlyValue(g.metric_key)}</Chip>}
-                    </div>
-                  </li>
-                ))}
-              </ul>
-            </GlassCard>
-          )}
-
-          {/* Missing integrations — surfaced from architect's missing_integrations / flagged_integrations */}
-          {(() => {
-            const flagged = ((fields.flagged_integrations as any[]) || []).filter(Boolean);
-            if (flagged.length === 0) return null;
-            return (
-              <GlassCard hoverable={false} className="border-amber-200">
-                <div style={{ ...LABEL, color: "#936027" }}>
-                  {t("page.workspace_draft_chat.needs_setup")} {flagged.length} {t("page.apps.integration")}{flagged.length === 1 ? "" : "s"}
-                </div>
-                <p style={{ ...SUBTLE, margin: "4px 0 10px", lineHeight: 1.5, color: "#76502c" }}>
-                  {t("page.workspace_draft_chat.these_integrations_weren_t_found_in_your_account")}
-                </p>
-                <ul style={{ margin: 0, padding: 0, listStyle: "none", display: "flex", flexDirection: "column", gap: 8 }}>
-                  {flagged.map((f: any, i: number) => (
-                    <li key={i} className="draft-side-surface draft-warning-surface" style={{
-                      padding: "8px 10px",
-                      borderRadius: 10,
-                      background: "rgba(243, 236, 214, 0.4)",
-                      border: "1px solid rgba(207, 155, 68, 0.3)",
-                    }}>
-                      <div style={{ display: "flex", alignItems: "center", gap: 6, justifyContent: "space-between" }}>
-                        <span style={{ ...VALUE, fontSize: 13 }}>{_humanize(f.provider)}</span>
-                        <span style={{ display: "flex", gap: 4, flexWrap: "wrap", justifyContent: "flex-end" }}>
-                          {f.setup_kind === "browser_extension" && (
-                            <Chip variant="blue" size="sm">
-                              {t("page.integrations.local_browser_setup_required")}
-                            </Chip>
-                          )}
-                          {f.required && <Chip variant="red" size="sm">{t("page.login.required")}</Chip>}
-                        </span>
-                      </div>
-                      {f.purpose && (
-                        <div className="draft-muted" style={{ fontSize: 11, color: "#76502c", marginTop: 4, lineHeight: 1.4 }}>
-                          {f.purpose}
-                        </div>
-                      )}
-                      {Array.isArray(f.linked_service_keys) && f.linked_service_keys.length > 0 && (
-                        <div style={{ display: "flex", flexWrap: "wrap", gap: 4, marginTop: 6 }}>
-                          {f.linked_service_keys.map((sk: string) => (
-                            <Chip key={sk} variant="orange" size="sm">{_friendlyValue(sk)}</Chip>
-                          ))}
-                        </div>
-                      )}
-                    </li>
-                  ))}
-                </ul>
-              </GlassCard>
-            );
-          })()}
-
-          {/* Channels */}
-          {(channelConfig.primary_external_channel?.channel_type ||
-            channelConfig.internal_channel?.channel_type) && (
-            <GlassCard hoverable={false}>
-              <div style={LABEL}>{t("page.workspace_draft_chat.channels")}</div>
-              {channelConfig.primary_external_channel?.channel_type && (
-                <div className="draft-row">
-                  <span className="label">{t("page.workspace_draft_chat.primary")}</span>
-                  <span className="value">{_friendlyValue(channelConfig.primary_external_channel.channel_type)}</span>
-                </div>
-              )}
-              {channelConfig.internal_channel?.channel_type && (
-                <div className="draft-row">
-                  <span className="label">{t("page.workspace_draft_chat.internal")}</span>
-                  <span className="value">{_friendlyValue(channelConfig.internal_channel.channel_type)}</span>
-                </div>
-              )}
-              {Array.isArray(channelConfig.secondary_external_channels) && channelConfig.secondary_external_channels.length > 0 && (
-                <div className="draft-row">
-                  <span className="label">{t("page.workspace_draft_chat.also")}</span>
-                  <span className="value" style={{ display: "flex", flexWrap: "wrap", gap: 4, justifyContent: "flex-end" }}>
-                    {channelConfig.secondary_external_channels.map((c: any, i: number) => (
-                      <Chip key={i} variant="teal" size="sm">{_friendlyValue(c.channel_type)}</Chip>
-                    ))}
-                  </span>
-                </div>
-              )}
-            </GlassCard>
-          )}
-
-          {/* Rules + automations as compact lists */}
-          {(rules.length > 0 || automations.length > 0) && (
-            <GlassCard hoverable={false}>
-              {rules.length > 0 && (
-                <div>
-                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-                    <div style={LABEL}>{t("page.workspace_draft_chat.rules")} {rules.length}</div>
-                    {!finalized && (
-                      <button
-                        onClick={() => { setComposerPrompt(t("page.workspace_draft_chat.prompt.add_rule")); }}
-                        style={{ background: "none", border: "none", cursor: "pointer", color: "#436b65", fontSize: 18, fontWeight: 700, lineHeight: 1, padding: "0 4px" }}
-                        title={t("page.workspace_draft_chat.add_rule")}
-                      >+</button>
-                    )}
-                  </div>
-                  <ul style={{ margin: 0, padding: 0, listStyle: "none", display: "flex", flexDirection: "column", gap: 6 }}>
-                    {rules.map((r, i) => {
-                      const enforcement = _inferDraftRuleEnforcement(r);
-                      return (
-                        <li key={i} style={{ fontSize: 12, color: "var(--text-strong)", lineHeight: 1.4, display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: 8 }}>
-                          <div style={{ flex: 1, minWidth: 0 }}>
-                            <div>• {r.description || _friendlyValue(r.rule_key)}</div>
-                            {enforcement ? (
-                              <div style={{ display: "flex", flexWrap: "wrap", gap: 4, marginTop: 5 }}>
-                                <Chip variant={enforcement.tone} size="sm">{enforcement.label}</Chip>
-                                {enforcement.patterns.map((pattern) => (
-                                  <Chip key={pattern} variant="slate" size="sm">{_friendlyActionPattern(pattern)}</Chip>
-                                ))}
-                              </div>
-                            ) : (
-                              <div style={{ ...SUBTLE, marginTop: 3 }}>
-                                {t("page.workspace_draft_chat.agent_visible_rule_no_direct_runtime_action_patt")}
-                              </div>
-                            )}
-                          </div>
-                          {!finalized && (
-                            <button
-                              onClick={() => removeFromArray("rules", i)}
-                              className="draft-remove"
-                              style={{ background: "none", border: "none", cursor: "pointer", color: "#a8a29e", fontSize: 13, lineHeight: 1, flexShrink: 0 }}
-                              title={t("page.workspace_draft_chat.remove_rule")}
-                            >×</button>
-                          )}
-                        </li>
-                      );
-                    })}
-                  </ul>
-                </div>
-              )}
-              {automations.length > 0 && (
-                <div style={{ marginTop: rules.length > 0 ? 14 : 0 }}>
-                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-                    <div style={LABEL}>{t("page.workspace_draft_chat.automations")} {automations.length}</div>
-                    {!finalized && (
-                      <button
-                        onClick={() => { setComposerPrompt(t("page.workspace_draft_chat.prompt.add_automation")); }}
-                        style={{ background: "none", border: "none", cursor: "pointer", color: "#436b65", fontSize: 18, fontWeight: 700, lineHeight: 1, padding: "0 4px" }}
-                        title={t("page.workspace_draft_chat.add_automation")}
-                      >+</button>
-                    )}
-                  </div>
-                  <ul style={{ margin: 0, padding: 0, listStyle: "none", display: "flex", flexDirection: "column", gap: 4 }}>
-                    {automations.map((a, i) => (
-                      <li key={i} style={{ fontSize: 12, color: "var(--text-strong)", lineHeight: 1.4, display: "flex", alignItems: "center", justifyContent: "space-between", gap: 4 }}>
-                        <span>• {a.description || _friendlyValue(a.automation_key)}{a.trigger && <span className="draft-muted" style={{ color: "#a8a29e", marginLeft: 4 }}>· {_friendlyValue(a.trigger)}</span>}</span>
-                        {!finalized && (
-                          <button
-                            onClick={() => removeFromArray("automations", i)}
-                            className="draft-remove"
-                            style={{ background: "none", border: "none", cursor: "pointer", color: "#a8a29e", fontSize: 13, lineHeight: 1, flexShrink: 0 }}
-                            title={t("page.workspace_draft_chat.remove_automation")}
-                          >×</button>
-                        )}
-                      </li>
-                    ))}
-                  </ul>
-                </div>
-              )}
-            </GlassCard>
-          )}
-
-          {/* Blueprint suggestion */}
-          {draft?.suggested_blueprint && !draft.applied_blueprint_id && (
-            <GlassCard hoverable={false}>
-              <div style={LABEL}>{t("page.workspace_draft_chat.suggested_template")}</div>
-              <div style={{ ...VALUE, fontSize: 14, fontWeight: 700 }}>{draft.suggested_blueprint.title}</div>
-              {draft.suggested_blueprint.summary && (
-                <div className="draft-muted" style={{ fontSize: 12, color: "#57534e", marginTop: 4, lineHeight: 1.5 }}>
-                  {draft.suggested_blueprint.summary}
-                </div>
-              )}
-              {draft.suggested_blueprint.tags?.length > 0 && (
-                <div style={{ display: "flex", flexWrap: "wrap", gap: 4, marginTop: 8 }}>
-                  {draft.suggested_blueprint.tags.slice(0, 4).map((t) => (
-                    <Chip key={t} variant="purple" size="sm">{t}</Chip>
-                  ))}
-                </div>
-              )}
-              <div style={{ marginTop: 12 }}>
-                <Button
-                  variant="primary"
-                  size="sm"
-                  loading={applyMutation.isPending}
-                  onClick={() => applyMutation.mutate({ id: draft.id, blueprint_id: draft.suggested_blueprint!.id })}
-                >
-                  {t("page.workspace_draft_chat.use_template")}
-                </Button>
-              </div>
-            </GlassCard>
-          )}
-
-          {/* Finalize CTA */}
-          <Button
-            variant="primary"
-            size="lg"
-            onClick={() => draft && finalizeMutation.mutate(draft.id)}
-            disabled={!draft || !draft.ready || finalizeMutation.isPending || finalized}
-            loading={finalizeMutation.isPending}
-          >
-            {finalized ? t("page.workspace_draft_chat.workspace_created")
-              : draft?.ready ? t("page.workspaces.create_workspace")
-                : t("page.workspace_draft_chat.keep_chatting_until_ready")}
-          </Button>
         </div>
       </div>
 
@@ -1615,7 +1047,9 @@ export default function WorkspaceDraftChat() {
         <FinalizeProgressOverlay
           steps={finalizeSteps}
           finalized={!!finalizeWorkspaceId}
+          autonomous={Boolean(draft?.fields.heartbeat_enabled)}
           strategistEta={strategistEta}
+          warning={finalizeWarning}
         />
       )}
     </div>
@@ -1640,12 +1074,19 @@ const FINALIZE_STEPS: { key: string; label: string }[] = [
 function FinalizeProgressOverlay({
   steps,
   finalized,
+  autonomous,
   strategistEta,
+  warning,
 }: {
   steps: FinalizeProgressEvent[];
   finalized: boolean;
+  autonomous: boolean;
   strategistEta: number | null;
+  warning: string | null;
 }) {
+  const visibleSteps = autonomous
+    ? FINALIZE_STEPS
+    : FINALIZE_STEPS.filter((step) => !["runtime_scheduled", "strategist_dispatched"].includes(step.key));
   const seenKeys = new Set(steps.map((s) => s.step));
   const lastAgent = [...steps].reverse().find((s) => s.step === "agent_provisioned");
   const teamPayload = steps.find((s) => s.step === "team_and_knowledge_done")?.payload as
@@ -1666,8 +1107,8 @@ function FinalizeProgressOverlay({
     return () => clearInterval(t);
   }, [strategistEta]);
 
-  const completed = seenKeys.size;
-  const total = FINALIZE_STEPS.length;
+  const completed = visibleSteps.filter((step) => seenKeys.has(step.key)).length;
+  const total = visibleSteps.length;
   const pct = Math.min(100, Math.round((completed / total) * 100));
 
   return createPortal(
@@ -1693,19 +1134,25 @@ function FinalizeProgressOverlay({
           {finalized ? (
             <div style={{
               width: 36, height: 36, borderRadius: "50%",
-              background: "#e4efe8", display: "flex", alignItems: "center",
-              justifyContent: "center", color: "#3d7351", fontSize: 18, fontWeight: 800,
-            }}>✓</div>
+              background: warning ? "#f8edd7" : "#e4efe8", display: "flex", alignItems: "center",
+              justifyContent: "center", color: warning ? "#936027" : "#3d7351", fontSize: 18, fontWeight: 800,
+            }}>{warning ? "!" : "✓"}</div>
           ) : (
             <LoadingSpinner size={20} />
           )}
           <div style={{ flex: 1 }}>
             <div style={{ fontSize: 17, fontWeight: 700, color: "var(--text-strong)" }}>
-              {finalized ? t("page.workspace_draft_chat.workspace_ready") : t("page.workspace_draft_chat.creating_your_workspace")}
+              {finalized
+                ? warning
+                  ? t("page.workspace_draft_chat.workspace_created_with_setup_warning")
+                  : t("page.workspace_draft_chat.workspace_ready")
+                : t("page.workspace_draft_chat.creating_your_workspace")}
             </div>
             <div style={{ fontSize: 12, color: "var(--text-muted)" }}>
               {finalized
-                ? secondsLeft != null && secondsLeft > 0
+                ? warning
+                  ? t("page.workspace_draft_chat.workspace_startup_needs_attention")
+                  : secondsLeft != null && secondsLeft > 0
                   ? `Strategist starts proposing tasks in ${secondsLeft}s — taking you in…`
                   : t("page.workspace_draft_chat.opening_workspace")
                 : t("page.workspace_draft_chat.provisioning_agents_channels_knowledge_and_runtime")}
@@ -1727,10 +1174,10 @@ function FinalizeProgressOverlay({
 
         {/* Step checklist */}
         <ul style={{ margin: 0, padding: 0, listStyle: "none", display: "flex", flexDirection: "column", gap: 6 }}>
-          {FINALIZE_STEPS.map((s, idx) => {
+          {visibleSteps.map((s, idx) => {
             const done = seenKeys.has(s.key);
             // The currently-active step is the first not-done after the last done.
-            const prevDone = idx === 0 || seenKeys.has(FINALIZE_STEPS[idx - 1].key);
+            const prevDone = idx === 0 || seenKeys.has(visibleSteps[idx - 1].key);
             const active = !done && prevDone && !finalized;
             const subtitle = (() => {
               if (s.key === "agent_provisioned" || s.key === "agents_done") {
@@ -1765,7 +1212,9 @@ function FinalizeProgressOverlay({
                 </span>
                 <div style={{ flex: 1, minWidth: 0 }}>
                   <div style={{ fontSize: 13, color: done ? "#1c1917" : active ? "#436b65" : "#78716c" }}>
-                    {s.label}
+                    {s.key === "complete" && warning
+                      ? t("page.workspace_draft_chat.workspace_created_startup_incomplete")
+                      : s.label}
                   </div>
                   {subtitle && (
                     <div style={{ fontSize: 11, color: "#a8a29e", marginTop: 1 }}>{subtitle}</div>

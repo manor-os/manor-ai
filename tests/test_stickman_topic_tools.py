@@ -24,6 +24,43 @@ def test_topic_tool_schemas_are_workspace_scoped() -> None:
     assert "backfill_used" in schemas["record_stickman_topic_ledger"]["properties"]["action"]["enum"]
 
 
+def test_topic_tools_are_registered_for_workflow_execution() -> None:
+    from packages.core.ai.tool_pool import ToolPool
+
+    pool = ToolPool()
+    pool.initialize()
+
+    assert {
+        "read_stickman_topic_ledger",
+        "record_stickman_topic_ledger",
+    } <= set(pool.registered_tool_names())
+
+
+def test_read_topic_tool_is_classified_as_read_only() -> None:
+    from packages.core.ai.runtime.approval_classifier import classify_runtime_tool
+    from packages.core.ai.runtime.tool_effect_classification import RuntimeToolEffect
+
+    classification = classify_runtime_tool("read_stickman_topic_ledger")
+
+    assert classification.effect is RuntimeToolEffect.READ_ONLY
+
+
+def test_record_topic_tool_is_classified_as_workspace_knowledge_update() -> None:
+    from packages.core.ai.runtime.approval_classifier import classify_runtime_tool
+    from packages.core.ai.runtime.tool_effect_classification import RuntimeToolEffect
+
+    classification = classify_runtime_tool(
+        "record_stickman_topic_ledger",
+        {"action": "reserve", "selected_topic": "A fresh topic"},
+    )
+
+    assert classification.effect is RuntimeToolEffect.ACTION
+    assert classification.action is not None
+    assert classification.action.action_key == "workspace.knowledge.update"
+    assert classification.action.resource_kind == "knowledge"
+    assert classification.action.operation == "modify"
+
+
 @pytest.mark.asyncio
 async def test_read_tool_returns_service_history(monkeypatch) -> None:
     module = _module()

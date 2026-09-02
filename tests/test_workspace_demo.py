@@ -1,4 +1,4 @@
-"""Workspace demo/sandbox scenarios."""
+"""Workspace simulation scenarios."""
 
 import pytest
 from httpx import AsyncClient
@@ -47,10 +47,12 @@ async def test_leasing_sandbox_demo_seeds_full_workspace_runtime(
     entity_id = workspace.entity_id
     assert workspace.kind == "leasing"
     assert workspace.settings["sandbox"] is True
+    assert workspace.name == "Leasing Consultant — Workspace Simulation"
     assert workspace.heartbeat_enabled is True
     assert workspace.monthly_budget_usd is not None
     assert workspace.operating_model["evaluation"]["loop"].startswith("After every active work batch")
     assert len(workspace.operating_model["goals"]) == 5
+    assert workspace.operating_model["strategist"]["use_goals"] is True
 
     subscriptions = (
         (await db_session.execute(select(AgentSubscription).where(AgentSubscription.workspace_id == workspace_id)))
@@ -272,16 +274,59 @@ async def test_leasing_sandbox_demo_seeds_full_workspace_runtime(
 
 
 @pytest.mark.asyncio
+async def test_leasing_sandbox_goal_repair_is_idempotent(
+    client: AsyncClient,
+    db_session,
+):
+    from packages.core.models.goal import Goal
+    from packages.core.models.workspace import Workspace
+
+    headers = await _register(client, "leasing_goal_identity")
+    create = await client.post(
+        "/api/v1/workspaces/sandbox",
+        headers=headers,
+        json={"kind": "leasing"},
+    )
+    assert create.status_code == 201, create.text
+    workspace_id = create.json()["workspace_id"]
+
+    workspace = (await db_session.execute(
+        select(Workspace).where(Workspace.id == workspace_id)
+    )).scalar_one()
+    goals = list((await db_session.execute(
+        select(Goal).where(Goal.workspace_id == workspace_id)
+    )).scalars().all())
+    assert {goal.goal_key for goal in goals} == {
+        goal["goal_key"] for goal in workspace.operating_model["goals"]
+    }
+
+    for _ in range(2):
+        repair = await client.post(
+            f"/api/v1/workspaces/{workspace_id}/operation/repair",
+            headers=headers,
+        )
+        assert repair.status_code == 200, repair.text
+        assert repair.json()["goals"]["created"] == 0
+
+    db_session.expire_all()
+    repaired_goals = list((await db_session.execute(
+        select(Goal).where(Goal.workspace_id == workspace_id)
+    )).scalars().all())
+    assert len(repaired_goals) == len(goals)
+
+
+@pytest.mark.asyncio
 async def test_social_sandbox_demo_seeds_visible_approval_card(
     client: AsyncClient,
     db_session,
 ):
+    from packages.core.constants.channels import ExternalMessageActionKey
     from packages.core.models.channel import ChannelConfig, MessageLog
     from packages.core.models.document import Channel
-    from packages.core.models.goal import GoalTaskLink
+    from packages.core.models.goal import Goal, GoalTaskLink
     from packages.core.models.runtime_learning import RuntimeEvidence
     from packages.core.models.task import Message
-    from packages.core.models.workspace import WorkspaceActivity
+    from packages.core.models.workspace import Workspace, WorkspaceActivity
 
     headers = await _register(client, "social_demo")
 
@@ -313,6 +358,16 @@ async def test_social_sandbox_demo_seeds_visible_approval_card(
     ).scalar_one()
     assert goal_link.contribution == "direct"
 
+    workspace = (await db_session.execute(
+        select(Workspace).where(Workspace.id == workspace_id)
+    )).scalar_one()
+    seeded_goal = (await db_session.execute(
+        select(Goal).where(Goal.workspace_id == workspace_id)
+    )).scalar_one()
+    assert workspace.name == "Twitter Growth — Workspace Simulation"
+    assert workspace.operating_model["strategist"]["use_goals"] is True
+    assert workspace.operating_model["goals"][0]["goal_key"] == seeded_goal.goal_key
+
     messages_resp = await client.get(
         f"/api/v1/workspaces/{workspace_id}/chat/messages",
         headers=headers,
@@ -321,7 +376,8 @@ async def test_social_sandbox_demo_seeds_visible_approval_card(
     pending = [
         msg
         for msg in messages_resp.json()
-        if (msg.get("pending_action") or {}).get("action_key") == "social_post.publish"
+        if (msg.get("pending_action") or {}).get("action_key")
+        == ExternalMessageActionKey.SEND.value
     ]
     assert pending
     assert pending[0]["pending_action"]["channel_config_id"] == channel_config_id
@@ -352,7 +408,11 @@ async def test_social_sandbox_demo_seeds_visible_approval_card(
             )
         )
     ).scalar_one()
-    assert message_log.status == "queued"
+    from packages.core.services.channel_outbound_delivery import (
+        ApprovedReplyAttemptStatus,
+    )
+
+    assert message_log.status == ApprovedReplyAttemptStatus.SENT.value
 
     decision_evidence = (
         await db_session.execute(
@@ -373,6 +433,17 @@ async def test_social_sandbox_demo_seeds_visible_approval_card(
         )
     ).scalar_one()
     assert approval_activity.details["choice"] == "approve"
+
+    repair = await client.post(
+        f"/api/v1/workspaces/{workspace_id}/operation/repair",
+        headers=headers,
+    )
+    assert repair.status_code == 200, repair.text
+    assert repair.json()["goals"]["created"] == 0
+    db_session.expire_all()
+    assert len((await db_session.execute(
+        select(Goal).where(Goal.workspace_id == workspace_id)
+    )).scalars().all()) == 1
 
 
 @pytest.mark.asyncio

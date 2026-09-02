@@ -14,7 +14,11 @@ def register_all_tools(pool) -> None:
         rag_tools,
         web_tools,
         weather_tools,
-        stickman_topic_tools,
+        content_ledger_tools,
+        finance_ledger_tools,
+        recruiting_ledger_tools,
+        relationship_ledger_tools,
+        ledger_query_tools,
         youtube_tools,
         system_tools,
         bash_tool,
@@ -29,12 +33,13 @@ def register_all_tools(pool) -> None:
         agent_file_tools,
         sandbox_file_tools,
         workspace_arch_tools,
-        workspace_agent_tools,
         agent_provisioning_tools,
         notification_tools,
+        response_surface_tools,
         dashboard_tools,
         workflow_tools,
         site_tools,
+        stickman_topic_tools,
         video_edit_tools,
     )
 
@@ -62,7 +67,11 @@ def register_all_tools(pool) -> None:
         rag_tools,
         web_tools,
         weather_tools,
-        stickman_topic_tools,
+        content_ledger_tools,
+        finance_ledger_tools,
+        recruiting_ledger_tools,
+        relationship_ledger_tools,
+        ledger_query_tools,
         youtube_tools,
         system_tools,
         bash_tool,
@@ -77,29 +86,60 @@ def register_all_tools(pool) -> None:
         agent_file_tools,
         sandbox_file_tools,
         workspace_arch_tools,
-        workspace_agent_tools,
         agent_provisioning_tools,
         notification_tools,
+        response_surface_tools,
         dashboard_tools,
         workflow_tools,
         site_tools,
+        stickman_topic_tools,
         video_edit_tools,
     ]:
         for schema, handler in module.get_tools():
             pool.register(schema["function"]["name"], schema, handler)
+
+    # Internal Workspace runtime operations are exposed through
+    # manor(action="workspace"). Keep the historical names executable for
+    # persisted task/tool calls, while leaving only the external least-
+    # privilege ticket intake entry discoverable.
+    from . import workspace_agent_tools
+    for schema, handler in workspace_agent_tools.get_tools():
+        name = schema["function"]["name"]
+        pool.register(
+            name,
+            schema,
+            handler,
+            discoverable=name == "workspace_create_task",
+        )
+
+    # The aggregate Ledger renderer is now manor workspace action
+    # visualize_ledgers. Retain its old execution name for resume safety.
+    for schema, handler in ledger_query_tools.get_legacy_tools():
+        pool.register(
+            schema["function"]["name"],
+            schema,
+            handler,
+            discoverable=False,
+        )
 
     # Workspace context search — lets agents query workspace state
     from . import workspace_context_tool
     for schema, handler in workspace_context_tool.get_tools():
         pool.register(schema["function"]["name"], schema, handler)
 
-    # Sandbox tools — only registered when SANDBOX_SERVICE_URL is configured.
-    # sandbox_exec / sandbox_destroy are always-loaded when present so the LLM
-    # can drive them interactively after invoke_skill returns a sandbox_id.
+    # Sandbox gateway — only registered when SANDBOX_SERVICE_URL is configured.
+    # Historical action-specific names remain execution-only aliases.
     try:
         from . import sandbox_tools as _sandbox_mod
         for schema, handler in _sandbox_mod.get_tools():
             pool.register(schema["function"]["name"], schema, handler)
+        for schema, handler in _sandbox_mod.get_legacy_tools():
+            pool.register(
+                schema["function"]["name"],
+                schema,
+                handler,
+                discoverable=False,
+            )
     except Exception as e:
         import logging
         logging.getLogger(__name__).debug("Sandbox tools not loaded: %s", e)

@@ -16,6 +16,7 @@ Scopes used:
 from __future__ import annotations
 
 import asyncio
+import contextvars
 from datetime import datetime, timezone
 import json
 import logging
@@ -36,22 +37,20 @@ _DEFAULT_ME_USER_FIELDS = "public_metrics,profile_image_url,description"
 
 # ── Per-call context (set by mcp_builtin dispatcher) ─────────────────────────
 #
-# Module-level dict matches the convention used by the other in-process MCP
-# modules (elevenlabs.py, _cli_runner.py). The dispatcher set/clears it
-# around each call_tool invocation. Used to scope an inline 401 refresh
-# back to the right OAuthAccount row.
-
-_call_context: Dict[str, str] = {}
+# The dispatcher set/clears this around each call_tool invocation. Context-local
+# storage keeps an inline 401 refresh bound to the initiating async call.
+_call_context_var: contextvars.ContextVar[Dict[str, str]] = contextvars.ContextVar(
+    "twitter_x_mcp_call_context",
+    default={},
+)
 
 
 def set_call_context(ctx: Dict[str, str]) -> None:
-    global _call_context
-    _call_context = dict(ctx or {})
+    _call_context_var.set(dict(ctx or {}))
 
 
 def clear_call_context() -> None:
-    global _call_context
-    _call_context = {}
+    _call_context_var.set({})
 
 
 # ── Process-local /users/me cache ────────────────────────────────────────────
@@ -142,14 +141,21 @@ async def call_tool(
     handler = _HANDLERS.get(name)
     if not handler:
         return _error(f"Unknown tool: {name}")
+    if not isinstance(arguments, dict):
+        return _error("arguments must be an object")
+    arguments = dict(arguments)
 
     spec = _TOOLS.get(name, {})
     missing = [p for p in spec.get("required", []) if arguments.get(p) in (None, "")]
     if missing:
         return _error(f"Missing required params: {', '.join(missing)}")
 
+    token = bearer_token.strip() if isinstance(bearer_token, str) else ""
+    if not token:
+        return _error("X access token is missing. Connect X/Twitter first.")
+
     try:
-        text = await handler(bearer_token, arguments)
+        text = await handler(token, arguments)
         return {"content": [{"type": "text", "text": text}], "isError": False}
     except _XApiError as e:
         # Surface as a real MCP error so the dispatcher's isError branch
@@ -670,7 +676,8 @@ async def _try_inline_refresh(old_token: str) -> Optional[str]:
     them inline would require routing through CredentialService for
     vault-backed reads which we keep out of the MCP module.
     """
-    user_id = _call_context.get("user_id")
+    call_context = _call_context_var.get()
+    user_id = call_context.get("user_id")
     if not user_id:
         return None
 
@@ -692,7 +699,7 @@ async def _try_inline_refresh(old_token: str) -> Optional[str]:
                 OAuthAccount.user_id == user_id,
                 OAuthAccount.provider.in_(provider_key_aliases("twitter_x")),
             )
-            integration_account_id = _call_context.get("integration_account_id")
+            integration_account_id = call_context.get("integration_account_id")
             if integration_account_id:
                 query = query.where(OAuthAccount.id == integration_account_id)
             row = (await db.execute(

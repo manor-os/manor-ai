@@ -99,7 +99,7 @@ class Staff(Base, TimestampMixin, SoftDeleteMixin):
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     email: Mapped[Optional[str]] = mapped_column(String(255))
     phone: Mapped[Optional[str]] = mapped_column(String(50))
-    avatar_url: Mapped[Optional[str]] = mapped_column(String(500))
+    avatar_url: Mapped[Optional[str]] = mapped_column(Text)
 
     # Manor login (employees; rare for contractors; typically none for vendors)
     user_id: Mapped[Optional[str]] = mapped_column(

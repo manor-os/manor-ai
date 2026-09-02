@@ -83,6 +83,30 @@ export function htmlPreviewAssetKind(ref, result) {
   return null;
 }
 
+function safeHtmlPreviewMimeType(value) {
+  const mime = String(value || "").trim().toLowerCase();
+  return /^[a-z0-9][a-z0-9!#$&^_.+-]*\/[a-z0-9][a-z0-9!#$&^_.+-]*$/.test(mime)
+    ? mime
+    : "application/octet-stream";
+}
+
+function utf8Base64(value) {
+  const bytes = new TextEncoder().encode(String(value));
+  let binary = "";
+  for (let index = 0; index < bytes.length; index += 0x8000) {
+    binary += String.fromCharCode(...bytes.subarray(index, index + 0x8000));
+  }
+  return globalThis.btoa(binary);
+}
+
+export function htmlPreviewAssetDataUrl(result) {
+  const mimeType = safeHtmlPreviewMimeType(result.mime_type);
+  const payload = result.encoding === "base64"
+    ? String(result.content).replace(/\s/g, "")
+    : utf8Base64(result.content);
+  return `data:${mimeType};base64,${payload}`;
+}
+
 function escapeHtmlPreviewAttribute(value) {
   return String(value)
     .replace(/&/g, "&amp;")

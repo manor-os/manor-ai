@@ -1,5 +1,7 @@
 """Execution defaults shared by agent and scheduler runtimes."""
 
+from enum import Enum
+
 DEFAULT_AGENT_MAX_TURNS = 50
 
 
@@ -10,9 +12,6 @@ DEFAULT_AGENT_MAX_TURNS = 50
 # real code, and nothing below is invented. These exist so code BRANCHES on
 # enum members instead of matching keyword strings; a new status is a new
 # member here, not a new literal scattered through the executor.
-
-from enum import Enum
-
 
 class ExecutionStepStatus(str, Enum):
     """Every state an ExecutionStep row takes."""
@@ -67,6 +66,138 @@ class WorkLeaseStatus(str, Enum):
     @classmethod
     def values(cls) -> list[str]:
         return [member.value for member in cls]
+
+
+class ScheduledDispatchKind(str, Enum):
+    """Celery entrypoints supported by the durable scheduler handoff."""
+
+    SCHEDULER_PARENT = "scheduler_parent"
+    AGENT_TASK = "agent_task"
+    WORKFLOW = "workflow"
+    GOAL_MEASUREMENT = "goal_measurement"
+    WORKSPACE_STAT_COLLECTION = "workspace_stat_collection"
+    STRATEGIST_REVIEW = "strategist_review"
+    MORNING_BRIEFING = "morning_briefing"
+    OUTCOME_EVALUATION = "outcome_evaluation"
+    CHAT_INSIGHT_EXTRACTION = "chat_insight_extraction"
+
+
+class ScheduledDispatchState(str, Enum):
+    """Persistence state of a scheduler-to-Celery handoff."""
+
+    PREPARED = "prepared"
+    PUBLISHED = "published"
+    QUARANTINED = "quarantined"
+
+
+class ScheduledDispatchRecoveryAction(str, Enum):
+    """Safe action for recovering one persisted scheduler handoff."""
+
+    REPUBLISH_AND_PROJECT = "republish_and_project"
+    REPUBLISH_EXECUTION = "republish_execution"
+    PROJECT_ONLY = "project_only"
+    QUARANTINE_AMBIGUOUS = "quarantine_ambiguous_execution"
+
+
+class ScheduledRecoveryKind(str, Enum):
+    """Independent durable recovery phases on one ScheduledJobRun."""
+
+    RESULT_PROJECTION = "result_projection"
+    SETTLEMENT = "settlement"
+    DISPATCH = "dispatch"
+    EXECUTION = "execution"
+
+
+class ScheduledRunStatus(str, Enum):
+    """Every durable status written to a ScheduledJobRun."""
+
+    RUNNING = "running"
+    SUCCESS = "success"
+    COMPLETED = "completed"
+    SKIPPED = "skipped"
+    CANCELLED = "cancelled"
+    ERROR = "error"
+
+
+class ScheduledChildExecutionState(str, Enum):
+    """Business-execution phase stored beside the dispatch handoff."""
+
+    ADMITTED = "admitted"
+    SETTLEMENT_PENDING = "settlement_pending"
+    SETTLED = "settled"
+
+
+class ScheduledResultProjectionKind(str, Enum):
+    """User-visible projections produced from terminal scheduled results."""
+
+    WORKSPACE_CHAT = "workspace_chat"
+
+
+class ScheduledResultProjectionState(str, Enum):
+    """Durable delivery state for a scheduled result projection."""
+
+    PENDING = "pending"
+    DELIVERED = "delivered"
+    QUARANTINED = "quarantined"
+
+
+class ScheduledJobSkillGenerationStatus(str, Enum):
+    """Operator-visible state of a ScheduledJob Skill generation intent."""
+
+    IDLE = "idle"
+    PENDING = "pending"
+    PAUSED = "paused"
+    FAILED = "failed"
+
+
+SCHEDULED_RECOVERY_RETRY_SECONDS = 60
+SCHEDULED_RUN_EXECUTION_RECHECK_SECONDS = 665
+SCHEDULED_EXECUTION_RECOVERY_HEADER = "manor_scheduled_execution_recovery"
+SCHEDULED_JOB_SKILL_GENERATION_RECHECK_SECONDS = 1865
+SCHEDULED_JOB_SKILL_GENERATION_MAX_ATTEMPTS = 3
+SCHEDULED_SETTLEMENT_MAX_RETRIES = 12
+SCHEDULED_DISPATCH_RECOVERY_MAX_RETRIES = 10
+SCHEDULED_SETTLEMENT_RECOVERY_DELAY_SECONDS = (
+    SCHEDULED_SETTLEMENT_MAX_RETRIES + 2
+) * SCHEDULED_RECOVERY_RETRY_SECONDS
+SCHEDULED_DISPATCH_RECOVERY_DELAY_SECONDS = (
+    SCHEDULED_DISPATCH_RECOVERY_MAX_RETRIES + 2
+) * SCHEDULED_RECOVERY_RETRY_SECONDS
+SCHEDULED_RESULT_PROJECTION_MAX_RETRIES = 12
+SCHEDULED_RESULT_PROJECTION_MAX_RECOVERY_CHAINS = 3
+SCHEDULED_RESULT_PROJECTION_RETRY_SECONDS = SCHEDULED_RECOVERY_RETRY_SECONDS
+# Keep the periodic recovery sweep behind one complete Celery retry chain.
+SCHEDULED_RESULT_PROJECTION_RECOVERY_DELAY_SECONDS = (
+    SCHEDULED_RESULT_PROJECTION_MAX_RETRIES + 2
+) * SCHEDULED_RESULT_PROJECTION_RETRY_SECONDS
+WORKFLOW_CONTINUATION_RETRY_SECONDS = 60
+WORKFLOW_TERMINAL_EFFECT_RETRY_SECONDS = 60
+
+
+class ScheduledChildAdmissionStatus(str, Enum):
+    """Result of atomically admitting one queued scheduled child."""
+
+    ADMITTED = "admitted"
+    CLOSED = "closed"
+    CANCELLED = "cancelled"
+    SETTLEMENT_PENDING = "settlement_pending"
+
+
+class ScheduledSettlementKind(str, Enum):
+    """Recovery entrypoint required to settle completed scheduled work."""
+
+    GENERIC = "generic"
+    AGENT_TASK = "agent_task"
+
+
+class ExecutionClaimKind(str, Enum):
+    """Shared namespaces for durable runtime execution fences."""
+
+    WORKFLOW_RUN = "workflow-run"
+    AGENT_TASK = "agent-task"
+    TASK_PLAN = "task-plan"
+    SCHEDULED_RUN = "scheduled-run"
+    SCHEDULED_JOB_SKILL = "scheduled-job-skill"
 
 
 class WorkerStatus(str, Enum):

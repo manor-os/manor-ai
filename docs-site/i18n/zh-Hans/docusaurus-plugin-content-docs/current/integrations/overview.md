@@ -21,8 +21,9 @@ Manor AI 通过提供商凭据、webhook、OAuth 以及可选的 Nango，
 
 ## 公开 URL {#public-urls}
 
-提供商需要一个稳定的 HTTPS 回调 URL。请将 `PUBLIC_BASE_URL` 设置为
-你的部署对外可访问的 URL。
+第一方 OAuth 提供商需要基于 `APP_URL` 的稳定回调 URL：
+`{APP_URL}/api/v1/integrations/oauth/{server_key}/callback`。入站 webhook
+提供商则需要把 `PUBLIC_BASE_URL` 设置为外部可以访问的 API URL。
 
 ## 本地测试 {#local-testing}
 

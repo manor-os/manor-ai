@@ -47,14 +47,19 @@ def _enqueue_after_commit(db: AsyncSession, run_id: str) -> None:
     sync_session.info[_ENQUEUE_LISTENER_KEY] = True
 
 
-def workflow_wait_approval_scope(config: dict[str, Any]) -> tuple[str | None, str | None]:
+def workflow_wait_approval_scope(
+    config: dict[str, Any],
+) -> tuple[str | None, str | None, str | None]:
     action_key = str(
         config.get("approval_action_key") or config.get("action_key") or ""
+    ).strip() or None
+    resource_id = str(
+        config.get("approval_resource_id") or config.get("resource_id") or ""
     ).strip() or None
     capability_id = str(
         config.get("approval_capability_id") or config.get("capability_id") or ""
     ).strip() or None
-    return action_key, capability_id
+    return action_key, resource_id, capability_id
 
 
 async def workflow_wait_has_standing_approval(
@@ -66,7 +71,7 @@ async def workflow_wait_has_standing_approval(
     """Honor the same durable Always store used by runtime tool approvals."""
     if not config.get("allow_always"):
         return False
-    action_key, capability_id = workflow_wait_approval_scope(config)
+    action_key, resource_id, capability_id = workflow_wait_approval_scope(config)
     if not action_key and not capability_id:
         return False
     if run.workspace_id:
@@ -76,6 +81,7 @@ async def workflow_wait_has_standing_approval(
             db,
             workspace_id=run.workspace_id,
             action_key=action_key,
+            resource_id=resource_id,
             capability_id=capability_id,
         )
     from packages.core.ai.runtime.approval_preferences import (
@@ -86,6 +92,7 @@ async def workflow_wait_has_standing_approval(
         db,
         user_id=run.started_by,
         action_key=action_key,
+        resource_id=resource_id,
         capability_id=capability_id,
     ) == "always_approve"
 
@@ -96,12 +103,31 @@ async def grant_workflow_wait_standing_approval(
     run: WorkflowRun,
     user_id: str,
     config: dict[str, Any],
+    authority_prechecked: bool = False,
 ) -> None:
     if not config.get("allow_always"):
         raise ValueError("Always approve is not enabled for this Workflow approval")
-    action_key, capability_id = workflow_wait_approval_scope(config)
+    action_key, resource_id, capability_id = workflow_wait_approval_scope(config)
     if not action_key and not capability_id:
         raise ValueError("Always approve requires a stable action or capability scope")
+    if not authority_prechecked:
+        from packages.core.governance.approvals import ApprovalAuthorityError
+        from packages.core.services.runtime_authorization import (
+            authorize_hitl_action,
+        )
+
+        authority = await authorize_hitl_action(
+            db,
+            entity_id=run.entity_id,
+            workspace_id=run.workspace_id,
+            by_user_id=user_id,
+            action_key=action_key,
+            capability_id=capability_id,
+            standing=True,
+            requested_by=run.started_by,
+        )
+        if not authority.allowed:
+            raise ApprovalAuthorityError(authority)
     if run.workspace_id:
         from packages.core.governance.service import (
             add_auto_approve_action,
@@ -114,6 +140,7 @@ async def grant_workflow_wait_standing_approval(
                 entity_id=run.entity_id,
                 workspace_id=run.workspace_id,
                 action_key=action_key,
+                resource_id=resource_id,
                 changed_by=user_id,
             )
         elif capability_id:
@@ -135,6 +162,7 @@ async def grant_workflow_wait_standing_approval(
         user_id=user_id,
         mode="always_approve",
         action_key=action_key,
+        resource_id=resource_id,
         capability_id=capability_id,
     )
 
@@ -233,20 +261,39 @@ async def resolve_chat_workflow_wait(
     from packages.core.services.workflow_run_trace import (
         DEFINITION_CHANGED_ERROR,
         workflow_definition_changed,
+        workflow_execution_view,
     )
 
     if workflow_definition_changed(workflow, run):
         return DEFINITION_CHANGED_ERROR
+    execution_workflow = workflow_execution_view(workflow, run)
     step = next(
         (
             candidate
-            for candidate in (workflow.steps or [])
+            for candidate in (execution_workflow.steps or [])
             if isinstance(candidate, dict)
             and str(candidate.get("id") or "") == step_id
         ),
         None,
     )
     config = step.get("config") if isinstance(step, dict) and isinstance(step.get("config"), dict) else {}
+
+    from packages.core.services.runtime_authorization import authorize_hitl_action
+
+    action_key, resource_id, capability_id = workflow_wait_approval_scope(config)
+    authority = await authorize_hitl_action(
+        db,
+        entity_id=entity_id,
+        workspace_id=run.workspace_id,
+        by_user_id=user_id,
+        action_key=action_key,
+        capability_id=capability_id,
+        standing=normalized_choice == "always_approve",
+        requested_by=run.started_by,
+        origin_conversation_id=conversation_id,
+    )
+    if not authority.allowed:
+        return authority.reason or "You do not have permission to resolve this Workflow approval."
 
     review_edited = False
     review_variable = _review_variable(config)
@@ -319,6 +366,7 @@ async def resolve_chat_workflow_wait(
             run=run,
             user_id=user_id,
             config=config,
+            authority_prechecked=True,
         )
 
     response_variable = str(pending.get("response_variable") or f"{step_id}_response")

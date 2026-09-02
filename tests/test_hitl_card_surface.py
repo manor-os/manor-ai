@@ -23,6 +23,7 @@ from packages.core.models.execution import ExecutionPlan, ExecutionStep
 from packages.core.models.task import Message
 from packages.core.models.worker import SubscriptionWorker, Worker
 from packages.core.models.workspace import Agent, AgentSubscription, Workspace
+from packages.core.models.user import User, UserMembership
 
 
 
@@ -100,6 +101,31 @@ async def test_publish_card_offers_always_too(db_session):
 
 
 @pytest.mark.asyncio
+async def test_review_card_offers_feedback_without_a_standing_grant(db_session):
+    entity_id, workspace_id = await _workspace(db_session)
+
+    await post_hitl_card(
+        entity_id=entity_id, workspace_id=workspace_id,
+        plan_id=generate_ulid(), step_id=generate_ulid(),
+        step_key="review_draft", kind="human",
+        action_key="content.review", matched_rule="step.requires_review",
+        reason="Review the generated file.",
+        approval_request_id=generate_ulid(),
+        hitl_type=HitlType.REVIEW.value,
+        payload={"diff": {"file": "draft.md"}, "why": "Final review"},
+        task_id=generate_ulid(), db=db_session,
+    )
+    card = await _card(db_session, entity_id)
+    assert card is not None
+    assert card.pending_action["options"] == [
+        "approve", "request_changes", "reject",
+    ]
+    assert "always_approve" not in card.pending_action["options"]
+    assert card.pending_action["review"] == {"file": "draft.md"}
+    assert card.pending_action["review_title"] == "Review review_draft"
+
+
+@pytest.mark.asyncio
 async def test_error_card_carries_the_real_failure_and_offers_no_approve(db_session):
     """error 卡片:说清楚坏在哪、怎么修,并且不提供"批准"。
 
@@ -162,6 +188,7 @@ async def _gated_scenario(db):
     task_id = generate_ulid()
     agent_id = generate_ulid()
     subscription_id = generate_ulid()
+    approval_actor_id = entity_id
     worker = Worker(
         id=generate_ulid(), entity_id=entity_id, kind="internal",
         display_name="Internal worker",
@@ -169,6 +196,20 @@ async def _gated_scenario(db):
         monthly_spent_usd=Decimal("0"), auto_pause_on_budget=True, status="active",
     )
     db.add_all([
+        User(
+            id=approval_actor_id,
+            entity_id=entity_id,
+            email=f"{approval_actor_id}@example.com",
+            password_hash="test-only",
+            role="owner",
+            status="active",
+        ),
+        UserMembership(
+            user_id=approval_actor_id,
+            entity_id=entity_id,
+            role="owner",
+            status="active",
+        ),
         Workspace(id=workspace_id, entity_id=entity_id,
                   name="Gated workspace", status="active"),
         worker,
@@ -201,6 +242,7 @@ async def _gated_scenario(db):
     return {
         "entity_id": entity_id, "step_id": step_id,
         "task_id": task_id, "worker": worker,
+        "approval_actor_id": approval_actor_id,
     }
 
 

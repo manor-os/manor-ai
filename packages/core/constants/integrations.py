@@ -1,0 +1,9 @@
+"""Shared integration persistence keys."""
+
+INTEGRATION_ACCOUNT_DEFAULTS_PREFERENCE_KEY = "integration_account_defaults"
+INTEGRATION_ACCOUNT_SELECTION_ARGUMENT = "integration_account_selection"
+INTEGRATION_ACCOUNT_CONTINUATION_ARGUMENT = "integration_account_continuation"
+INTEGRATION_ACCOUNT_CONTINUATION_MAX_CHARS = 32_768
+RUNTIME_MCP_ACCOUNT_REGISTRY_SNAPSHOT_ARGUMENT = "_runtime_mcp_account_registry_snapshot"
+RUNTIME_MCP_INTEGRATION_REGISTRY_ARGUMENT = "_runtime_mcp_integration_registry"
+RUNTIME_MCP_ALL_ACCOUNTS_CURSOR_ARGUMENT = "_runtime_mcp_all_accounts_cursor_account_id"

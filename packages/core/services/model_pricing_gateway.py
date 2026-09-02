@@ -27,6 +27,7 @@ def estimate_token_cost_usd(
     cache_write_multiplier: float = 1.25,
     audio_input_tokens: int = 0,
     audio_output_tokens: int = 0,
+    cached_audio_input_tokens: int = 0,
 ) -> float:
     return model_pricing.estimate_token_cost_usd(
         input_tokens,
@@ -40,6 +41,7 @@ def estimate_token_cost_usd(
         cache_write_multiplier=cache_write_multiplier,
         audio_input_tokens=audio_input_tokens,
         audio_output_tokens=audio_output_tokens,
+        cached_audio_input_tokens=cached_audio_input_tokens,
     )
 
 
@@ -71,6 +73,7 @@ def tokens_to_credits(
     cache_write_multiplier: float = 1.25,
     audio_input_tokens: int = 0,
     audio_output_tokens: int = 0,
+    cached_audio_input_tokens: int = 0,
 ) -> int:
     if not is_cloud():
         return 0

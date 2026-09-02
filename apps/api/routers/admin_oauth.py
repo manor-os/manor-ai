@@ -26,8 +26,11 @@ from apps.api.deps import get_current_user
 from packages.core.database import get_db
 from packages.core.models.mcp import MCPServer
 from packages.core.models.user import User
+from packages.core.permissions import user_is_effective_entity_admin
 from packages.core.services.oauth_provider_config import (
     _PROVIDER_OAUTH_META,
+    is_google_provider,
+    oauth_client_secret_required,
     resolve_oauth_config,
     save_oauth_config,
 )
@@ -36,8 +39,8 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/v1/admin/oauth-clients", tags=["admin-oauth"])
 
 
-def _require_admin(user: User) -> None:
-    if (user.role or "").lower() not in ("admin", "owner"):
+async def _require_admin(db: AsyncSession, user: User) -> None:
+    if not await user_is_effective_entity_admin(db, user):
         raise HTTPException(403, "Admin role required")
 
 
@@ -46,9 +49,10 @@ class OAuthClientStatus(BaseModel):
     name: str
     client_id: Optional[str]
     has_secret: bool
+    client_secret_required: bool = True
     source: str               # "env" | "ui" | "none"
     scopes: Optional[str]
-    configured: bool          # both client_id AND secret resolved
+    configured: bool          # client_id and any required secret resolved
     client_id_env_var: str    # for the admin's reference
     client_secret_env_var: str
     redirect_uri: str         # exact callback to whitelist in the provider console
@@ -56,7 +60,7 @@ class OAuthClientStatus(BaseModel):
 
 class UpdateOAuthClientRequest(BaseModel):
     client_id: str
-    client_secret: str
+    client_secret: str = ""
     scopes: Optional[str] = None
 
 
@@ -65,7 +69,7 @@ async def list_oauth_clients(
     db: AsyncSession = Depends(get_db),
     user: User = Depends(get_current_user),
 ) -> list[OAuthClientStatus]:
-    _require_admin(user)
+    await _require_admin(db, user)
 
     app_url = os.getenv("APP_URL", "http://localhost:3010").rstrip("/")
     out: list[OAuthClientStatus] = []
@@ -83,7 +87,8 @@ async def list_oauth_clients(
         if server:
             dc = server.default_config if isinstance(server.default_config, dict) else {}
             source = dc.get("_oauth_source") or ("db" if dc.get("oauth_client_id") else "none")
-            scopes = dc.get("oauth_scopes") or scopes
+            if not is_google_provider(server_key):
+                scopes = dc.get("oauth_scopes") or scopes
             has_secret = bool(server.credential_ref) or bool(dc.get("oauth_client_secret"))
 
         # If neither DB nor env had secret_present, ``configured`` is
@@ -94,6 +99,7 @@ async def list_oauth_clients(
             name=(server.name if server else server_key),
             client_id=client_id,
             has_secret=has_secret,
+            client_secret_required=oauth_client_secret_required(server_key),
             source=source,
             scopes=scopes,
             configured=configured,
@@ -112,11 +118,13 @@ async def update_oauth_client(
     db: AsyncSession = Depends(get_db),
     user: User = Depends(get_current_user),
 ) -> dict:
-    _require_admin(user)
+    await _require_admin(db, user)
     if server_key not in _PROVIDER_OAUTH_META:
         raise HTTPException(404, f"Unknown OAuth provider: {server_key}")
-    if not body.client_id.strip() or not body.client_secret.strip():
-        raise HTTPException(400, "client_id and client_secret are required")
+    if not body.client_id.strip() or (
+        oauth_client_secret_required(server_key) and not body.client_secret.strip()
+    ):
+        raise HTTPException(400, "Required OAuth client credentials are missing")
 
     saved = await save_oauth_config(
         db, server_key,
@@ -151,7 +159,7 @@ async def check_oauth_client_health(
     actually complete the OAuth flow — just verify the entry point is
     valid for our credentials.
     """
-    _require_admin(user)
+    await _require_admin(db, user)
     if server_key not in _PROVIDER_OAUTH_META:
         raise HTTPException(404, f"Unknown OAuth provider: {server_key}")
 
@@ -163,28 +171,48 @@ async def check_oauth_client_health(
         )
 
     import httpx
+    params = {
+        "client_id": cfg.client_id,
+        "redirect_uri": "https://example.com/cb",
+        "response_type": "code",
+        "scope": cfg.scopes.split()[0] if cfg.scopes else "",
+        "state": "healthcheck",
+    }
+    if server_key == "robinhood":
+        import base64
+        import hashlib
+        import secrets
+        from packages.core.services.oauth_provider_config import apply_authorize_param_conventions
+
+        params["redirect_uri"] = os.getenv("APP_URL", "http://localhost:3010").rstrip("/") + cfg.redirect_path
+        params["state"] = secrets.token_urlsafe(24)
+        params["code_challenge"] = base64.urlsafe_b64encode(
+            hashlib.sha256(secrets.token_urlsafe(64).encode()).digest()
+        ).rstrip(b"=").decode()
+        params["code_challenge_method"] = "S256"
+        params = apply_authorize_param_conventions(cfg, params)
     try:
         async with httpx.AsyncClient(timeout=8.0, follow_redirects=False) as cx:
             resp = await cx.get(
                 cfg.authorize_url,
-                params={
-                    "client_id": cfg.client_id,
-                    "redirect_uri": "https://example.com/cb",
-                    "response_type": "code",
-                    "scope": cfg.scopes.split()[0] if cfg.scopes else "",
-                    "state": "healthcheck",
-                },
+                params=params,
             )
         # 200 = login screen rendered; 302 = redirect to login
         # (typical); 400 might come back if redirect_uri doesn't match
         # an allow-list — still proves the client_id is recognized.
         # 401/403 = bad client_id; 404 = provider misconfigured.
         ok = resp.status_code in (200, 302, 303, 307, 400)
+        if server_key == "robinhood":
+            ok = resp.status_code in (200, 302, 303, 307)
         return OAuthClientHealth(
             server_key=server_key,
             ok=ok,
             status_code=resp.status_code,
-            detail=("OK" if ok else f"Provider returned HTTP {resp.status_code}"),
+            detail=(
+                "OAuth entry reachable; client registration and user consent are not verified by this probe."
+                if ok and server_key == "robinhood"
+                else ("OK" if ok else f"Provider returned HTTP {resp.status_code}")
+            ),
         )
     except httpx.RequestError as exc:
         return OAuthClientHealth(
@@ -201,7 +229,7 @@ async def reset_oauth_client(
 ) -> dict:
     """Clear the UI override on this provider so env bootstrap
     re-seeds it on next restart."""
-    _require_admin(user)
+    await _require_admin(db, user)
     if server_key not in _PROVIDER_OAUTH_META:
         raise HTTPException(404, f"Unknown OAuth provider: {server_key}")
 

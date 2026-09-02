@@ -3,7 +3,10 @@ from types import SimpleNamespace
 
 import pytest
 
-from packages.core.dispatcher.output_coercion import coerce_step_output_for_schema
+from packages.core.dispatcher.output_coercion import (
+    _file_ref_from_dict,
+    coerce_step_output_for_schema,
+)
 from packages.core.dispatcher.validation import SchemaError, validate_step_output
 
 
@@ -30,6 +33,16 @@ def _draft_pack_schema() -> dict:
             "summary": {"type": "string"},
             "draft_count": {"type": "integer"},
         },
+    }
+
+
+def test_file_ref_accepts_only_canonical_document_id() -> None:
+    assert _file_ref_from_dict({"id": "job_1", "name": "render"}) is None
+    assert _file_ref_from_dict({"doc_id": "doc_alias", "name": "legacy"}) is None
+    assert _file_ref_from_dict({"document_id": "doc_exact", "name": "report.pdf"}) == {
+        "name": "report.pdf",
+        "path": "doc_exact",
+        "document_id": "doc_exact",
     }
 
 

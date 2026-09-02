@@ -56,8 +56,9 @@ def _font_candidates() -> list[tuple[Path, Path | None, int, int]]:
     candidates.extend(
         [
             (
-                Path("/tmp/fonts/OTF/SimplifiedChinese/SourceHanSansSC-Regular.otf"),
-                Path("/tmp/fonts/OTF/SimplifiedChinese/SourceHanSansSC-Bold.otf"),
+                # Read-only font mounts supplied by the sandbox image.
+                Path("/tmp/fonts/OTF/SimplifiedChinese/SourceHanSansSC-Regular.otf"),  # nosec B108
+                Path("/tmp/fonts/OTF/SimplifiedChinese/SourceHanSansSC-Bold.otf"),  # nosec B108
                 0,
                 0,
             ),

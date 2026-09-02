@@ -7,7 +7,7 @@ admin-side test flows or CLI utilities later.
 What lives here
 ───────────────
 * ``begin_authorization()`` — generates ``state`` + PKCE code verifier
-  + code challenge, stores them in the in-memory pending map, returns
+  + code challenge, stores them in the shared pending-state store, returns
   a fully-built authorize URL.
 * ``complete_authorization()`` — pops the pending state, validates it,
   exchanges the code for an access token (PKCE-aware), returns a
@@ -17,10 +17,9 @@ What lives here
 
 State store
 ───────────
-``_pending_oauth_states`` is a process-local dict (not Redis-backed).
-For single-API-server deployments this is fine; if/when we scale out,
-swap the dict for a Redis hash with TTL — the API surface here doesn't
-change.
+Pending state is stored in Redis with a short TTL and consumed atomically so
+callbacks can land on any API replica or worker. Single-process OSS
+development falls back to an in-memory store when Redis is unavailable.
 
 PKCE
 ────
@@ -33,8 +32,10 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import json
 import logging
 import secrets
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional
@@ -46,6 +47,16 @@ from fastapi.responses import HTMLResponse
 from packages.core.external_api_versions import META_GRAPH
 
 logger = logging.getLogger(__name__)
+
+_OAUTH_STATE_TTL_SECONDS = 10 * 60
+_OAUTH_STATE_KEY_PREFIX = "manor:oauth:state:"
+_CONSUME_OAUTH_STATE_SCRIPT = """
+local value = redis.call('GET', KEYS[1])
+if value then
+    redis.call('DEL', KEYS[1])
+end
+return value
+"""
 
 
 # ── Public types ───────────────────────────────────────────────────────────
@@ -82,18 +93,70 @@ class OAuthFlowError(Exception):
         super().__init__(message)
 
 
-# ── State store (process-local) ────────────────────────────────────────────
+# ── State store ────────────────────────────────────────────────────────────
 
 
-_pending_oauth_states: Dict[str, Dict[str, str]] = {}
+_pending_oauth_states: Dict[str, tuple[float, Dict[str, str]]] = {}
 
 
-def _store_pending(
+def _load_process_pending(
+    state: str,
+    *,
+    consume: bool,
+) -> Dict[str, str] | None:
+    now = time.monotonic()
+    expired = [
+        key
+        for key, (expires_at, _pending) in _pending_oauth_states.items()
+        if expires_at <= now
+    ]
+    for key in expired:
+        _pending_oauth_states.pop(key, None)
+    entry = (
+        _pending_oauth_states.pop(state, None)
+        if consume
+        else _pending_oauth_states.get(state)
+    )
+    return entry[1] if entry is not None else None
+
+
+def _shared_state_store_required() -> bool:
+    from packages.core.config import get_settings
+
+    settings = get_settings()
+    return (
+        str(settings.DEPLOYMENT_MODE).strip().lower() == "cloud"
+        or settings.API_WORKERS > 1
+    )
+
+
+def _decode_pending_state(value: object) -> Dict[str, str] | None:
+    try:
+        decoded = json.loads(value) if isinstance(value, (str, bytes)) else value
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(decoded, dict):
+        return None
+    return {
+        str(key): str(item)
+        for key, item in decoded.items()
+        if item is not None
+    }
+
+
+async def _redis_client():
+    from packages.core.cache import _get_redis
+
+    return await _get_redis()
+
+
+async def _store_pending(
     state: str,
     *,
     user_id: str,
     server_key: str,
     code_verifier: str,
+    entity_id: str | None = None,
     return_to: str | None = None,
     connection_id: str | None = None,
 ) -> None:
@@ -104,81 +167,153 @@ def _store_pending(
     }
     if return_to:
         pending["return_to"] = return_to
+    if entity_id:
+        pending["entity_id"] = entity_id
     if connection_id:
         pending["connection_id"] = connection_id
-    _pending_oauth_states[state] = pending
+    redis = await _redis_client()
+    if redis is None:
+        if _shared_state_store_required():
+            raise OAuthFlowError(503, "OAuth state store is temporarily unavailable")
+        _load_process_pending(state, consume=True)
+        _pending_oauth_states[state] = (
+            time.monotonic() + _OAUTH_STATE_TTL_SECONDS,
+            pending,
+        )
+        return
+    try:
+        stored = await redis.set(
+            f"{_OAUTH_STATE_KEY_PREFIX}{state}",
+            json.dumps(pending),
+            ex=_OAUTH_STATE_TTL_SECONDS,
+            nx=True,
+        )
+    except Exception as exc:
+        logger.exception("Failed to store OAuth state")
+        raise OAuthFlowError(
+            503,
+            "OAuth state store is temporarily unavailable",
+        ) from exc
+    if not stored:
+        raise OAuthFlowError(503, "Could not allocate a unique OAuth state")
 
 
-def _pop_pending(state: str, *, server_key: str) -> Dict[str, str]:
-    pending = _pending_oauth_states.pop(state, None)
+async def _load_pending(state: str, *, consume: bool) -> Dict[str, str] | None:
+    redis = await _redis_client()
+    if redis is None:
+        if _shared_state_store_required():
+            raise OAuthFlowError(503, "OAuth state store is temporarily unavailable")
+        return _load_process_pending(state, consume=consume)
+    key = f"{_OAUTH_STATE_KEY_PREFIX}{state}"
+    try:
+        value = (
+            await redis.eval(_CONSUME_OAUTH_STATE_SCRIPT, 1, key)
+            if consume
+            else await redis.get(key)
+        )
+    except Exception as exc:
+        logger.exception("Failed to read OAuth state")
+        raise OAuthFlowError(
+            503,
+            "OAuth state store is temporarily unavailable",
+        ) from exc
+    pending = _decode_pending_state(value)
+    if pending is not None:
+        return pending
+    # Redis may have become available after an OSS single-process flow began.
+    return _load_process_pending(state, consume=consume)
+
+
+async def _pop_pending(state: str, *, server_key: str) -> Dict[str, str]:
+    pending = await _load_pending(state, consume=True)
     if not pending or pending.get("server_key") != server_key:
         raise OAuthFlowError(400, "Invalid or expired OAuth state")
     return pending
 
 
-def validate_pending_state(state: str, *, server_key: str) -> None:
+async def get_pending_state(state: str, *, server_key: str) -> Dict[str, str]:
+    """Read pending callback context without consuming its one-time state."""
+    pending = await _load_pending(state, consume=False)
+    if not pending or pending.get("server_key") != server_key:
+        raise OAuthFlowError(400, "Invalid or expired OAuth state")
+    return pending
+
+
+async def validate_pending_state(state: str, *, server_key: str) -> None:
     """Validate state before any provider/config side effects.
 
     Callback handlers use this to fail closed on forged states even if
     the deployment has not configured that provider yet. The actual
     completion path still pops the state later to preserve one-time use.
     """
-    pending = _pending_oauth_states.get(state)
-    if not pending or pending.get("server_key") != server_key:
-        raise OAuthFlowError(400, "Invalid or expired OAuth state")
+    await get_pending_state(state, server_key=server_key)
 
 
-def get_pending_return_to(state: str, *, server_key: str) -> str | None:
+async def get_pending_return_to(state: str, *, server_key: str) -> str | None:
     """Return the caller-provided post-OAuth path after validating state."""
-    pending = _pending_oauth_states.get(state)
-    if not pending or pending.get("server_key") != server_key:
-        raise OAuthFlowError(400, "Invalid or expired OAuth state")
+    pending = await get_pending_state(state, server_key=server_key)
     return pending.get("return_to")
 
 
-def get_pending_connection_id(state: str, *, server_key: str) -> str | None:
+async def get_pending_connection_id(state: str, *, server_key: str) -> str | None:
     """Return the OAuthAccount row explicitly being reconnected, if any."""
-    pending = _pending_oauth_states.get(state)
-    if not pending or pending.get("server_key") != server_key:
-        raise OAuthFlowError(400, "Invalid or expired OAuth state")
+    pending = await get_pending_state(state, server_key=server_key)
     return pending.get("connection_id")
+
+
+async def get_pending_entity_id(state: str, *, server_key: str) -> str | None:
+    """Return the Entity that initiated this OAuth flow, if one was supplied."""
+    pending = await get_pending_state(state, server_key=server_key)
+    return pending.get("entity_id")
 
 
 # ── Authorization step ─────────────────────────────────────────────────────
 
 
-def begin_authorization(
+async def begin_authorization(
     *,
     config: Any,           # OAuthProviderConfig — typed loosely to avoid import cycle
     user_id: str,
     redirect_uri: str,
+    entity_id: str | None = None,
     return_to: str | None = None,
     connection_id: str | None = None,
 ) -> AuthorizationStart:
     """Build the provider's authorize URL for ``user_id``.
 
     Generates a fresh ``state`` and a PKCE pair, stashes the verifier
-    against ``state`` in the pending map, and returns the URL. The
+    against ``state`` in the pending-state store, and returns the URL. The
     caller (router) is unchanged in shape.
     """
     state = secrets.token_urlsafe(24)
 
-    # PKCE — Twitter/X v2 mandates this; everyone else ignores extra
-    # params if they don't support it. ~86 chars, well within RFC's
-    # 43–128 range.
-    code_verifier = secrets.token_urlsafe(64)
-    code_challenge = base64.urlsafe_b64encode(
-        hashlib.sha256(code_verifier.encode()).digest()
-    ).rstrip(b"=").decode()
+    from packages.core.services.oauth_provider_config import (
+        oauth_provider_uses_pkce,
+    )
 
-    _store_pending(state,
-                   user_id=user_id,
-                   server_key=config.server_key,
-                   code_verifier=code_verifier,
-                   return_to=return_to,
-                   connection_id=connection_id)
+    uses_pkce = oauth_provider_uses_pkce(config.server_key)
+    # Twitter/X v2 mandates PKCE. Confidential server-side flows must omit
+    # both halves of the pair.
+    code_verifier = secrets.token_urlsafe(64) if uses_pkce else ""
+    code_challenge = (
+        base64.urlsafe_b64encode(
+            hashlib.sha256(code_verifier.encode()).digest()
+        ).rstrip(b"=").decode()
+        if uses_pkce
+        else ""
+    )
 
-    params = {
+    await _store_pending(
+        state,
+        user_id=user_id,
+        server_key=config.server_key,
+        code_verifier=code_verifier,
+        entity_id=entity_id,
+        return_to=return_to,
+        connection_id=connection_id,
+    )
+
+    params: Dict[str, str] = {
         "client_id": config.client_id,
         "redirect_uri": redirect_uri,
         "response_type": "code",
@@ -186,9 +321,10 @@ def begin_authorization(
         "state": state,
         "access_type": "offline",     # Google: get refresh_token
         "prompt": "consent",          # force re-consent so refresh_token is returned
-        "code_challenge": code_challenge,
-        "code_challenge_method": "S256",
     }
+    if uses_pkce:
+        params["code_challenge"] = code_challenge
+        params["code_challenge_method"] = "S256"
     # Provider-specific param naming (e.g. TikTok wants client_key, not
     # client_id). No-op for standard providers.
     from packages.core.services.oauth_provider_config import (
@@ -222,7 +358,7 @@ async def complete_authorization(
     function intentionally does not touch the database so it can be
     reused from CLI tools / tests.
     """
-    pending = _pop_pending(state, server_key=server_key)
+    pending = await _pop_pending(state, server_key=server_key)
     user_id = pending["user_id"]
     code_verifier = pending.get("code_verifier", "")
 
@@ -233,10 +369,14 @@ async def complete_authorization(
         "client_id": config.client_id,
         "client_secret": config.client_secret,
     }
-    if code_verifier and server_key != "facebook":
+    from packages.core.services.oauth_provider_config import (
+        build_token_request_auth,
+        oauth_provider_uses_pkce,
+    )
+
+    if code_verifier and oauth_provider_uses_pkce(server_key):
         body["code_verifier"] = code_verifier
 
-    from packages.core.services.oauth_provider_config import build_token_request_auth
     headers, body = build_token_request_auth(config, body)
 
     try:
@@ -248,6 +388,12 @@ async def complete_authorization(
                 resp = await client.get(
                     config.token_url,
                     params=body,
+                    headers=headers,
+                )
+            elif server_key == "notion":
+                resp = await client.post(
+                    config.token_url,
+                    json=body,
                     headers=headers,
                 )
             else:
@@ -352,10 +498,6 @@ _PROFILE_ENDPOINTS: dict[str, tuple[str, dict[str, str] | None]] = {
     "ms_calendar": ("https://graph.microsoft.com/v1.0/me", None),
     "ms_teams": ("https://graph.microsoft.com/v1.0/me", None),
     "ms_excel": ("https://graph.microsoft.com/v1.0/me", None),
-    "paypal": (
-        "https://api-m.paypal.com/v1/identity/oauth2/userinfo",
-        {"schema": "paypalv1.1"},
-    ),
 }
 
 
@@ -421,10 +563,75 @@ def _identity_from_payload(payload: dict[str, Any]) -> tuple[str | None, dict[st
     )
 
 
+def _slack_installation_profile(payload: dict[str, Any]) -> dict[str, str]:
+    """Extract non-secret Slack installation fields needed for routing."""
+    team = payload.get("team") if isinstance(payload.get("team"), dict) else {}
+    enterprise = (
+        payload.get("enterprise")
+        if isinstance(payload.get("enterprise"), dict)
+        else {}
+    )
+    authed_user = (
+        payload.get("authed_user")
+        if isinstance(payload.get("authed_user"), dict)
+        else {}
+    )
+    values = {
+        "app_id": payload.get("app_id"),
+        "team_id": team.get("id") or payload.get("team_id"),
+        "team_name": team.get("name") or (
+            payload.get("team") if isinstance(payload.get("team"), str) else None
+        ),
+        "enterprise_id": enterprise.get("id") or payload.get("enterprise_id"),
+        "enterprise_name": enterprise.get("name") or (
+            payload.get("enterprise")
+            if isinstance(payload.get("enterprise"), str)
+            else None
+        ),
+        "bot_user_id": payload.get("bot_user_id"),
+        "authed_user_id": authed_user.get("id"),
+    }
+    return {
+        key: str(value).strip()
+        for key, value in values.items()
+        if value not in (None, "")
+    }
+
+
+def _slack_installation_identity(profile: dict[str, Any]) -> str | None:
+    """Return a stable Slack App installation key, never the installer user."""
+    app_id = str(profile.get("app_id") or "unknown-app").strip()
+    team_id = str(profile.get("team_id") or "").strip()
+    enterprise_id = str(profile.get("enterprise_id") or "").strip()
+    if team_id:
+        return f"slack:{app_id}:team:{team_id}"
+    if enterprise_id:
+        return f"slack:{app_id}:enterprise:{enterprise_id}"
+    return None
+
+
+def _discord_installation_profile(
+    payload: dict[str, Any],
+    *,
+    application_id: str,
+) -> dict[str, str]:
+    """Extract the stable, non-secret Discord Guild installation identity."""
+    guild = payload.get("guild") if isinstance(payload.get("guild"), dict) else {}
+    guild_id = str(guild.get("id") or "").strip()
+    if not guild_id or not application_id:
+        return {}
+    return {
+        "application_id": application_id,
+        "guild_id": guild_id,
+        "guild_name": str(guild.get("name") or guild_id).strip(),
+    }
+
+
 async def resolve_oauth_identity(
     server_key: str,
     tokens: TokenSet,
     *,
+    application_id: str | None = None,
     timeout: float = 10.0,
 ) -> tuple[str, dict[str, Any]]:
     """Resolve a stable external account id and safe display profile.
@@ -434,8 +641,28 @@ async def resolve_oauth_identity(
     a non-reversible token fingerprint keeps separate connections distinct;
     explicit reconnect state still targets the original row.
     """
-    provider_user_id, profile = _identity_from_payload(tokens.raw or {})
+    raw_payload = tokens.raw or {}
+    provider_user_id, profile = _identity_from_payload(raw_payload)
+    if server_key == "slack":
+        profile.update(_slack_installation_profile(raw_payload))
+        provider_user_id = _slack_installation_identity(profile)
+    elif server_key == "discord":
+        profile = _discord_installation_profile(
+            raw_payload,
+            application_id=str(application_id or "").strip(),
+        )
+        guild_id = profile.get("guild_id")
+        if not guild_id or not application_id:
+            raise OAuthFlowError(502, "Discord did not return a Guild installation")
+        provider_user_id = f"discord:{application_id}:guild:{guild_id}"
     endpoint = _PROFILE_ENDPOINTS.get(server_key)
+    if server_key == "paypal":
+        from packages.core.services.official_remote_mcp import OfficialRemoteMCPFactory
+
+        endpoint = (
+            OfficialRemoteMCPFactory.paypal_oauth().identity_url,
+            {"schema": "paypalv1.1"},
+        )
     if endpoint and (not provider_user_id or not profile):
         url, params = endpoint
         try:
@@ -448,12 +675,23 @@ async def resolve_oauth_identity(
             if response.status_code < 400:
                 fetched = response.json()
                 fetched_id, fetched_profile = _identity_from_payload(fetched)
-                provider_user_id = provider_user_id or fetched_id
+                if server_key != "slack":
+                    provider_user_id = provider_user_id or fetched_id
+                else:
+                    fetched_profile.update(_slack_installation_profile(fetched))
                 profile = {**fetched_profile, **profile}
         except Exception:
             logger.debug("Could not fetch OAuth identity for %s", server_key, exc_info=True)
 
-    provider_user_id = provider_user_id or tokens.provider_user_id
+    if server_key == "slack":
+        provider_user_id = _slack_installation_identity(profile)
+    elif server_key == "discord":
+        guild_id = profile.get("guild_id")
+        if not guild_id or not application_id:
+            raise OAuthFlowError(502, "Discord did not return a Guild installation")
+        provider_user_id = f"discord:{application_id}:guild:{guild_id}"
+    else:
+        provider_user_id = provider_user_id or tokens.provider_user_id
     if not provider_user_id:
         digest = hashlib.sha256(tokens.access_token.encode("utf-8")).hexdigest()[:24]
         provider_user_id = f"token:{digest}"
@@ -497,6 +735,7 @@ __all__ = [
     "OAuthFlowError",
     "begin_authorization",
     "complete_authorization",
+    "get_pending_entity_id",
     "get_pending_return_to",
     "get_pending_connection_id",
     "resolve_oauth_identity",

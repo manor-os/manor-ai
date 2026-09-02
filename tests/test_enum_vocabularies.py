@@ -222,6 +222,7 @@ def test_vocabulary_has_no_literal_call_sites(label, receivers, enum_cls, only) 
 def test_task_types_are_derived_from_the_enum() -> None:
     assert TASK_TYPES == TaskType.values()
     assert TaskType.APPROVAL.value == "approval"
+    assert TaskType.INTERACTIVE.value == "interactive"
 
 
 def test_task_logs_are_written_with_the_log_type_enum() -> None:

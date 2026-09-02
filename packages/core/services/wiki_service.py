@@ -40,7 +40,15 @@ def extract_wiki_links(content: str) -> list[tuple[str, Optional[str]]]:
             for m in WIKI_LINK_PATTERN.finditer(content)]
 
 
-def build_file_index(entity_id: str) -> dict[str, str]:
+def list_wiki_pages(entity_id: str) -> list[str]:
+    """Return every user-visible markdown path that can participate in link resolution."""
+    return [rel for rel, _ in (_iter_visible_markdown_files(entity_id) or [])]
+
+
+def build_file_index(
+    entity_id: str,
+    allowed_paths: set[str] | None = None,
+) -> dict[str, str]:
     """
     Build a lookup index: {lowercase_name → relative_path} for all .md files.
     Used for case-insensitive link resolution.
@@ -49,6 +57,12 @@ def build_file_index(entity_id: str) -> dict[str, str]:
     if not os.path.isdir(root):
         return {}
 
+    has_path_filter = allowed_paths is not None
+    normalized_allowed_paths = {
+        normalize_rel_path(path)
+        for path in (allowed_paths or set())
+        if normalize_rel_path(path)
+    }
     index: dict[str, str] = {}
     for dirpath, dirnames, filenames in os.walk(root):
         rel_dir = normalize_rel_path(os.path.relpath(dirpath, root))
@@ -63,6 +77,8 @@ def build_file_index(entity_id: str) -> dict[str, str]:
             rel = normalize_rel_path(os.path.relpath(full, root))
             if not is_user_visible_path(rel):
                 continue
+            if has_path_filter and rel not in normalized_allowed_paths:
+                continue
             name_no_ext = rel[:-3]
             index[name_no_ext.lower()] = rel
             basename = os.path.splitext(fname)[0]
@@ -72,12 +88,27 @@ def build_file_index(entity_id: str) -> dict[str, str]:
     return index
 
 
-def resolve_link(target: str, entity_id: str, file_index: dict[str, str] | None = None) -> Optional[str]:
+def resolve_link(
+    target: str,
+    entity_id: str,
+    file_index: dict[str, str] | None = None,
+    allowed_paths: set[str] | None = None,
+) -> Optional[str]:
     """
     Resolve a wiki link target to an actual file path.
     Returns relative path from entity root, or None.
     """
     root = os.path.join(get_settings().MANOR_FS_ROOT, entity_id)
+    normalized_allowed_paths = None
+    if allowed_paths is not None:
+        normalized_allowed_paths = {
+            normalize_rel_path(path)
+            for path in allowed_paths
+            if normalize_rel_path(path)
+        }
+
+    def _is_allowed(rel: str) -> bool:
+        return normalized_allowed_paths is None or rel in normalized_allowed_paths
 
     target_clean = target.strip()
     if not target_clean.endswith(".md"):
@@ -88,21 +119,24 @@ def resolve_link(target: str, entity_id: str, file_index: dict[str, str] | None 
     exact = os.path.join(root, target_clean_md)
     if os.path.isfile(exact):
         rel = normalize_rel_path(os.path.relpath(exact, root))
-        return rel if is_user_visible_path(rel) else None
+        if is_user_visible_path(rel) and _is_allowed(rel):
+            return rel
 
     exact_raw = os.path.join(root, target_clean)
     if os.path.isfile(exact_raw):
         rel = normalize_rel_path(os.path.relpath(exact_raw, root))
-        return rel if is_user_visible_path(rel) else None
+        if is_user_visible_path(rel) and _is_allowed(rel):
+            return rel
 
     if file_index is None:
-        file_index = build_file_index(entity_id)
+        file_index = build_file_index(entity_id, allowed_paths=allowed_paths)
 
     key = target_clean.lower()
     if key.endswith(".md"):
         key = key[:-3]
     if key in file_index:
-        return file_index[key]
+        resolved = file_index[key]
+        return resolved if _is_allowed(resolved) else None
 
     return None
 
@@ -225,7 +259,10 @@ def build_wiki_graph(entity_id: str, allowed_paths: set[str] | None = None) -> d
         for path in (allowed_paths or set())
         if normalize_rel_path(path)
     }
-    file_index = build_file_index(entity_id)
+    file_index = build_file_index(
+        entity_id,
+        allowed_paths=normalized_allowed_paths if has_path_filter else None,
+    )
     pages: dict[str, dict[str, object]] = {}
     missing_by_target: dict[str, dict[str, object]] = {}
     seen_physical_files: set[tuple[int, int]] = set()
@@ -260,7 +297,14 @@ def build_wiki_graph(entity_id: str, allowed_paths: set[str] | None = None) -> d
 
         for target, display in extract_wiki_links(content):
             link_count += 1
-            resolved_path = resolve_link(target, entity_id, file_index)
+            resolved_path = resolve_link(
+                target,
+                entity_id,
+                file_index,
+                allowed_paths=normalized_allowed_paths if has_path_filter else None,
+            )
+            if has_path_filter and resolved_path not in normalized_allowed_paths:
+                resolved_path = None
             link = {
                 "target": target,
                 "display": display,

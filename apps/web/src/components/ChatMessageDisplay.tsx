@@ -4,10 +4,18 @@ import type { ChatMessage } from "../lib/chatStream";
 import { t } from "../lib/i18n";
 import type { Document } from "../lib/types";
 import {
+  filterGeneratedFileRecordsAlreadyLinkedInMarkdown,
+  filterGeneratedFileRecordsAlreadyRepresented,
+  generatedFileDocumentId,
   generatedFileOpenReference,
   isOpenableFileReference,
+  markdownContentWithRenderedAssistantFinalText,
 } from "../lib/fileReferences";
 import InlineFileReferenceCard from "./InlineFileReferenceCard";
+import {
+  displayContentForAssistantMessage,
+  isRetryableAssistantMessage,
+} from "./chat/ChatMessageActions";
 import {
   getChatBoxModeConfig,
   type ChatBoxMode,
@@ -23,7 +31,7 @@ export type ChatMessageDisplayChip = {
 export type ChatMessageDisplayReference = {
   key: string;
   name: string;
-  id?: string;
+  document_id?: string;
   kind: "image" | "video" | "audio" | "file";
   fileType?: string;
   mimeType?: string;
@@ -38,6 +46,13 @@ export type ParsedUserMessageDisplay = {
   chips: ChatMessageDisplayChip[];
   references: ChatMessageDisplayReference[];
 };
+
+export type ChatMessageDisplayProjectionOptions = {
+  renderedContent?: unknown;
+  streaming?: boolean;
+};
+
+export const CHAT_MESSAGE_REFERENCE_CARD_LIMIT = 8;
 
 const CHAT_BOX_MODE_KEYS = new Set<ChatBoxMode>([
   "auto",
@@ -229,20 +244,17 @@ function pushReference(
   const kind = ref.kind || inferReferenceKind(name, ref.mimeType, ref.fileType);
   const openReference = generatedFileOpenReference({
     ...ref,
-    document_id: ref.id,
     open_url: ref.openUrl,
     fs_path: ref.fsPath,
   });
   const previewKey = ref.previewUrl
     ? `${name}:${ref.previewUrl.length}:${ref.previewUrl.slice(-32)}`
     : "";
-  const key = ref.id || openReference || ref.url || previewKey || name;
-  const normalized = key.toLowerCase();
-  if (references.some((item) => item.key.toLowerCase() === normalized)) return;
-  references.push({
+  const key = ref.document_id || openReference || ref.url || previewKey || name;
+  const candidate: ChatMessageDisplayReference = {
     key,
     name,
-    id: ref.id,
+    document_id: ref.document_id,
     kind,
     fileType: ref.fileType,
     mimeType: ref.mimeType,
@@ -250,7 +262,12 @@ function pushReference(
     previewUrl: ref.previewUrl,
     openUrl: ref.openUrl,
     fsPath: ref.fsPath,
-  });
+  };
+  if (
+    references.some((item) => item.key === key)
+    || filterGeneratedFileRecordsAlreadyRepresented([candidate], references).length === 0
+  ) return;
+  references.push(candidate);
 }
 
 function stripReferenceTokens(text: string, references: ChatMessageDisplayReference[]) {
@@ -271,6 +288,30 @@ function stripReferenceTokens(text: string, references: ChatMessageDisplayRefere
     .replace(/\n[ \t]+/g, "\n");
 }
 
+export function filterChatMessageReferencesAlreadyLinked(
+  content: unknown,
+  references: ChatMessageDisplayReference[],
+): ChatMessageDisplayReference[] {
+  return filterGeneratedFileRecordsAlreadyLinkedInMarkdown(content, references);
+}
+
+export function renderedChatMessageMarkdownForFileDedupe(
+  msg: ChatMessage,
+  content: unknown = msg.content,
+  streaming = false,
+): string {
+  const source = typeof content === "string" ? content : "";
+  if (msg.role !== "assistant") {
+    return markdownContentWithRenderedAssistantFinalText(source, undefined);
+  }
+  const retryableAssistant = isRetryableAssistantMessage(msg, source);
+  return markdownContentWithRenderedAssistantFinalText(
+    displayContentForAssistantMessage(msg, source),
+    retryableAssistant ? undefined : msg.assistant_blocks,
+    streaming,
+  );
+}
+
 export function chatMessageReferencesFromAttachments(
   attachments: unknown,
 ): ChatMessageDisplayReference[] {
@@ -281,16 +322,18 @@ export function chatMessageReferencesFromAttachments(
     const attachment = value as Record<string, unknown>;
     pushReference(references, {
       name: String(attachment.name || attachment.filename || attachment.title || ""),
-      id: attachment.id == null
-        ? String(attachment.document_id || attachment.documentId || attachment.doc_id || "") || undefined
-        : String(attachment.id),
+      document_id: attachment.document_id == null
+        ? undefined
+        : String(attachment.document_id),
       fileType: attachment.fileType == null
         ? String(attachment.file_type || attachment.type || "") || undefined
         : String(attachment.fileType),
       mimeType: attachment.mimeType == null
         ? String(attachment.mime_type || "") || undefined
         : String(attachment.mimeType),
-      url: String(attachment.url || attachment.public_url || "") || undefined,
+      // These are file addresses, not thumbnails. Keep their identity even
+      // when a Document ID or an independent preview image is also present.
+      url: String(attachment.url || attachment.public_url || attachment.file_url || attachment.document_url || "") || undefined,
       previewUrl: attachment.previewUrl == null
         ? String(attachment.preview_url || attachment.file_url || attachment.document_url || "") || undefined
         : String(attachment.previewUrl),
@@ -316,17 +359,13 @@ const referenceDocumentCache = new Map<
 >();
 const referenceDocumentInflight = new Map<string, Promise<Document | null>>();
 
-function referenceDocumentCacheKey(refItem: ChatMessageDisplayReference) {
-  if (refItem.id) return `id:${refItem.id}`;
-  const name = refItem.name.trim().toLowerCase();
-  const url = (refItem.url || "").trim();
-  return `lookup:${refItem.kind}:${name}:${url}`;
-}
-
 export async function resolveChatMessageReferenceDocument(
   refItem: ChatMessageDisplayReference,
 ): Promise<Document | null> {
-  const cacheKey = referenceDocumentCacheKey(refItem);
+  const documentId = generatedFileDocumentId(refItem);
+  if (!documentId) return null;
+
+  const cacheKey = `id:${documentId}`;
   const now = Date.now();
   const cached = referenceDocumentCache.get(cacheKey);
   if (cached && cached.expiresAt > now) return cached.document;
@@ -335,31 +374,7 @@ export async function resolveChatMessageReferenceDocument(
   const inflight = referenceDocumentInflight.get(cacheKey);
   if (inflight) return inflight;
 
-  const lookup = (async () => {
-    if (refItem.id) {
-      try {
-        return await api.documents.get(refItem.id);
-      } catch {
-        // Older history can carry stale/missing ids; fall through to name search.
-      }
-    }
-
-    const name = refItem.name.trim();
-    if (!name) return null;
-    try {
-      const docs = await api.documents.list({ search: name, limit: 10 });
-      const exactName = name.toLowerCase();
-      const items = docs.items || [];
-      const kindMatches = items.filter((doc) => documentReferenceKind(doc) === refItem.kind);
-      return (
-        kindMatches.find((doc) => doc.name.toLowerCase() === exactName) ||
-        items.find((doc) => doc.name.toLowerCase() === exactName) ||
-        null
-      );
-    } catch {
-      return null;
-    }
-  })();
+  const lookup = api.documents.get(documentId).catch(() => null);
 
   referenceDocumentInflight.set(cacheKey, lookup);
   try {
@@ -368,7 +383,7 @@ export async function resolveChatMessageReferenceDocument(
       document,
       expiresAt: Date.now() + REFERENCE_DOCUMENT_CACHE_TTL_MS,
     });
-    if (refItem.id && document) {
+    if (document) {
       referenceDocumentCache.set(`id:${document.id}`, {
         document,
         expiresAt: Date.now() + REFERENCE_DOCUMENT_CACHE_TTL_MS,
@@ -388,7 +403,10 @@ export async function resolveChatMessageReferenceDocument(
   }
 }
 
-export function parseUserMessageDisplay(msg: ChatMessage): ParsedUserMessageDisplay {
+export function parseUserMessageDisplay(
+  msg: ChatMessage,
+  options: ChatMessageDisplayProjectionOptions = {},
+): ParsedUserMessageDisplay {
   const content = typeof msg.content === "string" ? msg.content : "";
   const lines = content.split(/\r?\n/);
   const keptLines: string[] = [];
@@ -504,8 +522,21 @@ export function parseUserMessageDisplay(msg: ChatMessage): ParsedUserMessageDisp
   )
     .replace(/\n{3,}/g, "\n\n")
     .trim();
+  const renderedContent =
+    options.renderedContent === undefined
+      ? cleanContent
+      : options.renderedContent;
 
-  const visibleReferenceCount = references.length || referenceCount;
+  const visibleReferences = filterChatMessageReferencesAlreadyLinked(
+    renderedChatMessageMarkdownForFileDedupe(
+      msg,
+      renderedContent,
+      Boolean(options.streaming),
+    ),
+    references,
+  );
+
+  const visibleReferenceCount = visibleReferences.length || referenceCount;
   if (visibleReferenceCount > 0) {
     pushUnique(chips, {
       key: "references",
@@ -527,7 +558,7 @@ export function parseUserMessageDisplay(msg: ChatMessage): ParsedUserMessageDisp
   return {
     cleanContent,
     chips,
-    references,
+    references: visibleReferences,
   };
 }
 
@@ -565,9 +596,9 @@ function ChatMessageReferenceThumb({ refItem }: { refItem: ChatMessageDisplayRef
       if (refItem.kind === "image" && refItem.previewUrl) {
         return { url: refItem.previewUrl, revoke: () => {} };
       }
-      if (refItem.id) {
+      if (refItem.document_id) {
         try {
-          return await loadDocumentThumb({ id: refItem.id });
+          return await loadDocumentThumb({ id: refItem.document_id });
         } catch {
           // Try URL/name fallback below.
         }
@@ -606,7 +637,7 @@ function ChatMessageReferenceThumb({ refItem }: { refItem: ChatMessageDisplayRef
       cancelled = true;
       revokeThumb();
     };
-  }, [refItem.id, refItem.kind, refItem.url, refItem.previewUrl]);
+  }, [refItem.document_id, refItem.kind, refItem.url, refItem.previewUrl]);
 
   if (thumbUrl) {
     return (
@@ -646,10 +677,10 @@ export function ChatMessageReferenceStrip({
       }`}
       aria-label={t("component.chat_message.references")}
     >
-      {references.slice(0, 8).map((refItem) => {
+      {references.slice(0, CHAT_MESSAGE_REFERENCE_CARD_LIMIT).map((refItem) => {
         const directReference = generatedFileOpenReference({
           ...refItem,
-          document_id: refItem.id,
+          document_id: refItem.document_id,
           open_url: refItem.openUrl,
           fs_path: refItem.fsPath,
         }) || [refItem.url, refItem.previewUrl].find(isOpenableFileReference) || "";

@@ -208,7 +208,7 @@ def upgrade() -> None:
     sa.Column('user_id', sa.String(length=26), nullable=True),
     sa.Column('action', sa.String(length=100), nullable=False),
     sa.Column('resource_type', sa.String(length=50), nullable=True),
-    sa.Column('resource_id', sa.String(length=26), nullable=True),
+    sa.Column('resource_id', sa.String(length=255), nullable=True),
     sa.Column('details', postgresql.JSONB(astext_type=sa.Text()), server_default='{}', nullable=False),
     sa.Column('ip_address', sa.String(length=128), nullable=True),
     sa.Column('user_agent', sa.String(length=500), nullable=True),
@@ -229,6 +229,62 @@ def upgrade() -> None:
     sa.Column('created_at', sa.DateTime(timezone=True), server_default=sa.text('now()'), nullable=False),
     sa.PrimaryKeyConstraint('id')
     )
+    op.create_table('blueprint_checkout_attempts',
+    sa.Column('id', sa.String(length=26), nullable=False),
+    sa.Column('purchase_id', sa.String(length=26), nullable=False),
+    sa.Column('blueprint_id', sa.String(length=26), nullable=False),
+    sa.Column('buyer_entity_id', sa.String(length=26), nullable=False),
+    sa.Column('seller_entity_id', sa.String(length=26), nullable=True),
+    sa.Column('stripe_checkout_session_id', sa.String(length=255), nullable=True),
+    sa.Column('stripe_payment_intent_id', sa.String(length=255), nullable=True),
+    sa.Column('stripe_destination_account_id', sa.String(length=255), nullable=True),
+    sa.Column('stripe_checkout_success_url', sa.String(length=1000), nullable=True),
+    sa.Column('stripe_checkout_cancel_url', sa.String(length=1000), nullable=True),
+    sa.Column('amount_cents', sa.Integer(), nullable=False),
+    sa.Column('currency', sa.String(length=10), nullable=False),
+    sa.Column('platform_fee_cents', sa.Integer(), nullable=False),
+    sa.Column('seller_amount_cents', sa.Integer(), nullable=False),
+    sa.Column('payload_snapshot', postgresql.JSONB(astext_type=sa.Text()), nullable=False),
+    sa.Column('blueprint_content_version', sa.String(length=20), nullable=True),
+    sa.Column('blueprint_title', sa.String(length=200), nullable=False),
+    sa.Column('status', sa.String(length=20), server_default='pending', nullable=False),
+    sa.Column('completed_at', sa.DateTime(timezone=True), nullable=True),
+    sa.Column('expired_at', sa.DateTime(timezone=True), nullable=True),
+    sa.Column('created_at', sa.DateTime(timezone=True), server_default=sa.text('now()'), nullable=False),
+    sa.Column('updated_at', sa.DateTime(timezone=True), nullable=True),
+    sa.PrimaryKeyConstraint('id')
+    )
+    op.create_table('blueprint_checkout_refunds',
+    sa.Column('id', sa.String(length=26), nullable=False),
+    sa.Column('purchase_id', sa.String(length=26), nullable=True),
+    sa.Column('attempt_id', sa.String(length=26), nullable=True),
+    sa.Column('blueprint_id', sa.String(length=26), nullable=True),
+    sa.Column('buyer_entity_id', sa.String(length=26), nullable=True),
+    sa.Column('seller_entity_id', sa.String(length=26), nullable=True),
+    sa.Column('stripe_checkout_session_id', sa.String(length=255), nullable=False),
+    sa.Column('stripe_payment_intent_id', sa.String(length=255), nullable=False),
+    sa.Column('stripe_refund_id', sa.String(length=255), nullable=True),
+    sa.Column('stripe_refund_status', sa.String(length=40), nullable=True),
+    sa.Column('amount_cents', sa.Integer(), nullable=False),
+    sa.Column('currency', sa.String(length=10), nullable=False),
+    sa.Column('platform_fee_cents', sa.Integer(), nullable=True),
+    sa.Column('transfer_reversed_amount_cents', sa.Integer(), nullable=True),
+    sa.Column('platform_fee_refunded_amount_cents', sa.Integer(), nullable=True),
+    sa.Column('reason', sa.String(length=80), nullable=False),
+    sa.Column('status', sa.String(length=20), server_default='pending', nullable=False),
+    sa.Column('refund_attempt', sa.Integer(), server_default='0', nullable=False),
+    sa.Column('retry_count', sa.Integer(), server_default='0', nullable=False),
+    sa.Column('refund_evidence', postgresql.JSONB(astext_type=sa.Text()), server_default='[]', nullable=False),
+    sa.Column('next_attempt_at', sa.DateTime(timezone=True), nullable=True),
+    sa.Column('claim_token', sa.String(length=64), nullable=True),
+    sa.Column('claim_expires_at', sa.DateTime(timezone=True), nullable=True),
+    sa.Column('last_error', sa.Text(), nullable=True),
+    sa.Column('succeeded_event_id', sa.String(length=255), nullable=True),
+    sa.Column('completed_at', sa.DateTime(timezone=True), nullable=True),
+    sa.Column('created_at', sa.DateTime(timezone=True), server_default=sa.text('now()'), nullable=False),
+    sa.Column('updated_at', sa.DateTime(timezone=True), nullable=True),
+    sa.PrimaryKeyConstraint('id')
+    )
     op.create_table('blueprint_favorites',
     sa.Column('id', sa.String(length=26), nullable=False),
     sa.Column('blueprint_id', sa.String(length=160), nullable=False),
@@ -243,18 +299,42 @@ def upgrade() -> None:
     sa.Column('blueprint_id', sa.String(length=26), nullable=False),
     sa.Column('buyer_entity_id', sa.String(length=26), nullable=False),
     sa.Column('buyer_user_id', sa.String(length=26), nullable=False),
+    sa.Column('seller_entity_id', sa.String(length=26), nullable=True),
+    sa.Column('seller_recovery_attempted_at', sa.DateTime(timezone=True), nullable=True),
+    sa.Column('seller_recovery_next_attempt_at', sa.DateTime(timezone=True), nullable=True),
+    sa.Column('seller_recovery_claim_token', sa.String(length=64), nullable=True),
+    sa.Column('seller_recovery_claim_expires_at', sa.DateTime(timezone=True), nullable=True),
+    sa.Column('seller_recovery_retry_count', sa.Integer(), server_default='0', nullable=False),
+    sa.Column('seller_recovery_last_error', sa.Text(), nullable=True),
+    sa.Column('allocation_recovery_attempted_at', sa.DateTime(timezone=True), nullable=True),
+    sa.Column('allocation_recovery_next_attempt_at', sa.DateTime(timezone=True), nullable=True),
+    sa.Column('allocation_recovery_claim_token', sa.String(length=64), nullable=True),
+    sa.Column('allocation_recovery_claim_expires_at', sa.DateTime(timezone=True), nullable=True),
+    sa.Column('allocation_recovery_retry_count', sa.Integer(), server_default='0', nullable=False),
+    sa.Column('allocation_recovery_last_error', sa.Text(), nullable=True),
     sa.Column('order_id', sa.String(length=26), nullable=True),
     sa.Column('amount_cents', sa.Integer(), nullable=False),
     sa.Column('currency', sa.String(length=10), server_default='usd', nullable=False),
     sa.Column('platform_fee_cents', sa.Integer(), server_default='0', nullable=False),
     sa.Column('seller_amount_cents', sa.Integer(), nullable=False),
+    sa.Column('refunded_amount_cents', sa.Integer(), server_default='0', nullable=False),
+    sa.Column('transfer_reversed_amount_cents', sa.Integer(), nullable=True),
+    sa.Column('platform_fee_refunded_amount_cents', sa.Integer(), nullable=True),
     sa.Column('stripe_checkout_session_id', sa.String(length=255), nullable=True),
     sa.Column('stripe_payment_intent_id', sa.String(length=255), nullable=True),
+    sa.Column('stripe_destination_account_id', sa.String(length=255), nullable=True),
     sa.Column('payload_snapshot', postgresql.JSONB(astext_type=sa.Text()), nullable=False),
+    sa.Column('blueprint_content_version', sa.String(length=20), nullable=True),
     sa.Column('blueprint_title', sa.String(length=200), nullable=False),
     sa.Column('status', sa.String(length=20), server_default='pending', nullable=False),
     sa.Column('purchased_at', sa.DateTime(timezone=True), nullable=True),
     sa.Column('refunded_at', sa.DateTime(timezone=True), nullable=True),
+    sa.Column('stripe_dispute_id', sa.String(length=255), nullable=True),
+    sa.Column('stripe_dispute_status', sa.String(length=40), nullable=True),
+    sa.Column('disputed_amount_cents', sa.Integer(), server_default='0', nullable=False),
+    sa.Column('dispute_funds_reinstated', sa.Boolean(), server_default='false', nullable=False),
+    sa.Column('last_dispute_event_id', sa.String(length=255), nullable=True),
+    sa.Column('last_dispute_event_created_at', sa.DateTime(timezone=True), nullable=True),
     sa.Column('created_at', sa.DateTime(timezone=True), server_default=sa.text('now()'), nullable=False),
     sa.Column('updated_at', sa.DateTime(timezone=True), nullable=True),
     sa.PrimaryKeyConstraint('id')
@@ -299,6 +379,13 @@ def upgrade() -> None:
     sa.Column('id', sa.String(length=26), nullable=False),
     sa.Column('entity_id', sa.String(length=26), nullable=False),
     sa.Column('workspace_id', sa.String(length=26), nullable=True),
+    sa.Column('owner_user_id', sa.String(length=26), nullable=True),
+    sa.Column('credential_source_kind', sa.String(length=32), nullable=True),
+    sa.Column('credential_source_id', sa.String(length=26), nullable=True),
+    sa.Column('telegram_bot_id', sa.String(length=32), nullable=True),
+    sa.Column('discord_application_id', sa.String(length=32), nullable=True),
+    sa.Column('discord_guild_id', sa.String(length=32), nullable=True),
+    sa.Column('whatsapp_phone_number_id', sa.String(length=32), nullable=True),
     sa.Column('channel_type', sa.String(length=30), nullable=False),
     sa.Column('provider', sa.String(length=30), nullable=False),
     sa.Column('name', sa.String(length=255), nullable=True),
@@ -370,21 +457,6 @@ def upgrade() -> None:
     sa.Column('created_at', sa.DateTime(timezone=True), server_default=sa.text('now()'), nullable=False),
     sa.Column('updated_at', sa.DateTime(timezone=True), nullable=True),
     sa.PrimaryKeyConstraint('id')
-    )
-    op.create_table('chat_message_feedback',
-    sa.Column('id', sa.String(length=26), nullable=False),
-    sa.Column('entity_id', sa.String(length=26), nullable=False),
-    sa.Column('user_id', sa.String(length=26), nullable=False),
-    sa.Column('conversation_id', sa.String(length=26), nullable=False),
-    sa.Column('message_id', sa.String(length=26), nullable=False),
-    sa.Column('rating', sa.String(length=10), nullable=False),
-    sa.Column('content_preview', sa.Text(), nullable=True),
-    sa.Column('request_preview', sa.Text(), nullable=True),
-    sa.Column('metadata', postgresql.JSONB(astext_type=sa.Text()), server_default='{}', nullable=False),
-    sa.Column('created_at', sa.DateTime(timezone=True), server_default=sa.text('now()'), nullable=False),
-    sa.Column('updated_at', sa.DateTime(timezone=True), server_default=sa.text('now()'), nullable=False),
-    sa.PrimaryKeyConstraint('id'),
-    sa.UniqueConstraint('message_id', 'user_id', name='uq_chat_feedback_message_user')
     )
     op.create_table('client_error_events',
     sa.Column('id', sa.String(length=26), nullable=False),
@@ -620,6 +692,8 @@ def upgrade() -> None:
     sa.Column('metadata', postgresql.JSONB(astext_type=sa.Text()), server_default='{}', nullable=False),
     sa.Column('created_by', sa.String(length=100), nullable=True),
     sa.Column('folder_id', sa.String(length=26), nullable=True),
+    sa.Column('upload_idempotency_key', sa.String(length=128), nullable=True),
+    sa.Column('upload_request_fingerprint', sa.String(length=64), nullable=True),
     sa.Column('is_trashed', sa.Boolean(), server_default='false', nullable=False),
     sa.Column('trashed_at', sa.DateTime(timezone=True), nullable=True),
     sa.Column('trashed_by', sa.String(length=100), nullable=True),
@@ -675,9 +749,18 @@ def upgrade() -> None:
     op.create_table('event_logs',
     sa.Column('id', sa.String(length=26), nullable=False),
     sa.Column('entity_id', sa.String(length=26), nullable=True),
+    sa.Column('workspace_id', sa.String(length=26), nullable=True),
     sa.Column('event_type', sa.String(length=100), nullable=False),
     sa.Column('source', sa.String(length=100), nullable=True),
     sa.Column('payload', postgresql.JSONB(astext_type=sa.Text()), server_default='{}', nullable=False),
+    sa.Column('external_delivery_status', sa.String(length=20), nullable=True),
+    sa.Column('external_delivery_attempt_count', sa.Integer(), server_default='0', nullable=False),
+    sa.Column('external_delivery_available_at', sa.DateTime(timezone=True), nullable=True),
+    sa.Column('external_delivery_locked_until', sa.DateTime(timezone=True), nullable=True),
+    sa.Column('external_delivery_claim_token', sa.String(length=26), nullable=True),
+    sa.Column('external_delivery_delivered_at', sa.DateTime(timezone=True), nullable=True),
+    sa.Column('external_delivery_completed_sinks', postgresql.JSONB(astext_type=sa.Text()), server_default='{}', nullable=False),
+    sa.Column('external_delivery_last_error', sa.Text(), nullable=True),
     sa.Column('created_at', sa.DateTime(timezone=True), server_default=sa.text('now()'), nullable=False),
     sa.PrimaryKeyConstraint('id')
     )
@@ -821,6 +904,7 @@ def upgrade() -> None:
     sa.Column('stat_id', sa.String(length=26), nullable=True),
     sa.Column('title', sa.String(length=255), nullable=False),
     sa.Column('description', sa.Text(), nullable=True),
+    sa.Column('goal_key', sa.String(length=100), nullable=False),
     sa.Column('metric_key', sa.String(length=100), nullable=False),
     sa.Column('target_value', sa.Numeric(precision=20, scale=4), nullable=False),
     sa.Column('baseline_value', sa.Numeric(precision=20, scale=4), nullable=True),
@@ -954,6 +1038,7 @@ def upgrade() -> None:
     op.create_table('integrations',
     sa.Column('id', sa.String(length=26), nullable=False),
     sa.Column('entity_id', sa.String(length=26), nullable=False),
+    sa.Column('owner_user_id', sa.String(length=26), nullable=True),
     sa.Column('created_by_user_id', sa.String(length=26), nullable=True),
     sa.Column('provider', sa.String(length=50), nullable=False),
     sa.Column('status', sa.String(length=20), nullable=False),
@@ -988,6 +1073,27 @@ def upgrade() -> None:
     sa.Column('created_at', sa.DateTime(timezone=True), server_default=sa.text('now()'), nullable=False),
     sa.Column('updated_at', sa.DateTime(timezone=True), nullable=True),
     sa.PrimaryKeyConstraint('code')
+    )
+    op.create_table('marketplace_resource_links',
+    sa.Column('id', sa.String(length=26), nullable=False),
+    sa.Column('entity_id', sa.String(length=26), nullable=False),
+    sa.Column('marketplace_source', sa.String(length=40), server_default='platform', nullable=False),
+    sa.Column('marketplace_resource_type', sa.String(length=40), nullable=False),
+    sa.Column('marketplace_resource_id', sa.String(length=160), nullable=False),
+    sa.Column('relationship', sa.String(length=30), nullable=False),
+    sa.Column('scope_type', sa.String(length=30), nullable=False),
+    sa.Column('scope_id', sa.String(length=160), nullable=False),
+    sa.Column('local_resource_type', sa.String(length=40), nullable=False),
+    sa.Column('local_resource_id', sa.String(length=160), nullable=False),
+    sa.Column('component_key', sa.String(length=160), server_default='root', nullable=False),
+    sa.Column('marketplace_version', sa.String(length=40), nullable=True),
+    sa.Column('linked_by', sa.String(length=26), nullable=True),
+    sa.Column('link_metadata', postgresql.JSONB(astext_type=sa.Text()), server_default='{}', nullable=False),
+    sa.Column('created_at', sa.DateTime(timezone=True), server_default=sa.text('now()'), nullable=False),
+    sa.Column('updated_at', sa.DateTime(timezone=True), nullable=True),
+    sa.PrimaryKeyConstraint('id'),
+    sa.UniqueConstraint('entity_id', 'marketplace_source', 'marketplace_resource_type', 'marketplace_resource_id', 'relationship', 'scope_type', 'scope_id', 'local_resource_type', 'component_key', name='uq_marketplace_resource_links_source_scope'),
+    sa.UniqueConstraint('entity_id', 'relationship', 'scope_type', 'scope_id', 'local_resource_type', 'local_resource_id', name='uq_marketplace_resource_links_local_scope')
     )
     op.create_table('mcp_servers',
     sa.Column('id', sa.String(length=26), nullable=False),
@@ -1080,6 +1186,7 @@ def upgrade() -> None:
     sa.Column('attachments', postgresql.JSONB(astext_type=sa.Text()), nullable=True),
     sa.Column('token_usage', postgresql.JSONB(astext_type=sa.Text()), nullable=True),
     sa.Column('metadata', postgresql.JSONB(astext_type=sa.Text()), server_default='{}', nullable=False),
+    sa.Column('response_surface_event_id', sa.String(length=96), nullable=True),
     sa.Column('created_at', sa.DateTime(timezone=True), server_default=sa.text('now()'), nullable=False),
     sa.Column('author_kind', sa.String(length=16), server_default='user', nullable=False),
     sa.Column('author_subscription_id', sa.String(length=26), nullable=True),
@@ -1139,6 +1246,8 @@ def upgrade() -> None:
     sa.Column('id', sa.String(length=26), nullable=False),
     sa.Column('entity_id', sa.String(length=26), nullable=False),
     sa.Column('user_id', sa.String(length=26), nullable=False),
+    sa.Column('workspace_id', sa.String(length=26), nullable=True),
+    sa.Column('idempotency_key', sa.String(length=255), nullable=True),
     sa.Column('type', sa.String(length=50), nullable=False),
     sa.Column('title', sa.String(length=500), nullable=True),
     sa.Column('content', sa.String(), nullable=True),
@@ -1285,6 +1394,18 @@ def upgrade() -> None:
     sa.Column('updated_at', sa.DateTime(timezone=True), nullable=True),
     sa.PrimaryKeyConstraint('id')
     )
+    op.create_table('product_growth_events',
+    sa.Column('id', sa.String(length=26), nullable=False),
+    sa.Column('entity_id', sa.String(length=26), nullable=False),
+    sa.Column('workspace_id', sa.String(length=26), nullable=True),
+    sa.Column('user_id', sa.String(length=26), nullable=False),
+    sa.Column('milestone', sa.String(length=50), nullable=False),
+    sa.Column('source_kind', sa.String(length=50), nullable=False),
+    sa.Column('source_id', sa.String(length=100), nullable=False),
+    sa.Column('occurred_at', sa.DateTime(timezone=True), nullable=False),
+    sa.Column('created_at', sa.DateTime(timezone=True), server_default=sa.text('now()'), nullable=False),
+    sa.PrimaryKeyConstraint('id')
+    )
     op.create_table('proposal_items',
     sa.Column('id', sa.String(length=26), nullable=False),
     sa.Column('proposal_id', sa.String(length=26), nullable=False),
@@ -1379,6 +1500,9 @@ def upgrade() -> None:
     sa.Column('watermark_end', sa.String(length=26), nullable=True),
     sa.Column('workspace_revision', sa.Integer(), nullable=True),
     sa.Column('policy_revision', sa.Integer(), nullable=True),
+    sa.Column('delivery_id', sa.String(length=120), nullable=True),
+    sa.Column('lease_owner', sa.String(length=120), nullable=True),
+    sa.Column('lease_expires_at', sa.DateTime(timezone=True), nullable=True),
     sa.Column('briefing', postgresql.JSONB(astext_type=sa.Text()), nullable=True),
     sa.Column('error', sa.Text(), nullable=True),
     sa.Column('created_at', sa.DateTime(timezone=True), server_default=sa.text('now()'), nullable=False),
@@ -1428,6 +1552,111 @@ def upgrade() -> None:
     sa.Column('updated_at', sa.DateTime(timezone=True), nullable=True),
     sa.PrimaryKeyConstraint('id')
     )
+    op.create_table('runtime_execution_claims',
+    sa.Column('claim_key', sa.String(length=255), nullable=False),
+    sa.Column('claim_token', sa.String(length=26), nullable=False),
+    sa.Column('expires_at', sa.DateTime(timezone=True), nullable=False),
+    sa.Column('created_at', sa.DateTime(timezone=True), server_default=sa.text('now()'), nullable=False),
+    sa.Column('updated_at', sa.DateTime(timezone=True), nullable=True),
+    sa.PrimaryKeyConstraint('claim_key')
+    )
+    op.create_table('runtime_outbox_events',
+    sa.Column('id', sa.String(length=26), nullable=False),
+    sa.Column('event_type', sa.String(length=80), nullable=False),
+    sa.Column('aggregate_id', sa.String(length=255), nullable=False),
+    sa.Column('dedupe_key', sa.String(length=255), nullable=False),
+    sa.Column('payload', postgresql.JSONB(astext_type=sa.Text()), nullable=False),
+    sa.Column('attempt_count', sa.Integer(), nullable=False),
+    sa.Column('available_at', sa.DateTime(timezone=True), nullable=False),
+    sa.Column('delivered_at', sa.DateTime(timezone=True), nullable=True),
+    sa.Column('last_error', sa.Text(), nullable=True),
+    sa.Column('created_at', sa.DateTime(timezone=True), nullable=False),
+    sa.PrimaryKeyConstraint('id'),
+    sa.UniqueConstraint('dedupe_key', name='uq_runtime_outbox_dedupe_key')
+    )
+    op.create_table('runtime_runs',
+    sa.Column('id', sa.String(length=26), nullable=False),
+    sa.Column('root_run_id', sa.String(length=26), nullable=False),
+    sa.Column('parent_run_id', sa.String(length=26), nullable=True),
+    sa.Column('conversation_id', sa.String(length=26), nullable=False),
+    sa.Column('assistant_message_id', sa.String(length=26), nullable=True),
+    sa.Column('entity_id', sa.String(length=26), nullable=False),
+    sa.Column('user_id', sa.String(length=26), nullable=False),
+    sa.Column('agent_id', sa.String(length=26), nullable=True),
+    sa.Column('workspace_id', sa.String(length=26), nullable=True),
+    sa.Column('status', sa.String(length=32), nullable=False),
+    sa.Column('status_reason', sa.String(length=80), nullable=True),
+    sa.Column('checkpoint', postgresql.JSONB(astext_type=sa.Text()), nullable=True),
+    sa.Column('execution_payload', postgresql.JSONB(astext_type=sa.Text()), nullable=False),
+    sa.Column('result', postgresql.JSONB(astext_type=sa.Text()), nullable=True),
+    sa.Column('error', postgresql.JSONB(astext_type=sa.Text()), nullable=True),
+    sa.Column('reservation_id', sa.String(length=26), nullable=True),
+    sa.Column('version', sa.Integer(), nullable=False),
+    sa.Column('lease_owner', sa.String(length=120), nullable=True),
+    sa.Column('lease_expires_at', sa.DateTime(timezone=True), nullable=True),
+    sa.Column('active_sandbox_id', sa.String(length=255), nullable=True),
+    sa.Column('active_execution_id', sa.String(length=128), nullable=True),
+    sa.Column('cancel_requested_at', sa.DateTime(timezone=True), nullable=True),
+    sa.Column('started_at', sa.DateTime(timezone=True), nullable=True),
+    sa.Column('completed_at', sa.DateTime(timezone=True), nullable=True),
+    sa.Column('created_at', sa.DateTime(timezone=True), server_default=sa.text('now()'), nullable=False),
+    sa.Column('updated_at', sa.DateTime(timezone=True), nullable=True),
+    sa.PrimaryKeyConstraint('id')
+    )
+    op.create_table('sandbox_instances',
+    sa.Column('sandbox_id', sa.String(length=255), nullable=False),
+    sa.Column('reservation_id', sa.String(length=26), nullable=False),
+    sa.Column('runtime_run_id', sa.String(length=26), nullable=False),
+    sa.Column('root_run_id', sa.String(length=26), nullable=False),
+    sa.Column('runner_id', sa.String(length=80), nullable=False),
+    sa.Column('status', sa.String(length=24), nullable=False),
+    sa.Column('released_at', sa.DateTime(timezone=True), nullable=True),
+    sa.Column('created_at', sa.DateTime(timezone=True), server_default=sa.text('now()'), nullable=False),
+    sa.Column('updated_at', sa.DateTime(timezone=True), nullable=True),
+    sa.PrimaryKeyConstraint('sandbox_id'),
+    sa.UniqueConstraint('reservation_id')
+    )
+    op.create_table('sandbox_reservations',
+    sa.Column('id', sa.String(length=26), nullable=False),
+    sa.Column('runtime_run_id', sa.String(length=26), nullable=False),
+    sa.Column('root_run_id', sa.String(length=26), nullable=False),
+    sa.Column('tool_call_id', sa.String(length=255), nullable=False),
+    sa.Column('entity_id', sa.String(length=26), nullable=False),
+    sa.Column('user_id', sa.String(length=26), nullable=False),
+    sa.Column('status', sa.String(length=24), nullable=False),
+    sa.Column('priority', sa.Integer(), nullable=False),
+    sa.Column('enqueued_at', sa.DateTime(timezone=True), nullable=False),
+    sa.Column('deadline_at', sa.DateTime(timezone=True), nullable=False),
+    sa.Column('runner_id', sa.String(length=80), nullable=True),
+    sa.Column('sandbox_id', sa.String(length=255), nullable=True),
+    sa.Column('request_payload', postgresql.JSONB(astext_type=sa.Text()), nullable=False),
+    sa.Column('attempt_count', sa.Integer(), nullable=False),
+    sa.Column('next_attempt_at', sa.DateTime(timezone=True), nullable=True),
+    sa.Column('version', sa.Integer(), nullable=False),
+    sa.Column('allocated_at', sa.DateTime(timezone=True), nullable=True),
+    sa.Column('consumed_at', sa.DateTime(timezone=True), nullable=True),
+    sa.Column('completed_at', sa.DateTime(timezone=True), nullable=True),
+    sa.Column('last_error', sa.Text(), nullable=True),
+    sa.Column('created_at', sa.DateTime(timezone=True), server_default=sa.text('now()'), nullable=False),
+    sa.Column('updated_at', sa.DateTime(timezone=True), nullable=True),
+    sa.PrimaryKeyConstraint('id'),
+    sa.UniqueConstraint('runtime_run_id', 'tool_call_id', name='uq_sandbox_reservations_run_tool')
+    )
+    op.create_table('sandbox_runners',
+    sa.Column('id', sa.String(length=80), nullable=False),
+    sa.Column('base_url', sa.Text(), nullable=False),
+    sa.Column('status', sa.String(length=20), nullable=False),
+    sa.Column('active_limit', sa.Integer(), nullable=False),
+    sa.Column('executing_limit', sa.Integer(), nullable=False),
+    sa.Column('active_count', sa.Integer(), nullable=False),
+    sa.Column('executing_count', sa.Integer(), nullable=False),
+    sa.Column('config', postgresql.JSONB(astext_type=sa.Text()), nullable=False),
+    sa.Column('last_health_at', sa.DateTime(timezone=True), nullable=True),
+    sa.Column('last_error', sa.Text(), nullable=True),
+    sa.Column('created_at', sa.DateTime(timezone=True), server_default=sa.text('now()'), nullable=False),
+    sa.Column('updated_at', sa.DateTime(timezone=True), nullable=True),
+    sa.PrimaryKeyConstraint('id')
+    )
     op.create_table('scheduled_job_runs',
     sa.Column('id', sa.String(length=26), nullable=False),
     sa.Column('job_id', sa.String(length=100), nullable=False),
@@ -1470,8 +1699,13 @@ def upgrade() -> None:
     sa.Column('enabled', sa.Boolean(), nullable=False),
     sa.Column('delete_after_run', sa.Boolean(), nullable=True),
     sa.Column('last_run_at', sa.DateTime(timezone=True), nullable=True),
+    sa.Column('next_run_at', sa.DateTime(timezone=True), nullable=True),
     sa.Column('last_status', sa.String(length=20), nullable=True),
     sa.Column('consecutive_errors', sa.Integer(), nullable=False),
+    sa.Column('skill_generation_revision', sa.Integer(), nullable=True),
+    sa.Column('skill_generation_next_attempt_at', sa.DateTime(timezone=True), nullable=True),
+    sa.Column('skill_generation_attempts', sa.Integer(), server_default='0', nullable=False),
+    sa.Column('skill_generation_last_error', sa.Text(), nullable=True),
     sa.Column('revision', sa.Integer(), server_default='1', nullable=False),
     sa.Column('created_at', sa.DateTime(timezone=True), server_default=sa.text('now()'), nullable=False),
     sa.Column('updated_at', sa.DateTime(timezone=True), nullable=True),
@@ -1519,6 +1753,7 @@ def upgrade() -> None:
     op.create_table('sites',
     sa.Column('id', sa.String(length=26), nullable=False),
     sa.Column('entity_id', sa.String(length=26), nullable=False),
+    sa.Column('created_by_user_id', sa.String(length=26), nullable=True),
     sa.Column('name', sa.String(length=255), nullable=False),
     sa.Column('slug', sa.String(length=63), nullable=False),
     sa.Column('status', sa.String(length=16), nullable=False),
@@ -1731,6 +1966,7 @@ def upgrade() -> None:
     sa.Column('deadline', sa.DateTime(timezone=True), nullable=True),
     sa.Column('started_at', sa.DateTime(timezone=True), nullable=True),
     sa.Column('completed_at', sa.DateTime(timezone=True), nullable=True),
+    sa.Column('status_changed_at', sa.DateTime(timezone=True), nullable=True),
     sa.Column('sla_policy_id', sa.String(length=26), nullable=True),
     sa.Column('sla_breached', sa.Boolean(), server_default='false', nullable=False),
     sa.Column('escalation_level', sa.Integer(), server_default='0', nullable=False),
@@ -1824,6 +2060,33 @@ def upgrade() -> None:
     sa.Column('updated_at', sa.DateTime(timezone=True), nullable=True),
     sa.PrimaryKeyConstraint('id')
     )
+    op.create_table('twilio_voice_call_sessions',
+    sa.Column('id', sa.String(length=26), nullable=False),
+    sa.Column('entity_id', sa.String(length=26), nullable=False),
+    sa.Column('owner_user_id', sa.String(length=26), nullable=True),
+    sa.Column('workspace_id', sa.String(length=26), nullable=True),
+    sa.Column('channel_config_id', sa.String(length=26), nullable=False),
+    sa.Column('agent_id', sa.String(length=26), nullable=True),
+    sa.Column('conversation_id', sa.String(length=26), nullable=True),
+    sa.Column('direction', sa.String(length=10), nullable=False),
+    sa.Column('status', sa.String(length=20), nullable=False),
+    sa.Column('call_sid', sa.String(length=64), nullable=True),
+    sa.Column('stream_sid', sa.String(length=64), nullable=True),
+    sa.Column('session_token_hash', sa.String(length=64), nullable=False),
+    sa.Column('token_used_at', sa.DateTime(timezone=True), nullable=True),
+    sa.Column('expires_at', sa.DateTime(timezone=True), nullable=False),
+    sa.Column('from_number', sa.String(length=40), nullable=True),
+    sa.Column('to_number', sa.String(length=40), nullable=True),
+    sa.Column('connected_at', sa.DateTime(timezone=True), nullable=True),
+    sa.Column('ended_at', sa.DateTime(timezone=True), nullable=True),
+    sa.Column('duration_seconds', sa.Integer(), nullable=True),
+    sa.Column('error_message', sa.String(length=500), nullable=True),
+    sa.Column('metadata_json', postgresql.JSONB(astext_type=sa.Text()), server_default='{}', nullable=False),
+    sa.Column('created_at', sa.DateTime(timezone=True), server_default=sa.text('now()'), nullable=False),
+    sa.Column('updated_at', sa.DateTime(timezone=True), nullable=True),
+    sa.PrimaryKeyConstraint('id'),
+    sa.UniqueConstraint('session_token_hash')
+    )
     op.create_table('user_memberships',
     sa.Column('id', sa.String(length=26), nullable=False),
     sa.Column('user_id', sa.String(length=26), nullable=False),
@@ -1881,7 +2144,7 @@ def upgrade() -> None:
     sa.Column('first_name', sa.String(length=100), nullable=True),
     sa.Column('last_name', sa.String(length=100), nullable=True),
     sa.Column('phone', sa.String(length=20), nullable=True),
-    sa.Column('avatar_url', sa.String(length=500), nullable=True),
+    sa.Column('avatar_url', sa.Text(), nullable=True),
     sa.Column('password_hash', sa.String(length=255), nullable=False),
     sa.Column('role', sa.String(length=20), nullable=False),
     sa.Column('llm_model', sa.String(length=100), nullable=True),
@@ -1961,6 +2224,17 @@ def upgrade() -> None:
     sa.Column('updated_at', sa.DateTime(timezone=True), nullable=True),
     sa.PrimaryKeyConstraint('id')
     )
+    op.create_table('wechat_personal_sessions',
+    sa.Column('session_id', sa.String(length=255), nullable=False),
+    sa.Column('entity_id', sa.String(length=26), nullable=False),
+    sa.Column('owner_user_id', sa.String(length=26), nullable=False),
+    sa.Column('integration_id', sa.String(length=26), nullable=True),
+    sa.Column('status', sa.String(length=20), server_default='pending', nullable=False),
+    sa.Column('created_at', sa.DateTime(timezone=True), server_default=sa.text('now()'), nullable=False),
+    sa.Column('updated_at', sa.DateTime(timezone=True), nullable=True),
+    sa.PrimaryKeyConstraint('session_id'),
+    sa.UniqueConstraint('integration_id')
+    )
     op.create_table('work_leases',
     sa.Column('id', sa.String(length=26), nullable=False),
     sa.Column('step_id', sa.String(length=26), nullable=False),
@@ -2032,13 +2306,18 @@ def upgrade() -> None:
     sa.Column('entity_id', sa.String(length=26), nullable=False),
     sa.Column('workspace_id', sa.String(length=26), nullable=False),
     sa.Column('workflow_run_id', sa.String(length=26), nullable=False),
-    sa.Column('project_id', sa.String(length=26), nullable=False),
+    sa.Column('project_id', sa.String(length=26), nullable=True),
+    sa.Column('proposal_item_id', sa.String(length=26), nullable=True),
+    sa.Column('workflow_lineage_root_run_id', sa.String(length=26), nullable=True),
+    sa.Column('action_key', sa.String(length=120), nullable=True),
     sa.Column('grant_type', sa.String(length=80), nullable=False),
     sa.Column('scope', postgresql.JSONB(astext_type=sa.Text()), nullable=False),
     sa.Column('granted_by', sa.String(length=26), nullable=False),
     sa.Column('granted_at', sa.DateTime(timezone=True), nullable=False),
     sa.Column('expires_at', sa.DateTime(timezone=True), nullable=False),
     sa.Column('revoked_at', sa.DateTime(timezone=True), nullable=True),
+    sa.Column('consumed_at', sa.DateTime(timezone=True), nullable=True),
+    sa.Column('consumed_by_run_id', sa.String(length=26), nullable=True),
     sa.Column('created_at', sa.DateTime(timezone=True), server_default=sa.text('now()'), nullable=False),
     sa.Column('updated_at', sa.DateTime(timezone=True), nullable=True),
     sa.PrimaryKeyConstraint('id')
@@ -2117,12 +2396,21 @@ def upgrade() -> None:
     sa.Column('variables', postgresql.JSONB(astext_type=sa.Text()), server_default='{}', nullable=False),
     sa.Column('step_results', postgresql.JSONB(astext_type=sa.Text()), server_default='{}', nullable=False),
     sa.Column('trigger_data', postgresql.JSONB(astext_type=sa.Text()), server_default='{}', nullable=False),
+    sa.Column('webchat_session_id', sa.String(length=128), nullable=True),
+    sa.Column('webchat_module_id', sa.String(length=80), nullable=True),
+    sa.Column('webchat_submission_id', sa.String(length=80), nullable=True),
     sa.Column('definition_snapshot', postgresql.JSONB(astext_type=sa.Text()), server_default='{}', nullable=False),
+    sa.Column('execution_snapshot', postgresql.JSONB(astext_type=sa.Text()), server_default='{}', nullable=False),
     sa.Column('execution_trace', postgresql.JSONB(astext_type=sa.Text()), server_default='[]', nullable=False),
     sa.Column('error', sa.Text(), nullable=True),
     sa.Column('started_by', sa.String(length=26), nullable=True),
     sa.Column('started_at', sa.DateTime(timezone=True), nullable=True),
     sa.Column('completed_at', sa.DateTime(timezone=True), nullable=True),
+    sa.Column('continuation_token', sa.String(length=26), nullable=True),
+    sa.Column('continuation_due_at', sa.DateTime(timezone=True), nullable=True),
+    sa.Column('continuation_next_attempt_at', sa.DateTime(timezone=True), nullable=True),
+    sa.Column('terminal_effects_completed_at', sa.DateTime(timezone=True), nullable=True),
+    sa.Column('terminal_effects_next_attempt_at', sa.DateTime(timezone=True), nullable=True),
     sa.Column('created_at', sa.DateTime(timezone=True), server_default=sa.text('now()'), nullable=False),
     sa.Column('updated_at', sa.DateTime(timezone=True), nullable=True),
     sa.PrimaryKeyConstraint('id')
@@ -2151,6 +2439,18 @@ def upgrade() -> None:
     sa.Column('details', postgresql.JSONB(astext_type=sa.Text()), nullable=True),
     sa.Column('user_id', sa.String(length=26), nullable=True),
     sa.Column('agent_id', sa.String(length=26), nullable=True),
+    sa.Column('created_at', sa.DateTime(timezone=True), server_default=sa.text('now()'), nullable=False),
+    sa.Column('updated_at', sa.DateTime(timezone=True), nullable=True),
+    sa.PrimaryKeyConstraint('id')
+    )
+    op.create_table('workspace_artifact_purge_jobs',
+    sa.Column('id', sa.String(length=26), nullable=False),
+    sa.Column('entity_id', sa.String(length=26), nullable=False),
+    sa.Column('storage_base', sa.String(length=1100), nullable=False),
+    sa.Column('target_kind', sa.String(length=16), server_default='tree', nullable=False),
+    sa.Column('attempt_count', sa.Integer(), server_default='0', nullable=False),
+    sa.Column('last_error', sa.Text(), nullable=True),
+    sa.Column('next_attempt_at', sa.DateTime(timezone=True), nullable=True),
     sa.Column('created_at', sa.DateTime(timezone=True), server_default=sa.text('now()'), nullable=False),
     sa.Column('updated_at', sa.DateTime(timezone=True), nullable=True),
     sa.PrimaryKeyConstraint('id')
@@ -2370,6 +2670,46 @@ def upgrade() -> None:
     sa.PrimaryKeyConstraint('id'),
     sa.UniqueConstraint('mcp_server_id')
     )
+    op.create_table('chat_message_feedback',
+    sa.Column('id', sa.String(length=26), nullable=False),
+    sa.Column('entity_id', sa.String(length=26), nullable=False),
+    sa.Column('user_id', sa.String(length=26), nullable=False),
+    sa.Column('conversation_id', sa.String(length=26), nullable=False),
+    sa.Column('message_id', sa.String(length=26), nullable=False),
+    sa.Column('target_kind', sa.String(length=32), nullable=False),
+    sa.Column('target_id', sa.String(length=64), nullable=False),
+    sa.Column('task_id', sa.String(length=26), nullable=True),
+    sa.Column('plan_id', sa.String(length=26), nullable=True),
+    sa.Column('rating', sa.String(length=10), nullable=False),
+    sa.Column('content_preview', sa.Text(), nullable=True),
+    sa.Column('request_preview', sa.Text(), nullable=True),
+    sa.Column('mutation_sequence', sa.BigInteger(), nullable=False),
+    sa.Column('metadata', postgresql.JSONB(astext_type=sa.Text()), server_default='{}', nullable=False),
+    sa.Column('created_at', sa.DateTime(timezone=True), server_default=sa.text('now()'), nullable=False),
+    sa.Column('updated_at', sa.DateTime(timezone=True), server_default=sa.text('now()'), nullable=False),
+    sa.ForeignKeyConstraint(['conversation_id'], ['conversations.id'], name='fk_chat_feedback_conversation', ondelete='CASCADE'),
+    sa.ForeignKeyConstraint(['message_id'], ['messages.id'], name='fk_chat_feedback_message', ondelete='CASCADE'),
+    sa.ForeignKeyConstraint(['user_id'], ['users.id'], name='fk_chat_feedback_user', ondelete='CASCADE'),
+    sa.PrimaryKeyConstraint('id'),
+    sa.UniqueConstraint('message_id', 'user_id', name='uq_chat_feedback_message_user')
+    )
+    op.create_table('mcp_account_tool_catalogs',
+    sa.Column('id', sa.String(length=26), nullable=False),
+    sa.Column('provider', sa.String(length=64), nullable=False),
+    sa.Column('oauth_account_id', sa.String(length=26), nullable=True),
+    sa.Column('integration_id', sa.String(length=26), nullable=True),
+    sa.Column('endpoint', sa.String(length=500), nullable=False),
+    sa.Column('tools_cached', postgresql.JSONB(astext_type=sa.Text()), server_default='{}', nullable=False),
+    sa.Column('tools_cached_at', sa.DateTime(timezone=True), nullable=True),
+    sa.Column('created_at', sa.DateTime(timezone=True), server_default=sa.text('now()'), nullable=False),
+    sa.Column('updated_at', sa.DateTime(timezone=True), nullable=True),
+    sa.CheckConstraint('(oauth_account_id IS NOT NULL AND integration_id IS NULL) OR (oauth_account_id IS NULL AND integration_id IS NOT NULL)', name='ck_mcp_account_tool_catalogs_one_source'),
+    sa.ForeignKeyConstraint(['integration_id'], ['integrations.id'], ondelete='CASCADE'),
+    sa.ForeignKeyConstraint(['oauth_account_id'], ['oauth_accounts.id'], ondelete='CASCADE'),
+    sa.PrimaryKeyConstraint('id'),
+    sa.UniqueConstraint('provider', 'integration_id', name='uq_mcp_account_tool_catalogs_integration'),
+    sa.UniqueConstraint('provider', 'oauth_account_id', name='uq_mcp_account_tool_catalogs_oauth')
+    )
     op.create_table('notification_deliveries',
     sa.Column('id', sa.String(length=26), nullable=False),
     sa.Column('notification_id', sa.String(length=26), nullable=False),
@@ -2392,6 +2732,22 @@ def upgrade() -> None:
     sa.ForeignKeyConstraint(['notification_id'], ['notifications.id'], ondelete='CASCADE'),
     sa.PrimaryKeyConstraint('id')
     )
+    op.create_table('notification_outbox_events',
+    sa.Column('id', sa.String(length=26), nullable=False),
+    sa.Column('notification_id', sa.String(length=26), nullable=False),
+    sa.Column('payload', postgresql.JSONB(astext_type=sa.Text()), server_default='{}', nullable=False),
+    sa.Column('status', sa.String(length=20), server_default='pending', nullable=False),
+    sa.Column('attempt_count', sa.Integer(), server_default='0', nullable=False),
+    sa.Column('available_at', sa.DateTime(timezone=True), nullable=False),
+    sa.Column('locked_until', sa.DateTime(timezone=True), nullable=True),
+    sa.Column('claim_token', sa.String(length=26), nullable=True),
+    sa.Column('delivered_at', sa.DateTime(timezone=True), nullable=True),
+    sa.Column('last_error', sa.Text(), nullable=True),
+    sa.Column('created_at', sa.DateTime(timezone=True), server_default=sa.text('now()'), nullable=False),
+    sa.Column('updated_at', sa.DateTime(timezone=True), server_default=sa.text('now()'), nullable=False),
+    sa.ForeignKeyConstraint(['notification_id'], ['notifications.id'], ondelete='CASCADE'),
+    sa.PrimaryKeyConstraint('id')
+    )
     op.create_table('staff',
     sa.Column('id', sa.String(length=26), nullable=False),
     sa.Column('entity_id', sa.String(length=26), nullable=False),
@@ -2399,7 +2755,7 @@ def upgrade() -> None:
     sa.Column('name', sa.String(length=255), nullable=False),
     sa.Column('email', sa.String(length=255), nullable=True),
     sa.Column('phone', sa.String(length=50), nullable=True),
-    sa.Column('avatar_url', sa.String(length=500), nullable=True),
+    sa.Column('avatar_url', sa.Text(), nullable=True),
     sa.Column('user_id', sa.String(length=26), nullable=True),
     sa.Column('title', sa.String(length=255), nullable=True),
     sa.Column('department_id', sa.String(length=26), nullable=True),
@@ -2423,6 +2779,17 @@ def upgrade() -> None:
     sa.ForeignKeyConstraint(['department_id'], ['departments.id'], ),
     sa.ForeignKeyConstraint(['role_id'], ['staff_roles.id'], ),
     sa.ForeignKeyConstraint(['user_id'], ['users.id'], ),
+    sa.PrimaryKeyConstraint('id')
+    )
+    op.create_table('user_session_leases',
+    sa.Column('id', sa.String(length=64), nullable=False),
+    sa.Column('entity_id', sa.String(length=26), nullable=False),
+    sa.Column('user_id', sa.String(length=26), nullable=False),
+    sa.Column('session_id', sa.String(length=26), nullable=False),
+    sa.Column('expires_at', sa.DateTime(timezone=True), nullable=False),
+    sa.Column('created_at', sa.DateTime(timezone=True), server_default=sa.text('now()'), nullable=False),
+    sa.Column('updated_at', sa.DateTime(timezone=True), nullable=True),
+    sa.ForeignKeyConstraint(['session_id'], ['user_session_logs.id'], ondelete='CASCADE'),
     sa.PrimaryKeyConstraint('id')
     )
     op.create_table('staff_schedule_adjustments',
@@ -2470,9 +2837,26 @@ def upgrade() -> None:
     op.create_index('ix_api_keys_entity_default', 'api_keys', ['entity_id', 'is_default'], unique=False)
     op.create_index('ix_audit_entity', 'audit_log', ['entity_id', 'created_at'], unique=False)
     op.create_index('uq_automation_revisions_target_rev', 'automation_revisions', ['target_kind', 'target_id', 'revision'], unique=True)
+    op.create_index('ix_blueprint_checkout_attempts_blueprint', 'blueprint_checkout_attempts', ['blueprint_id'], unique=False)
+    op.create_index('ix_blueprint_checkout_attempts_purchase', 'blueprint_checkout_attempts', ['purchase_id'], unique=False)
+    op.create_index('ix_blueprint_checkout_attempts_seller', 'blueprint_checkout_attempts', ['seller_entity_id'], unique=False)
+    op.create_index('ux_blueprint_checkout_attempts_payment_intent', 'blueprint_checkout_attempts', ['stripe_payment_intent_id'], unique=True, postgresql_where=sa.text('stripe_payment_intent_id IS NOT NULL'))
+    op.create_index('ux_blueprint_checkout_attempts_session', 'blueprint_checkout_attempts', ['stripe_checkout_session_id'], unique=True, postgresql_where=sa.text('stripe_checkout_session_id IS NOT NULL'))
+    op.create_index('ix_blueprint_checkout_refunds_attempt', 'blueprint_checkout_refunds', ['attempt_id'], unique=False)
+    op.create_index('ix_blueprint_checkout_refunds_buyer', 'blueprint_checkout_refunds', ['buyer_entity_id'], unique=False)
+    op.create_index('ix_blueprint_checkout_refunds_due', 'blueprint_checkout_refunds', ['status', 'next_attempt_at'], unique=False)
+    op.create_index('ix_blueprint_checkout_refunds_purchase', 'blueprint_checkout_refunds', ['purchase_id'], unique=False)
+    op.create_index('ix_blueprint_checkout_refunds_session_buyer', 'blueprint_checkout_refunds', ['stripe_checkout_session_id', 'buyer_entity_id'], unique=False)
+    op.create_index('ux_blueprint_checkout_refunds_payment_intent', 'blueprint_checkout_refunds', ['stripe_payment_intent_id'], unique=True)
     op.create_index('ix_blueprint_favorites_blueprint', 'blueprint_favorites', ['blueprint_id'], unique=False)
+    op.create_index('ix_blueprint_purchases_allocation_recovery', 'blueprint_purchases', ['seller_entity_id', 'allocation_recovery_attempted_at'], unique=False)
+    op.create_index('ix_blueprint_purchases_allocation_recovery_due', 'blueprint_purchases', ['seller_entity_id', 'allocation_recovery_next_attempt_at', 'allocation_recovery_claim_expires_at'], unique=False)
     op.create_index('ix_blueprint_purchases_blueprint', 'blueprint_purchases', ['blueprint_id'], unique=False)
     op.create_index('ix_blueprint_purchases_buyer', 'blueprint_purchases', ['buyer_entity_id'], unique=False)
+    op.create_index('ix_blueprint_purchases_payment_intent', 'blueprint_purchases', ['stripe_payment_intent_id'], unique=False)
+    op.create_index('ix_blueprint_purchases_seller', 'blueprint_purchases', ['seller_entity_id'], unique=False)
+    op.create_index('ix_blueprint_purchases_seller_recovery', 'blueprint_purchases', ['seller_entity_id', 'seller_recovery_attempted_at'], unique=False)
+    op.create_index('ix_blueprint_purchases_seller_recovery_due', 'blueprint_purchases', ['seller_entity_id', 'seller_recovery_next_attempt_at', 'seller_recovery_claim_expires_at'], unique=False)
     op.create_index('ux_blueprint_purchases_checkout_session', 'blueprint_purchases', ['stripe_checkout_session_id'], unique=True, postgresql_where=sa.text('stripe_checkout_session_id IS NOT NULL'))
     op.create_index('ux_blueprint_purchases_live_entitlement', 'blueprint_purchases', ['blueprint_id', 'buyer_entity_id'], unique=True, postgresql_where=sa.text("status != 'refunded'"))
     op.create_index('ix_business_order_items_order', 'business_order_items', ['order_id'], unique=False)
@@ -2481,6 +2865,9 @@ def upgrade() -> None:
     op.create_index('ix_business_orders_number', 'business_orders', ['order_number'], unique=True)
     op.create_index('ix_channel_configs_entity', 'channel_configs', ['entity_id'], unique=False)
     op.create_index('ix_channel_configs_type', 'channel_configs', ['entity_id', 'channel_type'], unique=False)
+    op.create_index('ux_channel_configs_discord_installation', 'channel_configs', ['discord_application_id', 'discord_guild_id'], unique=True)
+    op.create_index('ux_channel_configs_telegram_bot_id', 'channel_configs', ['telegram_bot_id'], unique=True)
+    op.create_index('ux_channel_configs_whatsapp_phone_number_id', 'channel_configs', ['whatsapp_phone_number_id'], unique=True)
     op.create_index('ix_channel_contacts_contact', 'channel_contacts', ['contact_id'], unique=False)
     op.create_index('ix_channel_contacts_entity', 'channel_contacts', ['entity_id'], unique=False)
     op.create_index('uq_channel_contact_source', 'channel_contacts', ['channel_config_id', 'source_id'], unique=True)
@@ -2488,9 +2875,7 @@ def upgrade() -> None:
     op.create_index('ux_channel_link_token', 'channel_link_tokens', ['token'], unique=True)
     op.create_index(op.f('ix_channel_pairing_codes_entity_id'), 'channel_pairing_codes', ['entity_id'], unique=False)
     op.create_index(op.f('ix_channel_pairing_codes_expires_at'), 'channel_pairing_codes', ['expires_at'], unique=False)
-    op.create_index('ix_chat_feedback_conversation', 'chat_message_feedback', ['conversation_id', 'created_at'], unique=False)
-    op.create_index('ix_chat_feedback_entity_created', 'chat_message_feedback', ['entity_id', 'created_at'], unique=False)
-    op.create_index('ix_chat_feedback_rating', 'chat_message_feedback', ['rating', 'created_at'], unique=False)
+    op.create_index('ux_channels_active_whatsapp_config', 'channels', [sa.literal_column("(config ->> 'channel_config_id')")], unique=True, postgresql_where=sa.text("type = 'whatsapp' AND status = 'active' AND config ->> 'channel_config_id' IS NOT NULL"), sqlite_where=sa.text("type = 'whatsapp' AND status = 'active' AND config ->> 'channel_config_id' IS NOT NULL"))
     op.create_index('ix_client_errors_created', 'client_error_events', ['created_at'], unique=False)
     op.create_index('ix_client_errors_entity_created', 'client_error_events', ['entity_id', 'created_at'], unique=False)
     op.create_index('ix_client_errors_fingerprint_created', 'client_error_events', ['fingerprint', 'created_at'], unique=False)
@@ -2499,6 +2884,7 @@ def upgrade() -> None:
     op.create_index(op.f('ix_clients_deleted_at'), 'clients', ['deleted_at'], unique=False)
     op.create_index('ix_comments_parent', 'comments', ['parent_id'], unique=False)
     op.create_index('ix_comments_resource', 'comments', ['resource_type', 'resource_id'], unique=False)
+    op.create_index('ix_comments_resource_normalized', 'comments', [sa.literal_column('lower(trim(resource_type))'), 'resource_id'], unique=False)
     op.create_index('ix_consolidation_reports_workspace_created', 'consolidation_reports', ['workspace_id', 'created_at'], unique=False)
     op.create_index('ix_conversation_shares_entity', 'conversation_shares', ['entity_id'], unique=False)
     op.create_index('ix_conversation_shares_token', 'conversation_shares', ['share_token'], unique=True)
@@ -2519,8 +2905,12 @@ def upgrade() -> None:
     op.create_index('ix_documents_entity', 'documents', ['entity_id'], unique=False)
     op.create_index('ix_documents_fs_path', 'documents', ['fs_path'], unique=False)
     op.create_index('ix_documents_name', 'documents', ['entity_id', 'name'], unique=False)
+    op.create_index('uq_documents_entity_fs_path_active', 'documents', ['entity_id', 'fs_path'], unique=True, postgresql_where=sa.text('fs_path IS NOT NULL AND is_trashed = false'), sqlite_where=sa.text('fs_path IS NOT NULL AND is_trashed = 0'))
+    op.create_index('uq_documents_upload_idempotency', 'documents', ['entity_id', 'owner_id', 'upload_idempotency_key'], unique=True, postgresql_where=sa.text('upload_idempotency_key IS NOT NULL'), sqlite_where=sa.text('upload_idempotency_key IS NOT NULL'))
     op.create_index(op.f('ix_entities_deleted_at'), 'entities', ['deleted_at'], unique=False)
     op.create_index('ix_event_entity_created', 'event_logs', ['entity_id', 'created_at'], unique=False)
+    op.create_index('ix_event_external_delivery_due', 'event_logs', ['external_delivery_status', 'external_delivery_available_at'], unique=False, postgresql_where=sa.text("external_delivery_status IN ('pending', 'processing')"))
+    op.create_index('ix_event_external_delivery_lease', 'event_logs', ['external_delivery_status', 'external_delivery_locked_until'], unique=False, postgresql_where=sa.text("external_delivery_status = 'processing'"))
     op.create_index('ix_event_type', 'event_logs', ['event_type'], unique=False)
     op.create_index('ix_plans_entity_status', 'execution_plans', ['entity_id', 'status'], unique=False)
     op.create_index('ix_plans_task', 'execution_plans', ['task_id'], unique=False)
@@ -2533,6 +2923,8 @@ def upgrade() -> None:
     op.create_index('ix_goals_entity_status', 'goals', ['entity_id', 'status'], unique=False)
     op.create_index('ix_goals_stat_id', 'goals', ['stat_id'], unique=False)
     op.create_index('ix_goals_workspace_status', 'goals', ['workspace_id', 'status'], unique=False)
+    op.create_index('uq_goals_entity_goal_key', 'goals', ['entity_id', 'goal_key'], unique=True, postgresql_where=sa.text('workspace_id IS NULL'), sqlite_where=sa.text('workspace_id IS NULL'))
+    op.create_index('uq_goals_workspace_goal_key', 'goals', ['workspace_id', 'goal_key'], unique=True, postgresql_where=sa.text('workspace_id IS NOT NULL'), sqlite_where=sa.text('workspace_id IS NOT NULL'))
     op.create_index(op.f('ix_governance_policies_entity_id'), 'governance_policies', ['entity_id'], unique=False)
     op.create_index(op.f('ix_governance_revisions_workspace_id'), 'governance_revisions', ['workspace_id'], unique=False)
     op.create_index('ix_hitl_requests_conversation', 'hitl_requests', ['origin_conversation_id'], unique=False)
@@ -2550,6 +2942,10 @@ def upgrade() -> None:
     op.create_index('ix_invite_redemptions_user', 'invitation_code_redemptions', ['user_id'], unique=False)
     op.create_index('ix_invitation_codes_expires', 'invitation_codes', ['expires_at'], unique=False)
     op.create_index('ix_invitation_codes_status', 'invitation_codes', ['status'], unique=False)
+    op.create_index(op.f('ix_marketplace_resource_links_entity_id'), 'marketplace_resource_links', ['entity_id'], unique=False)
+    op.create_index(op.f('ix_marketplace_resource_links_linked_by'), 'marketplace_resource_links', ['linked_by'], unique=False)
+    op.create_index('ix_marketplace_resource_links_local', 'marketplace_resource_links', ['entity_id', 'local_resource_type', 'local_resource_id', 'relationship'], unique=False)
+    op.create_index('ix_marketplace_resource_links_source', 'marketplace_resource_links', ['marketplace_source', 'marketplace_resource_type', 'marketplace_resource_id'], unique=False)
     op.create_index('ix_mcp_servers_status', 'mcp_servers', ['status'], unique=False)
     op.create_index('ix_media_jobs_conversation', 'media_jobs', ['conversation_id'], unique=False)
     op.create_index('ix_media_jobs_entity', 'media_jobs', ['entity_id'], unique=False)
@@ -2560,12 +2956,23 @@ def upgrade() -> None:
     op.create_index('ix_message_logs_conversation', 'message_logs', ['conversation_id'], unique=False)
     op.create_index('ix_message_logs_entity', 'message_logs', ['entity_id'], unique=False)
     op.create_index('ix_message_logs_external', 'message_logs', ['external_id'], unique=False)
+    op.create_index('uq_message_logs_discord_inbound_interaction', 'message_logs', ['channel_config_id', 'external_id'], unique=True, postgresql_where=sa.text("channel_type = 'discord' AND direction = 'inbound' AND external_id IS NOT NULL"))
+    op.create_index('uq_message_logs_ms_teams_inbound_event', 'message_logs', ['channel_config_id', 'external_id'], unique=True, postgresql_where=sa.text("channel_type = 'ms_teams' AND direction = 'inbound' AND external_id IS NOT NULL"))
+    op.create_index('uq_message_logs_outlook_inbound_message', 'message_logs', ['channel_config_id', 'external_id'], unique=True, postgresql_where=sa.text("channel_type = 'outlook' AND direction = 'inbound' AND external_id IS NOT NULL"))
+    op.create_index('uq_message_logs_slack_inbound_event', 'message_logs', ['channel_config_id', 'external_id'], unique=True, postgresql_where=sa.text("channel_type = 'slack' AND direction = 'inbound' AND external_id IS NOT NULL"))
+    op.create_index('uq_message_logs_twilio_inbound_sid', 'message_logs', ['channel_config_id', 'external_id'], unique=True, postgresql_where=sa.text("channel_type = 'twilio_sms' AND direction = 'inbound' AND external_id IS NOT NULL"))
+    op.create_index('uq_message_logs_wechat_inbound_message', 'message_logs', ['channel_config_id', 'external_id'], unique=True, postgresql_where=sa.text("channel_type = 'wechat' AND direction = 'inbound' AND external_id IS NOT NULL"))
+    op.create_index('uq_message_logs_wechat_personal_inbound_message', 'message_logs', ['channel_config_id', 'external_id'], unique=True, postgresql_where=sa.text("channel_type = 'wechat_personal' AND direction = 'inbound' AND external_id IS NOT NULL"))
+    op.create_index('uq_message_logs_whatsapp_inbound_event', 'message_logs', ['channel_config_id', 'external_id'], unique=True, postgresql_where=sa.text("channel_type = 'whatsapp' AND direction = 'inbound' AND external_id IS NOT NULL"))
     op.create_index('ix_messages_conv', 'messages', ['conversation_id', 'created_at'], unique=False)
+    op.create_index('uq_messages_conversation_response_surface_event', 'messages', ['conversation_id', 'response_surface_event_id'], unique=True, postgresql_where=sa.text('response_surface_event_id IS NOT NULL'))
     op.create_index('ix_nango_webhook_events_connection_id', 'nango_webhook_events', ['connection_id'], unique=False)
     op.create_index('ix_nango_webhook_events_entity_id', 'nango_webhook_events', ['entity_id'], unique=False)
     op.create_index('ix_nango_webhook_events_received_at', 'nango_webhook_events', ['received_at'], unique=False)
     op.create_index('ix_notifications_due', 'notifications', ['dispatch_status', 'deliver_at'], unique=False)
     op.create_index('ix_notifications_user', 'notifications', ['user_id', 'created_at'], unique=False)
+    op.create_index('ix_notifications_workspace', 'notifications', ['workspace_id', 'created_at'], unique=False)
+    op.create_index('uq_notifications_recipient_idempotency', 'notifications', ['entity_id', 'user_id', 'idempotency_key'], unique=True)
     op.create_index('ix_oauth_accounts_user_provider', 'oauth_accounts', ['user_id', 'provider'], unique=False)
     op.create_index('uq_oauth_accounts_user_provider_external', 'oauth_accounts', ['user_id', 'provider', 'provider_user_id'], unique=True)
     op.create_index('ix_oauth_codes_client_user', 'oauth_authorization_codes', ['client_id', 'user_id'], unique=False)
@@ -2584,6 +2991,8 @@ def upgrade() -> None:
     op.create_index('ix_platform_model_provider_keys_provider', 'platform_model_provider_keys', ['provider'], unique=True)
     op.create_index('ix_platform_model_provider_keys_status', 'platform_model_provider_keys', ['status'], unique=False)
     op.create_index('ix_platform_settings_key', 'platform_settings', ['key'], unique=True)
+    op.create_index('ix_product_growth_user_milestone_occurred', 'product_growth_events', ['user_id', 'milestone', 'occurred_at'], unique=False)
+    op.create_index('uq_product_growth_event_source', 'product_growth_events', ['entity_id', 'milestone', 'source_kind', 'source_id'], unique=True)
     op.create_index('ix_proposal_items_proposal', 'proposal_items', ['proposal_id'], unique=False)
     op.create_index('ix_proposal_items_workspace_status', 'proposal_items', ['workspace_id', 'status'], unique=False)
     op.create_index('ix_proposals_review_id', 'proposals', ['review_id'], unique=False)
@@ -2595,6 +3004,7 @@ def upgrade() -> None:
     op.create_index('ix_resource_grants_pending_resource', 'resource_grants_pending', ['resource_type', 'resource_id'], unique=False)
     op.create_index('ix_review_runs_workspace_created', 'review_runs', ['workspace_id', 'created_at'], unique=False)
     op.create_index('uq_review_runs_one_running', 'review_runs', ['workspace_id'], unique=True, postgresql_where=sa.text("status = 'running'"))
+    op.create_index('uq_review_runs_workspace_delivery_live_or_terminal', 'review_runs', ['workspace_id', 'delivery_id'], unique=True, postgresql_where=sa.text("delivery_id IS NOT NULL AND status IN ('running', 'succeeded', 'skipped')"))
     op.create_index('ix_runtime_event_logs_conversation_created', 'runtime_event_logs', ['conversation_id', 'created_at'], unique=False)
     op.create_index('ix_runtime_event_logs_entity_created', 'runtime_event_logs', ['entity_id', 'created_at'], unique=False)
     op.create_index('ix_runtime_event_logs_task_created', 'runtime_event_logs', ['task_id', 'created_at'], unique=False)
@@ -2605,13 +3015,29 @@ def upgrade() -> None:
     op.create_index('ix_runtime_evidence_task_created', 'runtime_evidence', ['task_id', 'created_at'], unique=False)
     op.create_index('ix_runtime_evidence_type_status', 'runtime_evidence', ['evidence_type', 'status'], unique=False)
     op.create_index('ix_runtime_evidence_workspace_created', 'runtime_evidence', ['entity_id', 'workspace_id', 'created_at'], unique=False)
+    op.create_index('ix_runtime_execution_claims_expires', 'runtime_execution_claims', ['expires_at'], unique=False)
+    op.create_index('ix_runtime_outbox_pending', 'runtime_outbox_events', ['available_at', 'created_at'], unique=False, postgresql_where=sa.text('delivered_at IS NULL'))
+    op.create_index('ix_runtime_runs_conversation_created', 'runtime_runs', ['conversation_id', 'created_at'], unique=False)
+    op.create_index('ix_runtime_runs_entity_status', 'runtime_runs', ['entity_id', 'status'], unique=False)
+    op.create_index('ix_runtime_runs_root_status', 'runtime_runs', ['root_run_id', 'status'], unique=False)
+    op.create_index('uq_runtime_runs_active_conversation', 'runtime_runs', ['conversation_id'], unique=True, postgresql_where=sa.text("parent_run_id IS NULL AND status IN ('queued','running','waiting_resource','resuming','cancel_requested','cancelling')"))
+    op.create_index('ix_sandbox_instances_root_status', 'sandbox_instances', ['root_run_id', 'status'], unique=False)
+    op.create_index('ix_sandbox_instances_runner_status', 'sandbox_instances', ['runner_id', 'status'], unique=False)
+    op.create_index('ix_sandbox_reservations_queue', 'sandbox_reservations', ['priority', 'enqueued_at', 'id'], unique=False, postgresql_where=sa.text("status IN ('queued','requeued')"))
+    op.create_index('ix_sandbox_reservations_root_status', 'sandbox_reservations', ['root_run_id', 'status'], unique=False)
+    op.create_index('uq_sandbox_reservations_sandbox', 'sandbox_reservations', ['sandbox_id'], unique=True, postgresql_where=sa.text('sandbox_id IS NOT NULL'))
+    op.create_index('ix_sandbox_runners_status', 'sandbox_runners', ['status', 'last_health_at'], unique=False)
+    op.create_index('uq_sandbox_runners_base_url', 'sandbox_runners', ['base_url'], unique=True)
     op.create_index('uq_scheduled_job_runs_occurrence', 'scheduled_job_runs', ['job_id', 'idempotency_key'], unique=True)
+    op.create_index('ix_scheduled_jobs_due', 'scheduled_jobs', ['enabled', 'next_run_at', 'id'], unique=False)
+    op.create_index('ix_scheduled_jobs_skill_generation_due', 'scheduled_jobs', ['enabled', 'skill_generation_next_attempt_at', 'id'], unique=False)
     op.create_index('ix_shares_entity_status', 'shares', ['entity_id', 'status'], unique=False)
     op.create_index('ix_shares_expires', 'shares', ['expires_at'], unique=False)
     op.create_index('ix_shares_resource', 'shares', ['resource_type', 'resource_id'], unique=False)
     op.create_index('ix_site_events_site_created', 'site_events', ['site_id', 'created_at'], unique=False)
     op.create_index('ix_site_events_type', 'site_events', ['site_id', 'event_type'], unique=False)
     op.create_index('ix_site_events_workspace_created', 'site_events', ['workspace_id', 'created_at'], unique=False)
+    op.create_index('ix_sites_created_by_user', 'sites', ['created_by_user_id'], unique=False)
     op.create_index('ix_sites_custom_domain', 'sites', ['custom_domain'], unique=True)
     op.create_index('ix_sites_entity', 'sites', ['entity_id'], unique=False)
     op.create_index('ix_sites_slug', 'sites', ['slug'], unique=True)
@@ -2623,6 +3049,7 @@ def upgrade() -> None:
     op.create_index('ix_skills_slug', 'skills', ['slug'], unique=False)
     op.create_index('ix_skills_tags', 'skills', ['tags'], unique=False, postgresql_using='gin')
     op.create_index('ix_skills_workspace', 'skills', ['entity_id', 'workspace_id'], unique=False)
+    op.create_index('uq_skills_builtin_slug', 'skills', ['slug'], unique=True, postgresql_where=sa.text('entity_id IS NULL AND slug IS NOT NULL'))
     op.create_index('ix_staff_roles_entity', 'staff_roles', ['entity_id'], unique=False)
     op.create_index('ix_sub_workers_worker', 'subscription_workers', ['worker_id'], unique=False)
     op.create_index('ix_support_messages_ticket', 'support_messages', ['ticket_id', 'created_at'], unique=False)
@@ -2649,6 +3076,13 @@ def upgrade() -> None:
     op.create_index('ix_tool_call_workspace', 'tool_call_logs', ['entity_id', 'workspace_id', 'created_at'], unique=False)
     op.create_index('ix_tool_intent_paths_user', 'tool_intent_paths', ['entity_id', 'user_id'], unique=False)
     op.create_index('uq_tool_intent_paths_key', 'tool_intent_paths', ['entity_id', 'user_id', 'intent_signature', 'tool_name'], unique=True)
+    op.create_index(op.f('ix_twilio_voice_call_sessions_channel_config_id'), 'twilio_voice_call_sessions', ['channel_config_id'], unique=False)
+    op.create_index(op.f('ix_twilio_voice_call_sessions_entity_id'), 'twilio_voice_call_sessions', ['entity_id'], unique=False)
+    op.create_index(op.f('ix_twilio_voice_call_sessions_owner_user_id'), 'twilio_voice_call_sessions', ['owner_user_id'], unique=False)
+    op.create_index(op.f('ix_twilio_voice_call_sessions_workspace_id'), 'twilio_voice_call_sessions', ['workspace_id'], unique=False)
+    op.create_index('ix_twilio_voice_sessions_config_status', 'twilio_voice_call_sessions', ['channel_config_id', 'status'], unique=False)
+    op.create_index('ix_twilio_voice_sessions_expires', 'twilio_voice_call_sessions', ['expires_at'], unique=False)
+    op.create_index('uq_twilio_voice_sessions_call_sid', 'twilio_voice_call_sessions', ['call_sid'], unique=True, postgresql_where=sa.text('call_sid IS NOT NULL'))
     op.create_index(op.f('ix_user_memberships_deleted_at'), 'user_memberships', ['deleted_at'], unique=False)
     op.create_index('ix_user_memberships_entity', 'user_memberships', ['entity_id'], unique=False)
     op.create_index('ix_user_memberships_status', 'user_memberships', ['entity_id', 'status'], unique=False)
@@ -2673,8 +3107,10 @@ def upgrade() -> None:
     op.create_index('ix_leases_worker_status', 'work_leases', ['worker_id', 'status'], unique=False)
     op.create_index('ix_worker_activity_recent', 'worker_activity_log', ['worker_id', 'occurred_at'], unique=False)
     op.create_index('ix_workers_entity_status', 'workers', ['entity_id', 'status'], unique=False)
+    op.create_index('ix_workflow_action_grants_lineage', 'workflow_action_grants', ['workflow_lineage_root_run_id', 'grant_type'], unique=False)
     op.create_index('ix_workflow_action_grants_project', 'workflow_action_grants', ['project_id', 'grant_type'], unique=False)
     op.create_index('ix_workflow_action_grants_workspace', 'workflow_action_grants', ['workspace_id', 'expires_at'], unique=False)
+    op.create_index('uq_workflow_action_grants_proposal_item', 'workflow_action_grants', ['proposal_item_id'], unique=True, postgresql_where=sa.text('proposal_item_id IS NOT NULL'), sqlite_where=sa.text('proposal_item_id IS NOT NULL'))
     op.create_index('ix_workflow_bindings_entity_workspace', 'workflow_bindings', ['entity_id', 'workspace_id'], unique=False)
     op.create_index('ix_workflow_bindings_workflow', 'workflow_bindings', ['workflow_id'], unique=False)
     op.create_index(op.f('ix_workflow_definitions_created_by'), 'workflow_definitions', ['created_by'], unique=False)
@@ -2683,15 +3119,20 @@ def upgrade() -> None:
     op.create_index('ix_workflow_projects_entity_type', 'workflow_projects', ['entity_id', 'project_type'], unique=False)
     op.create_index('ix_workflow_projects_workspace_stage', 'workflow_projects', ['workspace_id', 'current_stage'], unique=False)
     op.create_index('uq_workflow_projects_business_key', 'workflow_projects', ['entity_id', 'workspace_id', 'project_type', 'project_key'], unique=True)
+    op.create_index('ix_workflow_runs_continuation_due', 'workflow_runs', ['continuation_next_attempt_at'], unique=False)
     op.create_index('ix_workflow_runs_entity_status', 'workflow_runs', ['entity_id', 'status'], unique=False)
     op.create_index('ix_workflow_runs_lineage_root_run_id', 'workflow_runs', ['lineage_root_run_id'], unique=False)
     op.create_index('ix_workflow_runs_retry_of_run_id', 'workflow_runs', ['retry_of_run_id'], unique=False)
+    op.create_index('ix_workflow_runs_terminal_effects_due', 'workflow_runs', ['terminal_effects_completed_at', 'terminal_effects_next_attempt_at', 'id'], unique=False)
     op.create_index('ix_workflow_runs_workflow', 'workflow_runs', ['workflow_id', 'created_at'], unique=False)
     op.create_index('ix_workflow_runs_workspace', 'workflow_runs', ['workspace_id'], unique=False)
+    op.create_index('uq_workflow_runs_webchat_submission', 'workflow_runs', ['binding_id', 'webchat_session_id', 'webchat_module_id', 'webchat_submission_id'], unique=True, postgresql_where=sa.text("trigger_source = 'public_webchat' AND webchat_session_id IS NOT NULL AND webchat_module_id IS NOT NULL AND webchat_submission_id IS NOT NULL"), sqlite_where=sa.text("trigger_source = 'public_webchat' AND webchat_session_id IS NOT NULL AND webchat_module_id IS NOT NULL AND webchat_submission_id IS NOT NULL"))
     op.create_index(op.f('ix_workflow_template_installations_entity_id'), 'workflow_template_installations', ['entity_id'], unique=False)
     op.create_index(op.f('ix_workflow_template_installations_installed_by'), 'workflow_template_installations', ['installed_by'], unique=False)
     op.create_index('ix_workflow_template_installations_workflow', 'workflow_template_installations', ['workflow_id'], unique=False)
     op.create_index('ix_ws_activity_workspace', 'workspace_activities', ['workspace_id', 'created_at'], unique=False)
+    op.create_index('ix_workspace_artifact_purge_due', 'workspace_artifact_purge_jobs', ['next_attempt_at', 'created_at', 'id'], unique=False)
+    op.create_index('uq_workspace_artifact_purge_scope', 'workspace_artifact_purge_jobs', ['entity_id', 'storage_base'], unique=True)
     op.create_index(op.f('ix_workspace_blueprints_author_user_id'), 'workspace_blueprints', ['author_user_id'], unique=False)
     op.create_index(op.f('ix_workspace_blueprints_entity_id'), 'workspace_blueprints', ['entity_id'], unique=False)
     op.create_index(op.f('ix_workspace_blueprints_remixed_from_id'), 'workspace_blueprints', ['remixed_from_id'], unique=False)
@@ -2707,7 +3148,7 @@ def upgrade() -> None:
     op.create_index('ix_ws_operation_drafts_entity_workspace', 'workspace_operation_drafts', ['entity_id', 'workspace_id'], unique=False)
     op.create_index('ix_ws_operation_drafts_workspace_status', 'workspace_operation_drafts', ['workspace_id', 'status'], unique=False)
     op.create_index('ix_workspace_staff_user', 'workspace_staff', ['user_id'], unique=False)
-    op.create_index('ix_workspace_staff_workspace_user', 'workspace_staff', ['workspace_id', 'user_id'], unique=False)
+    op.create_index('uq_workspace_staff_workspace_user', 'workspace_staff', ['workspace_id', 'user_id'], unique=True)
     op.create_index('ix_workspace_stat_observations_stat_time', 'workspace_stat_observations', ['stat_id', 'observed_at'], unique=False)
     op.create_index('ix_workspace_stat_observations_workspace_time', 'workspace_stat_observations', ['workspace_id', 'observed_at'], unique=False)
     op.create_index('uq_workspace_stat_observations_idempotency', 'workspace_stat_observations', ['stat_id', 'idempotency_key'], unique=True)
@@ -2719,13 +3160,25 @@ def upgrade() -> None:
     op.create_index(op.f('ix_workspaces_deleted_at'), 'workspaces', ['deleted_at'], unique=False)
     op.create_index('ix_workspaces_entity', 'workspaces', ['entity_id'], unique=False)
     op.create_index('uq_workspaces_artifact_folder_id', 'workspaces', ['artifact_folder_id'], unique=True)
+    op.create_index('ix_chat_feedback_conversation', 'chat_message_feedback', ['conversation_id', 'created_at'], unique=False)
+    op.create_index('ix_chat_feedback_entity_created', 'chat_message_feedback', ['entity_id', 'created_at'], unique=False)
+    op.create_index('ix_chat_feedback_rating', 'chat_message_feedback', ['rating', 'created_at'], unique=False)
+    op.create_index('ix_chat_feedback_user', 'chat_message_feedback', ['user_id'], unique=False)
+    op.create_index('ux_chat_feedback_target_user', 'chat_message_feedback', ['target_kind', 'target_id', 'user_id'], unique=True)
+    op.create_index('ix_mcp_account_tool_catalogs_provider', 'mcp_account_tool_catalogs', ['provider'], unique=False)
     op.create_index('ix_notif_delivery_notification', 'notification_deliveries', ['notification_id'], unique=False)
     op.create_index('ix_notif_delivery_open_by_contact', 'notification_deliveries', ['channel_contact_id', 'status'], unique=False)
     op.create_index('ix_notif_delivery_open_by_conv', 'notification_deliveries', ['conversation_id', 'status'], unique=False)
+    op.create_index('ix_notification_outbox_due', 'notification_outbox_events', ['status', 'available_at'], unique=False)
+    op.create_index('ix_notification_outbox_lease', 'notification_outbox_events', ['status', 'locked_until'], unique=False)
+    op.create_index('uq_notification_outbox_notification', 'notification_outbox_events', ['notification_id'], unique=True)
     op.create_index(op.f('ix_staff_deleted_at'), 'staff', ['deleted_at'], unique=False)
     op.create_index('ix_staff_entity', 'staff', ['entity_id'], unique=False)
     op.create_index('ix_staff_kind', 'staff', ['entity_id', 'kind'], unique=False)
     op.create_index('ix_staff_user', 'staff', ['user_id'], unique=False)
+    op.create_index('ix_user_session_lease_expires', 'user_session_leases', ['expires_at'], unique=False)
+    op.create_index('ix_user_session_lease_scope_expiry', 'user_session_leases', ['entity_id', 'user_id', 'expires_at'], unique=False)
+    op.create_index('ix_user_session_lease_session', 'user_session_leases', ['session_id'], unique=False)
     op.create_index('ix_staff_adj_staff_date', 'staff_schedule_adjustments', ['staff_id', 'date'], unique=False)
     op.create_index('ix_staff_schedules_staff', 'staff_schedules', ['staff_id'], unique=False)
 
@@ -2735,15 +3188,31 @@ def downgrade() -> None:
     op.drop_table('staff_schedules')
     op.drop_index('ix_staff_adj_staff_date', table_name='staff_schedule_adjustments')
     op.drop_table('staff_schedule_adjustments')
+    op.drop_index('ix_user_session_lease_session', table_name='user_session_leases')
+    op.drop_index('ix_user_session_lease_scope_expiry', table_name='user_session_leases')
+    op.drop_index('ix_user_session_lease_expires', table_name='user_session_leases')
+    op.drop_table('user_session_leases')
     op.drop_index('ix_staff_user', table_name='staff')
     op.drop_index('ix_staff_kind', table_name='staff')
     op.drop_index('ix_staff_entity', table_name='staff')
     op.drop_index(op.f('ix_staff_deleted_at'), table_name='staff')
     op.drop_table('staff')
+    op.drop_index('uq_notification_outbox_notification', table_name='notification_outbox_events')
+    op.drop_index('ix_notification_outbox_lease', table_name='notification_outbox_events')
+    op.drop_index('ix_notification_outbox_due', table_name='notification_outbox_events')
+    op.drop_table('notification_outbox_events')
     op.drop_index('ix_notif_delivery_open_by_conv', table_name='notification_deliveries')
     op.drop_index('ix_notif_delivery_open_by_contact', table_name='notification_deliveries')
     op.drop_index('ix_notif_delivery_notification', table_name='notification_deliveries')
     op.drop_table('notification_deliveries')
+    op.drop_index('ix_mcp_account_tool_catalogs_provider', table_name='mcp_account_tool_catalogs')
+    op.drop_table('mcp_account_tool_catalogs')
+    op.drop_index('ux_chat_feedback_target_user', table_name='chat_message_feedback')
+    op.drop_index('ix_chat_feedback_user', table_name='chat_message_feedback')
+    op.drop_index('ix_chat_feedback_rating', table_name='chat_message_feedback')
+    op.drop_index('ix_chat_feedback_entity_created', table_name='chat_message_feedback')
+    op.drop_index('ix_chat_feedback_conversation', table_name='chat_message_feedback')
+    op.drop_table('chat_message_feedback')
     op.drop_table('browser_tool_specs')
     op.drop_index('uq_workspaces_artifact_folder_id', table_name='workspaces')
     op.drop_index('ix_workspaces_entity', table_name='workspaces')
@@ -2760,7 +3229,7 @@ def downgrade() -> None:
     op.drop_index('ix_workspace_stat_observations_workspace_time', table_name='workspace_stat_observations')
     op.drop_index('ix_workspace_stat_observations_stat_time', table_name='workspace_stat_observations')
     op.drop_table('workspace_stat_observations')
-    op.drop_index('ix_workspace_staff_workspace_user', table_name='workspace_staff')
+    op.drop_index('uq_workspace_staff_workspace_user', table_name='workspace_staff')
     op.drop_index('ix_workspace_staff_user', table_name='workspace_staff')
     op.drop_table('workspace_staff')
     op.drop_index('ix_ws_operation_drafts_workspace_status', table_name='workspace_operation_drafts')
@@ -2781,17 +3250,23 @@ def downgrade() -> None:
     op.drop_index(op.f('ix_workspace_blueprints_entity_id'), table_name='workspace_blueprints')
     op.drop_index(op.f('ix_workspace_blueprints_author_user_id'), table_name='workspace_blueprints')
     op.drop_table('workspace_blueprints')
+    op.drop_index('uq_workspace_artifact_purge_scope', table_name='workspace_artifact_purge_jobs')
+    op.drop_index('ix_workspace_artifact_purge_due', table_name='workspace_artifact_purge_jobs')
+    op.drop_table('workspace_artifact_purge_jobs')
     op.drop_index('ix_ws_activity_workspace', table_name='workspace_activities')
     op.drop_table('workspace_activities')
     op.drop_index('ix_workflow_template_installations_workflow', table_name='workflow_template_installations')
     op.drop_index(op.f('ix_workflow_template_installations_installed_by'), table_name='workflow_template_installations')
     op.drop_index(op.f('ix_workflow_template_installations_entity_id'), table_name='workflow_template_installations')
     op.drop_table('workflow_template_installations')
+    op.drop_index('uq_workflow_runs_webchat_submission', table_name='workflow_runs', postgresql_where=sa.text("trigger_source = 'public_webchat' AND webchat_session_id IS NOT NULL AND webchat_module_id IS NOT NULL AND webchat_submission_id IS NOT NULL"), sqlite_where=sa.text("trigger_source = 'public_webchat' AND webchat_session_id IS NOT NULL AND webchat_module_id IS NOT NULL AND webchat_submission_id IS NOT NULL"))
     op.drop_index('ix_workflow_runs_workspace', table_name='workflow_runs')
     op.drop_index('ix_workflow_runs_workflow', table_name='workflow_runs')
+    op.drop_index('ix_workflow_runs_terminal_effects_due', table_name='workflow_runs')
     op.drop_index('ix_workflow_runs_retry_of_run_id', table_name='workflow_runs')
     op.drop_index('ix_workflow_runs_lineage_root_run_id', table_name='workflow_runs')
     op.drop_index('ix_workflow_runs_entity_status', table_name='workflow_runs')
+    op.drop_index('ix_workflow_runs_continuation_due', table_name='workflow_runs')
     op.drop_table('workflow_runs')
     op.drop_index('uq_workflow_projects_business_key', table_name='workflow_projects')
     op.drop_index('ix_workflow_projects_workspace_stage', table_name='workflow_projects')
@@ -2804,8 +3279,10 @@ def downgrade() -> None:
     op.drop_index('ix_workflow_bindings_workflow', table_name='workflow_bindings')
     op.drop_index('ix_workflow_bindings_entity_workspace', table_name='workflow_bindings')
     op.drop_table('workflow_bindings')
+    op.drop_index('uq_workflow_action_grants_proposal_item', table_name='workflow_action_grants', postgresql_where=sa.text('proposal_item_id IS NOT NULL'), sqlite_where=sa.text('proposal_item_id IS NOT NULL'))
     op.drop_index('ix_workflow_action_grants_workspace', table_name='workflow_action_grants')
     op.drop_index('ix_workflow_action_grants_project', table_name='workflow_action_grants')
+    op.drop_index('ix_workflow_action_grants_lineage', table_name='workflow_action_grants')
     op.drop_table('workflow_action_grants')
     op.drop_index('ix_workers_entity_status', table_name='workers')
     op.drop_table('workers')
@@ -2815,6 +3292,7 @@ def downgrade() -> None:
     op.drop_index('ix_leases_step_status', table_name='work_leases')
     op.drop_index('ix_leases_expiry_scan', table_name='work_leases')
     op.drop_table('work_leases')
+    op.drop_table('wechat_personal_sessions')
     op.drop_index('ix_webhook_endpoints_entity', table_name='webhook_endpoints')
     op.drop_table('webhook_endpoints')
     op.drop_index('ix_webhook_deliveries_endpoint', table_name='webhook_deliveries')
@@ -2842,6 +3320,14 @@ def downgrade() -> None:
     op.drop_index('ix_user_memberships_entity', table_name='user_memberships')
     op.drop_index(op.f('ix_user_memberships_deleted_at'), table_name='user_memberships')
     op.drop_table('user_memberships')
+    op.drop_index('uq_twilio_voice_sessions_call_sid', table_name='twilio_voice_call_sessions', postgresql_where=sa.text('call_sid IS NOT NULL'))
+    op.drop_index('ix_twilio_voice_sessions_expires', table_name='twilio_voice_call_sessions')
+    op.drop_index('ix_twilio_voice_sessions_config_status', table_name='twilio_voice_call_sessions')
+    op.drop_index(op.f('ix_twilio_voice_call_sessions_workspace_id'), table_name='twilio_voice_call_sessions')
+    op.drop_index(op.f('ix_twilio_voice_call_sessions_owner_user_id'), table_name='twilio_voice_call_sessions')
+    op.drop_index(op.f('ix_twilio_voice_call_sessions_entity_id'), table_name='twilio_voice_call_sessions')
+    op.drop_index(op.f('ix_twilio_voice_call_sessions_channel_config_id'), table_name='twilio_voice_call_sessions')
+    op.drop_table('twilio_voice_call_sessions')
     op.drop_index('uq_tool_intent_paths_key', table_name='tool_intent_paths')
     op.drop_index('ix_tool_intent_paths_user', table_name='tool_intent_paths')
     op.drop_table('tool_intent_paths')
@@ -2885,6 +3371,7 @@ def downgrade() -> None:
     op.drop_table('subscription_workers')
     op.drop_index('ix_staff_roles_entity', table_name='staff_roles')
     op.drop_table('staff_roles')
+    op.drop_index('uq_skills_builtin_slug', table_name='skills', postgresql_where=sa.text('entity_id IS NULL AND slug IS NOT NULL'))
     op.drop_index('ix_skills_workspace', table_name='skills')
     op.drop_index('ix_skills_tags', table_name='skills', postgresql_using='gin')
     op.drop_index('ix_skills_slug', table_name='skills')
@@ -2897,6 +3384,7 @@ def downgrade() -> None:
     op.drop_index('ix_sites_slug', table_name='sites')
     op.drop_index('ix_sites_entity', table_name='sites')
     op.drop_index('ix_sites_custom_domain', table_name='sites')
+    op.drop_index('ix_sites_created_by_user', table_name='sites')
     op.drop_table('sites')
     op.drop_index('ix_site_events_workspace_created', table_name='site_events')
     op.drop_index('ix_site_events_type', table_name='site_events')
@@ -2906,9 +3394,30 @@ def downgrade() -> None:
     op.drop_index('ix_shares_expires', table_name='shares')
     op.drop_index('ix_shares_entity_status', table_name='shares')
     op.drop_table('shares')
+    op.drop_index('ix_scheduled_jobs_skill_generation_due', table_name='scheduled_jobs')
+    op.drop_index('ix_scheduled_jobs_due', table_name='scheduled_jobs')
     op.drop_table('scheduled_jobs')
     op.drop_index('uq_scheduled_job_runs_occurrence', table_name='scheduled_job_runs')
     op.drop_table('scheduled_job_runs')
+    op.drop_index('uq_sandbox_runners_base_url', table_name='sandbox_runners')
+    op.drop_index('ix_sandbox_runners_status', table_name='sandbox_runners')
+    op.drop_table('sandbox_runners')
+    op.drop_index('uq_sandbox_reservations_sandbox', table_name='sandbox_reservations', postgresql_where=sa.text('sandbox_id IS NOT NULL'))
+    op.drop_index('ix_sandbox_reservations_root_status', table_name='sandbox_reservations')
+    op.drop_index('ix_sandbox_reservations_queue', table_name='sandbox_reservations', postgresql_where=sa.text("status IN ('queued','requeued')"))
+    op.drop_table('sandbox_reservations')
+    op.drop_index('ix_sandbox_instances_runner_status', table_name='sandbox_instances')
+    op.drop_index('ix_sandbox_instances_root_status', table_name='sandbox_instances')
+    op.drop_table('sandbox_instances')
+    op.drop_index('uq_runtime_runs_active_conversation', table_name='runtime_runs', postgresql_where=sa.text("parent_run_id IS NULL AND status IN ('queued','running','waiting_resource','resuming','cancel_requested','cancelling')"))
+    op.drop_index('ix_runtime_runs_root_status', table_name='runtime_runs')
+    op.drop_index('ix_runtime_runs_entity_status', table_name='runtime_runs')
+    op.drop_index('ix_runtime_runs_conversation_created', table_name='runtime_runs')
+    op.drop_table('runtime_runs')
+    op.drop_index('ix_runtime_outbox_pending', table_name='runtime_outbox_events', postgresql_where=sa.text('delivered_at IS NULL'))
+    op.drop_table('runtime_outbox_events')
+    op.drop_index('ix_runtime_execution_claims_expires', table_name='runtime_execution_claims')
+    op.drop_table('runtime_execution_claims')
     op.drop_index('ix_runtime_evidence_workspace_created', table_name='runtime_evidence')
     op.drop_index('ix_runtime_evidence_type_status', table_name='runtime_evidence')
     op.drop_index('ix_runtime_evidence_task_created', table_name='runtime_evidence')
@@ -2921,6 +3430,7 @@ def downgrade() -> None:
     op.drop_index('ix_runtime_event_logs_entity_created', table_name='runtime_event_logs')
     op.drop_index('ix_runtime_event_logs_conversation_created', table_name='runtime_event_logs')
     op.drop_table('runtime_event_logs')
+    op.drop_index('uq_review_runs_workspace_delivery_live_or_terminal', table_name='review_runs', postgresql_where=sa.text("delivery_id IS NOT NULL AND status IN ('running', 'succeeded', 'skipped')"))
     op.drop_index('uq_review_runs_one_running', table_name='review_runs', postgresql_where=sa.text("status = 'running'"))
     op.drop_index('ix_review_runs_workspace_created', table_name='review_runs')
     op.drop_table('review_runs')
@@ -2938,6 +3448,9 @@ def downgrade() -> None:
     op.drop_index('ix_proposal_items_workspace_status', table_name='proposal_items')
     op.drop_index('ix_proposal_items_proposal', table_name='proposal_items')
     op.drop_table('proposal_items')
+    op.drop_index('uq_product_growth_event_source', table_name='product_growth_events')
+    op.drop_index('ix_product_growth_user_milestone_occurred', table_name='product_growth_events')
+    op.drop_table('product_growth_events')
     op.drop_index('ix_platform_settings_key', table_name='platform_settings')
     op.drop_table('platform_settings')
     op.drop_index('ix_platform_model_provider_keys_status', table_name='platform_model_provider_keys')
@@ -2967,6 +3480,8 @@ def downgrade() -> None:
     op.drop_index('uq_oauth_accounts_user_provider_external', table_name='oauth_accounts')
     op.drop_index('ix_oauth_accounts_user_provider', table_name='oauth_accounts')
     op.drop_table('oauth_accounts')
+    op.drop_index('uq_notifications_recipient_idempotency', table_name='notifications')
+    op.drop_index('ix_notifications_workspace', table_name='notifications')
     op.drop_index('ix_notifications_user', table_name='notifications')
     op.drop_index('ix_notifications_due', table_name='notifications')
     op.drop_table('notifications')
@@ -2976,8 +3491,17 @@ def downgrade() -> None:
     op.drop_table('nango_webhook_events')
     op.drop_table('metrics_daily_usage')
     op.drop_table('metrics_daily_tool_calls')
+    op.drop_index('uq_messages_conversation_response_surface_event', table_name='messages', postgresql_where=sa.text('response_surface_event_id IS NOT NULL'))
     op.drop_index('ix_messages_conv', table_name='messages')
     op.drop_table('messages')
+    op.drop_index('uq_message_logs_whatsapp_inbound_event', table_name='message_logs', postgresql_where=sa.text("channel_type = 'whatsapp' AND direction = 'inbound' AND external_id IS NOT NULL"))
+    op.drop_index('uq_message_logs_wechat_personal_inbound_message', table_name='message_logs', postgresql_where=sa.text("channel_type = 'wechat_personal' AND direction = 'inbound' AND external_id IS NOT NULL"))
+    op.drop_index('uq_message_logs_wechat_inbound_message', table_name='message_logs', postgresql_where=sa.text("channel_type = 'wechat' AND direction = 'inbound' AND external_id IS NOT NULL"))
+    op.drop_index('uq_message_logs_twilio_inbound_sid', table_name='message_logs', postgresql_where=sa.text("channel_type = 'twilio_sms' AND direction = 'inbound' AND external_id IS NOT NULL"))
+    op.drop_index('uq_message_logs_slack_inbound_event', table_name='message_logs', postgresql_where=sa.text("channel_type = 'slack' AND direction = 'inbound' AND external_id IS NOT NULL"))
+    op.drop_index('uq_message_logs_outlook_inbound_message', table_name='message_logs', postgresql_where=sa.text("channel_type = 'outlook' AND direction = 'inbound' AND external_id IS NOT NULL"))
+    op.drop_index('uq_message_logs_ms_teams_inbound_event', table_name='message_logs', postgresql_where=sa.text("channel_type = 'ms_teams' AND direction = 'inbound' AND external_id IS NOT NULL"))
+    op.drop_index('uq_message_logs_discord_inbound_interaction', table_name='message_logs', postgresql_where=sa.text("channel_type = 'discord' AND direction = 'inbound' AND external_id IS NOT NULL"))
     op.drop_index('ix_message_logs_external', table_name='message_logs')
     op.drop_index('ix_message_logs_entity', table_name='message_logs')
     op.drop_index('ix_message_logs_conversation', table_name='message_logs')
@@ -2992,6 +3516,11 @@ def downgrade() -> None:
     op.drop_table('media_jobs')
     op.drop_index('ix_mcp_servers_status', table_name='mcp_servers')
     op.drop_table('mcp_servers')
+    op.drop_index('ix_marketplace_resource_links_source', table_name='marketplace_resource_links')
+    op.drop_index('ix_marketplace_resource_links_local', table_name='marketplace_resource_links')
+    op.drop_index(op.f('ix_marketplace_resource_links_linked_by'), table_name='marketplace_resource_links')
+    op.drop_index(op.f('ix_marketplace_resource_links_entity_id'), table_name='marketplace_resource_links')
+    op.drop_table('marketplace_resource_links')
     op.drop_index('ix_invitation_codes_status', table_name='invitation_codes')
     op.drop_index('ix_invitation_codes_expires', table_name='invitation_codes')
     op.drop_table('invitation_codes')
@@ -3019,6 +3548,8 @@ def downgrade() -> None:
     op.drop_table('governance_revisions')
     op.drop_index(op.f('ix_governance_policies_entity_id'), table_name='governance_policies')
     op.drop_table('governance_policies')
+    op.drop_index('uq_goals_workspace_goal_key', table_name='goals', postgresql_where=sa.text('workspace_id IS NOT NULL'), sqlite_where=sa.text('workspace_id IS NOT NULL'))
+    op.drop_index('uq_goals_entity_goal_key', table_name='goals', postgresql_where=sa.text('workspace_id IS NULL'), sqlite_where=sa.text('workspace_id IS NULL'))
     op.drop_index('ix_goals_workspace_status', table_name='goals')
     op.drop_index('ix_goals_stat_id', table_name='goals')
     op.drop_index('ix_goals_entity_status', table_name='goals')
@@ -3040,11 +3571,15 @@ def downgrade() -> None:
     op.drop_index('ix_plans_entity_status', table_name='execution_plans')
     op.drop_table('execution_plans')
     op.drop_index('ix_event_type', table_name='event_logs')
+    op.drop_index('ix_event_external_delivery_lease', table_name='event_logs', postgresql_where=sa.text("external_delivery_status = 'processing'"))
+    op.drop_index('ix_event_external_delivery_due', table_name='event_logs', postgresql_where=sa.text("external_delivery_status IN ('pending', 'processing')"))
     op.drop_index('ix_event_entity_created', table_name='event_logs')
     op.drop_table('event_logs')
     op.drop_table('entity_quotas')
     op.drop_index(op.f('ix_entities_deleted_at'), table_name='entities')
     op.drop_table('entities')
+    op.drop_index('uq_documents_upload_idempotency', table_name='documents', postgresql_where=sa.text('upload_idempotency_key IS NOT NULL'), sqlite_where=sa.text('upload_idempotency_key IS NOT NULL'))
+    op.drop_index('uq_documents_entity_fs_path_active', table_name='documents', postgresql_where=sa.text('fs_path IS NOT NULL AND is_trashed = false'), sqlite_where=sa.text('fs_path IS NOT NULL AND is_trashed = 0'))
     op.drop_index('ix_documents_name', table_name='documents')
     op.drop_index('ix_documents_fs_path', table_name='documents')
     op.drop_index('ix_documents_entity', table_name='documents')
@@ -3078,6 +3613,7 @@ def downgrade() -> None:
     op.drop_table('conversation_shares')
     op.drop_index('ix_consolidation_reports_workspace_created', table_name='consolidation_reports')
     op.drop_table('consolidation_reports')
+    op.drop_index('ix_comments_resource_normalized', table_name='comments')
     op.drop_index('ix_comments_resource', table_name='comments')
     op.drop_index('ix_comments_parent', table_name='comments')
     op.drop_table('comments')
@@ -3089,10 +3625,7 @@ def downgrade() -> None:
     op.drop_index('ix_client_errors_entity_created', table_name='client_error_events')
     op.drop_index('ix_client_errors_created', table_name='client_error_events')
     op.drop_table('client_error_events')
-    op.drop_index('ix_chat_feedback_rating', table_name='chat_message_feedback')
-    op.drop_index('ix_chat_feedback_entity_created', table_name='chat_message_feedback')
-    op.drop_index('ix_chat_feedback_conversation', table_name='chat_message_feedback')
-    op.drop_table('chat_message_feedback')
+    op.drop_index('ux_channels_active_whatsapp_config', table_name='channels', postgresql_where=sa.text("type = 'whatsapp' AND status = 'active' AND config ->> 'channel_config_id' IS NOT NULL"), sqlite_where=sa.text("type = 'whatsapp' AND status = 'active' AND config ->> 'channel_config_id' IS NOT NULL"))
     op.drop_table('channels')
     op.drop_index(op.f('ix_channel_pairing_codes_expires_at'), table_name='channel_pairing_codes')
     op.drop_index(op.f('ix_channel_pairing_codes_entity_id'), table_name='channel_pairing_codes')
@@ -3104,6 +3637,9 @@ def downgrade() -> None:
     op.drop_index('ix_channel_contacts_entity', table_name='channel_contacts')
     op.drop_index('ix_channel_contacts_contact', table_name='channel_contacts')
     op.drop_table('channel_contacts')
+    op.drop_index('ux_channel_configs_whatsapp_phone_number_id', table_name='channel_configs')
+    op.drop_index('ux_channel_configs_telegram_bot_id', table_name='channel_configs')
+    op.drop_index('ux_channel_configs_discord_installation', table_name='channel_configs')
     op.drop_index('ix_channel_configs_type', table_name='channel_configs')
     op.drop_index('ix_channel_configs_entity', table_name='channel_configs')
     op.drop_table('channel_configs')
@@ -3115,11 +3651,30 @@ def downgrade() -> None:
     op.drop_table('business_order_items')
     op.drop_index('ux_blueprint_purchases_live_entitlement', table_name='blueprint_purchases', postgresql_where=sa.text("status != 'refunded'"))
     op.drop_index('ux_blueprint_purchases_checkout_session', table_name='blueprint_purchases', postgresql_where=sa.text('stripe_checkout_session_id IS NOT NULL'))
+    op.drop_index('ix_blueprint_purchases_seller_recovery_due', table_name='blueprint_purchases')
+    op.drop_index('ix_blueprint_purchases_seller_recovery', table_name='blueprint_purchases')
+    op.drop_index('ix_blueprint_purchases_seller', table_name='blueprint_purchases')
+    op.drop_index('ix_blueprint_purchases_payment_intent', table_name='blueprint_purchases')
     op.drop_index('ix_blueprint_purchases_buyer', table_name='blueprint_purchases')
     op.drop_index('ix_blueprint_purchases_blueprint', table_name='blueprint_purchases')
+    op.drop_index('ix_blueprint_purchases_allocation_recovery_due', table_name='blueprint_purchases')
+    op.drop_index('ix_blueprint_purchases_allocation_recovery', table_name='blueprint_purchases')
     op.drop_table('blueprint_purchases')
     op.drop_index('ix_blueprint_favorites_blueprint', table_name='blueprint_favorites')
     op.drop_table('blueprint_favorites')
+    op.drop_index('ux_blueprint_checkout_refunds_payment_intent', table_name='blueprint_checkout_refunds')
+    op.drop_index('ix_blueprint_checkout_refunds_session_buyer', table_name='blueprint_checkout_refunds')
+    op.drop_index('ix_blueprint_checkout_refunds_purchase', table_name='blueprint_checkout_refunds')
+    op.drop_index('ix_blueprint_checkout_refunds_due', table_name='blueprint_checkout_refunds')
+    op.drop_index('ix_blueprint_checkout_refunds_buyer', table_name='blueprint_checkout_refunds')
+    op.drop_index('ix_blueprint_checkout_refunds_attempt', table_name='blueprint_checkout_refunds')
+    op.drop_table('blueprint_checkout_refunds')
+    op.drop_index('ux_blueprint_checkout_attempts_session', table_name='blueprint_checkout_attempts', postgresql_where=sa.text('stripe_checkout_session_id IS NOT NULL'))
+    op.drop_index('ux_blueprint_checkout_attempts_payment_intent', table_name='blueprint_checkout_attempts', postgresql_where=sa.text('stripe_payment_intent_id IS NOT NULL'))
+    op.drop_index('ix_blueprint_checkout_attempts_seller', table_name='blueprint_checkout_attempts')
+    op.drop_index('ix_blueprint_checkout_attempts_purchase', table_name='blueprint_checkout_attempts')
+    op.drop_index('ix_blueprint_checkout_attempts_blueprint', table_name='blueprint_checkout_attempts')
+    op.drop_table('blueprint_checkout_attempts')
     op.drop_index('uq_automation_revisions_target_rev', table_name='automation_revisions')
     op.drop_table('automation_revisions')
     op.drop_index('ix_audit_entity', table_name='audit_log')
