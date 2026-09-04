@@ -22,28 +22,21 @@ _PERSISTED_PPTX_CONTEXT_KEYS = (
 )
 
 
-async def runtime_save_sandbox_context(conversation_id: str, ctx: dict[str, Any]) -> bool:
+async def runtime_save_sandbox_context(conversation_id: str, ctx: dict[str, Any]) -> None:
     """Persist Runtime-owned sandbox conversation context."""
 
     if not conversation_id:
-        return False
+        return
     try:
         from packages.core.cache import cache
 
-        saved = await cache.set(
+        await cache.set(
             f"{RUNTIME_SANDBOX_CONTEXT_PREFIX}{conversation_id}",
             ctx,
             ttl=RUNTIME_SANDBOX_CONTEXT_TTL,
         )
-        if not saved:
-            logger.warning(
-                "[runtime.sandbox] context save unavailable: conversation=%s",
-                conversation_id,
-            )
-        return bool(saved)
     except Exception as exc:
-        logger.warning("[runtime.sandbox] context save failed: %s", exc)
-        return False
+        logger.debug("[runtime.sandbox] context save failed: %s", exc)
 
 
 async def runtime_load_sandbox_context(conversation_id: str) -> dict[str, Any] | None:
@@ -80,7 +73,6 @@ async def runtime_init_sandbox_context(
     skill_key: str | None = None,
     entity_id: str | None = None,
     user_id: str | None = None,
-    agent_id: str | None = None,
     preserve_pptx_checkpoint: bool = True,
 ) -> dict[str, Any]:
     """Initialize or safely resume Runtime-owned sandbox context.
@@ -93,7 +85,6 @@ async def runtime_init_sandbox_context(
 
     entity_value = str(entity_id or "")
     user_value = str(user_id or "")
-    agent_value = str(agent_id or "")
     skill_key_value = str(skill_key or "").strip()
     existing = await runtime_load_sandbox_context(conversation_id)
     same_owner_and_skill = (
@@ -101,7 +92,6 @@ async def runtime_init_sandbox_context(
         and str(existing.get("skill_id") or "") == skill_id
         and str(existing.get("entity_id") or "") == entity_value
         and str(existing.get("user_id") or "") == user_value
-        and str(existing.get("agent_id") or "") == agent_value
     )
     can_resume = same_owner_and_skill and str(existing.get("sandbox_id") or "") == sandbox_id
     can_restore_pptx = (
@@ -119,7 +109,6 @@ async def runtime_init_sandbox_context(
                 "skill_key": skill_key_value,
                 "entity_id": entity_value,
                 "user_id": user_value,
-                "agent_id": agent_value,
                 "last_initialized_at": time.time(),
             }
         )
@@ -132,7 +121,6 @@ async def runtime_init_sandbox_context(
             "skill_key": skill_key_value,
             "entity_id": entity_value,
             "user_id": user_value,
-            "agent_id": agent_value,
             "created_at": time.time(),
             "exec_history": [],
         }
@@ -143,8 +131,7 @@ async def runtime_init_sandbox_context(
             ctx["pptx_checkpoint_restored_from_sandbox"] = str(
                 existing.get("sandbox_id") or ""
             )
-    if not await runtime_save_sandbox_context(conversation_id, ctx):
-        raise RuntimeError("Sandbox owner context could not be persisted.")
+    await runtime_save_sandbox_context(conversation_id, ctx)
     return ctx
 
 

@@ -75,17 +75,6 @@ def test_settings_read_cloud_runtime_overrides(monkeypatch):
     get_settings.cache_clear()
 
 
-def test_settings_reject_unknown_database_pool_mode_only_in_cloud(monkeypatch):
-    from packages.core.config import get_settings
-
-    monkeypatch.setenv("DATABASE_POOL_MODE", "mystery")
-    monkeypatch.setenv("DEPLOYMENT_MODE", "cloud")
-    get_settings.cache_clear()
-
-    with pytest.raises(RuntimeError, match="DATABASE_POOL_MODE"):
-        get_settings()
-
-    get_settings.cache_clear()
 
 
 def test_database_pool_kwargs_use_env_settings_for_non_test_database():

@@ -198,7 +198,6 @@ def chrome_outcome_for_result(
     content: Any,
     stop_reason: Any,
     error: Any = None,
-    control: dict[str, Any] | None = None,
 ) -> ChromeSkillOutcome:
     """Translate child-loop and Harness state into a parent-facing outcome."""
 
@@ -206,22 +205,13 @@ def chrome_outcome_for_result(
     pending_confirmation = contract.get("pending_chrome_confirmation")
     interruption = contract.get("control_interruption")
     normalized_stop_reason = str(stop_reason or "").strip().lower()
-    capability_blocked = (
-        isinstance(control, dict)
-        and control.get("kind") in {"capability_blocked", "tool_error"}
-        and control.get("blocked_capability") == "chrome"
-    )
     if error or normalized_stop_reason in {"error", "credit_exhausted"}:
         status: ChromeSkillStatus = "failed"
     elif isinstance(pending_confirmation, dict):
         status = "needs_approval"
     elif isinstance(interruption, dict):
         status = "needs_user"
-    elif capability_blocked or normalized_stop_reason in {
-        "max_rounds",
-        "cancelled",
-        "canceled",
-    }:
+    elif normalized_stop_reason in {"max_rounds", "cancelled", "canceled"}:
         status = "blocked"
     else:
         status = "completed"
@@ -237,21 +227,6 @@ def chrome_outcome_for_result(
             else None
         ),
         "stop_reason": str(stop_reason or "").strip() or None,
-        "block_reason": (
-            str(
-                control.get("block_reason")
-                or control.get("error_reason")
-                or ""
-            ).strip()
-            or None
-            if capability_blocked
-            else None
-        ),
-        "setup_url": (
-            str(control.get("setup_url") or "").strip() or None
-            if capability_blocked
-            else None
-        ),
     }
     state = ChromeSkillRunState(
         run_id=str(contract.get("run_id") or ""),

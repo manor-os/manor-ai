@@ -403,6 +403,7 @@ export default function WorkflowNodeConfigPanel({
     enabled: step?.type === "agent",
     staleTime: 0,
   });
+  let marketplaceAgents: { id: string; name: string }[] = [];
   const { data: skills = [] } = useQuery({
     queryKey: ["skills"],
     queryFn: () => api.skills.list(),
@@ -735,6 +736,9 @@ export default function WorkflowNodeConfigPanel({
                 options={[
                   { value: "", label: "— None (configure inline) —" },
                   ...(agents as { id: string; name: string }[]).map((a) => ({ value: a.id, label: a.name })),
+                  ...(marketplaceAgents as { id: string; name: string }[])
+                    .filter((m) => !(agents as { id: string }[]).some((a) => a.id === m.id))
+                    .map((m) => ({ value: m.id, label: `${m.name} · marketplace` })),
                 ]}
               />
               {config.agent_id && <OpenLink label="Open agent" onClick={() => goResource(`/agents/${config.agent_id}`)} />}

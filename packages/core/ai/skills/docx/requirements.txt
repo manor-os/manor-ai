@@ -1,3 +1,0 @@
-# OOXML unpacking, validation, and tracked-change helpers.
-defusedxml>=0.7
-lxml>=5.0

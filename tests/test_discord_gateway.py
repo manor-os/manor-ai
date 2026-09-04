@@ -173,39 +173,6 @@ async def test_discord_gateway_rejects_mismatched_token_application(
     assert not ready_path.exists()
 
 
-def test_doks_apply_treats_discord_gateway_as_a_singleton_app_workload() -> None:
-    source = (ROOT / "scripts" / "k8s_digitalocean_apply.sh").read_text()
-
-    assert (
-        "manor-beat|manor-discord-gateway|manor-web|wechat-runner"
-        in source
-    )
-    assert (
-        'rollout status "deployment/${deployment_name}" '
-        '--timeout=${ROLLOUT_WAIT_TIMEOUT}'
-        in source
-    )
-    assert "wait_for_deployment_rollout manor-discord-gateway" in source
-    assert 'validate_live_singleton_deployment "manor-discord-gateway"' in source
-    assert '--deployment-name "$deployment_name"' in source
-    assert source.count('"$overlay_config/discord-gateway.yaml"') >= 2
-
-
-def test_singleton_validator_accepts_discord_gateway_identity() -> None:
-    from scripts.k8s_wechat_runner_singleton import (
-        validate_live_wechat_runner_singleton,
-    )
-
-    validate_live_wechat_runner_singleton(
-        {
-            "metadata": {"name": "manor-discord-gateway"},
-            "spec": {"replicas": 1},
-            "status": {"updatedReplicas": 1, "availableReplicas": 1},
-        },
-        {"items": []},
-        {"items": []},
-        deployment_name="manor-discord-gateway",
-    )
 
 
 @pytest.mark.asyncio

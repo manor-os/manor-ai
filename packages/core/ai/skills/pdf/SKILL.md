@@ -16,16 +16,16 @@ This guide covers essential PDF processing operations using Python libraries and
 2. Inspect structure with `pypdf` or `pdfplumber`, but render every relevant page to PNG for layout review. Text extraction alone is not a visual correctness check.
 3. Put temporary work under `tmp/pdfs/` and final files under `output/pdf/` inside the skill workspace.
 4. After each meaningful edit, run `python scripts/verify_pdf.py <output.pdf> <render_dir/>`, then inspect every rendered page for alignment, spacing, clipping, glyphs, tables, images, headers, footers, and page transitions. Add `--expect-interactive --require-form-appearances` for an editable form or `--expect-flattened` for a static form copy.
-5. Before returning, save the verified file with `sandbox(action="save_result", params={...})`. That creates a new managed artifact through Manor's file-action boundary; do not use `generate_file` or `patch_file` to replace a read-only attachment.
+5. Before returning, save the verified file with `sandbox_save_result`. That creates a new managed artifact through Manor's file-action boundary; do not use `write_file` or `edit_file` to replace a read-only attachment.
 
 For signed PDFs, preserve the signed original. Editing invalidates its signature. Refuse by default and continue only when the user explicitly accepts signature invalidation. Never flatten a signed PDF without that explicit decision.
 
 ### Final Delivery Contract
 
-- Deliver one canonical PDF from the absolute path `/skill/output/pdf/<descriptive-name>.pdf`. The `filename` passed to sandbox action `save_result` must match that basename.
-- Call sandbox action `save_result` only after structural verification and page-by-page visual review. Save the final PDF exactly once in the successful path.
+- Deliver one canonical PDF from the absolute path `/skill/output/pdf/<descriptive-name>.pdf`. The `filename` passed to `sandbox_save_result` must match that basename.
+- Call `sandbox_save_result` only after structural verification and page-by-page visual review. Save the final PDF exactly once in the successful path.
 - Never save helper scripts, render PNGs, temporary copies, intermediate PDFs, or a fallback DOCX as final artifacts. Keep all of those under `/skill/tmp/pdfs/`.
-- If sandbox action `save_result` fails, use its exact returned error to correct the path or artifact once. Do not guess alternate directories or repeat an unchanged save call. The runtime stops the same failed file delivery after three attempts.
+- If `sandbox_save_result` fails, use its exact returned error to correct the path or artifact once. Do not guess alternate directories or repeat an unchanged save call. The runtime stops the same failed file delivery after three attempts.
 - Do not generate a DOCX substitute unless the user explicitly asked for a Word version. A missing PDF dependency is a readiness error, not permission to change the requested file type.
 
 ## Rendering and Validation
@@ -90,9 +90,9 @@ The generator validates required data, resolves fonts across sandbox/Linux/macOS
 
 Created PDFs may use photographs, illustrations, diagrams, textures, logos, and other raster images when they improve the document. Do not default to text-only pages when the user's brief calls for visual storytelling. Use one or more of these source routes:
 
-1. **User-provided or Knowledge image** - import the returned `fs_path` or upload path into `/skill/tmp/pdfs/assets/` with sandbox action `write_file`. Preserve the original as a read-only input.
+1. **User-provided or Knowledge image** - import the returned `fs_path` or upload path into `/skill/tmp/pdfs/assets/` with `sandbox_write_file`. Preserve the original as a read-only input.
 2. **Downloaded image** - use `web_search` or `web_fetch` to identify the source page and confirm the usage rights, then download the direct HTTPS image URL into `/skill/tmp/pdfs/assets/source/`. Record the source page, direct asset URL, license, and required credit. If the license or permission is unknown, do not embed the image.
-3. **Generated image** - call the system `generate_file(kind="image")` tool with the subject, visual style, composition, and aspect ratio. Use text-free imagery; keep all titles, labels, charts, and factual data as native PDF content. Import the returned workspace `fs_path` into `/skill/tmp/pdfs/assets/source/` with sandbox action `write_file` before continuing.
+3. **Generated image** - call the system `generate_file(kind="image")` tool with the subject, visual style, composition, and aspect ratio. Use text-free imagery; keep all titles, labels, charts, and factual data as native PDF content. Import the returned workspace `fs_path` into `/skill/tmp/pdfs/assets/source/` with `sandbox_write_file` before continuing.
 
 Never point ReportLab, fpdf2, or another renderer at a remote URL. Every image must exist as a local sandbox file before layout begins. If a download is unavailable in the sandbox, use a user-provided or generated image instead and report the limitation; do not leave a broken placeholder.
 

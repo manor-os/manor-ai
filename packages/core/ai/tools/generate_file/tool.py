@@ -9,11 +9,6 @@ from packages.core.contracts.audio_generation import (
     GenerateFileKind,
 )
 from packages.core.ai.runtime.tool_context import runtime_tool_call_context_from_kwargs
-from packages.core.contracts.file_engine import (
-    OPERATION_GENERATION_TYPES,
-    TEMPLATE_OPERATION_GENERATION_TYPES,
-    file_type_from_path,
-)
 
 from . import common
 from .audio import handle_audio
@@ -167,52 +162,6 @@ async def _generate_file_handler(
         "kwargs": kwargs,
         "agent_id": agent_id,
     }
-
-    has_template = "template" in kwargs or "template" in raw_params
-    if has_template or "operations" in kwargs or "operations" in raw_params:
-        office_types = {
-            GenerateFileKind.WORD_DOCUMENT: "docx",
-            GenerateFileKind.PRESENTATION: "pptx",
-            GenerateFileKind.SPREADSHEET: "xlsx",
-        }
-        if kind not in {GenerateFileKind.DOCUMENT, *office_types}:
-            return json.dumps({"error": "operations generation supports document/word_document/presentation/spreadsheet only"})
-        if "operations" in kwargs and "operations" in raw_params and kwargs["operations"] != raw_params["operations"]:
-            return json.dumps({"error": "Conflicting operations in top-level arguments and params"})
-        operations = kwargs["operations"] if "operations" in kwargs else raw_params.get("operations")
-        if not isinstance(operations, list) or not operations:
-            return json.dumps({"error": "operations must contain at least one patch operation"})
-        if any(source.get(key) is not None for source in (kwargs, raw_params) for key in ("content", "prompt", "files", "options")):
-            return json.dumps({"error": "operations cannot be combined with content, prompt, files or options"})
-        requested_type = str(kwargs.get("file_type") or params.get("file_type") or "").lower().lstrip(".")
-        if kwargs.get("file_type") and params.get("file_type") and str(params["file_type"]).lower().lstrip(".") != requested_type:
-            return json.dumps({"error": "Conflicting file_type in top-level arguments and params"})
-        selected_type = requested_type or office_types.get(kind) or file_type_from_path(name)
-        allowed_types = (
-            TEMPLATE_OPERATION_GENERATION_TYPES if has_template else OPERATION_GENERATION_TYPES
-        )
-        kind_matches = (
-            kind not in office_types
-            or office_types[kind] == selected_type
-            or (kind is GenerateFileKind.SPREADSHEET and selected_type == "xlsm")
-        )
-        if selected_type not in allowed_types or not kind_matches:
-            return json.dumps({
-                "error": (
-                    "operations file_type must match the selected Office kind "
-                    "(docx/pptx/xlsx; xlsm requires a template)"
-                ),
-            })
-        handler_kwargs["kwargs"] = {**kwargs, "operations": operations, "file_type": selected_type}
-        if has_template:
-            if "template" in kwargs and "template" in raw_params and kwargs["template"] != raw_params["template"]:
-                return json.dumps({"error": "Conflicting template in top-level arguments and params"})
-            template = kwargs["template"] if "template" in kwargs else raw_params["template"]
-            if not isinstance(template, dict):
-                return json.dumps({"error": "template requires path and expected_sha256 from read_file"})
-            handler_kwargs["kwargs"]["template"] = template
-        handler_kwargs["name"] = name or f"generated-document.{selected_type}"
-        return await handle_document(**handler_kwargs)
 
     if kind is GenerateFileKind.DIAGRAM:
         return await handle_diagram(**handler_kwargs)

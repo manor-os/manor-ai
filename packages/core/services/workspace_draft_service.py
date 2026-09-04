@@ -38,7 +38,6 @@ from packages.core.constants.workspace_drafts import (
     CREATION_PREFERENCES_FIELD,
     CURRENT_WORKSPACE_DRAFT_SCHEMA_VERSION,
     WORKSPACE_DRAFT_SCHEMA_VERSION_FIELD,
-    uses_ui_runtime_mode,
 )
 from packages.core.ai.runtime import (
     runtime_lint_workspace_draft,
@@ -354,7 +353,7 @@ def apply_public_field_updates(
     draft: WorkspaceDraft,
     updates: dict[str, Any],
 ) -> None:
-    """Merge user edits; a runtime-mode switch is itself the user's choice."""
+    """Merge public field edits without preserving stale creation consent."""
 
     previous_fields = dict(draft.fields or {})
     fields = dict(previous_fields)
@@ -366,17 +365,15 @@ def apply_public_field_updates(
         current = fields.get(CREATION_PREFERENCES_FIELD)
         preferences = dict(current) if isinstance(current, dict) else {}
         if (
-            any(key in updates and updates[key] != previous_fields.get(key)
-                for key in ("goals", "stats"))
+            "goals" in updates
+            and updates["goals"] != previous_fields.get("goals")
         ):
             preferences["goal_confirmed"] = False
         autonomy_changed = any(
             key in updates and updates[key] != previous_fields.get(key)
             for key in ("heartbeat_enabled", "heartbeat_cadence")
         )
-        if uses_ui_runtime_mode(fields) and "heartbeat_enabled" in updates:
-            preferences["autonomy_confirmed"] = True
-        elif autonomy_changed:
+        if autonomy_changed:
             preferences["autonomy_confirmed"] = False
         fields[CREATION_PREFERENCES_FIELD] = preferences
     draft.fields = fields
@@ -914,19 +911,13 @@ async def apply_blueprint(
     operating_model = dict(recipe.get("operating_model") or {})
 
     fields = copy.deepcopy(dict(draft.fields or DEFAULT_FIELDS))
-    previous_preferences = fields.get(CREATION_PREFERENCES_FIELD)
-    preserve_runtime_mode = (
-        uses_ui_runtime_mode(fields)
-        and isinstance(previous_preferences, dict)
-        and previous_preferences.get("autonomy_confirmed") is True
-    )
     if (
         WORKSPACE_DRAFT_SCHEMA_VERSION_FIELD in fields
         or CREATION_PREFERENCES_FIELD in fields
     ):
         fields[CREATION_PREFERENCES_FIELD] = {
             "goal_confirmed": False,
-            "autonomy_confirmed": preserve_runtime_mode,
+            "autonomy_confirmed": False,
         }
     fields["_blueprint_install_metadata"] = {
         BLUEPRINT_VERSION_KEY: str(source_version or "") or None,
@@ -969,7 +960,6 @@ async def apply_blueprint(
         ]
     if blueprint_goals:
         fields["goals"] = blueprint_goals
-    fields["stats"] = copy.deepcopy(recipe.get("stats") or [])
 
     scheduled_automations = [
         _blueprint_scheduled_job_to_draft(dict(job))
@@ -993,7 +983,7 @@ async def apply_blueprint(
         if isinstance(value, dict) and value:
             fields[object_key] = copy.deepcopy(value)
 
-    if "heartbeat_enabled" in operating_model and not preserve_runtime_mode:
+    if "heartbeat_enabled" in operating_model:
         fields["heartbeat_enabled"] = bool(operating_model["heartbeat_enabled"])
     if operating_model.get("heartbeat_cadence"):
         fields["heartbeat_cadence"] = operating_model["heartbeat_cadence"]
@@ -1117,7 +1107,6 @@ async def apply_blueprint(
         "settings",
         "services",
         "goals",
-        "stats",
         "rules",
         "automations",
         "evaluation",

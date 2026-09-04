@@ -336,7 +336,7 @@ async def allocate_reserved_sandbox_once(
 
 
 async def dispatch_runtime_outbox_once(*, batch_size: int = 20) -> int:
-    """Recover stale runs and publish pending versioned outbox rows."""
+    """Publish pending outbox rows; resume workers deduplicate by run version."""
 
     if not _durable_external_sandbox_enabled():
         return 0
@@ -345,25 +345,6 @@ async def dispatch_runtime_outbox_once(*, batch_size: int = 20) -> int:
     now = datetime.now(timezone.utc)
     session_factory = create_worker_session()
     async with session_factory() as db:
-        from packages.core.services.runtime_run_service import (
-            recover_expired_runtime_run_leases,
-        )
-
-        recovered, failed = await recover_expired_runtime_run_leases(
-            db,
-            now=now,
-            batch_size=batch_size,
-        )
-        if recovered or failed:
-            logger.warning(
-                "Runtime lease recovery sweep recovered=%d failed=%d",
-                recovered,
-                failed,
-            )
-        # Commit the recovered run state before its outbox event can reach a
-        # worker. If publishing wins that race, the worker could otherwise
-        # claim the old expired row and then be overwritten back to queued.
-        await db.commit()
         events = list(
             (
                 await db.execute(

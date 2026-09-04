@@ -40,8 +40,6 @@ logger = logging.getLogger(__name__)
 
 _sse = format_sse
 
-_DRAFT_STREAM_KEEPALIVE_SECONDS = 15.0
-
 
 class _HiddenBlockTokenFilter:
     """Drop the model's hidden ``<workspace_setup>...</workspace_setup>``
@@ -274,7 +272,6 @@ async def create_draft(
 # Event names emitted:
 #   start    {draft_id, status}
 #   token    {content}            -- one or more deltas of assistant text
-#   keepalive {draft_id}           -- keeps quiet tool phases connected
 #   done     {reply, draft}       -- the full final reply + hydrated draft
 #   error    {message}
 
@@ -402,19 +399,7 @@ async def _stream_turn(
 
     try:
         while True:
-            try:
-                event_name, payload = await asyncio.wait_for(
-                    queue.get(),
-                    timeout=_DRAFT_STREAM_KEEPALIVE_SECONDS,
-                )
-            except asyncio.TimeoutError:
-                # Capability matching can spend several minutes inside a
-                # single tool call without producing model deltas. Emit a
-                # small frame so proxies and browsers do not mistake that
-                # quiet period for an abandoned response and cancel runner
-                # before it can enqueue the terminal ``done`` event.
-                yield _sse("keepalive", {"draft_id": draft_id})
-                continue
+            event_name, payload = await queue.get()
             if (event_name, payload) == DONE:
                 break
             yield _sse(event_name, payload)
@@ -726,8 +711,6 @@ async def update_draft_fields(
             "Internal draft fields cannot be updated: "
             + ", ".join(internal_fields),
         )
-    if "heartbeat_enabled" in req and not isinstance(req["heartbeat_enabled"], bool):
-        raise HTTPException(400, "heartbeat_enabled must be a boolean")
     if "blueprint_channel_config_ids" in req:
         selections = req["blueprint_channel_config_ids"]
         if not isinstance(selections, dict) or any(

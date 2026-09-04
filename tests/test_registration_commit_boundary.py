@@ -73,7 +73,6 @@ async def test_registration_commits_before_success_or_verification(db_session, m
         return "12345678"
 
     monkeypatch.setattr(auth, "create_verification", verification_after_commit)
-    # Deliberately inspect before get_db's dependency teardown would commit.
     result = await auth.register(req, Request({"type": "http"}), db_session)
     await assert_committed()
     if mode in {"verification", "resend"}:

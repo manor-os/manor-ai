@@ -55,11 +55,7 @@ test("DOCX text editing autosaves and clears its saved confirmation", async ({ p
     await expect(editor).toBeVisible();
     await expect(editor).toHaveAttribute("contenteditable", "true");
     await expect(page.getByTitle("Undo (Ctrl+Z)")).toBeEnabled();
-    const toolsMenu = page.getByRole("button", { name: "Tools", exact: true });
-    await expect(toolsMenu).toBeEnabled();
-    await toolsMenu.click();
-    await expect(page.getByRole("menuitem", { name: "Find", exact: true })).toBeEnabled();
-    await toolsMenu.click();
+    await expect(page.getByTitle("Find (Cmd/Ctrl+F)")).toBeEnabled();
     await expect(page.locator(".richtext-editor-toolbar")).not.toHaveAttribute("aria-disabled", "true");
 
     const savedStatus = page.locator(".manor-editor-header").getByText("Saved", { exact: true });

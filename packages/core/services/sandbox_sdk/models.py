@@ -74,7 +74,6 @@ class SandboxInfo:
     last_used_at: float
     config: dict = field(default_factory=dict)
     active_command: Optional[str] = None
-    active_execution_id: Optional[str] = None
     expires_at: Optional[float] = None
 
 
@@ -115,48 +114,6 @@ class CancelExecutionResult:
     sandbox_id: str
     execution_id: str
     cancelled: bool
-
-
-@dataclass
-class ExecutionEventResult:
-    sequence: int
-    event_id: str
-    type: str
-    message: str = ""
-    payload: dict = field(default_factory=dict)
-    requires_response: bool = False
-    responded: bool = False
-    created_at: float = 0.0
-
-
-@dataclass
-class ExecutionStatusResult:
-    sandbox_id: str
-    execution_id: str
-    status: str
-    created_at: float
-    started_at: Optional[float] = None
-    finished_at: Optional[float] = None
-    stdout: Optional[str] = None
-    stderr: Optional[str] = None
-    exit_code: Optional[int] = None
-    error: Optional[str] = None
-    events: list[ExecutionEventResult] = field(default_factory=list)
-    next_sequence: int = 0
-    waiting_for_response: bool = False
-
-    @property
-    def terminal(self) -> bool:
-        return self.status in {"completed", "failed", "cancelled"}
-
-
-@dataclass
-class ExecutionResponseResult:
-    sandbox_id: str
-    execution_id: str
-    event_id: str
-    accepted: bool
-    duplicate: bool = False
 
 
 @dataclass

@@ -441,9 +441,7 @@ async def _bind_tools(
     try:
         from packages.core.ai.runtime.tool_registry import runtime_registered_tool_names
 
-        registered_names = set(
-            runtime_registered_tool_names(include_undiscoverable=True)
-        )
+        registered_names = set(runtime_registered_tool_names())
     except Exception:
         registered_names = set()
     bound: List[str] = []

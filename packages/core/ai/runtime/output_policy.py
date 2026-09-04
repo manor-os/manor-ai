@@ -7,7 +7,6 @@ from typing import Any
 from packages.core.ai.runtime.skill_forcing import runtime_message_text_for_intent
 from packages.core.services.sensitive_data import (
     redact_sensitive_text,
-    sanitize_approval_credentials,
     sanitize_sensitive_payload,
 )
 
@@ -273,7 +272,6 @@ def runtime_public_tool_result(value: Any) -> Any:
 
     if value is None:
         return value
-    value = sanitize_approval_credentials(value)
     text = value if isinstance(value, str) else str(value)
     had_executor_prefix = bool(_TOOL_ERROR_PREFIX_RE.search(text))
     public_text = _TOOL_ERROR_PREFIX_RE.sub("", text).strip()
@@ -381,8 +379,6 @@ def runtime_public_tool_payload(value: Any) -> Any:
             continue
         if key in _PUBLIC_TOOL_RESULT_KEYS:
             item = runtime_public_tool_result(item)
-        elif key in {"args", "arguments"}:
-            item = sanitize_approval_credentials(item)
         projected[key] = runtime_public_tool_payload(item)
     if (
         value.get("kind") == "tool"

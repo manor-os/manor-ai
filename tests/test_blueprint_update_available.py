@@ -32,7 +32,7 @@ from packages.core.blueprints.freshness import (
 )
 from packages.core.blueprints.solo_company import get_solo_company_blueprint
 
-SLUG = "solo-faceless-stickman-studio-v1"
+SLUG = "solo-video-account-studio-v1"
 
 
 @pytest.fixture

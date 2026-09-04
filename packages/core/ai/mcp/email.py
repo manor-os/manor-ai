@@ -28,7 +28,6 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
-import contextvars
 import imaplib
 import json
 import logging
@@ -51,54 +50,22 @@ _MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024
 _MAX_TOTAL_ATTACHMENT_BYTES = 20 * 1024 * 1024
 _MAX_THREAD_SCAN = 500
 
-_call_context: contextvars.ContextVar[Dict[str, Any]] = contextvars.ContextVar(
-    "email_mcp_call_context",
-    default={},
-)
-
-
-def set_call_context(context: Dict[str, Any]) -> None:
-    """Bind the current Runtime actor and Workspace to this async tool call."""
-
-    _call_context.set(dict(context or {}))
-
-
-def clear_call_context() -> None:
-    _call_context.set({})
-
 
 _ATTACHMENTS_SCHEMA: Dict[str, Any] = {
     "type": "array",
-    "description": (
-        "Optional MIME attachments (max 10 files / 20 MiB total). Each item uses "
-        "either data_base64 plus filename, or an authorized Workspace document_id."
-    ),
+    "description": "Optional MIME attachments encoded as base64 (max 10 files / 20 MiB total).",
     "maxItems": 10,
     "items": {
         "type": "object",
+        "required": ["filename", "data_base64"],
         "properties": {
-            "filename": {"type": "string", "minLength": 1},
+            "filename": {"type": "string"},
             "content_type": {
                 "type": "string",
                 "description": "MIME type; defaults to application/octet-stream.",
             },
-            "data_base64": {"type": "string", "minLength": 1},
-            "document_id": {
-                "type": "string",
-                "minLength": 1,
-                "description": "Authorized local Workspace/Knowledge document to attach.",
-            },
+            "data_base64": {"type": "string"},
         },
-        "oneOf": [
-            {
-                "required": ["document_id"],
-                "not": {"required": ["data_base64"]},
-            },
-            {
-                "required": ["filename", "data_base64"],
-                "not": {"required": ["document_id"]},
-            },
-        ],
     },
 }
 
@@ -155,21 +122,6 @@ _TOOLS: Dict[str, Dict[str, Any]] = {
     },
     "download_attachment": {
         "description": "Download one message attachment as base64-encoded bytes.",
-        "required": ["uid", "attachment_id"],
-        "properties": {
-            "uid": {"type": "string"},
-            "attachment_id": {
-                "type": "string",
-                "description": "ID returned by list_attachments/get_message.",
-            },
-            "folder": {"type": "string", "description": "Default 'INBOX'."},
-        },
-    },
-    "save_attachment_to_workspace": {
-        "description": (
-            "Download one IMAP attachment, save it to the current Workspace's "
-            "Email attachments folder, project it to Knowledge, and extract readable text."
-        ),
         "required": ["uid", "attachment_id"],
         "properties": {
             "uid": {"type": "string"},
@@ -378,17 +330,6 @@ async def call_tool(
         return _error("Email credentials malformed.")
 
     try:
-        arguments = dict(arguments)
-        if name in {
-            "send_email",
-            "reply_to_message",
-            "reply_all",
-            "create_draft",
-            "update_draft",
-        }:
-            arguments["attachments"] = await _hydrate_outgoing_attachments(
-                arguments.get("attachments") or []
-            )
         if name == "send_email":
             text = await asyncio.to_thread(_send_email, cfg, arguments)
         elif name == "list_messages":
@@ -399,8 +340,6 @@ async def call_tool(
             text = await asyncio.to_thread(_list_attachments, cfg, arguments)
         elif name == "download_attachment":
             text = await asyncio.to_thread(_download_attachment, cfg, arguments)
-        elif name == "save_attachment_to_workspace":
-            text = await _save_attachment_to_workspace(cfg, arguments)
         elif name == "reply_to_message":
             text = await asyncio.to_thread(_reply_to_message, cfg, arguments, False)
         elif name == "reply_all":
@@ -441,103 +380,9 @@ async def call_tool(
 
     # Attachment bytes are intentionally returned losslessly; truncating a
     # base64 payload would silently corrupt the downloaded file.
-    lossless_tools = {
-        "download_attachment",
-        "save_attachment_to_workspace",
-        "get_message",
-        "get_thread",
-        "get_draft",
-    }
+    lossless_tools = {"download_attachment", "get_message", "get_thread", "get_draft"}
     payload = text if name in lossless_tools else _truncate(text)
     return {"content": [{"type": "text", "text": payload}], "isError": False}
-
-
-async def _hydrate_outgoing_attachments(attachments: Any) -> List[Dict[str, Any]]:
-    """Resolve Workspace document references before entering blocking SMTP code."""
-
-    if not isinstance(attachments, list):
-        raise _EmailError("attachments must be an array.")
-    if len(attachments) > 10:
-        raise _EmailError("At most 10 attachments are allowed.")
-
-    context = _call_context.get()
-    hydrated: List[Dict[str, Any]] = []
-    for index, item in enumerate(attachments):
-        if not isinstance(item, dict):
-            raise _EmailError(f"Attachment {index + 1} must be an object.")
-        document_id = str(item.get("document_id") or "").strip()
-        if not document_id:
-            hydrated.append(dict(item))
-            continue
-        if item.get("data_base64") not in (None, ""):
-            raise _EmailError(
-                f"Attachment {index + 1} must use document_id or data_base64, not both."
-            )
-
-        from packages.core.services.email_attachments import (
-            EmailAttachmentError,
-            load_workspace_document_email_attachment,
-        )
-
-        try:
-            loaded = await load_workspace_document_email_attachment(
-                entity_id=str(context.get("entity_id") or ""),
-                user_id=str(context.get("user_id") or ""),
-                workspace_id=str(context.get("workspace_id") or "") or None,
-                document_id=document_id,
-                filename=str(item.get("filename") or "") or None,
-            )
-        except EmailAttachmentError as exc:
-            raise _EmailError(str(exc)) from exc
-        hydrated.append(loaded)
-    return hydrated
-
-
-async def _save_attachment_to_workspace(
-    cfg: Dict[str, Any],
-    args: Dict[str, Any],
-) -> str:
-    """Bridge an IMAP attachment into Workspace files and Knowledge."""
-
-    context = _call_context.get()
-    if not all(context.get(key) for key in ("entity_id", "workspace_id", "user_id")):
-        raise _EmailError(
-            "Saving an email attachment requires the current Workspace and user context."
-        )
-    raw = await asyncio.to_thread(_download_attachment, cfg, args)
-    downloaded = json.loads(raw)
-    try:
-        data = base64.b64decode(str(downloaded.get("data_base64") or ""), validate=True)
-    except (binascii.Error, ValueError) as exc:
-        raise _EmailError("Downloaded attachment data is invalid.") from exc
-
-    from packages.core.services.email_attachments import (
-        EmailAttachmentError,
-        persist_workspace_email_attachment,
-    )
-
-    try:
-        saved = await persist_workspace_email_attachment(
-            entity_id=str(context.get("entity_id") or ""),
-            workspace_id=str(context.get("workspace_id") or ""),
-            user_id=str(context.get("user_id") or ""),
-            data=data,
-            filename=str(downloaded.get("filename") or "attachment"),
-            content_type=str(
-                downloaded.get("content_type") or "application/octet-stream"
-            ),
-            source={
-                "message_id": downloaded.get("message_id"),
-                "folder": downloaded.get("folder"),
-                "uid": downloaded.get("uid"),
-                "attachment_id": downloaded.get("attachment_id"),
-            },
-            task_id=str(context.get("task_id") or "") or None,
-            conversation_id=str(context.get("conversation_id") or "") or None,
-        )
-    except EmailAttachmentError as exc:
-        raise _EmailError(str(exc)) from exc
-    return json.dumps(saved, ensure_ascii=False)
 
 
 # ── SMTP send (blocking helper) ─────────────────────────────────────────────
@@ -812,7 +657,6 @@ def _download_attachment(cfg: Dict[str, Any], args: Dict[str, Any]) -> str:
             return json.dumps({
                 "uid": uid,
                 "folder": folder,
-                "message_id": str(msg.get("Message-ID") or ""),
                 **meta,
                 "data_base64": base64.b64encode(data).decode("ascii"),
             }, ensure_ascii=False)

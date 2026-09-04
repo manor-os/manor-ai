@@ -62,7 +62,7 @@ def test_video_edit_tool_contract_has_approval_gated_operations():
     assert parameters["properties"]["quality"]["default"] == "high"
 
 
-def test_professional_video_sandbox_is_a_deferred_capability_tool():
+def test_professional_video_sandbox_is_a_direct_master_chat_tool():
     description = VIDEO_EDIT_SCHEMA["function"]["description"]
 
     assert "Video Edit" in description
@@ -70,8 +70,8 @@ def test_professional_video_sandbox_is_a_deferred_capability_tool():
     assert "HyperFrames" not in description
     assert "video_edit" in CORE_CAPABILITIES["sandbox.execute"].tool_names
     assert runtime_capability_id_for_action_key("video_edit") == "sandbox.execute"
-    assert "video_edit" not in MASTER_ALWAYS_LOADED
-    assert not runtime_tool_is_eager_for_profile(
+    assert "video_edit" in MASTER_ALWAYS_LOADED
+    assert runtime_tool_is_eager_for_profile(
         "video_edit",
         is_master=True,
     )

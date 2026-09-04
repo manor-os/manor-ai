@@ -363,21 +363,6 @@ function _formatMs(ms: number): string {
   return `${m}m ${(s - m * 60).toFixed(0)}s`;
 }
 
-function _hasCompletedDraftTurn(
-  messages: WorkspaceDraftMessage[],
-  userMessage: string,
-): boolean {
-  if (messages.length < 2) return false;
-  const assistant = messages[messages.length - 1];
-  const user = messages[messages.length - 2];
-  return (
-    user.role === "user" &&
-    user.content.trim() === userMessage.trim() &&
-    assistant.role === "assistant" &&
-    assistant.content.trim().length > 0
-  );
-}
-
 const DRAFT_ID_ALPHABET = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 
 function createClientDraftId(): string {
@@ -604,23 +589,9 @@ export default function WorkspaceDraftChat() {
       flushLiveEventsToLastAssistant();
       setDraft(turn.draft);
     },
-    onError: (err: Error, { id, message }) => {
+    onError: (err: Error) => {
       toast.error(t("page.workspace_draft_chat.send_failed"), err.message);
       setMessages((prev) => prev.slice(0, -2));
-      // The server did not acknowledge this turn with ``done``. Put the
-      // exact text back in the composer so a transport failure cannot make
-      // the user's input disappear, then reconcile any state that committed
-      // before the connection ended.
-      setInput((current) => current.trim() ? current : message);
-      void api.workspaceDrafts.get(id).then((freshDraft) => {
-        setDraft(freshDraft);
-        if (_hasCompletedDraftTurn(freshDraft.messages, message)) {
-          setMessages(freshDraft.messages.map((entry) => ({ ...entry })));
-          setInput((current) => current === message ? "" : current);
-        }
-      }).catch(() => {
-        // Keep the original send error and retryable composer text visible.
-      });
       liveEventsRef.current = [];
       setLiveEvents([]);
     },

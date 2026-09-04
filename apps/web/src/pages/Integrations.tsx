@@ -991,6 +991,7 @@ function MCPAgentsPanel({
   );
   // Drop internal automation-only cards from the public integration grid.
   const HIDDEN_INTERNAL_AUTOMATION_KEYS = new Set([
+    "local_browser",
     "knowledge_local",
     "chrome_knowledge_local",
   ]);
@@ -1924,6 +1925,7 @@ function ServerCard({
   let isCliWorker = false;
   let isLocalWorkerManager = false;
   let isManagedSessionCard = false;
+  let isChromeManagedSession = false;
   const hasEntityAccounts = (server.entity_accounts?.length ?? 0) > 0;
   const accessState = connectorAccessState(server);
   const hasPartialConnection = accessState !== "connect";
@@ -1933,6 +1935,7 @@ function ServerCard({
     : server.capabilities || [];
   const showGenericCapabilities = genericCapabilities.length > 0;
   let showManagedSessionCapabilities = false;
+  let managedSessionNeedsLoginSave = false;
   let managedSessionBusy = false;
   let managedSessionActionKey = server.server_key;
   const isEntityLevel = !!server.required_permission;
@@ -2243,6 +2246,7 @@ function ServerCard({
       title={server.name}
       subtitle={server.tagline || server.category || ""}
       meta={
+        (
           <span
             title={statusLabel}
             style={{
@@ -2252,6 +2256,7 @@ function ServerCard({
               background: "currentColor",
             }}
           />
+        )
       }
       metaTone={
         isManagedSessionCard

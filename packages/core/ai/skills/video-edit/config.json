@@ -19,7 +19,8 @@
   "tools": [
     "video_edit",
     "generate_file",
-    "patch_file",
+    "write_file",
+    "edit_file",
     "wait_media_jobs",
     "probe_media",
     "read_file",

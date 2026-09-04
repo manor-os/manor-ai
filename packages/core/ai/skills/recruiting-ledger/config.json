@@ -24,10 +24,9 @@
   "ledger_contracts": [
     "manor.recruiting_ledger/v1"
   ],
-  "capability_companion": {
-    "tool_names": [
-      "read_recruiting_ledger",
-      "record_recruiting_ledger"
-    ]
+  "invocation_policy": {
+    "mode": "required_before_answer",
+    "semantic_trigger": "the active internal Workspace has the Recruiting Ledger installed and the request requires reading, querying, changing, reconciling, or relying on candidate, employee, contractor, hiring, interview, onboarding, offboarding, role, manager, stage, status, or recruiting-ledger evidence, regardless of language",
+    "result_authority": "primary_source"
   }
 }

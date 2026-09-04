@@ -79,7 +79,7 @@ export default function LiveChatCallButton({ scope, disabled, onConversation, lo
         {call.transcript.map(item => <p key={item.id} className={item.role === "user" ? "live-chat-call__user" : undefined}>
           <span>{item.role === "user" ? say("you") : "AI"}</span>{item.text}
         </p>)}
-        {call.caption && <p><span>AI</span>{call.caption}</p>}
+        {call.caption && call.transcript.at(-1)?.role !== "assistant" && <p><span>AI</span>{call.caption}</p>}
       </div>
       {call.error && <p className="live-chat-call__error" role="alert">{say(`error.${call.error}`)}</p>}
       <div className="live-chat-call__actions">

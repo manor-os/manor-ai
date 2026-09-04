@@ -4,8 +4,6 @@ from types import SimpleNamespace
 
 import pytest
 
-from packages.core.ai.tools.generate_file.tool import _generate_file_handler as _generate_file
-
 from packages.core.services import artifact_knowledge
 
 
@@ -210,9 +208,10 @@ def test_executor_prefers_canonical_knowledge_refs_for_multi_file_results():
 
 
 @pytest.mark.asyncio
-async def test_generate_document_cannot_disable_knowledge_sync(tmp_path, monkeypatch):
+async def test_user_facing_write_file_cannot_disable_knowledge_sync(tmp_path, monkeypatch):
     import json
 
+    from packages.core.ai.tools import file_tools
     from packages.core.config import get_settings
     from packages.core.services import knowledge_sync
 
@@ -230,29 +229,29 @@ async def test_generate_document_cannot_disable_knowledge_sync(tmp_path, monkeyp
         sync_call.update(kwargs)
         return SimpleNamespace(synced=True, document_id="doc_write", reason=None)
 
-    monkeypatch.setattr("packages.core.ai.runtime.file_actions.runtime_guard_file_mutation", allow_write)
+    monkeypatch.setattr(file_tools, "runtime_guard_file_mutation", allow_write)
     monkeypatch.setattr(knowledge_sync, "sync_file_to_knowledge", sync_file)
     try:
         (tmp_path / "ent_1").mkdir()
-        result = json.loads(
-            await _generate_file(
-                kind="document",
-                entity_id="ent_1",
-                name="deliverable.md",
-                content="# Done\n",
-                agent_id="forged_agent",
-                _agent_id_from_context="agent_write",
-                save_to_knowledge=False,
-            )
-        )
+        result = json.loads(await file_tools._write_file(
+            entity_id="ent_1",
+            path="deliverable.md",
+            content="# Done\n",
+            agent_id="forged_agent",
+            _agent_id_from_context="agent_write",
+            save_to_knowledge=False,
+        ))
     finally:
         settings.MANOR_FS_ENABLED = old_enabled
         settings.MANOR_FS_ROOT = old_root
 
     assert sync_call["force"] is True
     assert sync_call["agent_id"] == "agent_write"
-    assert result["document"]["document_id"] == "doc_write"
-    assert result["document"]["viewer_url"] == "/viewer/doc_write"
+    assert result["document_id"] == "doc_write"
+    assert result["viewer_url"] == "/viewer/doc_write"
+    assert "save_to_knowledge" not in (
+        file_tools.WRITE_FILE_SCHEMA["function"]["parameters"]["properties"]
+    )
 
 
 def test_completed_task_output_detects_legacy_files_without_document_ids():

@@ -71,12 +71,12 @@ def test_unknown_integration_key_remains_extensible_but_unmonitored() -> None:
 
 @pytest.mark.asyncio
 async def test_health_status_distinguishes_known_unsupported_and_unknown() -> None:
-    unsupported = await integration_health.run_test("aider", {})
+    unsupported = await integration_health.run_test("manor_mcp_calendar", {})
     unknown = await integration_health.run_test("provider_typo", {})
 
     assert unsupported["ok"] is None
     assert unsupported["monitoring_status"] == "unsupported"
-    assert unsupported["provider_key"] == "aider"
+    assert unsupported["provider_key"] == "manor_mcp_calendar"
     assert unknown["ok"] is None
     assert unknown["monitoring_status"] == "unknown_provider"
     assert unknown["provider_key"] == "provider_typo"

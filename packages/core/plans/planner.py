@@ -26,7 +26,6 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-import re
 from collections.abc import Awaitable, Callable
 from copy import deepcopy
 from dataclasses import dataclass
@@ -764,8 +763,8 @@ async def _gather_context(db: AsyncSession, task: Task) -> _Context:
         staff_list = [{"staff_id": s.staff_id, "role": s.role} for s in staff_rows]
 
     # Per-agent platform tool bindings + skill bindings — so the Planner
-    # knows each agent's capabilities beyond MCP actions (e.g. generate_file,
-    # patch_file, invoke_skill, web_search).
+    # knows each agent's capabilities beyond MCP actions (e.g. write_file,
+    # generate_document_file, invoke_skill, web_search).
     agent_tool_names: dict[str, list[str]] = {}
     agent_skill_names: dict[str, list[dict]] = {}
     if agent_ids:
@@ -1126,192 +1125,31 @@ _EXPLICIT_SAVED_ARTIFACT_TERMS = (
 
 def _normalize_plan_for_task(task: Task, plan: Plan) -> Plan:
     """Normalize planner overreach before materializing executable steps."""
-    plan = _normalize_required_skill_steps(task, plan)
     plan = _normalize_internal_agent_high_risk_steps(plan)
     plan = _normalize_planner_hard_approval_steps(plan)
-    if _task_requests_text_report_only(task):
-        depended_on = {dep for step in plan.steps for dep in step.depends_on}
-        removable_keys = {
-            step.key
-            for step in plan.steps
-            if step.key not in depended_on
-            and _is_unrequested_text_report_file_write_step(step)
-        }
-        if removable_keys and len(removable_keys) < len(plan.steps):
-            metadata = plan.metadata.model_dump()
-            contract = metadata.get("acceptance_contract")
-            if isinstance(contract, dict):
-                for criterion in contract.get("criteria") or []:
-                    if isinstance(criterion, dict):
-                        criterion["evidence_step_keys"] = [
-                            key for key in criterion.get("evidence_step_keys") or []
-                            if key not in removable_keys
-                        ]
-                if any(
-                    not criterion.get("evidence_step_keys")
-                    for criterion in contract.get("criteria") or []
-                    if isinstance(criterion, dict)
-                ):
-                    metadata["acceptance_contract"] = None
-            plan = Plan.model_validate({
-                "steps": [
-                    step.model_dump()
-                    for step in plan.steps
-                    if step.key not in removable_keys
-                ],
-                "metadata": metadata,
-            })
-            try:
-                plan.metadata.normalized_removed_steps = sorted(removable_keys)
-                plan.metadata.normalization_reason = "unrequested_text_report_file_write"
-            except Exception:
-                pass
-
-    plan = _normalize_planner_acceptance_contract(plan, task)
-    _enforce_planner_acceptance_contract(plan, task)
-    return plan
-
-
-def _normalize_required_skill_steps(task: Task, plan: Plan) -> Plan:
-    """Bind required owner-service Skills to executable subagent steps."""
-    required_skills = [
-        str(value).strip()
-        for value in (getattr(task, "required_skills", None) or [])
-        if str(value or "").strip()
-    ]
-    owner_service_key = str(
-        getattr(task, "owner_service_key", "") or ""
-    ).strip()
-    if not required_skills or not owner_service_key:
+    if not _task_requests_text_report_only(task):
         return plan
 
-    changed: list[str] = []
-    steps: list[PlanStep] = []
-    for step in plan.steps:
-        if (
-            step.service_key == owner_service_key
-            and step.kind in {"llm", "subagent"}
-        ):
-            params = deepcopy(step.params)
-            params["skill_refs"] = list(dict.fromkeys([
-                *list(params.get("skill_refs") or []),
-                *required_skills,
-            ]))
-            steps.append(step.model_copy(update={
-                "kind": "subagent",
-                "params": params,
-            }))
-            changed.append(step.key)
-        else:
-            steps.append(step)
-    if not changed:
-        return plan
-    normalized = Plan(steps=steps, metadata=plan.metadata)
-    normalized.metadata.normalized_required_skill_steps = changed
-    return normalized
-
-
-def _task_acceptance_deliverables(task: Task) -> list[dict[str, Any]]:
-    expected_output = getattr(task, "expected_output", None)
-    if not isinstance(expected_output, dict):
-        return []
-    return [
-        item for item in (expected_output.get("deliverables") or [])
-        if isinstance(item, dict) and str(item.get("name") or "").strip()
-    ]
-
-
-def _acceptance_evidence_step_key(
-    deliverable_name: str,
-    steps: list[PlanStep],
-) -> str:
-    """Choose the narrowest step whose authored intent names a deliverable."""
-    needle = deliverable_name.strip().lower().replace("-", "_").replace(" ", "_")
-    for step in reversed(steps):
-        searchable = " ".join((
-            step.key,
-            str(step.description or ""),
-            str(step.params.get("prompt") or ""),
-        )).lower().replace("-", "_").replace(" ", "_")
-        if needle and needle in searchable:
-            return step.key
-    return steps[-1].key
-
-
-def _fallback_acceptance_contract(task: Task, plan: Plan) -> dict[str, Any] | None:
-    deliverables = _task_acceptance_deliverables(task)
-    if not deliverables:
-        return None
-    criteria = []
-    used_keys: set[str] = set()
-    for index, deliverable in enumerate(deliverables, 1):
-        name = str(deliverable["name"]).strip()
-        base_key = re.sub(r"[^a-z0-9]+", "_", name.lower()).strip("_") or f"deliverable_{index}"
-        key = f"{base_key}_accepted"
-        if key in used_keys:
-            key = f"{key}_{index}"
-        used_keys.add(key)
-        criteria.append({
-            "key": key,
-            "deliverable_name": name,
-            "description": str(
-                deliverable.get("acceptance")
-                or f"The {name} deliverable is produced."
-            ).strip(),
-            "evidence_step_keys": [
-                _acceptance_evidence_step_key(name, plan.steps)
-            ],
-        })
-    return {
-        "expected_result": str(
-            getattr(task, "description", None)
-            or getattr(task, "title", None)
-            or "The task deliverables are produced."
-        ).strip(),
-        "criteria": criteria,
+    depended_on = {dep for step in plan.steps for dep in step.depends_on}
+    removable_keys = {
+        step.key
+        for step in plan.steps
+        if step.key not in depended_on
+        and _is_unrequested_text_report_file_write_step(step)
     }
+    if not removable_keys or len(removable_keys) >= len(plan.steps):
+        return plan
 
-
-def _normalize_planner_acceptance_contract(task_plan: Plan, task: Task) -> Plan:
-    contract = task_plan.metadata.acceptance_contract
-    contract_payload = (
-        contract.model_dump() if contract is not None
-        else _fallback_acceptance_contract(task, task_plan)
+    normalized = Plan(
+        steps=[step for step in plan.steps if step.key not in removable_keys],
+        metadata=plan.metadata,
     )
-    if contract_payload is None:
-        return task_plan
-    expected_output = getattr(task, "expected_output", None)
-    contract_payload["task_expected_output"] = (
-        deepcopy(expected_output) if isinstance(expected_output, dict) else None
-    )
-    payload = task_plan.model_dump()
-    payload.setdefault("metadata", {})["acceptance_contract"] = contract_payload
-    return Plan.model_validate(payload)
-
-
-def _enforce_planner_acceptance_contract(plan: Plan, task: Task) -> None:
-    """Require each named Task deliverable to have one acceptance criterion."""
-    deliverable_names = [
-        str(item["name"]).strip() for item in _task_acceptance_deliverables(task)
-    ]
-    if not deliverable_names:
-        return
-    contract = plan.metadata.acceptance_contract
-    if contract is None:
-        raise PlannerError("plan is missing the required acceptance contract")
-    criterion_names = [criterion.deliverable_name for criterion in contract.criteria]
-    missing = [name for name in deliverable_names if criterion_names.count(name) == 0]
-    duplicates = [name for name in deliverable_names if criterion_names.count(name) > 1]
-    if missing:
-        raise PlannerError(
-            "acceptance contract is missing required criteria for: "
-            + ", ".join(missing)
-        )
-    if duplicates:
-        raise PlannerError(
-            "acceptance contract has duplicate criteria for: "
-            + ", ".join(duplicates)
-        )
+    try:
+        normalized.metadata.normalized_removed_steps = sorted(removable_keys)
+        normalized.metadata.normalization_reason = "unrequested_text_report_file_write"
+    except Exception:
+        pass
+    return normalized
 
 
 def _required_plan_step_errors(task: Task, plan: Plan) -> list[str]:

@@ -8,7 +8,6 @@ from unittest.mock import ANY, AsyncMock
 import pytest
 from fastapi import HTTPException
 from redis.exceptions import TimeoutError as RedisTimeoutError
-from sqlalchemy import select
 
 from apps.api.routers.chat import (
     _durable_runtime_event_stream,
@@ -16,11 +15,7 @@ from apps.api.routers.chat import (
     get_chat_runtime_run_status,
     reconnect_chat_runtime_run_events,
 )
-from packages.core.models.runtime_run import (
-    RuntimeOutboxEvent,
-    RuntimeRun,
-    RuntimeRunStatus,
-)
+from packages.core.models.runtime_run import RuntimeRun, RuntimeRunStatus
 from packages.core.models.base import generate_ulid
 from packages.core.services.runtime_event_stream import (
     parse_sse_frame,
@@ -30,7 +25,6 @@ from packages.core.services.runtime_event_stream import (
 from packages.core.services.runtime_run_service import (
     claim_runtime_run_execution,
     complete_runtime_run_execution,
-    recover_expired_runtime_run_leases,
 )
 from packages.core.tasks.runtime_tasks import _runtime_terminal_error_from_frame
 
@@ -148,69 +142,6 @@ async def test_execute_runtime_run_persists_terminal_stream_failure(monkeypatch)
     ]
 
 
-@pytest.mark.unit
-async def test_outbox_dispatch_commits_recovery_before_publishing(monkeypatch) -> None:
-    from packages.core.tasks import runtime_tasks
-
-    event = SimpleNamespace(
-        event_type="runtime.execute_run",
-        payload={"run_id": "recovered-run"},
-        delivered_at=None,
-        last_error=None,
-        attempt_count=0,
-    )
-    commits = 0
-    published: list[tuple[str, dict, str]] = []
-
-    class FakeResult:
-        def scalars(self):
-            return self
-
-        def all(self):
-            return [event]
-
-    class FakeSession:
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *_args):
-            return None
-
-        async def execute(self, _statement):
-            return FakeResult()
-
-        async def commit(self):
-            nonlocal commits
-            commits += 1
-
-    async def fake_recover(*_args, **_kwargs):
-        return 1, 0
-
-    def fake_send_task(name, *, kwargs, queue):
-        assert commits == 1
-        published.append((name, kwargs, queue))
-
-    monkeypatch.setattr(runtime_tasks, "_durable_external_sandbox_enabled", lambda: True)
-    monkeypatch.setattr(
-        "packages.core.database.create_worker_session",
-        lambda: lambda: FakeSession(),
-    )
-    monkeypatch.setattr(
-        "packages.core.services.runtime_run_service.recover_expired_runtime_run_leases",
-        fake_recover,
-    )
-    monkeypatch.setattr(runtime_tasks.celery_app, "send_task", fake_send_task)
-
-    delivered = await runtime_tasks.dispatch_runtime_outbox_once()
-
-    assert delivered == 1
-    assert commits == 2
-    assert published == [
-        ("runtime.execute_run", {"run_id": "recovered-run"}, "interactive")
-    ]
-    assert event.delivered_at is not None
-
-
 @pytest.mark.integration
 async def test_runtime_execution_claim_is_exclusive_and_terminal_write_is_idempotent(db_session) -> None:
     now = datetime.now(timezone.utc)
@@ -254,90 +185,6 @@ async def test_runtime_execution_claim_is_exclusive_and_terminal_write_is_idempo
 
     assert completed.status == RuntimeRunStatus.COMPLETED.value
     assert repeated.result == {"message_id": run.assistant_message_id}
-
-
-@pytest.mark.integration
-async def test_expired_runtime_lease_is_requeued_once_with_versioned_outbox(db_session) -> None:
-    now = datetime.now(timezone.utc)
-    run = _run(run_id=generate_ulid())
-    run.status = RuntimeRunStatus.RUNNING.value
-    run.version = 2
-    run.lease_owner = "worker-from-terminated-pod"
-    run.lease_expires_at = now - timedelta(seconds=1)
-    db_session.add(run)
-    await db_session.flush()
-
-    recovered, failed = await recover_expired_runtime_run_leases(
-        db_session,
-        now=now,
-    )
-    repeated = await recover_expired_runtime_run_leases(
-        db_session,
-        now=now,
-    )
-
-    outbox = list(
-        (
-            await db_session.execute(
-                select(RuntimeOutboxEvent).where(
-                    RuntimeOutboxEvent.aggregate_id == run.id
-                )
-            )
-        )
-        .scalars()
-        .all()
-    )
-    assert (recovered, failed) == (1, 0)
-    assert repeated == (0, 0)
-    assert run.status == RuntimeRunStatus.QUEUED.value
-    assert run.lease_owner is None
-    assert run.lease_expires_at is None
-    assert run.version == 3
-    assert len(outbox) == 1
-    assert outbox[0].dedupe_key == f"runtime.execute_run:{run.id}:recovery:3"
-    assert outbox[0].payload == {"run_id": run.id}
-
-
-@pytest.mark.integration
-async def test_runtime_lease_recovery_is_bounded_and_finalizes_expired_cancel(db_session) -> None:
-    now = datetime.now(timezone.utc)
-    exhausted = _run(run_id=generate_ulid())
-    exhausted.status = RuntimeRunStatus.RUNNING.value
-    exhausted.lease_owner = "lost-worker"
-    exhausted.lease_expires_at = now - timedelta(seconds=2)
-    cancelled = _run(run_id=generate_ulid())
-    cancelled.status = RuntimeRunStatus.CANCEL_REQUESTED.value
-    cancelled.lease_owner = "lost-cancel-worker"
-    cancelled.lease_expires_at = now - timedelta(seconds=1)
-    db_session.add_all([exhausted, cancelled])
-    for attempt in range(3):
-        db_session.add(
-            RuntimeOutboxEvent(
-                event_type="runtime.execute_run",
-                aggregate_id=exhausted.id,
-                dedupe_key=(
-                    f"runtime.execute_run:{exhausted.id}:recovery:{attempt + 2}"
-                ),
-                payload={"run_id": exhausted.id},
-                available_at=now,
-                created_at=now,
-            )
-        )
-    await db_session.flush()
-
-    recovered, failed = await recover_expired_runtime_run_leases(
-        db_session,
-        now=now,
-    )
-
-    assert (recovered, failed) == (0, 1)
-    assert exhausted.status == RuntimeRunStatus.FAILED.value
-    assert exhausted.status_reason == "runtime_recovery_exhausted"
-    assert exhausted.error["code"] == "runtime_recovery_exhausted"
-    assert exhausted.completed_at == now
-    assert cancelled.status == RuntimeRunStatus.CANCELLED.value
-    assert cancelled.status_reason == "user_cancelled"
-    assert cancelled.completed_at == now
 
 
 @pytest.mark.integration

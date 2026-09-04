@@ -106,45 +106,6 @@ class _MissingResult:
 MISSING_RESULT: Any = _MissingResult()
 
 
-def _reported_worker_failure(
-    result: Any,
-    *,
-    step_kind: str,
-) -> dict[str, Any] | None:
-    """Interpret the closed StepResult status only for agent step kinds."""
-    if step_kind not in {"llm", "subagent"} or not isinstance(result, dict):
-        return None
-    raw_status = result.get("status")
-    if raw_status is None:
-        return None
-    from packages.core.contracts.envelope import StepResultStatus
-
-    try:
-        status = StepResultStatus(str(raw_status))
-    except ValueError:
-        return {
-            "type": "InvalidStepResultStatus",
-            "message": f"invalid StepResult status {raw_status!r}",
-        }
-    if status is not StepResultStatus.FAILED:
-        return None
-    failure = result.get("failure")
-    reason = (
-        str(failure.get("reason") or "").strip()
-        if isinstance(failure, dict)
-        else ""
-    )
-    error: dict[str, Any] = {
-        "type": "WorkerReportedFailure",
-        "message": reason or str(
-            result.get("summary") or "step reported a failed StepResult"
-        ),
-    }
-    if isinstance(failure, dict) and failure:
-        error["failure"] = failure
-    return error
-
-
 _RISK_RANK = {"low": 0, "medium": 1, "high": 2}
 _DEFAULT_LEASE_TTL = timedelta(seconds=300)
 

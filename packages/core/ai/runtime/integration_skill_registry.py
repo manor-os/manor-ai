@@ -1,14 +1,13 @@
 """Internal Integration-to-Skill routing registry.
 
-Every static Integration catalog key has one route owner and one concrete
-built-in child Skill. A catalog-only Skill may explain that no executable tool
-surface exists, but it must never advertise actions the runtime cannot call.
+Every static Integration catalog key has one route owner. A route may point to
+an executable child Skill, a catalog-only placeholder, or a legacy alias.
+Catalog-only routes intentionally do not create fake MCP guidance packs.
 """
 from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from functools import lru_cache
 from typing import Literal
 
 
@@ -87,13 +86,6 @@ INTEGRATION_SKILL_ROUTES: dict[str, IntegrationSkillRoute] = {
             "manor calendar",
         ),
         _route(
-            "manor_mcp_minutes",
-            "platform-productivity",
-            "mcp_manor_mcp_minutes",
-            "manor minutes",
-            "meeting minutes",
-        ),
-        _route(
             "google_drive",
             "platform-productivity",
             "mcp_google_drive",
@@ -116,12 +108,6 @@ INTEGRATION_SKILL_ROUTES: dict[str, IntegrationSkillRoute] = {
         _route("stripe", "platform-commerce", "mcp_stripe", chrome_fallback=True),
         _route("paypal", "platform-commerce", "mcp_paypal", "pay pal", chrome_fallback=True),
         _route(
-            "robinhood",
-            "platform-market-data",
-            "mcp_robinhood",
-            "robin hood",
-        ),
-        _route(
             "slack",
             "platform-communications",
             "mcp_slack",
@@ -143,7 +129,7 @@ INTEGRATION_SKILL_ROUTES: dict[str, IntegrationSkillRoute] = {
         _route(
             "whatsapp",
             "platform-communications",
-            "mcp_whatsapp",
+            "mcp-whatsapp",
             "whats app",
             chrome_fallback=True,
         ),
@@ -311,34 +297,4 @@ def integration_parent_skill_slugs() -> frozenset[str]:
             *BROWSER_ONLY_PLATFORM_ROUTES,
         )
         if route.parent_skill
-    )
-
-
-def _normalized_skill_identifier(value: str | None) -> str:
-    return re.sub(r"[-\s]+", "_", str(value or "").strip().lower())
-
-
-@lru_cache(maxsize=128)
-def integration_provider_keys_for_skill(
-    slug: str | None,
-    name: str | None = None,
-) -> tuple[str, ...]:
-    """Return static Integration providers owned by one concrete child Skill.
-
-    Parent and alternate Skills are intentionally excluded. A broad platform
-    Skill may cover many providers conceptually, but only the concrete child
-    Skill is the provider's operational companion.
-    """
-
-    candidates = {
-        normalized
-        for value in (slug, name)
-        if (normalized := _normalized_skill_identifier(value))
-    }
-    if not candidates:
-        return ()
-    return tuple(
-        route.provider_key
-        for route in INTEGRATION_SKILL_ROUTES.values()
-        if _normalized_skill_identifier(route.child_skill) in candidates
     )

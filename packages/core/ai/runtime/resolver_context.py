@@ -204,27 +204,6 @@ class ToolResolverStage:
             allowed_tool_names=incoming_allowed,
             profile_extra_allowed_tool_names=profile_extra_allowed_tool_names,
         )
-        editor_context = context.request.editor_context or {}
-        native_editor_patch_enabled = bool(
-            editor_context.get("supportsNativeFilePatch")
-            or editor_context.get("supports_native_file_patch")
-        )
-        patch_file_requested = "patch_file" in incoming_allowed or any(
-            tool_name_from_schema(schema) == "patch_file"
-            for schema in context.tool_schemas
-        )
-        if (
-            profile == RuntimeProfile.FILE_EDITOR_PATCH
-            and patch_file_requested
-            and not native_editor_patch_enabled
-        ):
-            runtime_blocked.add("patch_file")
-            filtered_tools = [
-                schema
-                for schema in filtered_tools
-                if tool_name_from_schema(schema) != "patch_file"
-            ]
-            filtered_allowed.discard("patch_file")
         blocked = set(context.incoming_blocked_tool_names)
         blocked.update(runtime_blocked)
         if blocked:

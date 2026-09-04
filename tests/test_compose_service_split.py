@@ -64,10 +64,8 @@ def test_compose_keeps_local_state_single_machine_with_redis_db_split() -> None:
     assert worker_env["MANOR_ENV"] == "${MANOR_ENV:-dev}"
     assert worker_env["APP_URL"] == "${APP_URL:-http://localhost:18080}"
     assert worker_env["PUBLIC_BASE_URL"] == "${PUBLIC_BASE_URL:-http://localhost:8010}"
-    assert services["manor-sandbox"]["ports"] == ["127.0.0.1:8110:8000"]
-    local_sandbox_token = "${SANDBOX_API_TOKEN:-manor-local-sandbox-token-change-me}"
-    assert api_env["SANDBOX_API_TOKEN"] == local_sandbox_token
-    assert sandbox_env["SANDBOX_API_TOKEN"] == local_sandbox_token
+    assert api_env["SANDBOX_API_TOKEN"] == "${SANDBOX_API_TOKEN:-}"
+    assert sandbox_env["SANDBOX_API_TOKEN"] == "${SANDBOX_API_TOKEN:-}"
     assert sandbox_env["SANDBOX_REDIS_URL"] == "redis://redis:6379/0"
 
 

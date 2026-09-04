@@ -65,15 +65,3 @@ artifacts/
 .superpowers/
 # git worktrees
 .worktrees/
-
-# Static Integration sources must remain Git-visible even when a developer's
-# lower-precedence .git/info/exclude contains stale workspace-only entries.
-!packages/core/ai/mcp/alpaca_market_data.py
-!packages/core/ai/mcp/alpha_vantage.py
-!packages/core/ai/mcp/twelve_data.py
-!packages/core/ai/skills/mcp_alpaca_market_data/
-!packages/core/ai/skills/mcp_alpaca_market_data/**
-!packages/core/ai/skills/mcp_alpha_vantage/
-!packages/core/ai/skills/mcp_alpha_vantage/**
-!packages/core/ai/skills/mcp_twelve_data/
-!packages/core/ai/skills/mcp_twelve_data/**

@@ -16,24 +16,14 @@ __all__ = [
     "approval_paths",
     "approval_preview_arguments",
     "approval_public_content",
-    "RuntimeApprovalContinuationError",
     "describe_runtime_approval_action",
     "runtime_approval_prompt",
     "runtime_approval_rejected_message",
-    "runtime_approval_continuation",
-    "runtime_approval_runtime_metadata",
     "runtime_approval_retry_args",
     "runtime_approval_resume_guidance",
     "runtime_file_approval_guidance",
     "runtime_approval_retry_message",
 ]
-
-
-_RUNTIME_APPROVAL_CONTINUATION_MAX_CHARS = 64_000
-
-
-class RuntimeApprovalContinuationError(ValueError):
-    """An approval payload cannot be preserved for deterministic replay."""
 
 
 _CONTEXT_KEYS = {
@@ -127,22 +117,6 @@ def _strip_context(value: Any) -> Any:
         return out
     if isinstance(value, list):
         return [_strip_context(v) for v in value]
-    return value
-
-
-def _strip_runtime_context_exact(value: Any) -> Any:
-    """Remove injected runtime fields without changing public value types."""
-
-    if isinstance(value, dict):
-        return {
-            str(key): item
-            for key, item in value.items()
-            if str(key) not in _CONTEXT_KEYS
-            and not (
-                str(key).startswith("_")
-                and str(key).endswith("_from_context")
-            )
-        }
     return value
 
 
@@ -289,13 +263,7 @@ def _bash_intent_verb(command: str) -> str:
 
 def describe_runtime_approval_action(tool_name: str, arguments: dict[str, Any]) -> str:
     """Tool-specific one-line description of what is about to happen."""
-    from packages.core.ai.runtime.composite_tools import (
-        RuntimeCompositeToolCallFactory,
-    )
-
-    canonical_call = RuntimeCompositeToolCallFactory.create(tool_name, arguments)
-    tool_name = canonical_call.tool_name
-    args = canonical_call.arguments
+    args = arguments or {}
 
     def _str(key: str, default: str = "") -> str:
         v = args.get(key)
@@ -578,103 +546,12 @@ def approval_paths(
 
 
 def runtime_approval_retry_args(item: dict[str, Any], hitl_id: str) -> dict[str, Any]:
-    continuation = item.get("continuation")
-    args = (
-        continuation.get("arguments")
-        if isinstance(continuation, dict)
-        and continuation.get("version") == 1
-        and isinstance(continuation.get("arguments"), dict)
-        else item.get("retry_args")
-    )
+    args = item.get("retry_args")
     if not isinstance(args, dict):
         args = item.get("args_preview")
     retry_args = dict(args) if isinstance(args, dict) else {}
     retry_args["approval_token"] = hitl_id
     return retry_args
-
-
-def runtime_approval_continuation(
-    tool_name: str,
-    arguments: dict[str, Any],
-) -> dict[str, Any]:
-    """Freeze one exact, typed call for post-approval execution."""
-
-    clean = _strip_runtime_context_exact(arguments)
-    if not isinstance(clean, dict):
-        raise RuntimeApprovalContinuationError(
-            "Runtime approval arguments must be a JSON object."
-        )
-    try:
-        encoded = json.dumps(
-            clean,
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-        )
-    except (TypeError, ValueError) as exc:
-        raise RuntimeApprovalContinuationError(
-            "Runtime approval arguments are not JSON serializable."
-        ) from exc
-    if len(encoded.encode("utf-8")) > _RUNTIME_APPROVAL_CONTINUATION_MAX_CHARS:
-        raise RuntimeApprovalContinuationError(
-            "Runtime approval arguments are too large to preserve exactly."
-        )
-    return {
-        "version": 1,
-        "tool": str(tool_name or "").strip(),
-        "arguments": json.loads(encoded),
-    }
-
-
-def runtime_approval_runtime_metadata(
-    item: dict[str, Any],
-    hitl_id: str,
-) -> dict[str, Any] | None:
-    """Build a deterministic forced call from a frozen runtime approval."""
-
-    tool_name = str(item.get("tool") or "").strip()
-    if not tool_name:
-        return None
-    continuation = item.get("continuation")
-    if isinstance(continuation, dict):
-        if continuation.get("version") != 1:
-            return None
-        if str(continuation.get("tool") or "").strip() != tool_name:
-            return None
-        arguments = continuation.get("arguments")
-    else:
-        # Compatibility for approval rows created before structured
-        # continuations were persisted. A truncated preview is never replayed.
-        arguments = item.get("retry_args")
-        if not isinstance(arguments, dict):
-            preview = item.get("args_preview")
-            arguments = (
-                preview
-                if isinstance(preview, dict) and preview.get("truncated") is not True
-                else None
-            )
-    if not isinstance(arguments, dict):
-        return None
-    retry_args = json.loads(json.dumps(arguments, ensure_ascii=False))
-    retry_args["approval_token"] = hitl_id
-    return {
-        "extra_tool_names": [tool_name],
-        "forced_tool_calls": [
-            {
-                "name": tool_name,
-                "arguments": retry_args,
-                # The approved action gets one deterministic attempt. After
-                # it returns, the model may summarize the result but cannot
-                # improvise another side-effecting tool call in this turn.
-                "disable_followup_tools": True,
-            }
-        ],
-        "approval_resume_guidance": (
-            "Execute the supplied approved tool call exactly once. Do not "
-            "rediscover, rewrite, or issue a second copy of the action. After "
-            "the call returns, report its actual result without retrying it."
-        ),
-    }
 
 
 def runtime_approval_retry_message(item: dict[str, Any], hitl_id: str) -> str:

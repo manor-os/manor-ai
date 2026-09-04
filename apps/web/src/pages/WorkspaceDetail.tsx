@@ -54,7 +54,6 @@ import {
 import WorkspaceGoalGraph from "../components/ui/WorkspaceGoalGraph";
 import WorkspaceWorkflows from "../components/workflows/WorkspaceWorkflows";
 import WorkspaceStatsPanel from "../components/workspaces/WorkspaceStatsPanel";
-import WorkspaceConnectionNotice from "../components/workspaces/WorkspaceConnectionNotice";
 import ScheduledJobs from "./ScheduledJobs";
 import ExportBlueprintModal from "../components/blueprints/ExportBlueprintModal";
 import BlueprintUpgradeDialog from "../components/blueprints/BlueprintUpgradeDialog";
@@ -1566,13 +1565,6 @@ export default function WorkspaceDetail() {
   const canWriteWs = canWriteWorkspace(currentUser, staffList || []);
   const [showBlueprintUpgrade, setShowBlueprintUpgrade] = useState(false);
 
-  useEffect(() => {
-    if (canManageWs) return;
-    setShowChannelModal(false);
-    setEditingChannel(null);
-    setConfirmRemoveChannel(null);
-  }, [canManageWs]);
-
   // Pool of staff members in the entity that can be picked for assignment.
   // Only fetched when the assign modal is open to avoid a hot query on tab load.
   const { data: entityStaff } = useQuery({
@@ -1632,7 +1624,7 @@ export default function WorkspaceDetail() {
   const { data: availableChannels } = useQuery({
     queryKey: ["workspace-available-channels", workspaceId],
     queryFn: () => api.workspaces.availableChannels(workspaceId!),
-    enabled: !!workspaceId && canManageWs && showChannelModal,
+    enabled: !!workspaceId && showChannelModal,
   });
 
   const { data: workspaceCapabilities } = useQuery({
@@ -2994,6 +2986,99 @@ export default function WorkspaceDetail() {
           );
         })()}
 
+        {/* Missing integrations — flagged by the architect during creation */}
+        {(() => {
+          const flagged = (((ws.settings as any)?.flagged_integrations) || []) as any[];
+          if (!flagged || flagged.length === 0) return null;
+          return (
+            <GlassCard hoverable={false} className="workspace-overview-card workspace-overview-setup-card">
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
+                <div className="workspace-overview-setup-title" style={{ ...SECTION_TITLE, color: "var(--text-default)" }}>
+                  {t("page.workspace_detail.needs_setup")} {flagged.length} {t("page.apps.integration")}{flagged.length === 1 ? "" : "s"}
+                </div>
+                <div style={{ display: "flex", gap: 6 }}>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={async () => {
+                      try {
+                        const result = await api.workspaces.resolveIntegrations(workspaceId!);
+                        if (result.resolved.length > 0) {
+                          toast.success(`${t("page.workspace_detail.connected")}: ${result.resolved.join(", ")}`);
+                          queryClient.invalidateQueries({ queryKey: ["workspace", workspaceId] });
+                          queryClient.invalidateQueries({ queryKey: ["workspace-channels", workspaceId] });
+                        } else {
+                          toast.info(t("page.workspace_detail.no_new_integrations_found_set_them_up_first"));
+                        }
+                      } catch {
+                        toast.error(t("page.workspace_detail.failed_to_check_integrations"));
+                      }
+                    }}
+                  >
+                    {t("page.workspace_detail.check_again")}
+                  </Button>
+                  <Button variant="outline" size="sm" onClick={() => navigate("/integrations")}>
+                    {t("page.workspace_detail.open_integrations")}
+                  </Button>
+                </div>
+              </div>
+              <p className="workspace-overview-setup-copy" style={{ fontSize: 12, color: "var(--text-muted)", margin: "0 0 12px", lineHeight: 1.5 }}>
+                {t("page.workspace_detail.these_integrations_were_referenced_when_the_work")}
+              </p>
+              <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(min(100%, 240px), 1fr))", gap: 10 }}>
+                {flagged.map((f: any, i: number) => {
+                  const source = String(f.source || "");
+                  const providerKey = String(f.provider || "").toLowerCase();
+                  const legacyChannelProviders = new Set([
+                    "telegram", "slack", "discord", "whatsapp", "email", "wechat",
+                    "wechat_official", "wechat_personal", "twilio", "twilio_sms",
+                    "twilio_voice", "facebook", "webchat", "in_app", "inapp",
+                  ]);
+                  const isChannelSetup = source === "channel_setup" || (!source && legacyChannelProviders.has(providerKey));
+                  return (
+                    <div className="workspace-overview-setup-item" key={i} style={{
+                      padding: "10px 12px",
+                      borderRadius: 10,
+                      background: "var(--surface-muted)",
+                      border: "1px solid var(--border-subtle)",
+                    }}>
+                      <div style={{ display: "flex", alignItems: "center", gap: 6, justifyContent: "space-between" }}>
+                        <span className="workspace-overview-setup-item-title" style={{ fontSize: 13, fontWeight: 700, color: "var(--text-strong)" }}>
+                          {String(f.provider || "").replace(/[_\-]+/g, " ").replace(/\b\w/g, (c: string) => c.toUpperCase())}
+                        </span>
+                        <div style={{ display: "flex", gap: 4 }}>
+                          <Chip variant="slate" size="sm">
+                            {isChannelSetup ? t("page.workspace_detail.channel") : t("page.workspace_detail.capability")}
+                          </Chip>
+                          {f.setup_kind === "browser_extension" && (
+                            <Chip variant="slate" size="sm">
+                              {t("page.integrations.local_browser_setup_required")}
+                            </Chip>
+                          )}
+                          {f.required && <Chip variant="slate" size="sm">{t("page.login.required")}</Chip>}
+                        </div>
+                      </div>
+                      {f.purpose && (
+                        <div className="workspace-overview-setup-item-copy" style={{ fontSize: 11, color: "var(--text-muted)", marginTop: 4, lineHeight: 1.4 }}>
+                          {f.purpose}
+                        </div>
+                      )}
+                      {Array.isArray(f.linked_service_keys) && f.linked_service_keys.length > 0 && (
+                        <div className="workspace-overview-setup-chip-row" style={{ display: "flex", flexWrap: "wrap", gap: 4, marginTop: 6 }}>
+                          {f.linked_service_keys.map((sk: string) => (
+                            <Chip key={sk} variant="slate" size="sm">
+                              {_serviceLabelFromKey(sk, (operatingModel?.services as any[]) || [])}
+                            </Chip>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            </GlassCard>
+          );
+        })()}
 
         {/* Goal progress — compact inline cards */}
         {(() => {
@@ -4315,15 +4400,14 @@ export default function WorkspaceDetail() {
       (channelForm.mode !== "existing" || !!channelForm.channel_config_id);
     const isEditingChannel = !!editingChannel;
     const canSaveChannel =
-      canManageWs && (isEditingChannel
+      isEditingChannel
         ? !updateChannel.isPending
-        : canAttachChannel);
+        : canAttachChannel;
     const closeChannelModal = () => {
       setShowChannelModal(false);
       setEditingChannel(null);
     };
     const openAddChannel = () => {
-      if (!canManageWs) return;
       setEditingChannel(null);
       setChannelForm({
         mode: "existing",
@@ -4338,7 +4422,6 @@ export default function WorkspaceDetail() {
       setShowChannelModal(true);
     };
     const openEditChannel = (ch: any) => {
-      if (!canManageWs) return;
       const cfg = ch.config || {};
       const linkedServiceKey = cfg.linked_service_key || cfg.service_key || "";
       setEditingChannel(ch);
@@ -4368,11 +4451,9 @@ export default function WorkspaceDetail() {
             <Button variant="outline" size="sm" onClick={() => navigate("/integrations")}>
               {t("page.workspace_detail.manage_integrations")}
             </Button>
-            {canManageWs && (
-              <Button variant="primary" size="sm" onClick={openAddChannel}>
-                {t("page.workspace_detail.add_channel")}
-              </Button>
-            )}
+            <Button variant="primary" size="sm" onClick={openAddChannel}>
+              {t("page.workspace_detail.add_channel")}
+            </Button>
           </div>
         </div>
 
@@ -4483,11 +4564,11 @@ export default function WorkspaceDetail() {
           <EmptyState
             title={t("page.workspace_detail.no_channels")}
             description={t("page.workspace_detail.attach_a_ready_integration_or_create_a_public_we")}
-            action={canManageWs ? (
+            action={
               <Button variant="primary" onClick={openAddChannel}>
                 {t("page.workspace_detail.add_channel")}
               </Button>
-            ) : undefined}
+            }
           />
         ) : (
           <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(min(100%, 360px), 1fr))", gap: 16, alignItems: "start" }}>
@@ -4785,7 +4866,7 @@ export default function WorkspaceDetail() {
                     )}
                   </div>
 
-                  {canManageWs && ch.channel_binding_id && (
+                  {ch.channel_binding_id && (
                     <div style={{
                       marginTop: 12,
                       display: "flex",
@@ -4823,7 +4904,7 @@ export default function WorkspaceDetail() {
         )}
 
         <Modal
-          open={canManageWs && showChannelModal}
+          open={showChannelModal}
           onClose={closeChannelModal}
           title={isEditingChannel ? t("page.workspace_detail.edit_channel") : t("page.workspace_detail.add_channel")}
           maxWidth="560px"
@@ -4835,7 +4916,6 @@ export default function WorkspaceDetail() {
                 disabled={!canSaveChannel}
                 loading={isEditingChannel ? updateChannel.isPending : attachChannel.isPending}
                 onClick={() => {
-                  if (!canManageWs) return;
                   if (isEditingChannel) updateChannel.mutate();
                   else attachChannel.mutate();
                 }}
@@ -7790,8 +7870,6 @@ export default function WorkspaceDetail() {
         )}
       </PageHeader>
 
-      <WorkspaceConnectionNotice workspaceId={ws.id} />
-
       {canManageWs && (
         <ExportBlueprintModal
           open={exportOpen}
@@ -7955,9 +8033,9 @@ export default function WorkspaceDetail() {
       />
 
       <ConfirmDialog
-        open={canManageWs && !!confirmRemoveChannel}
+        open={!!confirmRemoveChannel}
         onClose={() => setConfirmRemoveChannel(null)}
-        onConfirm={() => { if (canManageWs && confirmRemoveChannel) removeChannel.mutate(confirmRemoveChannel.id); }}
+        onConfirm={() => { if (confirmRemoveChannel) removeChannel.mutate(confirmRemoveChannel.id); }}
         title={t("page.workspace_detail.remove_channel")}
         message={t("page.workspace_detail.remove_channel_message").replace("{name}", confirmRemoveChannel?.name || t("page.workspace_detail.this_channel"))}
         confirmLabel={t("page.task_detail.runtime.remove_rule")}

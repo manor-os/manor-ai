@@ -120,7 +120,6 @@ const GENERATED_FILE_URL_KEYS = [
   "open_url", "openUrl", "viewer_url", "viewerUrl", "result_url", "file_url",
   "download_url", "document_url", "artifact_url", "output_url", "public_url", "url",
 ] as const;
-const GENERATED_FILE_PREVIEW_URL_KEYS = ["previewUrl", "preview_url"] as const;
 
 function generatedFileText(record: GeneratedFileRecord, keys: readonly string[]): string {
   for (const key of keys) {
@@ -168,29 +167,10 @@ function platformFsPath(value: unknown): string {
   try {
     const url = new URL(text, "http://manor.local");
     const match = url.pathname.match(/^\/api\/v1\/fs\/[^/]+\/(.+)$/);
-    return match?.[1] ? normalizedRelativeFilePath(decodePathPart(match[1])) : "";
+    return match?.[1] ? decodePathPart(match[1]).replace(/^\/+/, "") : "";
   } catch {
     return "";
   }
-}
-
-function normalizedRelativeFilePath(text: string): string {
-  const rawPath = text.replace(/\\/g, "/");
-  if (/^(?:~\/|\/(?:Users|Volumes|private|tmp|var|etc)\/|[A-Za-z]:\/)/i.test(rawPath)) return "";
-  const isAbsoluteRoute = rawPath.startsWith("/");
-  const parts: string[] = [];
-  for (const part of rawPath.split("/")) {
-    if (!part || part === ".") continue;
-    if (part === "..") {
-      if (!parts.length) return "";
-      parts.pop();
-    } else {
-      parts.push(part);
-    }
-  }
-  const path = parts.join("/");
-  if (isAbsoluteRoute && /^(?:viewer|api\/v1|documents)\//i.test(path)) return "";
-  return path;
 }
 
 function canonicalGeneratedFilePath(value: unknown): string {
@@ -198,17 +178,14 @@ function canonicalGeneratedFilePath(value: unknown): string {
   if (!text) return "";
   const platformPath = platformFsPath(text);
   if (platformPath) return platformPath;
-  if (/^(?:[A-Za-z][A-Za-z\d+.-]*:|\/\/)/.test(text)) return "";
-  // Only URLs are decoded. Literal filenames may contain #, ?, and %20.
-  return normalizedRelativeFilePath(text);
-}
-
-function generatedFileUrlKeys(record: GeneratedFileRecord): readonly string[] {
-  return generatedFileDocumentId(record)
-    || GENERATED_FILE_PATH_KEYS.some(key => canonicalGeneratedFilePath(record[key]))
-    || generatedFileText(record, GENERATED_FILE_URL_KEYS)
-    ? GENERATED_FILE_URL_KEYS
-    : GENERATED_FILE_PREVIEW_URL_KEYS;
+  if (/^(?:https?:|data:|blob:)/i.test(text)) return "";
+  const rawPath = decodePathPart(text.split(/[?#]/, 1)[0] || text).replace(/\\/g, "/");
+  if (/^(?:~\/|\/(?:Users|Volumes|private|tmp|var|etc)\/|[A-Za-z]:\/)/i.test(rawPath)) return "";
+  const isAbsoluteRoute = rawPath.startsWith("/");
+  const decoded = rawPath.replace(/^\/+/, "");
+  if (!decoded || decoded === "." || decoded === ".." || decoded.startsWith("../")) return "";
+  if (isAbsoluteRoute && /^(?:viewer|api\/v1|documents)\//i.test(decoded)) return "";
+  return decoded.replace(/\/\.\//g, "/");
 }
 
 export function generatedFileDocumentId(value: unknown): string {
@@ -225,7 +202,7 @@ export function generatedFileFsPath(value: unknown): string {
     const path = canonicalGeneratedFilePath(record[key]);
     if (path) return path;
   }
-  for (const key of generatedFileUrlKeys(record)) {
+  for (const key of GENERATED_FILE_URL_KEYS) {
     const path = platformFsPath(record[key]);
     if (path) return path;
   }
@@ -256,13 +233,13 @@ export function generatedFileOpenReference(value: unknown): string {
     }
     return explicit;
   }
-  for (const key of generatedFileUrlKeys(record)) {
+  for (const key of GENERATED_FILE_URL_KEYS) {
     const url = String(record[key] ?? "").trim();
     if (platformFsPath(url)) return url;
   }
   const fsPath = generatedFileFsPath(record);
   if (fsPath) return fsPath;
-  for (const key of generatedFileUrlKeys(record)) {
+  for (const key of GENERATED_FILE_URL_KEYS) {
     const url = String(record[key] ?? "").trim();
     if (/^(?:https?:|data:|blob:)/i.test(url)) return url;
   }
@@ -329,27 +306,23 @@ function linkedDestinationAliases(value: string): string[] {
   const reference = String(value || "").trim();
   const decodedReference = decodeFileReferenceHref(reference)
     || decodeRouteReferenceHref(reference);
-  const source = decodedReference || reference;
-  const platformPath = platformFsPath(source);
-  const literalPath = platformPath ? "" : canonicalGeneratedFilePath(source);
-  // URL-normalizing a raw path would alias "report .md" with "report%20.md".
-  if (literalPath) return [`fs:${literalPath}`];
-  const normalized = normalizedLinkedDestination(source);
+  const normalized = normalizedLinkedDestination(decodedReference || value);
   if (!normalized) return [];
 
   const aliases = [`open:${normalized}`];
   try {
     const parsed = new URL(normalized, "https://manor.invalid");
     const viewerMatch = parsed.pathname.match(/^\/viewer\/([^/]+)\/?$/i);
-    const documentId = viewerMatch?.[1] ? decodePathPart(viewerMatch[1]) : "";
-    if (source.startsWith("/viewer/") && viewerPathForDocumentId(documentId)) {
-      aliases.push(`document:${documentId}`);
+    if (viewerMatch?.[1]) {
+      aliases.push(`document:${decodePathPart(viewerMatch[1])}`);
     }
   } catch {
     // The exact normalized address remains a usable alias below.
   }
 
-  if (platformPath) aliases.push(`fs:${platformPath}`);
+  const fsPath = platformFsPath(normalized)
+    || canonicalGeneratedFilePath(normalized);
+  if (fsPath) aliases.push(`fs:${fsPath}`);
   return Array.from(new Set(aliases));
 }
 
@@ -362,7 +335,7 @@ function generatedFileLinkAliases(value: unknown): string[] {
   if (documentId) aliases.push(`document:${documentId}`);
   if (fsPath) aliases.push(`fs:${fsPath}`);
 
-  for (const key of generatedFileUrlKeys(record)) {
+  for (const key of GENERATED_FILE_URL_KEYS) {
     aliases.push(...linkedDestinationAliases(String(record[key] ?? "")));
   }
   for (const key of GENERATED_FILE_PATH_KEYS) {

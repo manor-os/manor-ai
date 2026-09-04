@@ -88,7 +88,12 @@ def _patch_bridge(
     schemas=_FAKE_MCP_SCHEMAS,
     usable: frozenset[str] | None = frozenset({"google_calendar"}),
     calls: list | None = None,
+    flag_enabled: bool = True,
 ):
+    async def _fake_flag(*, entity_id, user_id):
+        return flag_enabled
+
+    monkeypatch.setattr(manor_tool, "_bridge_search_enabled", _fake_flag)
     monkeypatch.setattr(manor_tool, "_registered_tool_schemas", lambda: tuple(schemas))
 
     async def _fake_usable(*, entity_id, user_id, provider_keys):
@@ -232,9 +237,9 @@ async def test_search_bridge_caps_matches_at_five(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_search_bridge_is_enabled_after_v2_graduation(monkeypatch):
+async def test_search_bridge_skipped_when_flag_off(monkeypatch):
     calls: list = []
-    _patch_bridge(monkeypatch, calls=calls)
+    _patch_bridge(monkeypatch, calls=calls, flag_enabled=False)
 
     result = json.loads(
         await _manor_handler(
@@ -245,15 +250,17 @@ async def test_search_bridge_is_enabled_after_v2_graduation(monkeypatch):
         )
     )
 
-    assert result["mcp_tool_matches"]
-    assert calls
+    assert "mcp_tool_matches" not in result
+    # The per-provider availability sweep (the expensive part) never runs.
+    assert calls == []
+    # Part A stays unconditional: stub hiding doesn't depend on the flag.
     listed = {m["action"] for m in result["matches"]}
     assert listed <= _IMPLEMENTED_ACTIONS
 
 
 @pytest.mark.asyncio
-async def test_unimplemented_action_without_mcp_match_keeps_search_fallback_hint(monkeypatch):
-    _patch_bridge(monkeypatch, schemas=())
+async def test_unimplemented_action_flag_off_keeps_search_fallback_hint(monkeypatch):
+    _patch_bridge(monkeypatch, flag_enabled=False)
 
     result = json.loads(
         await _manor_handler(
@@ -263,6 +270,7 @@ async def test_unimplemented_action_without_mcp_match_keeps_search_fallback_hint
         )
     )
 
+    # Part C wording stays improved flag-off — just without MCP matches.
     assert "not implemented" in result["error"]
     assert "mcp_tool_matches" not in result
     assert "search" in result["hint"]
@@ -270,9 +278,13 @@ async def test_unimplemented_action_without_mcp_match_keeps_search_fallback_hint
 
 @pytest.mark.asyncio
 async def test_search_bridge_failure_degrades_to_action_matches(monkeypatch):
+    async def _flag_on(*, entity_id, user_id):
+        return True
+
     def _boom():
         raise RuntimeError("registry unavailable")
 
+    monkeypatch.setattr(manor_tool, "_bridge_search_enabled", _flag_on)
     monkeypatch.setattr(manor_tool, "_registered_tool_schemas", _boom)
 
     result = json.loads(

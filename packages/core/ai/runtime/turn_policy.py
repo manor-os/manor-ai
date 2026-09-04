@@ -63,7 +63,7 @@ _WORKSPACE_LEDGER_QUERY_VISIBLE_TOOL_NAMES = (
     "read_recruiting_ledger",
     "read_relationship_ledger",
     "query_ledger",
-    "manor",
+    "visualize_workspace_ledgers",
 )
 _WORKSPACE_LEDGER_READ_VISIBLE_TOOL_NAMES = frozenset(
     _WORKSPACE_LEDGER_QUERY_VISIBLE_TOOL_NAMES[:4]

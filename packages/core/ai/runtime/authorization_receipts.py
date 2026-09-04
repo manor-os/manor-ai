@@ -349,45 +349,35 @@ class WorkspaceFileAuthorizationResourceFactory:
         action_key: str,
         resource_id: str | None,
     ) -> tuple[WorkspaceFileAuthorizationResource, ...]:
-        from packages.core.ai.runtime.composite_tools import (
-            RuntimeCompositeToolCallFactory,
-        )
-
-        canonical_call = RuntimeCompositeToolCallFactory.create(
-            request.tool_name,
-            request.arguments,
-        )
-        tool_name = canonical_call.tool_name
-        arguments = canonical_call.arguments
         resource = _file_resource_id(resource_id)
-        direct_directory = cls._DIRECT_GENERATION_DIRECTORIES.get(tool_name)
+        direct_directory = cls._DIRECT_GENERATION_DIRECTORIES.get(request.tool_name)
         if direct_directory is not None:
             return cls.direct_generation_resources(
-                arguments,
+                request.arguments,
                 default_directory=direct_directory,
             )
-        if tool_name == "generate_file":
-            return cls.generate_file_resources(arguments, resource)
-        if tool_name == "generate_document_file":
+        if request.tool_name == "generate_file":
+            return cls.generate_file_resources(request.arguments, resource)
+        if request.tool_name == "generate_document_file":
             return cls.generate_document_resources(
-                arguments,
+                request.arguments,
                 resource,
                 workspace_scoped=bool(_scope(request.workspace_id)),
             )
-        if tool_name == "sandbox_save_result":
-            return cls.sandbox_save_result_resources(arguments)
-        if tool_name == "bash":
-            return cls._bash_resources(arguments)
+        if request.tool_name == "sandbox_save_result":
+            return cls.sandbox_save_result_resources(request.arguments)
+        if request.tool_name == "bash":
+            return cls._bash_resources(request.arguments)
         media_resources = cls.media_tool_resources(
-            tool_name,
-            arguments,
+            request.tool_name,
+            request.arguments,
         )
         if media_resources:
             return media_resources
         if resource is None:
             return ()
         if (
-            tool_name == "write_file"
+            request.tool_name == "write_file"
             and action_key == "workspace.file.create"
         ):
             return (WorkspaceFileAuthorizationResource(
@@ -398,7 +388,7 @@ class WorkspaceFileAuthorizationResourceFactory:
                 match_kind=WorkspaceFileResourceMatchKind.EXACT,
             ),)
         if (
-            tool_name in {"write_file", "edit_file", "patch_file", "delete_file"}
+            request.tool_name in {"write_file", "edit_file", "patch_file", "delete_file"}
             and request.workspace_id
             and "/" not in resource
         ):
@@ -425,11 +415,9 @@ class WorkspaceFileAuthorizationResourceFactory:
         return tool_name in {
             "delete_file",
             "edit_file",
-            "patch_file",
             "generate_document_file",
             "generate_file",
             "sandbox_save_result",
-            "sandbox",
             "write_file",
             *cls._DIRECT_GENERATION_DIRECTORIES,
             *cls._MEDIA_OUTPUT_SPECS,

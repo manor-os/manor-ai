@@ -70,11 +70,7 @@ async def test_alpaca_news_lookback_uses_server_time_and_returns_window(
     _mock_http(monkeypatch, handler)
     result = await alpaca_market_data.call_tool(
         "get_news",
-        {
-            "symbols": ["AAPL"],
-            "lookback_hours": 24,
-            "timezone": "America/Los_Angeles",
-        },
+        {"symbols": ["AAPL"], "lookback_hours": 24},
         json.dumps({"api_key": "key-id", "api_secret": "secret-value"}),
     )
 
@@ -85,14 +81,10 @@ async def test_alpaca_news_lookback_uses_server_time_and_returns_window(
     assert request.url.params["end"] == "2026-09-01T19:24:33Z"
     payload = _result_text(result)
     assert payload["observed_at"] == "2026-09-01T19:24:33Z"
-    assert payload["observed_at_local"] == "2026-09-01T12:24:33-07:00"
-    assert payload["timezone"] == "America/Los_Angeles"
     assert payload["request_window"] == {
         "start": "2026-08-31T19:24:33Z",
         "end": "2026-09-01T19:24:33Z",
         "lookback_hours": 24,
-        "local_start": "2026-08-31T12:24:33-07:00",
-        "local_end": "2026-09-01T12:24:33-07:00",
     }
 
 
@@ -113,25 +105,6 @@ async def test_alpaca_news_rejects_lookback_with_explicit_bounds(
 
     assert result["isError"] is True
     assert "cannot be combined" in result["content"][0]["text"]
-
-
-@pytest.mark.asyncio
-async def test_alpaca_news_rejects_invalid_user_timezone(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    class UnexpectedClient:
-        def __init__(self, **_kwargs):
-            raise AssertionError("invalid timezone must not call the provider")
-
-    monkeypatch.setattr(market_data_common.httpx, "AsyncClient", UnexpectedClient)
-    result = await alpaca_market_data.call_tool(
-        "get_news",
-        {"lookback_hours": 24, "timezone": "Pacific/Santa_Clara"},
-        json.dumps({"api_key": "key-id", "api_secret": "secret-value"}),
-    )
-
-    assert result["isError"] is True
-    assert "valid IANA timezone" in result["content"][0]["text"]
 
 
 @pytest.mark.asyncio

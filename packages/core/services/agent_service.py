@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from typing import Optional
 from urllib.parse import quote, unquote
 
-from sqlalchemy import select, and_, or_, update
+from sqlalchemy import select, and_, or_
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from packages.core.cache import cache
@@ -613,7 +613,7 @@ def _tool_catalog_category(name: str) -> str:
         return "mcp"
     if name.startswith("workspace_"):
         return "workspace"
-    if name in {"read_file", "patch_file", "inspect_file_engine", "list_files", "glob_files", "grep_files", "bash"}:
+    if name in {"read_file", "write_file", "edit_file", "list_files", "glob_files", "grep_files", "bash"}:
         return "files"
     if name.startswith("generate_"):
         return "generation"
@@ -638,20 +638,6 @@ async def ensure_runtime_tool_definitions(db: AsyncSession) -> int:
     )
 
     runtime_ensure_tool_registry_initialized()
-
-    # Keep saved bindings/audit rows readable, but stop offering retired
-    # duplicate file entrypoints in the Agent tool picker.
-    await db.execute(
-        update(ToolDefinition).where(
-            ToolDefinition.name.in_({
-                "write_file", "edit_file", "generate_document_file",
-                "mcp__manor_mcp_file_engine__inspect",
-                "mcp__manor_mcp_file_engine__generate",
-                "mcp__manor_mcp_file_engine__patch",
-            }),
-            ToolDefinition.status != "inactive",
-        ).values(status="inactive")
-    )
 
     existing_result = await db.execute(select(ToolDefinition.name))
     existing = {str(row[0]) for row in existing_result.all()}

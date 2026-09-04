@@ -8,5 +8,7 @@
   "description": "Use the connected user's official Robinhood Trading MCP tools. Discover live schemas before use; account consent may include trading permissions.",
   "version": "1.0.0",
   "tags": ["robinhood", "finance", "remote-mcp", "runtime-guidance", "builtin", "mcp"],
-  "tools": ["search_tools"]
+  "discoverable_provider_keys": ["robinhood"],
+  "discoverable_tool_prefixes": ["mcp__robinhood__"],
+  "tools": []
 }

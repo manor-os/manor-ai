@@ -71,8 +71,6 @@ async def endpoint(monkeypatch):
     monkeypatch.setattr(chat_voice, "acquire_audio_lease", AsyncMock(return_value=lease))
     monkeypatch.setattr(chat_voice, "resolve_realtime_route", AsyncMock(return_value=None))
     monkeypatch.setattr(chat_voice, "prepare_gateway_call", AsyncMock())
-    # Startup timing is isolated from durable receipt recovery in this fixture.
-    monkeypatch.setattr(chat_voice, "recover_call_work", AsyncMock(return_value=[]))
     cleanup = AsyncMock()
     monkeypatch.setattr(chat_voice, "remove_empty_created_call_conversation", cleanup)
     monkeypatch.setattr(chat_voice, "CALL_SETUP_TIMEOUT_SECONDS", 0.15)

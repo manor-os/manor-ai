@@ -2958,43 +2958,16 @@ async def revert(
         entry = prepared_entry["entry"]
         row = prepared_entry["row"]
         if prepared_entry["type"] == "channel":
-            before = entry.get("before")
-            if row.type == "twilio_voice" and (
-                before is None
-                or any(
-                    getattr(row, field) != before.get(field)
-                    for field in (
-                        "agent_id",
-                        "agent_subscription_id",
-                        "workspace_id",
-                        "type",
-                        "status",
-                    )
-                )
-            ):
-                from packages.core.services.voice.call_sessions import (
-                    cancel_unconnected_call_sessions_for_binding,
-                )
-
-                await cancel_unconnected_call_sessions_for_binding(
-                    db,
-                    channel_config_id=prepared_entry["account"].id,
-                    channel_binding_id=row.id,
-                    reason=(
-                        "Twilio Voice Blueprint binding was reverted before the "
-                        "call connected."
-                    ),
-                )
             if entry.get("before") is None:
                 # Same unbind operation as the channel API: retain the account
                 # and its conversations/logs; remove only this routing row.
                 await db.delete(row)
             else:
                 for field in CHANNEL_BINDING_SNAPSHOT_FIELDS:
-                    setattr(row, field, copy.deepcopy(before[field]))
+                    setattr(row, field, copy.deepcopy(entry["before"][field]))
                 # Undo routing, never undo the repair of a legacy missing owner.
                 row.user_id = prepared_entry["account"].owner_user_id
-                preserve_channel_binding_route_order(row, before["updated_at"])
+                preserve_channel_binding_route_order(row, entry["before"]["updated_at"])
             reverted.append({"kind": "channel", "name": entry.get("name")})
             continue
         if prepared_entry["type"] == "installed_workflow":

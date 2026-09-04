@@ -14,9 +14,6 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from packages.core.blueprints.installer import _blueprint_workflow_definition_values
-from packages.core.blueprints.seed import platform_blueprint_id
-from packages.core.blueprints.solo_company import get_solo_company_blueprints
 from packages.core.blueprints.workflow_dependencies import WorkflowDependencyFactory
 from packages.core.models.base import generate_ulid
 from packages.core.models.workflow import (
@@ -27,10 +24,6 @@ from packages.core.services.reusable_resource_locks import (
     lock_reusable_resource_payload_references,
 )
 from packages.core.services.workflow_run_trace import visible_workflow_tags
-
-
-FLOW_TEMPLATE_ID_PREFIX = "builtin-flow:"
-CONTENT_BLUEPRINT_SLUG = "solo-content-distribution-studio-v1"
 
 
 @dataclass(frozen=True)
@@ -50,76 +43,11 @@ class FlowTemplateSpec:
     visible: bool = True
 
 
-_ICON_BY_KEY = {
-    "opc-generate-topic-from-knowledge-v1": "rag",
-    "opc-write-article-from-topic-v1": "llm",
-    "opc-create-image-from-topic-v1": "image",
-    "opc-create-video-from-topic-v1": "video",
-    "opc-publish-linkedin-v1": "connector",
-    "opc-publish-medium-v1": "connector",
-    "opc-submit-hacker-news-v1": "connector",
-    "opc-publish-wechat-official-v1": "connector",
-    "opc-publish-x-v1": "connector",
-    "opc-publish-reddit-v1": "connector",
-    "opc-reply-platform-comments-v1": "notify",
-    "opc-execute-platform-slot-v1": "subworkflow",
-    "opc-daily-content-dispatcher-v1": "foreach_subworkflow",
-}
-
-_REQUIREMENTS_BY_KEY = {
-    "opc-generate-topic-from-knowledge-v1": ("Workspace Knowledge", "Web Search", "AI model"),
-    "opc-write-article-from-topic-v1": ("Approved topic brief", "Workspace Knowledge", "AI model"),
-    "opc-create-image-from-topic-v1": ("Approved topic brief", "Image generation model"),
-    "opc-create-video-from-topic-v1": ("Approved topic brief", "Video generation tools"),
-    "opc-publish-linkedin-v1": ("Approved content package", "LinkedIn connection or signed-in Chrome"),
-    "opc-publish-medium-v1": ("Approved content package", "Medium connection or signed-in Chrome"),
-    "opc-submit-hacker-news-v1": ("Approved canonical URL", "Signed-in Chrome"),
-    "opc-publish-wechat-official-v1": ("Approved content package", "WeChat connection or signed-in Chrome"),
-    "opc-publish-x-v1": ("Approved content package", "X connection or signed-in Chrome"),
-    "opc-publish-reddit-v1": ("Approved content package", "Reddit connection or signed-in Chrome"),
-    "opc-reply-platform-comments-v1": ("Owned publication", "Platform connection or signed-in Chrome"),
-    "opc-execute-platform-slot-v1": ("Installed atomic content Flows", "Workspace binding"),
-    "opc-daily-content-dispatcher-v1": ("Approved daily plan", "Installed platform Flows", "Workspace binding"),
-}
-
-
-def _content_blueprint_payload() -> dict[str, Any]:
-    for payload in get_solo_company_blueprints():
-        manifest = payload.get("manifest") if isinstance(payload, dict) else None
-        if isinstance(manifest, dict) and manifest.get("slug") == CONTENT_BLUEPRINT_SLUG:
-            return payload
-    raise LookupError(f"Missing platform Blueprint {CONTENT_BLUEPRINT_SLUG!r}")
 
 
 @lru_cache(maxsize=1)
 def _template_specs() -> dict[str, FlowTemplateSpec]:
-    payload = _content_blueprint_payload()
-    source_blueprint_id = platform_blueprint_id(CONTENT_BLUEPRINT_SLUG)
-    recipe = payload.get("recipe") if isinstance(payload.get("recipe"), dict) else {}
     specs: dict[str, FlowTemplateSpec] = {}
-    for workflow in recipe.get("workflows") or []:
-        if not isinstance(workflow, dict):
-            continue
-        key = str(workflow.get("slug") or "").strip()
-        if not key:
-            continue
-        values = _blueprint_workflow_definition_values(workflow)
-        template_id = f"{FLOW_TEMPLATE_ID_PREFIX}{key}"
-        specs[template_id] = FlowTemplateSpec(
-            id=template_id,
-            key=key,
-            name=str(workflow.get("name") or key),
-            description=str(workflow.get("description") or ""),
-            icon=_ICON_BY_KEY.get(key, "flow"),
-            version=f"{int(workflow.get('version') or 1)}.0.0",
-            trigger_type=str(workflow.get("trigger_type") or "manual"),
-            category="Content distribution",
-            tags=tuple(str(tag) for tag in (workflow.get("tags") or ["opc", "content"])),
-            requirements=_REQUIREMENTS_BY_KEY.get(key, ()),
-            source_blueprint_id=source_blueprint_id,
-            values=values,
-            visible=not bool(workflow.get("internal")),
-        )
     return specs
 
 

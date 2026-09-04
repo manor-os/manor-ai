@@ -311,9 +311,14 @@ async def test_heartbeat_stops_when_the_lease_stops_being_active(db_session):
     )
     heartbeat.start()
     try:
-        await asyncio.sleep(0.15)
-        _step, lease = await _reload(db_session, seeded)
-        assert lease.heartbeat_count >= 1
+        deadline = asyncio.get_running_loop().time() + 2.0
+        while True:
+            _step, lease = await _reload(db_session, seeded)
+            if lease.heartbeat_count >= 1:
+                break
+            if asyncio.get_running_loop().time() >= deadline:
+                pytest.fail("heartbeat did not extend the active lease within 2 seconds")
+            await asyncio.sleep(0.05)
 
         lease.status = "completed"
         await db_session.commit()

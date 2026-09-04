@@ -110,67 +110,6 @@ async def test_mcp_catalog_seed_replaces_legacy_google_scopes(client):
     }
 
 
-async def test_mcp_catalog_seed_removes_duplicate_file_engine(db_session):
-    import packages.core.database as db_module
-    from packages.core.models.mcp import MCPServer
-
-    db_session.add(MCPServer(
-        server_key="manor_mcp_file_engine",
-        name="Manor File Engine",
-        transport="builtin",
-        endpoint="packages.core.ai.mcp.manor_mcp_file_engine",
-        auth_type="internal",
-    ))
-    await db_session.commit()
-
-    await seed_mcp_catalog(db_module.engine)
-
-    assert await db_session.scalar(text(
-        "SELECT count(*) FROM mcp_servers WHERE server_key = 'manor_mcp_file_engine'"
-    )) == 0
-
-
-async def test_mcp_catalog_seed_removes_legacy_local_browser(db_session):
-    import packages.core.database as db_module
-    from packages.core.models.document import Integration
-    from packages.core.models.mcp import AgentMCPBinding, MCPServer
-
-    server = MCPServer(
-        server_key="local_browser",
-        name="Chrome (legacy alias)",
-        transport="builtin",
-        endpoint="packages.core.ai.mcp.local_browser",
-        auth_type="cli_worker",
-    )
-    db_session.add(server)
-    await db_session.flush()
-    server_id = server.id
-    db_session.add_all([
-        AgentMCPBinding(
-            agent_id="legacy-local-browser-agent",
-            mcp_server_id=server_id,
-        ),
-        Integration(
-            entity_id="legacy-browser-entity",
-            provider="local_browser",
-            status="active",
-        ),
-    ])
-    await db_session.commit()
-
-    await seed_mcp_catalog(db_module.engine)
-
-    assert await db_session.scalar(text(
-        "SELECT count(*) FROM mcp_servers WHERE server_key = 'local_browser'"
-    )) == 0
-    assert await db_session.scalar(text(
-        "SELECT count(*) FROM agent_mcp_bindings WHERE mcp_server_id = :server_id"
-    ), {"server_id": server_id}) == 0
-    assert await db_session.scalar(text(
-        "SELECT count(*) FROM integrations WHERE provider = 'local_browser'"
-    )) == 0
-
-
 async def test_mcp_catalog_seed_provides_official_workflow_tool_cache(client):
     import packages.core.database as db_module
     from packages.core.ai.runtime.planning import (

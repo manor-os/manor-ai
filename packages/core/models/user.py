@@ -75,8 +75,6 @@ class User(Base, TimestampMixin, SoftDeleteMixin):
     backup_codes: Mapped[Optional[list]] = mapped_column(JSONB)
 
 
-
-
 class UserMembership(Base, TimestampMixin, SoftDeleteMixin):
     """A user's membership in an entity/company."""
     __tablename__ = "user_memberships"

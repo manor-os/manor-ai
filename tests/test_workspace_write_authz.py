@@ -257,7 +257,6 @@ async def test_workspace_owner_cannot_overwrite_a_shared_blueprint_skill(
         "manifest": {
             "slug": "shared-scope-blueprint",
             "blueprint_version": "1.1",
-            "name": "Shared Scope Blueprint",
         },
         "embedded": {
             "skills": [{

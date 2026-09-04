@@ -33,7 +33,7 @@ _SKILLS_ROOT = _REPO_ROOT / "packages" / "core" / "ai" / "skills"
 # a richer in-process module exists (hidden capability, surfaced through
 # other channels). Anything listed here must keep its advertised list
 # empty — otherwise the allowlist rots into a bypass of the guard.
-_INTENTIONALLY_EMPTY: set[str] = set()
+_INTENTIONALLY_EMPTY = {"local_browser"}
 
 
 # ── 1. Deferred MCP schemas ─────────────────────────────────────────────────

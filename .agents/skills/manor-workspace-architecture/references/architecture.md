@@ -186,15 +186,7 @@ one bounded Workspace runtime envelope.
   `packages/core/services/task_session.py`,
   `packages/core/services/assistant_blocks.py`,
   `packages/core/services/response_surfaces.py`,
-  `packages/core/ai/mcp/email.py`,
-  `packages/core/services/channels/email_adapter.py`,
-  `packages/core/services/channel_gateway.py`,
   `packages/core/services/runtime_chat_context.py`,
-  `apps/api/routers/channels/voice_stream.py`,
-  `packages/core/services/voice/binding.py`,
-  `packages/core/services/voice/session.py`,
-  `packages/core/services/voice/work_queue.py`,
-  `packages/core/services/voice/work_router.py`,
   `packages/core/workspace_chat/context.py`,
   `packages/core/workspace_chat/service.py`, `apps/api/routers/workspace_chat.py`,
   `apps/api/routers/chat.py`, and `apps/api/routers/public_chat.py`.
@@ -204,15 +196,7 @@ one bounded Workspace runtime envelope.
   the runtime projection of explicitly published Workspace content references.
 - Success invariant: the turn sees only the target entity/Workspace/Task,
   correct service Agents and tools, plus unresolved HITL relevant to that
-  conversation. Runtime defaults, Agent bindings, and Workspace/Task overlays
-  resolve to one run-local effective tool scope consumed by prompt assembly,
-  `search_tools`, and the execution gate. Search may progressively load a
-  schema from that scope but cannot add a first-party permission; execution
-  still revalidates the current durable or contextual binding. Provider-level
-  MCP wildcard/action scope remains semantic run-local authority in the Runtime
-  envelope; it is not flattened into old catalog names and is not persisted in
-  message metadata for a later turn to replay. An `interactive`
-  Task thread always resolves and binds its
+  conversation. An `interactive` Task thread always resolves and binds its
   sole Host Agent from the Task assignment or owner subscription before Skill,
   prompt, tool, billing, and message-author resolution; request Agent IDs and
   mentions cannot replace that Host. A completed Plan has one feedback subject
@@ -248,102 +232,10 @@ one bounded Workspace runtime envelope.
   AgentSubscription/Workspace saved by Agent Binding. It never uses a
   `ChannelContact.agent_subscription_id` override or timestamp recency to
   choose among ambiguous routes.
-  Browser Voice admits each non-control utterance as one visible user `Message`
-  carrying a bounded `voice_work` lifecycle before it can report the work as
-  queued. Native Realtime and the shared STT/Chat/TTS Gateway then execute that
-  same origin through the ordinary Chat or Channel runtime, preserving one
-  authority for tools, approvals, budget, history, and assistant origin
-  metadata. Admission immediately starts the receipt in the background, emits
-  `work:running`, and returns the call to `listening`; elapsed time never
-  creates an Assistant turn. The data flow is transcription -> durable user
-  Message/receipt -> pending/running lifecycle -> ordinary Chat execution ->
-  terminal receipt plus the real Assistant result -> caption/audio/final turn.
-  Explicit progress questions and narrow call-level corrections stay in a
-  local foreground control plane. While one receipt is
-  running, that control plane compares each new utterance with the active
-  request and the latest available non-control Assistant output without sending
-  either to another model. A typed decision factory maps that context to enum
-  actions, reply kinds, durable states, and UI states consumed by both browser
-  transports. `STATUS` reports the persisted running/completed state and any
-  real Assistant output already available; `CANCEL` and `REPLACE` operate on
-  the exact receipt; `QUEUE` persists the new request and its direct reply names
-  both the active and queued requests. Status and ambiguous corrections do not
-  create new work. There is no timeout acknowledgement or synthetic progress
-  text. Only complete, explicit stop or replacement phrases mark that exact
-  Voice receipt interrupted; its Agent polls the receipt directly so sibling
-  text turns in the same conversation are unaffected. Replacement is admitted
-  as a new durable receipt and starts after the prior Agent reaches its
-  cooperative cancellation point. If the user explicitly replaces again
-  during that safe exit, the earlier pending replacement is marked interrupted
-  and skipped rather than being executed before the newest request.
-  A cancelled receipt is marked interrupted, its stale result is not spoken,
-  and already committed external effects are not represented as rolled back.
-  Twilio Voice creates its exact Channel `Conversation` before accepting the
-  Media Stream, freezes the Call's Channel/AgentSubscription/Agent/Workspace
-  scope, and admits every non-control utterance under the Call session ID. It
-  acknowledges admitted work without waiting for the Agent, keeps listening
-  while that receipt runs, and uses the same `STATUS`/`QUEUE`/`CANCEL`/`REPLACE`
-  control semantics. A changed binding interrupts pending Call work, suppresses
-  a stale running result, and never migrates the Call to the replacement Agent.
-  Work admitted before the Media Stream closes continues through its durable
-  queue, but a closed Call performs no further Realtime provider output.
-  Provider speech responses are serialized until the preceding
-  `response.done`, so control acknowledgements and final Agent replies do not
-  overlap.
-  Foreground control text is exposed before its TTS request so provider delay
-  never leaves an unexplained Thinking state. Normal Assistant captions are
-  exposed only with audio, accumulate incrementally for the active turn, and
-  become a completed call-log turn after the native response completes or the
-  Gateway's final clip finishes; the final turn must not hide its own live
-  captions at the first audio frame. A dominant CJK language in recent user
-  messages supplies only an ISO transcription hint, so short audio
-  is less likely to switch scripts without sending conversation history to a
-  second model. Pending receipts can resume on the next call. A receipt found
-  `running` after process loss is marked interrupted and is never replayed
-  automatically because an external side effect may already have committed.
-  A repository-controlled capability companion remains an ordinary searchable
-  Skill and is returned beside a matched available Tool/MCP capability without
-  consuming its result slot, marked to load before that paired capability is
-  used. Unavailable providers and uninstalled Ledger contracts cannot surface a
-  companion, and `invoke_skill` still revalidates the current runtime boundary
-  before loading its instructions. Every static Integration catalog key owns one
-  complete concrete child Skill through the Integration route registry. That
-  registry derives the child Skill's `mcp__<provider>__` discovery and companion
-  prefixes; provider Skill configs do not duplicate them. Browser-only routes
-  share the Chrome Skill, while non-Integration core Tool Skills use an explicit
-  trusted `capability_companion` binding.
-  Every registered or dynamically discovered public tool call validates the
-  model-authored arguments against the exact schema bound to that run before
-  authorization, approval creation, or handler execution. Runtime-only control
-  fields are excluded from the public instance contract and are never coerced
-  from strings into arrays or objects.
-  Generic Email MCP calls inherit the same run-local actor and Workspace scope:
-  saving a received attachment creates a bounded Workspace/Knowledge artifact,
-  while an outgoing `document_id` is read only after current document ACL and
-  Workspace scope validation. Email Channel attachment bytes are bounded before
-  queueing, are not persisted in message logs, and are exposed to the Agent only
-  through canonical saved-document refs plus bounded extracted text.
-  A background Sandbox execution may expose bounded structured events through
-  its exact runtime-owned Sandbox and execution identities. Status reads use an
-  incremental sequence cursor, and responses revalidate the same actor,
-  Entity, Agent, and Conversation ownership before delivery. A `need_tool`
-  event is untrusted advisory data: the Agent must resolve it through the
-  ordinary Runtime tool catalog, authorization, approval, and capability gate;
-  neither the event nor a response can grant a capability. Credential exchange
-  is reference-only by contract, and secret-shaped fields fail closed.
 - Failure boundary: a missing/deleted/inaccessible Workspace fails closed and
   must not fall back to entity-wide tools, another Workspace, or a fresh task.
   A missing or deleted Conversation also fails closed instead of using the
   request Agent or Manor AI as a fallback.
-  A tool execution failure remains a tool observation for the model and cannot
-  directly terminalize the Agent loop through `stop_parent`, a matching
-  terminal-success policy, or a media completion shortcut. Repeated all-error
-  rounds use the bounded circuit breaker to remove callable tools and request a
-  final model summary rather than returning an error terminator. Runtime
-  suspension, user cancellation, credit admission, billing settlement, and
-  deliberate successful terminal tools keep their separate control semantics.
-  Invalid tool input returns a structured field/rule error without echoing
-  sensitive values, mints no HITL request, and consumes no approval.
   An interactive Task with a missing, inactive, conflicting, or ambiguous Host
   fails before a provider call and never falls back implicitly to Manor AI.
   Completion feedback fails closed unless its normalized Plan/Task lineage is
@@ -351,13 +243,6 @@ one bounded Workspace runtime envelope.
   user turn as its request context.
   Invalid or unsupported response surfaces are dropped before persistence;
   external, background, and non-interactive runtime surfaces cannot render one.
-  Voice settlement is bounded: a timed-out active instruction is cancelled and
-  marked interrupted, while accepted pending instructions remain recoverable.
-  A progress question never claims an instruction receipt, and status intent
-  must match the complete short utterance so commands containing words such as
-  `status` or `progress` still reach the Chat Agent. Ambiguous, additive, or
-  unrelated speech defaults to the serial queue and can never cancel active
-  work; only explicit control language crosses the interruption boundary.
 
 ### WS-03: Readiness and context assembly
 
@@ -505,10 +390,6 @@ Purpose: execute runnable Plan steps once, with retries and captured evidence.
   recovery intent. Skill generation is claimed by exact ScheduledJob ID plus
   configuration revision; these fields are runtime coordination, not
   Blueprint-portable state.
-  A live background Sandbox command additionally owns a bounded, ephemeral
-  event/response mailbox keyed by its exact execution id. The mailbox is
-  execution runtime state, is removed with Sandbox/history cleanup, and is not
-  Blueprint-portable.
 - Success invariant: dependency-ready steps receive at most one active lease;
   only the claimed worker can complete it; results pass schema/reference and
   artifact checks; terminal Plan state reconciles exactly once to Task state.
@@ -631,11 +512,6 @@ Purpose: execute runnable Plan steps once, with retries and captured evidence.
   pending work before any new lease is issued.
   Dispatcher schema hydration uses the same resolved-requester account boundary as
   planning and never merges another actor's discovered actions.
-  Structured Sandbox events receive server-assigned monotonic sequences;
-  responses bind one exact response-requiring event, are idempotent for an
-  identical payload, and resume the same process rather than starting another
-  command. Event count, line size, stream size, response size, and history
-  lifetime are bounded.
 - Failure boundary: stale/duplicate leases cannot complete a step; retry limits
   terminate visibly; a worker claim of success without required effects/files
   triggers replan/failure rather than false completion. A committed business
@@ -653,10 +529,6 @@ Purpose: execute runnable Plan steps once, with retries and captured evidence.
   renewable lease; delayed recheck recovers after expiry rather than abandoning
   the nonterminal Task. A lease admitted before setup regresses may finish; the
   stricter gate applies to later Plan cycles and new leases.
-  Sandbox mailbox delivery proves that a response was atomically made
-  available, not that untrusted code consumed it. A terminal, cancelled,
-  expired, foreign-owned, unknown-event, conflicting duplicate, oversized, or
-  secret-shaped response fails closed.
 
 ### WS-08: HITL, approval, pause, and resume
 
@@ -670,21 +542,11 @@ operator intervention, then resume that same origin.
   Workspace chat resolution routes.
 - State: HITL request, pending action, approval payload hash/token, paused
   Step/Lease/Workflow node, user response, consumed decision, resolved UI
-  message, a bounded typed runtime-tool continuation, and the frozen provider
-  retry-mode snapshot on external-reply claim and delivery-attempt state.
+  message, and the frozen provider retry-mode snapshot on external-reply claim
+  and delivery-attempt state.
 - Success invariant: approval is scoped to exact action and arguments; one
   response is consumed once; the original Task/Plan/Workflow resumes without
   starting a duplicate execution; terminal/cancel cleanup resolves stale cards.
-  When multiple HITL requests share one Message metadata document, terminal
-  projection locks matching Message rows in deterministic order so concurrent
-  decisions preserve every card's resolved marker instead of reopening a peer.
-  A direct Chat tool approval resumes the persisted typed call exactly once,
-  injects its token only at execution, and removes callable tools before the
-  model summarizes the actual result. Provider-native two-call approvals freeze
-  and validate the exact confirmation/retry continuation before granting, then
-  likewise remove callable tools after the provider-token retry. The model never
-  reconstructs approved arguments and cannot create a second side effect or
-  approval card in the same resume turn.
   Human Workflow resume can complete only a real wait/stage-wait or an explicit
   manual pause. Subworkflow and foreach-subworkflow barriers are resumed only by
   their durable child receipts, never by treating a missing wait configuration
@@ -697,35 +559,13 @@ operator intervention, then resume that same origin.
   with the same provider key, while rejection remains blocked. Ambiguous
   at-least-once delivery is quarantined for manual reconciliation and is never
   retried automatically.
-  An approved chat-tool continuation also remains single-attempt. If Runtime
-  proves that the current attempt did not cross provider I/O, it returns the
-  failure to the Agent loop; the loop may continue with explicitly read-only
-  tools to inspect, reconcile an earlier ambiguous claim, or discover another
-  path. The failed write route and every unclassified/write tool stay
-  unavailable until a fresh user approval. Successful results and failures
-  returned after provider I/O disable all follow-up tools in that turn so an
-  alternate route cannot duplicate an external side effect.
-  Storage-unavailable pre-I/O failures use the same read-only fallback, and
-  the current loop never reuses the unsettled approval token.
   A WhatsApp free-form reply rejected because Meta's 24-hour customer-service
   window has closed is a determinate `whatsapp_template_required` failure. The
   approval remains actionable and an operator or Agent must explicitly select
   an approved template; runtime never guesses one.
-  A Sandbox `need_input`, `need_file`, `need_tool`, or `need_credential` event
-  is not itself a durable HITL request or approval grant. The Agent may answer
-  from already authorized context or ask the user in Chat, then deliver the
-  answer through the execution mailbox. Any action that independently requires
-  approval must still create and consume the ordinary WS-08 continuation.
 - Failure boundary: expired/mismatched tokens fail closed. Login blockers are
   not converted into generic approvals. Manual pause/cancel clears processing
-  state and does not leave the chat input locked. Stale/conflicting Runtime
-  state, explicit cancellation, bounded loop limits, credit exhaustion, and
-  ambiguous post-provider outcomes remain hard stops; only failures explicitly
-  classified before provider I/O may continue through the read-only fallback.
-  Missing, oversized,
-  unserializable, or schema-invalid continuations expire safely before token
-  consumption or external execution; the UI must show waiting/error state and
-  never claim recovery while an unresolved action remains.
+  state and does not leave the chat input locked.
 
 ### WS-09: Workspace Flow and Workflow runtime
 
@@ -781,15 +621,12 @@ Purpose: turn concrete execution output into a durable, visible Workspace
 artifact contract.
 
 - Code entry: `packages/core/ai/runtime/artifacts.py`,
-  `apps/api/routers/documents.py`,
   `packages/core/services/task_execution_reconcile.py`,
   `packages/core/services/artifact_knowledge.py`,
-  `packages/core/services/email_attachments.py`,
   `packages/core/services/knowledge_sync.py`,
   `packages/core/services/workspace_artifacts.py`, and artifact contracts.
 - State: tool/result artifact refs, entity-relative filesystem path,
   Workspace artifact folder, `Document`, provenance, `document_id`, viewer URL,
-  browser-upload idempotency receipt and hidden incomplete-upload recovery intent,
   Task/Workflow terminal result, and the EventLog external-delivery claim,
   attempt, lease, retry, and terminal evidence.
 - Success invariant: the Task reconciliation and artifact projection paths turn
@@ -801,19 +638,6 @@ artifact contract.
   Knowledge row, activity event, durable external-delivery state, and durable
   backup-cleanup intent through one boundary; external event delivery starts
   only after that commit and is claimed with a bounded lease.
-  Saved email attachments pass the upload-security gate, revalidate Workspace
-  write access at commit, and use that same atomic filesystem/Knowledge
-  projection boundary. Automatic Email Channel ingestion records only canonical
-  document metadata in conversation history; raw Base64 remains transient.
-  Browser uploads bind one idempotency key to the uploader/entity, request
-  fingerprint, source path, and Document receipt. An ambiguous database commit
-  preserves that hidden recovery intent and exact source bytes; a same-principal
-  retry reuses them without re-entering storage admission, while account changes
-  stop browser retry and receipt effects. Recovery intent is bounded (24 hours by
-  default): a scheduled claimant removes expired markers and only deletes source
-  bytes when no Document still references that path. Uploads without a client
-  idempotency key still receive an internal cleanup-only intent, so an ambiguous
-  commit cannot strand uncorrelated bytes forever.
 - Failure boundary: a requested filename, remote job ID, or local path alone is
   not completion. For a required Task artifact, projection failure blocks
   completion; another entity's path or document is rejected. A rolled-back
@@ -822,15 +646,6 @@ artifact contract.
   fast path; a periodic claimant resumes expired delivery leases without
   replaying the committed artifact transaction. Workflow nodes that do not
   invoke the projection path remain a coverage gap.
-  Rejected, oversized, inaccessible, or unprojectable email attachments retain
-  an explicit per-file error and never claim a readable document or leak their
-  raw bytes into durable chat/message-log state.
-  A negative receipt lookup is not proof of rollback: server and browser use
-  bounded reconciliation, and a hard reload may resume receipt polling but must
-  never reconstruct or automatically resend the original `File` payload. After
-  bounded reconciliation fails, the user may explicitly reselect a file with the
-  same name and size; the server then verifies the full fingerprint and reuses the
-  original idempotency key before accepting that retry.
 
 ### WS-11: Configurable Goals, measurements, events, evaluation, and learning
 loop
@@ -921,15 +736,8 @@ Workspace-owned runtime data after the grace period.
 
 - Code entry: `packages/core/services/entity_service.py`,
   `packages/core/services/user_lifecycle.py`,
-  `packages/core/services/actor_authorization.py`,
-  `packages/core/services/permission_gate.py`,
   `packages/core/services/document_access.py`, document/folder permission and
   public-share routers,
-  `apps/api/routers/workspaces.py`,
-  `packages/core/blueprints/installer.py`,
-  `packages/core/blueprints/upgrade.py`,
-  `packages/core/services/integration_service.py`,
-  `packages/core/services/workspace_operation_service.py`,
   `packages/core/services/voice/call_sessions.py`,
   `packages/core/services/scheduler_service.py`,
   `packages/core/tasks/deletion_tasks.py`, Workspace API routes, and lifecycle
@@ -942,17 +750,8 @@ Workspace-owned runtime data after the grace period.
   authorize access while their owning Workspace is deleted.
 - Success invariant: pause suppresses new autonomous work; soft delete
   immediately removes automations and access while preserving restorable data;
-  protected Document content and browse reads, migrated Folder/Filesystem read
-  batches, and Workspace list/detail reads retain one immutable admission
-  credential (fixed Entity, token version, expiry, and deployment-specific
-  session revocation point) and re-resolve the current User, Membership, Staff,
-  StaffRole, and Entity admission after policy or I/O waits. Identity SQL reads
-  scalar facts and never refreshes the request-local User display projection;
-  final list items, counts, capabilities, and Workspace management flags are
-  projected from the final authorized actor/context, so stale request roles,
-  ownership, and direct grants cannot bypass identity revocation;
-  document/folder ACL mutations, public-share reads (including each direct
-  child), and low-level filesystem write/move/delete
+  every document/folder ACL mutation, ordinary or batched read, public-share
+  read (including each direct child), and low-level filesystem write/move/delete
   re-resolves Workspace ownership through physical artifact identity,
   artifact-folder ancestry, or durable document provenance before role or grant
   shortcuts. Userless non-human actors fail closed. A deleted owner fails closed
@@ -971,12 +770,7 @@ Workspace-owned runtime data after the grace period.
   removed there as well, cascading their outbox and actionable delivery rows.
   Disconnecting a Twilio Integration cancels only its `pending/connecting`
   calls before deleting the ChannelConfig and preserves connected or terminal
-  history. Every supported Twilio Agent-binding writer, including Integration
-  binding and legacy Channel CRUD, Workspace attach/update/remove, Workspace
-  Operation apply, and Blueprint install/upgrade/revert, cancels calls frozen
-  to that binding while they are still `pending/connecting` before changing or
-  deleting the route; connected and terminal history remains.
-  User, Workspace, and final Entity hard purge remove Voice sessions
+  history. User, Workspace, and final Entity hard purge remove Voice sessions
   by their durable owner, Workspace, and Entity fields respectively, without
   deleting another user's or Workspace's history.
   Disconnecting WhatsApp Business first marks its `Integration` and
@@ -987,7 +781,6 @@ Workspace-owned runtime data after the grace period.
   WABA or phone. Failure retains sanitized retry state. Reconnect keeps the old
   active route until the replacement account is fully provisioned, then swaps
   the account pointer and phone ID in place without changing binding IDs.
-  User hard purge also removes that user's acquisition-attribution row.
   ScheduledJob runs are removed with their job definition during soft delete,
   before the definition identity disappears. Soft delete also deletes Workflow
   action grants immediately, so restore cannot revive approval tokens, while
@@ -1142,15 +935,13 @@ These edges require tests on both sides whenever either endpoint changes.
 | WS-01 -> WS-02 | A Webchat page exposes only explicitly selected Workspace content; server Review, Channel persistence, and public reads resolve the same references against the current Workspace policy |
 | WS-02 -> WS-04 | Chat/manual triggers preserve Workspace and user scope |
 | WS-02 -> WS-09 | A published Webchat action preserves Channel Workspace and visitor session scope, validates the exact current module, and launches one idempotent run through an active manual binding |
-| WS-02 -> WS-07 | Prompt visibility, progressive tool search, execution, and Sandbox event/response exchange consume one run-local effective tool scope; schema or event loading never replaces current binding authorization |
-| WS-02 -> WS-10 | Email attachment import preserves actor/Workspace scope, commits bytes and Knowledge identity atomically, and gives the Agent only canonical refs plus bounded extracted text |
 | WS-03 -> WS-04 | Strategist uses installed services and real readiness only; a configured external Goal/Stat source adds only its named provider dependency |
 | WS-04 -> WS-05 | Proposal validates before governance and persistence; proposed Goal changes address stable Goal identity |
 | WS-05 -> WS-06 | Only approved, dependency-ready Tasks begin planning |
 | WS-06 -> WS-07 | Plan DAG, capabilities, refs, and output contracts survive materialization |
 | WS-06 -> WS-12 | API and worker planning share one durable claim through the fenced Plan commit, so duplicate entrypoints cannot duplicate billable provider work |
 | WS-07 -> WS-12 | Enabled Scheduled Skill generation is revision-single-flight, persists a bounded attempt before provider I/O, and gates credits before generation; paused Jobs do not cross the billable boundary |
-| WS-07 -> WS-08 | Paused origin and resume identity remain exact; a Sandbox mailbox request is advisory and cannot replace a durable approval/HITL continuation |
+| WS-07 -> WS-08 | Paused origin and resume identity remain exact |
 | WS-07 -> WS-10 | Captured output becomes canonical artifact evidence |
 | WS-09 -> WS-08 | Workflow HITL resumes the same run/node |
 | WS-09 -> WS-10 | Workflow outputs and receipts remain visible after terminal state |
@@ -1162,7 +953,7 @@ These edges require tests on both sides whenever either endpoint changes.
 | WS-13 -> tested runtime entries | Paused/deleted Workspace cannot launch new work on covered entrypoints; new entries require lifecycle guards |
 | WS-13 -> WhatsApp Business | Reconnect preserves the active route until replacement readiness; disconnect stops routing before external cleanup and never deletes customer WABA/phone assets |
 | WS-13 -> WS-02/09 | Revoked public content disappears and inactive/deleted Workspace action targets fail closed through the same runtime readiness boundary |
-| WS-13 -> Twilio Voice | Integration disconnect and every supported Agent-binding change/remove path cancel only calls frozen to that binding while unconnected; connected history remains, and user, Workspace, and Entity hard purge remove only their owned Voice runtime rows |
+| WS-13 -> Twilio Voice | Integration disconnect cancels only unconnected calls; user, Workspace, and Entity hard purge remove only their owned Voice runtime rows |
 | WS-14 -> WS-01/03/09 | Installed portable configuration recreates runnable semantics, including Goal/Stat definitions without runtime measurements |
 | WS-07/08 -> WS-15 | Covered Task-event and HITL notification producers preserve recipient, Workspace scope, idempotency, and origin references; new Workflow or evaluation producers require their own explicit contract and regression |
 | WS-13 -> WS-15 | Paused/deleted/inaccessible Workspace cancels pending delivery and remains unreadable; lifecycle, membership, access-mode, and delivery serialize on the Workspace access lock, with authorization rechecked before every external target |

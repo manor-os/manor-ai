@@ -1,32 +1,11 @@
 from __future__ import annotations
 
-import json
 from datetime import datetime, timedelta, timezone
-from unittest.mock import AsyncMock
 
 import pytest
 
 import packages.core.ai.agentic_loop as loop_module
 from packages.core.ai.runtime.control import RuntimeToolSuspension
-
-
-def test_runtime_checkpoint_v1_remains_resume_compatible() -> None:
-    from packages.core.ai.runtime.control import RuntimeAgentCheckpoint
-
-    checkpoint = RuntimeAgentCheckpoint.from_dict({
-        "schema_version": 1,
-        "messages": [],
-        "usage": {},
-        "rounds": 1,
-        "tool_calls_made": [],
-        "pending_tool_call": {"id": "call-1", "name": "workspace_search"},
-        "remaining_tool_calls": [],
-        "pending_attempt": 1,
-        "seen_tool_result_digests": {},
-    })
-
-    assert checkpoint.disable_followup_tools is False
-    assert checkpoint.tool_continuations == {}
 
 
 def _tool(name: str) -> dict:
@@ -214,115 +193,3 @@ async def test_serial_suspension_does_not_execute_later_sibling_until_resume(mon
         "call-skill",
         "call-after",
     ]
-
-
-@pytest.mark.unit
-async def test_forced_provider_continuation_survives_suspension_without_duplicate_call(
-    monkeypatch,
-) -> None:
-    forced_calls = [
-        {
-            "name": "mcp__chrome__confirm_action",
-            "arguments": {
-                "approvalId": "approval-1",
-                "__manor_tool_continuation": {
-                    "kind": "retry_with_result_token",
-                    "tool": "mcp__chrome__click_element",
-                    "arguments": {"tabId": 7, "ref": "e1"},
-                    "required_status": "approved",
-                    "result_token_keys": ["approvalToken"],
-                    "argument_token_key": "approvalToken",
-                },
-            },
-            "disable_followup_tools": True,
-        }
-    ]
-    first_calls: list[str] = []
-
-    async def suspending_executor(name: str, _args: dict):
-        first_calls.append(name)
-        return RuntimeToolSuspension(
-            kind="waiting_resource",
-            reservation_id="provider-reservation",
-            poll_after_seconds=5,
-            deadline_at=datetime.now(timezone.utc) + timedelta(minutes=5),
-        )
-
-    suspended = await loop_module.agentic_loop(
-        system_prompt="system",
-        user_message="approve",
-        tools=[
-            _tool("mcp__chrome__confirm_action"),
-            _tool("mcp__chrome__click_element"),
-        ],
-        tool_executor=suspending_executor,
-        forced_tool_calls=forced_calls,
-        runtime_run_id="provider-run",
-        max_rounds=3,
-    )
-
-    resumed_calls: list[tuple[str, dict]] = []
-
-    async def resumed_executor(name: str, args: dict):
-        resumed_calls.append((name, dict(args)))
-        if name == "mcp__chrome__confirm_action":
-            return json.dumps({
-                "ok": True,
-                "status": "approved",
-                "approvalToken": "provider-token",
-            })
-        return json.dumps({"ok": True, "status": "clicked"})
-
-    text_completion = AsyncMock(return_value=("done", {}))
-    tool_completion = AsyncMock()
-    monkeypatch.setattr(
-        loop_module,
-        "runtime_execute_agentic_round_text_completion",
-        text_completion,
-    )
-    monkeypatch.setattr(
-        loop_module,
-        "runtime_execute_agentic_round_tool_completion",
-        tool_completion,
-    )
-
-    resumed = await loop_module.agentic_loop(
-        system_prompt="system",
-        user_message="approve",
-        tools=[
-            _tool("mcp__chrome__confirm_action"),
-            _tool("mcp__chrome__click_element"),
-        ],
-        tool_executor=resumed_executor,
-        forced_tool_calls=forced_calls,
-        runtime_run_id="provider-run",
-        resume_checkpoint=suspended.control["checkpoint"],
-        max_rounds=3,
-    )
-
-    assert first_calls == ["mcp__chrome__confirm_action"]
-    public_resumed_calls = [
-        (
-            name,
-            {
-                key: value
-                for key, value in args.items()
-                if not key.startswith("_runtime_")
-            },
-        )
-        for name, args in resumed_calls
-    ]
-    assert public_resumed_calls == [
-        ("mcp__chrome__confirm_action", {"approvalId": "approval-1"}),
-        (
-            "mcp__chrome__click_element",
-            {
-                "tabId": 7,
-                "ref": "e1",
-                "approvalToken": "provider-token",
-            },
-        ),
-    ]
-    assert resumed.content == "done"
-    text_completion.assert_awaited_once()
-    tool_completion.assert_not_awaited()

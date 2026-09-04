@@ -417,8 +417,6 @@ async def test_compose_sidecar_is_not_a_trusted_proxy():
     "compose_path",
     [
         "docker-compose.yml",
-        "docker-compose.dev.yml",
-        "docker-compose.cloud.yml",
     ],
 )
 def test_uvicorn_proxy_allowlist_never_trusts_every_source(compose_path):
@@ -440,10 +438,6 @@ def test_direct_api_ports_are_loopback_only():
     assert '"127.0.0.1:8011:8000"' in compose
 
 
-def test_cloud_multiworker_rate_limits_use_redis():
-    compose = (Path(__file__).parents[1] / "docker-compose.cloud.yml").read_text()
-
-    assert "REDIS_RATE_LIMIT_ENABLED: ${REDIS_RATE_LIMIT_ENABLED:-true}" in compose
 
 
 @pytest.mark.anyio

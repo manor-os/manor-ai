@@ -197,9 +197,6 @@ _INTERACTIVE_CHAT_SURFACES = frozenset({
     ChatSurface.WORKSPACE_CHAT,
     ChatSurface.TASK_COMMENT_THREAD,
 })
-_INTERACTIVE_CHAT_SURFACE_VALUES = frozenset(
-    surface.value for surface in _INTERACTIVE_CHAT_SURFACES
-)
 
 
 def _json(payload: dict[str, Any]) -> str:
@@ -232,8 +229,7 @@ async def _render_response_surface(
             },
         })
     runtime_surface = getattr(context.runtime_envelope, "surface", None)
-    runtime_surface_value = getattr(runtime_surface, "value", runtime_surface)
-    if runtime_surface_value not in _INTERACTIVE_CHAT_SURFACE_VALUES:
+    if runtime_surface not in _INTERACTIVE_CHAT_SURFACES:
         return _json({
             "ok": False,
             "error": {

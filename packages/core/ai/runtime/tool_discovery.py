@@ -6,19 +6,13 @@ import re
 from collections.abc import Iterable
 from dataclasses import dataclass
 
-from packages.core.ai.runtime.integration_setup_links import runtime_integration_setup_link
-
 logger = logging.getLogger(__name__)
 
 
 GENERIC_WEB_TOOLS = frozenset({"web_search", "web_fetch", "browse_web"})
 LOCAL_CODING_BLOCKED_FIRST_PARTY_TOOLS = GENERIC_WEB_TOOLS | frozenset({
     "bash",
-    "sandbox",
     "sandbox_exec",
-    "sandbox_status",
-    "sandbox_respond",
-    "sandbox_cancel",
     "sandbox_create",
     "sandbox_read_file",
     "sandbox_write_file",
@@ -96,6 +90,38 @@ MCP_PROVIDER_ALIASES: dict[str, tuple[str, ...]] = {
         "预约",
         "预约链接",
         "日历设置",
+    ),
+    "manor_mcp_file_engine": (
+        "manor file engine",
+        "file engine",
+        "office engine",
+        "document engine",
+        "knowledge editor",
+        "generate file",
+        "patch file",
+        "edit file",
+        "document patch",
+        "office patch",
+        "docx",
+        "word",
+        "pptx",
+        "powerpoint",
+        "slides",
+        "xlsx",
+        "excel",
+        "spreadsheet",
+        "文档引擎",
+        "文件引擎",
+        "office 引擎",
+        "知识库编辑",
+        "生成文件",
+        "编辑文件",
+        "补丁",
+        "word 文档",
+        "ppt",
+        "excel",
+        "表格",
+        "幻灯片",
     ),
     "google_drive": ("google drive", "drive", "云盘"),
     "github": ("github", "git hub"),
@@ -540,44 +566,18 @@ def runtime_search_tools_payload(
     suppressed_mcp: list[dict] | None = None,
     total_tool_count: int | None = None,
     servers: list[dict] | None = None,
-    total_skill_count: int | None = None,
 ) -> dict:
     suppressed_mcp = list(suppressed_mcp or [])
     if not matches:
-        tool_count = total_tool_count or 0
-        hint = (
-            f"No tools matched. {tool_count} tools available."
-            if total_skill_count is None
-            else (
-                "No capabilities matched. "
-                f"{tool_count} {'tool' if tool_count == 1 else 'tools'} and "
-                f"{total_skill_count} "
-                f"{'skill' if total_skill_count == 1 else 'skills'} available."
-            )
-        )
         payload: dict = {
             "matches": [],
             "query": query,
             "loaded_tools": [],
-            "hint": hint,
+            "hint": f"No tools matched. {total_tool_count or 0} tools available.",
         }
-        if query.casefold().startswith("select:"):
-            payload["hint"] = (
-                f"{hint} Exact selectors do not use fuzzy matching; search by "
-                "capability terms or use browse_server:<provider_key>."
-            )
         if suppressed_mcp:
             payload["suppressed_mcp"] = suppressed_mcp
             payload["hint"] = _runtime_empty_matches_suppression_hint(suppressed_mcp)
-            setup_links = [
-                runtime_integration_setup_link(provider)
-                for provider in dict.fromkeys(
-                    str(item.get("server_key") or "")
-                    for item in suppressed_mcp if item.get("reason") == "not_usable"
-                )
-            ]
-            if any(setup_links):
-                payload["integration_setup"] = [link for link in setup_links if link]
         return payload
 
     unavailable = [
@@ -598,9 +598,7 @@ def runtime_search_tools_payload(
         "loaded_tools": [
             match.get("name")
             for match in matches
-            if match.get("name")
-            and match.get("kind") != "skill"
-            and match.get("available") is not False
+            if match.get("name") and match.get("available") is not False
         ],
     }
     if suppressed_mcp:
@@ -618,15 +616,6 @@ def runtime_search_tools_payload(
         )
     if unavailable:
         payload["unavailable_mcp"] = unavailable
-        setup_links = [
-            runtime_integration_setup_link(provider)
-            for provider in dict.fromkeys(
-                str(item.get("server_key") or runtime_mcp_provider_from_tool_name(item.get("name") or "") or "")
-                for item in unavailable
-            )
-        ]
-        if any(setup_links):
-            payload["integration_setup"] = [link for link in setup_links if link]
         hints.append(
             "MCP candidates without connected credentials are listed for transparency "
             "but are not loaded or callable. Connect the integration under Settings \u2192 "

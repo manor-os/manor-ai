@@ -856,13 +856,10 @@ def runtime_plan_supervisor_prompt(
     task_title: str,
     task_description: str,
     task_output_contract: dict[str, Any] | None = None,
-    acceptance_contract: dict[str, Any] | None = None,
-    actual_result: dict[str, Any] | None = None,
     done_count: int,
     failed_count: int,
     skipped_count: int,
-    steps: Iterable[dict[str, Any]] = (),
-    step_lines: Iterable[str] = (),
+    steps: Iterable[dict[str, Any]],
     retryable_step_keys: Iterable[str] = (),
     plan_rationale: str = "",
     is_replan: bool = False,
@@ -884,9 +881,6 @@ def runtime_plan_supervisor_prompt(
         _render_supervisor_step(i + 1, info)
         for i, info in enumerate(step_list[:SUPERVISOR_MAX_STEPS])
     ]
-    rendered_steps.extend(
-        str(line) for line in step_lines if str(line or "").strip()
-    )
     if len(step_list) > SUPERVISOR_MAX_STEPS:
         rendered_steps.append(f"(+{len(step_list) - SUPERVISOR_MAX_STEPS} more steps omitted)")
     plan_context = ""
@@ -904,30 +898,6 @@ def runtime_plan_supervisor_prompt(
             "Task deliverable contract (authoritative JSON Schema): "
             + json.dumps(
                 task_output_contract,
-                ensure_ascii=False,
-                sort_keys=True,
-                default=str,
-            )[:SUPERVISOR_CONTRACT_CHARS]
-            + "\n"
-        )
-
-    acceptance_context = ""
-    if isinstance(acceptance_contract, dict):
-        acceptance_context = (
-            "Task acceptance contract (authoritative): "
-            + json.dumps(
-                acceptance_contract,
-                ensure_ascii=False,
-                sort_keys=True,
-                default=str,
-            )[:SUPERVISOR_CONTRACT_CHARS]
-            + "\n"
-        )
-    if isinstance(actual_result, dict):
-        acceptance_context += (
-            "Actual result evidence selected by that contract: "
-            + json.dumps(
-                actual_result,
                 ensure_ascii=False,
                 sort_keys=True,
                 default=str,
@@ -972,7 +942,6 @@ def runtime_plan_supervisor_prompt(
         f"Task: {task_title}\n"
         f"Description: {task_description}\n"
         + task_contract_context
-        + acceptance_context
         + "\n"
         f"Latest plan result: {done_count} steps done, {failed_count} failed, "
         f"{skipped_count} skipped\n" + plan_context + history + "\n"
@@ -980,8 +949,6 @@ def runtime_plan_supervisor_prompt(
         "Judge whether the TASK'S OWN deliverable was produced and delivered "
         "— judge the task itself, not the subject it reports on.\n\n"
         "Rules:\n"
-        "- Judge only the task acceptance contract when one is supplied. "
-        "Do not invent extra acceptance requirements.\n"
         "- Runtime validates every declared Step output contract and the Task "
         "deliverable contract before this semantic review. You cannot override "
         "a failed contract check or accept a differently shaped result.\n"
@@ -1035,8 +1002,6 @@ def runtime_plan_supervisor_messages(
     task_title: str,
     task_description: str,
     task_output_contract: dict[str, Any] | None = None,
-    acceptance_contract: dict[str, Any] | None = None,
-    actual_result: dict[str, Any] | None = None,
     done_count: int,
     failed_count: int,
     skipped_count: int,
@@ -1055,8 +1020,6 @@ def runtime_plan_supervisor_messages(
             task_title=task_title,
             task_description=task_description,
             task_output_contract=task_output_contract,
-            acceptance_contract=acceptance_contract,
-            actual_result=actual_result,
             done_count=done_count,
             failed_count=failed_count,
             skipped_count=skipped_count,
@@ -1075,8 +1038,6 @@ async def runtime_execute_plan_supervisor_completion(
     task_title: str,
     task_description: str,
     task_output_contract: dict[str, Any] | None = None,
-    acceptance_contract: dict[str, Any] | None = None,
-    actual_result: dict[str, Any] | None = None,
     done_count: int,
     failed_count: int,
     skipped_count: int,
@@ -1096,8 +1057,6 @@ async def runtime_execute_plan_supervisor_completion(
             task_title=task_title,
             task_description=task_description,
             task_output_contract=task_output_contract,
-            acceptance_contract=acceptance_contract,
-            actual_result=actual_result,
             done_count=done_count,
             failed_count=failed_count,
             skipped_count=skipped_count,

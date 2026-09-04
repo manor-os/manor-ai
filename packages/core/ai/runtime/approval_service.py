@@ -35,16 +35,13 @@ from packages.core.ai.runtime.approval_classifier import (
     classify_runtime_tool,
 )
 from packages.core.ai.runtime.approval_messages import (
-    RuntimeApprovalContinuationError,
     approval_args_hash,
     approval_content_preview,
     approval_paths,
     approval_preview_arguments,
     approval_public_content,
     runtime_approval_prompt,
-    runtime_approval_continuation,
     runtime_approval_rejected_message,
-    runtime_approval_runtime_metadata,
     runtime_approval_retry_message,
 )
 from packages.core.ai.runtime.approval_preferences import (
@@ -54,6 +51,7 @@ from packages.core.ai.runtime.approval_preferences import (
 from packages.core.ai.runtime.approval_store import (
     load_runtime_approval_conversation,
     mark_runtime_hitl_request_resolved,
+    mark_runtime_hitl_requests_resolved,
     runtime_approval_workspace_context,
 )
 from packages.core.services.hitl_options import (
@@ -69,8 +67,6 @@ from packages.core.ai.runtime.approvals import (
     runtime_requires_baseline_approval,
 )
 from packages.core.ai.runtime.provider_approvals import (
-    freeze_provider_approval_request,
-    provider_approval_confirmation_receipt,
     provider_approval_is_expired,
     provider_approval_runtime_metadata,
 )
@@ -679,7 +675,6 @@ async def _load_runtime_request(
     request_id: str,
     entity_id: str,
     conversation_id: str | None,
-    for_update: bool = False,
 ):
     """Load a HitlRequest ONLY if it is a runtime tool-call request for
     THIS conversation. Step-origin requests (dispatcher cards) and other
@@ -691,18 +686,12 @@ async def _load_runtime_request(
 
     from packages.core.models.hitl_request import HitlRequest
 
-    query = select(HitlRequest).where(
-        HitlRequest.id == request_id,
-        HitlRequest.entity_id == entity_id,
-    )
-    if for_update:
-        # A compatibility lookup may already have loaded this row into the
-        # session identity map before we acquire the lock. Refresh from the
-        # locked database version so a concurrent consumer cannot keep using
-        # its stale in-memory GRANTED snapshot after the first transaction
-        # commits CONSUMED.
-        query = query.with_for_update().execution_options(populate_existing=True)
-    req = (await db.execute(query)).scalar_one_or_none()
+    req = (await db.execute(
+        select(HitlRequest).where(
+            HitlRequest.id == request_id,
+            HitlRequest.entity_id == entity_id,
+        )
+    )).scalar_one_or_none()
     if req is None or req.origin_kind != _RUNTIME_ORIGIN_KIND:
         return None
     if req.origin_conversation_id != conversation_id:
@@ -723,7 +712,6 @@ def _runtime_request_item(req) -> dict[str, Any]:
         "args_hash": ctx.get("args_hash"),
         "args_preview": ctx.get("args_preview"),
         "retry_args": ctx.get("retry_args"),
-        "continuation": ctx.get("continuation"),
         "paths": ctx.get("paths"),
         "workspace": ctx.get("workspace"),
         "content": ctx.get("content"),
@@ -759,32 +747,12 @@ async def _runtime_render_context(
         "args_hash": approval_args_hash(arguments),
         "args_preview": args_preview,
         "retry_args": args_preview if not args_preview.get("truncated") else None,
-        "continuation": runtime_approval_continuation(tool_name, arguments),
         "paths": paths,
         "workspace": workspace,
         "content": content_preview,
         "requested_by": user_id,
         **confirmation_receipt,
     }
-
-
-def _runtime_continuation_error_result(
-    *,
-    tool_name: str,
-    error: RuntimeApprovalContinuationError,
-) -> str:
-    return json.dumps(
-        {
-            "error": "approval_continuation_unavailable",
-            "message": (
-                f"{error} Save large content as a Workspace document and retry "
-                "with its canonical reference."
-            ),
-            "tool": tool_name,
-            "retryable": True,
-        },
-        ensure_ascii=False,
-    )
 
 
 def _runtime_hitl_payload(
@@ -878,36 +846,30 @@ async def _runtime_block_payload(
             action=action,
         )
 
-    try:
-        decision = await resolve_approval(
-            db,
-            subject=ApprovalSubject(
-                entity_id=entity_id,
-                workspace_id=workspace_id,
-                action_key=action.action_key,
-                resource_id=action.resource_id,
-                capability_id=action.capability_id,
-                resource_kind=action.resource_kind,
-                risk_level=action.risk_level,
-                kind=action.kind,
-                requires_approval=True,
-            ),
-            origin=ApprovalOrigin(
-                kind=_RUNTIME_ORIGIN_KIND,
-                conversation_id=conversation_id,
-                args_hash=approval_args_hash(arguments),
-                context_loader=load_render_context,
-            ),
-            permission_decision=permission_decision,
-            reason=reason,
-            intrinsic_rule=matched_rule_hint or "approval_payload_changed",
-            intrinsic_reason=reason,
-        )
-    except RuntimeApprovalContinuationError as exc:
-        return _runtime_continuation_error_result(
-            tool_name=tool_name,
-            error=exc,
-        )
+    decision = await resolve_approval(
+        db,
+        subject=ApprovalSubject(
+            entity_id=entity_id,
+            workspace_id=workspace_id,
+            action_key=action.action_key,
+            resource_id=action.resource_id,
+            capability_id=action.capability_id,
+            resource_kind=action.resource_kind,
+            risk_level=action.risk_level,
+            kind=action.kind,
+            requires_approval=True,
+        ),
+        origin=ApprovalOrigin(
+            kind=_RUNTIME_ORIGIN_KIND,
+            conversation_id=conversation_id,
+            args_hash=approval_args_hash(arguments),
+            context_loader=load_render_context,
+        ),
+        permission_decision=permission_decision,
+        reason=reason,
+        intrinsic_rule=matched_rule_hint or "approval_payload_changed",
+        intrinsic_reason=reason,
+    )
     if decision.outcome is ApprovalOutcome.ALLOW:
         if decision.request is not None:
             from packages.core.governance.approvals import consume_approval
@@ -1151,42 +1113,36 @@ async def guard_runtime_tool_action(
                 action=action,
             )
 
-        try:
-            decision = await resolve_approval(
-                db,
-                subject=ApprovalSubject(
-                    entity_id=entity_id,
-                    workspace_id=workspace_id,
-                    action_key=action.action_key,
-                    resource_id=action.resource_id,
-                    capability_id=action.capability_id,
-                    resource_kind=action.resource_kind,
-                    risk_level=action.risk_level,
-                    kind=action.kind,
-                    requires_approval=baseline_required,
-                ),
-                origin=ApprovalOrigin(
-                    kind=_RUNTIME_ORIGIN_KIND,
-                    conversation_id=conversation_id,
-                    # Thread the task so task-level runtime rules gate this plane
-                    # too, and so task-terminal cleanup can expire these requests.
-                    task_id=task_id,
-                    args_hash=approval_args_hash(arguments),
-                    context_loader=load_render_context,
-                ),
-                permission_decision=permission_decision,
-                spent_credits=spent_credits_per_kind,
-                intrinsic_rule="direct_chat_baseline" if baseline_required else None,
-                intrinsic_reason=(
-                    "Direct chat safety requires approval for destructive, publishing, "
-                    "sending, or automation actions."
-                ) if baseline_required else None,
-            )
-        except RuntimeApprovalContinuationError as exc:
-            return _runtime_continuation_error_result(
-                tool_name=name,
-                error=exc,
-            )
+        decision = await resolve_approval(
+            db,
+            subject=ApprovalSubject(
+                entity_id=entity_id,
+                workspace_id=workspace_id,
+                action_key=action.action_key,
+                resource_id=action.resource_id,
+                capability_id=action.capability_id,
+                resource_kind=action.resource_kind,
+                risk_level=action.risk_level,
+                kind=action.kind,
+                requires_approval=baseline_required,
+            ),
+            origin=ApprovalOrigin(
+                kind=_RUNTIME_ORIGIN_KIND,
+                conversation_id=conversation_id,
+                # Thread the task so task-level runtime rules gate this plane
+                # too, and so task-terminal cleanup can expire these requests.
+                task_id=task_id,
+                args_hash=approval_args_hash(arguments),
+                context_loader=load_render_context,
+            ),
+            permission_decision=permission_decision,
+            spent_credits=spent_credits_per_kind,
+            intrinsic_rule="direct_chat_baseline" if baseline_required else None,
+            intrinsic_reason=(
+                "Direct chat safety requires approval for destructive, publishing, "
+                "sending, or automation actions."
+            ) if baseline_required else None,
+        )
 
         if decision.outcome is ApprovalOutcome.ALLOW:
             # If the allow rests on a one-time operator grant, spend it NOW —
@@ -1298,33 +1254,12 @@ async def resolve_runtime_approval_turn(
     """Resolve a runtime approval and expose any deterministic continuation."""
     # ── unified store first: the token is a HitlRequest id ──
     req = await _load_runtime_request(
-        db,
-        request_id=hitl_id,
-        entity_id=entity_id,
-        conversation_id=conversation_id,
-        for_update=True,
+        db, request_id=hitl_id, entity_id=entity_id, conversation_id=conversation_id,
     )
     if req is not None:
         item = _runtime_request_item(req)
         is_provider = (req.context or {}).get("kind") == "provider"
-        normalized = normalize_approval_choice(action)
-        actionable_provider_grant = (
-            is_provider
-            and req.status == ApprovalStatus.GRANTED
-            and (
-                normalized in {
-                    APPROVAL_CHOICE_APPROVE,
-                    APPROVAL_CHOICE_ALWAYS_APPROVE,
-                }
-                or (
-                    normalized == APPROVAL_CHOICE_REJECT
-                    and not isinstance(
-                        (req.context or {}).get("provider_action_claim"), dict
-                    )
-                )
-            )
-        )
-        if req.status != ApprovalStatus.PENDING and not actionable_provider_grant:
+        if req.status != ApprovalStatus.PENDING:
             status_label = {"granted": "approved", "denied": "rejected"}.get(
                 req.status, req.status
             )
@@ -1332,6 +1267,7 @@ async def resolve_runtime_approval_turn(
                 f"Runtime approval {hitl_id} is already {status_label}. "
                 "Do not retry the blocked tool call."
             )
+        normalized = normalize_approval_choice(action)
         if normalized in {
             APPROVAL_CHOICE_APPROVE,
             APPROVAL_CHOICE_ALWAYS_APPROVE,
@@ -1410,53 +1346,16 @@ async def resolve_runtime_approval_turn(
                         "The provider approval expired before it was confirmed. "
                         "Do not retry the blocked tool call."
                     )
-                provider_item = {
-                    **item,
-                    "kind": "provider",
-                    "provider": (req.context or {}).get("provider"),
-                    "provider_approval_id": (req.context or {}).get(
-                        "provider_approval_id"
-                    ),
-                    "continuation": continuation,
-                }
-                provider_runtime_metadata = provider_approval_runtime_metadata(
-                    provider_item
-                )
-                if provider_runtime_metadata is None:
-                    req.status = ApprovalStatus.EXPIRED.value
-                    req.resolved_reason = "approval_continuation_unavailable"
-                    req.decided_at = datetime.now(timezone.utc)
-                    await mark_runtime_hitl_request_resolved(
-                        db,
-                        conversation_id=conversation_id,
-                        hitl_id=hitl_id,
-                        choice="expired",
-                    )
-                    return RuntimeApprovalResolution(
-                        "The provider action could not be resumed because its "
-                        "exact continuation was not preserved. Please issue "
-                        "the action again."
-                    )
-                provider_runtime_metadata["provider_approval_execution"] = {
-                    "hitl_id": hitl_id,
-                    "confirmation_tool": str(
-                        continuation.get("confirmation_tool") or ""
-                    ).strip(),
-                    "retry_tool": str(
-                        continuation.get("retry_tool") or ""
-                    ).strip(),
-                }
                 provider_name = (req.context or {}).get("provider")
                 # For a provider Manor owns, "Always approve" is honored: the
                 # standing grant lands in the workspace policy auto-approve set
                 # (workspace chats) or the user preference (direct chat), and
                 # `register_provider_runtime_approval` auto-confirms future
                 # gates for the same action instead of asking again.
-                wants_standing_grant = (
+                if (
                     normalized == APPROVAL_CHOICE_ALWAYS_APPROVE
                     and _provider_supports_always_approve(provider_name)
-                )
-                if wants_standing_grant:
+                ):
                     if req.workspace_id:
                         await grant_approval(
                             db, req, by_user_id=user_id, via="chat_card_always",
@@ -1469,81 +1368,24 @@ async def resolve_runtime_approval_turn(
                         await grant_approval(
                             db, req, by_user_id=user_id, via="chat_card_always",
                         )
-                elif req.status == ApprovalStatus.PENDING:
-                    await grant_approval(
-                        db, req, by_user_id=user_id, via="chat_card",
-                    )
-                # Keep the card actionable until the exact provider attempt
-                # reaches a durable terminal state. If storage fails before
-                # execution, another click can resume this same frozen grant;
-                # a persisted provider-action claim prevents duplicate I/O.
+                else:
+                    await grant_approval(db, req, by_user_id=user_id, via="chat_card")
+                await mark_runtime_hitl_request_resolved(
+                    db,
+                    conversation_id=conversation_id,
+                    hitl_id=hitl_id,
+                    choice=normalized,
+                )
+                provider_item = {
+                    **item,
+                    "kind": "provider",
+                    "provider": (req.context or {}).get("provider"),
+                    "provider_approval_id": (req.context or {}).get("provider_approval_id"),
+                    "continuation": continuation,
+                }
                 return RuntimeApprovalResolution(
                     "[Runtime approval approved] Resume the exact provider action now.",
-                    provider_runtime_metadata,
-                )
-
-            runtime_metadata = runtime_approval_runtime_metadata(item, hitl_id)
-            if runtime_metadata is None:
-                req.status = ApprovalStatus.EXPIRED.value
-                req.resolved_reason = "approval_continuation_unavailable"
-                req.decided_at = datetime.now(timezone.utc)
-                await mark_runtime_hitl_request_resolved(
-                    db,
-                    conversation_id=conversation_id,
-                    hitl_id=hitl_id,
-                    choice="expired",
-                )
-                return RuntimeApprovalResolution(
-                    "The approved action could not be resumed because its exact "
-                    "tool arguments were not preserved. Please issue the action again."
-                )
-
-            forced_call = runtime_metadata["forced_tool_calls"][0]
-            from packages.core.ai.runtime.tool_input_validation import (
-                validate_runtime_tool_arguments,
-            )
-            from packages.core.ai.runtime.tool_registry import (
-                runtime_tool_schema_for_actor,
-            )
-
-            registered_schema = await runtime_tool_schema_for_actor(
-                str(forced_call["name"]),
-                entity_id=entity_id,
-                user_id=user_id,
-            )
-            if registered_schema is None:
-                req.status = ApprovalStatus.EXPIRED.value
-                req.resolved_reason = "approved_tool_schema_unavailable"
-                req.decided_at = datetime.now(timezone.utc)
-                await mark_runtime_hitl_request_resolved(
-                    db,
-                    conversation_id=conversation_id,
-                    hitl_id=hitl_id,
-                    choice="expired",
-                )
-                return RuntimeApprovalResolution(
-                    "The action was not executed because its current tool schema "
-                    "is unavailable for this account. Please issue it again."
-                )
-            validation_failure = (
-                validate_runtime_tool_arguments(
-                    arguments=dict(forced_call["arguments"]),
-                    tool_schema=registered_schema,
-                )
-            )
-            if validation_failure is not None:
-                req.status = ApprovalStatus.EXPIRED.value
-                req.resolved_reason = "approved_tool_input_invalid"
-                req.decided_at = datetime.now(timezone.utc)
-                await mark_runtime_hitl_request_resolved(
-                    db,
-                    conversation_id=conversation_id,
-                    hitl_id=hitl_id,
-                    choice="expired",
-                )
-                return RuntimeApprovalResolution(
-                    "The action was not executed because its stored tool input is "
-                    f"invalid: {validation_failure.message} Please issue it again."
+                    provider_approval_runtime_metadata(provider_item),
                 )
 
             if normalized == APPROVAL_CHOICE_ALWAYS_APPROVE:
@@ -1573,445 +1415,25 @@ async def resolve_runtime_approval_turn(
                 choice=normalized,
             )
             return RuntimeApprovalResolution(
-                runtime_approval_retry_message(item, hitl_id),
-                runtime_metadata,
+                runtime_approval_retry_message(item, hitl_id)
             )
         if normalized == APPROVAL_CHOICE_REJECT:
-            if is_provider and req.status == ApprovalStatus.GRANTED:
-                await _reject_unclaimed_provider_runtime_approval(
-                    db,
-                    req,
-                    user_id=user_id,
-                )
-            else:
-                from packages.core.governance.approvals import deny_approval
+            from packages.core.governance.approvals import deny_approval
 
-                await deny_approval(
-                    db, req, by_user_id=user_id, via="chat_card",
-                    reason="user rejected runtime approval",
-                )
-                await mark_runtime_hitl_request_resolved(
-                    db,
-                    conversation_id=conversation_id,
-                    hitl_id=hitl_id,
-                    choice=normalized,
-                )
+            await deny_approval(
+                db, req, by_user_id=user_id, via="chat_card",
+                reason="user rejected runtime approval",
+            )
+            await mark_runtime_hitl_request_resolved(
+                db,
+                conversation_id=conversation_id,
+                hitl_id=hitl_id,
+                choice=normalized,
+            )
             return RuntimeApprovalResolution(runtime_approval_rejected_message(item))
         return None
 
     return None
-
-
-@dataclass(frozen=True)
-class ProviderRuntimeApprovalExecutionPreflight:
-    """Durable decision made immediately before provider execution."""
-
-    result: str | None = None
-    changed: bool = False
-
-
-def _provider_runtime_execution_metadata(
-    runtime_metadata: dict[str, Any] | None,
-) -> tuple[str, str, str] | None:
-    execution = (
-        runtime_metadata.get("provider_approval_execution")
-        if isinstance(runtime_metadata, dict)
-        else None
-    )
-    if not isinstance(execution, dict):
-        return None
-    hitl_id = str(execution.get("hitl_id") or "").strip()
-    confirmation_tool = str(execution.get("confirmation_tool") or "").strip()
-    retry_tool = str(execution.get("retry_tool") or "").strip()
-    if not hitl_id or not confirmation_tool or not retry_tool:
-        return None
-    return hitl_id, confirmation_tool, retry_tool
-
-
-def _provider_execution_blocked_result(
-    *,
-    hitl_id: str,
-    status: str,
-    reason: str,
-) -> str:
-    return json.dumps(
-        {
-            "ok": False,
-            "error": "provider_approval_execution_blocked",
-            "status": status,
-            "approval_id": hitl_id,
-            "reason": reason,
-        },
-        ensure_ascii=False,
-    )
-
-
-async def _expire_provider_runtime_approval(
-    db,
-    req,
-    reason: str,
-    *,
-    card_choice: str = "expired",
-) -> None:
-    req.status = ApprovalStatus.EXPIRED.value
-    req.resolved_reason = reason
-    req.decided_at = datetime.now(timezone.utc)
-    req.consumed_at = None
-    from packages.core.ledger import adapters as ledger_adapters
-    from packages.core.ledger import event_types as ledger_et
-
-    await ledger_adapters.record_approval_event(
-        db,
-        req,
-        ledger_et.APPROVAL_EXPIRED,
-    )
-    await _resolve_provider_runtime_approval_card(
-        db,
-        req,
-        choice=card_choice,
-    )
-
-
-async def _reject_unclaimed_provider_runtime_approval(
-    db,
-    req,
-    *,
-    user_id: str,
-) -> None:
-    req.status = ApprovalStatus.DENIED.value
-    req.decided_by_user_id = user_id
-    req.decided_at = datetime.now(timezone.utc)
-    req.decided_via = "chat_card"
-    req.resolved_reason = "provider_approval_revoked"
-    req.consumed_at = None
-    req.reason = "user rejected runtime approval"
-    from packages.core.ledger import adapters as ledger_adapters
-    from packages.core.ledger import event_types as ledger_et
-
-    await ledger_adapters.record_approval_event(
-        db,
-        req,
-        ledger_et.APPROVAL_DENIED,
-        actor_id=user_id,
-    )
-    await _resolve_provider_runtime_approval_card(
-        db,
-        req,
-        choice=APPROVAL_CHOICE_REJECT,
-    )
-
-
-async def _resolve_provider_runtime_approval_card(
-    db,
-    req,
-    *,
-    choice: str,
-) -> None:
-    """Resolve the provider card in the same transaction as terminal state."""
-
-    conversation_id = str(req.origin_conversation_id or "").strip()
-    if not conversation_id:
-        return
-    from packages.core.services.hitl_requests import mark_hitl_request_resolved
-
-    await mark_hitl_request_resolved(
-        db,
-        conversation_id=conversation_id,
-        hitl_id=req.id,
-        choice=choice,
-    )
-
-
-def _provider_confirmation_receipt_matches(
-    receipt: Any,
-    *,
-    provider: Any,
-    provider_approval_id: Any,
-) -> bool:
-    return bool(
-        isinstance(receipt, dict)
-        and str(receipt.get("provider") or "").strip()
-        == str(provider or "").strip()
-        and str(receipt.get("provider_approval_id") or "").strip()
-        == str(provider_approval_id or "").strip()
-        and str(receipt.get("approval_token") or "").strip()
-    )
-
-
-async def prepare_provider_runtime_approval_execution(
-    db,
-    *,
-    runtime_metadata: dict[str, Any] | None,
-    entity_id: str,
-    conversation_id: str | None,
-    tool_name: str,
-    arguments: dict[str, Any] | None,
-) -> ProviderRuntimeApprovalExecutionPreflight:
-    """Persist or replay the exact provider continuation before provider I/O.
-
-    Confirmation receipts are durable, so a worker restart can reconstruct the
-    one-time provider token without confirming twice.  The external retry is
-    claimed under a row lock before its handler runs.  If the worker crashes
-    after provider I/O, that claim remains and all automatic replays fail
-    closed as an ambiguous outcome instead of repeating the side effect.
-    """
-
-    metadata = _provider_runtime_execution_metadata(runtime_metadata)
-    if metadata is None:
-        return ProviderRuntimeApprovalExecutionPreflight()
-    hitl_id, confirmation_tool, retry_tool = metadata
-    if tool_name not in {confirmation_tool, retry_tool}:
-        return ProviderRuntimeApprovalExecutionPreflight()
-
-    req = await _load_runtime_request(
-        db,
-        request_id=hitl_id,
-        entity_id=entity_id,
-        conversation_id=conversation_id,
-        for_update=True,
-    )
-    if req is None or (req.context or {}).get("kind") != "provider":
-        return ProviderRuntimeApprovalExecutionPreflight(
-            result=_provider_execution_blocked_result(
-                hitl_id=hitl_id,
-                status="invalid",
-                reason="The provider approval no longer exists in this conversation.",
-            )
-        )
-
-    context = dict(req.context or {})
-    continuation = freeze_provider_approval_request(context.get("continuation"))
-    if (
-        continuation is None
-        or str(continuation.get("confirmation_tool") or "").strip()
-        != confirmation_tool
-        or str(continuation.get("retry_tool") or "").strip() != retry_tool
-        or str(continuation.get("provider") or "").strip()
-        != str(context.get("provider") or "").strip()
-        or str(continuation.get("provider_approval_id") or "").strip()
-        != str(context.get("provider_approval_id") or "").strip()
-    ):
-        changed = False
-        if req.status == ApprovalStatus.GRANTED:
-            await _expire_provider_runtime_approval(
-                db,
-                req,
-                "provider_continuation_invalid_before_execution",
-            )
-            changed = True
-        return ProviderRuntimeApprovalExecutionPreflight(
-            result=_provider_execution_blocked_result(
-                hitl_id=hitl_id,
-                status="expired",
-                reason="The stored provider continuation is no longer valid.",
-            ),
-            changed=changed,
-        )
-
-    if req.status != ApprovalStatus.GRANTED:
-        return ProviderRuntimeApprovalExecutionPreflight(
-            result=_provider_execution_blocked_result(
-                hitl_id=hitl_id,
-                status=str(req.status),
-                reason="This provider approval is no longer executable.",
-            )
-        )
-
-    receipt = context.get("provider_confirmation_receipt")
-    receipt_matches = _provider_confirmation_receipt_matches(
-        receipt,
-        provider=context.get("provider"),
-        provider_approval_id=context.get("provider_approval_id"),
-    )
-    if tool_name == confirmation_tool:
-        if not receipt_matches:
-            return ProviderRuntimeApprovalExecutionPreflight()
-        return ProviderRuntimeApprovalExecutionPreflight(
-            result=json.dumps(
-                {
-                    "ok": True,
-                    "status": "approved",
-                    "approvalId": receipt["provider_approval_id"],
-                    "approvalToken": receipt["approval_token"],
-                },
-                ensure_ascii=False,
-            )
-        )
-
-    if not receipt_matches:
-        return ProviderRuntimeApprovalExecutionPreflight(
-            result=_provider_execution_blocked_result(
-                hitl_id=hitl_id,
-                status="unconfirmed",
-                reason="The provider confirmation receipt was not durably recorded.",
-            )
-        )
-
-    supplied_arguments = dict(arguments or {})
-    supplied_token = str(
-        supplied_arguments.pop("approvalToken", None)
-        or supplied_arguments.pop("approval_token", None)
-        or ""
-    ).strip()
-    expected_arguments = continuation.get("retry_arguments")
-    if (
-        supplied_token != str(receipt.get("approval_token") or "").strip()
-        or supplied_arguments != expected_arguments
-    ):
-        await _expire_provider_runtime_approval(
-            db,
-            req,
-            "provider_retry_payload_changed",
-        )
-        return ProviderRuntimeApprovalExecutionPreflight(
-            result=_provider_execution_blocked_result(
-                hitl_id=hitl_id,
-                status="expired",
-                reason="The provider retry no longer matches the approved action.",
-            ),
-            changed=True,
-        )
-
-    if isinstance(context.get("provider_action_claim"), dict):
-        return ProviderRuntimeApprovalExecutionPreflight(
-            result=_provider_execution_blocked_result(
-                hitl_id=hitl_id,
-                status="ambiguous",
-                reason=(
-                    "This provider action was already started. Its outcome must be "
-                    "reconciled before another attempt."
-                ),
-            )
-        )
-
-    context["provider_action_claim"] = {
-        "tool": retry_tool,
-        "args_hash": approval_args_hash(supplied_arguments),
-        "claimed_at": datetime.now(timezone.utc).isoformat(),
-    }
-    req.context = context
-    req.resolved_reason = "provider_action_claimed"
-    return ProviderRuntimeApprovalExecutionPreflight(changed=True)
-
-
-async def settle_provider_runtime_approval_execution(
-    db,
-    *,
-    runtime_metadata: dict[str, Any] | None,
-    entity_id: str,
-    conversation_id: str | None,
-    tool_name: str,
-    arguments: dict[str, Any] | None,
-    result: Any,
-) -> bool:
-    """Settle a provider HITL row at the Runtime tool boundary.
-
-    Provider-native approval is a two-call continuation: confirmation followed
-    by the exact external action.  The chat-card click grants consent, but the
-    grant is not spent until that second call actually completes.  A failed
-    confirmation or failed retry closes the one-time request so a stale grant
-    cannot be replayed.
-    """
-
-    metadata = _provider_runtime_execution_metadata(runtime_metadata)
-    if metadata is None:
-        return False
-    hitl_id, confirmation_tool, retry_tool = metadata
-    if tool_name not in {confirmation_tool, retry_tool}:
-        return False
-
-    req = await _load_runtime_request(
-        db,
-        request_id=hitl_id,
-        entity_id=entity_id,
-        conversation_id=conversation_id,
-        for_update=True,
-    )
-    if req is None or (req.context or {}).get("kind") != "provider":
-        return False
-    from packages.core.ai.runtime.streams import runtime_tool_status_for_chat
-
-    parsed_result = result if isinstance(result, dict) else None
-    result_text = (
-        result
-        if isinstance(result, str)
-        else json.dumps(result, ensure_ascii=False, default=str)
-    )
-    failed = runtime_tool_status_for_chat(result_text) == "error"
-    if parsed_result is None:
-        try:
-            parsed_result = json.loads(result_text)
-        except (TypeError, ValueError):
-            parsed_result = None
-    if isinstance(parsed_result, dict) and parsed_result.get("ok") is False:
-        failed = True
-
-    if tool_name == confirmation_tool:
-        if req.status != ApprovalStatus.GRANTED:
-            return False
-        receipt = provider_approval_confirmation_receipt(
-            tool_name,
-            arguments,
-            result,
-        )
-        context = dict(req.context or {})
-        if receipt is not None and not failed and _provider_confirmation_receipt_matches(
-            receipt,
-            provider=context.get("provider"),
-            provider_approval_id=context.get("provider_approval_id"),
-        ):
-            context["provider_confirmation_receipt"] = {
-                **receipt,
-                "confirmed_at": datetime.now(timezone.utc).isoformat(),
-            }
-            req.context = context
-            req.resolved_reason = "provider_confirmation_completed"
-            return True
-        await _expire_provider_runtime_approval(
-            db,
-            req,
-            "provider_confirmation_failed",
-        )
-        return True
-
-    if req.status != ApprovalStatus.GRANTED:
-        return False
-    context = dict(req.context or {})
-    if not isinstance(context.get("provider_action_claim"), dict):
-        if failed:
-            # Authorization, binding, or input validation can reject the
-            # continuation before the pre-I/O claim is created. Close that
-            # now-unresumable grant explicitly; no provider side effect ran.
-            await _expire_provider_runtime_approval(
-                db,
-                req,
-                "provider_action_blocked_before_execution",
-            )
-            return True
-        logger.error(
-            "Refusing to settle unclaimed provider action %s for approval %s",
-            tool_name,
-            hitl_id,
-        )
-        return False
-    if failed:
-        await _expire_provider_runtime_approval(db, req, "provider_action_failed")
-        return True
-
-    from packages.core.governance.approvals import consume_approval
-
-    await consume_approval(db, req)
-    req.resolved_reason = "provider_action_completed"
-    await _resolve_provider_runtime_approval_card(
-        db,
-        req,
-        choice=(
-            APPROVAL_CHOICE_ALWAYS_APPROVE
-            if req.decided_via == "chat_card_always"
-            else APPROVAL_CHOICE_APPROVE
-        ),
-    )
-    return True
 
 
 def _provider_hitl_data(
@@ -2110,8 +1532,7 @@ async def register_provider_runtime_approval(
     Dedup by (provider, provider_approval_id): a still-pending registration
     returns the same card; an already-decided one returns None (the provider
     approval was consumed/decided — re-registering must not re-ask)."""
-    request = freeze_provider_approval_request(request)
-    if request is None:
+    if not isinstance(request, dict):
         return None
     provider = str(request.get("provider") or "").strip()
     provider_approval_id = str(
@@ -2212,7 +1633,7 @@ async def cancel_pending_runtime_approvals(
     hitl_ids: Iterable[str] | None = None,
     reason: str = "request_stopped",
 ) -> int:
-    """Close pending approvals and unclaimed provider grants for a stopped request."""
+    """Permanently close pending runtime approvals for a stopped request."""
     wanted_ids = {
         str(item or "").strip()
         for item in (hitl_ids or [])
@@ -2231,56 +1652,30 @@ async def cancel_pending_runtime_approvals(
             HitlRequest.entity_id == entity_id,
             HitlRequest.origin_conversation_id == conversation_id,
             HitlRequest.origin_kind == _RUNTIME_ORIGIN_KIND,
-            HitlRequest.status.in_((
-                ApprovalStatus.PENDING.value,
-                ApprovalStatus.GRANTED.value,
-            )),
-        ).with_for_update()
+            HitlRequest.status == ApprovalStatus.PENDING,
+        )
     )).scalars().all()
     now_dt = datetime.now(timezone.utc)
     for row in rows:
         if wanted_ids and row.id not in wanted_ids:
             continue
-        unclaimed_provider_grant = False
-        if row.status == ApprovalStatus.GRANTED:
-            context = dict(row.context or {})
-            if (
-                context.get("kind") != "provider"
-                or isinstance(context.get("provider_action_claim"), dict)
-            ):
-                continue
-            unclaimed_provider_grant = True
         requested_by = (row.context or {}).get("requested_by")
         if user_id and requested_by and requested_by != user_id:
             continue
-        if unclaimed_provider_grant:
-            # A provider grant is still reversible until execution claims it.
-            # Reuse the strict terminal path so the ledger and visible card
-            # cannot disagree with the authorization state.
-            await _expire_provider_runtime_approval(
-                db,
-                row,
-                reason,
-                card_choice="cancelled",
-            )
-        else:
-            row.status = ApprovalStatus.EXPIRED.value
-            row.resolved_reason = reason
-            row.decided_at = now_dt
-            cancelled_ids.append(row.id)
+        row.status = ApprovalStatus.EXPIRED.value
+        row.resolved_reason = reason
+        row.decided_at = now_dt
         cancelled += 1
+        cancelled_ids.append(row.id)
 
     if not cancelled:
         return 0
-    from packages.core.services.hitl_requests import mark_hitl_request_resolved
-
-    for hitl_id in cancelled_ids:
-        await mark_hitl_request_resolved(
-            db,
-            conversation_id=conversation_id,
-            hitl_id=hitl_id,
-            choice="cancelled",
-        )
+    await mark_runtime_hitl_requests_resolved(
+        db,
+        conversation_id=conversation_id,
+        hitl_ids=cancelled_ids,
+        choice="cancelled",
+    )
     await db.flush()
     return cancelled
 
@@ -2363,11 +1758,7 @@ async def consume_runtime_approval(
 
     # ── unified store: the token is a HitlRequest id ──
     req = await _load_runtime_request(
-        db,
-        request_id=hitl_id,
-        entity_id=entity_id,
-        conversation_id=conversation_id,
-        for_update=True,
+        db, request_id=hitl_id, entity_id=entity_id, conversation_id=conversation_id,
     )
     if req is not None:
         ctx = dict(req.context or {})
@@ -2452,38 +1843,9 @@ async def consume_runtime_approval(
         and (row.context or {}).get("args_hash") in accepted_hashes
     ]
     if len(matches) == 1:
-        # The compatibility lookup above deliberately avoids locking every
-        # granted request in the conversation. Lock the one exact candidate
-        # now and re-check it after the lock: two workers may have observed the
-        # same GRANTED snapshot, but only the first may spend it.
-        matched = await _load_runtime_request(
-            db,
-            request_id=matches[0].id,
-            entity_id=entity_id,
-            conversation_id=conversation_id,
-            for_update=True,
-        )
-        if matched is None:
-            return APPROVAL_TOKEN_IGNORED
-        matched_context = dict(matched.context or {})
-        payload_still_matches = (
-            matched.action_key == action.action_key
-            and matched_context.get("tool") == tool_name
-            and matched_context.get("args_hash") in accepted_hashes
-        )
-        if not payload_still_matches:
-            return APPROVAL_TOKEN_IGNORED
-        if matched.status != ApprovalStatus.GRANTED:
-            if matched.status == ApprovalStatus.CONSUMED:
-                return json.dumps({
-                    "error": "approval_not_granted",
-                    "status": "consumed",
-                    "approval_token": matched.id,
-                })
-            return APPROVAL_TOKEN_IGNORED
         from packages.core.governance.approvals import consume_approval
 
-        await consume_approval(db, matched)
+        await consume_approval(db, matches[0])
         return None
 
     # Unknown token, no payload match — ignore it and let the normal gate

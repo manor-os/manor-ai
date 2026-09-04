@@ -1,14 +1,17 @@
 """
 Sandbox tools — expose Docker-based sandbox lifecycle to the LLM.
 
-One ``sandbox`` tool is registered when a local or coordinated runner is
-configured. Its action enum covers lifecycle, background execution status,
-file access, result projection, and cancellation. The former tool names remain
-execution-only compatibility aliases.
+Tools (only registered when SANDBOX_SERVICE_URL is set):
+  sandbox_create      – Create an isolated Docker container for a skill
+  sandbox_exec        – Execute a command inside a sandbox
+  sandbox_read_file   – Read a file from inside a sandbox
+  sandbox_write_file  – Write a file into a sandbox (direct content or from MinIO)
+  sandbox_save_result – Save a sandbox output file/URL, optionally registering it in Knowledge
+  sandbox_destroy     – Destroy a sandbox and release its resources
 
-Sandbox context (sandbox_id plus exact owner per conversation) is tracked via
-Redis so sessions survive across chat turns. Admission fails closed when that
-authorization context cannot be persisted.
+Sandbox context (sandbox_id per conversation) is tracked via Redis cache so
+that sessions survive across chat turns. Falls back silently to "no tracking"
+when Redis is unavailable.
 """
 from __future__ import annotations
 
@@ -27,19 +30,11 @@ from packages.core.ai.runtime.file_actions import (
     RuntimeFileProjectionError,
     RuntimeFileProjectionTransactionFactory,
     runtime_entity_file_root,
-    runtime_entity_filesystem_read_lock,
     runtime_entity_filesystem_mutation_lock,
-    runtime_guard_file_read_access,
     runtime_guard_file_mutation,
-    runtime_open_entity_file_snapshot,
     runtime_write_entity_file_atomic,
 )
 from packages.core.ai.runtime.file_contracts import FileMutationAction
-from packages.core.ai.runtime.composite_tools import (
-    RuntimeCompositeToolCallFactory,
-    SandboxToolAction,
-    SandboxToolErrorCode,
-)
 from packages.core.ai.runtime.sandbox import (
     RUNTIME_SANDBOX_CONTEXT_PREFIX,
     RUNTIME_SANDBOX_CONTEXT_TTL,
@@ -47,11 +42,10 @@ from packages.core.ai.runtime.sandbox import (
     runtime_delete_sandbox_context,
     runtime_init_sandbox_context,
     runtime_load_sandbox_context,
-    runtime_sandbox_context_owner_matches,
     runtime_save_sandbox_context,
 )
+from packages.core.ai.runtime.streams import runtime_tool_error_result
 from packages.core.ai.runtime.tool_context import (
-    RUNTIME_TOOL_CONTEXT_KEYS,
     runtime_tool_call_context_from_handler,
     runtime_tool_call_context_from_kwargs,
 )
@@ -63,30 +57,6 @@ from packages.core.services.generated_media_naming import (
 from packages.core.services.workspace_layout import WorkspaceArtifactDir
 
 logger = logging.getLogger(__name__)
-
-
-_GENERIC_SANDBOX_NAME = "generic-sandbox"
-_GENERIC_SANDBOX_FILES = {
-    "README.md": (
-        "# Generic sandbox\n\n"
-        "Temporary isolated workspace for ad hoc command execution.\n"
-    ),
-}
-
-
-def _sandbox_error(code: SandboxToolErrorCode, message: str) -> str:
-    """Encode every sandbox failure with the shared machine-readable contract."""
-
-    return json.dumps(
-        {
-            "ok": False,
-            "error": {
-                "code": code.value,
-                "message": message,
-            },
-        },
-        ensure_ascii=False,
-    )
 
 
 def _coerce_bool(value: Any, default: bool) -> bool:
@@ -153,79 +123,12 @@ async def _delete_ctx(conversation_id: str) -> None:
     await runtime_delete_sandbox_context(conversation_id)
 
 
-async def _init_ctx(
-    conversation_id: str,
-    sandbox_id: str,
-    skill_id: str,
-    *,
-    entity_id: str = "",
-    user_id: str = "",
-    agent_id: str = "",
-) -> dict:
-    return await runtime_init_sandbox_context(
-        conversation_id,
-        sandbox_id,
-        skill_id,
-        entity_id=entity_id,
-        user_id=user_id,
-        agent_id=agent_id,
-    )
-
-
-async def _sandbox_instance_access_error(
-    *,
-    sandbox_id: str,
-    entity_id: str,
-    user_id: str | None,
-    agent_id: str | None,
-    conversation_id: str,
-) -> str | None:
-    """Bind model-supplied Sandbox ids to the current Runtime owner."""
-
-    # Identity-free calls are retained for trusted internal compatibility
-    # helpers. Runtime tool calls always carry a conversation and actor scope.
-    if not conversation_id and not user_id:
-        return None
-    ctx = await _load_ctx(conversation_id)
-    if (
-        not isinstance(ctx, dict)
-        or str(ctx.get("sandbox_id") or "") != sandbox_id
-        or str(ctx.get("agent_id") or "") != str(agent_id or "")
-        or not runtime_sandbox_context_owner_matches(
-            ctx,
-            entity_id=entity_id,
-            user_id=user_id,
-        )
-    ):
-        return _sandbox_error(
-            SandboxToolErrorCode.ACCESS_DENIED,
-            "Sandbox access denied for the current conversation owner.",
-        )
-    return None
+async def _init_ctx(conversation_id: str, sandbox_id: str, skill_id: str) -> dict:
+    return await runtime_init_sandbox_context(conversation_id, sandbox_id, skill_id)
 
 
 def _sandbox_available() -> bool:
-    if _get_sandbox_service_url():
-        return True
-    try:
-        from packages.core.config import get_settings
-
-        settings = get_settings()
-        return (
-            settings.SANDBOX_COORDINATION_MODE == "external-runner"
-            and bool(settings.SANDBOX_RUNNERS_JSON.strip())
-        )
-    except Exception:
-        return False
-
-
-def _sandbox_uses_external_runners() -> bool:
-    try:
-        from packages.core.config import get_settings
-
-        return get_settings().SANDBOX_COORDINATION_MODE == "external-runner"
-    except Exception:
-        return False
+    return bool(SANDBOX_SERVICE_URL)
 
 
 def _get_client():
@@ -359,8 +262,43 @@ def _is_sandbox_capacity_error(exc: BaseException) -> bool:
 
 
 # ────────────────────────────────────────────────────────────────
-# Workspace input collection
+# File / credential collection from MinIO
 # ────────────────────────────────────────────────────────────────
+
+def _collect_skill_files_from_minio(skill_id: str, entity_id: str) -> dict[str, str]:
+    """Download all skill files from MinIO into a {rel_path: content} dict."""
+    try:
+        from packages.core.services.skill_file_storage import (
+            load_skill_extra_files,
+            load_skill_prompt,
+            load_skill_scripts,
+            load_skill_requirements,
+        )
+        files: dict[str, str] = {}
+        prompt = load_skill_prompt(entity_id, skill_id)
+        if prompt:
+            files["SKILL.md"] = prompt
+        scripts = load_skill_scripts(entity_id, skill_id) or {}
+        files.update(scripts)
+        reqs = load_skill_requirements(entity_id, skill_id) or ""
+        if reqs:
+            files["requirements.txt"] = reqs
+        extra = load_skill_extra_files(entity_id, skill_id) or {}
+        files.update(extra)
+        return files
+    except Exception as exc:
+        logger.debug("[sandbox] MinIO file collect failed skill=%s: %s", skill_id, exc)
+        return {}
+
+
+def _load_skill_credentials(skill_id: str, entity_id: str) -> dict[str, str]:
+    """Load saved credentials for a skill from MinIO credentials.json."""
+    try:
+        from packages.core.services.skill_file_storage import load_skill_credentials
+        return load_skill_credentials(entity_id, skill_id) or {}
+    except Exception:
+        return {}
+
 
 def _workspace_path_candidates(workspace_path: str) -> list[str]:
     raw = workspace_path.replace("\\", "/").strip()
@@ -381,40 +319,44 @@ def _workspace_path_candidates(workspace_path: str) -> list[str]:
     return list(dict.fromkeys(candidates))
 
 
-async def _read_workspace_bytes(
-    entity_id: str,
-    workspace_path: str,
-    *,
-    user_id: str | None,
-    workspace_id: str | None,
-    runtime_envelope: Any | None,
-) -> tuple[bytes | None, str | None]:
+def _read_workspace_bytes(entity_id: str, workspace_path: str) -> bytes | None:
     candidates = _workspace_path_candidates(workspace_path)
     if not candidates:
-        return None, None
+        return None
 
-    rel_path = candidates[0]
-    entity_root = runtime_entity_file_root(entity_id)
-    if not entity_root:
-        return None, None
     try:
-        async with runtime_entity_filesystem_read_lock(entity_root):
-            blocked = await runtime_guard_file_read_access(
-                entity_id=entity_id,
-                user_id=user_id,
-                workspace_id=workspace_id,
-                runtime_envelope=runtime_envelope,
-                tool_name="sandbox",
-                paths=[rel_path],
-            )
-            if blocked:
-                return None, blocked
-            with runtime_open_entity_file_snapshot(entity_id, rel_path) as snapshot:
-                with open(snapshot.descriptor_path, "rb") as handle:
-                    return handle.read(), None
+        from packages.core.config import get_settings
+        from packages.core.services.entity_fs import resolve_path
+
+        settings = get_settings()
+        if settings.MANOR_FS_ENABLED and entity_id:
+            for rel_path in candidates:
+                full_path = resolve_path(entity_id, rel_path)
+                if full_path and os.path.isfile(full_path):
+                    with open(full_path, "rb") as handle:
+                        return handle.read()
     except Exception as exc:
         logger.debug("[sandbox] entity FS workspace read failed path=%s: %s", workspace_path, exc)
-        return None, None
+
+    try:
+        from packages.core.services.skill_file_storage import _get_client as _minio_client
+
+        client, bucket = _minio_client()
+        if client is None or not bucket:
+            return None
+        for key in candidates:
+            try:
+                response = client.get_object(bucket, key)
+                try:
+                    return response.read()
+                finally:
+                    response.close()
+                    response.release_conn()
+            except Exception:
+                continue
+    except Exception as exc:
+        logger.debug("[sandbox] MinIO workspace read failed path=%s: %s", workspace_path, exc)
+    return None
 
 
 # ────────────────────────────────────────────────────────────────
@@ -423,124 +365,42 @@ async def _read_workspace_bytes(
 
 async def _sandbox_create(
     entity_id: str = "",
-    user_id: str = "",
     skill_id: str = "",
     conversation_id: str = "",
     **kwargs: Any,
 ) -> str:
-    runtime_context = runtime_tool_call_context_from_kwargs(
-        kwargs,
-        entity_id=entity_id,
-        user_id=user_id,
-        conversation_id=conversation_id,
-    )
-    skill_id = str(skill_id or "").strip()
-    if skill_id:
-        return _sandbox_error(
-            SandboxToolErrorCode.SKILL_REQUIRES_INVOKE,
-            "Stored Skills must be opened with invoke_skill so Skill permissions "
-            "and bindings are enforced. Omit skill_id to create a generic sandbox.",
-        )
-    if user_id and not conversation_id:
-        return _sandbox_error(
-            SandboxToolErrorCode.ACCESS_DENIED,
-            "Authenticated sandbox creation requires a conversation owner context.",
-        )
-    if _sandbox_uses_external_runners():
-        return _sandbox_error(
-            SandboxToolErrorCode.GENERIC_UNAVAILABLE,
-            "Generic sandbox creation is disabled with external-runner coordination "
-            "because it would bypass reservation and runner admission. Use invoke_skill "
-            "to allocate a governed sandbox.",
-        )
+    skill_id = skill_id.strip()
+    if not skill_id:
+        return "skill_id is required."
 
-    if conversation_id:
-        try:
-            existing_ctx = await _load_ctx(conversation_id)
-        except Exception as exc:
-            return _sandbox_error(
-                SandboxToolErrorCode.CREATE_FAILED,
-                f"Sandbox owner context could not be loaded: {exc}",
-            )
-        if existing_ctx is not None:
-            existing_sandbox_id = (
-                str(existing_ctx.get("sandbox_id") or "")
-                if isinstance(existing_ctx, dict)
-                else ""
-            )
-            owner_matches = (
-                isinstance(existing_ctx, dict)
-                and str(existing_ctx.get("agent_id") or "")
-                == str(runtime_context.agent_id or "")
-                and runtime_sandbox_context_owner_matches(
-                    existing_ctx,
-                    entity_id=entity_id,
-                    user_id=user_id,
-                )
-            )
-            if not owner_matches or not existing_sandbox_id:
-                return _sandbox_error(
-                    SandboxToolErrorCode.ACCESS_DENIED,
-                    "An existing Sandbox context belongs to another Runtime owner.",
-                )
-            if str(existing_ctx.get("skill_id") or ""):
-                return _sandbox_error(
-                    SandboxToolErrorCode.ALREADY_ACTIVE,
-                    "This conversation already has a governed Skill sandbox. Destroy "
-                    "or finish it before creating a generic sandbox.",
-                )
+    files = _collect_skill_files_from_minio(skill_id, entity_id)
+    if not files:
+        return f"No files found for skill '{skill_id}' in storage."
 
-            existing_client = None
-            try:
-                existing_client = await _get_client_for_sandbox(existing_sandbox_id)
-                existing_status = await existing_client.status(existing_sandbox_id)
-                status_value = getattr(existing_status.status, "value", existing_status.status)
-                return "\n".join(
-                    [
-                        f"sandbox_id: {existing_sandbox_id}",
-                        f"status: {status_value}",
-                        f"workdir: {existing_status.workdir}",
-                        "sandbox_kind: generic",
-                        "reused: true",
-                    ]
-                )
-            except Exception as exc:
-                from packages.core.services.sandbox_sdk.exceptions import (
-                    SandboxNotFoundError,
-                )
+    env = _load_skill_credentials(skill_id, entity_id)
+    allowed_keys = list(env.keys())
 
-                if isinstance(exc, SandboxNotFoundError):
-                    await _delete_ctx(conversation_id)
-                else:
-                    return _sandbox_error(
-                        SandboxToolErrorCode.CREATE_FAILED,
-                        f"Existing sandbox status could not be verified: {exc}",
-                    )
-            finally:
-                if existing_client is not None:
-                    await existing_client.close()
-    files = dict(_GENERIC_SANDBOX_FILES)
+    config_overrides = None
 
-    client = None
-    created_sandbox_id = ""
     try:
         client = _get_client()
-        result = await client.create_from_files(
-            skill_name=_GENERIC_SANDBOX_NAME,
-            files=files,
-            env={},
-            allowed_sensitive_keys=[],
-            auto_install=False,
-            config=None,
-        )
-        created_sandbox_id = result.sandbox_id
+        try:
+            result = await client.create_from_files(
+                skill_name=skill_id,
+                files=files,
+                env=env,
+                allowed_sensitive_keys=allowed_keys,
+                auto_install=True,
+                config=config_overrides,
+            )
+        finally:
+            await client.close()
 
         skill = result.skill
         parts = [
             f"sandbox_id: {result.sandbox_id}",
             f"status: {result.status}",
             f"workdir: {result.workdir}",
-            "sandbox_kind: generic",
         ]
         if skill.entry_hint:
             parts.append(f"entry_hint: {skill.entry_hint}")
@@ -548,57 +408,32 @@ async def _sandbox_create(
             parts.append(f"scripts: {', '.join(skill.scripts)}")
         if skill.requirements_txt:
             parts.append("dependencies: installed from requirements.txt")
-        parts.append("credentials_injected: (none)")
+        parts.append(
+            f"credentials_injected: {', '.join(env.keys())}" if env else "credentials_injected: (none)"
+        )
         if result.env_blocked:
             parts.append(f"env_blocked: {', '.join(result.env_blocked)}")
         parts.append(
-            "workspace_mount: (none; use sandbox action='write_file' with "
-            "workspace_path or direct content to inject inputs)"
+            "workspace_mount: (none; use sandbox_write_file with workspace_path or direct content to inject inputs)"
         )
         parts.append(
-            "NOTE: This is a blank isolated sandbox. Proceed with sandbox "
-            "action='exec' or action='write_file'."
+            "NOTE: All required credentials are pre-injected as environment variables. "
+            "Do NOT look for API keys elsewhere. Proceed directly with sandbox_exec."
         )
 
         if conversation_id:
-            await _init_ctx(
-                conversation_id,
-                result.sandbox_id,
-                "",
-                entity_id=entity_id,
-                user_id=user_id,
-                agent_id=runtime_context.agent_id or "",
-            )
+            await _init_ctx(conversation_id, result.sandbox_id, skill_id)
         logger.info(
-            "[sandbox] created: kind=generic sandbox=%s entity=%s",
-            result.sandbox_id,
-            entity_id or "(none)",
+            "[sandbox] created: skill=%s sandbox=%s entity=%s",
+            skill_id, result.sandbox_id, entity_id or "(none)",
         )
         return "\n".join(parts)
     except Exception as exc:
-        if created_sandbox_id and client is not None:
-            try:
-                await client.destroy(sandbox_id=created_sandbox_id)
-            except Exception:
-                logger.warning(
-                    "[sandbox] failed to destroy unadmitted sandbox=%s",
-                    created_sandbox_id,
-                    exc_info=True,
-                )
         if _is_sandbox_capacity_error(exc):
-            logger.warning("[sandbox] capacity full: kind=generic error=%s", exc)
-            return _sandbox_error(
-                SandboxToolErrorCode.CAPACITY_FULL,
-                f"Sandbox capacity is full. Please retry later. Details: {exc}",
-            )
-        logger.exception("[sandbox] create failed: kind=generic error=%s", exc)
-        return _sandbox_error(
-            SandboxToolErrorCode.CREATE_FAILED,
-            f"Sandbox creation failed: {exc}",
-        )
-    finally:
-        if client is not None:
-            await client.close()
+            logger.warning("[sandbox] capacity full: skill=%s error=%s", skill_id, exc)
+            return f"Sandbox capacity is full. Please retry later.\nDetails: {exc}"
+        logger.exception("[sandbox] create failed: skill=%s error=%s", skill_id, exc)
+        return f"Sandbox creation failed: {exc}"
 
 
 _SANDBOX_CREATE_SCHEMA = {
@@ -606,12 +441,19 @@ _SANDBOX_CREATE_SCHEMA = {
     "function": {
         "name": "sandbox_create",
         "description": (
-            "Create a blank isolated sandbox and return its sandbox_id and workdir. "
-            "Use invoke_skill for stored Skills so their permissions and bindings are enforced."
+            "Create a skill sandbox and return sandbox_id, skill info, and entry_hint. "
+            "Credentials are injected as env vars; do not search for API keys. "
+            "Then run sandbox_exec."
         ),
         "parameters": {
             "type": "object",
-            "properties": {},
+            "properties": {
+                "skill_id": {
+                    "type": "string",
+                    "description": "Skill id, e.g. 'my-org--data-processor'",
+                },
+            },
+            "required": ["skill_id"],
         },
     },
 }
@@ -623,20 +465,13 @@ _SANDBOX_CREATE_SCHEMA = {
 
 async def _sandbox_exec(
     entity_id: str = "",
-    user_id: str = "",
     sandbox_id: str = "",
     command: str = "",
     timeout: Any = 60,
-    background: Any = False,
     conversation_id: str = "",
     **kwargs: Any,
 ) -> str:
-    runtime_context = runtime_tool_call_context_from_kwargs(
-        kwargs,
-        entity_id=entity_id,
-        user_id=user_id,
-        conversation_id=conversation_id,
-    )
+    runtime_context = runtime_tool_call_context_from_kwargs(kwargs)
     sandbox_id = sandbox_id.strip()
     command = command.strip()
     try:
@@ -645,60 +480,11 @@ async def _sandbox_exec(
         timeout = 60
 
     if not sandbox_id or not command:
-        return _sandbox_error(
-            SandboxToolErrorCode.INVALID_REQUEST,
-            "sandbox_id and command are required.",
-        )
-
-    access_error = await _sandbox_instance_access_error(
-        sandbox_id=sandbox_id,
-        entity_id=entity_id,
-        user_id=user_id,
-        agent_id=runtime_context.agent_id,
-        conversation_id=conversation_id,
-    )
-    if access_error:
-        return access_error
+        return "sandbox_id and command are required."
 
     try:
         client = await _get_client_for_sandbox(sandbox_id)
         execution_id = _runtime_sandbox_execution_id(runtime_context, sandbox_id)
-        if _coerce_bool(background, False):
-            result = None
-            try:
-                result = await client.start_exec(
-                    sandbox_id=sandbox_id,
-                    command=command,
-                    timeout=timeout,
-                    execution_id=execution_id,
-                )
-                try:
-                    await _set_runtime_active_execution(
-                        runtime_context,
-                        sandbox_id=sandbox_id,
-                        execution_id=result.execution_id,
-                    )
-                except Exception:
-                    await client.cancel_execution(sandbox_id, result.execution_id)
-                    raise
-            finally:
-                await client.close()
-            assert result is not None
-            return json.dumps(
-                {
-                    "sandbox_id": result.sandbox_id,
-                    "execution_id": result.execution_id,
-                    "status": result.status,
-                    "created_at": result.created_at,
-                    "poll_after_seconds": 1,
-                    "hint": (
-                        "Poll with sandbox action='status' and the same sandbox_id/"
-                        "execution_id; use action='cancel' to stop it."
-                    ),
-                },
-                ensure_ascii=False,
-            )
-
         try:
             await _set_runtime_active_execution(
                 runtime_context,
@@ -731,16 +517,18 @@ async def _sandbox_exec(
         exc_type = type(exc).__name__.lower()
         is_timeout = "timed out" in err_msg or "timeout" in err_msg or "readtimeout" in exc_type
         if is_timeout:
-            return _sandbox_error(
-                SandboxToolErrorCode.EXEC_TIMEOUT,
-                f"Command exceeded its {timeout}s limit and was cancelled. Do not "
-                "automatically repeat a command with side effects. For long-running "
-                "work, start it with background=true and poll action='status'.",
+            cmd_lower = command.lower()
+            is_poll = any(kw in cmd_lower for kw in ("poll", "wait", "status", "check"))
+            retry_timeout = 120 if is_poll else 30
+            return (
+                f"Command timed out after {timeout}s. The sandbox is still running.\n\n"
+                "The task is likely still in progress. You MUST retry:\n"
+                f"  sandbox_exec(sandbox_id=\"{sandbox_id}\", "
+                f"command=\"<same command>\", timeout={retry_timeout})\n\n"
+                "IMPORTANT: Always use `bash` (not `sh`) to run scripts.\n"
+                "Do NOT destroy the sandbox. Do NOT give up."
             )
-        return _sandbox_error(
-            SandboxToolErrorCode.EXEC_FAILED,
-            f"Sandbox exec failed: {exc}",
-        )
+        return f"Sandbox exec failed: {exc}"
 
 
 _SANDBOX_EXEC_SCHEMA = {
@@ -749,10 +537,7 @@ _SANDBOX_EXEC_SCHEMA = {
         "name": "sandbox_exec",
         "description": (
             "Execute a command inside a sandbox; returns stdout/stderr/exit_code. "
-            "Use bash for .sh scripts. For long commands set background=true, then "
-            "poll status instead of retrying timed-out commands. "
-            "A background script can call `python \"$MANOR_SANDBOX_BRIDGE\" emit` "
-            "and `wait` to exchange bounded structured events with the Agent. "
+            "Use bash for .sh scripts, timeout=120 for polling, and retry after timeouts. "
             "Prefer running existing skill scripts or explicit helper files. "
             "Use sandbox_write_file for larger new files."
         ),
@@ -762,403 +547,8 @@ _SANDBOX_EXEC_SCHEMA = {
                 "sandbox_id": {"type": "string", "description": "Sandbox ID returned by sandbox_create"},
                 "command": {"type": "string", "description": "Shell command to run"},
                 "timeout": {"type": "integer", "description": "Timeout in seconds (default 60, max 300)"},
-                "background": {
-                    "type": "boolean",
-                    "description": (
-                        "Return immediately with execution_id, then poll sandbox status. "
-                        "Use for commands that may take more than a few seconds."
-                    ),
-                },
             },
             "required": ["sandbox_id", "command"],
-        },
-    },
-}
-
-
-# ────────────────────────────────────────────────────────────────
-# sandbox_status / sandbox_cancel
-# ────────────────────────────────────────────────────────────────
-
-def _sandbox_execution_payload(result: Any) -> dict[str, Any]:
-    payload = {
-        "sandbox_id": result.sandbox_id,
-        "execution_id": result.execution_id,
-        "status": result.status,
-        "created_at": result.created_at,
-        "started_at": result.started_at,
-        "finished_at": result.finished_at,
-        "stdout": result.stdout,
-        "stderr": result.stderr,
-        "exit_code": result.exit_code,
-        "error": result.error,
-        "terminal": result.terminal,
-        "events": [
-            {
-                "sequence": event.sequence,
-                "event_id": event.event_id,
-                "type": event.type,
-                "message": event.message,
-                "payload": event.payload,
-                "requires_response": event.requires_response,
-                "responded": event.responded,
-                "created_at": event.created_at,
-            }
-            for event in result.events
-        ],
-        "next_sequence": result.next_sequence,
-        "waiting_for_response": result.waiting_for_response,
-    }
-    if not result.terminal:
-        payload["poll_after_seconds"] = 1
-        payload["hint"] = (
-            "Handle each new structured event. For need_tool, call the requested "
-            "capability only through the normal Runtime permission gate; for "
-            "need_input ask the user only when you cannot resolve it. Reply with "
-            "action='respond' and the exact event_id, then poll status again. "
-            "Never send plaintext credentials; use a governed credential reference."
-            if result.waiting_for_response
-            else "Poll action='status' again with after_sequence, or use action='cancel'."
-        )
-    return payload
-
-
-async def _sandbox_status(
-    entity_id: str = "",
-    user_id: str = "",
-    sandbox_id: str = "",
-    execution_id: str = "",
-    after_sequence: Any = 0,
-    conversation_id: str = "",
-    **kwargs: Any,
-) -> str:
-    runtime_context = runtime_tool_call_context_from_kwargs(
-        kwargs,
-        entity_id=entity_id,
-        user_id=user_id,
-        conversation_id=conversation_id,
-    )
-    sandbox_id = sandbox_id.strip()
-    execution_id = execution_id.strip()
-    try:
-        after_sequence = max(0, int(after_sequence or 0))
-    except (TypeError, ValueError):
-        after_sequence = 0
-    if not sandbox_id or not execution_id:
-        return _sandbox_error(
-            SandboxToolErrorCode.INVALID_REQUEST,
-            "sandbox_id and execution_id are required.",
-        )
-    access_error = await _sandbox_instance_access_error(
-        sandbox_id=sandbox_id,
-        entity_id=entity_id,
-        user_id=user_id,
-        agent_id=runtime_context.agent_id,
-        conversation_id=conversation_id,
-    )
-    if access_error:
-        return access_error
-
-    client = None
-    try:
-        client = await _get_client_for_sandbox(sandbox_id)
-        result = await client.execution_status(
-            sandbox_id,
-            execution_id,
-            after_sequence=after_sequence,
-        )
-        if result.terminal:
-            await _clear_runtime_active_execution(runtime_context, execution_id)
-        return json.dumps(_sandbox_execution_payload(result), ensure_ascii=False)
-    except Exception as exc:
-        from packages.core.services.sandbox_sdk.exceptions import SandboxNotFoundError
-
-        code = (
-            SandboxToolErrorCode.EXECUTION_NOT_FOUND
-            if isinstance(exc, SandboxNotFoundError)
-            else SandboxToolErrorCode.EXEC_FAILED
-        )
-        return _sandbox_error(code, f"Sandbox execution status failed: {exc}")
-    finally:
-        if client is not None:
-            await client.close()
-
-
-_SANDBOX_STATUS_SCHEMA = {
-    "type": "function",
-    "function": {
-        "name": "sandbox_status",
-        "description": (
-            "Poll a background sandbox command and receive bounded structured events. "
-            "Use after_sequence from the prior result to fetch only newer events."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "sandbox_id": {"type": "string"},
-                "execution_id": {"type": "string"},
-                "after_sequence": {
-                    "type": "integer",
-                    "minimum": 0,
-                    "description": "Return events after this sequence number.",
-                },
-            },
-            "required": ["sandbox_id", "execution_id"],
-        },
-    },
-}
-
-
-async def _prepare_sandbox_response(
-    *,
-    client: Any,
-    sandbox_id: str,
-    execution_id: str,
-    event_id: str,
-    entity_id: str,
-    user_id: str,
-    payload: dict[str, Any],
-    message: str,
-) -> tuple[dict[str, Any], str]:
-    """Exchange an actor-scoped account choice for a signed Sandbox reference."""
-
-    status = await client.execution_status(sandbox_id, execution_id)
-    event = next(
-        (candidate for candidate in status.events if candidate.event_id == event_id),
-        None,
-    )
-    if event is None or str(event.type) != "need_credential":
-        return payload, message
-    if message.strip():
-        raise ValueError("need_credential responses do not accept a message")
-    if set(payload) - {"integration_account_id"}:
-        raise ValueError(
-            "need_credential responses accept only integration_account_id"
-        )
-    integration_account_id = (
-        str(payload.get("integration_account_id") or "").strip() or None
-    )
-    event_payload = event.payload if isinstance(event.payload, dict) else {}
-    provider = str(event_payload.get("provider") or "").strip()
-    if not entity_id or not user_id or not provider:
-        raise ValueError(
-            "need_credential requires an actor-scoped provider"
-        )
-
-    from packages.core.database import async_session
-    from packages.core.services.agent_permission_service import can_use_integration
-    from packages.core.services.provider_keys import canonical_provider_key
-    from packages.core.services.sandbox_credential_refs import (
-        issue_sandbox_credential_ref,
-    )
-
-    provider_key = canonical_provider_key(provider)
-    async with async_session() as db:
-        decision = await can_use_integration(
-            db,
-            user_id=user_id,
-            entity_id=entity_id,
-            provider=provider_key,
-            integration_account_id=integration_account_id,
-            allow_env_fallback=False,
-        )
-    if not decision.allowed or not decision.account_id:
-        raise ValueError(decision.reason or "Integration account access denied")
-    resolved_account_id = str(decision.account_id)
-    credential_ref = issue_sandbox_credential_ref(
-        signing_key=_get_sandbox_api_token(),
-        sandbox_id=sandbox_id,
-        execution_id=execution_id,
-        event_id=event_id,
-        provider=provider,
-        integration_account_id=resolved_account_id,
-    )
-    return {
-        "credential_ref": credential_ref,
-        "integration_account_id": resolved_account_id,
-        "provider": provider,
-    }, ""
-
-
-async def _sandbox_respond(
-    entity_id: str = "",
-    user_id: str = "",
-    sandbox_id: str = "",
-    execution_id: str = "",
-    event_id: str = "",
-    payload: Any = None,
-    message: str = "",
-    conversation_id: str = "",
-    **kwargs: Any,
-) -> str:
-    runtime_context = runtime_tool_call_context_from_kwargs(
-        kwargs,
-        entity_id=entity_id,
-        user_id=user_id,
-        conversation_id=conversation_id,
-    )
-    sandbox_id = sandbox_id.strip()
-    execution_id = execution_id.strip()
-    event_id = event_id.strip()
-    if not sandbox_id or not execution_id or not event_id:
-        return _sandbox_error(
-            SandboxToolErrorCode.INVALID_REQUEST,
-            "sandbox_id, execution_id, and event_id are required.",
-        )
-    if payload is None:
-        payload = {}
-    if not isinstance(payload, dict):
-        return _sandbox_error(
-            SandboxToolErrorCode.INVALID_REQUEST,
-            "payload must be an object.",
-        )
-    access_error = await _sandbox_instance_access_error(
-        sandbox_id=sandbox_id,
-        entity_id=entity_id,
-        user_id=user_id,
-        agent_id=runtime_context.agent_id,
-        conversation_id=conversation_id,
-    )
-    if access_error:
-        return access_error
-
-    client = None
-    try:
-        client = await _get_client_for_sandbox(sandbox_id)
-        payload, message = await _prepare_sandbox_response(
-            client=client,
-            sandbox_id=sandbox_id,
-            execution_id=execution_id,
-            event_id=event_id,
-            entity_id=str(runtime_context.entity_id or entity_id or ""),
-            user_id=str(runtime_context.user_id or user_id or ""),
-            payload=payload,
-            message=str(message or ""),
-        )
-        result = await client.send_execution_response(
-            sandbox_id,
-            execution_id,
-            event_id,
-            payload=payload,
-            message=message,
-        )
-        return json.dumps(
-            {
-                "sandbox_id": result.sandbox_id,
-                "execution_id": result.execution_id,
-                "event_id": result.event_id,
-                "accepted": result.accepted,
-                "duplicate": result.duplicate,
-                "hint": "Poll action='status' with the last next_sequence.",
-            },
-            ensure_ascii=False,
-        )
-    except Exception as exc:
-        from packages.core.services.sandbox_sdk.exceptions import SandboxNotFoundError
-
-        code = (
-            SandboxToolErrorCode.EXECUTION_EVENT_NOT_FOUND
-            if isinstance(exc, SandboxNotFoundError)
-            else SandboxToolErrorCode.RESPOND_FAILED
-        )
-        return _sandbox_error(code, f"Sandbox execution response failed: {exc}")
-    finally:
-        if client is not None:
-            await client.close()
-
-
-_SANDBOX_RESPOND_SCHEMA = {
-    "type": "function",
-    "function": {
-        "name": "sandbox_respond",
-        "description": (
-            "Reply to one structured event from a running sandbox command. "
-            "For need_credential, optionally provide only integration_account_id to "
-            "select among the current actor's connections; Core validates access and "
-            "creates the governed short-lived reference. Never include plaintext "
-            "credentials or a credential_ref."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "sandbox_id": {"type": "string"},
-                "execution_id": {"type": "string"},
-                "event_id": {"type": "string"},
-                "payload": {"type": "object"},
-                "message": {"type": "string"},
-            },
-            "required": ["sandbox_id", "execution_id", "event_id"],
-        },
-    },
-}
-
-
-async def _sandbox_cancel(
-    entity_id: str = "",
-    user_id: str = "",
-    sandbox_id: str = "",
-    execution_id: str = "",
-    conversation_id: str = "",
-    **kwargs: Any,
-) -> str:
-    runtime_context = runtime_tool_call_context_from_kwargs(
-        kwargs,
-        entity_id=entity_id,
-        user_id=user_id,
-        conversation_id=conversation_id,
-    )
-    sandbox_id = sandbox_id.strip()
-    execution_id = execution_id.strip()
-    if not sandbox_id or not execution_id:
-        return _sandbox_error(
-            SandboxToolErrorCode.INVALID_REQUEST,
-            "sandbox_id and execution_id are required.",
-        )
-    access_error = await _sandbox_instance_access_error(
-        sandbox_id=sandbox_id,
-        entity_id=entity_id,
-        user_id=user_id,
-        agent_id=runtime_context.agent_id,
-        conversation_id=conversation_id,
-    )
-    if access_error:
-        return access_error
-
-    client = None
-    try:
-        client = await _get_client_for_sandbox(sandbox_id)
-        result = await client.cancel_execution(sandbox_id, execution_id)
-        return json.dumps(
-            {
-                "sandbox_id": result.sandbox_id,
-                "execution_id": result.execution_id,
-                "cancelled": result.cancelled,
-                "hint": "Poll action='status' to observe the terminal state.",
-            },
-            ensure_ascii=False,
-        )
-    except Exception as exc:
-        return _sandbox_error(
-            SandboxToolErrorCode.CANCEL_FAILED,
-            f"Sandbox execution cancel failed: {exc}",
-        )
-    finally:
-        if client is not None:
-            await client.close()
-
-
-_SANDBOX_CANCEL_SCHEMA = {
-    "type": "function",
-    "function": {
-        "name": "sandbox_cancel",
-        "description": "Cancel one background sandbox command by execution_id.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "sandbox_id": {"type": "string"},
-                "execution_id": {"type": "string"},
-            },
-            "required": ["sandbox_id", "execution_id"],
         },
     },
 }
@@ -1170,54 +560,17 @@ _SANDBOX_CANCEL_SCHEMA = {
 
 async def _sandbox_read_file(
     entity_id: str = "",
-    user_id: str = "",
     sandbox_id: str = "",
     path: str = "",
-    conversation_id: str = "",
     **kwargs: Any,
 ) -> str:
-    runtime_context = runtime_tool_call_context_from_kwargs(
-        kwargs,
-        entity_id=entity_id,
-        user_id=user_id,
-        conversation_id=conversation_id,
-    )
     sandbox_id = sandbox_id.strip()
     path = (path or kwargs.get("file_path") or "").strip()
     if not sandbox_id or not path:
-        return _sandbox_error(
-            SandboxToolErrorCode.INVALID_REQUEST,
-            "sandbox_id and path are required.",
-        )
-
-    access_error = await _sandbox_instance_access_error(
-        sandbox_id=sandbox_id,
-        entity_id=entity_id,
-        user_id=user_id,
-        agent_id=runtime_context.agent_id,
-        conversation_id=conversation_id,
-    )
-    if access_error:
-        return access_error
+        return "sandbox_id and path are required."
 
     if not path.startswith("/"):
         path = f"/skill/{path}"
-
-    try:
-        offset = max(0, int(kwargs.get("offset") or 0))
-    except (TypeError, ValueError):
-        return _sandbox_error(
-            SandboxToolErrorCode.INVALID_REQUEST,
-            "offset must be a non-negative integer.",
-        )
-    raw_limit = kwargs.get("limit")
-    try:
-        limit = None if raw_limit is None else max(1, min(int(raw_limit), 50_000))
-    except (TypeError, ValueError):
-        return _sandbox_error(
-            SandboxToolErrorCode.INVALID_REQUEST,
-            "limit must be a positive integer.",
-        )
 
     try:
         client = await _get_client_for_sandbox(sandbox_id)
@@ -1225,48 +578,27 @@ async def _sandbox_read_file(
             result = await client.read_file(sandbox_id=sandbox_id, path=path)
         finally:
             await client.close()
-        full_content = result.content
-        page_end = len(full_content) if limit is None else offset + limit
-        content = full_content[offset:page_end]
-        returned_end = offset + len(content)
-        page_has_more = returned_end < len(full_content)
-        is_truncated = page_has_more or result.truncated
         return json.dumps(
             {
                 "path": result.path,
-                "content": content,
+                "content": result.content,
                 "size": result.size,
-                "offset": offset,
-                "returned_chars": len(content),
-                # Only advertise a next page that this endpoint can actually
-                # serve.  A service-level truncation means the remainder was
-                # never returned to us, so repeating with a larger offset
-                # would otherwise produce an empty/misleading page.
-                "next_offset": returned_end if page_has_more else None,
-                "truncated": is_truncated,
+                "truncated": result.truncated,
                 "content_sha256": hashlib.sha256(
-                    content.encode("utf-8", errors="replace")
+                    result.content.encode("utf-8", errors="replace")
                 ).hexdigest(),
                 "hint": (
-                    "More content is available; call read_file again with "
-                    f"offset={returned_end} and an appropriate limit."
-                    if page_has_more and not result.truncated
-                    else (
-                        "Content is truncated by the sandbox service read limit; inspect "
-                        "a smaller file or save/export the full artifact."
-                        if result.truncated
-                        else None
-                    )
+                    "Content is truncated by the sandbox read limit; inspect a smaller "
+                    "file or save/export the full artifact."
+                    if result.truncated
+                    else None
                 ),
             },
             ensure_ascii=False,
         )
     except Exception as exc:
         logger.exception("[sandbox] read_file failed: sandbox=%s error=%s", sandbox_id, exc)
-        return _sandbox_error(
-            SandboxToolErrorCode.READ_FAILED,
-            f"Sandbox read_file failed: {exc}",
-        )
+        return f"Sandbox read_file failed: {exc}"
 
 
 _SANDBOX_READ_FILE_SCHEMA = {
@@ -1279,17 +611,6 @@ _SANDBOX_READ_FILE_SCHEMA = {
             "properties": {
                 "sandbox_id": {"type": "string", "description": "Sandbox ID returned by sandbox_create"},
                 "path": {"type": "string", "description": "Absolute path inside the sandbox, e.g. '/skill/output.json'"},
-                "offset": {
-                    "type": "integer",
-                    "minimum": 0,
-                    "description": "Optional zero-based character offset for paginated text reads.",
-                },
-                "limit": {
-                    "type": "integer",
-                    "minimum": 1,
-                    "maximum": 50000,
-                    "description": "Optional maximum number of characters to return.",
-                },
             },
             "required": ["sandbox_id", "path"],
         },
@@ -1303,75 +624,32 @@ _SANDBOX_READ_FILE_SCHEMA = {
 
 async def _sandbox_write_file(
     entity_id: str = "",
-    user_id: str = "",
-    workspace_id: str = "",
     sandbox_id: str = "",
     path: str = "",
     content: Any = None,
     workspace_path: str = "",
-    conversation_id: str = "",
     **kwargs: Any,
 ) -> str:
-    runtime_context = runtime_tool_call_context_from_kwargs(
-        kwargs,
-        entity_id=entity_id,
-        user_id=user_id,
-        workspace_id=workspace_id,
-        conversation_id=conversation_id,
-    )
     sandbox_id = sandbox_id.strip()
     path = (path or kwargs.get("file_path") or "").strip()
     workspace_path = (workspace_path or "").strip()
 
     if not sandbox_id or not path:
-        return _sandbox_error(
-            SandboxToolErrorCode.INVALID_REQUEST,
-            "sandbox_id and path are required.",
-        )
+        return "sandbox_id and path are required."
     if not path.startswith("/"):
         path = f"/skill/{path}"
     if content is not None and workspace_path:
-        return _sandbox_error(
-            SandboxToolErrorCode.INVALID_REQUEST,
-            "Provide either `content` or `workspace_path`, not both.",
-        )
+        return "Provide either `content` or `workspace_path`, not both."
     if content is None and not workspace_path:
-        return _sandbox_error(
-            SandboxToolErrorCode.INVALID_REQUEST,
-            "Either `content` or `workspace_path` must be provided.",
-        )
-
-    access_error = await _sandbox_instance_access_error(
-        sandbox_id=sandbox_id,
-        entity_id=entity_id,
-        user_id=user_id,
-        agent_id=runtime_context.agent_id,
-        conversation_id=conversation_id,
-    )
-    if access_error:
-        return access_error
+        return "Either `content` or `workspace_path` must be provided."
 
     try:
         client = await _get_client_for_sandbox(sandbox_id)
         try:
             if workspace_path:
-                workspace_bytes, read_blocked = await _read_workspace_bytes(
-                    entity_id,
-                    workspace_path,
-                    user_id=user_id or runtime_context.user_id,
-                    workspace_id=workspace_id or runtime_context.workspace_id,
-                    runtime_envelope=runtime_context.runtime_envelope,
-                )
-                if read_blocked:
-                    return _sandbox_error(
-                        SandboxToolErrorCode.ACCESS_DENIED,
-                        "Workspace file read access denied.",
-                    )
+                workspace_bytes = _read_workspace_bytes(entity_id, workspace_path)
                 if workspace_bytes is None:
-                    return _sandbox_error(
-                        SandboxToolErrorCode.WORKSPACE_FILE_NOT_FOUND,
-                        f"File not found in workspace: {workspace_path}",
-                    )
+                    return f"File not found in workspace: {workspace_path}"
                 result = await client.write_file_base64(
                     sandbox_id=sandbox_id,
                     path=path,
@@ -1388,10 +666,7 @@ async def _sandbox_write_file(
         return f"Written to {result.path} (source: {source})"
     except Exception as exc:
         logger.exception("[sandbox] write_file failed: sandbox=%s error=%s", sandbox_id, exc)
-        return _sandbox_error(
-            SandboxToolErrorCode.WRITE_FAILED,
-            f"Sandbox write_file failed: {exc}",
-        )
+        return f"Sandbox write_file failed: {exc}"
 
 
 _SANDBOX_WRITE_FILE_SCHEMA = {
@@ -1644,37 +919,16 @@ async def _sandbox_save_result(
     display_as_artifact, artifact_role = _artifact_display_params(kwargs)
 
     if not filename:
-        return _sandbox_error(
-            SandboxToolErrorCode.INVALID_REQUEST,
-            "filename is required.",
-        )
+        return "filename is required."
     if not sandbox_id and not file_path and not url:
-        return _sandbox_error(
-            SandboxToolErrorCode.INVALID_REQUEST,
-            "Provide either (sandbox_id + file_path) or url.",
-        )
+        return "Provide either (sandbox_id + file_path) or url."
     if sandbox_id and file_path and url:
-        return _sandbox_error(
-            SandboxToolErrorCode.INVALID_REQUEST,
-            "Provide either (sandbox_id + file_path) or url, not both.",
-        )
+        return "Provide either (sandbox_id + file_path) or url, not both."
     if url and not url.startswith(("http://", "https://")):
-        return _sandbox_error(
-            SandboxToolErrorCode.INVALID_REQUEST,
+        return (
             f"Invalid url '{url}': must start with http:// or https://. "
-            "To save a file generated inside the sandbox, use sandbox_id + file_path instead of url.",
+            "To save a file generated inside the sandbox, use sandbox_id + file_path instead of url."
         )
-
-    if sandbox_id:
-        access_error = await _sandbox_instance_access_error(
-            sandbox_id=sandbox_id,
-            entity_id=entity_id,
-            user_id=runtime_context.user_id,
-            agent_id=runtime_context.agent_id,
-            conversation_id=runtime_context.conversation_id or "",
-        )
-        if access_error:
-            return access_error
 
     content_bytes: bytes | None = None
     quality_evidence: dict[str, Any] | None = None
@@ -1696,18 +950,16 @@ async def _sandbox_save_result(
             or PurePosixPath(filename).suffix.lower() == ".docx"
         )
         if pptx_is_deliverable and pptx_gate_context is None:
-            return _sandbox_error(
-                SandboxToolErrorCode.QUALITY_GATE_BLOCKED,
+            return runtime_tool_error_result(
                 "PPTX_FINAL_QUALITY_GATE_BLOCKED: PPTX deliverables must be exported "
                 "from /skill/projects/<project>/exports/ so Manor can verify project, "
-                "render, and quality evidence. No file was saved.",
+                "render, and quality evidence. No file was saved."
             )
         if is_final_docx and docx_gate_context is None:
-            return _sandbox_error(
-                SandboxToolErrorCode.QUALITY_GATE_BLOCKED,
+            return runtime_tool_error_result(
                 "DOCX_FINAL_QUALITY_GATE_BLOCKED: final DOCX files must be exported "
                 "from /skill/projects/<project>/exports/ so Manor can verify project, "
-                "render, and quality evidence. No file was saved.",
+                "render, and quality evidence. No file was saved."
             )
         gate_context = pptx_gate_context or docx_gate_context
         gate_kind = "pptx" if pptx_gate_context is not None else "docx"
@@ -1790,21 +1042,18 @@ async def _sandbox_save_result(
                         file_path,
                         evidence_error,
                     )
-                    return _sandbox_error(
-                        SandboxToolErrorCode.QUALITY_GATE_BLOCKED,
+                    return runtime_tool_error_result(
                         f"{label}_FINAL_QUALITY_GATE_BLOCKED: "
                         f"{evidence_error}. Fix the source, re-export it, render every "
                         f"{'slide' if gate_kind == 'pptx' else 'page'}, and call "
-                        "sandbox action='save_result' again. "
-                        f"The current {label} was not saved.",
+                        f"sandbox_save_result again. The current {label} was not saved."
                     )
         except Exception as exc:
             logger.exception("[sandbox] save_result read failed: %s", exc)
-            return _sandbox_error(
-                SandboxToolErrorCode.READ_FAILED,
+            return runtime_tool_error_result(
                 f"Failed to read file from sandbox: {exc}. No file was saved. "
-                "Check that the prior sandbox action='exec' command succeeded and that "
-                f"'{file_path}' actually exists before calling sandbox action='save_result' again.",
+                "Check that the prior sandbox_exec command succeeded and that "
+                f"'{file_path}' actually exists before calling sandbox_save_result again."
             )
     elif url:
         try:
@@ -1812,40 +1061,25 @@ async def _sandbox_save_result(
             async with httpx.AsyncClient(timeout=120, follow_redirects=True) as http:
                 resp = await http.get(url)
             if resp.status_code != 200:
-                return _sandbox_error(
-                    SandboxToolErrorCode.DOWNLOAD_FAILED,
-                    f"Failed to download URL (HTTP {resp.status_code}): {url}",
-                )
+                return f"Failed to download URL (HTTP {resp.status_code}): {url}"
             content_bytes = resp.content
         except Exception as exc:
             logger.exception("[sandbox] save_result download failed: %s", exc)
-            return _sandbox_error(
-                SandboxToolErrorCode.DOWNLOAD_FAILED,
-                f"Failed to download URL: {exc}",
-            )
+            return f"Failed to download URL: {exc}"
 
     if not content_bytes:
-        return _sandbox_error(
-            SandboxToolErrorCode.EMPTY_RESULT,
-            "No content to save.",
-        )
+        return "No content to save."
 
     import os as _os
 
     safe_filename = _os.path.basename(filename)
     if safe_filename != filename or safe_filename in {"", ".", ".."}:
-        return _sandbox_error(
-            SandboxToolErrorCode.INVALID_REQUEST,
-            "filename must be a plain file name, not a path.",
-        )
+        return "filename must be a plain file name, not a path."
 
     # Save to entity filesystem + document store
     entity_dir = runtime_entity_file_root(entity_id)
     if not entity_dir:
-        return _sandbox_error(
-            SandboxToolErrorCode.FILESYSTEM_UNAVAILABLE,
-            "Entity filesystem is not enabled.",
-        )
+        return "Entity filesystem is not enabled."
 
     rel_path = safe_filename
     if runtime_context.workspace_id:
@@ -1856,15 +1090,9 @@ async def _sandbox_save_result(
                 task_id=runtime_context.task_id,
             )
         except Exception as exc:  # noqa: BLE001
-            return _sandbox_error(
-                SandboxToolErrorCode.WORKSPACE_SCOPE_UNAVAILABLE,
-                f"Workspace artifact scope is unavailable: {exc}",
-            )
+            return f"Workspace artifact scope is unavailable: {exc}"
         if not workspace_base:
-            return _sandbox_error(
-                SandboxToolErrorCode.WORKSPACE_SCOPE_UNAVAILABLE,
-                "Workspace artifact scope is unavailable.",
-            )
+            return "Workspace artifact scope is unavailable."
         rel_path = scope_workspace_artifact_path(
             rel_path,
             workspace_base,
@@ -1916,10 +1144,7 @@ async def _sandbox_save_result(
                     require_missing=True,
                 )
             except Exception as exc:  # noqa: BLE001
-                return _sandbox_error(
-                    SandboxToolErrorCode.FILESYSTEM_UNAVAILABLE,
-                    f"Entity filesystem is not available: {exc}",
-                )
+                return f"Entity filesystem is not available: {exc}"
             rel_path = _os.path.relpath(target, entity_dir).replace(_os.sep, "/")
             mime_type = mimetypes.guess_type(target)[0] or "application/octet-stream"
             return json.dumps({
@@ -1993,22 +1218,15 @@ async def _sandbox_save_result(
                 **({"quality_gate": quality_evidence} if quality_evidence else {}),
             })
         except RuntimeFileCommitError as exc:
-            return _sandbox_error(
-                SandboxToolErrorCode.FILESYSTEM_UNAVAILABLE,
-                f"Entity filesystem is not available: {exc}",
-            )
+            return f"Entity filesystem is not available: {exc}"
         except RuntimeFileProjectionError as exc:
-            return _sandbox_error(
-                SandboxToolErrorCode.DOCUMENT_SYNC_FAILED,
+            return (
                 "Document sync failed and the downloaded file was rolled back: "
-                f"{exc.reason}",
+                f"{exc.reason}"
             )
         except Exception as exc:
             logger.exception("[sandbox] save_result doc register failed: %s", exc)
-            return _sandbox_error(
-                SandboxToolErrorCode.DOCUMENT_SYNC_FAILED,
-                f"File was not committed to the document store: {exc}",
-            )
+            return f"File was not committed to the document store: {exc}"
 
 
 _SANDBOX_SAVE_RESULT_SCHEMA = {
@@ -2050,33 +1268,13 @@ _SANDBOX_SAVE_RESULT_SCHEMA = {
 
 async def _sandbox_destroy(
     entity_id: str = "",
-    user_id: str = "",
     sandbox_id: str = "",
     conversation_id: str = "",
     **kwargs: Any,
 ) -> str:
-    runtime_context = runtime_tool_call_context_from_kwargs(
-        kwargs,
-        entity_id=entity_id,
-        user_id=user_id,
-        conversation_id=conversation_id,
-    )
     sandbox_id = sandbox_id.strip()
     if not sandbox_id:
-        return _sandbox_error(
-            SandboxToolErrorCode.INVALID_REQUEST,
-            "sandbox_id is required.",
-        )
-
-    access_error = await _sandbox_instance_access_error(
-        sandbox_id=sandbox_id,
-        entity_id=entity_id,
-        user_id=user_id,
-        agent_id=runtime_context.agent_id,
-        conversation_id=conversation_id,
-    )
-    if access_error:
-        return access_error
+        return "sandbox_id is required."
 
     try:
         client = await _get_client_for_sandbox(sandbox_id)
@@ -2099,10 +1297,9 @@ async def _sandbox_destroy(
             logger.info("[sandbox] destroy ignored; sandbox already gone: sandbox=%s", sandbox_id)
             return f"Sandbox {sandbox_id} was already destroyed."
         logger.exception("[sandbox] destroy failed: sandbox=%s error=%s", sandbox_id, exc)
-        return _sandbox_error(
-            SandboxToolErrorCode.DESTROY_FAILED,
-            f"Sandbox destroy failed: {exc}",
-        )
+        if conversation_id:
+            await _delete_ctx(conversation_id)
+        return f"Sandbox destroy failed: {exc}"
 
 
 _SANDBOX_DESTROY_SCHEMA = {
@@ -2127,121 +1324,6 @@ _SANDBOX_DESTROY_SCHEMA = {
 # ────────────────────────────────────────────────────────────────
 # Public API
 # ────────────────────────────────────────────────────────────────
-
-SANDBOX_SCHEMA = {
-    "type": "function",
-    "function": {
-        "name": "sandbox",
-        "description": (
-            "Run an isolated sandbox lifecycle through one action gateway. "
-            "Use create, then exec/status/respond/cancel/read_file/write_file/save_result as needed, and "
-            "destroy once when finished. Allowed action values are exactly create, "
-            "exec, status, respond, cancel, read_file, write_file, save_result, and destroy; do not substitute "
-            "run, shell, execute, exec_command, or command. Create always returns a "
-            "blank sandbox; use invoke_skill when a stored Skill is required."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "action": {
-                    "type": "string",
-                    "enum": list(SandboxToolAction.values()),
-                    "description": "Sandbox operation to perform.",
-                },
-                "params": {
-                    "type": "object",
-                    "description": (
-                        "Action-specific parameters. create: no params. "
-                        "exec: sandbox_id, command, timeout?, background?; background "
-                        "scripts may use $MANOR_SANDBOX_BRIDGE emit/wait for "
-                        "structured Agent interaction. "
-                        "status: sandbox_id, execution_id, after_sequence?. "
-                        "respond: sandbox_id, execution_id, event_id, payload?, message?. "
-                        "cancel: sandbox_id, execution_id. "
-                        "read_file: sandbox_id, path, offset?/limit?. write_file: "
-                        "sandbox_id, path plus exactly one of content/workspace_path. "
-                        "save_result: filename plus sandbox_id/file_path or url. "
-                        "destroy: sandbox_id."
-                    ),
-                    "additionalProperties": True,
-                },
-            },
-            "required": ["action"],
-        },
-    },
-}
-
-
-async def _sandbox_handler(
-    entity_id: str = "",
-    user_id: str = "",
-    workspace_id: str = "",
-    conversation_id: str = "",
-    **kwargs: Any,
-) -> str:
-    raw_action = str(kwargs.get("action") or "").strip()
-    raw_params = kwargs.get("params")
-    if raw_params is None:
-        raw_params = {}
-    if not raw_action:
-        return _sandbox_error(
-            SandboxToolErrorCode.INVALID_REQUEST,
-            "action is required",
-        )
-    if not isinstance(raw_params, dict):
-        return _sandbox_error(
-            SandboxToolErrorCode.INVALID_REQUEST,
-            "params must be an object",
-        )
-
-    try:
-        action = SandboxToolAction(raw_action)
-    except ValueError:
-        return _sandbox_error(
-            SandboxToolErrorCode.UNSUPPORTED_ACTION,
-            f"unsupported sandbox action: {raw_action}",
-        )
-    handlers = {
-        SandboxToolAction.CREATE: _sandbox_create,
-        SandboxToolAction.EXEC: _sandbox_exec,
-        SandboxToolAction.STATUS: _sandbox_status,
-        SandboxToolAction.RESPOND: _sandbox_respond,
-        SandboxToolAction.CANCEL: _sandbox_cancel,
-        SandboxToolAction.READ_FILE: _sandbox_read_file,
-        SandboxToolAction.WRITE_FILE: _sandbox_write_file,
-        SandboxToolAction.SAVE_RESULT: _sandbox_save_result,
-        SandboxToolAction.DESTROY: _sandbox_destroy,
-    }
-    handler = handlers.get(action)
-    if handler is None:
-        return _sandbox_error(
-            SandboxToolErrorCode.UNSUPPORTED_ACTION,
-            f"unsupported sandbox action: {raw_action}",
-        )
-
-    # Runtime-injected context is authoritative. Never let nested model params
-    # replace actor, scope, approval, or envelope values.
-    normalized_params = RuntimeCompositeToolCallFactory.sandbox_params(kwargs)
-    handler_kwargs = {
-        key: value
-        for key, value in normalized_params.items()
-        if key not in RUNTIME_TOOL_CONTEXT_KEYS
-        and key not in {"entity_id", "user_id"}
-    }
-    handler_kwargs.update(
-        {
-            key: value
-            for key, value in kwargs.items()
-            if key in RUNTIME_TOOL_CONTEXT_KEYS
-        }
-    )
-    return await handler(
-        entity_id=entity_id,
-        user_id=user_id,
-        workspace_id=workspace_id,
-        conversation_id=conversation_id,
-        **handler_kwargs,
-    )
 
 async def destroy_all_sandboxes() -> None:
     """Destroy all active sandboxes (called on app shutdown as a safety net)."""
@@ -2272,21 +1354,10 @@ def get_tools() -> list[tuple[dict, Any]]:
     if not _sandbox_available():
         logger.debug("[sandbox] SANDBOX_SERVICE_URL not set — sandbox tools disabled")
         return []
-    logger.info("[sandbox] loading composite sandbox tool (service=%s)", SANDBOX_SERVICE_URL)
-    return [(SANDBOX_SCHEMA, _sandbox_handler)]
-
-
-def get_legacy_tools() -> list[tuple[dict, Any]]:
-    """Return execution-only aliases for persisted calls and tool bindings."""
-
-    if not _sandbox_available():
-        return []
+    logger.info("[sandbox] loading 6 sandbox tools (service=%s)", SANDBOX_SERVICE_URL)
     return [
         (_SANDBOX_CREATE_SCHEMA, _sandbox_create),
         (_SANDBOX_EXEC_SCHEMA, _sandbox_exec),
-        (_SANDBOX_STATUS_SCHEMA, _sandbox_status),
-        (_SANDBOX_RESPOND_SCHEMA, _sandbox_respond),
-        (_SANDBOX_CANCEL_SCHEMA, _sandbox_cancel),
         (_SANDBOX_READ_FILE_SCHEMA, _sandbox_read_file),
         (_SANDBOX_WRITE_FILE_SCHEMA, _sandbox_write_file),
         (_SANDBOX_SAVE_RESULT_SCHEMA, _sandbox_save_result),

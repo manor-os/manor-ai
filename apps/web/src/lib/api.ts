@@ -77,7 +77,6 @@ import {
   type ManualSkillReference,
 } from "./manualSkillRefs";
 import {
-  authPrincipalKey,
   getAuthToken,
   clearAuthBrowserState,
 } from "./authToken";
@@ -191,7 +190,6 @@ type DocumentBrowseResponse = DocumentListResponse & {
   total_documents: number;
   direct_total_files?: number;
   direct_total_size?: number;
-  max_upload_mb: number;
 };
 type DocumentIndexingStatus = Pick<Document, "id" | "vector_status" | "indexing_progress">;
 
@@ -693,22 +691,6 @@ export interface WorkspaceDraftFinalize {
 
 // ── Workspace Blueprint / Marketplace types (M12) ─────────────────────
 
-export interface WorkspaceConnectionStatus {
-  workspace_id: string;
-  required_issue_count: number;
-  requirements: Array<{
-    key: string;
-    kind: "integration" | "channel" | "browser_session";
-    provider: string;
-    label: string;
-    required: boolean;
-    ready: boolean;
-    reason: string;
-    service_keys: string[];
-    setup_kind?: string | null;
-  }>;
-}
-
 export interface BlueprintSetupItem {
   label: string;
   key: string | null;
@@ -790,22 +772,14 @@ export interface BlueprintSummary {
   created_at: string;
   updated_at: string | null;
   published_at: string | null;
-  // Server-computed / read-only marketplace fields. Pricing is changed via
-  // api.blueprints.setPricing, never via update().
-  price_cents?: number | null;
-  list_price_cents?: number | null;
-  currency?: string;
-  purchase_count?: number;
   has_share_token?: boolean;
-  // Whether the current caller owns this blueprint row. False for built-in
-  // marketplace blueprints and other tenants' published blueprints.
+  // Whether the current caller owns this blueprint row.
   is_owner?: boolean;
 }
 
 export interface BlueprintDetail extends BlueprintSummary {
   description: string | null;
   payload: Record<string, unknown>;
-  purchased?: boolean;
 }
 
 // Mirrors backend UpdateBlueprintRequest (apps/api/routers/blueprints.py):
@@ -1127,72 +1101,6 @@ export interface BlueprintInstallPreflight {
 }
 
 
-// Mirrors backend PurchaseStatusResponse (apps/api/routers/marketplace.py).
-export interface PurchaseStatusResponse {
-  purchase_id: string | null;
-  blueprint_id: string | null;
-  status: string;
-  purchase_status: string | null;
-  attempt_status?: string | null;
-  purchased_at?: string | null;
-}
-
-// Mirrors backend MerchantStatusResponse (apps/api/routers/merchant.py).
-export interface MerchantStatusResponse {
-  exists: boolean;
-  onboarding_status?: string;
-  charges_enabled: boolean;
-  payouts_enabled: boolean;
-}
-
-export interface MerchantSaleItem {
-  purchase_id: string;
-  blueprint_id: string;
-  blueprint_title: string;
-  buyer_display_name: string | null;
-  amount_cents: number;
-  refunded_amount_cents: number;
-  transfer_reversed_amount_cents: number | null;
-  platform_fee_refunded_amount_cents: number | null;
-  platform_fee_cents: number | null;
-  seller_amount_cents: number | null;
-  reconciliation_pending: boolean;
-  currency: string;
-  status: string;
-  purchased_at?: string | null;
-}
-
-export interface MerchantSalesResponse {
-  items: MerchantSaleItem[];
-  gross_cents: number | null;
-  fees_cents: number | null;
-  net_cents: number | null;
-  reconciliation_pending: boolean;
-  reconciliation_pending_count: number;
-}
-
-export interface BillingPayment {
-  id: string;
-  amount_cents: number;
-  /** @deprecated Use amount_cents. */
-  amount: number;
-  currency: string;
-  credits: number;
-  status: string;
-  kind: "credit_topup" | "subscription" | "payment";
-  action: "credit_purchase" | "plan_upgrade" | "subscription_renewal" | "payment";
-  plan_id?: string | null;
-  event_type?: string | null;
-  description?: string | null;
-  stripe_payment_intent_id?: string | null;
-  created_at: string;
-  metadata: Record<string, unknown>;
-}
-
-export interface BillingPaymentsResponse {
-  items: BillingPayment[];
-  total: number;
-}
 
 export interface InstallTodo {
   kind: "channel" | "browser_session" | "missing_agent" | "note";
@@ -1351,44 +1259,6 @@ export class ApiError extends Error {
   ) {
     super(message);
     this.name = "ApiError";
-  }
-}
-
-export type DocumentUploadPhase = "uploading" | "processing";
-
-export interface DocumentUploadProgress {
-  phase: DocumentUploadPhase;
-  loaded: number;
-  total: number;
-  percent: number;
-}
-
-export interface DocumentUploadRequestOptions {
-  signal?: AbortSignal;
-  onProgress?: (progress: DocumentUploadProgress) => void;
-  /** Abort only while the browser has stopped sending bytes for this long. */
-  stallTimeoutMs?: number;
-  /** Bound the server-side validation/persistence phase after all bytes arrive. */
-  processingTimeoutMs?: number;
-  /** Stable across retries so an ambiguous completion cannot create a duplicate. */
-  idempotencyKey?: string;
-  /** Bound receipt reconciliation after the browser times out waiting for processing. */
-  receiptReconcileTimeoutMs?: number;
-}
-
-export class DocumentUploadStalledError extends Error {
-  constructor(public phase: DocumentUploadPhase = "uploading") {
-    super(phase === "processing"
-      ? "Upload processing did not finish in time"
-      : "Upload stopped making progress");
-    this.name = "DocumentUploadStalledError";
-  }
-}
-
-export class DocumentUploadAuthChangedError extends Error {
-  constructor() {
-    super("Upload stopped because the authenticated account changed");
-    this.name = "DocumentUploadAuthChangedError";
   }
 }
 
@@ -1735,7 +1605,7 @@ function pruneDocumentDownloadCache(protectedId?: string) {
 
 function invalidateDocumentDownloadCache(id?: string) {
   if (id) {
-    [id, `download:${id}`, `preview:${id}`, `thumbnail:${id}`].forEach((key) => {
+    [id, `download:${id}`, `thumbnail:${id}`].forEach((key) => {
       documentDownloadCache.delete(key);
       documentDownloadInflight.delete(key);
     });
@@ -1815,16 +1685,15 @@ async function fetchProtectedDocumentBlob(
 }
 
 async function fetchDocumentBlob(id: string, options: DocumentBlobOptions = {}): Promise<Blob> {
-  return fetchProtectedDocumentBlob(`download:${id}`, `/documents/${id}/download`, { ...options, cache: false });
+  return fetchProtectedDocumentBlob(`download:${id}`, `/documents/${id}/download`, options);
 }
 
 async function fetchDocumentResponse(
   id: string,
   options: DocumentResponseOptions = {},
-  action = "download",
 ): Promise<Response> {
   const token = getAuthToken();
-  const response = await fetch(cacheBustUrl(`${API_BASE}/documents/${id}/${action}`), {
+  const response = await fetch(cacheBustUrl(`${API_BASE}/documents/${id}/download`), {
     cache: "no-store",
     headers: token ? { Authorization: `Bearer ${token}` } : {},
     signal: options.signal,
@@ -1955,7 +1824,7 @@ async function fetchDocumentVideoThumbnailUrl(id: string, options: DocumentThumb
     // browser capture fallback below.
   }
 
-  const blob = await fetchProtectedDocumentBlob(`preview:${id}`, `/documents/${id}/preview/content`, options);
+  const blob = await fetchDocumentBlob(id, options);
   const videoUrl = URL.createObjectURL(blob);
   try {
     const dataUrl = await captureDocumentVideoFrame(videoUrl);
@@ -2015,7 +1884,7 @@ async function fetchDocumentImageThumbnailUrl(id: string, options: DocumentThumb
     // client-side fallback.
   }
 
-  const blob = await fetchProtectedDocumentBlob(`preview:${id}`, `/documents/${id}/preview/content`, options);
+  const blob = await fetchDocumentBlob(id, options);
   if (usePersistentCache) {
     const captured = await captureDocumentImageThumbnail(blob).catch(() => null);
     const dataUrl = captured
@@ -2191,413 +2060,6 @@ async function request<T>(
 
   if (res.status === 204) return undefined as T;
   return res.json();
-}
-
-const DEFAULT_DOCUMENT_UPLOAD_STALL_TIMEOUT_MS = 120_000;
-const DEFAULT_DOCUMENT_UPLOAD_PROCESSING_TIMEOUT_MS = 600_000;
-const DEFAULT_DOCUMENT_UPLOAD_RECEIPT_RECONCILE_TIMEOUT_MS = 15_000;
-
-function createDocumentUploadIdempotencyKey(): string {
-  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
-    return crypto.randomUUID();
-  }
-  return `document-upload-${Date.now()}-${Math.random().toString(36).slice(2)}`;
-}
-
-function documentUploadResponseBody(xhr: XMLHttpRequest): Record<string, any> {
-  let body: Record<string, any> = {};
-  try {
-    body = xhr.responseText ? JSON.parse(xhr.responseText) : {};
-  } catch {
-    body = {};
-  }
-  return body;
-}
-
-function documentUploadHttpError(
-  xhr: XMLHttpRequest,
-  path: string,
-  requestToken: string | null,
-  body = documentUploadResponseBody(xhr),
-): ApiError {
-  const detail = body.detail;
-  const message =
-    (typeof detail === "string" ? detail : detail?.message)
-    || xhr.statusText
-    || "Upload failed";
-  const coded = _extractCodedDetail(detail);
-
-  if (xhr.status === 402) {
-    const limitDetail = normalizePlanLimitDetail(
-      detail,
-      body.error || t("component.upgrade_prompt.default_message"),
-    );
-    const error = new ApiError(xhr.status, limitDetail.message);
-    error.detail = limitDetail as unknown as Record<string, unknown>;
-    return error;
-  }
-
-  if (
-    xhr.status === 401
-    && Boolean(requestToken)
-    && requestToken === getAuthToken()
-  ) {
-    handleSessionExpired(path);
-  }
-  if (isBackendUnavailableStatus(xhr.status)) {
-    const error = new ApiError(xhr.status, t("lib.api.backend_unavailable"));
-    if (coded.code) error.code = coded.code;
-    if (coded.vars) error.vars = coded.vars;
-    if (typeof detail === "object" && detail !== null) {
-      error.detail = detail as Record<string, unknown>;
-    }
-    captureClientError(error, {
-      handled: true,
-      mechanism: "api.http",
-      tags: { method: "POST", path, status: xhr.status },
-    });
-    return error;
-  }
-
-  const error = new ApiError(xhr.status, message);
-  if (coded.code) error.code = coded.code;
-  if (coded.vars) error.vars = coded.vars;
-  if (typeof detail === "object" && detail !== null) {
-    error.detail = detail as Record<string, unknown>;
-  }
-  return error;
-}
-
-function documentUploadReceiptPause(ms: number, signal?: AbortSignal): Promise<void> {
-  return new Promise((resolve, reject) => {
-    if (signal?.aborted) {
-      reject(new DOMException("Upload cancelled", "AbortError"));
-      return;
-    }
-    const timer = setTimeout(() => {
-      signal?.removeEventListener("abort", abort);
-      resolve();
-    }, ms);
-    const abort = () => {
-      clearTimeout(timer);
-      reject(new DOMException("Upload cancelled", "AbortError"));
-    };
-    signal?.addEventListener("abort", abort, { once: true });
-  });
-}
-
-async function reconcileDocumentUploadReceipt(
-  idempotencyKey: string,
-  timeoutMs: number,
-  signal?: AbortSignal,
-  expectedPrincipalKey = authPrincipalKey(getAuthToken()),
-): Promise<Document> {
-  const deadline = Date.now() + timeoutMs;
-  let pauseMs = 250;
-  while (true) {
-    if (signal?.aborted) throw new DOMException("Upload cancelled", "AbortError");
-    if (authPrincipalKey(getAuthToken()) !== expectedPrincipalKey) {
-      throw new DocumentUploadAuthChangedError();
-    }
-    const receipt = await lookupDocumentUploadReceipt(
-      idempotencyKey,
-      signal,
-      expectedPrincipalKey,
-    );
-    if (receipt) return receipt;
-    const remainingMs = deadline - Date.now();
-    if (remainingMs <= 0) throw new DocumentUploadStalledError("processing");
-    await documentUploadReceiptPause(Math.min(pauseMs, remainingMs), signal);
-    pauseMs = Math.min(pauseMs * 2, 4_000);
-  }
-}
-
-async function lookupDocumentUploadReceipt(
-  idempotencyKey: string,
-  signal?: AbortSignal,
-  expectedPrincipalKey = authPrincipalKey(getAuthToken()),
-): Promise<Document | null> {
-  const receiptToken = getAuthToken();
-  if (authPrincipalKey(receiptToken) !== expectedPrincipalKey) {
-    throw new DocumentUploadAuthChangedError();
-  }
-  try {
-    return await request<Document>(
-      `/documents/upload-receipts/${encodeURIComponent(idempotencyKey)}`,
-      {
-        signal,
-        headers: { "X-Silent-Error": "1" },
-      },
-      receiptToken,
-    );
-  } catch (error) {
-    if (error instanceof ApiError && error.status === 404) return null;
-    throw error;
-  }
-}
-
-function uploadDocumentRequest(
-  file: File,
-  folderId?: string | null,
-  options?: {
-    visibility?: string;
-    classification?: string;
-    client_visible?: boolean;
-  },
-  requestOptions: DocumentUploadRequestOptions = {},
-  requestAttempt = 0,
-  expectedPrincipalKey?: string,
-): Promise<Document> {
-  const form = new FormData();
-  form.append("file", file);
-  const params = new URLSearchParams();
-  if (folderId) params.set("folder_id", folderId);
-  if (options?.visibility) params.set("visibility", options.visibility);
-  if (options?.classification) params.set("classification", options.classification);
-  if (options?.client_visible != null) params.set("client_visible", String(options.client_visible));
-  const query = params.toString();
-  const path = `/documents/upload${query ? `?${query}` : ""}`;
-  const stallTimeoutMs = Math.max(
-    1_000,
-    requestOptions.stallTimeoutMs ?? DEFAULT_DOCUMENT_UPLOAD_STALL_TIMEOUT_MS,
-  );
-  const processingTimeoutMs = Math.max(
-    1_000,
-    requestOptions.processingTimeoutMs ?? DEFAULT_DOCUMENT_UPLOAD_PROCESSING_TIMEOUT_MS,
-  );
-  const receiptReconcileTimeoutMs = Math.max(
-    0,
-    requestOptions.receiptReconcileTimeoutMs
-      ?? DEFAULT_DOCUMENT_UPLOAD_RECEIPT_RECONCILE_TIMEOUT_MS,
-  );
-  const idempotencyKey = requestOptions.idempotencyKey || createDocumentUploadIdempotencyKey();
-  const token = getAuthToken();
-  const requestPrincipalKey = expectedPrincipalKey ?? authPrincipalKey(token);
-
-  return new Promise<Document>((resolve, reject) => {
-    if (authPrincipalKey(token) !== requestPrincipalKey) {
-      reject(new DocumentUploadAuthChangedError());
-      return;
-    }
-    if (requestOptions.signal?.aborted) {
-      reject(new DOMException("Upload cancelled", "AbortError"));
-      return;
-    }
-
-    const xhr = new XMLHttpRequest();
-    let settled = false;
-    let stalledPhase: DocumentUploadPhase | null = null;
-    let uploadBytesSent = false;
-    let lastLoaded = 0;
-    let stallTimer: ReturnType<typeof setTimeout> | null = null;
-    let processingTimer: ReturnType<typeof setTimeout> | null = null;
-
-    const clearStallTimer = () => {
-      if (stallTimer !== null) {
-        clearTimeout(stallTimer);
-        stallTimer = null;
-      }
-    };
-    const armStallTimer = () => {
-      clearStallTimer();
-      stallTimer = setTimeout(() => {
-        stalledPhase = "uploading";
-        xhr.abort();
-      }, stallTimeoutMs);
-    };
-    const clearProcessingTimer = () => {
-      if (processingTimer !== null) {
-        clearTimeout(processingTimer);
-        processingTimer = null;
-      }
-    };
-    const armProcessingTimer = () => {
-      clearProcessingTimer();
-      processingTimer = setTimeout(() => {
-        stalledPhase = "processing";
-        xhr.abort();
-      }, processingTimeoutMs);
-    };
-    const cleanup = () => {
-      clearStallTimer();
-      clearProcessingTimer();
-      requestOptions.signal?.removeEventListener("abort", abortRequest);
-    };
-    const finishResolve = (document: Document) => {
-      if (settled) return;
-      if (authPrincipalKey(getAuthToken()) !== requestPrincipalKey) {
-        finishReject(new DocumentUploadAuthChangedError());
-        return;
-      }
-      settled = true;
-      cleanup();
-      resolve(document);
-    };
-    const finishReject = (error: unknown) => {
-      if (settled) return;
-      settled = true;
-      cleanup();
-      reject(error);
-    };
-    const finishRetry = () => {
-      if (settled) return;
-      if (authPrincipalKey(getAuthToken()) !== requestPrincipalKey) {
-        finishReject(new DocumentUploadAuthChangedError());
-        return;
-      }
-      settled = true;
-      cleanup();
-      uploadDocumentRequest(
-        file,
-        folderId,
-        options,
-        { ...requestOptions, idempotencyKey },
-        requestAttempt + 1,
-        requestPrincipalKey,
-      ).then(resolve, reject);
-    };
-    const finishProcessingReconciliation = () => {
-      if (settled) return;
-      settled = true;
-      cleanup();
-      reconcileDocumentUploadReceipt(
-        idempotencyKey,
-        receiptReconcileTimeoutMs,
-        requestOptions.signal,
-        requestPrincipalKey,
-      ).then(resolve, reject);
-    };
-    const finishHttpFailureReconciliation = (originalError: unknown) => {
-      if (settled) return;
-      settled = true;
-      cleanup();
-      // A proxy can synthesize a 5xx, or corrupt a successful response, before
-      // a committed receipt is visible. Reconcile for a bounded window; one
-      // negative read is not proof that the server rolled the upload back.
-      reconcileDocumentUploadReceipt(
-        idempotencyKey,
-        receiptReconcileTimeoutMs,
-        requestOptions.signal,
-        requestPrincipalKey,
-      ).then(
-        resolve,
-        (reconciliationError) => {
-          if (
-            reconciliationError instanceof DocumentUploadAuthChangedError
-            || reconciliationError instanceof DOMException
-            || (originalError instanceof ApiError
-              && originalError.code === "document_upload_commit_uncertain")
-          ) {
-            reject(reconciliationError);
-          } else {
-            reject(originalError);
-          }
-        },
-      );
-    };
-    const abortRequest = () => xhr.abort();
-
-    xhr.open("POST", `${API_BASE}${path}`);
-    xhr.setRequestHeader("X-Language", getStoredLocale());
-    if (token) xhr.setRequestHeader("Authorization", `Bearer ${token}`);
-    xhr.setRequestHeader("Idempotency-Key", idempotencyKey);
-
-    xhr.upload.addEventListener("loadstart", () => {
-      requestOptions.onProgress?.({ phase: "uploading", loaded: 0, total: file.size, percent: 0 });
-      armStallTimer();
-    });
-    xhr.upload.addEventListener("progress", (event) => {
-      const total = event.lengthComputable && event.total > 0 ? event.total : file.size;
-      const loaded = Math.min(event.loaded, total || event.loaded);
-      if (loaded > lastLoaded) {
-        lastLoaded = loaded;
-        armStallTimer();
-      }
-      const percent = total > 0 ? Math.min(100, Math.round((loaded / total) * 100)) : 0;
-      requestOptions.onProgress?.({ phase: "uploading", loaded, total, percent });
-    });
-    xhr.upload.addEventListener("load", () => {
-      uploadBytesSent = true;
-      clearStallTimer();
-      armProcessingTimer();
-      requestOptions.onProgress?.({
-        phase: "processing",
-        loaded: file.size,
-        total: file.size,
-        percent: 100,
-      });
-    });
-
-    xhr.addEventListener("load", () => {
-      if (xhr.status < 200 || xhr.status >= 300) {
-        const body = documentUploadResponseBody(xhr);
-        if (xhr.status === 401 && requestAttempt === 0) {
-          const latestToken = getAuthToken();
-          if (latestToken && latestToken !== token) {
-            if (authPrincipalKey(latestToken) === requestPrincipalKey) {
-              finishRetry();
-            } else {
-              finishReject(new DocumentUploadAuthChangedError());
-            }
-            return;
-          }
-        }
-        const error = documentUploadHttpError(xhr, path, token, body);
-        if (uploadBytesSent && xhr.status >= 500) {
-          finishHttpFailureReconciliation(error);
-          return;
-        }
-        finishReject(error);
-        return;
-      }
-      try {
-        const document = JSON.parse(xhr.responseText) as Document;
-        clearBackendUnavailableToast();
-        finishResolve(document);
-      } catch (error) {
-        const invalidResponse = new ApiError(
-          500,
-          error instanceof Error ? `Invalid upload response: ${error.message}` : "Invalid upload response",
-        );
-        if (uploadBytesSent) {
-          finishHttpFailureReconciliation(invalidResponse);
-          return;
-        }
-        finishReject(invalidResponse);
-      }
-    });
-    xhr.addEventListener("error", () => {
-      // Once every byte left the browser, a transport error can mean the
-      // server committed but its response was lost. Resolve the durable
-      // receipt before presenting a retryable failure, so a retry cannot
-      // create an ambiguous duplicate.
-      if (uploadBytesSent) {
-        finishProcessingReconciliation();
-        return;
-      }
-      const error = new TypeError("Network request failed");
-      captureClientError(error, {
-        handled: true,
-        mechanism: "api.network",
-        tags: { method: "POST", path },
-      });
-      finishReject(error);
-    });
-    xhr.addEventListener("abort", () => {
-      if (stalledPhase === "processing") {
-        finishProcessingReconciliation();
-        return;
-      }
-      finishReject(
-        stalledPhase
-          ? new DocumentUploadStalledError(stalledPhase)
-          : new DOMException("Upload cancelled", "AbortError"),
-      );
-    });
-
-    requestOptions.signal?.addEventListener("abort", abortRequest, { once: true });
-    xhr.send(form);
-  });
 }
 
 async function requestStreamResponse(
@@ -3301,7 +2763,7 @@ export const api = {
       invitation_code?: string;
       invite_token?: string;
     }) =>
-      request<{ access_token: string; user_id: string; entity_id: string; role: string; is_new?: boolean }>("/auth/register", {
+      request<{ access_token: string; user_id: string; entity_id: string; role: string }>("/auth/register", {
         method: "POST",
         body: JSON.stringify(data),
       }),
@@ -3408,16 +2870,8 @@ export const api = {
       }>("/auth/me/models", {
         method: "PUT", body: JSON.stringify(data),
       }),
-    oauthGoogle: (opts: {
-      code?: string;
-      redirectUri: string;
-      invitationCode?: string;
-      teamInviteToken?: string;
-      oauthSession?: string;
-      publicChatToken?: string;
-      rememberMe?: boolean;
-    }) =>
-      request<{ access_token: string; user: User; is_new?: boolean }>("/auth/oauth/google", {
+    oauthGoogle: (opts: { code?: string; redirectUri: string; invitationCode?: string; teamInviteToken?: string; oauthSession?: string; publicChatToken?: string; rememberMe?: boolean }) =>
+      request<{ access_token: string; user: User }>("/auth/oauth/google", {
         method: "POST",
         body: JSON.stringify({
           code: opts.code,
@@ -3717,7 +3171,6 @@ export const api = {
           mimeType?: string | null;
           editorType?: string | null;
           supportsImageGeneration?: boolean | null;
-          supportsNativeFilePatch?: boolean | null;
           currentDocumentContent?: string | null;
         };
         conversationSurface?: ConversationSurfaceKind;
@@ -3916,21 +3369,21 @@ export const api = {
         classification?: string;
         client_visible?: boolean;
       },
-      requestOptions?: DocumentUploadRequestOptions,
-    ): Promise<Document> => uploadDocumentRequest(file, folderId, options, requestOptions),
-    reconcileUploadReceipt: (
-      idempotencyKey: string,
-      options?: Pick<DocumentUploadRequestOptions, "signal" | "receiptReconcileTimeoutMs">,
-    ): Promise<Document> => reconcileDocumentUploadReceipt(
-      idempotencyKey,
-      Math.max(
-        0,
-        options?.receiptReconcileTimeoutMs
-          ?? DEFAULT_DOCUMENT_UPLOAD_RECEIPT_RECONCILE_TIMEOUT_MS,
-      ),
-      options?.signal,
-      authPrincipalKey(getAuthToken()),
-    ),
+    ): Promise<Document> => {
+      const form = new FormData();
+      form.append("file", file);
+      const params = new URLSearchParams();
+      if (folderId) params.set("folder_id", folderId);
+      if (options?.visibility) params.set("visibility", options.visibility);
+      if (options?.classification) params.set("classification", options.classification);
+      if (options?.client_visible != null) params.set("client_visible", String(options.client_visible));
+      const q = params.toString();
+      return request<Document>(`/documents/upload${q ? `?${q}` : ""}`, {
+        method: "POST",
+        headers: { "X-Silent-Error": "1" },
+        body: form,
+      });
+    },
     delete: async (id: string) => {
       const result = await request<void>(`/documents/${id}`, { method: "DELETE" });
       invalidateDocumentDownloadCache(id);
@@ -3962,7 +3415,6 @@ export const api = {
       file: File,
       saveIntent?: EditorSaveIntent,
       authTokenOverride?: string | null,
-      expectedSourceSha256?: string | null,
     ): Promise<Document> => {
       const token = authTokenOverride === undefined ? getAuthToken() : authTokenOverride;
       const form = new FormData();
@@ -3970,9 +3422,6 @@ export const api = {
       if (saveIntent) {
         form.append("save_session_id", saveIntent.sessionId);
         form.append("save_sequence", String(saveIntent.sequence));
-      }
-      if (expectedSourceSha256) {
-        form.append("expected_source_sha256", expectedSourceSha256);
       }
       const headers: Record<string, string> = {};
       if (token) headers["Authorization"] = `Bearer ${token}`;
@@ -4002,16 +3451,10 @@ export const api = {
     },
     downloadBlob: (id: string, options?: DocumentBlobOptions): Promise<Blob> =>
       fetchDocumentBlob(id, options),
-    editableResponse: (id: string): Promise<Response> =>
-      fetchDocumentResponse(id, {}, "editable-file"),
+    editableBlob: (id: string): Promise<Blob> =>
+      fetchProtectedDocumentBlob(`editable:${id}`, `/documents/${id}/editable-file`, { cache: false }),
     downloadResponse: (id: string, options?: DocumentResponseOptions): Promise<Response> =>
       fetchDocumentResponse(id, options),
-    preview: async (id: string, options?: DocumentBlobOptions): Promise<string> =>
-      URL.createObjectURL(await fetchProtectedDocumentBlob(`preview:${id}`, `/documents/${id}/preview/content`, options)),
-    previewBlob: (id: string, options?: DocumentBlobOptions): Promise<Blob> =>
-      fetchProtectedDocumentBlob(`preview:${id}`, `/documents/${id}/preview/content`, options),
-    previewResponse: (id: string, options?: DocumentResponseOptions): Promise<Response> =>
-      fetchDocumentResponse(id, options, "preview/content"),
     thumbnail: (id: string, options?: DocumentThumbnailOptions): Promise<string> => fetchDocumentThumbnailUrl(id, options),
     imageThumbnail: (id: string, options?: DocumentThumbnailOptions): Promise<string> => fetchDocumentImageThumbnailUrl(id, options),
     localImageThumbnail: (file: Blob): Promise<string> => captureDocumentImageThumbnail(file),
@@ -4776,7 +4219,6 @@ export const api = {
     }),
     removeChannel: (wsId: string, channelBindingId: string) =>
       request<void>(`/workspaces/${wsId}/channels/${channelBindingId}`, { method: "DELETE" }),
-    connectionStatus: (wsId: string) => request<WorkspaceConnectionStatus>(`/workspaces/${wsId}/connection-status`),
     resolveIntegrations: (wsId: string) => request<{ resolved: string[]; remaining: string[] }>(`/workspaces/${wsId}/resolve-integrations`, { method: "POST" }),
     documents: (wsId: string) => request<any[]>(`/workspaces/${wsId}/documents`),
     knowledge: {
@@ -5089,11 +4531,6 @@ export const api = {
         `/blueprints/${id}/favorite`,
         { method: "POST" },
       ),
-    submitReview: (id: string, data?: { note?: string }) =>
-      request<BlueprintSummary>(
-        `/blueprints/${id}/submit-review`,
-        { method: "POST", body: JSON.stringify(data ?? {}) },
-      ),
     delete: (id: string) =>
       request<void>(`/blueprints/${id}`, { method: "DELETE" }),
     installPreflight: (
@@ -5132,14 +4569,6 @@ export const api = {
       ),
     governancePresets: () =>
       request<GovernancePresetSummary[]>("/blueprints/governance-presets"),
-    setPricing: (id: string, data: {
-      price_cents: number;
-      list_price_cents?: number | null;
-    }) =>
-      request<BlueprintSummary>(`/blueprints/${id}/pricing`, {
-        method: "PUT",
-        body: JSON.stringify(data),
-      }),
     createShareToken: (id: string) =>
       request<{ share_token: string }>(`/blueprints/${id}/share-token`, {
         method: "POST",
@@ -5151,29 +4580,6 @@ export const api = {
   },
 
 
-  marketplace: {
-    checkout: (blueprintId: string) =>
-      request<{ checkout_url: string }>(
-        `/marketplace/blueprints/${blueprintId}/checkout`,
-        { method: "POST" },
-      ),
-    purchaseBySession: (sessionId: string) =>
-      request<PurchaseStatusResponse>(
-        `/marketplace/purchases/by-session/${encodeURIComponent(sessionId)}`,
-      ),
-  },
-
-  merchant: {
-    onboard: (returnPath: "/merchant" | "/creator-center" = "/merchant") =>
-      request<{ onboarding_url: string }>(`/merchant/onboard?return_path=${encodeURIComponent(returnPath)}`, {
-        method: "POST",
-      }),
-    dashboard: () => request<{ dashboard_url: string }>("/merchant/dashboard", {
-      method: "POST",
-    }),
-    status: () => request<MerchantStatusResponse>("/merchant/status"),
-    sales: () => request<MerchantSalesResponse>("/merchant/sales"),
-  },
 
   notifications: {
     list: (params?: { unread_only?: boolean }) => {

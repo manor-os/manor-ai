@@ -1635,54 +1635,6 @@ def delete_entity_path(
         raise EntityFilesystemError("Entity file target has an unsupported type")
 
 
-def unlink_entity_file_entry(
-    entity_id: str,
-    rel_path: str,
-    *,
-    allow_symlink: bool = False,
-) -> bool:
-    """Unlink one exact file entry through a pinned, non-symlink parent.
-
-    Unlike :func:`resolve_path`, this intentionally does not follow the final
-    directory entry. Cleanup jobs can therefore remove a final symlink itself
-    without ever touching its destination. Parent-directory aliases still fail
-    closed through ``_open_entity_target_parent``.
-    """
-    safe_rel = rel_path.replace("\\", "/").lstrip("/")
-    if not safe_rel or any(part in {"", ".", ".."} for part in safe_rel.split("/")):
-        raise EntityFilesystemError(f"Invalid entity file path: {rel_path!r}")
-    entity_root = canonical_entity_root(entity_id)
-    full_path = os.path.abspath(os.path.join(entity_root, safe_rel))
-    try:
-        if os.path.commonpath([entity_root, full_path]) != entity_root:
-            raise EntityFilesystemError(f"Path traversal not allowed: {rel_path!r}")
-    except ValueError as exc:
-        raise EntityFilesystemError(f"Invalid entity file path: {rel_path!r}") from exc
-
-    with _open_entity_target_parent(entity_id, full_path, create=False) as (
-        parent_fd,
-        target_name,
-        parent_path,
-    ):
-        if not _directory_fd_matches_path(parent_fd, parent_path):
-            raise EntityFilesystemError("Entity file parent changed before unlink")
-        try:
-            target_stat = os.stat(
-                target_name,
-                dir_fd=parent_fd,
-                follow_symlinks=False,
-            )
-        except FileNotFoundError:
-            return False
-        if stat.S_ISLNK(target_stat.st_mode):
-            if not allow_symlink:
-                raise EntityFilesystemError("Entity file target became a filesystem alias")
-        elif not stat.S_ISREG(target_stat.st_mode):
-            raise EntityFilesystemError("Entity file target is not a regular file")
-        os.unlink(target_name, dir_fd=parent_fd)
-        return True
-
-
 def entity_fs_exists(entity_id: str) -> bool:
     """Check if an entity's filesystem has been provisioned."""
     root = get_entity_root(entity_id)

@@ -21,7 +21,6 @@ function draft(
     missing: status === "active" ? ["creation_preferences"] : [],
     messages: [],
     fields: {
-      heartbeat_enabled: true,
       name: "Focused product collaboration",
       kind: "team",
       initial_brief: "Plan and deliver product work in Chat.",
@@ -51,14 +50,7 @@ function draft(
           },
         },
       ],
-      goals: [{
-        goal_key: "weekly_delivery", title: "Weekly delivery", target: "90%", cadence: "weekly", metric_key: "commitment_rate",
-        measurement: {
-          key: "commitment_rate", name: "Verified delivery rate", value_type: "percent", unit: "percent", window: "calendar_week",
-          description: "Accepted weekly commitments divided by all agreed commitments × 100; no review stays unmeasured.",
-          source: "Owner-reviewed weekly delivery report, recorded manually.",
-        },
-      }],
+      goals: [{ goal_key: "weekly_delivery", title: "Weekly delivery", target: "90%", cadence: "weekly", metric: "commitment_rate" }],
       staff_assignments: [{ staff_id: "01K3E2ESTAFFMEMBER00000001", staff_name: "Ada Product", role: "approver", service_key: "product_planning", rationale: "Owns final roadmap approval." }],
       knowledge_attachments: [
         {
@@ -90,7 +82,7 @@ function draft(
       rules: [{ name: "Approval before publish", rule_type: "approval", severity: "high", scope: "external", action_patterns: ["publish_*"], description: "Require owner approval." }],
       automations: [{ name: "Weekly planning reminder", schedule_kind: "cron", cron_expr: "0 9 * * 1", timezone: "America/Los_Angeles", service_key: "product_planning" }],
       notes: "Keep final decisions in Chat.",
-      _draft_schema_version: 4,
+      _draft_schema_version: 2,
       _creation_preferences: {
         goal_confirmed: status !== "active",
         autonomy_confirmed: status !== "active",
@@ -337,7 +329,6 @@ async function mockApp(
       const body = request.postDataJSON() as {
         blueprint_personalization?: Record<string, unknown>;
         blueprint_channel_config_ids?: Record<string, string>;
-        heartbeat_enabled?: boolean;
       };
       if (body.blueprint_personalization) {
         personalizationUpdates.push(body.blueprint_personalization);
@@ -387,7 +378,7 @@ async function mockApp(
         });
         return;
       }
-      currentDraft = { ...currentDraft, status: "finalized", ready: true };
+      currentDraft = draft("finalized", { appliedBlueprint: Boolean(currentDraft.applied_blueprint_id) });
       await route.fulfill({
         status: 200,
         contentType: "application/json",
@@ -476,7 +467,6 @@ async function mockApp(
   });
 
   return {
-    runtimeMode: () => currentDraft.fields.heartbeat_enabled,
     finalizeCalls: () => finalizeCalls,
     applyCalls: () => applyCalls,
     fuzzyDocumentLookupCalls: () => fuzzyDocumentLookupCalls,
@@ -650,46 +640,6 @@ test("creation with an initial brief keeps the user context", async ({ page }) =
   expect(app.pageErrors).toEqual([]);
 });
 
-for (const width of [1440, 390]) {
-  for (const manual of [false, true]) {
-    test(`creation defaults to automatic and preserves ${manual ? "manual" : "automatic"} mode at ${width}px`, async ({ page }, testInfo) => {
-      await page.setViewportSize({ width, height: 900 });
-      const state = await mockApp(page);
-      await page.goto("/chat");
-      const open = () => page.locator("button.chat-artifact-summary-open", { hasText: "Focused product collaboration" }).click();
-      await open();
-      const panel = page.getByRole("region", { name: "Draft summary" });
-      const mode = panel.getByRole("switch", { name: "Run automatically after creation" });
-      await expect(mode).toBeChecked();
-      await expect(panel.getByText("Automatic (default)", { exact: true })).toBeVisible();
-      if (manual) {
-        await mode.focus();
-        await page.keyboard.press("Space");
-        await expect(mode).not.toBeChecked();
-        await expect(panel.getByText("Manual mode", { exact: true })).toBeVisible();
-        // Toggle back and forth to verify both directions persist.
-        await mode.click();
-        await expect(mode).toBeChecked();
-        await mode.click();
-        await expect(mode).not.toBeChecked();
-      }
-      await expect(panel.getByRole("button", { name: "Create Workspace", exact: true })).toBeEnabled();
-      await page.reload();
-      if (!(await panel.isVisible())) await open();
-      await expect(mode).toHaveAttribute("aria-checked", String(!manual));
-      expect(state.runtimeMode()).toBe(!manual);
-      await mode.scrollIntoViewIfNeeded();
-      await page.screenshot({ path: testInfo.outputPath("creation-runtime-mode.png") });
-      expect(await panel.evaluate((element) => element.scrollWidth <= element.clientWidth)).toBe(true);
-      await panel.getByRole("button", { name: "Create Workspace", exact: true }).click();
-      await expect.poll(state.finalizeCalls).toBe(1);
-      await expect(panel.getByRole("button", { name: "Open workspace", exact: true })).toBeVisible();
-      expect(state.runtimeMode()).toBe(!manual);
-      expect(state.pageErrors).toEqual([]);
-    });
-  }
-}
-
 test("ordinary Chat keeps Workspace creation inline and restores the saved draft panel", async ({ page }) => {
   const state = await mockApp(page);
   await page.goto("/chat");
@@ -723,10 +673,6 @@ test("ordinary Chat keeps Workspace creation inline and restores the saved draft
   await expect(panel.getByText("Excluded", { exact: true })).toBeVisible();
   await expect(panel.getByText("Login required", { exact: false })).toBeVisible();
   await expect(panel.getByText("Commitment Rate", { exact: true })).toBeVisible();
-  await expect(panel.getByText("Verified delivery rate", { exact: true })).toBeVisible();
-  await expect(panel.getByText("Accepted weekly commitments divided by all agreed commitments × 100; no review stays unmeasured.", { exact: true })).toBeVisible();
-  await expect(panel.getByText("Owner-reviewed weekly delivery report, recorded manually.", { exact: true })).toBeVisible();
-  await expect(panel.getByText("Manual recording required · starts unmeasured", { exact: true })).toBeVisible();
   await expect(panel.getByText("target: 90", { exact: false })).toBeVisible();
   await expect(panel.getByText("warning: 75", { exact: false })).toBeVisible();
   await expect(panel.getByText("0 9 * * 1", { exact: false })).toBeVisible();
@@ -752,55 +698,11 @@ test("ordinary Chat keeps Workspace creation inline and restores the saved draft
   expect(state.pageErrors).toEqual([]);
 });
 
-test("Draft library measurement shows the collector's canonical definition", async ({ page }) => {
-  await mockApp(page);
-  const saved = draft();
-  await page.route(`**/api/v1/workspace-drafts/${DRAFT_ID}`, (route) => route.fulfill({
-    json: {
-      ...saved,
-      fields: {
-        ...saved.fields,
-        goals: [{
-          goal_key: "completed_tasks", title: "Complete ten tasks", target: "10", cadence: "weekly",
-          measurement: { library_key: "workspace.tasks.completed" },
-        }],
-      },
-    },
-  }));
-  await page.route("**/api/v1/workspaces/stats/library", (route) => route.fulfill({
-    json: { items: [{
-      key: "workspace.tasks.completed", name: "Tasks completed", unit: "tasks",
-      description: "Tasks completed in the selected time window.", default_window: "calendar_week",
-      default_cadence: "daily", collector_type: "workspace_internal",
-    }] },
-  }));
-  await page.goto("/chat");
-  await page.locator("button.chat-artifact-summary-open", { hasText: "Focused product collaboration" }).click();
-  const panel = page.getByRole("region", { name: "Draft summary" });
-  await expect(panel.getByText("Tasks completed in the selected time window.", { exact: true })).toBeVisible();
-  await expect(panel.getByText("Automatic collection · starts unmeasured", { exact: true })).toBeVisible();
-});
-
 for (const width of [1280, 390]) {
-  test(`Draft measurement definition remains readable at ${width}px`, async ({ page }, testInfo) => {
-    await page.setViewportSize({ width, height: 900 });
-    await mockApp(page);
-    await page.goto("/chat");
-    await page.locator("button.chat-artifact-summary-open", { hasText: "Focused product collaboration" }).click();
-    const panel = page.getByRole("region", { name: "Draft summary" });
-    const collection = panel.getByText("Manual recording required · starts unmeasured", { exact: true });
-    await collection.scrollIntoViewIfNeeded();
-    await expect(collection).toBeVisible();
-    await expect(panel.getByText("Owner-reviewed weekly delivery report, recorded manually.", { exact: true })).toBeVisible();
-    expect(await panel.evaluate((element) => element.scrollWidth <= element.clientWidth)).toBe(true);
-    await page.screenshot({ path: testInfo.outputPath(`measurement-${width}.png`) });
-  });
-
   test(`Draft channel selection persists and unblocks creation at ${width}px`, async ({ page }) => {
     await page.setViewportSize({ width, height: 900 });
     await mockApp(page, { withChannels: true });
     await page.goto("/chat");
-    await page.locator("button.chat-artifact-summary-open", { hasText: "Focused product collaboration" }).click();
     const panel = page.getByRole("region", { name: "Draft summary" });
     await expect(panel.getByRole("button", { name: "Keep chatting until ready", exact: true })).toBeDisabled();
     const selector = panel.getByRole("button", { name: "Telegram alerts", exact: true });
@@ -809,7 +711,6 @@ for (const width of [1280, 390]) {
     await expect(selector).toContainText("Backup bot");
     await expect(panel.getByRole("button", { name: "Create Workspace", exact: true })).toBeEnabled();
     await page.reload();
-    await page.locator("button.chat-artifact-summary-open", { hasText: "Focused product collaboration" }).click();
     await expect(selector).toContainText("Backup bot");
   });
 }

@@ -2,8 +2,6 @@
 from __future__ import annotations
 
 import asyncio
-import heapq
-import hashlib
 import io
 import json
 import logging
@@ -15,17 +13,15 @@ import tempfile
 import time
 import urllib.parse
 import zipfile
-from collections.abc import Iterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
-from fastapi import APIRouter, Depends, Header, HTTPException, Query, UploadFile, File, Form
+from fastapi import APIRouter, Depends, HTTPException, Query, UploadFile, File, Form
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field, model_validator
 from sqlalchemy import select, text
-from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from packages.core.database import get_db
@@ -93,8 +89,7 @@ from packages.core.services.permission_gate import (
     ResourcePermissionGate,
 )
 from packages.core.ai.runtime import runtime_text_completion_platform_configured
-from apps.api.deps import enforce_plan_resource, get_current_user, require_plan
-from apps.api.errors import CodedError
+from apps.api.deps import get_current_user, require_plan
 from apps.api.file_responses import EntitySnapshotFileResponse, entity_filesystem_read_boundary
 from packages.core.models.permission import Capability
 from packages.core.permissions import (
@@ -732,14 +727,6 @@ def _capture_document_source_snapshot(source_path: str) -> _DocumentSourceSnapsh
     )
 
 
-def _document_source_sha256(source_path: str) -> str:
-    digest = hashlib.sha256()
-    with open(source_path, "rb") as source_file:
-        while chunk := source_file.read(1024 * 1024):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
 def _document_source_matches(
     snapshot: _DocumentSourceSnapshot,
     current_source_path: str | None,
@@ -1070,168 +1057,17 @@ async def _commit_document_and_dispatch_embeddings(
 ) -> None:
     """Commit a document before dispatching its embedding work."""
     await db.commit()
-    await _run_committed_document_side_effects(document_id, entity_id)
+    from packages.core.services.slide_renderer import invalidate_document_preview_versions
 
-
-async def _run_committed_document_side_effects(
-    document_id: str,
-    entity_id: str,
-) -> None:
-    """Run post-commit work without turning a durable write into a failure."""
-    try:
-        from packages.core.services.slide_renderer import invalidate_document_preview_versions
-
-        await asyncio.to_thread(
-            invalidate_document_preview_versions,
-            _entity_root(entity_id),
-            document_id,
-        )
-    except Exception:
-        logger.warning(
-            "Committed document preview invalidation failed for %s",
-            document_id,
-            exc_info=True,
-        )
-    try:
-        await _dispatch_document_embeddings_and_invalidate_cache(
-            document_id,
-            entity_id,
-        )
-    except Exception:
-        logger.warning(
-            "Committed document post-processing failed for %s",
-            document_id,
-            exc_info=True,
-        )
-
-
-async def _load_committed_document_upload(
-    *,
-    document_id: str,
-    entity_id: str,
-    owner_id: str,
-    idempotency_key: str | None,
-    request_fingerprint: str,
-    require_source_file: bool,
-) -> Document | None:
-    """Use a fresh transaction to resolve an ambiguous upload commit."""
-    from packages.core import database as database_module
-
-    async with database_module.async_session() as receipt_db:
-        if idempotency_key is not None:
-            document = await _find_idempotent_document_upload(
-                receipt_db,
-                entity_id=entity_id,
-                owner_id=owner_id,
-                idempotency_key=idempotency_key,
-            )
-        else:
-            document = await receipt_db.scalar(
-                select(Document).where(
-                    Document.id == document_id,
-                    Document.entity_id == entity_id,
-                    Document.owner_id == owner_id,
-                )
-            )
-        if document is None:
-            return None
-        if idempotency_key is not None:
-            await _validate_idempotent_document_upload(
-                receipt_db,
-                document,
-                request_fingerprint=request_fingerprint,
-            )
-        if require_source_file:
-            source_path = _document_full_path(document, entity_id)
-            if source_path is None or not await asyncio.to_thread(os.path.isfile, source_path):
-                logger.error(
-                    "Committed upload %s has no readable source file",
-                    document.id,
-                )
-                return None
-        receipt_db.expunge(document)
-        return document
-
-
-class _DocumentUploadCommitUncertain(HTTPException):
-    def __init__(self):
-        super().__init__(
-            status_code=503,
-            detail={
-                "code": "document_upload_commit_uncertain",
-                "message": "Upload completion is still being reconciled; retry with the same Idempotency-Key",
-            },
-        )
-
-
-async def _commit_document_upload_with_reconciliation(
-    db: AsyncSession,
-    document: Document,
-    *,
-    entity_id: str,
-    owner_id: str,
-    idempotency_key: str | None,
-    request_fingerprint: str,
-    require_source_file: bool,
-) -> Document:
-    """Commit once, proving durable success before any upload cleanup."""
-    committed_document = document
-    document_id = document.id
-    try:
-        await db.commit()
-    except IntegrityError:
-        # Constraint failures are a definite database rejection. The caller
-        # owns the normal idempotency-race lookup and source-file cleanup.
-        await _rollback_database_best_effort(db)
-        raise
-    except Exception as commit_error:
-        await _rollback_database_best_effort(db)
-        reconciled = None
-        # A successful COMMIT can become visible to a fresh connection shortly
-        # after its acknowledgement is lost. A single negative read is not
-        # proof of rollback, so use a small bounded visibility window before
-        # reporting the outcome as ambiguous.
-        for delay_seconds in (0.0, 0.05, 0.1, 0.2, 0.4):
-            if delay_seconds:
-                await asyncio.sleep(delay_seconds)
-            try:
-                reconciled = await _load_committed_document_upload(
-                    document_id=document_id,
-                    entity_id=entity_id,
-                    owner_id=owner_id,
-                    idempotency_key=idempotency_key,
-                    request_fingerprint=request_fingerprint,
-                    require_source_file=require_source_file,
-                )
-            except Exception as reconciliation_error:
-                logger.error(
-                    "Could not reconcile document upload %s after commit failure",
-                    document_id,
-                    exc_info=True,
-                )
-                raise _DocumentUploadCommitUncertain() from ExceptionGroup(
-                    "Upload commit and reconciliation both failed",
-                    [commit_error, reconciliation_error],
-                )
-            if reconciled is not None:
-                break
-        if reconciled is None:
-            logger.warning(
-                "Document upload %s remained ambiguous after bounded commit reconciliation",
-                document_id,
-            )
-            raise _DocumentUploadCommitUncertain() from commit_error
-        committed_document = reconciled
-        logger.warning(
-            "Recovered committed document upload %s after commit acknowledgement failure",
-            committed_document.id,
-        )
-
-    await _run_committed_document_side_effects(
-        committed_document.id,
+    await asyncio.to_thread(
+        invalidate_document_preview_versions,
+        _entity_root(entity_id),
+        document_id,
+    )
+    await _dispatch_document_embeddings_and_invalidate_cache(
+        document_id,
         entity_id,
     )
-    return committed_document
 
 
 async def _remove_or_quarantine_document_file(
@@ -1700,561 +1536,6 @@ async def list_my_documents(
 
 # ── Upload (fixed path — before /{doc_id}) ──
 
-_UPLOAD_IDEMPOTENCY_KEY_RE = re.compile(r"^[A-Za-z0-9._:-]{8,128}$")
-
-
-@dataclass(frozen=True)
-class _DocumentUploadRecoveryIntent:
-    rel_path: str
-    fs_path: str
-    owner_id: str = ""
-    idempotency_key: str | None = None
-    request_fingerprint: str = ""
-    expires_at: float = 0.0
-
-
-class _DocumentUploadRecoveryConflict(HTTPException):
-    def __init__(self, message: str):
-        super().__init__(409, message)
-
-
-def _document_upload_recovery_intent_rel_path(
-    owner_id: str,
-    recovery_token: str,
-) -> str:
-    digest = hashlib.sha256(
-        f"document-upload-v1\0{owner_id}\0{recovery_token}".encode("utf-8"),
-    ).hexdigest()
-    return os.path.join(
-        ".ai",
-        "document-upload-intents",
-        digest[:2],
-        f"{digest}.json",
-    )
-
-
-def _document_upload_recovery_ttl_seconds() -> int:
-    raw = os.getenv("DOCUMENT_UPLOAD_RECOVERY_TTL_SECONDS", "86400")
-    try:
-        value = int(raw)
-    except ValueError:
-        value = 86400
-    return max(3600, min(value, 7 * 86400))
-
-
-def _document_upload_recovery_expiry(
-    payload: dict[str, object],
-    marker_mtime: float,
-) -> float:
-    expires_at = payload.get("expires_at")
-    if isinstance(expires_at, (int, float)) and not isinstance(expires_at, bool):
-        return float(expires_at)
-    return marker_mtime + _document_upload_recovery_ttl_seconds()
-
-
-async def _read_document_upload_recovery_payload(
-    *,
-    entity_id: str,
-    intent_rel_path: str,
-) -> tuple[dict[str, object], float] | None:
-    from packages.core.services.entity_fs import open_entity_file_snapshot, resolve_path
-
-    resolved = resolve_path(entity_id, intent_rel_path)
-    if resolved is None:
-        raise EntityFilesystemError("Upload recovery intent path is invalid")
-
-    def _read() -> tuple[dict[str, object], float] | None:
-        try:
-            with open_entity_file_snapshot(entity_id, intent_rel_path) as snapshot:
-                with open(snapshot.descriptor_path, "rb") as intent_file:
-                    payload = json.load(intent_file)
-                if not isinstance(payload, dict):
-                    raise EntityFilesystemError("Upload recovery intent is malformed")
-                return payload, float(snapshot.stat.st_mtime)
-        except EntityFilesystemError:
-            if not os.path.lexists(resolved):
-                return None
-            raise
-
-    return await asyncio.to_thread(_read)
-
-
-def _parse_document_upload_recovery_intent(
-    *,
-    entity_id: str,
-    intent_rel_path: str,
-    payload: dict[str, object],
-    marker_mtime: float,
-) -> _DocumentUploadRecoveryIntent:
-    from packages.core.services.entity_fs import resolve_path
-
-    version = payload.get("version")
-    owner_id = payload.get("owner_id")
-    idempotency_key = payload.get("idempotency_key")
-    request_fingerprint = payload.get("request_fingerprint")
-    fs_path = payload.get("fs_path")
-    recovery_token = payload.get("recovery_token")
-    if version == 1 and isinstance(idempotency_key, str):
-        recovery_token = idempotency_key
-    if (
-        version not in {1, 2}
-        or not isinstance(owner_id, str)
-        or not owner_id
-        or not (idempotency_key is None or isinstance(idempotency_key, str))
-        or not isinstance(recovery_token, str)
-        or not recovery_token
-        or not isinstance(request_fingerprint, str)
-        or not request_fingerprint
-        or not isinstance(fs_path, str)
-        or not fs_path
-        or _document_upload_recovery_intent_rel_path(owner_id, recovery_token) != intent_rel_path
-    ):
-        raise EntityFilesystemError("Upload recovery intent is malformed")
-    normalized_fs_path = fs_path.replace("\\", "/").lstrip("/")
-    resolved_source = resolve_path(entity_id, normalized_fs_path)
-    if resolved_source is None or normalized_fs_path.startswith(".ai/"):
-        raise EntityFilesystemError("Upload recovery source path is invalid")
-    return _DocumentUploadRecoveryIntent(
-        rel_path=intent_rel_path,
-        fs_path=normalized_fs_path,
-        owner_id=owner_id,
-        idempotency_key=idempotency_key,
-        request_fingerprint=request_fingerprint,
-        expires_at=_document_upload_recovery_expiry(payload, marker_mtime),
-    )
-
-
-async def _has_active_document_upload_recovery_intent(
-    *,
-    entity_id: str,
-    owner_id: str,
-    idempotency_key: str | None,
-) -> bool:
-    if idempotency_key is None:
-        return False
-    intent_rel_path = _document_upload_recovery_intent_rel_path(owner_id, idempotency_key)
-    try:
-        loaded = await _read_document_upload_recovery_payload(
-            entity_id=entity_id,
-            intent_rel_path=intent_rel_path,
-        )
-        if loaded is None:
-            return False
-        payload, marker_mtime = loaded
-        intent = _parse_document_upload_recovery_intent(
-            entity_id=entity_id,
-            intent_rel_path=intent_rel_path,
-            payload=payload,
-            marker_mtime=marker_mtime,
-        )
-    except (EntityFilesystemError, OSError, ValueError, json.JSONDecodeError):
-        logger.warning(
-            "Ignoring invalid document upload recovery intent %s",
-            intent_rel_path,
-            exc_info=True,
-        )
-        return False
-    return (
-        intent.owner_id == owner_id
-        and intent.idempotency_key == idempotency_key
-        and intent.expires_at > time.time()
-    )
-
-
-async def _load_document_upload_recovery_intent(
-    *,
-    entity_id: str,
-    owner_id: str,
-    idempotency_key: str | None,
-    request_fingerprint: str,
-) -> _DocumentUploadRecoveryIntent | None:
-    if idempotency_key is None:
-        return None
-    intent_rel_path = _document_upload_recovery_intent_rel_path(
-        owner_id,
-        idempotency_key,
-    )
-    loaded = await _read_document_upload_recovery_payload(
-        entity_id=entity_id,
-        intent_rel_path=intent_rel_path,
-    )
-    if loaded is None:
-        return None
-    payload, marker_mtime = loaded
-    try:
-        intent = _parse_document_upload_recovery_intent(
-            entity_id=entity_id,
-            intent_rel_path=intent_rel_path,
-            payload=payload,
-            marker_mtime=marker_mtime,
-        )
-    except EntityFilesystemError as exc:
-        raise _DocumentUploadRecoveryConflict(
-            "Idempotency-Key conflicts with an incomplete document upload",
-        ) from exc
-    if (
-        intent.owner_id != owner_id
-        or intent.idempotency_key != idempotency_key
-        or intent.request_fingerprint != request_fingerprint
-    ):
-        raise _DocumentUploadRecoveryConflict(
-            "Idempotency-Key conflicts with an incomplete document upload",
-        )
-    if intent.expires_at <= time.time():
-        raise _DocumentUploadRecoveryConflict(
-            "This incomplete document upload has expired; start a new upload",
-        )
-    return intent
-
-
-async def _create_document_upload_recovery_intent(
-    *,
-    entity_id: str,
-    owner_id: str,
-    idempotency_key: str | None,
-    request_fingerprint: str,
-    fs_path: str,
-) -> _DocumentUploadRecoveryIntent | None:
-    recovery_token = idempotency_key or (
-        f"anonymous-{time.time_ns()}-{os.urandom(16).hex()}"
-    )
-    intent_rel_path = _document_upload_recovery_intent_rel_path(
-        owner_id,
-        recovery_token,
-    )
-    created_at = time.time()
-    expires_at = created_at + _document_upload_recovery_ttl_seconds()
-    payload = json.dumps(
-        {
-            "version": 2,
-            "owner_id": owner_id,
-            "idempotency_key": idempotency_key,
-            "recovery_token": recovery_token,
-            "request_fingerprint": request_fingerprint,
-            "fs_path": fs_path,
-            "created_at": created_at,
-            "expires_at": expires_at,
-        },
-        ensure_ascii=False,
-        separators=(",", ":"),
-        sort_keys=True,
-    ).encode("utf-8")
-    await _write_document_bytes_atomic(
-        entity_id,
-        intent_rel_path,
-        payload,
-        allow_empty=False,
-    )
-    return _DocumentUploadRecoveryIntent(
-        rel_path=intent_rel_path,
-        fs_path=fs_path,
-        owner_id=owner_id,
-        idempotency_key=idempotency_key,
-        request_fingerprint=request_fingerprint,
-        expires_at=expires_at,
-    )
-
-
-async def _document_upload_source_matches(
-    *,
-    entity_id: str,
-    fs_path: str,
-    content_sha256: str,
-    file_size: int,
-) -> bool:
-    from packages.core.services.entity_fs import open_entity_file_snapshot, resolve_path
-
-    resolved = resolve_path(entity_id, fs_path)
-    if resolved is None:
-        raise EntityFilesystemError("Upload recovery source path is invalid")
-
-    def _matches() -> bool:
-        if not os.path.lexists(resolved):
-            return False
-        try:
-            with open_entity_file_snapshot(
-                entity_id,
-                fs_path,
-                expected_content_sha256=content_sha256,
-            ) as snapshot:
-                return snapshot.stat.st_size == file_size
-        except EntityFilesystemError as exc:
-            raise _DocumentUploadRecoveryConflict(
-                "Stored bytes conflict with this incomplete document upload",
-            ) from exc
-
-    return await asyncio.to_thread(_matches)
-
-
-async def _cleanup_document_upload_recovery_intent(
-    entity_id: str,
-    intent: _DocumentUploadRecoveryIntent | None,
-) -> None:
-    if intent is None:
-        return
-    try:
-        from packages.core.services.entity_fs import unlink_entity_file_entry
-
-        await asyncio.to_thread(
-            unlink_entity_file_entry,
-            entity_id,
-            intent.rel_path,
-            allow_symlink=True,
-        )
-    except Exception:
-        logger.warning(
-            "Could not remove completed document upload recovery intent %s",
-            intent.rel_path,
-            exc_info=True,
-        )
-
-
-def _iter_stale_document_upload_recovery_markers(
-    *,
-    now: float,
-) -> Iterator[tuple[float, str, str]]:
-    root = os.path.realpath(settings.MANOR_FS_ROOT)
-    cutoff = now - _document_upload_recovery_ttl_seconds()
-
-    def _entries(path: str) -> Iterator[os.DirEntry[str]]:
-        try:
-            scanner = os.scandir(path)
-        except (FileNotFoundError, NotADirectoryError, PermissionError):
-            return
-        with scanner:
-            yield from scanner
-
-    for entity_entry in _entries(root):
-        if not entity_entry.is_dir(follow_symlinks=False):
-            continue
-        intents_root = os.path.join(
-            entity_entry.path,
-            ".ai",
-            "document-upload-intents",
-        )
-        for shard_entry in _entries(intents_root):
-            if not shard_entry.is_dir(follow_symlinks=False):
-                continue
-            for marker_entry in _entries(shard_entry.path):
-                try:
-                    marker_stat = marker_entry.stat(follow_symlinks=False)
-                except OSError:
-                    continue
-                if (
-                    not marker_entry.is_file(follow_symlinks=False)
-                    or not marker_entry.name.endswith(".json")
-                    or marker_stat.st_mtime > cutoff
-                ):
-                    continue
-                rel_path = os.path.relpath(marker_entry.path, entity_entry.path)
-                yield marker_stat.st_mtime, entity_entry.name, rel_path
-
-
-async def cleanup_expired_document_upload_recovery_intents(
-    *,
-    now: float | None = None,
-    limit: int = 200,
-) -> dict[str, int]:
-    """Remove bounded, expired upload intents and unreferenced source bytes."""
-    if not settings.MANOR_FS_ENABLED or limit <= 0:
-        return {"examined": 0, "cleaned": 0, "sources_removed": 0, "failed": 0}
-    cleanup_now = time.time() if now is None else float(now)
-    candidates = heapq.nsmallest(
-        limit,
-        _iter_stale_document_upload_recovery_markers(now=cleanup_now),
-    )
-    report = {"examined": 0, "cleaned": 0, "sources_removed": 0, "failed": 0}
-    from packages.core import database as database_module
-    from packages.core.services.entity_fs import unlink_entity_file_entry
-
-    async with database_module.async_session() as cleanup_db:
-        for _marker_mtime, entity_id, intent_rel_path in candidates:
-            report["examined"] += 1
-            try:
-                async with _document_filesystem_mutation(entity_id):
-                    try:
-                        loaded = await _read_document_upload_recovery_payload(
-                            entity_id=entity_id,
-                            intent_rel_path=intent_rel_path,
-                        )
-                    except (EntityFilesystemError, OSError, ValueError, json.JSONDecodeError):
-                        await asyncio.to_thread(
-                            unlink_entity_file_entry,
-                            entity_id,
-                            intent_rel_path,
-                            allow_symlink=True,
-                        )
-                        report["cleaned"] += 1
-                        continue
-                    if loaded is None:
-                        continue
-                    payload, current_mtime = loaded
-                    try:
-                        intent = _parse_document_upload_recovery_intent(
-                            entity_id=entity_id,
-                            intent_rel_path=intent_rel_path,
-                            payload=payload,
-                            marker_mtime=current_mtime,
-                        )
-                    except EntityFilesystemError:
-                        await asyncio.to_thread(
-                            unlink_entity_file_entry,
-                            entity_id,
-                            intent_rel_path,
-                            allow_symlink=True,
-                        )
-                        report["cleaned"] += 1
-                        continue
-                    if intent.expires_at > cleanup_now:
-                        continue
-                    document_id = await cleanup_db.scalar(
-                        select(Document.id).where(
-                            Document.entity_id == entity_id,
-                            Document.fs_path == intent.fs_path,
-                        ).limit(1)
-                    )
-                    if document_id is None:
-                        removed = await asyncio.to_thread(
-                            unlink_entity_file_entry,
-                            entity_id,
-                            intent.fs_path,
-                            allow_symlink=True,
-                        )
-                        if removed:
-                            report["sources_removed"] += 1
-                    await asyncio.to_thread(
-                        unlink_entity_file_entry,
-                        entity_id,
-                        intent.rel_path,
-                        allow_symlink=True,
-                    )
-                    report["cleaned"] += 1
-            except Exception:
-                report["failed"] += 1
-                await cleanup_db.rollback()
-                logger.warning(
-                    "Could not clean expired document upload recovery intent %s/%s",
-                    entity_id,
-                    intent_rel_path,
-                    exc_info=True,
-                )
-    return report
-
-
-def _normalize_upload_idempotency_key(raw_key: str | None) -> str | None:
-    key = (raw_key or "").strip()
-    if not key:
-        return None
-    if not _UPLOAD_IDEMPOTENCY_KEY_RE.fullmatch(key):
-        raise HTTPException(
-            400,
-            "Idempotency-Key must be 8-128 URL-safe characters",
-        )
-    return key
-
-
-def _document_upload_request_fingerprint(
-    *,
-    content_sha256: str,
-    filename: str,
-    file_size: int,
-    folder_id: str | None,
-    visibility: str | None,
-    classification: str | None,
-    client_visible: bool | None,
-) -> str:
-    payload = {
-        "classification": classification,
-        "client_visible": client_visible,
-        "content_sha256": content_sha256,
-        "file_size": file_size,
-        "filename": filename,
-        "folder_id": folder_id,
-        "visibility": visibility,
-    }
-    encoded = json.dumps(
-        payload,
-        ensure_ascii=False,
-        separators=(",", ":"),
-        sort_keys=True,
-    ).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
-
-
-async def _find_idempotent_document_upload(
-    db: AsyncSession,
-    *,
-    entity_id: str,
-    owner_id: str,
-    idempotency_key: str | None,
-) -> Document | None:
-    if idempotency_key is None:
-        return None
-    return await db.scalar(
-        select(Document).where(
-            Document.entity_id == entity_id,
-            Document.owner_id == owner_id,
-            Document.upload_idempotency_key == idempotency_key,
-        )
-    )
-
-
-async def _require_idempotent_document_upload_visible(
-    db: AsyncSession,
-    document: Document,
-) -> None:
-    if await document_is_owned_by_deleted_workspace(
-        db,
-        document,
-        lock_for_read=True,
-    ):
-        raise HTTPException(404, "Document not found")
-    if document.is_trashed:
-        raise HTTPException(
-            409,
-            "This upload already completed, but its document is now in trash",
-        )
-
-
-async def _validate_idempotent_document_upload(
-    db: AsyncSession,
-    document: Document,
-    *,
-    request_fingerprint: str,
-) -> Document:
-    await _require_idempotent_document_upload_visible(db, document)
-    if document.upload_request_fingerprint != request_fingerprint:
-        raise HTTPException(
-            409,
-            "Idempotency-Key was already used for a different document upload",
-        )
-    return document
-
-
-@router.get("/upload-receipts/{idempotency_key}", response_model=DocumentResponse)
-async def get_document_upload_receipt(
-    idempotency_key: str,
-    user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
-):
-    """Resolve an ambiguously completed browser upload without resending bytes."""
-    normalized_key = _normalize_upload_idempotency_key(idempotency_key)
-    # This is a read-side reconciliation endpoint, not a new upload attempt.
-    # The durable receipt is scoped to the authenticated uploader and entity;
-    # requiring DOCS_UPLOAD again would make an already accepted upload
-    # impossible to reconcile if that permission changed while it processed.
-    document = await _find_idempotent_document_upload(
-        db,
-        entity_id=user.entity_id,
-        owner_id=user.id,
-        idempotency_key=normalized_key,
-    )
-    if document is None:
-        raise HTTPException(404, "Upload receipt not found")
-    await _require_idempotent_document_upload_visible(db, document)
-    return await _doc_resp_for_user(db, document, user)
-
-
 @router.post("/upload", response_model=DocumentResponse, status_code=201)
 async def upload_document(
     file: UploadFile = File(...),
@@ -2262,7 +1543,7 @@ async def upload_document(
     visibility: str | None = Query(None, description="private | workspace | entity | public"),
     classification: str | None = Query(None, description="public | internal | confidential | restricted"),
     client_visible: bool | None = Query(None, description="Show in client portal"),
-    idempotency_key: str | None = Header(None, alias="Idempotency-Key"),
+    _gate=Depends(require_plan("storage_mb")),
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
@@ -2271,29 +1552,6 @@ async def upload_document(
     from packages.core.services.document_service import get_document
 
     await _require_document_upload(db, user)
-    idempotency_key = _normalize_upload_idempotency_key(idempotency_key)
-    existing_receipt = await _find_idempotent_document_upload(
-        db,
-        entity_id=user.entity_id,
-        owner_id=user.id,
-        idempotency_key=idempotency_key,
-    )
-    active_recovery_intent = (
-        existing_receipt is None
-        and settings.MANOR_FS_ENABLED
-        and await _has_active_document_upload_recovery_intent(
-            entity_id=user.entity_id,
-            owner_id=user.id,
-            idempotency_key=idempotency_key,
-        )
-    )
-    # A committed replay does not consume storage again and must remain
-    # recoverable even when the first upload brought the entity to its limit.
-    # A validated pending intent is the same already-admitted logical attempt,
-    # not a new upload. New attempts retain the route's early plan gate;
-    # create_document also rechecks at the persistence boundary to close races.
-    if existing_receipt is None and not active_recovery_intent:
-        await enforce_plan_resource("storage_mb", user=user, db=db)
 
     # Validate enum-style params; reject unknown values rather than silently
     # accept (avoids "Confidentail" typos surviving into the DB).
@@ -2309,9 +1567,6 @@ async def upload_document(
     # Cross-field: confidential+ cannot be client_visible
     if client_visible and classification in {"confidential", "restricted"}:
         raise HTTPException(400, "Confidential/Restricted documents cannot be client_visible")
-    requested_visibility = visibility
-    requested_classification = classification
-    requested_client_visible = client_visible
     if folder_id:
         _, folder_by_id = await _load_document_folders(db, user.entity_id)
         folder = folder_by_id.get(folder_id)
@@ -2355,7 +1610,6 @@ async def upload_document(
     entity_root = _entity_root(entity_id)
     fs_path = None
     file_size = 0
-    content_hasher = hashlib.sha256()
     resolved_folder_id = folder_id
     workspace_binding = await _workspace_storage_for_folder(
         db,
@@ -2374,13 +1628,7 @@ async def upload_document(
                 while chunk := await file.read(1024 * 256):  # 256KB chunks
                     file_size += len(chunk)
                     if file_size > max_bytes:
-                        raise CodedError(
-                            413,
-                            code="page.knowledge.file_too_large_max_mb",
-                            message=f"File too large. Max {settings.MANOR_MAX_UPLOAD_MB}MB",
-                            vars={"max": settings.MANOR_MAX_UPLOAD_MB},
-                        )
-                    content_hasher.update(chunk)
+                        raise HTTPException(413, f"File too large. Max {settings.MANOR_MAX_UPLOAD_MB}MB")
                     await f.write(chunk)
             from packages.core.services.upload_security import (
                 UploadSecurityError,
@@ -2395,86 +1643,23 @@ async def upload_document(
                 )
             except UploadSecurityError as exc:
                 raise HTTPException(exc.status_code, str(exc)) from exc
-            request_fingerprint = _document_upload_request_fingerprint(
-                content_sha256=content_hasher.hexdigest(),
-                filename=filename,
-                file_size=file_size,
-                folder_id=resolved_folder_id,
-                visibility=requested_visibility,
-                classification=requested_classification,
-                client_visible=requested_client_visible,
-            )
             async with _document_filesystem_mutation(entity_id):
 
                 async def persist_upload():
                     nonlocal fs_path
-                    recovery_intent: _DocumentUploadRecoveryIntent | None = None
-                    is_recovery_retry = False
                     try:
-                        existing = await _find_idempotent_document_upload(
-                            db,
-                            entity_id=entity_id,
-                            owner_id=owner_id,
-                            idempotency_key=idempotency_key,
+                        rel_target = _unique_document_rel_path(
+                            entity_id,
+                            filename,
+                            rel_dir=workspace_binding.storage_dir if workspace_binding else None,
                         )
-                        if existing is not None:
-                            existing = await _validate_idempotent_document_upload(
-                                db,
-                                existing,
-                                request_fingerprint=request_fingerprint,
-                            )
-                            stale_intent = (
-                                _DocumentUploadRecoveryIntent(
-                                    rel_path=_document_upload_recovery_intent_rel_path(
-                                        owner_id,
-                                        idempotency_key,
-                                    ),
-                                    fs_path="",
-                                )
-                                if idempotency_key is not None
-                                else None
-                            )
-                            await _cleanup_document_upload_recovery_intent(
-                                entity_id,
-                                stale_intent,
-                            )
-                            return existing
-                        recovery_intent = await _load_document_upload_recovery_intent(
-                            entity_id=entity_id,
-                            owner_id=owner_id,
-                            idempotency_key=idempotency_key,
-                            request_fingerprint=request_fingerprint,
+                        fs_path = await _copy_document_file_atomic(
+                            entity_id,
+                            rel_target,
+                            tmp_path,
+                            expected_size=file_size,
+                            allow_empty=True,
                         )
-                        if recovery_intent is None:
-                            rel_target = _unique_document_rel_path(
-                                entity_id,
-                                filename,
-                                rel_dir=workspace_binding.storage_dir if workspace_binding else None,
-                            )
-                            recovery_intent = await _create_document_upload_recovery_intent(
-                                entity_id=entity_id,
-                                owner_id=owner_id,
-                                idempotency_key=idempotency_key,
-                                request_fingerprint=request_fingerprint,
-                                fs_path=rel_target,
-                            )
-                        else:
-                            is_recovery_retry = True
-                            rel_target = recovery_intent.fs_path
-                        fs_path = rel_target
-                        if not await _document_upload_source_matches(
-                            entity_id=entity_id,
-                            fs_path=rel_target,
-                            content_sha256=content_hasher.hexdigest(),
-                            file_size=file_size,
-                        ):
-                            fs_path = await _copy_document_file_atomic(
-                                entity_id,
-                                rel_target,
-                                tmp_path,
-                                expected_size=file_size,
-                                allow_empty=True,
-                            )
                         sync = await sync_file_to_knowledge(
                             entity_id=entity_id,
                             abs_path=os.path.join(entity_root, fs_path),
@@ -2488,7 +1673,6 @@ async def upload_document(
                             visibility=visibility,
                             classification=classification,
                             client_visible=client_visible,
-                            storage_admission_prevalidated=is_recovery_retry,
                             db=db,
                         )
                         doc = await get_document(db, sync.document_id, entity_id) if sync.document_id else None
@@ -2499,10 +1683,6 @@ async def upload_document(
                         doc.name = filename
                         doc.file_type = ext
                         doc.mime_type = mime_type
-                        doc.upload_idempotency_key = idempotency_key
-                        doc.upload_request_fingerprint = (
-                            request_fingerprint if idempotency_key is not None else None
-                        )
                         _apply_permission_overrides(
                             doc,
                             owner_id,
@@ -2511,63 +1691,15 @@ async def upload_document(
                             client_visible,
                         )
                         await db.flush()
-                        doc = await _commit_document_upload_with_reconciliation(
+                        await _commit_document_and_dispatch_embeddings(
                             db,
-                            doc,
-                            entity_id=entity_id,
-                            owner_id=owner_id,
-                            idempotency_key=idempotency_key,
-                            request_fingerprint=request_fingerprint,
-                            require_source_file=True,
-                        )
-                        await _cleanup_document_upload_recovery_intent(
+                            doc.id,
                             entity_id,
-                            recovery_intent,
                         )
                         return doc
-                    except IntegrityError:
-                        await _rollback_database_best_effort(db)
-                        existing = await _find_idempotent_document_upload(
-                            db,
-                            entity_id=entity_id,
-                            owner_id=owner_id,
-                            idempotency_key=idempotency_key,
-                        )
-                        if existing is not None:
-                            existing = await _validate_idempotent_document_upload(
-                                db,
-                                existing,
-                                request_fingerprint=request_fingerprint,
-                            )
-                            await _cleanup_document_upload_recovery_intent(
-                                entity_id,
-                                recovery_intent,
-                            )
-                            return existing
-                        await _remove_or_quarantine_document_file(entity_id, fs_path)
-                        await _cleanup_document_upload_recovery_intent(
-                            entity_id,
-                            recovery_intent,
-                        )
-                        raise
-                    except _DocumentUploadCommitUncertain:
-                        # The commit outcome could not be proven. Preserve the
-                        # source path so a durable receipt can never point at
-                        # bytes this request deleted while the DB recovered.
-                        await _rollback_database_best_effort(db)
-                        raise
-                    except _DocumentUploadRecoveryConflict:
-                        # This key belongs to an earlier incomplete request.
-                        # Never delete that request's recovery bytes.
-                        await _rollback_database_best_effort(db)
-                        raise
                     except Exception:
                         await _rollback_database_best_effort(db)
                         await _remove_or_quarantine_document_file(entity_id, fs_path)
-                        await _cleanup_document_upload_recovery_intent(
-                            entity_id,
-                            recovery_intent,
-                        )
                         raise
 
                 doc = await _finish_document_filesystem_mutation(persist_upload())
@@ -2577,111 +1709,44 @@ async def upload_document(
             except OSError:
                 pass
     else:
-        # Metadata-only deployments still accept large files. Stream through a
-        # bounded temporary file so validation, hashing, and the size gate do
-        # not allocate the complete request body a second time.
-        fd, tmp_path = tempfile.mkstemp(prefix="manor-doc-upload-", suffix=".tmp")
-        os.close(fd)
-        try:
-            async with aiofiles.open(tmp_path, "wb") as target:
-                while chunk := await file.read(1024 * 256):
-                    file_size += len(chunk)
-                    if file_size > max_bytes:
-                        raise CodedError(
-                            413,
-                            code="page.knowledge.file_too_large_max_mb",
-                            message=f"File too large. Max {settings.MANOR_MAX_UPLOAD_MB}MB",
-                            vars={"max": settings.MANOR_MAX_UPLOAD_MB},
-                        )
-                    content_hasher.update(chunk)
-                    await target.write(chunk)
-            from packages.core.services.upload_security import (
-                UploadSecurityError,
-                inspect_upload_path,
-            )
+        # No filesystem — just read to get size for DB record
+        content = await file.read()
+        file_size = len(content)
+        if file_size > max_bytes:
+            raise HTTPException(413, f"File too large. Max {settings.MANOR_MAX_UPLOAD_MB}MB")
+        from packages.core.services.upload_security import UploadSecurityError, inspect_upload_content
 
-            try:
-                mime_type = await inspect_upload_path(
-                    tmp_path,
-                    filename=filename,
-                    declared_content_type=file.content_type,
-                )
-            except UploadSecurityError as exc:
-                raise HTTPException(exc.status_code, str(exc)) from exc
-            request_fingerprint = _document_upload_request_fingerprint(
-                content_sha256=content_hasher.hexdigest(),
+        try:
+            mime_type = await inspect_upload_content(
+                content,
                 filename=filename,
-                file_size=file_size,
-                folder_id=resolved_folder_id,
-                visibility=requested_visibility,
-                classification=requested_classification,
-                client_visible=requested_client_visible,
+                declared_content_type=file.content_type,
             )
-            existing = await _find_idempotent_document_upload(
+        except UploadSecurityError as exc:
+            raise HTTPException(exc.status_code, str(exc)) from exc
+        doc = await create_document(
+            db,
+            entity_id,
+            name=filename,
+            fs_path=fs_path,
+            file_size=file_size,
+            file_type=ext,
+            mime_type=mime_type,
+            source="upload",
+            created_by=created_by,
+            folder_id=resolved_folder_id,
+            visibility=visibility,
+            classification=classification,
+            client_visible=client_visible,
+            owner_id=owner_id,
+        )
+        await _finish_document_filesystem_mutation(
+            _commit_document_and_dispatch_embeddings(
                 db,
-                entity_id=entity_id,
-                owner_id=owner_id,
-                idempotency_key=idempotency_key,
+                doc.id,
+                entity_id,
             )
-            if existing is not None:
-                doc = await _validate_idempotent_document_upload(
-                    db,
-                    existing,
-                    request_fingerprint=request_fingerprint,
-                )
-            else:
-                try:
-                    doc = await create_document(
-                        db,
-                        entity_id,
-                        name=filename,
-                        fs_path=fs_path,
-                        file_size=file_size,
-                        file_type=ext,
-                        mime_type=mime_type,
-                        source="upload",
-                        created_by=created_by,
-                        folder_id=resolved_folder_id,
-                        visibility=visibility,
-                        classification=classification,
-                        client_visible=client_visible,
-                        owner_id=owner_id,
-                        upload_idempotency_key=idempotency_key,
-                        upload_request_fingerprint=(
-                            request_fingerprint if idempotency_key is not None else None
-                        ),
-                    )
-                    doc = await _finish_document_filesystem_mutation(
-                        _commit_document_upload_with_reconciliation(
-                            db,
-                            doc,
-                            entity_id=entity_id,
-                            owner_id=owner_id,
-                            idempotency_key=idempotency_key,
-                            request_fingerprint=request_fingerprint,
-                            require_source_file=False,
-                        )
-                    )
-                except IntegrityError:
-                    await _rollback_database_best_effort(db)
-                    existing = await _find_idempotent_document_upload(
-                        db,
-                        entity_id=entity_id,
-                        owner_id=owner_id,
-                        idempotency_key=idempotency_key,
-                    )
-                    if existing is None:
-                        raise
-                    doc = await _validate_idempotent_document_upload(
-                        db,
-                        existing,
-                        request_fingerprint=request_fingerprint,
-                    )
-        finally:
-            try:
-                os.remove(tmp_path)
-            except OSError:
-                pass
+        )
 
     return await _doc_resp_for_user(db, doc, user)
 
@@ -4558,12 +3623,6 @@ async def replace_document_file_endpoint(
     file: UploadFile = File(...),
     save_session_id: str | None = Form(default=None, min_length=1, max_length=128),
     save_sequence: int | None = Form(default=None, ge=1, le=9_007_199_254_740_991),
-    expected_source_sha256: str | None = Form(
-        default=None,
-        min_length=64,
-        max_length=64,
-        pattern=r"^[0-9a-fA-F]{64}$",
-    ),
     _gate=Depends(require_plan("storage_mb")),
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
@@ -4622,7 +3681,6 @@ async def replace_document_file_endpoint(
             created_by=(user.display_name or user.email),
             save_session_id=save_session_id,
             save_sequence=save_sequence,
-            expected_source_sha256=expected_source_sha256,
             mutation_authorizer=_document_mutation_authorizer(
                 user,
                 {Capability.EDIT},
@@ -5103,10 +4161,6 @@ async def get_editable_document_file(
             _capture_document_source_snapshot,
             source_path,
         )
-        source_sha256 = await asyncio.to_thread(
-            _document_source_sha256,
-            source_path,
-        )
         await db.rollback()
 
     from packages.core.services.office_editing import (
@@ -5188,7 +4242,6 @@ async def get_editable_document_file(
             "Content-Disposition": f"attachment; filename*=UTF-8''{encoded_name}",
             "Cache-Control": "private, no-store",
             "Content-Length": str(converted.size),
-            "X-Manor-Source-SHA256": source_sha256,
         },
     )
 
@@ -5779,7 +4832,6 @@ class DocumentBrowseResponse(DocumentListResponse):
     total_documents: int = 0
     direct_total_files: int = 0
     direct_total_size: int = 0
-    max_upload_mb: int
 
 
 def _folder_resp(
@@ -6315,7 +5367,6 @@ async def browse_documents(
         total_size=total_size,
         storage_used_mb=gate.current,
         storage_limit_mb=gate.limit,
-        max_upload_mb=settings.MANOR_MAX_UPLOAD_MB,
     )
 
 

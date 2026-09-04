@@ -49,8 +49,6 @@ def _earliest_by_user(rows: Iterable[tuple[Any, Any]]) -> dict[str, datetime]:
     return result
 
 
-
-
 async def get_product_growth_metrics(
     db: AsyncSession,
     *,
@@ -211,8 +209,6 @@ async def get_product_growth_metrics(
         milestone_users["task_completed"]
         | milestone_users["automation_succeeded"]
     )
-
-
     registered = len(user_ids)
     milestone_labels = {
         "workspace_created": "Created a workspace",

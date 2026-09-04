@@ -19,7 +19,6 @@ from packages.core.ai.runtime.file_actions import (
 )
 from packages.core.ai.runtime.file_contracts import FileMutationAction
 from packages.core.ai.runtime.tool_context import runtime_tool_call_context_from_kwargs
-from packages.core.contracts.file_engine import TEXT_CONTENT_TYPES, file_type_from_path
 
 from . import common
 from packages.core.services.workspace_layout import WorkspaceArtifactDir
@@ -205,12 +204,6 @@ async def _handle_code_under_entity_lock(
     target_paths: set[str] = set()
     for file in files:
         rel_file = file["path"]
-        if file_type_from_path(rel_file) not in TEXT_CONTENT_TYPES:
-            return json.dumps({
-                "error": "unsupported_code_file_type",
-                "path": rel_file,
-                "hint": "Code bundles contain text sources, not binary media or Office files.",
-            }, ensure_ascii=False)
         rel_target = runtime_normalize_entity_file_path(f"{bundle}/{rel_file}")
         if not runtime_user_visible_file_path(rel_target):
             return json.dumps({"error": f"Cannot create hidden/system path: {rel_file}"}, ensure_ascii=False)

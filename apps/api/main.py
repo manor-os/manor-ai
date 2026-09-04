@@ -188,46 +188,47 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             logger.warning("MCP catalog auto-seed skipped: %s", e)
 
-    # Register built-in runtime Skills before the first Agent turn. This also
-    # selects the edition-specific public product guide: cloud-intro in the
-    # Cloud source tree, or intro in the OSS export.
-    try:
-        from packages.core.database import async_session
-        from packages.core.services.builtin_skill_loader import seed_builtin_skills
-        async with async_session() as _db:
-            await seed_builtin_skills(_db)
-            await _db.commit()
-    except Exception as e:
-        logger.warning("Built-in Skill auto-seed skipped: %s", e)
+    if _run_api_side_effects:
+        # Register built-in runtime Skills before the first Agent turn. This also
+        # selects the edition-specific public product guide: cloud-intro in the
+        # Cloud source tree, or intro in the OSS export.
+        try:
+            from packages.core.database import async_session
+            from packages.core.services.builtin_skill_loader import seed_builtin_skills
+            async with async_session() as _db:
+                await seed_builtin_skills(_db)
+                await _db.commit()
+        except Exception as e:
+            logger.warning("Built-in Skill auto-seed skipped: %s", e)
 
-    # Publish the platform's own blueprints into the marketplace table, so
-    # they are ordinary published rows — reviewed, versioned and identified
-    # by id like any contributor's — rather than a parallel code path. A
-    # redeploy of unchanged configs writes nothing; a corrected one bumps its
-    # version, which is what tells installed workspaces an update exists.
-    try:
-        from packages.core.blueprints.seed import seed_platform_blueprints
-        from packages.core.database import async_session
-        async with async_session() as _db:
-            await seed_platform_blueprints(_db)
-            await _db.commit()
-    except Exception as e:
-        logger.warning("Platform blueprint auto-seed skipped: %s", e)
+        # Publish the platform's own blueprints into the marketplace table, so
+        # they are ordinary published rows — reviewed, versioned and identified
+        # by id like any contributor's — rather than a parallel code path. A
+        # redeploy of unchanged configs writes nothing; a corrected one bumps its
+        # version, which is what tells installed workspaces an update exists.
+        try:
+            from packages.core.blueprints.seed import seed_platform_blueprints
+            from packages.core.database import async_session
+            async with async_session() as _db:
+                await seed_platform_blueprints(_db)
+                await _db.commit()
+        except Exception as e:
+            logger.warning("Platform blueprint auto-seed skipped: %s", e)
 
-    # Register the platform feature flags the code gates on, so they show
-    # up in the admin Flags page at their safe default instead of ops
-    # having to guess the exact key. Only creates missing rows — an
-    # ops-set default or an archived flag is never overwritten.
-    try:
-        from packages.core.database import async_session
-        from packages.core.services.feature_flags import seed_known_flags
-        async with async_session() as _db:
-            _flags_created = await seed_known_flags(_db)
-            await _db.commit()
-        if _flags_created:
-            logger.info("Registered %d missing platform feature flag(s)", _flags_created)
-    except Exception as e:
-        logger.warning("Known feature flag auto-seed skipped: %s", e)
+        # Register the platform feature flags the code gates on, so they show
+        # up in the admin Flags page at their safe default instead of ops
+        # having to guess the exact key. Only creates missing rows — an
+        # ops-set default or an archived flag is never overwritten.
+        try:
+            from packages.core.database import async_session
+            from packages.core.services.feature_flags import seed_known_flags
+            async with async_session() as _db:
+                _flags_created = await seed_known_flags(_db)
+                await _db.commit()
+            if _flags_created:
+                logger.info("Registered %d missing platform feature flag(s)", _flags_created)
+        except Exception as e:
+            logger.warning("Known feature flag auto-seed skipped: %s", e)
 
     # Refresh optional plan metadata when the deployment provides it.
     # OSS builds keep the local OSS plan and return immediately.
@@ -773,9 +774,6 @@ def create_app() -> FastAPI:
     # ── M12.1 Workspace Blueprints / Marketplace ──
     app.include_router(blueprints_router.blueprint_router)
     app.include_router(blueprints_router.workspace_router)
-    from apps.api.routers import public_marketplace as public_marketplace_router
-    app.include_router(public_marketplace_router.api_router)
-    app.include_router(public_marketplace_router.page_router)
 
 
     return app

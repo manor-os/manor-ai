@@ -173,8 +173,6 @@ async def discovery_health(db: AsyncSession, *, days: int = 30) -> dict:
             select(
                 func.count(ToolCallLog.id).label("call_count"),
                 func.sum(case((ToolCallLog.outcome == "empty_result", 1), else_=0)).label("empty_result_count"),
-                func.count(ToolCallLog.duration_ms).label("duration_count"),
-                func.coalesce(func.sum(ToolCallLog.duration_ms), 0).label("duration_ms_sum"),
             )
             .where(ToolCallLog.created_at >= cutoff, ToolCallLog.tool_name == "search_tools")
         )).one()
@@ -191,8 +189,6 @@ async def discovery_health(db: AsyncSession, *, days: int = 30) -> dict:
             select(
                 func.coalesce(func.sum(MetricsDailyToolCalls.call_count), 0).label("call_count"),
                 func.coalesce(func.sum(MetricsDailyToolCalls.empty_result_count), 0).label("empty_result_count"),
-                func.coalesce(func.sum(MetricsDailyToolCalls.call_count), 0).label("duration_count"),
-                func.coalesce(func.sum(MetricsDailyToolCalls.duration_ms_sum), 0).label("duration_ms_sum"),
             )
             .where(MetricsDailyToolCalls.day >= cutoff_day, MetricsDailyToolCalls.tool_name == "search_tools")
         )).one()
@@ -201,22 +197,6 @@ async def discovery_health(db: AsyncSession, *, days: int = 30) -> dict:
     total_errors = int(total_row.error_count or 0)
     search_calls = int(search_row.call_count or 0)
     search_empty = int(search_row.empty_result_count or 0)
-    search_duration_count = int(search_row.duration_count or 0)
-    search_duration_ms_sum = int(search_row.duration_ms_sum or 0)
-
-    # Percentiles cannot be composed from daily rollups, so latency tails use
-    # the bounded raw-log window for both live and rollup-backed reports.
-    search_p95_duration_ms = (await db.execute(
-        select(
-            func.percentile_cont(0.95).within_group(
-                ToolCallLog.duration_ms.asc()
-            )
-        ).where(
-            ToolCallLog.created_at >= cutoff,
-            ToolCallLog.tool_name == "search_tools",
-            ToolCallLog.duration_ms.isnot(None),
-        )
-    )).scalar_one_or_none()
 
     path_row = (await db.execute(
         select(
@@ -234,21 +214,10 @@ async def discovery_health(db: AsyncSession, *, days: int = 30) -> dict:
 
     return {
         "days": days,
-        "discovery_version": "v2",
         "total_tool_calls": total_calls,
         "tool_dead_end_rate": (total_errors / total_calls) if total_calls else None,
         "search_call_count": search_calls,
         "search_hit_rate": (1 - search_empty / search_calls) if search_calls else None,
-        "search_avg_duration_ms": (
-            search_duration_ms_sum / search_duration_count
-            if search_duration_count
-            else None
-        ),
-        "search_p95_duration_ms": (
-            float(search_p95_duration_ms)
-            if search_p95_duration_ms is not None
-            else None
-        ),
         "intent_path_total": total_paths,
         "intent_path_suppression_rate": (suppressed_paths / total_paths) if total_paths else None,
         "intent_path_success_rate": (success_sum / total_outcomes) if total_outcomes else None,

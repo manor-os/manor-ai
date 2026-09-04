@@ -141,7 +141,6 @@ async def sync_file_to_knowledge(
     classification: str | None = None,
     client_visible: bool | None = None,
     expected_content_sha256: str | None = None,
-    storage_admission_prevalidated: bool = False,
     db: AsyncSession | None = None,
     commit: bool = False,
 ) -> KnowledgeSyncResult:
@@ -221,12 +220,8 @@ async def sync_file_to_knowledge(
                     )
 
     # Reconcile re-projects files already on disk, so it must never be blocked
-    # by the storage quota. A browser upload recovery intent is also one
-    # already-admitted logical attempt: its first request passed the route and
-    # persistence gates before the commit outcome became ambiguous. Only that
-    # caller may set ``storage_admission_prevalidated`` after validating the
-    # same owner, idempotency key, request fingerprint, and source path.
-    skip_storage_check = source == "filesystem_reconcile" or storage_admission_prevalidated
+    # by the storage quota; every other source counts as adding to the KB.
+    skip_storage_check = source == "filesystem_reconcile"
     async with _knowledge_sync_session(db) as (sync_db, owns_session):
         try:
             upsert = await upsert_document_by_fs_path_result(

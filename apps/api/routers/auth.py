@@ -76,8 +76,6 @@ router = APIRouter(prefix="/api/v1/auth", tags=["auth"])
 
 # ── Schemas ──
 
-
-
 class RegisterRequest(BaseModel):
     username: str | None = None
     email: str
@@ -107,7 +105,6 @@ class TokenResponse(BaseModel):
     user_id: str
     entity_id: str
     role: str
-    is_new: bool = False
 
 
 class MfaStepUpRequest(BaseModel):
@@ -277,10 +274,6 @@ async def _register_from_staff_invite(
 
 
 
-
-
-
-
 @router.post("/register")
 async def register(req: RegisterRequest, request: Request, db: AsyncSession = Depends(get_db)):
     """Register a new user + entity. If email verification is enabled, returns pending status.
@@ -307,7 +300,6 @@ async def register(req: RegisterRequest, request: Request, db: AsyncSession = De
     if (req.invite_token or "").strip():
         user, entity = await _register_from_staff_invite(db, req=req)
         mark_user_login(user, source="auth.register_invite")
-        # A following request must see the account before we issue its token.
         await db.commit()
         token = create_access_token(
             user.id, entity.id, user.role, token_version=user.token_version,
@@ -317,7 +309,6 @@ async def register(req: RegisterRequest, request: Request, db: AsyncSession = De
             user_id=user.id,
             entity_id=entity.id,
             role=user.role,
-            is_new=True,
         )
 
     # ── Invitation code gate (validate up front) ──────────────────────
@@ -387,7 +378,6 @@ async def register(req: RegisterRequest, request: Request, db: AsyncSession = De
                 await send_verification_email(existing.email, code)
                 return {
                     "requires_verification": True,
-                    "is_new": False,
                     "email": existing.email,
                     "message": "Verification code resent to your email",
                 }
@@ -408,7 +398,6 @@ async def register(req: RegisterRequest, request: Request, db: AsyncSession = De
 
     if _CLOUD_FEATURES_ENABLED:
         user.status = "pending"
-        # Verification must not become usable before its account is committed.
         await db.commit()
         code = await create_verification(
             user.email,
@@ -418,13 +407,11 @@ async def register(req: RegisterRequest, request: Request, db: AsyncSession = De
         await send_verification_email(user.email, code)
         return {
             "requires_verification": True,
-            "is_new": True,
             "email": user.email,
             "message": "Verification code sent to your email",
         }
 
     mark_user_login(user, source="auth.register")
-    # get_db's teardown can run after the success response has been sent.
     await db.commit()
     token = create_access_token(
         user.id, entity.id, user.role, token_version=user.token_version,
@@ -434,7 +421,6 @@ async def register(req: RegisterRequest, request: Request, db: AsyncSession = De
         user_id=user.id,
         entity_id=entity.id,
         role=user.role,
-        is_new=True,
     )
 
 
@@ -467,7 +453,7 @@ async def verify_email_endpoint(
         raise HTTPException(400, "User not found")
 
     mark_user_login(user, source="auth.verify_email")
-    # Activation must be durable and visible before issuing a token or sending welcome.
+    # The activation must be durable before issuing a token or sending welcome.
     await db.commit()
 
     from packages.core.services.email_service import send_welcome_email
@@ -636,9 +622,9 @@ async def renew_session(
     if claims.get("typ") == "impersonation":
         raise HTTPException(403, "Support sessions cannot be renewed")
 
-    # ``get_current_user`` resolves the membership carried by the token without
-    # mutating it, so these values reflect current server-side membership data
-    # rather than trusting possibly stale role claims during renewal.
+    # ``get_current_user`` activates the membership carried by the token, so
+    # these values reflect current server-side membership data rather than
+    # trusting possibly stale role claims during renewal.
     entity_id = str(user.entity_id)
     role = str(user.role)
     mfa_authenticated = "mfa" in {
@@ -2453,10 +2439,6 @@ async def oauth_google(req: OAuthGoogleRequest, db: AsyncSession = Depends(get_d
     if team_invite_token:
         from packages.core.services.team_invite_service import accept_team_invite_with_oauth
 
-        existing_team_user_id = await db.scalar(
-            select(User.id).where(func.lower(User.email) == info.get("email", "").lower())
-        )
-
         accepted = await accept_team_invite_with_oauth(
             db,
             token=team_invite_token,
@@ -2483,7 +2465,6 @@ async def oauth_google(req: OAuthGoogleRequest, db: AsyncSession = Depends(get_d
             user_id=accepted.user.id,
             entity_id=accepted.user.entity_id,
             role=accepted.user.role,
-            is_new=existing_team_user_id is None,
         )
 
     # ── Invitation code gate (only for NEW users) ──────────────────
@@ -2566,7 +2547,6 @@ async def oauth_google(req: OAuthGoogleRequest, db: AsyncSession = Depends(get_d
         # Don't catch — if redemption fails, let the error propagate
         # so the user sees it and can retry. Silent failures = lost credits.
 
-
     if _is_new:
         # Welcome email for new OAuth users (verification is skipped)
         try:
@@ -2588,7 +2568,6 @@ async def oauth_google(req: OAuthGoogleRequest, db: AsyncSession = Depends(get_d
         user_id=user.id,
         entity_id=user.entity_id,
         role=user.role,
-        is_new=_is_new,
     )
 
 

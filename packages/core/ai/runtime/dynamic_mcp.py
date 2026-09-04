@@ -141,7 +141,6 @@ class RuntimeDynamicMCPToolBinding:
     provider: str
     action: str
     expires_at: float
-    schema: dict[str, Any] | None = None
     account_ids: tuple[str, ...] = ()
     effect: str = "write"
     requires_explicit_account: bool = False
@@ -164,11 +163,6 @@ class RuntimeDynamicMCPToolBindingFactory:
         return RuntimeDynamicMCPToolBinding(
             provider=str(getattr(tool, "provider", "") or ""),
             action=str(getattr(tool, "action", "") or ""),
-            schema=(
-                dict(getattr(tool, "schema"))
-                if isinstance(getattr(tool, "schema", None), dict)
-                else None
-            ),
             account_ids=tuple(getattr(tool, "account_ids", ()) or ()),
             effect=str(effect or "write"),
             requires_explicit_account=bool(

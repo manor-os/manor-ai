@@ -1245,7 +1245,7 @@ def test_query_rejects_invalid_cursor_and_limit() -> None:
 def test_query_tool_is_registered_as_read_only() -> None:
     from packages.core.ai.runtime.approval_classifier import classify_runtime_tool
     from packages.core.ai.runtime.tool_effect_classification import RuntimeToolEffect
-    from packages.core.ai.tools.ledger_query_tools import get_legacy_tools, get_tools
+    from packages.core.ai.tools.ledger_query_tools import get_tools
 
     schema, _handler = get_tools()[0]
     assert schema["function"]["name"] == "query_ledger"
@@ -1260,7 +1260,7 @@ def test_query_tool_is_registered_as_read_only() -> None:
     assert schema["function"]["parameters"]["properties"]["presentation"]["properties"]["sections"]["maxItems"] == 4
     assert schema["function"]["parameters"]["properties"]["coalesce_previous_visualization"]["type"] == "boolean"
     assert classify_runtime_tool("query_ledger", {}).effect is RuntimeToolEffect.READ_ONLY
-    visualization_schema, _visualization_handler = get_legacy_tools()[0]
+    visualization_schema, _visualization_handler = get_tools()[1]
     assert visualization_schema["function"]["name"] == "visualize_workspace_ledgers"
     assert classify_runtime_tool("visualize_workspace_ledgers", {}).effect is RuntimeToolEffect.READ_ONLY
 

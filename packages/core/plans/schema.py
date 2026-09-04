@@ -183,23 +183,6 @@ class PlanStep(BaseModel):
         return self
 
 
-class PlanAcceptanceCriterion(BaseModel):
-    """One task-specific success condition and the steps that prove it."""
-
-    key: str = Field(..., min_length=1, max_length=128)
-    deliverable_name: str = Field(..., min_length=1, max_length=255)
-    description: str = Field(..., min_length=1, max_length=1000)
-    evidence_step_keys: list[str] = Field(..., min_length=1)
-
-
-class PlanAcceptanceContract(BaseModel):
-    """Task acceptance criteria snapshotted onto an executable Plan."""
-
-    expected_result: str = Field(..., min_length=1, max_length=2000)
-    criteria: list[PlanAcceptanceCriterion] = Field(..., min_length=1)
-    task_expected_output: Optional[dict[str, Any]] = None
-
-
 class PlanMetadata(BaseModel):
     """Free-form fields the Planner attaches for audit / display."""
 
@@ -207,7 +190,6 @@ class PlanMetadata(BaseModel):
     estimated_cost_usd: Optional[float] = None
     estimated_duration_seconds: Optional[int] = None
     rationale: Optional[str] = None
-    acceptance_contract: Optional[PlanAcceptanceContract] = None
     # Why the Planner chose this shape — shown in the plan detail UI
     # so the user understands the agent's reasoning at approve time.
 
@@ -233,20 +215,6 @@ class Plan(BaseModel):
                     raise ValueError(
                         f"step {s.key} depends_on unknown step {dep!r}"
                     )
-
-        acceptance_contract = self.metadata.acceptance_contract
-        if acceptance_contract is not None:
-            unknown_evidence = sorted({
-                evidence_key
-                for criterion in acceptance_contract.criteria
-                for evidence_key in criterion.evidence_step_keys
-                if evidence_key not in keys
-            })
-            if unknown_evidence:
-                raise ValueError(
-                    "acceptance contract references unknown evidence steps: "
-                    + ", ".join(unknown_evidence)
-                )
 
         # Cycle check via DFS — small N, no need for fancier algo.
         graph = {s.key: list(s.depends_on) for s in self.steps}

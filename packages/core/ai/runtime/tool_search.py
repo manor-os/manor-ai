@@ -1,17 +1,11 @@
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 import time
 from collections.abc import Awaitable, Callable, Iterable, Mapping
 from typing import Any
 
-from packages.core.ai.runtime.capability_search import (
-    runtime_merge_capability_matches,
-    runtime_search_companion_skill_candidates,
-    runtime_search_skill_candidates,
-)
 from packages.core.ai.runtime.tool_visibility import (
     runtime_search_always_loaded_tool_names,
     runtime_search_bound_tool_names_for_profile,
@@ -39,7 +33,6 @@ logger = logging.getLogger(__name__)
 
 _TOOL_MANIFEST_DESCRIPTION_CHARS = 260
 _TOOL_MANIFEST_PARAMETER_LIMIT = 12
-_CAPABILITY_KINDS = frozenset({"tool", "mcp_tool", "skill"})
 
 
 def runtime_search_tools_schema() -> dict:
@@ -50,10 +43,8 @@ def runtime_search_tools_schema() -> dict:
         "function": {
             "name": "search_tools",
             "description": (
-                "Search available tools, MCP actions, and reusable Skills by "
-                "capability description. Use concise capability terms (translate "
-                "them when useful), \"select:tool_name1,tool_name2\" for an exact Tool or "
-                'Skill, or "browse_server:key" for one MCP server\'s tools.'
+                "Search tools by keyword. Use \"select:tool_name1,tool_name2\" for "
+                'exact match, or "browse_server:key" for one server\'s tools.'
             ),
             "parameters": {
                 "type": "object",
@@ -64,17 +55,7 @@ def runtime_search_tools_schema() -> dict:
                     },
                     "max_results": {
                         "type": "integer",
-                        "description": "Max capabilities to return (default 5, hard cap 8).",
-                    },
-                    "kinds": {
-                        "type": "array",
-                        "items": {
-                            "type": "string",
-                            "enum": ["tool", "mcp_tool", "skill"],
-                        },
-                        "description": (
-                            "Optional capability kinds to search. Omit to search all."
-                        ),
+                        "description": "Max tools to return (default 5, hard cap 8).",
                     },
                 },
                 "required": ["query"],
@@ -93,7 +74,6 @@ def runtime_tool_manifest(name: str, schema: dict) -> dict:
         else {}
     )
     manifest = {
-        "kind": "mcp_tool" if name.startswith("mcp__") else "tool",
         "name": name,
         "description": description[:_TOOL_MANIFEST_DESCRIPTION_CHARS],
         "parameters": list(params.keys())[:_TOOL_MANIFEST_PARAMETER_LIMIT],
@@ -101,37 +81,6 @@ def runtime_tool_manifest(name: str, schema: dict) -> dict:
     if len(description) > _TOOL_MANIFEST_DESCRIPTION_CHARS:
         manifest["description_truncated"] = True
     return manifest
-
-
-def _runtime_requested_capability_kinds(
-    raw_kinds: object,
-) -> tuple[frozenset[str], str | None]:
-    if raw_kinds is None:
-        return _CAPABILITY_KINDS, None
-    if not isinstance(raw_kinds, (list, tuple, set, frozenset)):
-        return frozenset(), "kinds must be an array"
-    kinds = frozenset(str(kind or "").strip() for kind in raw_kinds)
-    invalid = sorted(kinds - _CAPABILITY_KINDS)
-    if invalid:
-        return frozenset(), f"unknown capability kinds: {', '.join(invalid)}"
-    if not kinds:
-        return frozenset(), "kinds must contain at least one capability kind"
-    return kinds, None
-
-
-def _runtime_partition_suggestion_overflow(
-    matches: Iterable[Mapping[str, Any]],
-    suggestion_providers: frozenset[str],
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    primary: list[dict[str, Any]] = []
-    overflow: list[dict[str, Any]] = []
-    for raw_match in matches:
-        match = dict(raw_match)
-        provider = runtime_mcp_provider_from_tool_name(
-            str(match.get("name") or "")
-        )
-        (overflow if provider in suggestion_providers else primary).append(match)
-    return primary, overflow
 
 
 def _live_mcp_tool_name_and_schema(
@@ -226,60 +175,6 @@ def runtime_select_tool_candidates(selector: str, tool_names: Iterable[str]) -> 
     )
 
 
-def _runtime_browse_server_key(
-    selector: str,
-    server_index: Mapping[str, dict],
-) -> str:
-    """Resolve a provider key from common MCP/Skill selector spellings.
-
-    Integration child Skills are named ``mcp_<provider>`` while public tools
-    use ``mcp__<provider>__<action>``. Treating those identifiers as literal
-    server keys produced the misleading ``mcp_gmail is not connected`` error
-    even when ``gmail`` was connected. Resolution stays exact over known
-    server metadata; it never grants or invents a provider.
-    """
-
-    raw = str(selector or "").strip().casefold()
-    candidates = [raw]
-    if raw.startswith("mcp__"):
-        candidates.append(raw[5:].split("__", 1)[0])
-    if raw.startswith("mcp_"):
-        candidates.append(raw[4:])
-
-    for candidate in dict.fromkeys(candidates):
-        if candidate in server_index:
-            return candidate
-    return raw
-
-
-def _runtime_explicit_query_provider_keys(
-    query: str,
-    server_index: Mapping[str, dict],
-) -> frozenset[str]:
-    """Return provider keys named by an explicit discovery convention.
-
-    Dynamic official MCP tools may have no static fallback schema yet. In that
-    case ``select:mcp__provider__action`` is the only local evidence naming the
-    provider, and it still has to participate in the account-readiness batch
-    before Runtime performs remote ``tools/list`` discovery.
-    """
-
-    normalized = str(query or "").strip().casefold()
-    if normalized.startswith("select:"):
-        return frozenset(
-            provider
-            for selector in normalized[7:].split(",")
-            if (
-                provider := runtime_mcp_provider_from_tool_name(selector.strip())
-            )
-        )
-    if normalized.startswith("browse_server:"):
-        selector = normalized.split(":", 1)[1].strip().split(None, 1)[0]
-        provider = _runtime_browse_server_key(selector, server_index)
-        return frozenset({provider}) if provider in server_index else frozenset()
-    return frozenset()
-
-
 def runtime_search_tool_candidates(
     *,
     tool_schemas: Iterable[tuple[str, dict]],
@@ -294,10 +189,10 @@ def runtime_search_tool_candidates(
 ) -> tuple[list[dict], list[dict]]:
     """Search tool manifests and return MCP providers suppressed by intent.
 
-    ``usable_providers`` (Tool Discovery v2 A1) and ``server_index``
-    (Tool Discovery v2 A2) default to ``None`` so pure callers may opt out of
-    provider pre-filtering and server-level scoring. Runtime search always
-    supplies the v2 server index. ``intent_path_boosts`` (v2 A3 memory) is an
+    ``usable_providers`` (tool_discovery_v2 A1) and ``server_index``
+    (tool_discovery_v2 A2) both default to ``None``, which preserves exact
+    v1 behavior: no provider pre-filtering and no server-level score floor.
+    ``intent_path_boosts`` (tool_discovery_v2 A3 intent-path memory) is an
     optional provider->boost map, each value capped at +9 so memory can
     only nudge among near-ties — it never beats a real keyword+alias match
     (provider_query_score contributes at least 100 once nonzero, since
@@ -326,15 +221,14 @@ def runtime_search_tool_candidates(
     # B1: browse_server:<key> lists one server's tools, bypassing the
     # per-provider dedup applied below (the whole point of browsing one
     # server is to see many of its tools). Gated on server_index is not
-    # None so pure callers can still use the lower-level legacy scorer without
-    # this convention. The Runtime handler always passes the v2 index.
+    # None (only passed by the handler when tool_discovery_v2 is on) so
+    # the convention doesn't exist at all when the flag is off — flag-off
+    # callers get byte-identical v1 behavior even if a query happens to
+    # start with this literal prefix.
     if server_index is not None and query_lower.startswith("browse_server:"):
         remainder = query[len("browse_server:"):].strip()
         parts = remainder.split(None, 1)
-        server_key = _runtime_browse_server_key(
-            parts[0] if parts else "",
-            server_index,
-        )
+        server_key = (parts[0] if parts else "").strip().lower()
         extra_terms = parts[1] if len(parts) > 1 else ""
         if usable_providers is not None and server_key not in usable_providers:
             return [], [{
@@ -834,20 +728,9 @@ async def runtime_execute_search_tools_handler(
         [frozenset[str]],
         Awaitable[dict[str, list[Any]]],
     ] | None = None,
-    skill_descriptor_loader: Callable[
-        [],
-        Awaitable[Iterable[Any]],
-    ] | None = None,
 ) -> str:
     """Execute the built-in search_tools contract against a registry snapshot."""
 
-    performance_started = time.monotonic()
-    provider_resolution_ms = 0.0
-    ranking_ms = 0.0
-    availability_ms = 0.0
-    live_schema_ms = 0.0
-    skill_search_ms = 0.0
-    provider_keys: list[str] = []
     tool_schemas = tuple(tool_schemas)
     available_names = tuple(str(name) for name in available_tool_names)
     search_request = runtime_prepare_search_tools_request(
@@ -856,11 +739,6 @@ async def runtime_execute_search_tools_handler(
     )
     if not search_request.ok:
         return json.dumps({"error": search_request.error})
-    requested_kinds, kinds_error = _runtime_requested_capability_kinds(
-        arguments.get("kinds")
-    )
-    if kinds_error:
-        return json.dumps({"error": kinds_error})
 
     runtime_context = runtime_tool_call_context_from_kwargs(dict(arguments))
     runtime_envelope = runtime_context.runtime_envelope
@@ -923,132 +801,62 @@ async def runtime_execute_search_tools_handler(
             name for name in available_names if name in scoped_names
         }
 
-    if requested_kinds != _CAPABILITY_KINDS:
-        def _requested_tool_kind(name: str) -> bool:
-            kind = "mcp_tool" if str(name).startswith("mcp__") else "tool"
-            return kind in requested_kinds
-
-        scoped_tool_schemas = tuple(
-            (name, schema)
-            for name, schema in scoped_tool_schemas
-            if _requested_tool_kind(str(name))
-        )
-        scoped_available_names = {
-            name for name in scoped_available_names if _requested_tool_kind(name)
-        }
-
     active_user_message = (
         runtime_context.active_user_message
         if isinstance(runtime_context.active_user_message, str)
         else None
     )
 
-    effective_skill_loader = skill_descriptor_loader
-    if effective_skill_loader is None and runtime_envelope is not None:
-        async def _load_runtime_skill_descriptors() -> Iterable[Any]:
-            from packages.core.ai.runtime.skills import (
-                runtime_searchable_skill_descriptors_from_tool_kwargs,
-            )
-            from packages.core.database import async_session
-
-            async with async_session() as skill_db:
-                return await runtime_searchable_skill_descriptors_from_tool_kwargs(
-                    skill_db,
-                    dict(arguments),
-                )
-
-        effective_skill_loader = _load_runtime_skill_descriptors
-
-    searchable_skills: list[Any] = []
-    skill_matches: list[dict[str, Any]] = []
-    skill_catalog_loaded = False
-    skill_discovery_error: str | None = None
-
-    # Tool Discovery v2 graduated from its rollout flag and is now the Runtime
-    # default. Build the in-process server index independently from account
-    # availability so a transient registry outage can degrade only the
-    # pre-filter, not server-first ranking or browse_server routing.
+    # tool_discovery_v2 (A1 pre-filter + A2 server scoring): resolve the flag
+    # and the usable-provider set once per search call. No `db` is threaded
+    # into this handler (unlike the plan's pseudocode assumption) — the
+    # availability annotation below opens its own session the same way, so
+    # we mirror that pattern here rather than adding a new db parameter.
+    # Any failure degrades both params to None = exact v1 behavior.
+    v2_enabled = False
     usable_providers: frozenset[str] | None = None
-    from packages.core.ai.runtime.tool_discovery import runtime_server_index
-
-    server_idx: dict[str, dict] | None = runtime_server_index() or None
+    server_idx: dict[str, dict] | None = None
     intent_path_boosts: dict[str, float] | None = None
-    provider_keys = sorted(
-        scoped_mcp_provider_keys
-        | {
-            provider
-            for name, _schema in scoped_tool_schemas
-            if (provider := runtime_mcp_provider_from_tool_name(str(name)))
-        }
-        | _runtime_explicit_query_provider_keys(
-            search_request.query,
-            server_idx or {},
-        )
-    )
+    try:
+        if entity_id:
+            from packages.core.database import async_session
+            from packages.core.services.feature_flags import is_enabled
 
-    async def _load_usable_providers() -> tuple[frozenset[str], float]:
-        started = time.monotonic()
-        from packages.core.database import async_session
-        from packages.core.services.agent_permission_service import (
-            resolve_usable_mcp_providers,
-        )
-
-        async with async_session() as discovery_db:
-            usable = await resolve_usable_mcp_providers(
-                discovery_db,
-                user_id=user_id,
-                entity_id=entity_id,
-                provider_keys=provider_keys,
-            )
-        return usable, (time.monotonic() - started) * 1000
-
-    async def _load_searchable_skills() -> tuple[list[Any], float]:
-        started = time.monotonic()
-        assert effective_skill_loader is not None
-        skills = list(await effective_skill_loader())
-        return skills, (time.monotonic() - started) * 1000
-
-    parallel_names: list[str] = []
-    parallel_jobs: list[Awaitable[tuple[Any, float]]] = []
-    if entity_id:
-        parallel_names.append("providers")
-        parallel_jobs.append(_load_usable_providers())
-    if "skill" in requested_kinds and effective_skill_loader is not None:
-        parallel_names.append("skills")
-        parallel_jobs.append(_load_searchable_skills())
-
-    if parallel_jobs:
-        parallel_results = await asyncio.gather(
-            *parallel_jobs,
-            return_exceptions=True,
-        )
-        for name, result in zip(parallel_names, parallel_results, strict=True):
-            if isinstance(result, BaseException):
-                if name == "providers":
-                    logger.warning(
-                        "Tool discovery provider pre-filter failed; continuing without it",
-                        exc_info=(type(result), result, result.__traceback__),
+            async with async_session() as flag_db:
+                v2_enabled = await is_enabled(
+                    flag_db, "tool_discovery_v2",
+                    entity_id=entity_id, user_id=user_id, fallback=False,
+                )
+                if v2_enabled:
+                    from packages.core.services.agent_permission_service import (
+                        resolve_usable_mcp_providers,
                     )
-                    usable_providers = None
-                else:
-                    logger.warning(
-                        "Runtime Skill discovery failed; returning Tool/MCP candidates",
-                        exc_info=(type(result), result, result.__traceback__),
+                    # Derive provider keys from THIS handler's own schema
+                    # view rather than importing the mcp_builtin catalog
+                    # from the (non-runtime) permission service — that
+                    # service is scanned by
+                    # test_production_tool_to_tool_imports_stay_runtime_owned
+                    # and must stay free of packages.core.ai.tools imports.
+                    # This handler lives under ai/runtime and is exempt.
+                    provider_keys = sorted(scoped_mcp_provider_keys | {
+                        provider
+                        for name, _schema in scoped_tool_schemas
+                        if (provider := runtime_mcp_provider_from_tool_name(str(name)))
+                    })
+                    _t0 = time.monotonic()
+                    usable_providers = await resolve_usable_mcp_providers(
+                        flag_db, user_id=user_id, entity_id=entity_id,
+                        provider_keys=provider_keys,
                     )
-                    skill_discovery_error = (
-                        "The Skill catalog could not be searched; no Skill was loaded."
+                    logger.info(
+                        "resolve_usable_mcp_providers took %.1fms for %d providers",
+                        (time.monotonic() - _t0) * 1000,
+                        len(provider_keys),
                     )
-                continue
-            value, elapsed_ms = result
-            if name == "providers":
-                usable_providers = value
-                provider_resolution_ms = elapsed_ms
-            else:
-                searchable_skills = value
-                skill_catalog_loaded = True
-                skill_search_ms = elapsed_ms
-    if entity_id and user_id and active_user_message:
-        try:
+        if v2_enabled:
+            from packages.core.ai.runtime.tool_discovery import runtime_server_index
+            server_idx = runtime_server_index() or None
+        if v2_enabled and entity_id and user_id and active_user_message:
             # A3 rank boost: re-run the SAME cache-first lookup
             # resolve_runtime_chat_context already did earlier this turn
             # (tool_path_memory.lookup_paths is Redis-blob-backed, so this
@@ -1063,9 +871,11 @@ async def runtime_execute_search_tools_handler(
             )
             if paths:
                 intent_path_boosts = tpm.fold_path_boosts(paths)
-        except Exception:
-            logger.debug("Tool discovery intent-path lookup failed", exc_info=True)
-            intent_path_boosts = None
+    except Exception:
+        v2_enabled = False
+        usable_providers = None
+        server_idx = None  # degrade to v1
+        intent_path_boosts = None
 
     # A1 suggestion channel (spec §A3... §A1): a query that strongly names an
     # UNCONNECTED provider must not regress below v1 ("no tools matched").
@@ -1084,7 +894,8 @@ async def runtime_execute_search_tools_handler(
     effective_usable_providers = usable_providers
     suggestion_providers: frozenset[str] = frozenset()
     if (
-        usable_providers is not None
+        v2_enabled
+        and usable_providers is not None
         and server_idx
         and not search_request.query.lower().startswith(("select:", "browse_server:"))
     ):
@@ -1107,7 +918,6 @@ async def runtime_execute_search_tools_handler(
             suggestion_providers = frozenset()
             effective_usable_providers = usable_providers  # degrade: no suggestions
 
-    ranking_started = time.monotonic()
     matches, suppressed_mcp = runtime_search_tool_registry_candidates(
         tool_schemas=scoped_tool_schemas,
         query=search_request.query,
@@ -1118,16 +928,13 @@ async def runtime_execute_search_tools_handler(
         server_index=server_idx,
         intent_path_boosts=intent_path_boosts,
     )
-    ranking_ms += (time.monotonic() - ranking_started) * 1000
     if matches:
-        availability_started = time.monotonic()
         matches = await runtime_annotate_tool_availability(matches, entity_id, user_id)
-        availability_ms += (time.monotonic() - availability_started) * 1000
 
     live_schema_by_name: dict[str, dict[str, Any]] = {}
     live_account_ids_by_name: dict[str, tuple[str, ...]] = {}
     live_tool_by_name: dict[str, Any] = {}
-    if live_mcp_schema_loader is not None and "mcp_tool" in requested_kinds:
+    if live_mcp_schema_loader is not None:
         from packages.core.services.official_remote_mcp import (
             OfficialRemoteMCPProvider,
         )
@@ -1150,7 +957,6 @@ async def runtime_execute_search_tools_handler(
             server_index=server_idx,
         )
         if discovery_providers:
-            live_schema_started = time.monotonic()
             try:
                 discovered_by_provider = await live_mcp_schema_loader(
                     discovery_providers
@@ -1161,7 +967,6 @@ async def runtime_execute_search_tools_handler(
                     exc_info=True,
                 )
                 discovered_by_provider = {}
-            live_schema_ms += (time.monotonic() - live_schema_started) * 1000
             if discovered_by_provider:
                 authoritative_providers = set(discovered_by_provider)
                 merged_schemas = [
@@ -1195,7 +1000,6 @@ async def runtime_execute_search_tools_handler(
                     if bound_tools is None
                     else set(bound_tools) | set(live_schema_by_name)
                 )
-                ranking_started = time.monotonic()
                 matches, suppressed_mcp = runtime_search_tool_registry_candidates(
                     tool_schemas=tuple(merged_schemas),
                     query=search_request.query,
@@ -1206,17 +1010,12 @@ async def runtime_execute_search_tools_handler(
                     server_index=server_idx,
                     intent_path_boosts=intent_path_boosts,
                 )
-                ranking_ms += (time.monotonic() - ranking_started) * 1000
                 if matches:
-                    availability_started = time.monotonic()
                     matches = await runtime_annotate_tool_availability(
                         matches,
                         entity_id,
                         user_id,
                     )
-                    availability_ms += (
-                        time.monotonic() - availability_started
-                    ) * 1000
                 for match in matches:
                     name = str(match.get("name") or "")
                     schema = live_schema_by_name.get(name)
@@ -1273,12 +1072,12 @@ async def runtime_execute_search_tools_handler(
     else:
         visible_matches = list(matches)[:search_request.max_results]
 
-    # B1: servers[] summary, grouped over the FINAL (post-slice,
-    # post-slot-rule) matches in match
+    # B1: servers[] summary — only computed when tool_discovery_v2 is on,
+    # grouped over the FINAL (post-slice, post-slot-rule) matches in match
     # order, one entry per provider the first time it's seen. Additive;
     # matches[] itself is untouched.
     servers_summary: list[dict] | None = None
-    if visible_matches:
+    if v2_enabled and visible_matches:
         server_lookup = server_idx or {}
         grouped: dict[str, dict] = {}
         order: list[str] = []
@@ -1305,57 +1104,6 @@ async def runtime_execute_search_tools_handler(
                 grouped[provider]["top_tools"].append(name)
         servers_summary = [grouped[key] for key in order] or None
 
-    if (
-        skill_catalog_loaded
-        and not search_request.query.casefold().startswith("browse_server:")
-    ):
-        skill_ranking_started = time.monotonic()
-        skill_matches = runtime_search_skill_candidates(
-            skills=searchable_skills,
-            query=search_request.query,
-            max_results=search_request.search_pool_size,
-        )
-        skill_search_ms += (time.monotonic() - skill_ranking_started) * 1000
-
-    primary_visible_matches, suggested_overflow = (
-        _runtime_partition_suggestion_overflow(
-            visible_matches,
-            suggestion_providers,
-        )
-    )
-    if skill_matches:
-        primary_visible_matches = [
-            match
-            for match in primary_visible_matches
-            if str(match.get("name") or "") != "invoke_skill"
-        ]
-    visible_matches = runtime_merge_capability_matches(
-        tool_matches=primary_visible_matches,
-        skill_matches=skill_matches,
-        query=search_request.query,
-        max_results=search_request.max_results,
-    )
-    visible_matches.extend(suggested_overflow)
-    companion_matches = runtime_search_companion_skill_candidates(
-        skills=searchable_skills,
-        tool_matches=visible_matches,
-    )
-    visible_skill_by_id = {
-        str(match.get("skill_id") or ""): match
-        for match in visible_matches
-        if match.get("kind") == "skill" and str(match.get("skill_id") or "")
-    }
-    for companion in companion_matches:
-        skill_id = str(companion.get("skill_id") or "")
-        existing = visible_skill_by_id.get(skill_id)
-        if existing is not None:
-            existing["capability_role"] = "companion"
-            existing["companion_for"] = companion["companion_for"]
-            existing["load_before_use"] = True
-            continue
-        visible_matches.append(companion)
-        visible_skill_by_id[skill_id] = companion
-
     payload = runtime_search_tools_payload(
         matches=visible_matches,
         query=search_request.query,
@@ -1366,20 +1114,7 @@ async def runtime_execute_search_tools_handler(
             else len(scoped_available_names | set(live_schema_by_name))
         ),
         servers=servers_summary,
-        total_skill_count=(
-            len(searchable_skills)
-            if skill_catalog_loaded
-            else None
-        ),
     )
-    if skill_discovery_error:
-        payload["skill_discovery_error"] = skill_discovery_error
-    if (
-        any(match.get("kind") == "skill" for match in visible_matches)
-        and "invoke_skill" in available_names
-        and "invoke_skill" not in payload.get("loaded_tools", [])
-    ):
-        payload.setdefault("loaded_tools", []).append("invoke_skill")
     if runtime_envelope is not None:
         from packages.core.ai.runtime.dynamic_mcp import (
             RuntimeDynamicMCPAccountRegistrySnapshotFactory,
@@ -1419,22 +1154,4 @@ async def runtime_execute_search_tools_handler(
             ))
         if grants:
             runtime_envelope.discovered_tool_grants.grant(grants)
-    logger.info(
-        "tool_discovery.performance %s",
-        {
-            "version": "v2",
-            "total_ms": round((time.monotonic() - performance_started) * 1000, 1),
-            "provider_resolution_ms": round(provider_resolution_ms, 1),
-            "ranking_ms": round(ranking_ms, 1),
-            "availability_ms": round(availability_ms, 1),
-            "live_schema_ms": round(live_schema_ms, 1),
-            "skill_search_ms": round(skill_search_ms, 1),
-            "provider_count": len(provider_keys),
-            "static_tool_count": len(scoped_tool_schemas),
-            "live_tool_count": len(live_schema_by_name),
-            "searchable_skill_count": len(searchable_skills),
-            "visible_match_count": len(visible_matches),
-            "loaded_tool_count": len(payload.get("loaded_tools") or ()),
-        },
-    )
     return json.dumps(payload, ensure_ascii=False)

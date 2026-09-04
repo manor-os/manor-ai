@@ -172,28 +172,6 @@ async def test_unknown_tool_rejected_locally():
 # ── App-subscription gating ─────────────────────────────────────────────────
 
 
-async def test_permission_gate_requires_app_subscription(monkeypatch):
-    from packages.core.services import minutes_app
-    from packages.core.services.agent_permission_service import can_use_integration
-
-    async def _subscribed(db, entity_id):
-        return entity_id == "ent-subscribed"
-
-    monkeypatch.setattr(minutes_app, "minutes_app_subscribed", _subscribed)
-
-    allowed = await can_use_integration(
-        None, user_id="u1", entity_id="ent-subscribed",
-        provider="manor_mcp_minutes",
-    )
-    assert allowed.allowed is True
-    assert allowed.scope == "internal"
-
-    denied = await can_use_integration(
-        None, user_id="u1", entity_id="ent-other",
-        provider="manor_mcp_minutes",
-    )
-    assert denied.allowed is False
-    assert "Meeting Minutes app" in denied.reason
 
 
 def test_minutes_app_environment_override(monkeypatch):

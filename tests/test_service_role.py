@@ -139,8 +139,8 @@ async def test_cloud_api_lifespan_starts_ws_redis_relay_per_api_pod(monkeypatch)
 
 
 @pytest.mark.asyncio
-async def test_cloud_chat_lifespan_skips_external_pricing_warmup(monkeypatch):
-    """manor-chat must not fan out non-chat startup warmups per replica."""
+async def test_cloud_chat_lifespan_skips_single_owner_startup_side_effects(monkeypatch):
+    """manor-chat must not fan out API-owned startup work per replica."""
 
     from packages.core.config import get_settings
 
@@ -156,6 +156,7 @@ async def test_cloud_chat_lifespan_skips_external_pricing_warmup(monkeypatch):
             pass
 
     pricing_warmups: list[float] = []
+    startup_writes: list[str] = []
 
     async def fake_load_plans(_db) -> int:
         return 0
@@ -163,6 +164,16 @@ async def test_cloud_chat_lifespan_skips_external_pricing_warmup(monkeypatch):
     async def fake_pricing_sync(*, timeout_s: float):
         pricing_warmups.append(timeout_s)
         return {"count": 0, "path": "/tmp/unused"}
+
+    async def fake_seed_builtin_skills(_db):
+        startup_writes.append("skills")
+
+    async def fake_seed_platform_blueprints(_db):
+        startup_writes.append("blueprints")
+
+    async def fake_seed_known_flags(_db):
+        startup_writes.append("feature_flags")
+        return 0
 
     class FakeSettings:
         DEPLOYMENT_MODE = "cloud"
@@ -187,6 +198,18 @@ async def test_cloud_chat_lifespan_skips_external_pricing_warmup(monkeypatch):
             "packages.core.services.openrouter_pricing_sync.sync_openrouter_pricing_cache",
             fake_pricing_sync,
         )
+        monkeypatch.setattr(
+            "packages.core.services.builtin_skill_loader.seed_builtin_skills",
+            fake_seed_builtin_skills,
+        )
+        monkeypatch.setattr(
+            "packages.core.blueprints.seed.seed_platform_blueprints",
+            fake_seed_platform_blueprints,
+        )
+        monkeypatch.setattr(
+            "packages.core.services.feature_flags.seed_known_flags",
+            fake_seed_known_flags,
+        )
         monkeypatch.setattr(cache_module, "cache", FakeCache())
 
         from apps.api.main import lifespan
@@ -197,6 +220,7 @@ async def test_cloud_chat_lifespan_skips_external_pricing_warmup(monkeypatch):
         get_settings.cache_clear()
 
     assert pricing_warmups == []
+    assert startup_writes == []
 
 
 @pytest.mark.asyncio

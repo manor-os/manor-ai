@@ -54,11 +54,11 @@ class ChatContext:
     allowed_tool_names: set[str] = field(default_factory=set)
     auto_forced_tool_calls: list[dict] = field(default_factory=list)
 
-    # Tool Discovery v2 (A3 intent-path memory): the tool names surfaced in
+    # tool_discovery_v2 (A3 intent-path memory): the tool names surfaced in
     # this turn's cache-first hint (resolve_runtime_chat_context), so the
     # chat-layer tool-exec callback can pass it to
     # agentic_loop._maybe_record_tool_path for hinted-failure recording.
-    # Empty when there is no match or lookup failed.
+    # Empty when the flag is off, no match, or lookup failed.
     hinted_tool_names: set[str] = field(default_factory=set)
 
     extra_context: str | None = None

@@ -133,19 +133,11 @@ async def test_efficiency_metrics_cache_hit_rate_is_none_without_prompt_tokens(d
     assert bucket["cache_hit_rate"] is None
 
 
-def _tool_call_row(
-    *,
-    tool_name: str,
-    source: str,
-    outcome: str,
-    age_days=1,
-    duration_ms: int | None = None,
-):
+def _tool_call_row(*, tool_name: str, source: str, outcome: str, age_days=1):
     from packages.core.models.usage import ToolCallLog
     return ToolCallLog(
         id=generate_ulid(), entity_id=generate_ulid(), tool_name=tool_name,
         source=source, outcome=outcome, success=(outcome != "error"),
-        duration_ms=duration_ms,
         created_at=datetime.now(timezone.utc) - timedelta(days=age_days),
     )
 
@@ -194,42 +186,9 @@ async def test_discovery_health_reports_intent_path_suppression_rate(db_session)
 
 
 @pytest.mark.asyncio
-async def test_discovery_health_reports_search_latency_for_v2(db_session):
-    db_session.add_all([
-        _tool_call_row(
-            tool_name="search_tools",
-            source="chat",
-            outcome="success",
-            duration_ms=100,
-        ),
-        _tool_call_row(
-            tool_name="search_tools",
-            source="chat",
-            outcome="success",
-            duration_ms=200,
-        ),
-        _tool_call_row(
-            tool_name="search_tools",
-            source="chat",
-            outcome="empty_result",
-            duration_ms=300,
-        ),
-    ])
-    await db_session.flush()
-
-    result = await metrics_query.discovery_health(db_session, days=7)
-
-    assert result["discovery_version"] == "v2"
-    assert result["search_avg_duration_ms"] == pytest.approx(200)
-    assert result["search_p95_duration_ms"] == pytest.approx(290)
-
-
-@pytest.mark.asyncio
 async def test_discovery_health_handles_zero_search_calls(db_session):
     result = await metrics_query.discovery_health(db_session, days=7)
     assert result["search_hit_rate"] is None
-    assert result["search_avg_duration_ms"] is None
-    assert result["search_p95_duration_ms"] is None
     assert result["tool_dead_end_rate"] is None
 
 

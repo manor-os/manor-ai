@@ -2,13 +2,16 @@
   "id": "file_engine",
   "name": "File Engine",
   "description": "Create and patch Knowledge files through one generate/read/patch contract.",
-  "version": "1.2.0",
+  "version": "1.0.0",
   "tools": [
     "inspect_file_engine",
     "search_documents",
     "list_documents",
     "read_file",
     "generate_file",
-    "patch_file"
+    "patch_file",
+    "mcp__manor_mcp_file_engine__inspect",
+    "mcp__manor_mcp_file_engine__generate",
+    "mcp__manor_mcp_file_engine__patch"
   ]
 }

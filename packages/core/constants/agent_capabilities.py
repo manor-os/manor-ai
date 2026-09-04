@@ -8,8 +8,3 @@ AGENT_CAPABILITY_SELECTION_LIMIT = 200
 # round. Wider Agents retain the same authorization scope but discover the
 # non-core schemas progressively through ``search_tools``.
 AGENT_EAGER_BOUND_TOOL_LIMIT = 16
-
-# Serialized schema budget for a narrow Agent's eagerly loaded first-party
-# bindings. Count remains a defensive ceiling, while this budget catches a few
-# unusually large schemas before they consume the first model round.
-AGENT_EAGER_BOUND_TOOL_SCHEMA_CHAR_BUDGET = 20_000

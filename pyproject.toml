@@ -58,7 +58,7 @@ dependencies = [
     # Credential vault
     "hvac>=2.0",
     "cryptography>=50.0.0",
-    # JWT token handling for the public authentication service.
+    # JWT signing and verification for the shared OSS authentication flow.
     "PyJWT>=2.10",
     # Workspace memory (frontmatter parsing, wiki-link rendering)
     "PyYAML>=6.0",

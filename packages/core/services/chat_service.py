@@ -56,10 +56,7 @@ from packages.core.ai.runtime.streams import (
     runtime_tool_status_for_chat as tool_status_for_chat,
     runtime_tool_stream_sink_var,
 )
-from packages.core.ai.runtime.provider_approvals import (
-    ProviderApprovalCollector,
-    provider_tool_result_for_persistence,
-)
+from packages.core.ai.runtime.provider_approvals import ProviderApprovalCollector
 from packages.core.services.conversation_messages import (
     ORIGIN_USER_MESSAGE_ID_META_KEY,
     add_message,
@@ -70,8 +67,8 @@ from packages.core.services.conversation_messages import (
     save_or_update_assistant_stream_message,
 )
 from packages.core.services.assistant_blocks import (
+    ASSISTANT_STRUCTURED_RESULT_TOOLS,
     AssistantBlocksBuilder,
-    assistant_tool_uses_structured_result,
     assistant_blocks_stream_payload,
 )
 from packages.core.services.chat_artifacts import chat_attachments_from_tool_results
@@ -349,7 +346,6 @@ async def _publish_chat_stream_snapshot(
 
 
 def _attach_raw_tool_result(tool_events: list[dict], name: str, result: str) -> None:
-    persisted_result = provider_tool_result_for_persistence(name, result)
     for event in reversed(tool_events):
         if (
             isinstance(event, dict)
@@ -357,7 +353,7 @@ def _attach_raw_tool_result(tool_events: list[dict], name: str, result: str) -> 
             and event.get("status") != "pending"
             and "raw_result" not in event
         ):
-            event["raw_result"] = persisted_result
+            event["raw_result"] = result
             return
 
 
@@ -733,7 +729,7 @@ async def stream_chat_response(
                     result=tool_call.get("result"),
                     structured_result=(
                         persisted_result
-                        if assistant_tool_uses_structured_result(name, args)
+                        if name in ASSISTANT_STRUCTURED_RESULT_TOOLS
                         else None
                     ),
                     status=tool_call.get("status"),
@@ -1088,7 +1084,7 @@ async def stream_chat_response(
                 # existing redacted and bounded preview path.
                 structured_result=(
                     result
-                    if assistant_tool_uses_structured_result(name, event_args)
+                    if name in ASSISTANT_STRUCTURED_RESULT_TOOLS
                     else None
                 ),
                 status=status,
@@ -2001,29 +1997,6 @@ async def run_chat_message(
         )
         manual_skill_ids = runtime_manual_skill_ids_from_refs(manual_skill_refs)
 
-        is_cancelled = None
-        voice_origin_message_id = str(
-            (runtime_metadata or {}).get("origin_user_message_id") or ""
-        ).strip()
-        if (
-            (runtime_metadata or {}).get("voice_session_mode") == "chat_gateway"
-            and voice_origin_message_id
-        ):
-            from packages.core.database import async_session as _voice_cancel_session
-            from packages.core.services.voice.work_queue import (
-                voice_work_was_interrupted,
-            )
-
-            async def voice_turn_cancelled() -> bool:
-                async with _voice_cancel_session() as cancel_db:
-                    return await voice_work_was_interrupted(
-                        cancel_db,
-                        message_id=voice_origin_message_id,
-                        conversation_id=conversation_id,
-                    )
-
-            is_cancelled = voice_turn_cancelled
-
         result = await runtime_execute_chat_agent_loop(
             runtime_envelope=ctx.runtime_envelope,
             system_prompt=system_prompt,
@@ -2052,7 +2025,6 @@ async def run_chat_message(
             metadata=resolve_llm_metadata_from_context(ctx),
             forced_tool_calls=runtime_forced_tool_calls_for_turn(ctx, manual_skill_refs, message),
             max_rounds=runtime_turn_max_rounds(ctx),
-            is_cancelled=is_cancelled,
         )
 
         trace.total_usage = result.usage or {}
@@ -2141,7 +2113,7 @@ async def run_chat_message(
                     result=item.get("result"),
                     structured_result=(
                         item.get("raw_result")
-                        if assistant_tool_uses_structured_result(name, args)
+                        if name in ASSISTANT_STRUCTURED_RESULT_TOOLS
                         else None
                     ),
                     status=item.get("status"),

@@ -12,12 +12,17 @@ import re
 from typing import Any
 
 # Toolset for sandbox (bundle) skills — mirrors builtin skills so generated
-# bundles run through the same SKILL.md/sandbox executor.
+# bundles run through the same SKILL.md/sandbox executor (progressive
+# disclosure via sandbox_read_file, standalone scripts via sandbox_exec).
 SANDBOX_SKILL_TOOLS = [
     "invoke_skill",
     "search_tools",
     "generate_file",
-    "sandbox",
+    "sandbox_exec",
+    "sandbox_read_file",
+    "sandbox_write_file",
+    "sandbox_save_result",
+    "sandbox_destroy",
 ]
 
 

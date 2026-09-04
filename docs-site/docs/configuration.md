@@ -82,10 +82,8 @@ The shared speech path uses local speech detection to reduce background noise.
 Suspected speech temporarily pauses playback; recognized words confirm an interruption.
 An empty transcript resumes the paused audio, and completed replies stay visible
 in the call panel even when their audio is interrupted.
-The call panel shows microphone level and provides a
-**Test speaker** tone that does not send audio to a provider. If a call is silent,
-check the input meter, speaker test, browser output device and volume, then check
-the server's gateway connectivity.
+The call panel shows microphone level. If a call is silent, check the input
+meter, browser output device and volume, then check the server's gateway connectivity.
 
 Hanging up stops capture, cancels request preparation, and prevents new retries.
 A speech gateway request already submitted may finish and have its usage recorded after the call ends.

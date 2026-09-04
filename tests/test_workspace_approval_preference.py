@@ -43,9 +43,8 @@ class _SessionContext:
 
 _CREATE_ARGS = {
     "name": "hourly X post runner health check",
-    "schedule_kind": "cron",
-    "cron_expr": "0 * * * *",
-    "payload_message": "Check the runner is healthy.",
+    "cron": "0 * * * *",
+    "prompt": "Check the runner is healthy.",
 }
 
 

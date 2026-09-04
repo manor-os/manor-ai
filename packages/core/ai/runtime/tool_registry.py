@@ -32,34 +32,12 @@ def runtime_tool_schema(name: str) -> dict | None:
     return runtime_ensure_tool_registry_initialized().get_schema(name)
 
 
-async def runtime_tool_schema_for_actor(
-    name: str,
-    *,
-    entity_id: str,
-    user_id: str,
-) -> dict | None:
-    """Return the current static or actor-scoped dynamic schema for execution."""
-
-    return await runtime_ensure_tool_registry_initialized().get_schema_for_actor(
-        name,
-        entity_id=entity_id,
-        user_id=user_id,
-    )
-
-
 def runtime_tool_schemas_for_names(names: Iterable[str]) -> list[dict]:
     return runtime_ensure_tool_registry_initialized().get_schemas_for_names(names)
 
 
-def runtime_registered_tool_names(
-    *,
-    prefix: str | None = None,
-    include_undiscoverable: bool = False,
-) -> tuple[str, ...]:
-    return runtime_ensure_tool_registry_initialized().registered_tool_names(
-        prefix=prefix,
-        include_undiscoverable=include_undiscoverable,
-    )
+def runtime_registered_tool_names(*, prefix: str | None = None) -> tuple[str, ...]:
+    return runtime_ensure_tool_registry_initialized().registered_tool_names(prefix=prefix)
 
 
 def runtime_registered_tool_schemas() -> tuple[tuple[str, dict], ...]:

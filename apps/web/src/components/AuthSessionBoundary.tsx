@@ -2,8 +2,7 @@ import { useEffect, useRef } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { useAuthStore } from "../stores/auth";
 import { useChatStreamStore } from "../stores/chatStream";
-import { resetKnowledgeUploadsForAuthChange } from "../stores/knowledgeUploads";
-import { authPrincipalKey, decodeAuthTokenClaims, isSameAuthIdentity } from "../lib/authToken";
+import { decodeAuthTokenClaims, isSameAuthIdentity } from "../lib/authToken";
 
 const PENDING_CHAT_RETRY_KEY = "manor_pending_chat_retry";
 const ACTIVE_SESSION_RENEW_INTERVAL_MS = 5 * 60 * 1000;
@@ -17,12 +16,6 @@ export default function AuthSessionBoundary() {
   const lastRenewedAtRef = useRef(Date.now());
 
   useEffect(() => {
-    if (
-      previousTokenRef.current !== undefined
-      && authPrincipalKey(previousTokenRef.current) !== authPrincipalKey(token)
-    ) {
-      resetKnowledgeUploadsForAuthChange();
-    }
     if (
       previousTokenRef.current !== undefined &&
       previousTokenRef.current !== token &&

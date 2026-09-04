@@ -14,7 +14,6 @@ import re
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Awaitable, Callable, Dict, List
 from urllib.parse import quote
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from packages.core.ai.mcp._http import mcp_err
 from packages.core.ai.mcp._market_data import (
@@ -226,14 +225,6 @@ def _rfc3339_utc(value: datetime) -> str:
     return value.astimezone(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
-def _user_timezone(arguments: Dict[str, Any]) -> ZoneInfo:
-    name = _optional_text(arguments, "timezone", max_length=64) or "UTC"
-    try:
-        return ZoneInfo(name)
-    except ZoneInfoNotFoundError as exc:
-        raise MarketDataError("timezone must be a valid IANA timezone.") from exc
-
-
 async def _get_bars(client: MarketDataClient, arguments: Dict[str, Any]) -> Any:
     symbol = _symbol(arguments)
     feed = _feed(arguments)
@@ -307,13 +298,10 @@ async def _get_news(client: MarketDataClient, arguments: Dict[str, Any]) -> Any:
         lookback_hours = _bounded_int(arguments, "lookback_hours", 24, 1, 168)
         if start is not None or end is not None:
             raise MarketDataError("lookback_hours cannot be combined with start or end.")
-    user_timezone = _user_timezone(arguments)
     observed_at = _utc_now()
-    window_start = None
     if lookback_hours is not None:
         end = _rfc3339_utc(observed_at)
-        window_start = observed_at - timedelta(hours=lookback_hours)
-        start = _rfc3339_utc(window_start)
+        start = _rfc3339_utc(observed_at - timedelta(hours=lookback_hours))
     params = {
         "symbols": ",".join(symbols) if symbols else None,
         "start": start,
@@ -325,19 +313,9 @@ async def _get_news(client: MarketDataClient, arguments: Dict[str, Any]) -> Any:
     data = await client.get("/v1beta1/news", params=params)
     result = _with_provenance(data)
     result["observed_at"] = _rfc3339_utc(observed_at)
-    result["observed_at_local"] = observed_at.astimezone(user_timezone).isoformat(
-        timespec="seconds"
-    )
-    result["timezone"] = user_timezone.key
     result["request_window"] = {"start": start, "end": end}
     if lookback_hours is not None:
         result["request_window"]["lookback_hours"] = lookback_hours
-        result["request_window"]["local_start"] = window_start.astimezone(
-            user_timezone
-        ).isoformat(timespec="seconds")
-        result["request_window"]["local_end"] = observed_at.astimezone(
-            user_timezone
-        ).isoformat(timespec="seconds")
     return result
 
 
@@ -486,14 +464,6 @@ _TOOLS: Dict[str, Dict[str, Any]] = {
                 "description": (
                     "Closed lookback window ending at the adapter's current UTC request time; "
                     "cannot be combined with start or end. Use 24 for latest news."
-                ),
-            },
-            "timezone": {
-                "type": "string",
-                "maxLength": 64,
-                "description": (
-                    "Current user's IANA timezone, for example America/Los_Angeles. "
-                    "The provider request stays UTC; returned metadata includes local times."
                 ),
             },
             "limit": {"type": "integer", "minimum": 1, "maximum": 50},

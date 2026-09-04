@@ -24,10 +24,9 @@
   "ledger_contracts": [
     "manor.relationship_ledger/v1"
   ],
-  "capability_companion": {
-    "tool_names": [
-      "read_relationship_ledger",
-      "record_relationship_ledger"
-    ]
+  "invocation_policy": {
+    "mode": "required_before_answer",
+    "semantic_trigger": "the active Workspace has the Relationship Ledger installed and the request requires reading, querying, changing, reconciling, or relying on CRM-style relationship data such as people, organizations, contacts, leads, customers, partners, vendors, investors, outreach, replies, follow-ups, meetings, consent, bounce, unsubscribe, do-not-contact, or duplicate identity state, regardless of language",
+    "result_authority": "primary_source"
   }
 }

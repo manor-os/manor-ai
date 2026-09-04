@@ -511,21 +511,6 @@ async def handle_inbound_message(
         or payload.get("external_id")
     )
 
-    raw_attachments = payload.get("attachments")
-    logged_attachments = None
-    if isinstance(raw_attachments, list) and raw_attachments:
-        logged_attachments = {
-            "items": [
-                {
-                    key: value
-                    for key, value in item.items()
-                    if key not in {"data_base64", "content_base64"}
-                }
-                for item in raw_attachments
-                if isinstance(item, dict)
-            ]
-        }
-
     log_entry = MessageLog(
         id=generate_ulid(),
         entity_id=entity_id,
@@ -538,7 +523,6 @@ async def handle_inbound_message(
         subject=subject,
         content=content,
         html_content=payload.get("html_content"),
-        attachments=logged_attachments,
         external_id=external_id,
         status="received",
     )

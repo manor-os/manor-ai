@@ -3317,29 +3317,6 @@ async def chat_message(
     except ValueError as exc:
         raise HTTPException(409, str(exc)) from exc
 
-    voice_origin_user_message: Message | None = None
-    voice_origin_message_id = (
-        getattr(request.state, "voice_origin_message_id", None)
-        if getattr(request.state, "voice_session_mode", None) == "chat_gateway"
-        else None
-    )
-    if voice_origin_message_id:
-        from packages.core.services.voice.work_queue import (
-            validate_voice_origin_message,
-        )
-
-        candidate = await db.scalar(
-            select(Message).where(Message.id == str(voice_origin_message_id))
-        )
-        try:
-            voice_origin_user_message = validate_voice_origin_message(
-                candidate,
-                conversation_id=conv.id,
-                content=llm_base_message,
-            )
-        except RuntimeError as exc:
-            raise HTTPException(409, str(exc)) from exc
-
     if _is_runtime_approval_rejected_message(llm_base_message):
         assistant_msg = await add_message(db, conv.id, role="assistant", content=_RUNTIME_APPROVAL_REJECTED_REPLY)
         await db.commit()
@@ -3373,7 +3350,7 @@ async def chat_message(
         await require_plan("ai_budget_usd")(user=user, db=db)
 
     if replacement and _is_workflow_approval_resolution(approval_runtime_metadata):
-        if save_user_message and voice_origin_user_message is None:
+        if save_user_message:
             await add_message(
                 db,
                 conv.id,
@@ -3448,19 +3425,18 @@ async def chat_message(
         )
 
     # Save user message
-    origin_user_message = voice_origin_user_message
+    origin_user_message = None
     if save_user_message:
         saved_text = approval_saved_text or saved_user_base
         if not approval_saved_text:
             saved_text = runtime_saved_message_with_file_references(saved_text, attachments)
         # Attribute the message to its author so workspace chat can tell who
         # sent it (see /chat/stream above for the full rationale).
-        if origin_user_message is None:
-            origin_user_message = await add_message(
-                db, conv.id, role="user", content=saved_text,
-                attachments=attachments.attachment_refs or None,
-                meta={"author_user_id": user.id},
-            )
+        origin_user_message = await add_message(
+            db, conv.id, role="user", content=saved_text,
+            attachments=attachments.attachment_refs or None,
+            meta={"author_user_id": user.id},
+        )
     await db.commit()
 
     # Run agentic loop

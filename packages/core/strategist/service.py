@@ -3249,11 +3249,6 @@ async def _persist_tasks(
             expected_output=_task_expected_output_from_proposed(pt),
             creator_id=None,
         )
-        from packages.core.ai.runtime.task_requirements import (
-            apply_workspace_service_task_requirements,
-        )
-
-        apply_workspace_service_task_requirements(row, workspace)
         db.add(row)
         ids.append(row.id)
         rows_by_key[task_key] = row

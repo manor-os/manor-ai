@@ -47,7 +47,7 @@ _KNOWN_INTEGRATION_SERVER_KEYS = frozenset({
     "wechat_personal", "telegram", "replicate", "elevenlabs", "tavily", "jimeng",
     "claude_code", "codex_cli", "gemini_cli", "cursor_cli", "aider", "continue_cli",
     "producthunt", "facebook", "chrome", "chrome_knowledge_local", "knowledge_local",
-    "youtube", "tiktok", "shopify", "woocommerce", "square",
+    "local_browser", "youtube", "tiktok", "shopify", "woocommerce", "square",
     "tiktok_shop", "amazon",
 })
 

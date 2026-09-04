@@ -28,18 +28,6 @@ _VOICE_AND_EDITOR_PROFILES = (
 )
 _ALL_RUNTIME_PROFILES = _INTERNAL_PROFILES + _CUSTOMER_SAFE_PROFILES + _VOICE_AND_EDITOR_PROFILES
 
-_TOOL_CAPABILITY_ALIAS_TARGETS = {
-    "sandbox_create": "sandbox",
-    "sandbox_exec": "sandbox",
-    "sandbox_status": "sandbox",
-    "sandbox_respond": "sandbox",
-    "sandbox_cancel": "sandbox",
-    "sandbox_read_file": "sandbox",
-    "sandbox_write_file": "sandbox",
-    "sandbox_save_result": "sandbox",
-    "sandbox_destroy": "sandbox",
-}
-
 
 @dataclass(frozen=True)
 class BusinessCapability:
@@ -289,7 +277,7 @@ CORE_CAPABILITIES: dict[str, BusinessCapability] = {
         id="file.write",
         name="File write",
         description="Create, edit, or generate workspace files.",
-        tool_names=("generate_file", "patch_file"),
+        tool_names=("write_file", "edit_file", "patch_file", "generate_file"),
         profiles=(
             RuntimeProfile.OWNER_COPILOT,
             RuntimeProfile.AGENT_DELEGATE,
@@ -306,7 +294,12 @@ CORE_CAPABILITIES: dict[str, BusinessCapability] = {
         name="Sandbox execution",
         description="Run isolated sandbox commands and exchange sandbox files.",
         tool_names=(
-            "sandbox",
+            "sandbox_create",
+            "sandbox_exec",
+            "sandbox_read_file",
+            "sandbox_write_file",
+            "sandbox_save_result",
+            "sandbox_destroy",
             "video_edit",
             "coding_based_video",
         ),
@@ -457,27 +450,10 @@ CORE_CAPABILITIES: dict[str, BusinessCapability] = {
     "file.patch": BusinessCapability(
         id="file.patch",
         name="File patch proposal",
-        description="Inspect the current file context and its native file-engine operations.",
-        tool_names=(
-            "read_file",
-            "list_files",
-            "glob_files",
-            "grep_files",
-            "inspect_file_engine",
-        ),
+        description="Inspect the current file context and propose a UI-confirmed patch.",
+        tool_names=("read_file", "list_files", "glob_files", "grep_files"),
         profiles=(RuntimeProfile.FILE_EDITOR_PATCH,),
         risk_level="safe",
-    ),
-    "file.editor_write": BusinessCapability(
-        id="file.editor_write",
-        name="File editor write",
-        description=(
-            "Apply an approval-gated native patch to the exact file mounted by the active editor."
-        ),
-        tool_names=("patch_file",),
-        profiles=(RuntimeProfile.FILE_EDITOR_PATCH,),
-        risk_level="write",
-        required_approval=True,
     ),
 }
 
@@ -498,15 +474,11 @@ def capabilities_for_tool_names(
     *,
     profile: RuntimeProfile | None = None,
 ) -> list[BusinessCapability]:
-    canonical_names = {
-        _TOOL_CAPABILITY_ALIAS_TARGETS.get(name, name)
-        for name in tool_names
-    }
     matches: list[BusinessCapability] = []
     for capability in CORE_CAPABILITIES.values():
         if profile is not None and capability.profiles and profile not in capability.profiles:
             continue
-        if canonical_names.intersection(capability.tool_names):
+        if tool_names.intersection(capability.tool_names):
             matches.append(capability)
     return matches
 
@@ -540,12 +512,7 @@ def classified_tool_names_for_profile(
 ) -> set[str]:
     names: set[str] = set()
     for capability in capabilities_for_tool_names(tool_names, profile=profile):
-        names.update(
-            name
-            for name in tool_names
-            if _TOOL_CAPABILITY_ALIAS_TARGETS.get(name, name)
-            in capability.tool_names
-        )
+        names.update(name for name in capability.tool_names if name in tool_names)
     return names
 
 

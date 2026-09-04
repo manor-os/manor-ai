@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import logging
 from decimal import Decimal
+from urllib.parse import quote
 from typing import Any, Optional
 
 from sqlalchemy import select
@@ -29,13 +30,7 @@ from packages.core.services.chat_feedback import (
     ChatFeedbackTargetKind,
     lock_completion_feedback_subject,
 )
-from packages.core.services.generated_file_refs import (
-    ArtifactReferenceFactory,
-    canonical_document_id,
-    dedupe_generated_file_refs,
-    entity_fs_open_url,
-    generated_file_ref_url_keys,
-)
+from packages.core.services.generated_file_refs import canonical_document_id
 from packages.core.workspace_chat import service as chat
 
 logger = logging.getLogger(__name__)
@@ -527,12 +522,27 @@ def summarize_result_for_chat(result: Any, *, max_chars: int = 1200) -> Optional
     return _clip_text(_strip_boilerplate_completion_headings(text), max_chars)
 
 
+def _artifact_identity(kind: Any, value: Any) -> str:
+    """What makes two artifacts the same file.
+
+    One step result names the same file several ways — `fs_path`, `path`,
+    a leading slash, a workspace prefix — and comparing the raw strings let
+    every spelling through as a separate line. Paths compare by their
+    normalised form so the duplicates collapse.
+    """
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    if str(kind or "") != "file":
+        return text
+    return text.replace("\\", "/").lstrip("/").rstrip("/").casefold()
+
+
 def extract_artifacts_for_chat(result: Any) -> list[dict]:
     """Return user-visible files/URLs produced by a step result."""
     artifacts: list[dict] = []
-    factory = ArtifactReferenceFactory()
 
-    def add(kind: str, value: Any, *, name: Optional[str] = None, fs_path: str = "") -> None:
+    def add(kind: str, value: Any, *, name: Optional[str] = None) -> None:
         if not isinstance(value, str):
             return
         value = value.strip()
@@ -540,10 +550,11 @@ def extract_artifacts_for_chat(result: Any) -> list[dict]:
             return
         if kind == "document" and not canonical_document_id(value):
             return
-        artifact = {"kind": kind, "value": value, "name": name}
-        if kind == "document" and fs_path:
-            artifact["fs_path"] = fs_path
-        artifacts.append(artifact)
+        key = (kind, _artifact_identity(kind, value))
+        if any((a.get("kind"), _artifact_identity(a.get("kind"), a.get("value"))) == key
+               for a in artifacts):
+            return
+        artifacts.append({"kind": kind, "value": value, "name": name})
 
     def walk(obj: Any) -> None:
         if not isinstance(obj, dict):
@@ -563,40 +574,33 @@ def extract_artifacts_for_chat(result: Any) -> list[dict]:
                 return None
             return location.replace("\\", "/").rstrip("/").rsplit("/", 1)[-1]
 
-        identity = factory.inspect(obj)
-        path_identity = factory.inspect({
-            key: obj.get(key) for key in ("fs_path", "path", "file_path", "output_path")
-        })
         doc = obj.get("document")
         if isinstance(doc, dict):
-            child = {**doc, "document_id": doc.get("document_id") or doc.get("id")}
-            child_identity = factory.inspect(child)
-            if (
-                child_identity.document_id
-                and not child_identity.fs_path
-                and path_identity.fs_path
-                and identity.document_id in {"", child_identity.document_id}
-            ):
-                # The nested Document describes this parent's materialized file;
-                # retain that explicit association, not a filename heuristic.
-                child["fs_path"] = path_identity.fs_path
-            walk(child)
+            doc_name = label_for(doc)
+            if canonical_document_id(doc.get("id")):
+                add("document", doc.get("id"), name=doc_name)
+            else:
+                add("file", doc.get("fs_path") or doc.get("path") or doc_name, name=doc_name)
+                add("url", doc.get("file_url") or doc.get("url"), name=doc_name)
 
+        document_id = canonical_document_id(obj.get("document_id"))
         object_name = label_for(obj)
-        if identity.document_id:
-            add("document", identity.document_id, name=object_name, fs_path=identity.fs_path)
-        elif path_identity.fs_path:
-            # Address fields on one file record are alternatives, not outputs.
-            # The shared factory selects fs_path before relative path aliases.
-            add("file", path_identity.fs_path, name=object_name)
+        if document_id:
+            # A Document is the canonical user-facing handle. Do not also
+            # render its filesystem provenance as a second, raw-path artifact.
+            add("document", document_id, name=object_name)
 
-        reference_url_keys = generated_file_ref_url_keys(obj)
         for key, kind in (
-            ("open_url", "url"),
-            ("openUrl", "url"),
-            ("viewer_url", "url"),
-            ("previewUrl", "url"),
-            ("preview_url", "url"),
+            ("fs_path", "file"),
+            ("path", "file"),
+            ("file_path", "file"),
+            ("output_path", "file"),
+            # ("name", "file") used to be here. A name is not a location:
+            # it produced a second "file" artifact for every file that also
+            # had a path, so the same MP4 was listed twice — once as
+            # `final/two_minute_rule.mp4` and once as `two_minute_rule.mp4`
+            # — and the bare one could never be opened. The name still rides
+            # along as the label of the real entry below.
             ("file_url", "url"),
             ("document_url", "url"),
             ("image_url", "url"),
@@ -605,12 +609,7 @@ def extract_artifacts_for_chat(result: Any) -> list[dict]:
             ("url", "url"),
             ("job_id", "job"),
         ):
-            if key in {"previewUrl", "preview_url"} and key not in reference_url_keys:
-                continue
-            if kind == "url" and (
-                identity.document_id
-                or (path_identity.fs_path and key not in {"image_url", "video_url"})
-            ):
+            if document_id and kind in {"file", "url"}:
                 continue
             add(kind, obj.get(key), name=object_name)
 
@@ -629,7 +628,19 @@ def extract_artifacts_for_chat(result: Any) -> list[dict]:
 
     parsed = _parse_json_if_string(result)
     walk(parsed)
-    return _unique_artifacts(artifacts)[:8]
+    document_names = {
+        str(artifact.get("name") or "").strip().casefold()
+        for artifact in artifacts
+        if artifact.get("kind") == "document" and artifact.get("name")
+    }
+    canonical = [
+        artifact
+        for artifact in artifacts
+        if artifact.get("kind") == "document"
+        or not artifact.get("name")
+        or str(artifact.get("name") or "").strip().casefold() not in document_names
+    ]
+    return canonical[:8]
 
 
 def _render_plan_completion_summary(
@@ -706,7 +717,6 @@ def _render_step_completion_summary(
     entity_id: str = "",
 ) -> str:
     lines = [f"✅ **Completed: {label}**{agent_part}{time_part}"]
-    artifacts = _unique_artifacts(artifacts)
 
     clean_summary = _clip_text(_as_text(summary), max_summary_chars)
     if clean_summary:
@@ -814,7 +824,8 @@ def _format_artifact(artifact: dict, *, entity_id: str = "") -> str:
     elif kind == "url":
         href = value
     elif kind == "file" and entity_id:
-        href = entity_fs_open_url(entity_id, value)
+        path = value.replace("\\", "/").lstrip("/")
+        href = f"/api/v1/fs/{entity_id}/{quote(path)}"
 
     if href:
         return f"{kind.title()}: [{name}]({href})"
@@ -829,8 +840,10 @@ def _artifacts_as_attachments(
     entity_id: str = "",
 ) -> list[dict]:
     """Persist produced files as the same structured chat contract used by direct turns."""
-    attachments: list[dict] = []
-    for artifact in _unique_artifacts(artifacts or []):
+    by_name: dict[str, dict] = {}
+    for artifact in artifacts or []:
+        if not isinstance(artifact, dict):
+            continue
         kind = _as_text(artifact.get("kind")) or "output"
         value = _as_text(artifact.get("value"))
         if not value or kind not in {"file", "document", "url"}:
@@ -842,64 +855,36 @@ def _artifacts_as_attachments(
             or value.replace("\\", "/").rstrip("/").rsplit("/", 1)[-1]
             or value
         )
-        attachment = {"name": name, "type": "knowledge"}
+        key = name.casefold()
+        attachment = by_name.setdefault(key, {"name": name, "type": "knowledge"})
         if "." in name:
             attachment.setdefault("fileType", name.rsplit(".", 1)[-1].lower()[:20])
         if kind == "document":
             attachment["document_id"] = value
-            attachment["openUrl"] = f"/viewer/{value}"
         elif kind == "url":
-            attachment["previewUrl"] = value
-            attachment["openUrl"] = value
-        path = value if kind == "file" else _as_text(artifact.get("fs_path"))
-        if path:
-            attachment["fsPath"] = path
-            if address := entity_fs_open_url(entity_id, path):
-                attachment["previewUrl"] = address
-                attachment.setdefault("openUrl", address)
-        attachments.append(attachment)
-    return attachments[:8]
+            attachment.setdefault("previewUrl", value)
+        elif entity_id:
+            path = value.replace("\\", "/").lstrip("/")
+            attachment.setdefault(
+                "previewUrl",
+                f"/api/v1/fs/{entity_id}/{quote(path)}",
+            )
+    return list(by_name.values())[:8]
 
 
 def _unique_artifacts(artifacts: Any) -> list[dict]:
-    """Use the same durable identities for step, plan, and attachment views."""
-    refs: list[dict] = []
+    out: list[dict] = []
+    seen: set[tuple[str, str]] = set()
     for artifact in artifacts:
-        if not isinstance(artifact, dict):
-            continue
         kind = _as_text(artifact.get("kind")) or "output"
         value = _as_text(artifact.get("value"))
         if not value:
             continue
-        ref = {**artifact, "kind": kind, "value": value}
-        if kind == "document":
-            if not canonical_document_id(value):
-                continue
-            ref["document_id"] = value
-        elif kind == "file":
-            ref["fs_path"] = value
-        elif kind == "url":
-            ref["url"] = value
-        refs.append(ref)
-
-    out: list[dict] = []
-    seen: set[tuple[str, str]] = set()
-    factory = ArtifactReferenceFactory()
-    for ref in dedupe_generated_file_refs(refs):
-        identity = factory.inspect(ref)
-        kind, value = ref["kind"], ref["value"]
-        if identity.document_id:
-            kind, value = "document", identity.document_id
-        elif identity.fs_path and kind == "file":
-            kind, value = "file", identity.fs_path
         key = (kind, value)
         if key in seen:
             continue
         seen.add(key)
-        artifact = {"kind": kind, "value": value, "name": _as_text(ref.get("name"))}
-        if kind == "document" and identity.fs_path:
-            artifact["fs_path"] = identity.fs_path
-        out.append(artifact)
+        out.append({"kind": kind, "value": value, "name": _as_text(artifact.get("name"))})
     return out
 
 
@@ -998,7 +983,7 @@ def _render_step(s: dict, icons: dict, indent: str = "", *, entity_id: str = "")
         preview = _clip_text(s["result_summary"], 600)
         line += f"\n{indent}  ↳ {preview}"
 
-    artifacts = _unique_artifacts(s.get("artifacts") or [])
+    artifacts = s.get("artifacts") or []
     if status == "done" and artifacts:
         for artifact in artifacts[:3]:
             if isinstance(artifact, dict):

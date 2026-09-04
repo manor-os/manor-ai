@@ -130,21 +130,9 @@ export default function BlueprintUpgradeDialog({
   };
 
   const invalidate = () => {
-    // These projections have independent query keys; refreshing the Workspace
-    // alone leaves Channel bindings and setup/Agent configuration stale.
-    return Promise.all([
-      queryClient.invalidateQueries({ queryKey: ["workspaces"] }),
-      queryClient.invalidateQueries({ queryKey: ["entity-agents-for-mapping"] }),
-      queryClient.invalidateQueries({ queryKey: ["agents"] }),
-      queryClient.invalidateQueries({ queryKey: ["skills"] }),
-      queryClient.invalidateQueries({ queryKey: ["workflows"] }),
-      ...[
-        "workspace", "blueprint-upgrade-plan", "workspace-channels",
-        "workspace-available-channels", "workspace-agents", "workspace-setup-status",
-        "workspace-capabilities", "workspace-operating-model", "workspace-dashboard",
-        "workspace-documents", "workflow-bindings", "workspace-automation-bindings-summary",
-      ].map((key) => queryClient.invalidateQueries({ queryKey: [key, workspaceId] })),
-    ]);
+    queryClient.invalidateQueries({ queryKey: ["workspaces"] });
+    queryClient.invalidateQueries({ queryKey: ["workspace", workspaceId] });
+    queryClient.invalidateQueries({ queryKey: ["blueprint-upgrade-plan", workspaceId] });
   };
 
   const applyMutation = useMutation({
@@ -176,7 +164,7 @@ export default function BlueprintUpgradeDialog({
       }
       return result;
     },
-    onSuccess: async (result) => {
+    onSuccess: (result) => {
       setApplied({
         updated: result.updated.length,
         kept: result.kept_yours.length,
@@ -184,7 +172,7 @@ export default function BlueprintUpgradeDialog({
         versionOnly: result.updated.length === 0 && result.kept_yours.length === 0,
         partial: !result.fully_synchronized,
       });
-      await invalidate();
+      invalidate();
     },
     onError: () => {
       queryClient.invalidateQueries({ queryKey: ["blueprint-upgrade-plan", workspaceId] });
@@ -193,9 +181,9 @@ export default function BlueprintUpgradeDialog({
 
   const revertMutation = useMutation({
     mutationFn: () => api.workspaces.revertBlueprintUpgrade(workspaceId),
-    onSuccess: async () => {
+    onSuccess: () => {
       setApplied(null);
-      await invalidate();
+      invalidate();
       onClose();
     },
   });
@@ -260,23 +248,6 @@ export default function BlueprintUpgradeDialog({
     !hasBlockingSetupRequirement &&
     (selectedUpdateCount > 0 || keepYoursOnlySync || versionOnlySync);
   const busy = applyMutation.isPending || revertMutation.isPending;
-  const canRevert = applied?.canRevert ?? plan?.can_revert ?? false;
-  const revertButton = canRevert ? (
-    <button
-      onClick={() => revertMutation.mutate()}
-      disabled={busy}
-      style={secondaryButton}
-    >
-      {t("page.blueprints.upgrade_revert")}
-    </button>
-  ) : null;
-  const revertError = revertMutation.isError ? (
-    <p role="alert" style={{ fontSize: 12, color: "var(--danger, #b42318)", lineHeight: 1.55, margin: 0 }}>
-      {revertMutation.error instanceof Error && revertMutation.error.message
-        ? revertMutation.error.message
-        : t("page.blueprints.upgrade_plan_changed")}
-    </p>
-  ) : null;
 
   useEffect(() => {
     if (!open) return;
@@ -333,9 +304,23 @@ export default function BlueprintUpgradeDialog({
               {t("page.blueprints.upgrade_partial_done")}
             </p>
           )}
-          {revertError}
+          {revertMutation.isError && (
+            <p role="alert" style={{ fontSize: 12, color: "#b42318", lineHeight: 1.55, margin: 0 }}>
+              {revertMutation.error instanceof Error && revertMutation.error.message
+                ? revertMutation.error.message
+                : t("page.blueprints.upgrade_plan_changed")}
+            </p>
+          )}
           <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
-            {revertButton}
+            {applied.canRevert && (
+              <button
+                onClick={() => revertMutation.mutate()}
+                disabled={busy}
+                style={secondaryButton}
+              >
+                {t("page.blueprints.upgrade_revert")}
+              </button>
+            )}
             <button onClick={onClose} disabled={busy} style={primaryButton}>
               {t("action.done")}
             </button>
@@ -601,12 +586,10 @@ export default function BlueprintUpgradeDialog({
             </p>
           )}
 
-          {revertError}
-          <div style={{ display: "flex", flexWrap: "wrap", gap: 8, justifyContent: "flex-end" }}>
+          <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
             <button onClick={onClose} disabled={busy} style={secondaryButton}>
               {t("action.cancel")}
             </button>
-            {revertButton}
             <button
               onClick={() => applyMutation.mutate()}
               disabled={busy || !canApply || !hasCurrentPlan}

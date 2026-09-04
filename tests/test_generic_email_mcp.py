@@ -12,11 +12,7 @@ from email.message import EmailMessage
 import pytest
 
 from packages.core.ai.mcp import email as email_mcp
-from packages.core.ai.runtime.approval_classifier import (
-    classify_runtime_tool,
-    classify_runtime_tool_action,
-)
-from packages.core.ai.runtime.tool_effect_classification import RuntimeToolEffect
+from packages.core.ai.runtime.approval_classifier import classify_runtime_tool_action
 
 
 def _message_bytes(*, with_attachment: bool = False) -> bytes:
@@ -167,7 +163,6 @@ def test_tool_catalog_exposes_full_generic_email_actions():
     assert {
         "list_attachments",
         "download_attachment",
-        "save_attachment_to_workspace",
         "list_threads",
         "get_thread",
         "reply_to_message",
@@ -260,111 +255,6 @@ async def test_send_email_accepts_base64_attachments(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_send_email_accepts_authorized_workspace_document(monkeypatch):
-    from packages.core.services import email_attachments as attachment_service
-
-    _FakeSmtp.sent.clear()
-    monkeypatch.setattr(email_mcp.smtplib, "SMTP", _FakeSmtp)
-    captured = {}
-
-    async def load_attachment(**kwargs):
-        captured.update(kwargs)
-        return {
-            "filename": "workspace-report.csv",
-            "content_type": "text/csv",
-            "data_base64": base64.b64encode(b"a,b\n3,4\n").decode("ascii"),
-        }
-
-    monkeypatch.setattr(
-        attachment_service,
-        "load_workspace_document_email_attachment",
-        load_attachment,
-    )
-    email_mcp.set_call_context({
-        "entity_id": "entity-1",
-        "workspace_id": "workspace-1",
-        "user_id": "user-1",
-    })
-    try:
-        result = await email_mcp.call_tool(
-            "send_email",
-            {
-                "to": "alice@example.com",
-                "subject": "Workspace file",
-                "body": "Attached.",
-                "attachments": [{"document_id": "document-1"}],
-            },
-            json.dumps(_credentials()),
-        )
-    finally:
-        email_mcp.clear_call_context()
-
-    assert result["isError"] is False
-    assert captured == {
-        "entity_id": "entity-1",
-        "user_id": "user-1",
-        "workspace_id": "workspace-1",
-        "document_id": "document-1",
-        "filename": None,
-    }
-    sent_attachment = list(_FakeSmtp.sent[-1][0].iter_attachments())[0]
-    assert sent_attachment.get_filename() == "workspace-report.csv"
-    assert sent_attachment.get_payload(decode=True) == b"a,b\n3,4\n"
-
-
-@pytest.mark.asyncio
-async def test_save_attachment_projects_to_current_workspace(monkeypatch):
-    from packages.core.services import email_attachments as attachment_service
-
-    monkeypatch.setattr(
-        email_mcp,
-        "_imap_connect",
-        lambda cfg: _FakeImap(_message_bytes(with_attachment=True)),
-    )
-    captured = {}
-
-    async def persist_attachment(**kwargs):
-        captured.update(kwargs)
-        return {
-            "saved": True,
-            "filename": kwargs["filename"],
-            "document_id": "document-1",
-            "viewer_url": "/viewer/document-1",
-            "text_content": "attachment bytes",
-        }
-
-    monkeypatch.setattr(
-        attachment_service,
-        "persist_workspace_email_attachment",
-        persist_attachment,
-    )
-    email_mcp.set_call_context({
-        "entity_id": "entity-1",
-        "workspace_id": "workspace-1",
-        "user_id": "user-1",
-        "conversation_id": "conversation-1",
-    })
-    try:
-        result = await email_mcp.call_tool(
-            "save_attachment_to_workspace",
-            {"uid": "7", "folder": "INBOX", "attachment_id": "4"},
-            json.dumps(_credentials()),
-        )
-    finally:
-        email_mcp.clear_call_context()
-
-    assert result["isError"] is False
-    payload = json.loads(result["content"][0]["text"])
-    assert payload["document_id"] == "document-1"
-    assert captured["data"] == b"attachment bytes"
-    assert captured["entity_id"] == "entity-1"
-    assert captured["workspace_id"] == "workspace-1"
-    assert captured["user_id"] == "user-1"
-    assert captured["conversation_id"] == "conversation-1"
-    assert captured["source"]["uid"] == "7"
-
-
-@pytest.mark.asyncio
 async def test_get_thread_scans_inbox_and_sent(monkeypatch):
     root = _thread_message_bytes(
         sender="Alice <alice@example.com>",
@@ -443,26 +333,3 @@ def test_reply_actions_use_email_send_approval(tool_name):
     assert action is not None
     assert action.action_key == "email.send"
     assert action.risk_level == "high"
-
-
-def test_save_attachment_uses_workspace_knowledge_approval():
-    action = classify_runtime_tool_action(
-        "mcp__email__save_attachment_to_workspace",
-        {"uid": "7", "attachment_id": "3"},
-    )
-    assert action is not None
-    assert action.action_key == "workspace.knowledge.update"
-    assert action.risk_level == "medium"
-
-
-@pytest.mark.parametrize("action", [
-    "list_attachments",
-    "download_attachment",
-    "list_threads",
-    "get_thread",
-    "list_drafts",
-    "get_draft",
-])
-def test_generic_email_mailbox_reads_are_classified_read_only(action):
-    classification = classify_runtime_tool(f"mcp__email__{action}", {})
-    assert classification.effect is RuntimeToolEffect.READ_ONLY

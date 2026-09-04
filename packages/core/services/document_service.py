@@ -547,8 +547,6 @@ async def create_document(
     classification: str | None = None,
     client_visible: bool | None = None,
     owner_id: str | None = None,
-    upload_idempotency_key: str | None = None,
-    upload_request_fingerprint: str | None = None,
     # When True, skip the plan storage-limit check. Used for bookkeeping that
     # re-projects files already on disk (e.g. filesystem reconcile), which must
     # not be blocked just because the entity is over its quota.
@@ -573,8 +571,6 @@ async def create_document(
         source=source,
         created_by=created_by,
         folder_id=folder_id,
-        upload_idempotency_key=upload_idempotency_key,
-        upload_request_fingerprint=upload_request_fingerprint,
     )
     if visibility is not None:
         doc.visibility = visibility
@@ -1446,7 +1442,6 @@ async def save_document_file(
     created_by: str | None = None,
     save_session_id: str | None = None,
     save_sequence: int | None = None,
-    expected_source_sha256: str | None = None,
     mutation_authorizer: (
         Callable[[AsyncSession, Document], Awaitable[None]] | None
     ) = None,
@@ -1458,12 +1453,6 @@ async def save_document_file(
         raise ValueError("Filesystem storage is not enabled")
     if (save_session_id is None) != (save_sequence is None):
         raise ValueError("save_session_id and save_sequence must be provided together")
-    expected_source_digest = str(expected_source_sha256 or "").strip().lower()
-    if expected_source_digest and (
-        len(expected_source_digest) != 64
-        or any(character not in "0123456789abcdef" for character in expected_source_digest)
-    ):
-        raise ValueError("expected_source_sha256 must be a 64-character SHA-256 digest")
 
     from packages.core.services.office_editing import OfficeConversionFactory
 
@@ -1482,7 +1471,6 @@ async def save_document_file(
         claim_entity_editor_write_intent,
         entity_filesystem_mutation_lock,
         finish_entity_filesystem_mutation,
-        open_entity_file_snapshot,
         write_entity_file_atomic,
     )
     assert_entity_filesystem_ready()
@@ -1547,58 +1535,6 @@ async def save_document_file(
         root = os.path.realpath(entity_root)
         if os.path.commonpath([root, full_path]) != root:
             raise ValueError("Document path escaped entity root")
-        expected_source_version = None
-        if expected_source_digest:
-            accepted_source_digests = [expected_source_digest]
-            if save_session_id is not None and save_sequence is not None:
-                previous_session = _metadata_editor_write_session(
-                    doc.metadata_,
-                    save_session_id,
-                )
-                previous_sequence = (
-                    previous_session.get("sequence")
-                    if isinstance(previous_session, dict)
-                    else None
-                )
-                previous_digest = (
-                    previous_session.get("content_digest")
-                    if isinstance(previous_session, dict)
-                    else None
-                )
-                if (
-                    previous_session
-                    and previous_session.get("committed") is True
-                    and isinstance(previous_sequence, int)
-                    and previous_sequence <= save_sequence
-                    and isinstance(previous_digest, str)
-                    and previous_digest not in accepted_source_digests
-                ):
-                    accepted_source_digests.append(previous_digest)
-
-            stale_error: EntityFilesystemStaleWriteError | None = None
-            source_fs_path = replaced_legacy_fs_path or doc.fs_path
-            for accepted_digest in accepted_source_digests:
-                try:
-                    with open_entity_file_snapshot(
-                        entity_id,
-                        source_fs_path,
-                        expected_content_sha256=accepted_digest,
-                    ) as source_snapshot:
-                        # A legacy Office save validates the old binary source,
-                        # then writes a newly allocated OOXML path. The entity
-                        # mutation lock fences that two-path transition; a
-                        # same-path save also carries the version into the
-                        # atomic writer to close the validation/write gap.
-                        if source_fs_path == doc.fs_path:
-                            expected_source_version = source_snapshot.version
-                    stale_error = None
-                    break
-                except EntityFilesystemStaleWriteError as exc:
-                    stale_error = exc
-            if stale_error is not None:
-                raise EntityFilesystemStaleWriteError(
-                    "The document changed after this editor snapshot was loaded",
-                ) from stale_error
         file_digest = hashlib.sha256(file_bytes).hexdigest()
         if save_session_id is not None and save_sequence is not None:
             claim_result = await asyncio.to_thread(
@@ -1645,7 +1581,6 @@ async def save_document_file(
                 file_bytes,
                 expected_size=len(file_bytes),
                 allow_empty=True,
-                expected_source_version=expected_source_version,
             )
 
             ext = office_extension or os.path.splitext(doc.name or filename or "")[1].lstrip(".").lower()

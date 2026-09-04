@@ -48,7 +48,6 @@ from packages.core.constants.pending_actions import (
     WORKFLOW_RUN_ACTION_KINDS,
     PendingActionKind,
 )
-from packages.core.constants.task import TaskStatus
 from packages.core.database import get_db
 from packages.core.ai.runtime.output_policy import (
     runtime_public_assistant_message_content,
@@ -289,14 +288,8 @@ def _to_message(
     author_user: User | None = None,
     resolved_by_user: User | None = None,
     updated_at: datetime | None = None,
-    recovery_reason: str | None = None,
 ) -> MessageResponse:
     pending_action = m.pending_action if isinstance(m.pending_action, dict) and m.pending_action.get("kind") else None
-    if recovery_reason and pending_action:
-        pending_action = {
-            **pending_action,
-            "payload": {**pending_action.get("payload", {}), "why": recovery_reason},
-        }
     author_user_id = _message_author_user_id(m)
     raw_meta = m.meta if isinstance(m.meta, dict) else {}
     public_meta = runtime_public_tool_payload(raw_meta)
@@ -961,54 +954,6 @@ async def _plan_task_ids_for_messages(
     return {str(plan_id): str(task_id) for plan_id, task_id in rows if task_id}
 
 
-async def _legacy_recovery_reasons(
-    db: AsyncSession,
-    messages: list[Message],
-    *,
-    entity_id: str,
-    workspace_id: str,
-) -> dict[str, str]:
-    """Repair pre-fix display projections without rewriting approval payloads.
-
-    Old recovery cards used the generic missing-artifact check even when the
-    same Plan recorded a concrete execution failure. Only that legacy text is
-    replaced, and only from the exact Task/Plan's durable supervisor evidence.
-    """
-    candidates = {}
-    for message in messages:
-        action = message.pending_action if isinstance(message.pending_action, dict) else {}
-        payload = action.get("payload") if isinstance(action.get("payload"), dict) else {}
-        if (
-            not message.resolved_at
-            and action.get("kind") == PendingActionKind.TASK_RECOVERY.value
-            and action.get("task_id") and action.get("plan_id")
-            and str(payload.get("why") or "").startswith("This workspace task needs a saved file/media/document deliverable,")
-        ):
-            candidates[message.id] = action
-    if not candidates:
-        return {}
-
-    from packages.core.models.task import Task
-
-    rows = (await db.execute(select(Task.id, Task.actual_output).where(
-        Task.id.in_({action["task_id"] for action in candidates.values()}),
-        Task.entity_id == entity_id, Task.workspace_id == workspace_id,
-        Task.status == TaskStatus.WAITING_ON_CUSTOMER,
-    ))).all()
-    outputs = {task_id: output for task_id, output in rows if isinstance(output, dict)}
-    reasons = {}
-    for message_id, action in candidates.items():
-        output = outputs.get(action["task_id"], {})
-        evidence = output.get("supervisor_evidence")
-        if (
-            output.get("plan_id") == action["plan_id"]
-            and output.get("supervisor_verdict") == "needs_human"
-            and isinstance(evidence, str) and evidence.strip()
-        ):
-            reasons[message_id] = evidence
-    return reasons
-
-
 async def _hydrate_messages(
     db: AsyncSession,
     rows: list[Message],
@@ -1054,9 +999,6 @@ async def _hydrate_messages(
         conversation_task_ids=conversation_task_ids,
     )
     authors_by_id = await _load_message_authors(db, rows)
-    recovery_reasons = await _legacy_recovery_reasons(
-        db, rows, entity_id=entity_id, workspace_id=workspace_id,
-    )
     return [
         _to_message(
             m,
@@ -1069,7 +1011,6 @@ async def _hydrate_messages(
             author_user=authors_by_id.get(_message_author_user_id(m) or ""),
             resolved_by_user=authors_by_id.get(m.resolved_by_user_id or ""),
             updated_at=workflow_run_updated_at.get(_message_workflow_run_id(m) or ""),
-            recovery_reason=recovery_reasons.get(m.id),
         )
         for m in rows
     ]

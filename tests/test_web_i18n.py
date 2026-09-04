@@ -4,7 +4,7 @@ import re
 
 ROOT = Path(__file__).resolve().parents[1]
 I18N_DIR = ROOT / "apps" / "web" / "src" / "lib" / "i18n"
-LOCALES = ("en", "zh", "de", "es", "fr")
+LOCALES = ("en", "zh", "es", "fr")
 ASSISTANT_PROCESS_PREFIXES = (
     "component.assistant_message_blocks.",
     "component.assistant_process.",

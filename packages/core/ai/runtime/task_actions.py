@@ -17,32 +17,6 @@ _RUNTIME_TASK_PRIORITY_LABELS = {
     "urgent": 5,
 }
 
-_RUNTIME_TASK_SEARCH_FILTER_KEYS = frozenset({
-    "assignee_id",
-    "assignee_ids",
-    "category_id",
-    "category_ids",
-    "completed_after",
-    "completed_before",
-    "created_after",
-    "created_before",
-    "deadline_after",
-    "deadline_before",
-    "priorities",
-    "priority",
-    "priority_max",
-    "priority_min",
-    "query",
-    "status",
-    "statuses",
-    "task_type",
-    "task_types",
-    "updated_after",
-    "updated_before",
-    "workspace_id",
-    "workspace_ids",
-})
-
 
 def runtime_normalize_task_priority(value: Any, default: int = 3) -> int:
     """Normalize task priority labels/numbers to Manor's 1-5 scale."""
@@ -89,47 +63,38 @@ async def runtime_search_tasks_action(
     from packages.core.services import task_service
 
     raw_params = dict(params or {})
-    try:
-        limit = max(1, min(int(raw_params.get("limit") or 20), 100))
-        offset = max(0, int(raw_params.get("offset") or 0))
-    except (TypeError, ValueError):
-        return json.dumps({
-            "error": "invalid_task_filters",
-            "message": "limit and offset must be integers",
-        })
-    service_params = {
-        key: value
-        for key, value in raw_params.items()
-        if key in _RUNTIME_TASK_SEARCH_FILTER_KEYS
-        and value not in (None, "", [], ())
-    }
-    service_params.update({"limit": limit, "offset": offset})
+    status = raw_params.get("status")
+    limit = min(int(raw_params.get("limit") or 20), 100)
 
-    try:
-        async with async_session() as db:
-            tasks, total = await task_service.list_tasks(
-                db,
-                entity_id,
-                **service_params,
-            )
-    except (TypeError, ValueError) as exc:
-        return json.dumps({
-            "error": "invalid_task_filters",
-            "message": str(exc),
-        })
+    async with async_session() as db:
+        tasks, total = await task_service.list_tasks(
+            db,
+            entity_id,
+            status=status,
+            assignee_id=raw_params.get("assignee_id"),
+            completed_after=raw_params.get("completed_after"),
+            limit=limit,
+        )
+
+    query = (raw_params.get("query") or "").strip().lower()
+    if query:
+        tasks = [
+            task
+            for task in tasks
+            if query in (task.title or "").lower()
+            or query in (task.description or "").lower()
+        ]
+
+    priority = raw_params.get("priority")
+    if priority is not None:
+        tasks = [
+            task
+            for task in tasks
+            if task.priority == int(priority)
+        ]
 
     results = [runtime_task_summary_dict(task) for task in tasks]
-    next_offset = offset + len(results)
-    has_more = next_offset < total
-    return json.dumps({
-        "total": total,
-        "count": len(results),
-        "limit": limit,
-        "offset": offset,
-        "has_more": has_more,
-        "next_offset": next_offset if has_more else None,
-        "tasks": results,
-    })
+    return json.dumps({"total": total, "count": len(results), "tasks": results})
 
 
 async def runtime_create_task_action(

@@ -6,8 +6,6 @@ from collections.abc import Mapping
 from pathlib import PurePath
 from typing import Any
 
-from packages.core.ai.runtime.composite_tools import RuntimeCompositeToolCallFactory
-
 
 ASSISTANT_BLOCKS_SCHEMA = "v1"
 ASSISTANT_PROCESS_TOOL_KEY_PREFIX = "component.assistant_process.tool"
@@ -24,20 +22,6 @@ _LEDGER_FINANCE_METRICS = _LEDGER_COUNT_METRICS | {
     "sum_inflow_minor",
     "sum_outflow_minor",
 }
-
-
-def assistant_tool_uses_structured_result(name: str, arguments: Any = None) -> bool:
-    """Return whether a tool result must bypass the lossy preview path."""
-
-    args = arguments if isinstance(arguments, dict) else {}
-    canonical_call = RuntimeCompositeToolCallFactory.create(name, args)
-    if canonical_call.tool_name in ASSISTANT_STRUCTURED_RESULT_TOOLS:
-        return True
-    return (
-        canonical_call.tool_name == "workspace_agent"
-        and str(canonical_call.arguments.get("action") or "").strip().lower()
-        == "visualize_ledgers"
-    )
 
 
 def _ledger_metric_types(contract_id: Any) -> set[str]:
@@ -498,7 +482,7 @@ def _mcp_display_metadata(
             "display_params": {"target": display_target},
         }
 
-    if lower_server == "chrome" or "browser" in lower_server:
+    if lower_server in {"chrome", "local_browser"} or "browser" in lower_server:
         if any(token in lower_tool for token in ("open", "goto", "navigate")):
             key = "browser.open"
         elif lower_tool in {"read_page", "get_interactive_elements"}:
@@ -680,11 +664,8 @@ def _tool_display_metadata(
     skill_display_names: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
     normalized_name = (name or "tool").strip()
-    args = arguments if isinstance(arguments, dict) else {}
-    canonical_call = RuntimeCompositeToolCallFactory.create(normalized_name, args)
-    normalized_name = canonical_call.tool_name
     lower_name = normalized_name.lower()
-    args = canonical_call.arguments
+    args = arguments if isinstance(arguments, dict) else {}
     target = summary
 
     if lower_name == "manor":
@@ -803,40 +784,23 @@ def _tool_display_metadata(
             "display_params": {"target": _tool_target(args, fallback=target or "workspace")},
         }
     if lower_name.startswith("workspace_"):
-        workspace_action = (
-            str(args.get("action") or "").strip().lower()
-            if lower_name == "workspace_agent"
-            else ""
-        )
-        workspace_args = (
-            args.get("params")
-            if workspace_action and isinstance(args.get("params"), dict)
-            else args
-        )
-        if lower_name in {"workspace_search", "workspace_list_knowledge"} or workspace_action in {
-            "search",
-            "list_knowledge",
-            "get_goal_status",
-            "visualize_ledgers",
-        }:
+        if lower_name in {"workspace_search", "workspace_list_knowledge"} or lower_name == "rag":
             key = "workspace.search"
-        elif lower_name == "workspace_create_task" or workspace_action == "create_task":
+        elif lower_name == "workspace_create_task":
             key = "workspace.create_task"
-        elif lower_name == "workspace_update_task_runtime" or workspace_action == "update_task_runtime":
+        elif lower_name == "workspace_update_task_runtime":
             key = "workspace.update_task"
-        elif "knowledge" in lower_name or "knowledge" in workspace_action:
+        elif "knowledge" in lower_name:
             key = "workspace.knowledge"
-        elif "rule" in lower_name or "rule" in workspace_action:
+        elif "rule" in lower_name:
             key = "workspace.rule"
-        elif "review" in lower_name or "review" in workspace_action:
+        elif "review" in lower_name:
             key = "workspace.review"
         else:
             key = "workspace.operate"
         return {
             "display_key": f"{ASSISTANT_PROCESS_TOOL_KEY_PREFIX}.{key}",
-            "display_params": {
-                "target": _tool_target(workspace_args, fallback=target or "workspace")
-            },
+            "display_params": {"target": _tool_target(args, fallback=target or "workspace")},
         }
     if lower_name.startswith("ws_"):
         if "search" in lower_name:
@@ -1196,20 +1160,10 @@ class AssistantBlocksBuilder:
             step["duration_ms"] = int(duration_ms)
         if now_ms is not None:
             step["ended_at_ms"] = int(now_ms)
-        canonical_call = RuntimeCompositeToolCallFactory.create(
-            wanted,
-            display_arguments if isinstance(display_arguments, dict) else {},
-        )
         expected_visualization_kind = {
             "visualize_workspace_ledgers": "workspace_ledger_overview",
             "query_ledger": "ledger_query_result",
-        }.get(canonical_call.tool_name)
-        if (
-            canonical_call.tool_name == "workspace_agent"
-            and str(canonical_call.arguments.get("action") or "").strip().lower()
-            == "visualize_ledgers"
-        ):
-            expected_visualization_kind = "workspace_ledger_overview"
+        }.get(wanted)
         if expected_visualization_kind:
             visualization = _workspace_ledger_visualization(
                 structured_result if structured_result is not None else result,

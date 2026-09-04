@@ -11,11 +11,11 @@ from packages.core.contracts.audio_generation import (
 _CAPABILITIES = {
     "diagram": "Create an editable .diagram.json canvas from a prompt and save it to Knowledge.",
     "code": "Create a multi-file website/code bundle from params.files; use real extensions like .html/.css/.js, not .txt.",
-    "document": "Create from content (.md, .txt, .csv, .json, .diagram.json, .html, .docx, .pptx, .pdf), blank DOCX/PPTX/XLSX operations, or template DOCX/PPTX/XLSX/XLSM operations. Optional template={path,expected_sha256} uses an existing readable Knowledge file unchanged; XLSM requires it. Operations cannot mix with content/prompt/options.",
-    "word_document": "Create DOCX from patch_file operations; without operations, use document specialist skills.",
+    "document": "Create a simple user-visible file from supplied content (.md, .txt, .csv, .json, .diagram.json, .html, .docx, .pptx, .pdf). Use .diagram.json for editable AI-drawn diagrams.",
+    "word_document": "Compatibility fallback for document specialist skills when no matching Available Skills entry is selected.",
     "pdf": "Compatibility fallback for document specialist skills when no matching Available Skills entry is selected.",
-    "presentation": "Create PPTX from patch_file operations; without operations, use presentation specialist skills.",
-    "spreadsheet": "Create XLSX, or XLSM from a same-type template, using patch_file operations; without operations, use spreadsheet specialist skills.",
+    "presentation": "Compatibility fallback for presentation specialist skills when no matching Available Skills entry is selected.",
+    "spreadsheet": "Compatibility fallback for spreadsheet specialist skills when no matching Available Skills entry is selected.",
     "image": "Generate an image with the Account-selected image model and BYOK/platform billing rules.",
     "video": "Generate one short video clip with the Account-selected video model and BYOK/platform billing rules. For >15s total runtime, segment, wait, then merge.",
     "audio": (
@@ -36,7 +36,7 @@ GENERATE_FILE_SCHEMA: dict[str, Any] = {
     "type": "function",
     "function": {
         "name": "generate_file",
-        "description": "Create Knowledge files, incl. videos/mp4. Edit with patch_file.",
+        "description": "Create docs, code, diagrams, images, videos/mp4, audio.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -57,31 +57,9 @@ GENERATE_FILE_SCHEMA: dict[str, Any] = {
                     "type": "string",
                     "description": "Content",
                 },
-                "operations": {
-                    "type": "array",
-                    "minItems": 1,
-                    "items": {"type": "object"},
-                    "description": "Office ops; no content/prompt/options. See inspect_file_engine.",
-                },
-                "template": {
-                    "type": "object",
-                    "description": "read_file Office template; unchanged.",
-                    "properties": {
-                        "path": {"type": "string"},
-                        "expected_sha256": {"type": "string"},
-                    },
-                    "required": ["path", "expected_sha256"],
-                    "additionalProperties": False,
-                },
                 "file_type": {
                     "type": "string",
                     "description": "Extension",
-                },
-                "storage_scope": {
-                    "type": "string",
-                    "enum": ["task", "workspace"],
-                    "default": "task",
-                    "description": "Task/workspace scope.",
                 },
                 "approval_token": {
                     "type": "string",
@@ -247,11 +225,13 @@ GENERATE_FILE_SCHEMA: dict[str, Any] = {
                     "type": "string",
                     "enum": VIDEO_RESOLUTION_CHOICES,
                     "default": "720p",
+                    "description": "Res.",
                 },
                 "aspect_ratio": {
                     "type": "string",
                     "enum": VIDEO_ASPECT_RATIO_CHOICES,
                     "default": "16:9",
+                    "description": "Aspect.",
                 },
                 "requires_reference_media": {
                     "type": "boolean",
@@ -273,7 +253,7 @@ GENERATE_FILE_SCHEMA: dict[str, Any] = {
                 },
                 "language": {
                     "type": "string",
-                    "description": "BCP-47; defaults to Workspace audio language.",
+                    "description": "BCP-47; defaults to Workspace settings.audio_defaults.language.",
                 },
                 "save_to_knowledge": {
                     "type": "boolean",

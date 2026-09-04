@@ -107,17 +107,6 @@ def test_non_heavy_process_schedules_video_job_through_celery(monkeypatch) -> No
     assert queued == ["job-2"]
 
 
-def test_document_upload_recovery_cleanup_has_a_daily_schedule() -> None:
-    from packages.core.celery_app import celery_app
-
-    entry = celery_app.conf.beat_schedule[
-        "maintenance-cleanup-document-upload-recovery"
-    ]
-    assert entry["task"] == "maintenance.cleanup_document_upload_recovery"
-
-
-
-
 
 
 def test_channel_dispatch_passes_receipt_id_once(monkeypatch) -> None:

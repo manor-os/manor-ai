@@ -1,4 +1,4 @@
-"""Duplex browser audio with a live foreground and durable Manor task loop."""
+"""Duplex browser audio; Manor remains the authority for every spoken turn."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ import time
 import uuid
 from collections import deque
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from typing import Any
 
 from fastapi import WebSocket
@@ -21,10 +21,6 @@ from packages.core.services.voice.latency import (
     voice_latency_async_context,
     voice_latency_outcome,
     voice_latency_span,
-)
-from packages.core.services.voice.live_agent import (
-    LiveVoiceToolResult,
-    live_voice_session_factory,
 )
 from packages.core.services.voice.profiles import (
     DEFAULT_VOICE_PROFILE,
@@ -44,18 +40,6 @@ from packages.core.services.voice.realtime import (
     extract_realtime_usage,
     open_realtime_connection,
 )
-from packages.core.services.voice.work_queue import (
-    VoiceWorkReceipt,
-    is_voice_progress_query,
-    voice_call_control_kind,
-)
-from packages.core.services.voice.work_router import voice_work_reply_factory
-from packages.core.services.voice.work_types import (
-    VoiceControlReplyKind,
-    VoiceWorkAction,
-    VoiceWorkDecision,
-    VoiceWorkUiStatus,
-)
 
 SAMPLE_RATE = 24000
 MAX_CALL_SECONDS = 1800
@@ -64,6 +48,10 @@ RESERVATION_KIND = "browser_voice_call"
 # Chat/tool request must not retain the call lease forever.
 TURN_SETTLEMENT_TIMEOUT_SECONDS = 12 * 60
 PROVIDER_SETTLEMENT_TIMEOUT_SECONDS = 3
+# Keep the phone conversation responsive while the bound Chat Agent performs
+# tools or other long-running work. Fast conversational turns still complete
+# normally without an acknowledgement in front of them.
+BACKGROUND_ACK_AFTER_SECONDS = 0.8
 RECENT_WORK_STATUS_SECONDS = 30
 
 logger = logging.getLogger(__name__)
@@ -75,76 +63,117 @@ class BrowserAgentWork:
     call: BridgeCall
     task: asyncio.Task[VoiceAgentOutcome]
     started_at: float
-    receipt: VoiceWorkReceipt | None = None
     acknowledged: bool = False
-    suppress_delivery: bool = False
 
 
 @dataclass(frozen=True)
 class QueuedBrowserAgentCall:
     generation: int
     call: BridgeCall
-    receipt: VoiceWorkReceipt | None = None
 
 
-@dataclass
+@dataclass(frozen=True)
 class BrowserSpeechRequest:
     request_id: str
     spoken_reply: str
     retry_silent_audio: bool
     retry_count: int = 0
-    status: str = "ok"
-    conversation_id: str | None = None
-    turn_sent: bool = False
-
-
-@dataclass
-class BrowserLiveRequest:
-    user_text: str
-    transcript_parts: list[str]
 
 
 _SPEECH_REQUEST_KEY = "_manor_speech_request"
-_LIVE_REQUEST_KEY = "_manor_live_request"
 
 
-def _completed_response_transcript(response: dict[str, Any]) -> str:
-    """Read the final assistant transcript when delta delivery was incomplete."""
+def _voice_reply_language(text: str) -> str:
+    if any("\u4e00" <= char <= "\u9fff" for char in text):
+        return "zh"
+    if any("\uac00" <= char <= "\ud7af" for char in text):
+        return "ko"
+    if any("\u3040" <= char <= "\u30ff" for char in text):
+        return "ja"
+    return "en"
 
-    parts: list[str] = []
-    output = response.get("output")
-    if not isinstance(output, list):
-        return ""
-    for item in output:
-        if not isinstance(item, dict):
-            continue
-        content = item.get("content")
-        if not isinstance(content, list):
-            continue
-        for part in content:
-            if not isinstance(part, dict):
-                continue
-            value = part.get("transcript") or part.get("text")
-            if isinstance(value, str) and value:
-                parts.append(value)
-    return "".join(parts).strip()
+
+def _voice_work_reply(text: str, kind: str) -> str:
+    replies = {
+        "zh": {
+            "ack": "好的，我正在处理。你可以随时问我进度。",
+            "progress": "还在处理中，完成后我会马上告诉你。",
+            "busy": "我还在处理上一项工作，完成后就可以继续。",
+            "queued": "好的，已排队。上一项完成后我会接着处理。",
+            "completed": "刚刚已经完成，结果也发到对话里了。",
+            "error": "处理时遇到了问题，请稍后再试。",
+        },
+        "ko": {
+            "ack": "알겠습니다. 지금 처리하고 있어요. 언제든 진행 상황을 물어보세요.",
+            "progress": "아직 처리 중이에요. 끝나는 대로 바로 알려드릴게요.",
+            "busy": "이전 작업을 처리 중이에요. 끝나면 바로 이어갈게요.",
+            "queued": "알겠습니다. 대기열에 추가했어요. 이전 작업이 끝나면 이어서 처리할게요.",
+            "completed": "방금 완료했고 결과도 대화에 남겼어요.",
+            "error": "처리 중 문제가 생겼어요. 잠시 후 다시 시도해 주세요.",
+        },
+        "ja": {
+            "ack": "はい、今処理しています。いつでも進捗を聞いてください。",
+            "progress": "まだ処理中です。終わり次第すぐにお知らせします。",
+            "busy": "前の作業を処理中です。終わったら続けられます。",
+            "queued": "承知しました。前の作業が終わり次第、続けて処理します。",
+            "completed": "先ほど完了し、結果もチャットに保存しました。",
+            "error": "処理中に問題が発生しました。少し後でもう一度お試しください。",
+        },
+        "en": {
+            "ack": "Okay, I'm working on it. You can ask me for an update anytime.",
+            "progress": "I'm still working on it. I'll tell you as soon as it's ready.",
+            "busy": "I'm still handling the previous request. We can continue when it's done.",
+            "queued": "Okay, I queued that. I'll handle it after the current request finishes.",
+            "completed": "It just finished, and I added the result to the chat.",
+            "error": "I ran into a problem while working on that. Please try again shortly.",
+        },
+    }
+    return replies[_voice_reply_language(text)][kind]
+
+
+def is_voice_progress_query(text: str) -> bool:
+    normalized = " ".join(text.casefold().replace("'", "").split())
+    return any(
+        phrase in normalized
+        for phrase in (
+            "进度",
+            "怎么样了",
+            "好了没",
+            "好了吗",
+            "完成了吗",
+            "查到了吗",
+            "到哪了",
+            "结果呢",
+            "有消息吗",
+            "status",
+            "progress",
+            "any update",
+            "how is it going",
+            "hows it going",
+            "are you done",
+            "is it done",
+            "finished yet",
+            "still working",
+            "진행 상황",
+            "어떻게 됐",
+            "끝났",
+            "進捗",
+            "終わった",
+        )
+    )
 
 
 def browser_session_update(
     model: str,
     voice: VoiceProfile = DEFAULT_VOICE_PROFILE,
-    transcription_language: str | None = None,
 ) -> dict:
     event = build_realtime_session_update(
         model=model,
         voice=openai_voice(voice),
         input_transcription_model=VERCEL_REALTIME_TRANSCRIPTION_MODEL,
-        input_transcription_language=transcription_language,
-        live_agent=True,
     )
     session = event["session"]
     session["audio"]["input"]["format"] = {"type": "audio/pcm", "rate": SAMPLE_RATE}
-    session["audio"]["input"]["noise_reduction"] = {"type": "far_field"}
     session["audio"]["output"]["format"] = {"type": "audio/pcm", "rate": SAMPLE_RATE}
     # The server gates each response on current authorization and credit. VAD
     # commits audio automatically, while dedicated transcription avoids a full
@@ -156,6 +185,10 @@ def browser_session_update(
         threshold=0.72,
         silence_duration_ms=420,
         prefix_padding_ms=240,
+    )
+    session["instructions"] = (
+        "You are Manor's speech renderer. Speak only the exact assistant text supplied "
+        "by the server. Never answer the user or perform actions yourself."
     )
     return event
 
@@ -186,24 +219,10 @@ class BrowserVoiceSession:
         agent_id: str | None,
         check_access: Callable[[], Awaitable[None]],
         agent: Callable[[str], Awaitable[VoiceAgentOutcome]],
-        admit_work: Callable[[str], Awaitable[VoiceWorkReceipt]] | None = None,
-        execute_work: Callable[[VoiceWorkReceipt], Awaitable[VoiceAgentOutcome]] | None = None,
-        recover_work: Callable[[], Awaitable[list[VoiceWorkReceipt]]] | None = None,
-        route_followup: Callable[
-            [str, VoiceWorkReceipt], Awaitable[VoiceWorkDecision]
-        ] | None = None,
-        route_work_action: Callable[
-            [str, VoiceWorkReceipt, VoiceWorkAction],
-            Awaitable[VoiceWorkDecision],
-        ] | None = None,
-        cancel_work: Callable[
-            [VoiceWorkReceipt, VoiceWorkReceipt | None], Awaitable[bool]
-        ] | None = None,
         record_control_turn: Callable[[str, str], Awaitable[None]] | None = None,
         connection_factory: Callable = open_realtime_connection,
         on_ready: Callable[[], None] | None = None,
         voice: VoiceProfile = DEFAULT_VOICE_PROFILE,
-        transcription_language: str | None = None,
     ):
         self.ws = ws
         self.call_id = uuid.uuid4().hex[:12]
@@ -215,14 +234,7 @@ class BrowserVoiceSession:
             agent_id=agent_id,
         )
         self.check_access, self.agent = check_access, agent
-        self.admit_work = admit_work
-        self.execute_work = execute_work
-        self.recover_work = recover_work
-        self.route_followup = route_followup
-        self.route_work_action = route_work_action
-        self.cancel_work = cancel_work
         self.record_control_turn = record_control_turn
-        self.suppressed_work_ids: set[str] = set()
         self.engine = RealtimeVoiceEngine(
             route=route,
             usage_scope=self.usage_scope,
@@ -234,15 +246,12 @@ class BrowserVoiceSession:
         )
         self.on_ready = on_ready
         self.voice = normalize_voice_profile(voice)
-        self.transcription_language = transcription_language
         self.voice_locked = False
         self.generation = 0
         self.response_generation = 0
         self.response_has_audio = False
         self.response_audio_bytes = 0
-        self.pending_response_captions: list[dict[str, Any]] = []
         self.active_speech_request: BrowserSpeechRequest | None = None
-        self.active_live_request: BrowserLiveRequest | None = None
         self.response_idle = asyncio.Event()
         self.response_idle.set()
         self.requests: asyncio.Queue = asyncio.Queue(maxsize=8)
@@ -265,7 +274,6 @@ class BrowserVoiceSession:
         self.agent_completion_tasks: set[asyncio.Task] = set()
         self.last_work_completed_at: float | None = None
         self.last_work_status: str | None = None
-        self.last_work_receipt: VoiceWorkReceipt | None = None
         self.ready = False
         self.closing = False
         self.billing_failures: set[str] = set()
@@ -398,11 +406,7 @@ class BrowserVoiceSession:
                             self.session_update_started_at = time.monotonic()
                             try:
                                 ready_event = await self.wait_for_ready_or_hangup(
-                                    browser_session_update(
-                                        self.route.model,
-                                        self.voice,
-                                        self.transcription_language,
-                                    ),
+                                    browser_session_update(self.route.model, self.voice),
                                 )
                             except BaseException as error:
                                 outcome = voice_latency_outcome(error)
@@ -435,10 +439,6 @@ class BrowserVoiceSession:
                                 return
                             provider_started = True
                             await self.handle_provider(ready_event)
-                            if self.recover_work is not None:
-                                self._queue_recovered_work(
-                                    await self.recover_work()
-                                )
                             tasks = [
                                 asyncio.create_task(fn())
                                 for fn in (
@@ -553,24 +553,11 @@ class BrowserVoiceSession:
         if not run_turns.done():
             run_turns.cancel()
         result = (await asyncio.gather(run_turns, return_exceptions=True))[0]
-        completion_tasks = tuple(self.agent_completion_tasks)
-        if timed_out:
-            self.queued_agent_calls.clear()
-            if self.active_agent_work is not None:
-                self.active_agent_work.task.cancel()
-            for task in completion_tasks:
-                task.cancel()
-        if completion_tasks:
-            # Cancellation is cooperative. A broken tool must not turn the
-            # settlement deadline into another unbounded wait.
-            done, pending = await asyncio.wait(completion_tasks, timeout=1)
-            for task in pending:
-                task.cancel()
-            for task in done:
-                try:
-                    task.result()
-                except BaseException:
-                    pass
+        if self.agent_completion_tasks:
+            await asyncio.gather(
+                *tuple(self.agent_completion_tasks),
+                return_exceptions=True,
+            )
         if (
             not timed_out
             and isinstance(result, BaseException)
@@ -680,11 +667,7 @@ class BrowserVoiceSession:
                 ):
                     self.voice = requested_voice
                     await self.engine.send(
-                        browser_session_update(
-                            self.route.model,
-                            self.voice,
-                            self.transcription_language,
-                        )
+                        browser_session_update(self.route.model, self.voice)
                     )
                 await self.ws.send_json(
                     {"type": "voice", "voice": self.voice, "locked": self.voice_locked}
@@ -737,7 +720,6 @@ class BrowserVoiceSession:
             generation, queued_event = await self.requests.get()
             event = dict(queued_event)
             speech_request = event.pop(_SPEECH_REQUEST_KEY, None)
-            live_request = event.pop(_LIVE_REQUEST_KEY, None)
             await asyncio.wait_for(self.response_idle.wait(), timeout=90)
             if generation != self.generation:
                 self.finish_turn_timing(generation, outcome="interrupted")
@@ -764,30 +746,14 @@ class BrowserVoiceSession:
                     if isinstance(speech_request, BrowserSpeechRequest)
                     else None
                 )
-                self.active_live_request = (
-                    live_request
-                    if isinstance(live_request, BrowserLiveRequest)
-                    else None
-                )
                 self.response_has_audio = (
                     event.get("response", {}).get("output_modalities") == ["audio"]
                 )
                 self.response_audio_bytes = 0
-                self.pending_response_captions = []
                 timing = self.turn_timings.setdefault(
                     generation,
                     VoiceTurnTiming(turn_id=generation),
                 )
-                if (
-                    self.active_live_request is not None
-                    and timing.transcription_completed_at is not None
-                ):
-                    self.log_latency(
-                        "live_agent_queue",
-                        timing.transcription_completed_at,
-                        generation=generation,
-                        ended_at=now,
-                    )
                 if timing.tts_queued_at is not None:
                     self.log_latency(
                         "tts_queue",
@@ -842,9 +808,6 @@ class BrowserVoiceSession:
         retry_silent_audio: bool,
         request_id: str | None = None,
         retry_count: int = 0,
-        status: str = "ok",
-        conversation_id: str | None = None,
-        turn_sent: bool = False,
     ) -> None:
         event = build_spoken_response_event(spoken_reply=spoken_reply)
         event[_SPEECH_REQUEST_KEY] = BrowserSpeechRequest(
@@ -852,31 +815,6 @@ class BrowserVoiceSession:
             spoken_reply=spoken_reply,
             retry_silent_audio=retry_silent_audio,
             retry_count=retry_count,
-            status=status,
-            conversation_id=conversation_id,
-            turn_sent=turn_sent,
-        )
-        self.queue_latest_response((generation, event))
-
-    def _queue_live_response(self, generation: int, user_text: str) -> None:
-        event = live_voice_session_factory.response_event()
-        event[_LIVE_REQUEST_KEY] = BrowserLiveRequest(
-            user_text=user_text,
-            transcript_parts=[],
-        )
-        self.queue_latest_response((generation, event))
-
-    def _queue_live_tool_result_response(
-        self,
-        generation: int,
-        result: LiveVoiceToolResult,
-    ) -> None:
-        event = live_voice_session_factory.tool_result_response_event(result)
-        # The durable receipt already saved the caller's utterance. Persist only
-        # the Live Agent's generated acknowledgement for this provider response.
-        event[_LIVE_REQUEST_KEY] = BrowserLiveRequest(
-            user_text="",
-            transcript_parts=[],
         )
         self.queue_latest_response((generation, event))
 
@@ -888,16 +826,15 @@ class BrowserVoiceSession:
 
         discarded: list[BridgeCall] = []
         if self.turns.full():
-            retained: list[tuple] = []
+            retained: list[tuple[int, BridgeCall]] = []
             while True:
                 try:
-                    queued_item = self.turns.get_nowait()
+                    queued_generation, queued_call = self.turns.get_nowait()
                 except asyncio.QueueEmpty:
                     break
-                queued_generation, queued_call = queued_item[:2]
                 self.turns.task_done()
                 if queued_generation == generation:
-                    retained.append(queued_item)
+                    retained.append((queued_generation, queued_call))
                 else:
                     discarded.append(queued_call)
 
@@ -961,19 +898,8 @@ class BrowserVoiceSession:
                         {"type": "listening", "generation": generation}
                     )
                 return
-            await self.ws.send_json(
-                {
-                    "type": "transcript",
-                    "role": "user",
-                    "text": call.utterance,
-                    "generation": generation,
-                }
-            )
             await self.ws.send_json({"type": "thinking", "generation": generation})
-            # The foreground Realtime Agent now decides whether to answer this
-            # turn itself or call the typed Manor task tool. Access and credit
-            # checks still happen in generate_responses before response.create.
-            self._queue_live_response(generation, call.utterance)
+            await self.queue_bridge_call(generation, call)
             return
         if self.closing and kind != "response.done":
             return
@@ -1081,13 +1007,6 @@ class BrowserVoiceSession:
                             segment=timing.tts_attempt,
                             ended_at=now,
                         )
-                        if self.active_live_request is not None:
-                            self.log_latency(
-                                "live_agent_first_audio",
-                                timing.tts_started_at,
-                                generation=self.response_generation,
-                                ended_at=now,
-                            )
                     if timing.input_committed_at is not None:
                         self.log_latency(
                             "turn_first_audio",
@@ -1101,34 +1020,16 @@ class BrowserVoiceSession:
                 self.playback = dict(item_id=item_id, content_index=event.get("content_index", 0), bytes=0)
             self.playback["bytes"] += len(audio)
             await self.ws.send_json({"type": "audio", "audio": payload, "item_id": item_id})
-            for caption in self.pending_response_captions:
-                await self.ws.send_json(caption)
-            self.pending_response_captions = []
         elif kind == "response.output_audio_transcript.delta" and self.response_generation == self.generation:
-            live_request = self.active_live_request
-            delta = str(event.get("delta") or "")
-            if live_request is not None and delta:
-                live_request.transcript_parts.append(delta)
-            speech_request = self.active_speech_request
-            if speech_request is not None and speech_request.turn_sent:
-                return
-            caption = {
-                "type": "caption",
-                "delta": delta,
-                "item_id": event.get("item_id"),
-                "generation": self.response_generation,
-            }
-            if self.response_audio_bytes:
-                await self.ws.send_json(caption)
-            else:
-                self.pending_response_captions.append(caption)
+            await self.ws.send_json(
+                {"type": "caption", "delta": event.get("delta", ""), "item_id": event.get("item_id")}
+            )
         elif kind == "response.output_audio.done" and self.response_generation == self.generation:
             await self.ws.send_json({"type": "audio_done", "item_id": event.get("item_id")})
         elif kind == "response.done":
             event_received_at = time.monotonic()
             response_generation = self.response_generation
             speech_request = self.active_speech_request
-            live_request = self.active_live_request
             response = event.get("response") or {}
             response_id = str(response.get("id") or "").strip()
             if response_id and response_id in self.engine.completed_response_ids:
@@ -1150,7 +1051,6 @@ class BrowserVoiceSession:
                     ended_at=event_received_at,
                 )
                 self.active_speech_request = None
-                self.active_live_request = None
                 self.response_idle.set()
                 raise
             inspected = await self.engine.inspect_provider_event(event)
@@ -1175,27 +1075,10 @@ class BrowserVoiceSession:
                     ended_at=now,
                 )
                 self.active_speech_request = None
-                self.active_live_request = None
                 self.response_idle.set()
                 return
             call = inspected.bridge_call
-            if live_request is not None and timing and timing.tts_started_at is not None:
-                self.log_latency(
-                    "live_agent_decision" if call else "live_agent_response",
-                    timing.tts_started_at,
-                    generation=response_generation,
-                    outcome=response_status,
-                    ended_at=now,
-                )
             if call:
-                if live_request is not None:
-                    # The provider chooses a typed action, but the accepted
-                    # transcript remains the source of truth for user text.
-                    call = replace(
-                        call,
-                        utterance=live_request.user_text,
-                        transcript_sent=True,
-                    )
                 if self.response_generation != self.generation:
                     await self.discard_bridge_call(call)
                 else:
@@ -1233,7 +1116,6 @@ class BrowserVoiceSession:
                     # audio. Request-local state prevents an earlier response in
                     # the same microphone generation from consuming the retry.
                     self.active_speech_request = None
-                    self.active_live_request = None
                     self.response_idle.set()
                     self._queue_spoken_response(
                         generation,
@@ -1241,13 +1123,9 @@ class BrowserVoiceSession:
                         retry_silent_audio=True,
                         request_id=speech_request.request_id,
                         retry_count=1,
-                        status=speech_request.status,
-                        conversation_id=speech_request.conversation_id,
-                        turn_sent=speech_request.turn_sent,
                     )
                     return
                 self.active_speech_request = None
-                self.active_live_request = None
                 self.response_idle.set()
                 self.finish_turn_timing(generation, outcome="no_audio", ended_at=now)
                 raise RuntimeError("Voice provider returned no audio")
@@ -1257,47 +1135,7 @@ class BrowserVoiceSession:
                 and self.response_generation == self.generation
                 and self.response_audio_bytes > 0
             ):
-                if live_request is not None:
-                    assistant_text = (
-                        "".join(live_request.transcript_parts).strip()
-                        or _completed_response_transcript(response)
-                    )
-                    if not assistant_text:
-                        self.active_live_request = None
-                        self.finish_turn_timing(
-                            self.response_generation,
-                            outcome="no_transcript",
-                            ended_at=now,
-                        )
-                        raise RuntimeError(
-                            "Live Voice Agent returned audio without a transcript"
-                        )
-                    await self._record_control_turn(
-                        live_request.user_text,
-                        assistant_text,
-                    )
-                    await self.ws.send_json(
-                        {
-                            "type": "turn",
-                            "conversation_id": self.usage_scope["conversation_id"],
-                            "text": assistant_text,
-                            "status": "ok",
-                            "generation": self.response_generation,
-                        }
-                    )
-                elif speech_request is not None and not speech_request.turn_sent:
-                    await self.ws.send_json(
-                        {
-                            "type": "turn",
-                            "conversation_id": speech_request.conversation_id,
-                            "text": speech_request.spoken_reply,
-                            "status": speech_request.status,
-                            "generation": self.response_generation,
-                        }
-                    )
-                    speech_request.turn_sent = True
                 self.active_speech_request = None
-                self.active_live_request = None
                 self.finish_turn_timing(
                     self.response_generation,
                     outcome="completed",
@@ -1305,14 +1143,12 @@ class BrowserVoiceSession:
                 )
             elif response_status == "cancelled":
                 self.active_speech_request = None
-                self.active_live_request = None
                 self.finish_turn_timing(
                     self.response_generation,
                     outcome="interrupted",
                     ended_at=now,
                 )
             self.active_speech_request = None
-            self.active_live_request = None
             self.response_idle.set()
 
     async def _send_spoken_turn(
@@ -1321,19 +1157,17 @@ class BrowserVoiceSession:
         outcome: VoiceAgentOutcome,
         *,
         retry_silent_audio: bool,
-        expose_text_immediately: bool = False,
     ) -> None:
+        await self.ws.send_json(
+            {
+                "type": "turn",
+                "conversation_id": outcome.conversation_id,
+                "text": outcome.spoken_reply,
+                "status": outcome.status,
+                "generation": generation,
+            }
+        )
         if outcome.spoken_reply and generation == self.generation:
-            if expose_text_immediately:
-                await self.ws.send_json(
-                    {
-                        "type": "turn",
-                        "conversation_id": outcome.conversation_id,
-                        "text": outcome.spoken_reply,
-                        "status": outcome.status,
-                        "generation": generation,
-                    }
-                )
             await self.ws.send_json(
                 {"type": "synthesizing", "generation": generation}
             )
@@ -1341,21 +1175,8 @@ class BrowserVoiceSession:
                 generation,
                 outcome.spoken_reply,
                 retry_silent_audio=retry_silent_audio,
-                status=outcome.status,
-                conversation_id=outcome.conversation_id,
-                turn_sent=expose_text_immediately,
             )
         else:
-            if not outcome.spoken_reply:
-                await self.ws.send_json(
-                    {
-                        "type": "turn",
-                        "conversation_id": outcome.conversation_id,
-                        "text": "",
-                        "status": outcome.status,
-                        "generation": generation,
-                    }
-                )
             self.finish_turn_timing(
                 generation,
                 outcome=(
@@ -1363,83 +1184,32 @@ class BrowserVoiceSession:
                 ),
             )
 
-    async def _send_work_state(self, status: VoiceWorkUiStatus) -> None:
+    async def _send_work_state(self, status: str) -> None:
         if not self.closing:
-            await self.ws.send_json({"type": "work", "status": status.value})
-
-    def _queue_recovered_work(
-        self,
-        receipts: list[VoiceWorkReceipt],
-    ) -> None:
-        """Restore the durable queue without expanding the provider-call queue."""
-
-        for index, receipt in enumerate(receipts):
-            self.generation += 1
-            generation = self.generation
-            self.turn_timings[generation] = VoiceTurnTiming(
-                turn_id=generation,
-                agent_queued_at=time.monotonic(),
-            )
-            call = BridgeCall(None, receipt.text, "")
-            if index == 0:
-                self.turns.put_nowait((generation, call, receipt))
-            else:
-                self.queued_agent_calls.append(
-                    QueuedBrowserAgentCall(
-                        generation=generation,
-                        call=call,
-                        receipt=receipt,
-                    )
-                )
+            await self.ws.send_json({"type": "work", "status": status})
 
     async def _record_control_turn(self, user_text: str, assistant_text: str) -> None:
         if self.record_control_turn is not None:
             await self.record_control_turn(user_text, assistant_text)
-
-    async def _admit_agent_work(
-        self,
-        generation: int,
-        text: str,
-    ) -> VoiceWorkReceipt | None:
-        if self.admit_work is None:
-            return None
-        with voice_latency_span(
-            self.log_latency,
-            "work_persist",
-            generation=generation,
-        ):
-            return await self.admit_work(text)
 
     async def _reply_about_work(
         self,
         generation: int,
         call: BridgeCall,
         *,
-        kind: VoiceControlReplyKind,
+        kind: str,
         expected_work: BrowserAgentWork | None = None,
-        reply: str | None = None,
     ) -> None:
         async with self.foreground_delivery_lock:
             # Completion delivery uses the same lock. If it won the race, never
             # follow a completed result with a stale "still working" response.
             if expected_work is not None and self.active_agent_work is not expected_work:
-                kind = (
-                    VoiceControlReplyKind.ERROR
-                    if self.last_work_status == "error"
-                    else VoiceControlReplyKind.COMPLETED
-                )
-                reply = None
-            elif expected_work is not None and reply is None:
-                await self._send_work_state(VoiceWorkUiStatus.RUNNING)
-            spoken_reply = (
-                reply
-                if reply is not None
-                else voice_work_reply_factory.create_control(call.utterance, kind)
-            )
-            await self._record_control_turn(call.utterance, spoken_reply)
+                kind = "error" if self.last_work_status == "error" else "completed"
+            reply = _voice_work_reply(call.utterance, kind)
+            await self._record_control_turn(call.utterance, reply)
             outcome = VoiceAgentOutcome(
                 status="action_handled",
-                spoken_reply=spoken_reply,
+                spoken_reply=reply,
                 conversation_id=self.usage_scope["conversation_id"],
                 agent_id=self.usage_scope["agent_id"],
             )
@@ -1449,173 +1219,35 @@ class BrowserVoiceSession:
                 outcome,
                 retry_silent_audio=True,
             )
-
-    async def _decide_work_followup(
-        self,
-        call: BridgeCall,
-        receipt: VoiceWorkReceipt,
-    ) -> VoiceWorkDecision | None:
-        if call.action is not None and self.route_work_action is not None:
-            return await self.route_work_action(
-                call.utterance,
-                receipt,
-                call.action,
-            )
-        if self.route_followup is not None:
-            return await self.route_followup(call.utterance, receipt)
-        return None
-
-    async def _route_active_work_followup(
-        self,
-        generation: int,
-        call: BridgeCall,
-        work: BrowserAgentWork,
-    ) -> VoiceWorkDecision | None:
-        """Handle local status/control decisions without a second Chat Agent."""
-
-        if work.receipt is None:
-            return None
-        with voice_latency_span(
-            self.log_latency,
-            "foreground_route",
-            generation=generation,
-        ):
-            decision = await self._decide_work_followup(call, work.receipt)
-        if decision is None:
-            return None
-        if decision.action is VoiceWorkAction.QUEUE:
-            return decision
-        if decision.action in {VoiceWorkAction.STATUS, VoiceWorkAction.CLARIFY}:
-            await self._reply_about_work(
-                generation,
-                call,
-                kind=VoiceControlReplyKind.PROGRESS,
-                expected_work=work,
-                reply=decision.reply,
-            )
-            return decision
-        if self.cancel_work is None:
-            return None
-
-        async with self.foreground_delivery_lock:
-            if self.active_agent_work is not work:
-                return None
-            replacement: VoiceWorkReceipt | None = None
-            if decision.action is VoiceWorkAction.REPLACE:
-                replacement = await self._admit_agent_work(
-                    generation,
-                    call.utterance,
-                )
-            was_acknowledged = work.acknowledged
-            with voice_latency_span(
-                self.log_latency,
-                "work_cancel",
-                generation=generation,
-            ):
-                interrupted = await self.cancel_work(work.receipt, replacement)
-            if decision.superseded_by:
-                self.suppressed_work_ids.add(decision.superseded_by)
-            if not interrupted:
-                # The Agent completed between routing and cancellation. Refresh
-                # the local reply so we do not claim that completed work stopped.
-                refreshed = await self._decide_work_followup(call, work.receipt)
-                if refreshed is not None:
-                    decision = refreshed
-            work.suppress_delivery = True
-            work.acknowledged = was_acknowledged or interrupted
-            if interrupted and not was_acknowledged and not work.receipt.recovered:
-                await self.engine.send_function_outcome(
-                    work.call,
-                    VoiceAgentOutcome(
-                        status="cancelled",
-                        spoken_reply="",
-                        conversation_id=self.usage_scope["conversation_id"],
-                        agent_id=self.usage_scope["agent_id"],
-                    ),
-                )
-            if replacement is not None:
-                self.queued_agent_calls.append(
-                    QueuedBrowserAgentCall(
-                        generation=generation,
-                        call=call,
-                        receipt=replacement,
-                    )
-                )
-            outcome = VoiceAgentOutcome(
-                status="action_handled",
-                spoken_reply=decision.reply,
-                conversation_id=self.usage_scope["conversation_id"],
-                agent_id=self.usage_scope["agent_id"],
-            )
-            await self.engine.send_function_outcome(call, outcome)
-            await self._send_work_state(
-                VoiceWorkUiStatus.QUEUED
-                if replacement
-                else VoiceWorkUiStatus.CANCELLED
-                if interrupted
-                else VoiceWorkUiStatus.COMPLETED
-            )
-            # Replacement already has its durable user receipt. Save only the
-            # spoken foreground confirmation to avoid a duplicate user bubble.
-            await self._record_control_turn(
-                "" if replacement is not None else call.utterance,
-                decision.reply,
-            )
-            await self._send_spoken_turn(
-                generation,
-                outcome,
-                retry_silent_audio=True,
-            )
-            return decision
 
     async def _queue_followup_agent_call(
         self,
         generation: int,
         call: BridgeCall,
-        receipt: VoiceWorkReceipt | None,
-        *,
-        reply: str | None = None,
     ) -> bool:
-        """Retain a new instruction while another Agent runs."""
+        """Acknowledge and retain a new instruction while another Agent runs."""
 
         async with self.foreground_delivery_lock:
             if self.active_agent_work is None:
                 return False
             self.queued_agent_calls.append(
-                QueuedBrowserAgentCall(
-                    generation=generation,
-                    call=call,
-                    receipt=receipt,
-                )
+                QueuedBrowserAgentCall(generation=generation, call=call)
             )
+            reply = _voice_work_reply(call.utterance, "queued")
             outcome = VoiceAgentOutcome(
                 status="action_handled",
-                spoken_reply=(
-                    ""
-                    if receipt and receipt.recovered
-                    else (
-                        reply
-                        if reply is not None
-                        else voice_work_reply_factory.create_control(
-                            call.utterance,
-                            VoiceControlReplyKind.QUEUED,
-                        )
-                    )
-                ),
+                spoken_reply=reply,
                 conversation_id=self.usage_scope["conversation_id"],
                 agent_id=self.usage_scope["agent_id"],
             )
             # Close the provider function call now. The queued Chat Agent result
             # is delivered as speech later and must not reuse the function id.
-            if not (receipt and receipt.recovered):
-                await self.engine.send_function_outcome(call, outcome)
-                await self._send_spoken_turn(
-                    generation,
-                    outcome,
-                    retry_silent_audio=True,
-                    expose_text_immediately=True,
-                )
-            await self._send_work_state(VoiceWorkUiStatus.QUEUED)
+            await self.engine.send_function_outcome(call, outcome)
+            await self._send_spoken_turn(
+                generation,
+                outcome,
+                retry_silent_audio=True,
+            )
             return True
 
     def _create_agent_work(
@@ -1623,7 +1255,6 @@ class BrowserVoiceSession:
         generation: int,
         call: BridgeCall,
         *,
-        receipt: VoiceWorkReceipt | None = None,
         acknowledged: bool = False,
         timing: VoiceTurnTiming | None = None,
     ) -> BrowserAgentWork:
@@ -1640,17 +1271,11 @@ class BrowserVoiceSession:
                 generation=generation,
                 ended_at=started_at,
             )
-        agent_task = (
-            self.execute_work(receipt)
-            if receipt is not None and self.execute_work is not None
-            else self.agent(call.utterance)
-        )
         work = BrowserAgentWork(
             generation=generation,
             call=call,
-            task=asyncio.create_task(agent_task),
+            task=asyncio.create_task(self.agent(call.utterance)),
             started_at=started_at,
-            receipt=receipt,
             acknowledged=acknowledged,
         )
         self.active_agent_work = work
@@ -1661,29 +1286,18 @@ class BrowserVoiceSession:
         if self.active_agent_work is not work:
             return
         self.active_agent_work = None
-        queued = None
-        while self.queued_agent_calls:
-            candidate = self.queued_agent_calls.popleft()
-            if (
-                candidate.receipt is not None
-                and candidate.receipt.id in self.suppressed_work_ids
-            ):
-                self.suppressed_work_ids.discard(candidate.receipt.id)
-                continue
-            queued = candidate
-            break
-        if queued is None:
+        if not self.queued_agent_calls:
             self.turn_idle.set()
             return
+        queued = self.queued_agent_calls.popleft()
         next_work = self._create_agent_work(
             queued.generation,
             queued.call,
-            receipt=queued.receipt,
             acknowledged=True,
         )
         completion = asyncio.create_task(self._deliver_agent_work(next_work))
         self._track_agent_completion(completion)
-        await self._send_work_state(VoiceWorkUiStatus.RUNNING)
+        await self._send_work_state("running")
 
     async def _deliver_agent_work(
         self,
@@ -1717,10 +1331,7 @@ class BrowserVoiceSession:
                 )
                 outcome = VoiceAgentOutcome(
                     status="error",
-                    spoken_reply=voice_work_reply_factory.create_control(
-                        work.call.utterance,
-                        VoiceControlReplyKind.ERROR,
-                    ),
+                    spoken_reply=_voice_work_reply(work.call.utterance, "error"),
                     conversation_id=self.usage_scope["conversation_id"],
                     agent_id=self.usage_scope["agent_id"],
                 )
@@ -1738,7 +1349,6 @@ class BrowserVoiceSession:
                 raise RuntimeError("Voice conversation changed during call")
             self.last_work_completed_at = completed_at
             self.last_work_status = outcome.status
-            self.last_work_receipt = work.receipt
             if self.closing:
                 self.finish_turn_timing(
                     work.generation,
@@ -1750,25 +1360,17 @@ class BrowserVoiceSession:
             async with self.foreground_delivery_lock:
                 if not self.closing:
                     delivery_generation = self.generation
-                    suppressed = work.suppress_delivery or outcome.status == "cancelled"
-                    if work.acknowledged and not work.suppress_delivery:
+                    if work.acknowledged:
                         await self._send_work_state(
-                            VoiceWorkUiStatus.FAILED
-                            if outcome.status == "error"
-                            else VoiceWorkUiStatus.CANCELLED
-                            if outcome.status == "cancelled"
-                            else VoiceWorkUiStatus.COMPLETED
+                            "failed" if outcome.status == "error" else "completed"
                         )
-                    if not work.acknowledged and not (
-                        work.receipt and work.receipt.recovered
-                    ):
+                    if not work.acknowledged:
                         await self.engine.send_function_outcome(work.call, outcome)
-                    if not suppressed:
-                        await self._send_spoken_turn(
-                            delivery_generation,
-                            outcome,
-                            retry_silent_audio=True,
-                        )
+                    await self._send_spoken_turn(
+                        delivery_generation,
+                        outcome,
+                        retry_silent_audio=True,
+                    )
                 await self._advance_agent_queue_locked(work)
                 advanced = True
         except asyncio.CancelledError:
@@ -1789,62 +1391,67 @@ class BrowserVoiceSession:
         generation: int,
         call: BridgeCall,
         timing: VoiceTurnTiming,
-        receipt: VoiceWorkReceipt | None = None,
     ) -> None:
-        work = self._create_agent_work(
-            generation,
-            call,
-            timing=timing,
-            receipt=receipt,
-            acknowledged=True,
-        )
-        # Work becomes background work at admission, not after an arbitrary
-        # timer. The Voice foreground returns to listening immediately and can
-        # route later utterances against this receipt's real state/output.
+        work = self._create_agent_work(generation, call, timing=timing)
+        started_at = work.started_at
+        task = work.task
         try:
-            await self._send_work_state(VoiceWorkUiStatus.RUNNING)
-            if (
-                not (receipt and receipt.recovered)
-                and receipt is not None
-                and call.call_id is not None
-                and call.transcript_sent
-            ):
-                result = LiveVoiceToolResult.WORK_ACCEPTED
-                await self.engine.send_function_result(
-                    call,
-                    live_voice_session_factory.tool_result(result),
-                )
-                self._queue_live_tool_result_response(
-                    generation,
-                    result,
-                )
-            else:
-                if not (receipt and receipt.recovered):
-                    await self.engine.send_function_outcome(
-                        call,
-                        VoiceAgentOutcome(
-                            status="action_handled",
-                            spoken_reply="",
-                            conversation_id=self.usage_scope["conversation_id"],
-                            agent_id=self.usage_scope["agent_id"],
-                        ),
-                    )
-                await self.ws.send_json(
-                    {"type": "listening", "generation": generation}
-                )
-        finally:
+            outcome = await asyncio.wait_for(
+                asyncio.shield(task),
+                timeout=BACKGROUND_ACK_AFTER_SECONDS,
+            )
+        except TimeoutError:
+            if task.done():
+                try:
+                    outcome = task.result()
+                except BaseException as error:
+                    await self._deliver_agent_work(work, error=error)
+                else:
+                    await self._deliver_agent_work(work, outcome=outcome)
+                return
+            work.acknowledged = True
+            acknowledgement = VoiceAgentOutcome(
+                status="action_handled",
+                spoken_reply=_voice_work_reply(call.utterance, "ack"),
+                conversation_id=self.usage_scope["conversation_id"],
+                agent_id=self.usage_scope["agent_id"],
+            )
+            self.log_latency(
+                "agent_ack",
+                started_at,
+                generation=generation,
+            )
+            await self._send_work_state("running")
+            await self.engine.send_function_outcome(call, acknowledgement)
+            await self._send_spoken_turn(
+                generation,
+                acknowledgement,
+                retry_silent_audio=True,
+            )
             completion = asyncio.create_task(self._deliver_agent_work(work))
             self._track_agent_completion(completion)
+        except asyncio.CancelledError:
+            # The bounded hangup path owns cancellation. asyncio.shield keeps
+            # an admitted Chat request alive during normal transport teardown,
+            # but once its settlement deadline expires the underlying task
+            # must also stop and the infinite turn worker must stay cancelled.
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            if self.active_agent_work is work:
+                self.active_agent_work = None
+                self.turn_idle.set()
+            raise
+        except BaseException as error:
+            await self._deliver_agent_work(work, error=error)
+        else:
+            await self._deliver_agent_work(work, outcome=outcome)
 
     async def run_turns(self):
         while True:
-            queued_turn = await self.turns.get()
-            generation, call = queued_turn[:2]
-            receipt = queued_turn[2] if len(queued_turn) > 2 else None
-            recovered = bool(receipt and receipt.recovered)
+            generation, call = await self.turns.get()
             if self.closing:
                 return
-            if not recovered and generation != self.generation:
+            if generation != self.generation:
                 await self.discard_bridge_call(call)
                 continue
             try:
@@ -1862,7 +1469,7 @@ class BrowserVoiceSession:
                 raise
             if self.closing:
                 return
-            if not recovered and generation != self.generation:
+            if generation != self.generation:
                 await self.discard_bridge_call(call)
                 continue
             try:
@@ -1870,126 +1477,50 @@ class BrowserVoiceSession:
                     generation,
                     VoiceTurnTiming(turn_id=generation),
                 )
-                if not (receipt and receipt.recovered) and not call.transcript_sent:
-                    await self.ws.send_json(
-                        {
-                            "type": "transcript",
-                            "role": "user",
-                            "text": call.utterance,
-                            "generation": generation,
-                        }
-                    )
+                await self.ws.send_json(
+                    {
+                        "type": "transcript",
+                        "role": "user",
+                        "text": call.utterance,
+                        "generation": generation,
+                    }
+                )
                 active_work = self.active_agent_work
                 if active_work is not None:
-                    control_kind = voice_call_control_kind(call.utterance)
-                    if control_kind is not None:
-                        await self._reply_about_work(
-                            generation,
-                            call,
-                            kind=control_kind,
-                            expected_work=active_work,
-                        )
-                        continue
-                    decision = await self._route_active_work_followup(
-                        generation,
-                        call,
-                        active_work,
-                    )
-                    if (
-                        decision is not None
-                        and decision.action is not VoiceWorkAction.QUEUE
-                    ):
-                        continue
                     if is_voice_progress_query(call.utterance):
                         await self._reply_about_work(
                             generation,
                             call,
-                            kind=VoiceControlReplyKind.PROGRESS,
+                            kind="progress",
                             expected_work=active_work,
                         )
                         continue
-                    if receipt is None:
-                        receipt = await self._admit_agent_work(
-                            generation,
-                            call.utterance,
-                        )
-                    if await self._queue_followup_agent_call(
-                        generation,
-                        call,
-                        receipt,
-                        reply=decision.reply if decision is not None else None,
-                    ):
+                    if await self._queue_followup_agent_call(generation, call):
                         continue
                 if (
-                    (
-                        call.action is VoiceWorkAction.STATUS
-                        or is_voice_progress_query(call.utterance)
-                    )
+                    is_voice_progress_query(call.utterance)
                     and self.last_work_completed_at is not None
                     and time.monotonic() - self.last_work_completed_at
                     <= RECENT_WORK_STATUS_SECONDS
                 ):
                     self.turn_idle.clear()
                     try:
-                        recent_reply = None
-                        if self.last_work_receipt is not None and (
-                            self.route_work_action is not None
-                            or self.route_followup is not None
-                        ):
-                            recent_decision = (
-                                await self.route_work_action(
-                                    call.utterance,
-                                    self.last_work_receipt,
-                                    VoiceWorkAction.STATUS,
-                                )
-                                if self.route_work_action is not None
-                                else await self.route_followup(
-                                    call.utterance,
-                                    self.last_work_receipt,
-                                )
-                            )
-                            recent_reply = recent_decision.reply
                         await self._reply_about_work(
                             generation,
                             call,
                             kind=(
-                                VoiceControlReplyKind.ERROR
+                                "error"
                                 if self.last_work_status == "error"
-                                else VoiceControlReplyKind.COMPLETED
+                                else "completed"
                             ),
-                            reply=recent_reply,
                         )
                     finally:
                         self.turn_idle.set()
                     continue
-                if call.action in {
-                    VoiceWorkAction.STATUS,
-                    VoiceWorkAction.CANCEL,
-                }:
-                    self.turn_idle.clear()
-                    try:
-                        await self._reply_about_work(
-                            generation,
-                            call,
-                            kind=VoiceControlReplyKind.IDLE,
-                        )
-                    finally:
-                        self.turn_idle.set()
-                    continue
-                if receipt is None:
-                    receipt = await self._admit_agent_work(
-                        generation,
-                        call.utterance,
-                    )
                 # The standard Chat Agent remains authoritative for messages,
-                # approvals, tools and credit usage. It starts in the background
-                # immediately so elapsed time never controls conversation flow.
-                await self._start_agent_work(
-                    generation,
-                    call,
-                    timing,
-                    receipt,
-                )
+                # approvals, tools and credit usage. Slow work is detached from
+                # the foreground phone turn after a short acknowledgement.
+                await self._start_agent_work(generation, call, timing)
             except BaseException as error:
                 self.finish_turn_timing(
                     generation,

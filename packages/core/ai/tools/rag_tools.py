@@ -6,15 +6,15 @@ documents bound to a specific workspace (everything else in the entity is
 filtered out).
 
 Indexing is NOT an agent concern — it happens automatically when documents
-are uploaded or when files created via ``generate_file`` are picked up by the
+are uploaded or when files written via ``write_file`` are picked up by the
 ingest watcher. There is no ``index_document`` tool.
 
 ``search_documents`` and ``list_documents`` remain metadata-only document
 inventory tools; they are not RAG aliases and their filename matches are not
 evidence of document contents. Agents who need document metadata use
 ``manor({action: "list_documents"})``; agents who need to produce final
-deliverable files use ``generate_file`` and existing files use ``patch_file``;
-both persist through the Runtime Knowledge projection boundary.
+deliverable files can use ``generate_document_file``; agents doing low-level
+file I/O should use ``write_file`` and let the watcher index it.
 """
 from __future__ import annotations
 

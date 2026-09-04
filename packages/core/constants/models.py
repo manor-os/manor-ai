@@ -374,6 +374,22 @@ VIDEO_MODEL_CAPABILITIES = {
         "audio_reference": False,
         "max_audio_references": 0,
     },
+    "atlascloud/wan-2.2-turbo-spicy": {
+        "text_to_video": False,
+        "requires_first_frame": True,
+        "first_frame": True,
+        "last_frame": False,
+        "reference_images": False,
+        "max_reference_images": 0,
+        "reference_videos": False,
+        "max_reference_videos": 0,
+        "native_audio": False,
+        "native_dialogue": False,
+        "native_narration": False,
+        "native_subtitles": False,
+        "audio_reference": False,
+        "max_audio_references": 0,
+    },
 }
 
 DEFAULT_VIDEO_MODEL_CAPABILITIES = {

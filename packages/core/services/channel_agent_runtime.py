@@ -30,7 +30,6 @@ class ChannelAgentRunResult:
     content: str
     runtime_meta: dict[str, Any] | None = None
     runtime_envelope: Any | None = None
-    stop_reason: str | None = None
 
 
 async def run_channel_agent_turn(
@@ -133,10 +132,6 @@ async def run_channel_agent_turn(
             bound_tool_names=runtime.bound_tool_names,
             is_master=runtime.is_master,
             mcp_allowed_names=runtime.mcp_allowed_names,
-            mcp_provider_scopes=getattr(runtime, "mcp_provider_scopes", ()),
-            mcp_scope_unrestricted=bool(
-                getattr(runtime, "mcp_scope_unrestricted", False)
-            ),
             active_user_message=current_message,
             legacy_extra_context=runtime.extra_context,
             extra_tool_schemas=extra_tool_schemas,
@@ -156,43 +151,6 @@ async def run_channel_agent_turn(
         attachment_handler = None
 
     system_prompt = runtime_merge_prompt_appendix(base_prompt, appendix)
-
-    is_cancelled = None
-    if (
-        (runtime_metadata or {}).get("voice_session_mode") == "chat_gateway"
-        and (runtime_metadata or {}).get("voice_origin_message_id")
-    ):
-        from packages.core.services.voice.work_queue import (
-            voice_work_was_interrupted,
-        )
-
-        voice_origin_message_id = str(
-            (runtime_metadata or {}).get("voice_origin_message_id")
-        )
-        twilio_call_session_id = str(
-            (runtime_metadata or {}).get("twilio_call_session_id") or ""
-        ).strip()
-
-        async def voice_turn_cancelled() -> bool:
-            async with async_session() as cancel_db:
-                interrupted = await voice_work_was_interrupted(
-                    cancel_db,
-                    message_id=voice_origin_message_id,
-                    conversation_id=conversation_id,
-                )
-                if interrupted or not twilio_call_session_id:
-                    return interrupted
-                from packages.core.services.voice.binding import (
-                    twilio_call_binding_is_valid,
-                )
-
-                return not await twilio_call_binding_is_valid(
-                    cancel_db,
-                    twilio_call_session_id,
-                    conversation_id=conversation_id,
-                )
-
-        is_cancelled = voice_turn_cancelled
 
     result = await runtime_execute_channel_agent_loop(
         runtime_envelope=runtime_envelope,
@@ -218,17 +176,14 @@ async def run_channel_agent_turn(
             if attachment_handler is not None
             else None
         ),
-        is_cancelled=is_cancelled,
     )
     content = (result.content or "").strip()
-    stop_reason = str(getattr(result, "stop_reason", "") or "").strip() or None
-    if not content and stop_reason not in {"cancelled", "canceled"}:
+    if not content:
         return None
     return ChannelAgentRunResult(
         content=content,
         runtime_meta=runtime_envelope_meta(runtime_envelope),
         runtime_envelope=runtime_envelope,
-        stop_reason=stop_reason,
     )
 
 

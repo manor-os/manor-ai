@@ -265,32 +265,3 @@ async def cancel_pending_call_sessions(
     )
     await db.flush()
     return int(result.rowcount or 0)
-
-
-async def cancel_unconnected_call_sessions_for_binding(
-    db: AsyncSession,
-    *,
-    channel_config_id: str,
-    channel_binding_id: str,
-    reason: str,
-) -> int:
-    """Cancel only unconnected calls frozen to one changed Voice binding."""
-
-    if not channel_config_id or not channel_binding_id:
-        return 0
-    result = await db.execute(
-        update(TwilioVoiceCallSession)
-        .where(
-            TwilioVoiceCallSession.channel_config_id == channel_config_id,
-            TwilioVoiceCallSession.status.in_(("pending", "connecting")),
-            TwilioVoiceCallSession.metadata_json["channel_binding_id"].astext
-            == channel_binding_id,
-        )
-        .values(
-            status="canceled",
-            ended_at=_now(),
-            error_message=str(reason)[:500],
-        )
-    )
-    await db.flush()
-    return int(result.rowcount or 0)

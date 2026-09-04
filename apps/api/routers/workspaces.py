@@ -407,28 +407,6 @@ class SetupFinalizeRequest(BaseModel):
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
-
-async def _cancel_unconnected_twilio_binding_calls(
-    db: AsyncSession,
-    *,
-    channel_config: ChannelConfig,
-    channel_binding_id: str,
-    reason: str,
-) -> None:
-    if channel_config.channel_type != "twilio_voice":
-        return
-    from packages.core.services.voice.call_sessions import (
-        cancel_unconnected_call_sessions_for_binding,
-    )
-
-    await cancel_unconnected_call_sessions_for_binding(
-        db,
-        channel_config_id=channel_config.id,
-        channel_binding_id=channel_binding_id,
-        reason=reason,
-    )
-
-
 def _user_display_name(user: User | None) -> str | None:
     if not user:
         return None
@@ -3529,20 +3507,6 @@ async def attach_workspace_channel(
             agent_ids=(resolved_agent_id,),
         )
     if existing:
-        if (
-            existing.agent_id != resolved_agent_id
-            or existing.agent_subscription_id != (sub.id if sub else None)
-            or existing.workspace_id != workspace_id
-            or existing.status != "active"
-        ):
-            await _cancel_unconnected_twilio_binding_calls(
-                db,
-                channel_config=channel_config,
-                channel_binding_id=existing.id,
-                reason=(
-                    "Twilio Voice Agent binding changed before the call connected."
-                ),
-            )
         existing.agent_id = resolved_agent_id
         existing.agent_subscription_id = sub.id if sub else None
         existing.name = req.name or existing.name or channel_config.name or channel_config.channel_type
@@ -3710,18 +3674,6 @@ async def update_workspace_channel(
     if req.name is not None:
         binding.name = req.name.strip() or binding.name
     if routing_requested:
-        if (
-            binding.agent_id != resolved_agent_id
-            or binding.agent_subscription_id != (sub.id if sub else None)
-        ):
-            await _cancel_unconnected_twilio_binding_calls(
-                db,
-                channel_config=channel_config,
-                channel_binding_id=binding.id,
-                reason=(
-                    "Twilio Voice Agent binding changed before the call connected."
-                ),
-            )
         binding.agent_id = resolved_agent_id
         binding.agent_subscription_id = sub.id if sub else None
     binding.config = binding_config
@@ -3782,22 +3734,6 @@ async def remove_workspace_channel(
     if not binding:
         raise HTTPException(404, "Channel binding not found")
     cc_id = (binding.config or {}).get("channel_config_id")
-    if cc_id:
-        channel_config = await db.scalar(
-            select(ChannelConfig).where(
-                ChannelConfig.id == cc_id,
-                ChannelConfig.entity_id == user.entity_id,
-            )
-        )
-        if channel_config is not None:
-            await _cancel_unconnected_twilio_binding_calls(
-                db,
-                channel_config=channel_config,
-                channel_binding_id=binding.id,
-                reason=(
-                    "Twilio Voice Agent binding was removed before the call connected."
-                ),
-            )
     await db.delete(binding)
     if cc_id:
         cc = (await db.execute(

@@ -2,7 +2,6 @@ import {
   presentationTextEditSpans,
   presentationTextEditSpansFromSourceMap,
   presentationTextEditSpansForSource,
-  reconcilePresentationTextSourceMap,
   type PresentationTextSourceMap,
 } from "./presentationTextEdits";
 import {
@@ -38,8 +37,6 @@ interface PresentationText {
   fontFamily?: string;
   bullet?: string;
   indent?: number;
-  indentRight?: number;
-  hanging?: number;
   lineSpacing?: number;
   spaceBefore?: number;
   spaceAfter?: number;
@@ -63,9 +60,6 @@ interface PresentationTableCell {
   text: string;
   sourceMap?: PresentationTextSourceMap;
   bold?: boolean;
-  italic?: boolean;
-  fontSize?: number;
-  fontFamily?: string;
   color?: string;
   fill?: string;
   gridSpan?: number;
@@ -87,18 +81,15 @@ export interface PreservePresentationShape {
   opacity?: number;
   stroke?: string;
   strokeWidth?: number;
-  strokeDash?: string;
   presetGeom?: string;
   borderRadius?: number;
   shadow?: { blur: number; dist: number; angle: number; color: string; alpha: number };
   vAlign?: "top" | "middle" | "bottom";
-  wordWrap?: boolean;
   padding?: { l: number; t: number; r: number; b: number };
   imgCrop?: { l: number; t: number; r: number; b: number };
   texts: PresentationText[];
   tableRows?: PresentationTableCell[][];
   tableColWidths?: number[];
-  tableRowHeights?: number[];
   imgUrl?: string;
   hyperlink?: string;
   imageFit?: "cover" | "contain" | "fill";
@@ -251,113 +242,62 @@ function presentationFillXml(shape: PreservePresentationShape): string {
 
 function presentationLineXml(shape: PreservePresentationShape): string {
   if (!shape.stroke || (shape.strokeWidth ?? 0) <= 0) return "<a:ln><a:noFill/></a:ln>";
-  return `<a:ln w="${Math.max(1, Math.round((shape.strokeWidth || 1) * 12_700))}"><a:solidFill>${presentationColorXml(shape.stroke)}</a:solidFill><a:prstDash val="${escapeXml(shape.strokeDash || "solid")}"/></a:ln>`;
-}
-
-/** Direct child spans keep nested texture/extension markup out of style edits. */
-function shapePropertyChildren(xml: string): Array<{ start: number; end: number; xml: string }> {
-  const children: Array<{ start: number; end: number; xml: string }> = [];
-  let depth = 0;
-  let start = 0;
-  for (const match of xml.matchAll(/<!--[\s\S]*?-->|<!\[CDATA\[[\s\S]*?\]\]>|<\/?[\w:.-]+(?:[^>"']|"[^"]*"|'[^']*')*>/g)) {
-    const token = match[0];
-    if (token.startsWith("<!")) continue;
-    const end = match.index! + token.length;
-    if (token.startsWith("</")) {
-      depth -= 1;
-      if (depth === 1) children.push({ start, end, xml: xml.slice(start, end) });
-    } else {
-      if (depth === 1) {
-        start = match.index!;
-        if (token.endsWith("/>")) children.push({ start, end, xml: token });
-      }
-      if (!token.endsWith("/>")) depth += 1;
-    }
-  }
-  return children;
-}
-
-function patchDirectXmlChild(
-  parentXml: string,
-  pattern: RegExp,
-  replacement: string,
-  following: RegExp,
-): string {
-  const children = shapePropertyChildren(parentXml);
-  const existing = children.find((child) => child.xml.search(pattern) === 0);
-  if (existing) {
-    return `${parentXml.slice(0, existing.start)}${replacement}${parentXml.slice(existing.end)}`;
-  }
-  if (!replacement) return parentXml;
-  const next = children.find((child) => child.xml.search(following) === 0);
-  if (next) return `${parentXml.slice(0, next.start)}${replacement}${parentXml.slice(next.start)}`;
-  const tagName = parentXml.match(/^<([A-Za-z_][\w:.-]*)\b/)?.[1];
-  if (!tagName) return parentXml;
-  return parentXml.replace(new RegExp(`</${tagName}>\\s*$`, "i"), `${replacement}</${tagName}>`);
+  return `<a:ln w="${Math.max(1, Math.round((shape.strokeWidth || 1) * 12_700))}"><a:solidFill>${presentationColorXml(shape.stroke)}</a:solidFill><a:prstDash val="solid"/></a:ln>`;
 }
 
 function patchDirectShapeProperty(
   shapeProperties: string,
   pattern: RegExp,
   replacement: string,
-  following: RegExp,
 ): string {
-  return patchDirectXmlChild(shapeProperties, pattern, replacement, following);
+  if (pattern.test(shapeProperties)) return shapeProperties.replace(pattern, replacement);
+  return shapeProperties.replace(/<\/p:spPr>\s*$/i, `${replacement}</p:spPr>`);
 }
 
 function patchDirectShapeFill(shapeProperties: string, replacement: string): string {
-  return patchDirectShapeProperty(shapeProperties, /<a:(?:noFill|solidFill|gradFill|blipFill|pattFill|grpFill)\b/i, replacement, /<a:(?:ln|effectLst|effectDag|scene3d|sp3d|extLst)\b/i);
+  const fillPattern = /<a:(?:noFill|solidFill|gradFill|pattFill)\b[^>]*(?:\/>|>[\s\S]*?<\/a:(?:solidFill|gradFill|pattFill)>)/ig;
+  const lineIndex = shapeProperties.search(/<a:ln\b/i);
+  for (const match of shapeProperties.matchAll(fillPattern)) {
+    if (lineIndex < 0 || match.index! < lineIndex) {
+      return `${shapeProperties.slice(0, match.index)}${replacement}${shapeProperties.slice(match.index! + match[0].length)}`;
+    }
+  }
+  if (lineIndex >= 0) return `${shapeProperties.slice(0, lineIndex)}${replacement}${shapeProperties.slice(lineIndex)}`;
+  return shapeProperties.replace(/<\/p:spPr>\s*$/i, `${replacement}</p:spPr>`);
 }
 
-function patchShapeFormatting(element: string, shape: PreservePresentationShape, original: PreservePresentationShape): string {
+function patchShapeFormatting(element: string, shape: PreservePresentationShape): string {
   const shapeProperties = element.match(/<p:spPr\b[^>]*(?:\/>|>[\s\S]*?<\/p:spPr>)/i)?.[0];
   if (!shapeProperties) return element;
-  let patched = shapeProperties.replace(/\/>$/, "></p:spPr>");
-  const changed = (...keys: Array<keyof PreservePresentationShape>) => !sameValue(keys.map((key) => original[key]), keys.map((key) => shape[key]));
-  if (changed("fill", "gradFill")) patched = patchDirectShapeFill(patched, presentationFillXml(shape));
-  if (changed("stroke", "strokeWidth", "strokeDash")) {
-    const pattern = /<a:ln\b[^>]*?(?:\/>|>[\s\S]*?<\/a:ln>)/i;
-    let line = shapePropertyChildren(patched).find((child) => child.xml.search(pattern) === 0)?.xml;
-    if (!line) line = presentationLineXml(shape);
-    else {
-      line = line.replace(/\/>$/, "></a:ln>");
-      if (changed("strokeWidth")) line = line.replace(/^<a:ln\b[^>]*>/, (opening) => setXmlAttribute(opening, "w", String(Math.round((shape.strokeWidth ?? 1) * 12700))));
-      if (changed("stroke")) {
-        const fill = shape.stroke ? `<a:solidFill>${presentationColorXml(shape.stroke)}</a:solidFill>` : "<a:noFill/>";
-        const fillPattern = /<a:(?:noFill|solidFill|gradFill|blipFill|pattFill)\b[^>]*?(?:\/>|>[\s\S]*?<\/a:(?:noFill|solidFill|gradFill|blipFill|pattFill)>)/i;
-        line = fillPattern.test(line) ? line.replace(fillPattern, fill) : line.replace(/^<a:ln\b[^>]*>/, `$&${fill}`);
-      }
-      if (changed("strokeDash")) {
-        line = line.replace(/<a:(?:prstDash|custDash)\b[^>]*?(?:\/>|>[\s\S]*?<\/a:(?:prstDash|custDash)>)/ig, "");
-        line = line.replace(/<a:(?:round|bevel|miter|headEnd|tailEnd|extLst)\b|<\/a:ln>/i, `<a:prstDash val="${escapeXml(shape.strokeDash || "solid")}"/>$&`);
-      }
-    }
-    patched = patchDirectShapeProperty(patched, pattern, line, /<a:(?:effectLst|effectDag|scene3d|sp3d|extLst)\b/i);
-  }
-  if (changed("presetGeom", "borderRadius")) {
-    patched = patchDirectShapeProperty(patched, /<a:(?:prstGeom|custGeom)\b[^>]*?(?:\/>|>[\s\S]*?<\/a:(?:prstGeom|custGeom)>)/i, presentationGeometryXml(shape), /<a:(?:noFill|solidFill|gradFill|blipFill|pattFill|grpFill|ln|effectLst|effectDag|scene3d|sp3d|extLst)\b/i);
-  }
-  if (changed("shadow")) {
-    if (/<a:effectDag\b/i.test(patched)) throw new PresentationPreservationError("Editing a complex shape effect graph is not supported.");
-    const pattern = /<a:effectLst\b[^>]*?(?:\/>|>[\s\S]*?<\/a:effectLst>)/i;
-    let effects = (shapePropertyChildren(patched).find((child) => child.xml.search(pattern) === 0)?.xml || "<a:effectLst/>").replace(/\/>$/, "></a:effectLst>");
-    effects = effects.replace(/<a:outerShdw\b[^>]*?(?:\/>|>[\s\S]*?<\/a:outerShdw>)/i, "");
-    if (shape.shadow) {
-      const shadow = `<a:outerShdw blurRad="${Math.round(Math.max(0, shape.shadow.blur) * 12_700)}" dist="${Math.round(Math.max(0, shape.shadow.dist) * 12_700)}" dir="${Math.round((((shape.shadow.angle || 0) % 360) + 360) % 360 * 60_000)}">${presentationColorXml(shape.shadow.color, shape.shadow.alpha)}</a:outerShdw>`;
-      effects = effects.replace(/<a:(?:prstShdw|reflection|softEdge)\b|<\/a:effectLst>/i, `${shadow}$&`);
-    }
+  let patched = shapeProperties;
+  patched = patchDirectShapeFill(patched, presentationFillXml(shape));
+  patched = patchDirectShapeProperty(
+    patched,
+    /<a:ln\b[^>]*(?:\/>|>[\s\S]*?<\/a:ln>)/i,
+    presentationLineXml(shape),
+  );
+  const geometry = presentationGeometryXml(shape);
+  patched = patchDirectShapeProperty(
+    patched,
+    /<a:prstGeom\b[^>]*(?:\/>|>[\s\S]*?<\/a:prstGeom>)/i,
+    geometry,
+  );
+  if (shape.shadow) {
+    const shadow = `<a:effectLst><a:outerShdw blurRad="${Math.round(Math.max(0, shape.shadow.blur) * 12_700)}" dist="${Math.round(Math.max(0, shape.shadow.dist) * 12_700)}" dir="${Math.round((((shape.shadow.angle || 0) % 360) + 360) % 360 * 60_000)}">${presentationColorXml(shape.shadow.color, shape.shadow.alpha)}</a:outerShdw></a:effectLst>`;
     patched = patchDirectShapeProperty(
-      patched, pattern, effects, /<a:(?:scene3d|sp3d|extLst)\b/i,
+      patched,
+      /<a:effectLst\b[^>]*(?:\/>|>[\s\S]*?<\/a:effectLst>)/i,
+      shadow,
     );
+  } else {
+    patched = patched.replace(/<a:effectLst\b[^>]*(?:\/>|>[\s\S]*?<\/a:effectLst>)/i, "");
   }
   let output = element.replace(shapeProperties, patched);
-  if (!changed("vAlign", "padding", "wordWrap")) return output;
   output = output.replace(/<a:bodyPr\b[^>]*\/?\s*>/i, (bodyPr) => {
     const anchor = shape.vAlign === "middle" ? "ctr" : shape.vAlign === "bottom" ? "b" : "t";
-    let next = changed("vAlign") ? setXmlAttribute(bodyPr, "anchor", anchor) : bodyPr;
-    if (changed("wordWrap")) next = setXmlAttribute(next, "wrap", shape.wordWrap === false ? "none" : "square");
+    let next = setXmlAttribute(bodyPr, "anchor", anchor);
     const padding = shape.padding;
-    if (padding && changed("padding")) {
+    if (padding) {
       next = setXmlAttribute(next, "lIns", String(Math.round(padding.l * 12_700)));
       next = setXmlAttribute(next, "tIns", String(Math.round(padding.t * 12_700)));
       next = setXmlAttribute(next, "rIns", String(Math.round(padding.r * 12_700)));
@@ -387,259 +327,17 @@ function presentationRunProperties(text: PresentationText, run: NonNullable<Pres
   return `<a:rPr ${attributes}>${children}</a:rPr>`;
 }
 
-const PRESENTATION_INLINE_FORMAT_KEYS = [
-  "bold",
-  "italic",
-  "underline",
-  "strikethrough",
-  "fontSize",
-  "color",
-  "fontFamily",
-  "baseline",
-  "spacing",
-] as const;
-
-type PresentationInlineFormatting = Pick<PresentationText, typeof PRESENTATION_INLINE_FORMAT_KEYS[number]>;
-
-function presentationInlineFormattingAt(
-  text: PresentationText,
-  position: number,
-): PresentationInlineFormatting {
-  const paragraphFormatting = Object.fromEntries(
-    PRESENTATION_INLINE_FORMAT_KEYS.map((key) => [key, text[key]]),
-  ) as PresentationInlineFormatting;
-  if (!text.runs?.length) return paragraphFormatting;
-  let offset = 0;
-  for (const run of text.runs) {
-    const end = offset + presentationTextLength(run.text);
-    if (position < end || (position === end && end === presentationTextLength(text.text))) {
-      return { ...paragraphFormatting, ...run };
-    }
-    offset = end;
-  }
-  return paragraphFormatting;
-}
-
-function patchPresentationRunProperties(
-  propertiesXml: string,
-  baseline: PresentationInlineFormatting,
-  edited: PresentationInlineFormatting,
-): string {
-  const tagName = propertiesXml.match(/^<([A-Za-z_][\w:.-]*)\b/)?.[1];
-  if (!tagName) return propertiesXml;
-  let patched = propertiesXml.replace(/\/>\s*$/, `></${tagName}>`);
-  const changed = (key: keyof PresentationInlineFormatting) => !sameValue(baseline[key], edited[key]);
-  patched = patched.replace(new RegExp(`^<${tagName}\\b[^>]*>`, "i"), (opening) => {
-    let next = opening;
-    if (changed("fontSize")) {
-      next = setXmlAttribute(next, "sz", edited.fontSize == null
-        ? undefined
-        : String(Math.max(100, Math.round(edited.fontSize * 100))));
-    }
-    if (changed("bold")) next = setXmlAttribute(next, "b", edited.bold == null ? undefined : edited.bold ? "1" : "0");
-    if (changed("italic")) next = setXmlAttribute(next, "i", edited.italic == null ? undefined : edited.italic ? "1" : "0");
-    if (changed("underline")) next = setXmlAttribute(next, "u", edited.underline == null ? undefined : edited.underline ? "sng" : "none");
-    if (changed("strikethrough")) {
-      next = setXmlAttribute(
-        next,
-        "strike",
-        edited.strikethrough == null ? undefined : edited.strikethrough ? "sngStrike" : "noStrike",
-      );
-    }
-    if (changed("baseline")) {
-      next = setXmlAttribute(next, "baseline", edited.baseline == null
-        ? undefined
-        : String(Math.round(edited.baseline * 1000)));
-    }
-    if (changed("spacing")) {
-      next = setXmlAttribute(next, "spc", edited.spacing == null
-        ? undefined
-        : String(Math.round(edited.spacing * 100)));
-    }
-    return next;
-  });
-  if (changed("color")) {
-    patched = patchDirectXmlChild(
-      patched,
-      /<a:(?:noFill|solidFill|gradFill|blipFill|pattFill|grpFill)\b/i,
-      edited.color ? `<a:solidFill>${presentationColorXml(edited.color)}</a:solidFill>` : "",
-      /<a:(?:latin|ea|cs|sym|hlinkClick|hlinkMouseOver|rtl|extLst)\b/i,
-    );
-  }
-  if (changed("fontFamily")) {
-    patched = patchDirectXmlChild(
-      patched,
-      /<a:latin\b/i,
-      edited.fontFamily ? `<a:latin typeface="${escapeXml(edited.fontFamily)}"/>` : "",
-      /<a:(?:ea|cs|sym|hlinkClick|hlinkMouseOver|rtl|extLst)\b/i,
-    );
-  }
-  return patched;
-}
-
-function patchPresentationRunFormatting(
-  tokenXml: string,
-  baseline: PresentationInlineFormatting,
-  edited: PresentationInlineFormatting,
-): string {
-  if (sameValue(baseline, edited)) return tokenXml;
-  const properties = tokenXml.match(/<a:rPr\b[^>]*(?:\/>|>[\s\S]*?<\/a:rPr>)/i)?.[0];
-  const patched = patchPresentationRunProperties(properties || "<a:rPr/>", baseline, edited);
-  if (properties) return tokenXml.replace(properties, patched);
-  return tokenXml.replace(/^<a:(?:r|fld)\b[^>]*>/i, (opening) => `${opening}${patched}`);
-}
-
-function presentationBulletXml(bullet: string | undefined): string {
-  if (!bullet) return "<a:buNone/>";
-  if (bullet === "#." || bullet === "a." || bullet === "i.") {
-    const type = bullet === "a." ? "alphaLcPeriod" : bullet === "i." ? "romanLcPeriod" : "arabicPeriod";
-    return `<a:buAutoNum type="${type}"/>`;
-  }
-  return `<a:buChar char="${escapeXml(bullet)}"/>`;
-}
-
-function presentationAlignmentValue(align: string | undefined): string | undefined {
-  if (!align) return undefined;
-  if (align === "center" || align === "ctr") return "ctr";
-  if (align === "right" || align === "r") return "r";
-  if (align === "justify" || align === "just") return "just";
-  return "l";
-}
-
-function patchPresentationParagraphProperties(
-  paragraphXml: string,
-  baseline: PresentationText,
-  edited: PresentationText,
-): string {
-  const changed = (key: keyof PresentationText) => !sameValue(baseline[key], edited[key]);
-  const changedKeys: Array<keyof PresentationText> = [
-    "align",
-    "bullet",
-    "indent",
-    "indentRight",
-    "hanging",
-    "lineSpacing",
-    "spaceBefore",
-    "spaceAfter",
-  ];
-  if (!changedKeys.some(changed)) return paragraphXml;
-  const originalProperties = paragraphXml.match(/<a:pPr\b[^>]*(?:\/>|>[\s\S]*?<\/a:pPr>)/i)?.[0] || "";
-  let properties = (originalProperties || "<a:pPr/>").replace(/\/>\s*$/, "></a:pPr>");
-  properties = properties.replace(/^<a:pPr\b[^>]*>/i, (opening) => {
-    let next = opening;
-    if (changed("align")) next = setXmlAttribute(next, "algn", presentationAlignmentValue(edited.align));
-    if (changed("indent")) {
-      next = setXmlAttribute(next, "marL", edited.indent == null
-        ? undefined
-        : String(Math.round(Math.max(0, edited.indent) * 12_700)));
-    }
-    if (changed("indentRight")) {
-      next = setXmlAttribute(next, "marR", edited.indentRight == null
-        ? undefined
-        : String(Math.round(Math.max(0, edited.indentRight) * 12_700)));
-    }
-    if (changed("hanging")) {
-      next = setXmlAttribute(next, "indent", edited.hanging == null
-        ? undefined
-        : String(Math.round(edited.hanging * 12_700)));
-    }
-    return next;
-  });
-  if (changed("lineSpacing")) {
-    properties = patchDirectXmlChild(
-      properties,
-      /<a:lnSpc\b/i,
-      edited.lineSpacing == null
-        ? ""
-        : `<a:lnSpc><a:spcPct val="${Math.round(Math.max(0.1, edited.lineSpacing) * 100_000)}"/></a:lnSpc>`,
-      /<a:(?:spcBef|spcAft|buClr|buSzPct|buSzPts|buSzTx|buFont|buNone|buChar|buAutoNum|tabLst|defRPr|extLst)\b/i,
-    );
-  }
-  if (changed("spaceBefore")) {
-    properties = patchDirectXmlChild(
-      properties,
-      /<a:spcBef\b/i,
-      edited.spaceBefore == null
-        ? ""
-        : `<a:spcBef><a:spcPts val="${Math.round(Math.max(0, edited.spaceBefore) * 100)}"/></a:spcBef>`,
-      /<a:(?:spcAft|buClr|buSzPct|buSzPts|buSzTx|buFont|buNone|buChar|buAutoNum|tabLst|defRPr|extLst)\b/i,
-    );
-  }
-  if (changed("spaceAfter")) {
-    properties = patchDirectXmlChild(
-      properties,
-      /<a:spcAft\b/i,
-      edited.spaceAfter == null
-        ? ""
-        : `<a:spcAft><a:spcPts val="${Math.round(Math.max(0, edited.spaceAfter) * 100)}"/></a:spcAft>`,
-      /<a:(?:buClr|buSzPct|buSzPts|buSzTx|buFont|buNone|buChar|buAutoNum|tabLst|defRPr|extLst)\b/i,
-    );
-  }
-  if (changed("bullet")) {
-    properties = patchDirectXmlChild(
-      properties,
-      /<a:(?:buNone|buChar|buAutoNum)\b/i,
-      presentationBulletXml(edited.bullet),
-      /<a:(?:tabLst|defRPr|extLst)\b/i,
-    );
-  }
-  if (originalProperties) return paragraphXml.replace(originalProperties, properties);
-  return paragraphXml.replace(/^<a:p\b[^>]*>/i, (opening) => `${opening}${properties}`);
-}
-
-function patchPresentationParagraphFormatting(
-  paragraphXml: string,
-  baseline: PresentationText,
-  edited: PresentationText,
-): string {
-  let patched = patchPresentationParagraphProperties(paragraphXml, baseline, edited);
-  const editedCharacters = Array.from(edited.text);
-  const sourceMap = edited.sourceMap?.length === editedCharacters.length
-    ? edited.sourceMap
-    : reconcilePresentationTextSourceMap(baseline.text, edited.text);
-  const tokens = presentationTextTokens(patched);
-  let tokenIndex = 0;
-  patched = patched.replace(
-    /<a:fld[\s>][\s\S]*?<\/a:fld>|<a:r[\s>][\s\S]*?<\/a:r>|<a:br\b[^>]*(?:\/>|>[\s\S]*?<\/a:br>)|<a:t(?:\s[^>]*)?>[\s\S]*?<\/a:t>/g,
-    (raw) => {
-      const token = tokens[tokenIndex++];
-      if (!token || (token.kind !== "run" && token.kind !== "field")) return raw;
-      const sourceIndex = sourceMap
-        .slice(token.start, token.end)
-        .find((position): position is number => position != null);
-      if (sourceIndex == null) return raw;
-      return patchPresentationRunFormatting(
-        raw,
-        presentationInlineFormattingAt(baseline, sourceIndex),
-        presentationInlineFormattingAt(edited, token.start),
-      );
-    },
-  );
-  if (!tokens.some((token) => token.kind === "run" || token.kind === "field")) {
-    const endProperties = patched.match(/<a:endParaRPr\b[^>]*(?:\/>|>[\s\S]*?<\/a:endParaRPr>)/i)?.[0];
-    if (endProperties) {
-      patched = patched.replace(
-        endProperties,
-        patchPresentationRunProperties(
-          endProperties,
-          presentationInlineFormattingAt(baseline, 0),
-          presentationInlineFormattingAt(edited, 0),
-        ),
-      );
-    }
-  }
-  return patched;
-}
-
 function presentationParagraphXml(text: PresentationText): string {
-  const alignment = presentationAlignmentValue(text.align) || "l";
+  const alignment = text.align === "center" ? "ctr" : text.align === "right" ? "r" : text.align === "justify" ? "just" : "l";
   const paragraphAttributes = [
     `algn="${alignment}"`,
     text.indent != null ? `marL="${Math.round(Math.max(0, text.indent) * 12_700)}"` : "",
-    text.indentRight != null ? `marR="${Math.round(Math.max(0, text.indentRight) * 12_700)}"` : "",
-    text.hanging != null ? `indent="${Math.round(text.hanging * 12_700)}"` : "",
   ].filter(Boolean).join(" ");
-  const bullet = presentationBulletXml(text.bullet);
+  const bullet = text.bullet
+    ? text.bullet === "#." || text.bullet === "a." || text.bullet === "i."
+      ? `<a:buAutoNum type="${text.bullet === "a." ? "alphaLcPeriod" : text.bullet === "i." ? "romanLcPeriod" : "arabicPeriod"}"/>`
+      : `<a:buChar char="${escapeXml(text.bullet)}"/>`
+    : "<a:buNone/>";
   const spacing = [
     text.lineSpacing != null ? `<a:lnSpc><a:spcPct val="${Math.round(Math.max(0.1, text.lineSpacing) * 100_000)}"/></a:lnSpc>` : "",
     text.spaceBefore != null ? `<a:spcBef><a:spcPts val="${Math.round(Math.max(0, text.spaceBefore) * 100)}"/></a:spcBef>` : "",
@@ -906,6 +604,55 @@ function patchPresentationParagraphText(
   ), paragraphXml);
 }
 
+function presentationTextFormatting(text: PresentationText): unknown {
+  const { text: _text, runs: _runs, sourceMap: _sourceMap, ...paragraphFormatting } = text;
+  return paragraphFormatting;
+}
+
+function presentationRunsFollowTextEdit(baseline: PresentationText, edited: PresentationText): boolean {
+  if (!baseline.runs?.length && !edited.runs?.length) return true;
+  if (!baseline.runs?.length || (!edited.runs?.length && edited.text.length > 0)) return false;
+  if (!edited.runs?.length) return edited.text.length === 0;
+  const baselineCharacters = baseline.runs.flatMap((run) => {
+    const { text, ...formatting } = run;
+    return Array.from(text, (character) => ({ character, formatting }));
+  });
+  const editedCharacters = edited.runs.flatMap((run) => {
+    const { text, ...formatting } = run;
+    return Array.from(text, (character) => ({ character, formatting }));
+  });
+  const baselineText = baselineCharacters.map(({ character }) => character).join("");
+  const editedText = editedCharacters.map(({ character }) => character).join("");
+  if (baselineText !== baseline.text || editedText !== edited.text) return false;
+
+  let baselineCursor = 0;
+  let editedCursor = 0;
+  for (const span of presentationTextEditSpansForSource(baseline.text, edited.text, edited.sourceMap)) {
+    const unchangedLength = span.originalStart - baselineCursor;
+    for (let offset = 0; offset < unchangedLength; offset += 1) {
+      if (!sameValue(
+        editedCharacters[editedCursor + offset]?.formatting,
+        baselineCharacters[baselineCursor + offset]?.formatting,
+      )) return false;
+    }
+    const insertedFormatting = baselineCharacters[Math.max(0, span.originalStart - 1)]?.formatting
+      || baselineCharacters[span.originalStart]?.formatting
+      || {};
+    for (let index = span.editedStart; index < span.editedEnd; index += 1) {
+      if (!sameValue(editedCharacters[index]?.formatting, insertedFormatting)) return false;
+    }
+    baselineCursor = span.originalEnd;
+    editedCursor = span.editedEnd;
+  }
+  for (let offset = 0; baselineCursor + offset < baselineCharacters.length; offset += 1) {
+    if (!sameValue(
+      editedCharacters[editedCursor + offset]?.formatting,
+      baselineCharacters[baselineCursor + offset]?.formatting,
+    )) return false;
+  }
+  return true;
+}
+
 function patchTextParagraphs(
   element: string,
   baselineTexts: PresentationText[],
@@ -929,8 +676,13 @@ function patchTextParagraphs(
         const baseline = baselineTexts[index];
         const edited = texts[index];
         if (sameValue(baseline, edited)) return paragraph;
-        const textPatched = patchPresentationParagraphText(paragraph, edited.text, edited);
-        return patchPresentationParagraphFormatting(textPatched, baseline, edited);
+        if (
+          sameValue(presentationTextFormatting(baseline), presentationTextFormatting(edited))
+          && presentationRunsFollowTextEdit(baseline, edited)
+        ) {
+          return patchPresentationParagraphText(paragraph, edited.text, edited);
+        }
+        return presentationParagraphXml(edited);
       }).join("")
     : (texts.length ? texts : [{ text: "" }]).map(presentationParagraphXml).join("");
   return element.replace(textBody, `${openTag}${bodyPr}${listStyle}${paragraphs}</p:txBody>`);
@@ -1102,15 +854,10 @@ function patchTableCells(
     const textBody = cellXml.match(/<a:txBody\b[^>]*>[\s\S]*?<\/a:txBody>/i)?.[0];
     if (!textBody) throw new PresentationPreservationError("This table cell has no editable OOXML text body.");
     const baselineCell = baselineCells[index];
-    const textFormattingChanged = !sameValue(
-      [baselineCell.bold, baselineCell.italic, baselineCell.fontSize, baselineCell.fontFamily, baselineCell.color],
-      [cell.bold, cell.italic, cell.fontSize, cell.fontFamily, cell.color],
+    let patched = cellXml.replace(
+      textBody,
+      patchTableCellTextBody(textBody, baselineCell.text, cell.text, cell.sourceMap),
     );
-    let patchedTextBody = patchTableCellTextBody(textBody, baselineCell.text, cell.text, cell.sourceMap);
-    if (textFormattingChanged) {
-      patchedTextBody = patchTableCellTextFormatting(patchedTextBody, baselineCell, cell);
-    }
-    let patched = cellXml.replace(textBody, patchedTextBody);
     if (baselineCell.fill !== cell.fill) {
       const tcPr = patched.match(/<a:tcPr\b[^>]*(?:\/>|>[\s\S]*?<\/a:tcPr>)/i)?.[0];
       if (tcPr) {
@@ -1122,100 +869,11 @@ function patchTableCells(
   });
 }
 
-function patchDirectRunProperty(
-  properties: string,
-  pattern: RegExp,
-  replacement: string,
-  following: RegExp,
-): string {
-  const children = shapePropertyChildren(properties);
-  const existing = children.find((child) => child.xml.search(pattern) === 0);
-  if (existing) {
-    return `${properties.slice(0, existing.start)}${replacement}${properties.slice(existing.end)}`;
-  }
-  if (!replacement) return properties;
-  const next = children.find((child) => child.xml.search(following) === 0);
-  if (next) return `${properties.slice(0, next.start)}${replacement}${properties.slice(next.start)}`;
-  return properties.replace(/<\/a:(?:rPr|endParaRPr)>\s*$/i, `${replacement}$&`);
-}
-
-function patchTableCellRunProperties(
-  properties: string,
-  baseline: PresentationTableCell,
-  cell: PresentationTableCell,
-): string {
-  const tag = properties.match(/^<a:(rPr|endParaRPr)\b/i)?.[1];
-  if (!tag) return properties;
-  let patched = properties.replace(/\/>\s*$/, `></a:${tag}>`);
-  let opening = patched.match(/^<a:(?:rPr|endParaRPr)\b[^>]*>/i)?.[0];
-  if (!opening) return properties;
-  for (const [key, attribute] of [["bold", "b"], ["italic", "i"]] as const) {
-    if (baseline[key] === cell[key]) continue;
-    opening = setXmlAttribute(opening, attribute, cell[key] == null ? undefined : cell[key] ? "1" : "0");
-  }
-  if (baseline.fontSize !== cell.fontSize) {
-    opening = setXmlAttribute(
-      opening,
-      "sz",
-      cell.fontSize == null ? undefined : String(Math.round(Math.max(1, cell.fontSize) * 100)),
-    );
-  }
-  patched = patched.replace(/^<a:(?:rPr|endParaRPr)\b[^>]*>/i, opening);
-  if (baseline.color !== cell.color) {
-    const fill = cell.color ? `<a:solidFill>${presentationColorXml(cell.color)}</a:solidFill>` : "";
-    patched = patchDirectRunProperty(
-      patched,
-      /<a:(?:noFill|solidFill|gradFill|pattFill|grpFill)\b/i,
-      fill,
-      /<a:(?:effectLst|effectDag|highlight|uLnTx|uLn|uFillTx|uFill|latin|ea|cs|sym|hlinkClick|hlinkMouseOver|rtl|extLst)\b/i,
-    );
-  }
-  if (baseline.fontFamily !== cell.fontFamily) {
-    const latin = cell.fontFamily ? `<a:latin typeface="${escapeXml(cell.fontFamily)}"/>` : "";
-    patched = patchDirectRunProperty(
-      patched,
-      /<a:latin\b/i,
-      latin,
-      /<a:(?:ea|cs|sym|hlinkClick|hlinkMouseOver|rtl|extLst)\b/i,
-    );
-  }
-  return patched;
-}
-
-function patchTableCellTextFormatting(
-  textBody: string,
-  baseline: PresentationTableCell,
-  cell: PresentationTableCell,
-): string {
-  let patched = textBody.replace(
-    /<a:(rPr|endParaRPr)\b[^>]*(?:\/>|>[\s\S]*?<\/a:\1>)/gi,
-    (properties) => patchTableCellRunProperties(properties, baseline, cell),
-  );
-  patched = patched.replace(/<a:(r|fld)\b[^>]*>[\s\S]*?<\/a:\1>/gi, (run) => {
-    if (/<a:rPr\b/i.test(run)) return run;
-    const properties = patchTableCellRunProperties("<a:rPr/>", baseline, cell);
-    return run.replace(/^<a:(?:r|fld)\b[^>]*>/i, `$&${properties}`);
-  });
-  return patched.replace(/<a:p\b[^>]*>[\s\S]*?<\/a:p>/gi, (paragraph) => {
-    if (/<a:endParaRPr\b/i.test(paragraph)) return paragraph;
-    const properties = patchTableCellRunProperties("<a:endParaRPr/>", baseline, cell);
-    return paragraph.replace(/<\/a:p>\s*$/i, `${properties}</a:p>`);
-  });
-}
-
 function patchDirectTableCellFill(tableCellProperties: string, replacement: string): string {
-  const pattern = /<a:(?:noFill|solidFill|gradFill|blipFill|pattFill|grpFill)\b/i;
-  const children = shapePropertyChildren(tableCellProperties);
-  const existing = children.find((child) => child.xml.search(pattern) === 0);
-  if (existing) {
-    return `${tableCellProperties.slice(0, existing.start)}${replacement}${tableCellProperties.slice(existing.end)}`;
-  }
+  const pattern = /<a:(?:noFill|solidFill|gradFill|pattFill)\b[^>]*(?:\/>|>[\s\S]*?<\/a:(?:solidFill|gradFill|pattFill)>)/i;
+  if (pattern.test(tableCellProperties)) return tableCellProperties.replace(pattern, replacement);
   if (/\/>\s*$/i.test(tableCellProperties)) {
     return tableCellProperties.replace(/\/>\s*$/i, `>${replacement}</a:tcPr>`);
-  }
-  const extension = children.find((child) => child.xml.search(/<a:extLst\b/i) === 0);
-  if (extension) {
-    return `${tableCellProperties.slice(0, extension.start)}${replacement}${tableCellProperties.slice(extension.start)}`;
   }
   return tableCellProperties.replace(/<\/a:tcPr>\s*$/i, `${replacement}</a:tcPr>`);
 }
@@ -1357,7 +1015,7 @@ function transformXml(shape: PreservePresentationShape, slideWidth: number, slid
 function bodyPropertiesXml(shape: PreservePresentationShape): string {
   const anchor = shape.vAlign === "middle" ? "ctr" : shape.vAlign === "bottom" ? "b" : "t";
   const padding = shape.padding;
-  return `<a:bodyPr wrap="${shape.wordWrap === false ? "none" : "square"}" anchor="${anchor}"${padding ? ` lIns="${Math.round(padding.l * 12_700)}" tIns="${Math.round(padding.t * 12_700)}" rIns="${Math.round(padding.r * 12_700)}" bIns="${Math.round(padding.b * 12_700)}"` : ""}/>`;
+  return `<a:bodyPr wrap="square" anchor="${anchor}"${padding ? ` lIns="${Math.round(padding.l * 12_700)}" tIns="${Math.round(padding.t * 12_700)}" rIns="${Math.round(padding.r * 12_700)}" bIns="${Math.round(padding.b * 12_700)}"` : ""}/>`;
 }
 
 function shapeObjectXml(
@@ -1374,7 +1032,7 @@ function shapeObjectXml(
   const paragraphs = (shape.texts.length ? shape.texts : [{ text: "" }]).map(presentationParagraphXml).join("");
   return [
     "<p:sp>",
-    `<p:nvSpPr><p:cNvPr id="${objectId}" name="Manor object ${objectId}">${hyperlinkRelationshipId ? `<a:hlinkClick r:id="${hyperlinkRelationshipId}"/>` : ""}</p:cNvPr><p:cNvSpPr${shape.type === "textbox" ? ' txBox="1"' : ""}/><p:nvPr/></p:nvSpPr>`,
+    `<p:nvSpPr><p:cNvPr id="${objectId}" name="Manor object ${objectId}">${hyperlinkRelationshipId ? `<a:hlinkClick r:id="${hyperlinkRelationshipId}"/>` : ""}</p:cNvPr><p:cNvSpPr/><p:nvPr/></p:nvSpPr>`,
     `<p:spPr>${transformXml(shape, slideWidth, slideHeight)}${geometry}${presentationFillXml(shape)}${presentationLineXml(shape)}${effect}</p:spPr>`,
     `<p:txBody>${bodyPropertiesXml(shape)}<a:lstStyle/>${paragraphs}</p:txBody>`,
     "</p:sp>",
@@ -1384,7 +1042,7 @@ function shapeObjectXml(
 function tableCellXml(cell: PresentationTableCell): string {
   const attributes = `${cell.gridSpan && cell.gridSpan > 1 ? ` gridSpan="${cell.gridSpan}"` : ""}${cell.vMerge ? ' vMerge="1"' : ""}`;
   const fill = cell.fill ? `<a:solidFill>${presentationColorXml(cell.fill)}</a:solidFill>` : "<a:noFill/>";
-  return `<a:tc${attributes}><a:txBody><a:bodyPr/><a:lstStyle/>${presentationParagraphXml({ text: cell.text, bold: cell.bold, italic: cell.italic, fontSize: cell.fontSize, fontFamily: cell.fontFamily, color: cell.color })}</a:txBody><a:tcPr>${fill}</a:tcPr></a:tc>`;
+  return `<a:tc${attributes}><a:txBody><a:bodyPr/><a:lstStyle/>${presentationParagraphXml({ text: cell.text, bold: cell.bold, color: cell.color })}</a:txBody><a:tcPr>${fill}</a:tcPr></a:tc>`;
 }
 
 function tableObjectXml(
@@ -1404,14 +1062,9 @@ function tableObjectXml(
   const gridWidths = sourceColumnWidths.length === columnCount && totalSourceColumnWidth > 0
     ? sourceColumnWidths.map((value) => Math.max(1, Math.round((Math.max(0, Number(value) || 0) / totalSourceColumnWidth) * width)))
     : Array.from({ length: columnCount }, () => columnWidth);
-  const sourceRowHeights = shape.tableRowHeights || [];
-  const totalSourceRowHeight = sourceRowHeights.reduce((sum, value) => sum + Math.max(0, Number(value) || 0), 0);
-  const rowHeights = sourceRowHeights.length === rows.length && totalSourceRowHeight > 0
-    ? sourceRowHeights.map((value) => Math.max(1, Math.round((Math.max(0, Number(value) || 0) / totalSourceRowHeight) * height)))
-    : Array.from({ length: Math.max(1, rows.length) }, () => rowHeight);
   const grid = gridWidths.map((gridWidth) => `<a:gridCol w="${gridWidth}"/>`).join("");
   const rowXml = (rows.length ? rows : [[{ text: "" }]])
-    .map((row, rowIndex) => `<a:tr h="${rowHeights[rowIndex] || rowHeight}">${row.map(tableCellXml).join("")}</a:tr>`)
+    .map((row) => `<a:tr h="${rowHeight}">${row.map(tableCellXml).join("")}</a:tr>`)
     .join("");
   return [
     "<p:graphicFrame>",
@@ -1719,34 +1372,6 @@ function removePartOverride(contentTypesXml: string, part: string): string {
 }
 
 function ensureCompatibleShapeChange(baseline: PreservePresentationShape, edited: PreservePresentationShape) {
-  if (baseline.source?.kind !== "pic" && baseline.opacity !== edited.opacity) {
-    throw new PresentationPreservationError(
-      "Opacity can only be edited on native presentation pictures.",
-    );
-  }
-  if (baseline.source?.kind === "graphicFrame") {
-    const formattingKeys: Array<keyof PreservePresentationShape> = [
-      "fill",
-      "gradFill",
-      "stroke",
-      "strokeWidth",
-      "strokeDash",
-      "presetGeom",
-      "borderRadius",
-      "shadow",
-      "vAlign",
-      "padding",
-      "wordWrap",
-    ];
-    if (!sameValue(
-      formattingKeys.map((key) => baseline[key]),
-      formattingKeys.map((key) => edited[key]),
-    )) {
-      throw new PresentationPreservationError(
-        "Table and chart frames must use their dedicated native formatting operations.",
-      );
-    }
-  }
   const baselineCells = baseline.tableRows?.flat() || [];
   const editedCells = edited.tableRows?.flat() || [];
   if (baselineCells.length !== editedCells.length) {
@@ -1973,9 +1598,9 @@ export async function preservePresentationFileWithSnapshot(
           clonedObject = patchImageOpacity(clonedObject, clonedShape.opacity);
         }
         if (!sameValue(
-          [templateShape.fill, templateShape.gradFill, templateShape.stroke, templateShape.strokeWidth, templateShape.strokeDash, templateShape.presetGeom, templateShape.borderRadius, templateShape.shadow, templateShape.vAlign, templateShape.padding, templateShape.wordWrap],
-          [clonedShape.fill, clonedShape.gradFill, clonedShape.stroke, clonedShape.strokeWidth, clonedShape.strokeDash, clonedShape.presetGeom, clonedShape.borderRadius, clonedShape.shadow, clonedShape.vAlign, clonedShape.padding, clonedShape.wordWrap],
-        )) clonedObject = patchShapeFormatting(clonedObject, clonedShape, templateShape);
+          [templateShape.fill, templateShape.gradFill, templateShape.stroke, templateShape.strokeWidth, templateShape.presetGeom, templateShape.borderRadius, templateShape.shadow, templateShape.vAlign, templateShape.padding],
+          [clonedShape.fill, clonedShape.gradFill, clonedShape.stroke, clonedShape.strokeWidth, clonedShape.presetGeom, clonedShape.borderRadius, clonedShape.shadow, clonedShape.vAlign, clonedShape.padding],
+        )) clonedObject = patchShapeFormatting(clonedObject, clonedShape);
         if (!sameValue(templateShape.texts, clonedShape.texts)) {
           clonedObject = patchTextParagraphs(clonedObject, templateShape.texts, clonedShape.texts);
         }
@@ -2053,8 +1678,8 @@ export async function preservePresentationFileWithSnapshot(
       const cropChanged = !sameValue(originalShape.imgCrop, editedShape.imgCrop);
       const opacityChanged = originalShape.opacity !== editedShape.opacity;
       const formattingChanged = !sameValue(
-        [originalShape.fill, originalShape.gradFill, originalShape.stroke, originalShape.strokeWidth, originalShape.strokeDash, originalShape.presetGeom, originalShape.borderRadius, originalShape.shadow, originalShape.vAlign, originalShape.padding, originalShape.wordWrap],
-        [editedShape.fill, editedShape.gradFill, editedShape.stroke, editedShape.strokeWidth, editedShape.strokeDash, editedShape.presetGeom, editedShape.borderRadius, editedShape.shadow, editedShape.vAlign, editedShape.padding, editedShape.wordWrap],
+        [originalShape.fill, originalShape.gradFill, originalShape.stroke, originalShape.strokeWidth, originalShape.presetGeom, originalShape.borderRadius, originalShape.shadow, originalShape.vAlign, originalShape.padding],
+        [editedShape.fill, editedShape.gradFill, editedShape.stroke, editedShape.strokeWidth, editedShape.presetGeom, editedShape.borderRadius, editedShape.shadow, editedShape.vAlign, editedShape.padding],
       );
       const textChanged = !sameValue(originalShape.texts, editedShape.texts);
       const tableChanged = !sameValue(originalShape.tableRows, editedShape.tableRows);
@@ -2065,7 +1690,7 @@ export async function preservePresentationFileWithSnapshot(
             : element;
           if (cropChanged) patched = patchImageCrop(patched, editedShape.imgCrop);
           if (opacityChanged && source.kind === "pic") patched = patchImageOpacity(patched, editedShape.opacity);
-          if (formattingChanged) patched = patchShapeFormatting(patched, editedShape, originalShape);
+          if (formattingChanged) patched = patchShapeFormatting(patched, editedShape);
           if (textChanged) patched = patchTextParagraphs(patched, originalShape.texts, editedShape.texts);
           if (tableChanged && editedShape.tableRows) {
             patched = patchTableCells(patched, originalShape.tableRows || [], editedShape.tableRows);

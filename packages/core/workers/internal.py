@@ -1971,17 +1971,6 @@ async def _exec_subagent(s: dict) -> dict:
     entity_id = s.get("entity_id")
     agent_id = s.get("resolved_agent_id")
 
-    params = s.get("params") if isinstance(s.get("params"), dict) else {}
-    required_skill_refs = [
-        str(ref).strip()
-        for ref in (params.get("skill_refs") or [])
-        if str(ref or "").strip()
-    ]
-    runtime_skill_refs = [
-        {"kind": "slug", "value": ref}
-        for ref in required_skill_refs
-    ]
-
     async with async_session() as db:
         ctx = await build_agent_context(
             db, entity_id=entity_id or "", agent_id=agent_id,
@@ -1995,10 +1984,10 @@ async def _exec_subagent(s: dict) -> dict:
             active_user_message=prompt,
             model_role="primary",
             runtime_metadata=s.get("runtime_metadata"),
-            skill_refs=runtime_skill_refs,
         )
 
     system_prompt = s["params"].get("system_prompt") or ctx.system_prompt
+    params = s.get("params") if isinstance(s.get("params"), dict) else {}
 
     # ── forced submit_result finalization (StepResult envelope part ②) ──
     # The loop carries a submit_result tool and terminates on its call; the
@@ -2037,16 +2026,6 @@ async def _exec_subagent(s: dict) -> dict:
             requested_max_rounds=params.get("max_rounds"),
             dynamic_tool_handlers={SUBMIT_RESULT_TOOL_NAME: submit_handler},
             terminal_tool_result_policy=SUBMIT_RESULT_TERMINAL_POLICY,
-            forced_tool_calls=[
-                {
-                    "name": "invoke_skill",
-                    "arguments": {
-                        "skill_id": ref,
-                        "input": original_prompt,
-                    },
-                }
-                for ref in required_skill_refs
-            ] or None,
             on_tool_start=on_tool_start,
             on_tool_end=on_tool_end,
         )

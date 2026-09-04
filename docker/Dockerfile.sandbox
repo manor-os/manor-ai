@@ -34,18 +34,12 @@ RUN apt-get update \
     chromium \
     curl \
     ffmpeg \
-    gcc \
     git \
     jq \
-    libreoffice-calc \
     libreoffice-impress \
-    libreoffice-writer \
     librsvg2-bin \
-    pandoc \
     poppler-utils \
-    qpdf \
     ripgrep \
-    tesseract-ocr \
     && rm -rf /var/lib/apt/lists/* \
     && chromium --version
 

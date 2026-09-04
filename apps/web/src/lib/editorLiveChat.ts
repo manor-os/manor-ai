@@ -364,44 +364,6 @@ export type EditorLiveTurnMetadata = Pick<
   "documentName" | "fileType" | "mimeType" | "editorType" | "sourcePath"
 >;
 
-export type EditorNativeFilePatchResult = {
-  patched: true;
-  path: string;
-  document_id?: string | null;
-  source_sha256?: string | null;
-  knowledge_synced?: boolean;
-  [key: string]: unknown;
-};
-
-/** Extract only a completed, successful native patch_file result from an SSE frame. */
-export function nativeFilePatchResultFromSseFrame(
-  parsed: unknown,
-): EditorNativeFilePatchResult | null {
-  if (!parsed || typeof parsed !== "object") return null;
-  const frame = parsed as {
-    tool_call?: { name?: string; result?: unknown; status?: string };
-  };
-  const tool = frame.tool_call;
-  if (!tool) return null;
-  const status = String(tool.status || "").trim().toLowerCase();
-  if (!["success", "completed", "ok"].includes(status)) return null;
-  if ((tool.name || "").toLowerCase() !== "patch_file") return null;
-  let result = tool.result;
-  if (typeof result === "string") {
-    try {
-      result = JSON.parse(result.trim());
-    } catch {
-      return null;
-    }
-  }
-  if (!result || typeof result !== "object") return null;
-  const record = result as Record<string, unknown>;
-  if (record.error || record.patched !== true || typeof record.path !== "string" || !record.path) {
-    return null;
-  }
-  return record as EditorNativeFilePatchResult;
-}
-
 export type EditorLiveChatMetadata = {
   documentId?: string | null;
   documentName?: string | null;
@@ -409,9 +371,6 @@ export type EditorLiveChatMetadata = {
   mimeType?: string | null;
   editorType?: string | null;
   sourcePath?: string | null;
-  /** Browser route that owns this session. This must not be overloaded with
-   * sourcePath, which can be a Knowledge filesystem path for native tools. */
-  routePath?: string | null;
   instruction?: string | null;
   sessionLabel?: string | null;
   emptyDescription?: string | null;
@@ -423,19 +382,8 @@ export type EditorLiveChatMetadata = {
     imageUrl: string,
     meta: EditorLiveApplyMeta,
   ) => boolean | void | Promise<boolean | void>;
-  supportsNativeFilePatch?: boolean;
-  /** Reload persisted editor bytes after an approval-gated patch_file succeeds. */
-  applyNativeFilePatch?: (
-    result: EditorNativeFilePatchResult,
-    meta: EditorLiveApplyMeta,
-  ) => boolean | void | Promise<boolean | void>;
   /** Resolved after read() locks the target for the current streamed turn. */
   getTurnMetadata?: () => EditorLiveTurnMetadata;
-  previewStatus?: AiEditPreviewStatus | null;
-  previewChangeCount?: number;
-  previewAccepting?: boolean;
-  acceptPreview?: () => void | Promise<void>;
-  discardPreview?: () => void | Promise<void>;
 };
 
 export type EditorLiveChatDetail = EditorLiveChatMetadata & {
@@ -1617,7 +1565,6 @@ export function openEditorLiveChat(detail: EditorLiveChatDetail) {
   const liveEditDetail: EditorLiveChatDetail = {
     ...detail,
     sourcePath: detail.sourcePath || window.location.pathname,
-    routePath: detail.routePath || window.location.pathname,
   };
   window.dispatchEvent(
     new CustomEvent<EditorLiveChatDetail>(EDITOR_LIVE_CHAT_EVENT, {
@@ -1634,7 +1581,6 @@ export function updateEditorLiveChat(detail: EditorLiveChatDetail) {
       detail: {
         ...detail,
         sourcePath: detail.sourcePath || window.location.pathname,
-        routePath: detail.routePath || window.location.pathname,
       },
     }),
   );

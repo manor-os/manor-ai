@@ -106,9 +106,8 @@ def get_tools():
                         "Invoke a reusable skill by ID. Skills are pre-built prompt+tool "
                         "chains or sandboxed script workflows for specialized tasks like "
                         "'write_email', 'research_topic', document generation, or complex "
-                        "file editing. Use this when a matching Skill appears in search_tools "
-                        "or was explicitly selected for the turn; use "
-                        "generate_file(kind='document') for direct conversion of "
+                        "file editing. Use this when a matching entry appears in Available "
+                        "Skills; use generate_document_file only for direct conversion of "
                         "already-supplied text/Markdown into a simple document. For external "
                         "social platform operations, invoke a subscribed social operations "
                         "skill when one is available; otherwise use search_tools to load the "
@@ -119,10 +118,6 @@ def get_tools():
                         "type": "object",
                         "properties": {
                             "skill_id": {"type": "string", "description": "Runtime skill ID to invoke"},
-                            "skill": {
-                                "type": "string",
-                                "description": "Legacy alias for skill_id.",
-                            },
                             "input": {"type": "string", "description": "Input text/instructions for the skill"},
                             "params": {
                                 "type": "object",
@@ -133,11 +128,7 @@ def get_tools():
                                 "additionalProperties": True,
                             },
                         },
-                        "required": ["input"],
-                        "anyOf": [
-                            {"required": ["skill_id"]},
-                            {"required": ["skill"]},
-                        ],
+                        "required": ["skill_id", "input"],
                     },
                 },
             },

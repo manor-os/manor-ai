@@ -31,20 +31,15 @@ from packages.core.constants.plans import is_cloud
 from packages.core.constants.workspace_drafts import (
     CREATION_PREFERENCES_FIELD,
     WORKSPACE_DRAFT_SCHEMA_VERSION_FIELD,
-    uses_ui_runtime_mode,
 )
 from packages.core.cron import validate_cron_expression
-from packages.core.services.workspace_goal_measurements import (
-    GOAL_MEASUREMENT_SCHEMA,
-    measurement_stat_definition,
-    resolve_draft_goal_measurements,
-)
 
 logger = logging.getLogger(__name__)
 
 _INTERNAL_SKILL_MCP_PROVIDERS = {
     "chrome_knowledge_local",
     "knowledge_local",
+    "local_browser",
 }
 _AGENT_CAPABILITY_PLANS_FIELD = "agent_capability_plans"
 _AGENT_CAPABILITY_CONTEXT_FIELDS = frozenset({
@@ -132,15 +127,14 @@ PROPOSE_GOAL_SCHEMA = {
         "name": "ws_propose_goal",
         "description": (
             "Add or replace one measurable goal. Re-calling with the same "
-            "goal_key replaces the prior entry. goal_key, description, "
-            "target, cadence, and measurement are required — never omit "
+            "goal_key replaces the prior entry. ALL four of goal_key, "
+            "description, target, and cadence are required — never omit "
             "target or cadence. Call only after the user supplied or confirmed "
-            "the measurable target and measurement definition; never infer or invent a KPI. "
-            "Include its formula/rubric, evidence source and manual/automatic collection mode."
+            "the measurable target; never infer or invent a KPI."
         ),
         "parameters": {
             "type": "object",
-            "required": ["draft_id", "goal_key", "title", "description", "target", "cadence", "measurement"],
+            "required": ["draft_id", "goal_key", "title", "description", "target", "cadence"],
             "properties": {
                 "draft_id": {"type": "string"},
                 "goal_key": {"type": "string", "pattern": "^[a-z][a-z0-9_]*$"},
@@ -148,7 +142,7 @@ PROPOSE_GOAL_SCHEMA = {
                 "description": {"type": "string", "minLength": 10},
                 "target": {"type": "string", "minLength": 1, "description": "Target value as string: '10000', '5%', '45%'"},
                 "cadence": {"enum": CADENCE_VALUES},
-                "measurement": GOAL_MEASUREMENT_SCHEMA,
+                "metric_key": {"type": "string", "description": "Canonical metric, e.g. 'follower_count'"},
                 "rationale": {"type": "string"},
             },
         },
@@ -580,9 +574,8 @@ SET_AUTONOMY_SCHEMA = {
             "Set the workspace-wide autonomous runtime choice. This controls "
             "automatic Strategist reviews and evolution schedules; it is "
             "independent from service autonomy levels and from whether Goals "
-            "are configured. New drafts default to automatic. Preserve the "
-            "current mode: the user switches Automatic/Manual in the creation "
-            "panel. This tool may adjust cadence, not override that mode."
+            "are configured. Leave disabled unless the user explicitly asks "
+            "for autonomous or scheduled operation."
         ),
         "parameters": {
             "type": "object",
@@ -605,14 +598,15 @@ CONFIRM_CREATION_PREFERENCES_SCHEMA = {
     "function": {
         "name": "ws_confirm_creation_preferences",
         "description": (
-            "Record the user's Goal choice. New drafts default to automatic; "
-            "omit autonomous_enabled to preserve the creation panel's mode. "
-            "Never infer a manual-mode choice from a Goal answer. For a new "
-            "Goal, call ws_propose_goal and wait for its result first."
+            "Atomically record both creation choices after the user answers "
+            "the combined confirmation question: whether the draft keeps a "
+            "configured Goal, and whether autonomous mode starts after "
+            "creation. For a new Goal, call ws_propose_goal and wait for its "
+            "result before calling this tool."
         ),
         "parameters": {
             "type": "object",
-            "required": ["draft_id", "goal_choice"],
+            "required": ["draft_id", "goal_choice", "autonomous_enabled"],
             "properties": {
                 "draft_id": {"type": "string"},
                 "goal_choice": {"enum": ["configured", "none"]},
@@ -1776,15 +1770,10 @@ async def _propose_goal(db, *, entity_id: str, user_id: str = "", **kwargs):
         return _err("goal_key must be snake_case", got=goal_key)
     target = kwargs.get("target", "")
     cadence = kwargs.get("cadence", "")
-    if target in (None, ""):
+    if not target:
         return _err("target is required (e.g. '10000', '5%') -- ask the user instead of inferring a target")
     if cadence not in CADENCE_VALUES:
         return _err(f"cadence must be one of {CADENCE_VALUES}", got=cadence)
-    try:
-        measurement = kwargs.get("measurement")
-        stat_definition = measurement_stat_definition(measurement, cadence=cadence)
-    except ValueError as exc:
-        return _err(str(exc))
 
     goal = {
         "goal_key": goal_key,
@@ -1792,10 +1781,9 @@ async def _propose_goal(db, *, entity_id: str, user_id: str = "", **kwargs):
         "description": kwargs.get("description", ""),
         "target": str(target),
         "cadence": cadence,
-        "measurement": measurement,
-        "stat_key": stat_definition["key"],
-        "metric_key": stat_definition["key"],
     }
+    if kwargs.get("metric_key"):
+        goal["metric_key"] = kwargs["metric_key"]
     if kwargs.get("rationale"):
         goal["rationale"] = kwargs["rationale"]
 
@@ -1804,17 +1792,6 @@ async def _propose_goal(db, *, entity_id: str, user_id: str = "", **kwargs):
     fields["goals"] = _replace_in_list(
         fields.get("goals") or [], "goal_key", goal_key, goal,
     )
-    # A Blueprint may already define this Stat separately. An explicitly
-    # confirmed Goal edit must update that definition, not leave two
-    # conflicting formulas for the same key.
-    if any(
-        (stat.get("key") or stat.get("library_key")) == stat_definition["key"]
-        for stat in fields.get("stats") or [] if isinstance(stat, dict)
-    ):
-        fields["stats"] = [
-            stat_definition if (stat.get("key") or stat.get("library_key")) == stat_definition["key"] else stat
-            for stat in fields["stats"]
-        ]
     _confirm_creation_preference(fields, "goal")
     _reconcile_removed_channel_references(fields)
     draft.fields = fields
@@ -2669,8 +2646,6 @@ async def _set_autonomy(db, *, entity_id: str, user_id: str = "", **kwargs):
 
     fields = dict(draft.fields or {})
     cadence: str | None = None
-    if uses_ui_runtime_mode(fields) and enabled != fields.get("heartbeat_enabled"):
-        return _err("Runtime mode is controlled by the creation panel. Ask the user to switch Automatic/Manual there.")
     if "cadence" in kwargs:
         try:
             cadence = _validated_autonomy_cadence(kwargs.get("cadence"))
@@ -2688,8 +2663,7 @@ async def _set_autonomy(db, *, entity_id: str, user_id: str = "", **kwargs):
     fields["heartbeat_enabled"] = enabled
     if enabled:
         fields["heartbeat_cadence"] = cadence
-    if not uses_ui_runtime_mode(fields):
-        _confirm_creation_preference(fields, "autonomy")
+    _confirm_creation_preference(fields, "autonomy")
     draft.fields = fields
     await _persist(db, draft)
     return _ok({
@@ -2712,13 +2686,9 @@ async def _confirm_creation_preferences(db, *, entity_id: str, user_id: str = ""
         return _err("goal_choice must be 'configured' or 'none'", got=goal_choice)
     if goal_choice == "configured" and not (fields.get("goals") or []):
         return _err("no Goal is configured -- call ws_propose_goal with the user's confirmed details")
-    if not uses_ui_runtime_mode(fields) and "autonomous_enabled" not in kwargs:
-        return _err("autonomous_enabled must be a boolean")
-    autonomous_enabled = kwargs.get("autonomous_enabled", fields.get("heartbeat_enabled"))
+    autonomous_enabled = kwargs.get("autonomous_enabled")
     if not isinstance(autonomous_enabled, bool):
         return _err("autonomous_enabled must be a boolean")
-    if uses_ui_runtime_mode(fields) and autonomous_enabled != fields.get("heartbeat_enabled"):
-        return _err("Runtime mode is controlled by the creation panel. Omit autonomous_enabled to preserve the user's mode.")
     autonomy_cadence: str | None = None
     if "autonomy_cadence" in kwargs:
         try:
@@ -2742,8 +2712,7 @@ async def _confirm_creation_preferences(db, *, entity_id: str, user_id: str = ""
     if autonomous_enabled:
         fields["heartbeat_cadence"] = autonomy_cadence
     _confirm_creation_preference(fields, "goal")
-    if not uses_ui_runtime_mode(fields):
-        _confirm_creation_preference(fields, "autonomy")
+    _confirm_creation_preference(fields, "autonomy")
     draft.fields = fields
     await _persist(db, draft)
     return _ok({
@@ -3186,9 +3155,7 @@ async def _lint_draft(db, *, entity_id: str, user_id: str = "", **kwargs):
             ToolDefinition.status == "active",
         )
     )).scalars().all()) if tool_refs else set()
-    available_tool_refs = tool_rows | set(
-        runtime_registered_tool_names(include_undiscoverable=True)
-    )
+    available_tool_refs = tool_rows | set(runtime_registered_tool_names())
 
     skill_refs = {
         str(ref).strip()
@@ -3425,16 +3392,12 @@ async def _lint_draft(db, *, entity_id: str, user_id: str = "", **kwargs):
 
     # Goals are optional. When the user does configure one, keep its
     # measurement contract strict instead of inventing a target or cadence.
-    try:
-        goals, _ = resolve_draft_goal_measurements(fields)
-    except ValueError as exc:
-        issues.append({"severity": "P0", "where": "goals.measurement", "message": str(exc)})
-        goals = []
+    goals = fields.get("goals") or []
     for g in goals:
         gk = (g or {}).get("goal_key", "<unknown>")
-        if g.get("target", g.get("target_value")) in (None, ""):
+        if not (g or {}).get("target"):
             issues.append({"severity": "P0", "where": f"goals.{gk}", "message": "goal missing target."})
-        if not (g.get("cadence") or g.get("measurement_cadence")):
+        if not (g or {}).get("cadence"):
             issues.append({"severity": "P0", "where": f"goals.{gk}", "message": "goal missing cadence."})
 
     # New Workspace drafts require explicit conversational decisions. Both
@@ -3454,16 +3417,9 @@ async def _lint_draft(db, *, entity_id: str, user_id: str = "", **kwargs):
             issues.append({
                 "severity": "P0",
                 "where": "creation_preferences.goal",
-                "message": "Confirm the user's Goal choice, then call ws_confirm_creation_preferences.",
+                "message": "Ask the combined Goal/autonomous creation question, then call ws_confirm_creation_preferences.",
             })
-        if uses_ui_runtime_mode(fields):
-            if not isinstance(fields.get("heartbeat_enabled"), bool):
-                issues.append({
-                    "severity": "P0",
-                    "where": "creation_preferences.autonomy",
-                    "message": "Choose Automatic or Manual mode in the creation panel.",
-                })
-        elif (
+        if (
             not isinstance(creation_preferences, dict)
             or creation_preferences.get("autonomy_confirmed") is not True
         ):

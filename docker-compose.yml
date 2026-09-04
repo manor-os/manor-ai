@@ -248,7 +248,7 @@ services:
       DOCUMENT_FILE_REPAIR_ENABLED: ${DOCUMENT_FILE_REPAIR_ENABLED:-true}
       DOCUMENT_FILE_STALE_HEAL_ENABLED: ${DOCUMENT_FILE_STALE_HEAL_ENABLED:-true}
       SANDBOX_SERVICE_URL: http://manor-sandbox:8000
-      SANDBOX_API_TOKEN: ${SANDBOX_API_TOKEN:-manor-local-sandbox-token-change-me}
+      SANDBOX_API_TOKEN: ${SANDBOX_API_TOKEN:-}
       SHELL_SANDBOX_ENABLED: "true"
       CELERY_BROKER_URL: redis://redis:6379/2
       CELERY_RESULT_BACKEND: redis://redis:6379/3
@@ -531,7 +531,7 @@ services:
     # to settle. Default 10s sometimes wasn't enough during deploy windows.
     stop_grace_period: 30s
     ports:
-      - "127.0.0.1:8110:8000"
+      - "8110:8000"
     volumes:
       # Sandbox service needs host Docker daemon to spawn skill containers
       - /var/run/docker.sock:/var/run/docker.sock
@@ -539,7 +539,7 @@ services:
       MANOR_SERVICE_ROLE: sandbox
       SANDBOX_HOST: "0.0.0.0"
       SANDBOX_PORT: "8000"
-      SANDBOX_API_TOKEN: ${SANDBOX_API_TOKEN:-manor-local-sandbox-token-change-me}
+      SANDBOX_API_TOKEN: ${SANDBOX_API_TOKEN:-}
       SANDBOX_IMAGE: ${SANDBOX_IMAGE:-sandbox-skill:latest}
       SANDBOX_NETWORK: ${SANDBOX_NETWORK:-bridge}
       # The general sandbox uses bridge for managed skill sessions. The

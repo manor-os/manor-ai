@@ -43,39 +43,6 @@ from packages.core.services.workspace_setup_service import DEFAULT_FIELDS
 pytestmark = pytest.mark.asyncio
 
 
-@pytest.mark.parametrize("blueprint_mode", [False, True])
-@pytest.mark.parametrize("user_mode", [None, False, True])
-async def test_blueprint_mode_respects_explicit_creation_switch(
-    db_session, blueprint_mode, user_mode,
-) -> None:
-    from packages.core.services.workspace_draft_service import (
-        apply_public_field_updates,
-        create_draft_shell,
-    )
-
-    entity_id, user_id = generate_ulid(), generate_ulid()
-    payload = _payload(agent_slug="mode-agent", skill_slug="mode-skill", server_slug="mode-server")
-    payload["recipe"]["operating_model"]["heartbeat_enabled"] = blueprint_mode
-    blueprint = WorkspaceBlueprint(
-        id=generate_ulid(), entity_id=entity_id, slug=f"mode-{entity_id}",
-        title="Runtime mode Blueprint", payload=payload,
-        payload_version="1.1", status="published",
-    )
-    db_session.add(blueprint)
-    draft = await create_draft_shell(db_session, entity_id=entity_id, user_id=user_id)
-    if user_mode is not None:
-        apply_public_field_updates(draft, {"heartbeat_enabled": user_mode})
-    await db_session.commit()
-    applied = await apply_blueprint(
-        db_session, draft_id=draft.id, entity_id=entity_id,
-        blueprint_id=blueprint.id, user_id=user_id,
-    )
-    assert applied.fields["heartbeat_enabled"] is (
-        blueprint_mode if user_mode is None else user_mode
-    )
-    assert applied.fields[CREATION_PREFERENCES_FIELD]["autonomy_confirmed"] is (user_mode is not None)
-
-
 def _payload(*, agent_slug: str, skill_slug: str, server_slug: str) -> dict:
     return {
         "manifest": {
@@ -151,12 +118,10 @@ def _payload(*, agent_slug: str, skill_slug: str, server_slug: str) -> dict:
             "goals": [{
                 "title": "Complete copied work",
                 "metric_key": "completed_items",
-                "stat_key": "workspace.tasks.completed",
                 "target_value": 10,
-                "measurement_cadence": None,
+                "measurement_cadence": "daily",
                 "priority": 3,
             }],
-            "stats": [{"library_key": "workspace.tasks.completed", "collection_cadence": "daily"}],
             "task_categories": [],
             "custom_fields": [],
             "sla_policies": [],
@@ -332,8 +297,7 @@ async def test_apply_blueprint_materializes_agent_capabilities(
     assert custom["mcp_bindings"] == [server_slug]
     assert custom["missing_skill_specs"][0]["slug"] == skill_slug
     assert applied.fields["goals"][0]["target"] == 10
-    assert applied.fields["goals"][0]["stat_key"] == "workspace.tasks.completed"
-    assert applied.fields["stats"] == payload["recipe"]["stats"]
+    assert applied.fields["goals"][0]["cadence"] == "daily"
     assert applied.fields["heartbeat_enabled"] is True
     assert applied.fields["heartbeat_cadence"] == "weekly"
     assert applied.fields["_blueprint_operating_model"]["strategist"]["cadence"] == "daily"
@@ -343,7 +307,7 @@ async def test_apply_blueprint_materializes_agent_capabilities(
     assert applied.fields["_blueprint_disable_business_ledger_matching"] is True
     assert applied.fields[CREATION_PREFERENCES_FIELD] == {
         "goal_confirmed": False,
-        "autonomy_confirmed": True,
+        "autonomy_confirmed": False,
     }
     assert applied.missing == ["creation_preferences"]
     assert applied.status == "active"
@@ -386,16 +350,6 @@ async def test_apply_blueprint_materializes_agent_capabilities(
     assert workspace is not None
     assert workspace.heartbeat_enabled is True
     assert workspace.heartbeat_cadence == "weekly"
-    from packages.core.models.goal import Goal
-    from packages.core.models.workspace_stat import WorkspaceStat
-
-    goal = (await db_session.execute(select(Goal).where(Goal.workspace_id == workspace_id))).scalar_one()
-    stat = (await db_session.execute(select(WorkspaceStat).where(WorkspaceStat.workspace_id == workspace_id))).scalar_one()
-    assert goal.stat_id == stat.id
-    assert stat.key == "workspace.tasks.completed"
-    assert stat.collection_cadence == "daily"
-    assert stat.current_value is None and goal.current_value is None
-    assert goal.measurement_source is None and goal.measurement_cadence is None
     assert workspace.settings["ledger_contracts"][0]["contract_id"] == (
         "manor.recruiting_ledger/v1"
     )

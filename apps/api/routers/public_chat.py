@@ -1078,21 +1078,7 @@ async def send_message(
         content=req.text,
         attachments=req.attachments,
         runtime_metadata=(
-            {
-                "voice_session_mode": "chat_gateway",
-                **(
-                    {
-                        "voice_origin_message_id": str(
-                            request.state.voice_origin_message_id
-                        ),
-                        "origin_user_message_id": str(
-                            request.state.voice_origin_message_id
-                        ),
-                    }
-                    if getattr(request.state, "voice_origin_message_id", None)
-                    else {}
-                ),
-            }
+            {"voice_session_mode": "chat_gateway"}
             if getattr(request.state, "voice_session_mode", None) == "chat_gateway"
             else None
         ),

@@ -381,12 +381,6 @@ def _supervisor_tool_names_for_call(tool_name: str, tool_args: Mapping[str, Any]
         action = str(tool_args.get("action") or "").strip()
         if action:
             names.append(f"{tool_name}:{action}")
-        if tool_name == "manor" and action == "workspace":
-            raw_params = tool_args.get("params")
-            params = raw_params if isinstance(raw_params, Mapping) else {}
-            workspace_action = str(params.get("action") or "").strip()
-            if workspace_action:
-                names.append(f"manor:workspace:{workspace_action}")
     return names
 
 

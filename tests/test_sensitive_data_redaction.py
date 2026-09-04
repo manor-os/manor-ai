@@ -2,12 +2,7 @@ from packages.core.ai.runtime.envelope import RuntimeEnvelope
 from packages.core.ai.runtime.principals import RuntimePrincipal, RuntimePrincipalKind
 from packages.core.ai.runtime.profiles import RuntimeProfile
 from packages.core.ai.runtime.surfaces import ChatSurface
-from packages.core.services.sensitive_data import (
-    REDACTED,
-    redact_sensitive_text,
-    sanitize_approval_credentials,
-    sanitize_sensitive_payload,
-)
+from packages.core.services.sensitive_data import REDACTED, redact_sensitive_text, sanitize_sensitive_payload
 
 
 def test_sanitize_sensitive_payload_redacts_nested_credentials() -> None:
@@ -45,24 +40,6 @@ def test_redact_sensitive_text_covers_common_inline_key_shapes() -> None:
     assert "ark-test-secret" not in redacted
     assert "sk-ant-secret-value" not in redacted
     assert "workspace_id=ok" in redacted
-
-
-def test_sanitize_approval_credentials_covers_structured_and_broken_results() -> None:
-    structured = sanitize_approval_credentials({
-        "ok": True,
-        "approvalToken": "single-use-secret",
-        "nested": {"approval_token": "nested-secret", "safe": "ok"},
-    })
-    plain = sanitize_approval_credentials("approvalToken=plain-secret")
-    broken = sanitize_approval_credentials(
-        'provider failed: {"approval_token":"broken-secret"'
-    )
-
-    assert structured == {"ok": True, "nested": {"safe": "ok"}}
-    assert "plain-secret" not in plain
-    assert "broken-secret" not in broken
-    assert REDACTED in plain
-    assert REDACTED in broken
 
 
 def test_redaction_covers_proxy_auth_password_client_secret_and_private_key_blocks() -> None:

@@ -21,7 +21,6 @@ was the one that could never be opened.
 from __future__ import annotations
 
 import re
-from urllib.parse import quote
 
 import pytest
 
@@ -31,7 +30,6 @@ from packages.core.workspace_chat.notifiers import (
     _render_dag,
     _render_plan_completion_summary,
     _render_step_completion_summary,
-    _unique_artifacts,
     extract_artifacts_for_chat,
 )
 
@@ -68,6 +66,7 @@ def test_a_name_is_not_another_location():
     [
         {"path": "/Workspaces/W/final/clip.mp4"},          # leading slash
         {"fs_path": "Workspaces/W/final/clip.mp4/"},       # trailing slash
+        {"output_path": "Workspaces/W/final/CLIP.MP4"},    # case
         {"file_path": "Workspaces\\W\\final\\clip.mp4"},          # separators
     ],
 )
@@ -88,151 +87,6 @@ def test_genuinely_different_files_both_survive():
     assert len([a for a in found if a["kind"] == "file"]) == 2
 
 
-def test_one_result_with_full_and_relative_paths_has_one_completion_file():
-    name = "AI_SDE_20小时课程_学生教材版.md"
-    path = f"Workspaces/W/final/{name}"
-    artifacts = extract_artifacts_for_chat({
-        "files": [{"name": name, "fs_path": path, "path": name}],
-    })
-    assert artifacts == [{"kind": "file", "value": path, "name": name}]
-    summary = _render_plan_completion_summary(
-        plan_id="plan_1", task_title="Write textbook", duration_seconds=1,
-        cost_usd=None, steps=[_step(artifacts)], entity_id=ENTITY,
-    )
-    assert summary.count("File:") == 1
-    assert len(_artifacts_as_attachments(artifacts, entity_id=ENTITY)) == 1
-
-
-def test_completion_preserves_same_named_files_at_distinct_paths():
-    artifacts = extract_artifacts_for_chat({"files": [
-        {"fs_path": "Workspaces/W/a/report.md"},
-        {"fs_path": "Workspaces/W/b/report.md"},
-        {"fs_path": "Workspaces/W/a/REPORT.md"},
-    ]})
-    assert len(artifacts) == 3
-    attachments = _artifacts_as_attachments(artifacts, entity_id=ENTITY)
-    assert len(attachments) == 3
-    assert len({item["previewUrl"] for item in attachments}) == 3
-
-
-def test_completion_preserves_literal_path_characters_through_all_projections():
-    paths = [f"Workspaces/W/{name}" for name in ["report#1.md", "report#2.md", "report%2520.md", "report?2.md"]]
-    artifacts = extract_artifacts_for_chat({"files": [{"fs_path": path} for path in paths]})
-    assert [item["value"] for item in artifacts] == paths
-    attachments = _artifacts_as_attachments(artifacts, entity_id=ENTITY)
-    assert [item["fsPath"] for item in attachments] == paths
-    summary = _render_plan_completion_summary(
-        plan_id="plan_1", task_title="Save reports", duration_seconds=1,
-        cost_usd=None, steps=[_step(artifacts)], entity_id=ENTITY,
-    )
-    assert summary.count("File:") == len(paths)
-    for path, attachment in zip(paths, attachments):
-        address = f"/api/v1/fs/{ENTITY}/{quote(path)}"
-        assert attachment["openUrl"] == address
-        assert f"]({address})" in summary
-
-
-@pytest.mark.parametrize("reverse", [False, True])
-def test_completion_merges_viewer_url_with_known_document(reverse):
-    files = [{"document_id": "doc_1", "name": "report.md"}, {"open_url": "/viewer/doc_1", "name": "report.md"}]
-    artifacts = extract_artifacts_for_chat({"files": list(reversed(files)) if reverse else files})
-    assert artifacts == [{"kind": "document", "value": "doc_1", "name": "report.md"}]
-    assert len(_artifacts_as_attachments(artifacts)) == 1
-    assert _render_dag([_step(artifacts)]).count("/viewer/doc_1") == 1
-
-
-@pytest.mark.parametrize("field", ["previewUrl", "preview_url"])
-def test_formal_output_address_does_not_emit_its_thumbnail_as_another_file(field):
-    address = "https://cdn.example/report.pdf"
-    artifacts = extract_artifacts_for_chat({"file_url": address, field: "https://cdn.example/cover.png", "name": "report.pdf"})
-    assert artifacts == [{"kind": "url", "value": address, "name": "report.pdf"}]
-
-
-def test_document_only_reference_does_not_hide_an_unrelated_same_named_file():
-    artifacts = extract_artifacts_for_chat({
-        "files": [{"fs_path": "Workspaces/W/other/report.md"}],
-        "knowledge_artifacts": [{"document_id": "doc_report", "name": "report.md"}],
-    })
-    assert len(artifacts) == 2
-    assert len(_artifacts_as_attachments(artifacts, entity_id=ENTITY)) == 2
-
-
-def test_plan_summary_and_attachments_share_canonical_path_identity():
-    artifacts = [
-        {"kind": "file", "value": "Workspaces/W/final/report.md", "name": "report.md"},
-        {"kind": "file", "value": "/Workspaces/W/final/./report.md", "name": "report.md"},
-        {"kind": "url", "value": f"/api/v1/fs/{ENTITY}/Workspaces/W/final/report.md", "name": "report.md"},
-    ]
-    assert len(_unique_artifacts(artifacts)) == 1
-    assert len(_artifacts_as_attachments(artifacts, entity_id=ENTITY)) == 1
-    summary = _render_step_completion_summary(
-        label="Write report", agent_part="", time_part="", summary=None,
-        artifacts=artifacts, max_summary_chars=1000, entity_id=ENTITY,
-    )
-    assert summary.count("File:") == 1
-    assert _render_dag([_step(artifacts)], entity_id=ENTITY).count("File:") == 1
-
-
-@pytest.mark.parametrize("key", ["url", "previewUrl", "preview_url"])
-def test_url_only_output_keeps_its_exact_address_without_entity_context(key):
-    address = f"https://manor.example/api/v1/fs/{ENTITY}/Workspaces/W/report.md"
-    artifacts = extract_artifacts_for_chat({key: address, "name": "report.md"})
-    assert artifacts == [{"kind": "url", "value": address, "name": "report.md"}]
-    assert f"]({address})" in _format_artifact(artifacts[0])
-    assert _artifacts_as_attachments(artifacts)[0]["openUrl"] == address
-
-
-@pytest.mark.parametrize("id_key", ["id", "document_id"])
-def test_nested_document_keeps_its_path_identity(id_key):
-    artifacts = extract_artifacts_for_chat({
-        "files": [{"fs_path": "Workspaces/W/report.md"}],
-        "document": {
-            id_key: "doc_report", "fs_path": "Workspaces/W/report.md", "name": "report.md",
-        },
-    })
-    assert artifacts == [{
-        "kind": "document", "value": "doc_report", "name": "report.md",
-        "fs_path": "Workspaces/W/report.md",
-    }]
-
-
-@pytest.mark.parametrize("id_key", ["id", "document_id"])
-def test_nested_document_inherits_explicit_parent_path(id_key):
-    path = "Workspaces/W/report.md"
-    artifacts = extract_artifacts_for_chat({
-        "fs_path": path, "name": "report.md",
-        "document": {id_key: "doc_report", "name": "report.md"},
-    })
-    assert artifacts == [{"kind": "document", "value": "doc_report", "name": "report.md", "fs_path": path}]
-    assert len(_artifacts_as_attachments(artifacts, entity_id=ENTITY)) == 1
-
-
-def test_nested_document_does_not_inherit_another_documents_path_or_a_thumbnail():
-    path = "Workspaces/W/report.md"
-    for parent in [{"fs_path": path, "document_id": "doc_parent"}, {"previewUrl": f"/api/v1/fs/{ENTITY}/{path}"}]:
-        artifacts = extract_artifacts_for_chat({**parent, "document": {"id": "doc_child", "name": "report.md"}})
-        child = next(item for item in artifacts if item["value"] == "doc_child")
-        assert "fs_path" not in child
-        assert len(artifacts) == 2
-    artifacts = extract_artifacts_for_chat({
-        "fs_path": path, "document": {"id": "doc_child", "fs_path": "Workspaces/W/other.md"},
-    })
-    assert len(artifacts) == 2
-    assert artifacts[0]["fs_path"] == "Workspaces/W/other.md"
-
-
-def test_document_path_identity_survives_step_extraction_for_plan_dedupe():
-    document = extract_artifacts_for_chat({
-        "document_id": "doc_report", "fs_path": "Workspaces/W/report.md",
-    })
-    file = extract_artifacts_for_chat({"fs_path": "Workspaces/W/report.md"})
-    artifacts = _unique_artifacts([*file, *document])
-    assert len(artifacts) == 1
-    assert artifacts[0]["kind"] == "document"
-    assert artifacts[0]["value"] == "doc_report"
-    assert artifacts[0]["fs_path"] == "Workspaces/W/report.md"
-
-
 def test_a_knowledge_document_replaces_its_raw_filesystem_reference():
     found = extract_artifacts_for_chat(
         {
@@ -246,7 +100,6 @@ def test_a_knowledge_document_replaces_its_raw_filesystem_reference():
         "kind": "document",
         "value": "01KYNERQ91YH35G3V7FA1M0J8F",
         "name": "report.md",
-        "fs_path": "Workspaces/W/final/report.md",
     }]
 
 
@@ -386,7 +239,6 @@ def test_completed_artifacts_share_the_structured_chat_attachment_contract():
                 "kind": "document",
                 "value": "01KYNERQ91YH35G3V7FA1M0J8F",
                 "name": "clip.mp4",
-                "fs_path": "Workspaces/W/final/clip.mp4",
             },
         ],
         entity_id=ENTITY,
@@ -399,8 +251,6 @@ def test_completed_artifacts_share_the_structured_chat_attachment_contract():
             "fileType": "mp4",
             "previewUrl": f"/api/v1/fs/{ENTITY}/Workspaces/W/final/clip.mp4",
             "document_id": "01KYNERQ91YH35G3V7FA1M0J8F",
-            "fsPath": "Workspaces/W/final/clip.mp4",
-            "openUrl": "/viewer/01KYNERQ91YH35G3V7FA1M0J8F",
         }
     ]
 

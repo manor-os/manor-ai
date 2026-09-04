@@ -92,7 +92,6 @@ from packages.core.services.entity_fs import (
 )
 from packages.core.services.entity_service import get_workspace
 from packages.core.services.workspace_access import user_can_manage_workspace
-from packages.core.services.merchant_service import get_merchant_account
 from packages.core.services.marketplace_billing import (
     blueprint_delivery_requires_paid_plan,
     blueprint_delivery_source,
@@ -346,24 +345,6 @@ class BlueprintFavoriteResponse(BaseModel):
     favorite_count: int
 
 
-class SubmitBlueprintReviewRequest(BaseModel):
-    note: Optional[str] = Field(None, max_length=1000)
-
-
-class BlueprintPricingRequest(BaseModel):
-    price_cents: int = Field(ge=0, le=1_000_000)
-    list_price_cents: Optional[int] = Field(None, ge=0, le=1_000_000)
-
-    @model_validator(mode="after")
-    def validate_sale_price(self):
-        if (
-            self.list_price_cents is not None
-            and self.list_price_cents <= self.price_cents
-        ):
-            raise ValueError(
-                "list_price_cents must be greater than price_cents",
-            )
-        return self
 
 
 class ShareTokenResponse(BaseModel):
@@ -2061,47 +2042,6 @@ async def toggle_blueprint_favorite(
     )
 
 
-@blueprint_router.put("/{blueprint_id}/pricing", response_model=BlueprintSummary)
-async def set_blueprint_pricing(
-    blueprint_id: str,
-    req: BlueprintPricingRequest,
-    user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
-):
-    """Set the current checkout price and optional higher list price.
-
-    Free (0) works everywhere; a paid checkout price requires cloud mode and
-    a charges- and payouts-enabled merchant account. Pricing does not touch
-    review status.
-    """
-    if _builtin_payload_for_id(blueprint_id) is not None:
-        raise HTTPException(409, "built-in marketplace blueprints cannot be priced")
-
-    row = await _load_blueprint(db, blueprint_id, user.entity_id, allow_published=False)
-    await check_effective_user_permission(db, user, Permission.ADMIN_BILLING)
-
-    if req.price_cents > 0:
-        if os.getenv("DEPLOYMENT_MODE", "oss") != "cloud":
-            raise HTTPException(403, "Paid blueprints are only available in cloud mode")
-        merchant = await get_merchant_account(db, user.entity_id)
-        if (
-            merchant is None
-            or not merchant.charges_enabled
-            or not merchant.payouts_enabled
-        ):
-            raise HTTPException(
-                409,
-                "Connect a payout account before setting a price "
-                "(POST /api/v1/merchant/onboard)",
-            )
-
-    row.price_cents = req.price_cents
-    row.list_price_cents = req.list_price_cents
-    await db.flush()
-    await db.refresh(row)
-    summary = await _summary_with_signals(db, row, user.entity_id, user.id)
-    await db.commit()
-    return summary
 
 
 @blueprint_router.post("/{blueprint_id}/share-token", response_model=ShareTokenResponse)
@@ -2135,37 +2075,6 @@ async def revoke_share_token(
     await db.commit()
 
 
-@blueprint_router.post("/{blueprint_id}/submit-review", response_model=BlueprintSummary)
-async def submit_blueprint_for_review(
-    blueprint_id: str,
-    req: SubmitBlueprintReviewRequest,
-    user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
-):
-    """Submit an owned blueprint for platform-admin marketplace review."""
-    if _builtin_payload_for_id(blueprint_id) is not None:
-        raise HTTPException(409, "built-in marketplace blueprints are already published")
-
-    row = await _load_blueprint(db, blueprint_id, user.entity_id, allow_published=False)
-    if row.status == BlueprintStatus.PUBLISHED:
-        raise HTTPException(409, "blueprint is already published")
-    if row.status == BlueprintStatus.PENDING_REVIEW:
-        return await _summary_with_signals(
-            db, row, user.entity_id, user.id,
-        )
-    if row.status not in BLUEPRINT_EDITABLE_STATUSES:
-        raise HTTPException(409, f"blueprint cannot be submitted from status {row.status!r}")
-
-    row.status = BlueprintStatus.PENDING_REVIEW.value
-    row.published_at = None
-    # ``note`` is intentionally not persisted in the portable payload. The
-    # review workflow is status-based; admin approve/reject records the audit
-    # reason separately so installs continue to consume a clean blueprint JSON.
-    await db.flush()
-    await db.refresh(row)
-    summary = await _summary_with_signals(db, row, user.entity_id, user.id)
-    await db.commit()
-    return summary
 
 
 @blueprint_router.delete("/{blueprint_id}", status_code=204)

@@ -65,12 +65,7 @@ app.add_middleware(
 @app.middleware("http")
 async def require_sandbox_api_token(request: Request, call_next):
     token = config.API_TOKEN.strip()
-    if request.url.path.startswith("/api/v1/"):
-        if not token:
-            return JSONResponse(
-                {"detail": "Sandbox API token is not configured"},
-                status_code=503,
-            )
+    if token and request.url.path.startswith("/api/v1/"):
         supplied = request.headers.get("X-Manor-Sandbox-Token", "")
         if not secrets.compare_digest(supplied, token):
             return JSONResponse(

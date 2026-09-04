@@ -9802,10 +9802,6 @@ html[data-theme="dark"] .task-detail-meta-card {
     overflow: visible;
   }
 
-  .manor-docx-native .manor-docx-paragraph {
-    position: relative;
-  }
-
   .manor-docx-page__header,
   .manor-docx-page__footer {
     position: absolute;
@@ -9823,38 +9819,6 @@ html[data-theme="dark"] .task-detail-meta-card {
   .manor-docx-page__footer {
     bottom: var(--docx-footer-distance);
     max-height: calc(var(--docx-margin-bottom) - var(--docx-footer-distance));
-  }
-
-  .manor-docx-anchor-origin {
-    position: absolute;
-    top: 0;
-    left: 0;
-    display: inline-block;
-    width: 0;
-    height: 0;
-    vertical-align: baseline;
-  }
-
-  .manor-docx-floating-picture {
-    box-sizing: border-box;
-  }
-
-  .manor-docx-text-box {
-    min-width: 1px;
-    min-height: 1px;
-    transform-origin: center;
-  }
-
-  .manor-docx-text-box > [data-docx-text-box-paragraph-index] {
-    display: block;
-    min-height: 1em;
-    margin: 0;
-    outline: none;
-    white-space: pre-wrap;
-  }
-
-  .manor-docx-readonly .manor-docx-text-box > [data-docx-text-box-paragraph-index] {
-    pointer-events: none;
   }
 
   .manor-docx-native p {

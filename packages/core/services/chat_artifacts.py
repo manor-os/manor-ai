@@ -6,12 +6,11 @@ import os
 import re
 from typing import Any
 
-from packages.core.ai.runtime.composite_tools import RuntimeCompositeToolCallFactory
+from packages.core.services.file_type_detection import mime_for_extension
 from packages.core.services.generated_file_refs import (
     canonical_generated_file_ref,
     dedupe_generated_file_refs,
 )
-
 
 _COLLECTION_KEYS = (
     "files",
@@ -166,6 +165,9 @@ def _mime_type(name: str, explicit: Any = None) -> str:
     explicit_text = _text(explicit)
     if explicit_text:
         return explicit_text
+    known = mime_for_extension(_extension_from_name(name))
+    if known != "application/octet-stream":
+        return known
     guessed, _encoding = mimetypes.guess_type(name)
     return guessed or ""
 
@@ -368,16 +370,7 @@ def chat_attachments_from_tool_results(tool_results: list[dict] | None) -> list[
             continue
         payload = _parse_json(item.get("raw_result", item.get("result")))
         if isinstance(payload, dict):
-            arguments = item.get("arguments")
-            canonical_call = RuntimeCompositeToolCallFactory.create(
-                _text(item.get("name")),
-                arguments if isinstance(arguments, dict) else {},
-            )
-            add_from_obj(
-                payload,
-                tool_name=canonical_call.tool_name,
-                inherited_created=False,
-            )
+            add_from_obj(payload, tool_name=_text(item.get("name")), inherited_created=False)
 
     attachments: list[dict[str, Any]] = []
     for ref in dedupe_generated_file_refs(canonical_refs, entity_id=entity_id)[:12]:

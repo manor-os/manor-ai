@@ -51,27 +51,6 @@ def cleanup_chat_uploads() -> dict:
         return {"ok": False, "error": str(exc)}
 
 
-@celery_app.task(name="maintenance.cleanup_document_upload_recovery")
-def cleanup_document_upload_recovery() -> dict:
-    """Remove expired browser-upload intents and unreferenced source bytes."""
-
-    async def _run() -> dict:
-        from apps.api.routers.documents import (
-            cleanup_expired_document_upload_recovery_intents,
-        )
-
-        report = await cleanup_expired_document_upload_recovery_intents(
-            limit=_env_int("DOCUMENT_UPLOAD_RECOVERY_CLEANUP_LIMIT", 200),
-        )
-        return {"ok": True, **report}
-
-    try:
-        return _run_async(_run())
-    except Exception as exc:  # noqa: BLE001
-        logger.exception("maintenance.cleanup_document_upload_recovery failed: %s", exc)
-        return {"ok": False, "error": str(exc)}
-
-
 @celery_app.task(name="maintenance.cleanup_ai_edit_sessions")
 def cleanup_ai_edit_sessions() -> dict:
     """Delete inactive host-owned AI Edit conversations after their TTL."""

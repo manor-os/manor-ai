@@ -1,6 +1,4 @@
 import JSZip from "jszip";
-import type { CSSProperties } from "react";
-import { officeCompatibleFontFamily } from "./officeFonts";
 import {
   createSpreadsheetFormulaEvaluationState,
   evaluateSpreadsheetFormulaValue,
@@ -18,7 +16,6 @@ type SpreadsheetFormulaCacheValue = SpreadsheetFormulaValue | SpreadsheetFormula
 const UNCALCULATED_FORMULA_VALUE: SpreadsheetFormulaErrorValue = { type: "error", value: "#N/A" };
 const INVALID_WORKSHEET_NAME_CHARACTER = /[\\/\[\]:*?]/;
 const INVALID_XML_CONTROL_CHARACTER = /[\u0000-\u0008\u000B\u000C\u000E-\u001F]/;
-const SPREADSHEET_CHART_MAX_POINTS = 10_000;
 
 export function isValidSpreadsheetWorksheetName(name: string): boolean {
   return Boolean(
@@ -42,14 +39,6 @@ export interface SpreadsheetCellStyle {
   color?: string;
   fill?: string;
   align?: "left" | "center" | "right";
-  verticalAlign?: "top" | "middle" | "bottom";
-  underline?: boolean;
-  strike?: boolean;
-  wrapText?: boolean;
-  borderTop?: string;
-  borderBottom?: string;
-  borderLeft?: string;
-  borderRight?: string;
 }
 
 export interface SpreadsheetRange {
@@ -59,37 +48,16 @@ export interface SpreadsheetRange {
 
 export interface SpreadsheetChartSeries {
   name: string;
-  categories: Array<string | number>;
+  categories: string[];
   values: number[];
-  color?: string;
-  pointColors?: string[];
-  showMarkers?: boolean;
-  plotType?: "column" | "bar" | "line" | "area" | "pie" | "doughnut" | "scatter" | "stock" | "volume";
 }
 
 export interface SpreadsheetChartModel {
   id: string;
-  type: "column" | "bar" | "line" | "area" | "pie" | "doughnut" | "scatter" | "combo_column_line" | "stock_hlc" | "stock_ohlc" | "stock_vhlc" | "stock_vohlc";
-  grouping?: "clustered" | "standard" | "stacked" | "percentStacked";
-  scatterStyle?: "marker" | "line" | "lineMarker" | "smooth" | "smoothMarker";
+  type: "bar" | "line" | "pie";
   title: string;
   series: SpreadsheetChartSeries[];
   anchor?: SpreadsheetRange;
-}
-
-export interface SpreadsheetImageModel {
-  id: string;
-  src: string;
-  name: string;
-  altText: string;
-  anchor: { r: number; c: number };
-  end?: { r: number; c: number };
-  offsetX: number;
-  offsetY: number;
-  endOffsetX?: number;
-  endOffsetY?: number;
-  width?: number;
-  height?: number;
 }
 
 export interface SpreadsheetEditorChart {
@@ -113,11 +81,9 @@ export interface SpreadsheetSheetModel {
   rowHeights: number[];
   merges: SpreadsheetRange[];
   charts: SpreadsheetChartModel[];
-  images: SpreadsheetImageModel[];
   editorCharts?: SpreadsheetEditorChart[];
   structureOperations?: SpreadsheetStructureOperation[];
   hidden: boolean;
-  showGridlines?: boolean;
 }
 
 export interface SpreadsheetSheetSnapshot {
@@ -163,25 +129,6 @@ export function nextSpreadsheetSheetName(existingNames: string[]): string {
     const candidate = `Sheet${index}`;
     if (!usedNames.has(candidate.toLocaleLowerCase())) return candidate;
   }
-}
-
-export function spreadsheetActiveSheetIndex(
-  workbook: any,
-  sheets: SpreadsheetSheetModel[],
-  excludedNames: string[] = [],
-): number {
-  const excluded = new Set(excludedNames.map((name) => name.toLocaleLowerCase()));
-  const selectable = (index: number) => Boolean(
-    sheets[index]
-    && !sheets[index].hidden
-    && !excluded.has(sheets[index].name.toLocaleLowerCase()),
-  );
-  const activeTab = Number(workbook?.Workbook?.WBView?.[0]?.activeTab);
-  if (Number.isInteger(activeTab) && activeTab >= 0 && activeTab < sheets.length && selectable(activeTab)) {
-    return activeTab;
-  }
-  const firstSelectable = sheets.findIndex((_sheet, index) => selectable(index));
-  return Math.max(0, firstSelectable);
 }
 
 function styleKey(row: number, column: number): string {
@@ -294,122 +241,9 @@ export function spreadsheetSheetsFromWorkbook(XLSX: any, workbook: any): Spreads
       rowHeights,
       merges,
       charts: [],
-      images: [],
       hidden: Number(workbookSheets[sheetIndex]?.Hidden || 0) !== 0,
     };
   });
-}
-
-/** Native style tables supplement SheetJS CE's fill-only cell.s projection. */
-export async function spreadsheetSheetsFromFile(XLSX: any, workbook: any, source: ArrayBuffer): Promise<SpreadsheetSheetModel[]> {
-  const sheets = spreadsheetSheetsFromWorkbook(XLSX, workbook);
-  const bytes = new Uint8Array(source);
-  if (bytes[0] !== 0x50 || bytes[1] !== 0x4b) return sheets;
-  const [zip, charts, images] = await Promise.all([
-    JSZip.loadAsync(source),
-    spreadsheetChartsFromFile(source, XLSX, workbook),
-    spreadsheetImagesFromFile(source),
-  ]);
-  const parts = await workbookSheetParts(zip);
-  const stylesXml = await zip.file("xl/styles.xml")?.async("text") || "";
-  const fonts = spreadsheetXmlItems(stylesXml, "fonts", "font");
-  const fills = spreadsheetXmlItems(stylesXml, "fills", "fill");
-  const borders = spreadsheetXmlItems(stylesXml, "borders", "border");
-  const attr = (xml: string, name: string) => xml.match(new RegExp(`\\b${name}="([^"]*)"`, "i"))?.[1];
-  const child = (xml: string, name: string) => xml.match(new RegExp(`<(?:[A-Za-z_][\\w.-]*:)?${name}\\b[^>]*?(?:\\/>|>[\\s\\S]*?<\\/(?:[A-Za-z_][\\w.-]*:)?${name}>)`, "i"))?.[0] || "";
-  const flag = (xml: string, name: string) => {
-    const tag = child(xml, name);
-    return Boolean(tag) && !["0", "false", "off", "none"].includes(attr(tag, "val") || "1");
-  };
-  const resolvedColor = (color: string) => {
-    const direct = attr(color, "rgb");
-    const theme = attr(color, "theme");
-    const resolved = theme != null ? workbook.Themes?.themeElements?.clrScheme?.[Number(theme)]?.rgb : undefined;
-    const value = direct && /^[a-f\d]{6,8}$/i.test(direct)
-      ? direct.slice(-6)
-      : typeof resolved === "string" && /^[a-f\d]{6}$/i.test(resolved) ? resolved : undefined;
-    if (!value) return undefined;
-    const tint = Number(attr(color, "tint"));
-    if (!Number.isFinite(tint) || tint === 0) return `#${value}`;
-    const channels = value.match(/../g)!.map((channel) => {
-      const current = Number.parseInt(channel, 16);
-      return Math.max(0, Math.min(255, Math.round(
-        tint < 0 ? current * (1 + tint) : current + (255 - current) * tint,
-      )));
-    });
-    return `#${channels.map((channel) => channel.toString(16).padStart(2, "0")).join("").toUpperCase()}`;
-  };
-  const rgb = (xml: string) => resolvedColor(child(xml, "color"));
-  const nativeStyles = spreadsheetXmlItems(stylesXml, "cellXfs", "xf").map((xf): SpreadsheetCellStyle => {
-    const font = fonts[Number(attr(xf, "fontId") || 0)] || "";
-    const fill = fills[Number(attr(xf, "fillId") || 0)] || "";
-    const patternFill = child(fill, "patternFill");
-    const fillColor = attr(patternFill, "patternType") === "solid"
-      ? resolvedColor(child(patternFill, "fgColor"))
-      : undefined;
-    const alignment = child(xf, "alignment");
-    const horizontal = attr(alignment, "horizontal");
-    const vertical = attr(alignment, "vertical");
-    const size = Number(attr(child(font, "sz"), "val"));
-    const name = attr(child(font, "name"), "val");
-    const border = borders[Number(attr(xf, "borderId") || 0)] || "";
-    const visual: SpreadsheetCellStyle = {
-      bold: flag(font, "b"), italic: flag(font, "i"), underline: flag(font, "u"), strike: flag(font, "strike"),
-      ...(Number.isFinite(size) && size > 0 ? { fontSize: size } : {}),
-      ...(name ? { fontFamily: decodeXml(name) } : {}),
-      ...(rgb(font) ? { color: rgb(font) } : {}),
-      ...(fillColor ? { fill: fillColor } : {}),
-      ...(horizontal === "left" || horizontal === "center" || horizontal === "right" ? { align: horizontal } : {}),
-      ...(vertical === "center" ? { verticalAlign: "middle" } : vertical === "top" || vertical === "bottom" ? { verticalAlign: vertical } : {}),
-      ...(attr(alignment, "wrapText") != null ? { wrapText: ["1", "true"].includes(attr(alignment, "wrapText")!) } : {}),
-    };
-    for (const edge of ["Top", "Bottom", "Left", "Right"] as const) {
-      const side = child(border, edge.toLowerCase());
-      const style = attr(side, "style");
-      if (!style) continue;
-      const width = style === "double" || style === "thick" ? 3 : style.startsWith("medium") ? 2 : 1;
-      const line = style === "double" ? "double" : /dash/i.test(style) ? "dashed" : style === "dotted" || style === "hair" ? "dotted" : "solid";
-      visual[`border${edge}`] = `${width}px ${line} ${rgb(side) || "#000000"}`;
-    }
-    return visual;
-  });
-  for (const sheet of sheets) {
-    sheet.charts = charts.get(sheet.name) || [];
-    sheet.images = images.get(sheet.name) || [];
-    const part = parts.get(sheet.name);
-    const xml = part ? await zip.file(part)?.async("text") || "" : "";
-    const view = child(xml, "sheetView");
-    sheet.showGridlines = !["0", "false"].includes(attr(view, "showGridLines") || "1");
-    for (const row of xml.match(/<(?:[A-Za-z_][\w.-]*:)?row\b[^>]*>/gi) || []) {
-      const index = Number(attr(row, "r")) - 1;
-      const points = Number(attr(row, "ht"));
-      if (index >= 0 && index < sheet.rowHeights.length && Number.isFinite(points) && points > 0) sheet.rowHeights[index] = points * 96 / 72;
-    }
-    for (const cell of xml.match(/<(?:[A-Za-z_][\w.-]*:)?c\b[^>]*>/gi) || []) {
-      const reference = attr(cell, "r");
-      if (!reference || !/^[A-Z]+\d+$/i.test(reference)) continue;
-      const { r, c } = XLSX.utils.decode_cell(reference);
-      if (r >= sheet.data.length || c >= sheet.columnWidths.length) continue;
-      const visual = nativeStyles[Number(attr(cell, "s") || 0)];
-      if (visual) sheet.styles[styleKey(r, c)] = { ...sheet.styles[styleKey(r, c)], ...visual };
-    }
-  }
-  return sheets;
-}
-
-export function spreadsheetCellVisualStyle(style: SpreadsheetCellStyle): CSSProperties {
-  return {
-    color: style.color, fontFamily: style.fontFamily ? `"${officeCompatibleFontFamily(style.fontFamily)}", sans-serif` : undefined,
-    fontSize: style.fontSize != null ? `${style.fontSize}pt` : undefined,
-    fontWeight: style.bold ? 700 : 400, fontStyle: style.italic ? "italic" : "normal",
-    textDecoration: [style.underline ? "underline" : "", style.strike ? "line-through" : ""].filter(Boolean).join(" ") || undefined,
-    textAlign: style.align, verticalAlign: style.verticalAlign,
-    ...(style.borderTop ? { borderTop: style.borderTop } : {}),
-    ...(style.borderBottom ? { borderBottom: style.borderBottom } : {}),
-    ...(style.borderLeft ? { borderLeft: style.borderLeft } : {}),
-    ...(style.borderRight ? { borderRight: style.borderRight } : {}),
-    whiteSpace: style.wrapText === false ? "pre" : "pre-wrap",
-  };
 }
 
 function decodeXml(value: string): string {
@@ -505,13 +339,6 @@ function elementBlocks(xml: string, localName: string): string[] {
   return xml.match(pattern) || [];
 }
 
-function drawingAnchorBlocks(xml: string): string[] {
-  return [...xml.matchAll(new RegExp(
-    `<(?:[A-Za-z_][\\w.-]*:)?(twoCellAnchor|oneCellAnchor|absoluteAnchor)\\b[^>]*>[\\s\\S]*?<\\/(?:[A-Za-z_][\\w.-]*:)?\\1>`,
-    "gi",
-  ))].map((match) => match[0]);
-}
-
 function elementText(xml: string | null, localName: string): string {
   if (!xml) return "";
   const pattern = new RegExp(
@@ -519,42 +346,6 @@ function elementText(xml: string | null, localName: string): string {
     "i",
   );
   return decodeXml(xml.match(pattern)?.[1] || "");
-}
-
-function elementAttribute(xml: string | null, localName: string, attribute: string): string {
-  if (!xml) return "";
-  const opening = xml.match(new RegExp(`<(?:[A-Za-z_][\\w.-]*:)?${localName}\\b[^>]*>`, "i"))?.[0] || "";
-  return decodeXml(opening.match(new RegExp(`\\b${attribute}="([^"]*)"`, "i"))?.[1] || "");
-}
-
-function spreadsheetThemeColors(xml: string): Map<string, string> {
-  const colors = new Map<string, string>();
-  const scheme = elementBlock(xml, "clrScheme");
-  if (!scheme) return colors;
-  for (const name of ["dk1", "lt1", "dk2", "lt2", "accent1", "accent2", "accent3", "accent4", "accent5", "accent6", "hlink", "folHlink"]) {
-    const entry = elementBlock(scheme, name);
-    const value = elementAttribute(entry, "srgbClr", "val") || elementAttribute(entry, "sysClr", "lastClr");
-    if (/^[0-9a-f]{6}$/i.test(value)) colors.set(name, `#${value.toUpperCase()}`);
-  }
-  return colors;
-}
-
-function chartRgbColor(xml: string | null, themeColors: Map<string, string>): string | undefined {
-  if (!xml) return undefined;
-  const direct = elementAttribute(xml, "srgbClr", "val");
-  const scheme = elementAttribute(xml, "schemeClr", "val");
-  const value = /^[0-9a-f]{6}$/i.test(direct) ? direct : themeColors.get(scheme)?.slice(1);
-  if (!value || !/^[0-9a-f]{6}$/i.test(value)) return undefined;
-  const lumModAttribute = elementAttribute(xml, "lumMod", "val");
-  const lumOffAttribute = elementAttribute(xml, "lumOff", "val");
-  const lumModValue = Number(lumModAttribute);
-  const lumOffValue = Number(lumOffAttribute);
-  const lumMod = lumModAttribute && Number.isFinite(lumModValue) ? lumModValue / 100_000 : 1;
-  const lumOff = lumOffAttribute && Number.isFinite(lumOffValue) ? lumOffValue / 100_000 : 0;
-  const channels = value.match(/../g)!.map((channel) => (
-    Math.max(0, Math.min(255, Math.round(Number.parseInt(channel, 16) * lumMod + 255 * lumOff)))
-  ));
-  return `#${channels.map((channel) => channel.toString(16).padStart(2, "0")).join("").toUpperCase()}`;
 }
 
 function formulaRangeValues(
@@ -568,25 +359,14 @@ function formulaRangeValues(
   const match = normalized.match(/^(?:'((?:''|[^'])+)'|([^!]+))!(\$?[A-Z]+\$?\d+(?::\$?[A-Z]+\$?\d+)?)$/i);
   const sheetName = (match?.[1]?.replace(/''/g, "'") || match?.[2] || fallbackSheetName).trim();
   const rangeText = (match?.[3] || normalized).replace(/\$/g, "");
-  if (!/^[A-Z]+\d+(?::[A-Z]+\d+)?$/i.test(rangeText)) return [];
   const worksheet = workbook?.Sheets?.[sheetName];
   if (!worksheet) return [];
   let range: { s: { r: number; c: number }; e: { r: number; c: number } };
   try {
     range = XLSX.utils.decode_range(rangeText);
-    const usedRange = typeof worksheet["!ref"] === "string"
-      ? XLSX.utils.decode_range(worksheet["!ref"])
-      : range;
-    range = {
-      s: { r: Math.max(range.s.r, usedRange.s.r), c: Math.max(range.s.c, usedRange.s.c) },
-      e: { r: Math.min(range.e.r, usedRange.e.r), c: Math.min(range.e.c, usedRange.e.c) },
-    };
   } catch {
     return [];
   }
-  if (range.s.r > range.e.r || range.s.c > range.e.c) return [];
-  const pointCount = (range.e.r - range.s.r + 1) * (range.e.c - range.s.c + 1);
-  if (pointCount > SPREADSHEET_CHART_MAX_POINTS) return [];
   const values: Array<string | number> = [];
   for (let row = range.s.r; row <= range.e.r; row += 1) {
     for (let column = range.s.c; column <= range.e.c; column += 1) {
@@ -596,38 +376,6 @@ function formulaRangeValues(
     }
   }
   return values;
-}
-
-function chartCachedValues(source: string | null, display: boolean): Array<string | number> {
-  if (!source) return [];
-  const cache = ["strCache", "numCache", "strLit", "numLit"]
-    .map((localName) => elementBlock(source, localName))
-    .find(Boolean);
-  if (!cache) return [];
-  const points = new Map<number, string | number>();
-  let lastPointIndex = -1;
-  for (const point of elementBlocks(cache, "pt")) {
-    const index = Number(elementAttribute(point, "pt", "idx"));
-    const rawValue = elementText(point, "v");
-    const value = display ? rawValue : Number(rawValue);
-    if (
-      Number.isInteger(index) && index >= 0 && index < SPREADSHEET_CHART_MAX_POINTS
-      && (display || Number.isFinite(value))
-    ) {
-      points.set(index, value);
-      lastPointIndex = Math.max(lastPointIndex, index);
-    }
-  }
-  const declaredCount = Number(elementAttribute(cache, "ptCount", "val"));
-  const lastIndex = Math.min(SPREADSHEET_CHART_MAX_POINTS - 1, Math.max(
-    Number.isInteger(declaredCount) && declaredCount > 0 ? declaredCount - 1 : -1,
-    lastPointIndex,
-  ));
-  if (lastIndex < 0) return [];
-  return Array.from(
-    { length: lastIndex + 1 },
-    (_, index) => points.get(index) ?? (display ? "" : 0),
-  );
 }
 
 function chartAnchor(block: string): SpreadsheetRange | undefined {
@@ -646,133 +394,31 @@ function parseChartModel(
   chartXml: string,
   sheetName: string,
   id: string,
-  themeColors: Map<string, string>,
   anchor?: SpreadsheetRange,
 ): SpreadsheetChartModel | null {
-  const chartTypes = ["barChart", "lineChart", "areaChart", "pieChart", "doughnutChart", "scatterChart", "stockChart"] as const;
-  const chartBlocks = chartTypes.flatMap((name) => (
-    elementBlocks(chartXml, name).map((block) => ({ name, block }))
-  ));
-  if (chartBlocks.length === 0) return null;
-  const primary = chartBlocks[0];
-  type NativePlotType = Exclude<NonNullable<SpreadsheetChartSeries["plotType"]>, "volume">;
-  const nativePlotType = (
-    name: typeof chartTypes[number], block: string,
-  ): NativePlotType => name === "barChart"
-    ? elementAttribute(block, "barDir", "val") === "bar" ? "bar" : "column"
-    : name === "lineChart" ? "line"
-      : name === "areaChart" ? "area"
-        : name === "doughnutChart" ? "doughnut"
-          : name === "scatterChart" ? "scatter"
-            : name === "stockChart" ? "stock" : "pie";
-  const plotTypes = chartBlocks.map(({ name, block }) => nativePlotType(name, block)!);
-  const isColumnLineCombo = plotTypes.length === 2
-    && plotTypes.includes("column")
-    && plotTypes.includes("line")
-    && plotTypes.every((plotType) => plotType === "column" || plotType === "line");
-  const isVolumeStockCandidate = plotTypes.length === 2
-    && plotTypes.includes("column")
-    && plotTypes.includes("stock")
-    && plotTypes.every((plotType) => plotType === "column" || plotType === "stock");
-  if (plotTypes.length !== 1 && !isColumnLineCombo && !isVolumeStockCandidate) return null;
-  let type: SpreadsheetChartModel["type"] = isColumnLineCombo
-    ? "combo_column_line"
-    : plotTypes[0] === "stock" ? "stock_hlc" : plotTypes[0];
-  const chartBlock = chartBlocks.find(({ name, block }) => nativePlotType(name, block) === "column")?.block
-    || primary.block;
-  const scatterStyleValue = elementAttribute(chartBlock, "scatterStyle", "val");
-  const scatterStyle = ["marker", "line", "lineMarker", "smooth", "smoothMarker"].includes(scatterStyleValue)
-    ? scatterStyleValue as SpreadsheetChartModel["scatterStyle"]
-    : undefined;
-  const groupingValue = elementAttribute(chartBlock, "grouping", "val");
-  const grouping = ["clustered", "standard", "stacked", "percentStacked"].includes(groupingValue)
-    ? groupingValue as SpreadsheetChartModel["grouping"]
-    : undefined;
-  const plotAreaStart = chartXml.search(/<(?:[A-Za-z_][\w.-]*:)?plotArea\b/i);
-  const chartHeader = plotAreaStart >= 0 ? chartXml.slice(0, plotAreaStart) : chartXml;
-  const titleContainer = elementBlock(chartHeader, "title");
-  const titleText = elementBlock(titleContainer || "", "tx");
-  const titleBlock = elementBlock(titleText || "", "rich");
-  const titleReference = elementBlock(titleText || "", "strRef");
-  const titleFormula = elementText(titleReference, "f");
-  const formulaTitle = titleFormula
-    ? formulaRangeValues(XLSX, workbook, titleFormula, sheetName, true)[0]
-    : undefined;
-  const cachedTitle = chartCachedValues(titleReference, true)[0];
-  const title = elementBlocks(titleBlock || "", "t").map((block) => elementText(block, "t")).join("")
-    || String(formulaTitle ?? cachedTitle ?? (elementText(titleText, "v") || "Chart"));
-  let seriesIndex = 0;
-  let series: SpreadsheetChartSeries[] = chartBlocks.flatMap(({ name: plotName, block: plotBlock }) => {
-    const plotType = nativePlotType(plotName, plotBlock)!;
-    return elementBlocks(plotBlock, "ser").flatMap((seriesBlock) => {
-      const currentSeriesIndex = seriesIndex;
-      seriesIndex += 1;
-      const tx = elementBlock(seriesBlock, "tx");
-      const txReference = elementBlock(tx || "", "strRef");
-      const txFormula = elementText(txReference, "f");
-      const formulaName = txFormula
-        ? formulaRangeValues(XLSX, workbook, txFormula, sheetName, true)[0]
-        : undefined;
-      const cachedName = chartCachedValues(txReference, true)[0];
-      const name = String(formulaName ?? cachedName ?? (elementText(tx, "v") || `Series ${currentSeriesIndex + 1}`));
-      const categorySource = elementBlock(seriesBlock, plotType === "scatter" ? "xVal" : "cat");
-      const valueSource = elementBlock(seriesBlock, plotType === "scatter" ? "yVal" : "val");
-      const categoryFormula = elementText(categorySource, "f");
-      const valueFormula = elementText(valueSource, "f");
-      const formulaCategories = formulaRangeValues(XLSX, workbook, categoryFormula, sheetName, plotType !== "scatter");
-      const formulaValues = formulaRangeValues(XLSX, workbook, valueFormula, sheetName, false);
-      const categories = (formulaCategories.length > 0
-        ? formulaCategories
-        : chartCachedValues(categorySource, plotType !== "scatter"))
-        .map((value) => plotType === "scatter" ? Number(value) : String(value));
-      const values = (formulaValues.length > 0 ? formulaValues : chartCachedValues(valueSource, false))
-        .map((value) => Number.isFinite(Number(value)) ? Number(value) : 0);
-      const seriesProperties = elementBlock(seriesBlock, "spPr");
-      const points = elementBlocks(seriesBlock, "dPt");
-      const pointColors: string[] = [];
-      for (const point of points) {
-        const index = Number(elementAttribute(point, "idx", "val"));
-        const color = chartRgbColor(elementBlock(point, "spPr"), themeColors);
-        if (Number.isInteger(index) && index >= 0 && color) pointColors[index] = color;
-      }
-      return values.length > 0 || categories.length > 0 ? [{
-        name,
-        categories,
-        values,
-        ...(chartRgbColor(seriesProperties, themeColors) ? { color: chartRgbColor(seriesProperties, themeColors) } : {}),
-        ...(pointColors.some(Boolean) ? { pointColors } : {}),
-        plotType,
-        ...(plotType === "line" || plotType === "scatter" ? {
-          showMarkers: !["", "none"].includes(elementAttribute(seriesBlock, "symbol", "val")),
-        } : {}),
-      }] : [];
-    });
+  const chartTypes = ["barChart", "lineChart", "pieChart"] as const;
+  const matchedType = chartTypes.find((name) => elementBlock(chartXml, name));
+  if (!matchedType) return null;
+  const chartBlock = elementBlock(chartXml, matchedType)!;
+  const type: SpreadsheetChartModel["type"] = matchedType === "lineChart" ? "line" : matchedType === "pieChart" ? "pie" : "bar";
+  const titleBlock = elementBlock(elementBlock(chartXml, "title") || "", "rich");
+  const title = elementBlocks(titleBlock || "", "t").map((block) => elementText(block, "t")).join("") || "Chart";
+  const series = elementBlocks(chartBlock, "ser").flatMap((seriesBlock, seriesIndex) => {
+    const tx = elementBlock(seriesBlock, "tx");
+    const txFormula = elementText(elementBlock(tx || "", "strRef"), "f");
+    const formulaName = txFormula
+      ? formulaRangeValues(XLSX, workbook, txFormula, sheetName, true)[0]
+      : undefined;
+    const name = String(formulaName ?? (elementText(tx, "v") || `Series ${seriesIndex + 1}`));
+    const categoryFormula = elementText(elementBlock(seriesBlock, "cat"), "f");
+    const valueFormula = elementText(elementBlock(seriesBlock, "val"), "f");
+    const categories = formulaRangeValues(XLSX, workbook, categoryFormula, sheetName, true).map(String);
+    const values = formulaRangeValues(XLSX, workbook, valueFormula, sheetName, false)
+      .map((value) => Number.isFinite(Number(value)) ? Number(value) : 0);
+    return values.length > 0 || categories.length > 0 ? [{ name, categories, values }] : [];
   });
   if (series.length === 0) return null;
-  const columnSeriesCount = series.filter((item) => item.plotType === "column").length;
-  const stockSeriesCount = series.filter((item) => item.plotType === "stock").length;
-  if (isVolumeStockCandidate) {
-    const columnPlotCount = plotTypes.filter((plotType) => plotType === "column").length;
-    const stockPlotCount = plotTypes.filter((plotType) => plotType === "stock").length;
-    if (
-      columnPlotCount !== 1 || stockPlotCount !== 1
-      || columnSeriesCount !== 1 || ![3, 4].includes(stockSeriesCount)
-    ) return null;
-    series = series.map((item) => item.plotType === "column" ? { ...item, plotType: "volume" } : item);
-    type = stockSeriesCount === 4 ? "stock_vohlc" : "stock_vhlc";
-  } else if (plotTypes[0] === "stock") {
-    if (plotTypes.length !== 1 || ![3, 4].includes(stockSeriesCount)) return null;
-    type = stockSeriesCount === 4 ? "stock_ohlc" : "stock_hlc";
-  }
-  return {
-    id,
-    type,
-    ...(grouping ? { grouping } : {}),
-    ...(scatterStyle ? { scatterStyle } : {}),
-    title,
-    series,
-    anchor,
-  };
+  return { id, type, title, series, anchor };
 }
 
 /** Resolve and read native SpreadsheetML chart parts without converting them. */
@@ -783,7 +429,6 @@ export async function spreadsheetChartsFromFile(
 ): Promise<Map<string, SpreadsheetChartModel[]>> {
   const zip = await JSZip.loadAsync(source);
   const sheetParts = await workbookSheetParts(zip);
-  const themeColors = spreadsheetThemeColors(await zip.file("xl/theme/theme1.xml")?.async("text") || "");
   const chartsBySheet = new Map<string, SpreadsheetChartModel[]>();
   for (const [sheetName, sheetPart] of sheetParts) {
     const sheetFile = zip.file(sheetPart);
@@ -809,7 +454,11 @@ export async function spreadsheetChartsFromFile(
         drawingRelationshipsFile.async("text"),
       ]);
       const drawingRelationships = relationshipMap(drawingRelationshipsXml);
-      const anchors = drawingAnchorBlocks(drawingXml);
+      const anchors = [
+        ...elementBlocks(drawingXml, "twoCellAnchor"),
+        ...elementBlocks(drawingXml, "oneCellAnchor"),
+        ...elementBlocks(drawingXml, "absoluteAnchor"),
+      ];
       for (let anchorIndex = 0; anchorIndex < anchors.length; anchorIndex += 1) {
         const anchorBlock = anchors[anchorIndex];
         const chartRelationshipId = anchorBlock.match(/<(?:[A-Za-z_][\w.-]*:)?chart\b[^>]*\br:id="([^"]+)"/i)?.[1];
@@ -824,7 +473,6 @@ export async function spreadsheetChartsFromFile(
           await chartFile.async("text"),
           sheetName,
           `${drawingPart}:${anchorIndex}`,
-          themeColors,
           chartAnchor(anchorBlock),
         );
         if (chart) sheetCharts.push(chart);
@@ -833,90 +481,6 @@ export async function spreadsheetChartsFromFile(
     chartsBySheet.set(sheetName, sheetCharts);
   }
   return chartsBySheet;
-}
-
-function spreadsheetImageMime(path: string): string {
-  const extension = path.split(".").pop()?.toLowerCase();
-  return ({
-    png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg", gif: "image/gif",
-    svg: "image/svg+xml", webp: "image/webp", bmp: "image/bmp", avif: "image/avif",
-  } as Record<string, string>)[extension || ""] || "application/octet-stream";
-}
-
-function drawingMarker(block: string, name: "from" | "to"): { r: number; c: number; x: number; y: number } | undefined {
-  const marker = elementBlock(block, name);
-  if (!marker) return undefined;
-  return {
-    r: Number(elementText(marker, "row") || 0),
-    c: Number(elementText(marker, "col") || 0),
-    x: Number(elementText(marker, "colOff") || 0) / 9525,
-    y: Number(elementText(marker, "rowOff") || 0) / 9525,
-  };
-}
-
-/** Resolve native SpreadsheetML image relationships without rasterizing the worksheet. */
-export async function spreadsheetImagesFromFile(source: ArrayBuffer): Promise<Map<string, SpreadsheetImageModel[]>> {
-  const zip = await JSZip.loadAsync(source);
-  const sheetParts = await workbookSheetParts(zip);
-  const imagesBySheet = new Map<string, SpreadsheetImageModel[]>();
-  for (const [sheetName, sheetPart] of sheetParts) {
-    const sheetFile = zip.file(sheetPart);
-    const sheetRelationshipsFile = zip.file(relationshipsPart(sheetPart));
-    if (!sheetFile || !sheetRelationshipsFile) continue;
-    const [sheetXml, sheetRelationshipsXml] = await Promise.all([
-      sheetFile.async("text"), sheetRelationshipsFile.async("text"),
-    ]);
-    const sheetRelationships = relationshipMap(sheetRelationshipsXml);
-    const drawingIds = [...sheetXml.matchAll(/<(?:[A-Za-z_][\w.-]*:)?drawing\b[^>]*\br:id="([^"]+)"[^>]*\/?\s*>/gi)]
-      .map((match) => match[1]);
-    const sheetImages: SpreadsheetImageModel[] = [];
-    for (const drawingId of drawingIds) {
-      const drawingTarget = sheetRelationships.get(drawingId);
-      if (!drawingTarget) continue;
-      const drawingPart = resolveSpreadsheetPartTarget(sheetPart, drawingTarget);
-      const drawingFile = zip.file(drawingPart);
-      const drawingRelationshipsFile = zip.file(relationshipsPart(drawingPart));
-      if (!drawingFile || !drawingRelationshipsFile) continue;
-      const [drawingXml, drawingRelationshipsXml] = await Promise.all([
-        drawingFile.async("text"), drawingRelationshipsFile.async("text"),
-      ]);
-      const drawingRelationships = relationshipMap(drawingRelationshipsXml);
-      const anchors = drawingAnchorBlocks(drawingXml);
-      for (let anchorIndex = 0; anchorIndex < anchors.length; anchorIndex += 1) {
-        const block = anchors[anchorIndex];
-        const picture = elementBlock(block, "pic");
-        const relationshipId = picture?.match(/<(?:[A-Za-z_][\w.-]*:)?blip\b[^>]*\br:embed="([^"]+)"/i)?.[1];
-        const target = relationshipId ? drawingRelationships.get(relationshipId) : undefined;
-        if (!picture || !target) continue;
-        const mediaPart = resolveSpreadsheetPartTarget(drawingPart, target);
-        const media = zip.file(mediaPart);
-        if (!media) continue;
-        const start = drawingMarker(block, "from");
-        const end = drawingMarker(block, "to");
-        const x = Number(elementAttribute(block, "pos", "x") || 0) / 9525;
-        const y = Number(elementAttribute(block, "pos", "y") || 0) / 9525;
-        const width = Number(elementAttribute(block, "ext", "cx") || 0) / 9525;
-        const height = Number(elementAttribute(block, "ext", "cy") || 0) / 9525;
-        const name = elementAttribute(picture, "cNvPr", "name") || `Picture ${sheetImages.length + 1}`;
-        const altText = elementAttribute(picture, "cNvPr", "descr") || name;
-        sheetImages.push({
-          id: `${drawingPart}:${anchorIndex}`,
-          src: `data:${spreadsheetImageMime(mediaPart)};base64,${await media.async("base64")}`,
-          name,
-          altText,
-          anchor: start ? { r: start.r, c: start.c } : { r: 0, c: 0 },
-          ...(end ? { end: { r: end.r, c: end.c } } : {}),
-          offsetX: start?.x ?? x,
-          offsetY: start?.y ?? y,
-          ...(end ? { endOffsetX: end.x, endOffsetY: end.y } : {}),
-          ...(width > 0 ? { width } : {}),
-          ...(height > 0 ? { height } : {}),
-        });
-      }
-    }
-    imagesBySheet.set(sheetName, sheetImages);
-  }
-  return imagesBySheet;
 }
 
 function cellReference(row: number, column: number): string {
@@ -2159,12 +1723,9 @@ function forceWorkbookRecalculation(xml: string): string {
 
 function spreadsheetSetXmlAttribute(openTag: string, name: string, value: string | undefined): string {
   const attribute = new RegExp(`\\s${name}="[^"]*"`, "i");
-  // Callers may pass a whole xf/row container, not just its opening tag.
-  return openTag.replace(/^<[^>]+>/, (opening) => {
-    if (value == null) return opening.replace(attribute, "");
-    if (attribute.test(opening)) return opening.replace(attribute, ` ${name}="${value}"`);
-    return opening.replace(/\s*\/?\s*>$/, (ending) => ` ${name}="${value}"${ending}`);
-  });
+  if (value == null) return openTag.replace(attribute, "");
+  if (attribute.test(openTag)) return openTag.replace(attribute, ` ${name}="${value}"`);
+  return openTag.replace(/\s*\/?\s*>$/, (ending) => ` ${name}="${value}"${ending}`);
 }
 
 function spreadsheetXmlItems(xml: string, collection: string, item: string): string[] {
@@ -2173,7 +1734,7 @@ function spreadsheetXmlItems(xml: string, collection: string, item: string): str
     "i",
   ))?.[1] || "";
   return body.match(new RegExp(
-    `<(?:[A-Za-z_][\\w.-]*:)?${item}\\b[^>]*?(?:\\/>|>[\\s\\S]*?<\\/(?:[A-Za-z_][\\w.-]*:)?${item}>)`,
+    `<(?:[A-Za-z_][\\w.-]*:)?${item}\\b[^>]*(?:\\/>|>[\\s\\S]*?<\\/(?:[A-Za-z_][\\w.-]*:)?${item}>)`,
     "gi",
   )) || [];
 }

@@ -24,10 +24,9 @@
   "ledger_contracts": [
     "manor.finance_ledger/v1"
   ],
-  "capability_companion": {
-    "tool_names": [
-      "read_finance_ledger",
-      "record_finance_ledger"
-    ]
+  "invocation_policy": {
+    "mode": "required_before_answer",
+    "semantic_trigger": "the active Workspace has the Finance Ledger installed and the request requires reading, querying, changing, reconciling, or relying on financial entries, income, expenses, invoices, bills, payments, refunds, transfers, adjustments, journal entries, balances, or finance-ledger evidence, regardless of language",
+    "result_authority": "primary_source"
   }
 }

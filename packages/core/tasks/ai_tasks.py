@@ -1542,25 +1542,6 @@ def run_outcome_evaluation(
     )
 
 
-@celery_app.task(bind=True, max_retries=0, name="billing.refresh_plans_cache")
-def refresh_plans_cache(self):
-    """Reload subscription_plans into the in-process PLANS cache.
-
-    Sibling API/worker processes won't see admin-side plan edits until
-    their own cache refreshes — this beat task closes the gap so the
-    drift window is bounded by the schedule (5 min).
-    """
-    async def _go():
-        from packages.core.database import create_worker_session
-        from packages.core.constants.plans import load_plans_into_cache
-        async with create_worker_session()() as db:
-            return await load_plans_into_cache(db)
-
-    try:
-        n = _run_async(_go())
-        logger.debug("refresh_plans_cache: %d plan(s) loaded", n or 0)
-    except Exception:
-        logger.warning("refresh_plans_cache failed", exc_info=True)
 
 
 

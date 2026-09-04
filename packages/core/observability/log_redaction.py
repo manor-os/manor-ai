@@ -26,16 +26,6 @@ def redact_sensitive_log_text(value: str) -> str:
 
 class SensitiveQueryStringFilter(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
-        if record.name == "uvicorn.access" and isinstance(record.args, tuple) and len(record.args) == 5:
-            # AccessFormatter unpacks these arguments after filters run. Preserve
-            # their shape while still removing credentials from the request path.
-            record.msg = redact_sensitive_log_text(str(record.msg))
-            record.args = tuple(
-                redact_sensitive_log_text(value) if isinstance(value, str) else value
-                for value in record.args
-            )
-            return True
-
         # HTTPX passes a URL object, and callers may split a key and value
         # across format arguments. Redact the rendered message, not just str args.
         if record.name == "uvicorn.access" and isinstance(record.args, tuple) and len(record.args) == 5:

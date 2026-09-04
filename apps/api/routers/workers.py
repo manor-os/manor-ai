@@ -273,9 +273,16 @@ def _merge_worker_capabilities(
     *,
     worker_id: str | None = None,
 ) -> dict:
-    """Merge heartbeat capabilities and normalize Chrome-only browser state."""
+    """Merge heartbeat capabilities without erasing just-connected sessions.
+
+    Older local worker builds probe browser sessions only once at startup.
+    After a
+    user connects a local browser session from Integrations, the API writes the
+    connected platform into worker.capabilities immediately; the next heartbeat
+    from an older daemon can otherwise shallow-merge an empty browser session
+    list over that fresh state.
+    """
     merged = dict(stored or {})
-    merged.pop("local_browser", None)
     incoming = dict(reported or {})
     for key, value in incoming.items():
         if key != "browser":
@@ -297,17 +304,80 @@ def _merge_worker_capabilities(
     browser = dict(current_browser)
     browser.update(reported_browser)
 
-    for legacy_key in (
-        "playwright_available",
-        "browser_use_available",
-        "legacy_backend",
-        "active_sessions",
-        "saved_sessions",
-        "saved_sessions_authoritative",
-        "session_statuses",
-        "last_session_action",
-    ):
-        browser.pop(legacy_key, None)
+    current_statuses = (
+        dict(current_browser.get("session_statuses") or {})
+        if isinstance(current_browser.get("session_statuses"), dict)
+        else {}
+    )
+    reported_statuses = (
+        dict(reported_browser.get("session_statuses") or {})
+        if isinstance(reported_browser.get("session_statuses"), dict)
+        else {}
+    )
+    session_statuses = {**current_statuses, **reported_statuses}
+    if session_statuses:
+        browser["session_statuses"] = session_statuses
+
+    saved_sessions_authoritative = reported_browser.get("saved_sessions_authoritative") is True
+    for key in ("saved_sessions", "active_sessions"):
+        reported_sessions = _string_list(reported_browser.get(key))
+        if reported_sessions:
+            if key == "saved_sessions" and saved_sessions_authoritative:
+                # Modern local workers report saved_sessions from the local cookie
+                # files on every heartbeat. Treat that as the source of truth
+                # so reconnecting after a prior explicit disconnect works.
+                browser[key] = reported_sessions
+                for platform in reported_sessions:
+                    session_statuses[platform] = "connected"
+                last_action = (
+                    dict(browser.get("last_session_action") or {})
+                    if isinstance(browser.get("last_session_action"), dict)
+                    else {}
+                )
+                if (
+                    last_action.get("platform") in reported_sessions
+                    and last_action.get("status") == "disconnected"
+                ):
+                    browser["last_session_action"] = {
+                        **last_action,
+                        "status": "connected",
+                    }
+            else:
+                # For non-authoritative or active-session lists, do not let a
+                # stale heartbeat resurrect a platform that a stop_session
+                # action has already marked disconnected.
+                browser[key] = [
+                    platform
+                    for platform in reported_sessions
+                    if session_statuses.get(platform) != "disconnected"
+                ]
+            continue
+        if key == "saved_sessions" and saved_sessions_authoritative:
+            browser[key] = []
+            continue
+        if key in reported_browser:
+            preserved = [
+                platform
+                for platform in _string_list(current_browser.get(key))
+                if session_statuses.get(platform) == "connected"
+            ]
+            browser[key] = preserved
+
+    disconnected = {
+        platform
+        for platform, status in session_statuses.items()
+        if status == "disconnected"
+    }
+    if disconnected:
+        for key in ("saved_sessions", "active_sessions"):
+            if key in browser:
+                browser[key] = [
+                    platform
+                    for platform in _string_list(browser.get(key))
+                    if platform not in disconnected
+                ]
+    if session_statuses:
+        browser["session_statuses"] = session_statuses
 
     gateway = browser.get("gateway")
     if isinstance(gateway, dict):

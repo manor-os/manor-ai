@@ -12,9 +12,6 @@
 # Editable PPTX export.
 python-pptx>=1.0.2
 
-# Safe XML parsing is imported directly by the SVG and OOXML pipelines.
-defusedxml>=0.7
-
 # Image sizing/cropping helpers used by finalize/export paths when slides
 # contain raster images. Also pulled by python-pptx, listed here explicitly
 # because the skill calls Pillow directly in several scripts.

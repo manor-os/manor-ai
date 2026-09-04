@@ -9,7 +9,6 @@ path. The raw token is never stored in the database and cannot be replayed.
 """
 from __future__ import annotations
 
-import asyncio
 import logging
 from datetime import datetime, timezone
 
@@ -36,233 +35,6 @@ _VOICE_APPROVAL_REPLY = (
 _VOICE_ROUTE_ERROR_REPLY = "Sorry, I cannot complete that request right now."
 
 
-async def _prepare_voice_conversation(db, call_session: TwilioVoiceCallSession) -> str:
-    """Create the exact channel conversation before any Voice work is accepted."""
-
-    from packages.core.services.channel_contacts import upsert_channel_contact
-    from packages.core.services.channel_conversations import (
-        get_or_create_channel_conversation,
-    )
-    from packages.core.services.voice.binding import (
-        resolve_twilio_call_binding_scope,
-    )
-
-    binding_scope = await resolve_twilio_call_binding_scope(db, call_session)
-    if binding_scope is None:
-        raise RuntimeError("Twilio Voice Agent binding changed")
-    remote_number = str(
-        (
-            call_session.to_number
-            if call_session.direction == "outbound"
-            else call_session.from_number
-        )
-        or ""
-    ).strip()
-    if not remote_number:
-        raise RuntimeError("Twilio Voice remote number is missing")
-    contact = await upsert_channel_contact(
-        db,
-        entity_id=call_session.entity_id,
-        channel_type="twilio_voice",
-        channel_config_id=call_session.channel_config_id,
-        source_id=remote_number,
-        sender_name=None,
-    )
-    if contact.status == "blocked":
-        raise RuntimeError("Twilio Voice caller is blocked")
-    conversation = await get_or_create_channel_conversation(
-        db,
-        entity_id=call_session.entity_id,
-        channel_type="twilio_voice",
-        channel_config_id=call_session.channel_config_id,
-        channel_contact_id=contact.id,
-        sender_id=remote_number,
-        sender_name=None,
-        chat_id=remote_number,
-        agent_id=binding_scope.agent_id,
-        user_id=call_session.owner_user_id,
-        workspace_id=binding_scope.workspace_id,
-        agent_subscription_id=binding_scope.agent_subscription_id,
-    )
-    call_session.conversation_id = conversation.id
-    await db.flush()
-    return conversation.id
-
-
-async def _admit_twilio_call_work(
-    db,
-    call_session: TwilioVoiceCallSession,
-    text: str,
-):
-    """Persist one instruction only while the Call's original binding is valid."""
-
-    from packages.core.services.voice.binding import (
-        resolve_twilio_call_binding_scope,
-    )
-    from packages.core.services.voice.work_queue import admit_voice_work
-
-    if await resolve_twilio_call_binding_scope(db, call_session) is None:
-        raise RuntimeError("Twilio Voice Agent binding changed")
-    if not call_session.conversation_id:
-        raise RuntimeError("Twilio Voice conversation is missing")
-    return await admit_voice_work(
-        db,
-        conversation_id=call_session.conversation_id,
-        text=text,
-        user_id=call_session.owner_user_id,
-        public_channel=True,
-        scope_id=call_session.id,
-    )
-
-
-async def _execute_twilio_call_work(
-    call_session_id: str,
-    receipt,
-) -> VoiceAgentOutcome:
-    """Run one admitted receipt through the Call's frozen channel scope."""
-
-    from packages.core.services.voice.binding import (
-        resolve_twilio_call_binding_scope,
-    )
-    from packages.core.services.voice.work_queue import (
-        VoiceWorkNotPendingError,
-        claim_voice_work,
-        finish_voice_work,
-    )
-
-    async with async_session() as db:
-        call_session = await db.get(TwilioVoiceCallSession, call_session_id)
-        conversation_id = (
-            call_session.conversation_id if call_session is not None else None
-        )
-        binding_scope = (
-            await resolve_twilio_call_binding_scope(db, call_session)
-            if call_session is not None
-            else None
-        )
-        if (
-            call_session is None
-            or binding_scope is None
-            or not conversation_id
-            or receipt.scope_id != call_session.id
-        ):
-            if (
-                call_session is not None
-                and conversation_id
-                and receipt.scope_id == call_session.id
-            ):
-                await finish_voice_work(
-                    db,
-                    receipt,
-                    conversation_id=conversation_id,
-                    state="interrupted",
-                    error="Twilio Voice Agent binding changed.",
-                )
-            return VoiceAgentOutcome(
-                status="cancelled",
-                spoken_reply="",
-                conversation_id=conversation_id,
-                agent_id=call_session.agent_id if call_session is not None else None,
-            )
-        try:
-            await claim_voice_work(
-                db,
-                receipt,
-                conversation_id=conversation_id,
-            )
-        except VoiceWorkNotPendingError:
-            return VoiceAgentOutcome(
-                status="cancelled",
-                spoken_reply="",
-                conversation_id=conversation_id,
-                agent_id=call_session.agent_id,
-            )
-        remote_number = str(
-            (
-                call_session.to_number
-                if call_session.direction == "outbound"
-                else call_session.from_number
-            )
-            or ""
-        ).strip()
-        agent_kwargs = {
-            "entity_id": call_session.entity_id,
-            "channel_config_id": call_session.channel_config_id,
-            "channel_binding_id": binding_scope.channel_binding_id,
-            "agent_subscription_id": binding_scope.agent_subscription_id,
-            "agent_id": binding_scope.agent_id,
-            "workspace_id": binding_scope.workspace_id,
-            "call_sid": "",
-            "from_number": remote_number,
-            "text": receipt.text,
-            "origin_message_id": receipt.message_id,
-            "call_session_id": call_session.id,
-        }
-
-    try:
-        outcome = await _voice_agent_call(**agent_kwargs)
-    except asyncio.CancelledError:
-        async with async_session() as db:
-            await finish_voice_work(
-                db,
-                receipt,
-                conversation_id=conversation_id,
-                state="interrupted",
-                error="Twilio Voice execution was cancelled.",
-            )
-        raise
-    except BaseException as exc:
-        async with async_session() as db:
-            await finish_voice_work(
-                db,
-                receipt,
-                conversation_id=conversation_id,
-                state="failed",
-                error=str(exc),
-            )
-        raise
-
-    async with async_session() as db:
-        current = await db.get(TwilioVoiceCallSession, call_session_id)
-        binding_scope = (
-            await resolve_twilio_call_binding_scope(db, current)
-            if current is not None
-            else None
-        )
-        binding_changed = (
-            current is None
-            or binding_scope is None
-            or current.conversation_id != conversation_id
-        )
-        await finish_voice_work(
-            db,
-            receipt,
-            conversation_id=conversation_id,
-            state=(
-                "interrupted"
-                if binding_changed or outcome.status == "cancelled"
-                else "failed"
-                if outcome.status == "error"
-                else "completed"
-            ),
-            error=(
-                "Twilio Voice Agent binding changed."
-                if binding_changed
-                else outcome.spoken_reply
-                if outcome.status == "error"
-                else None
-            ),
-        )
-    if binding_changed:
-        return VoiceAgentOutcome(
-            status="cancelled",
-            spoken_reply="",
-            conversation_id=conversation_id,
-            agent_id=agent_kwargs["agent_id"],
-        )
-    return outcome
-
-
 @router.websocket("/stream/{session_token}")
 async def voice_stream(ws: WebSocket, session_token: str):
     """Accept one authenticated Twilio Media Stream for a call session."""
@@ -283,18 +55,6 @@ async def voice_stream(ws: WebSocket, session_token: str):
         if cc is None:
             await db.rollback()
             await ws.close(code=4404)
-            return
-        try:
-            conversation_id = await _prepare_voice_conversation(db, call_session)
-        except Exception as exc:
-            await finish_call_session(
-                db,
-                call_session,
-                status="failed",
-                error_message=str(exc),
-            )
-            await db.commit()
-            await ws.close(code=4409)
             return
         call_session_id = call_session.id
         entity_id = call_session.entity_id
@@ -346,131 +106,12 @@ async def voice_stream(ws: WebSocket, session_token: str):
                 raise ValueError("Twilio stream CallSid mismatch")
             await mark_call_connected(db, current, stream_sid=stream_sid)
             await db.commit()
-
-    async def _admit_work(text: str):
-        async with async_session() as db:
-            current = await db.get(TwilioVoiceCallSession, call_session_id)
-            if current is None or current.conversation_id != conversation_id:
-                raise RuntimeError("Twilio Voice call session changed")
-            return await _admit_twilio_call_work(db, current, text)
-
-    async def _execute_work(receipt):
-        return await _execute_twilio_call_work(call_session_id, receipt)
-
-    async def _route_followup(text, active_receipt):
-        from packages.core.services.voice.binding import (
-            resolve_twilio_call_binding_scope,
-        )
-        from packages.core.services.voice.work_queue import voice_work_context
-        from packages.core.services.voice.work_router import (
-            classify_voice_work_followup,
-        )
-
-        async with async_session() as db:
-            current = await db.get(TwilioVoiceCallSession, call_session_id)
-            binding_scope = (
-                await resolve_twilio_call_binding_scope(db, current)
-                if current is not None
-                else None
-            )
-            if (
-                current is None
-                or binding_scope is None
-                or current.conversation_id != conversation_id
-                or active_receipt.scope_id != current.id
-            ):
-                raise RuntimeError("Twilio Voice Agent binding changed")
-            context = await voice_work_context(
-                db,
-                active_receipt,
-                conversation_id=conversation_id,
-            )
-        return classify_voice_work_followup(text, context)
-
-    async def _cancel_work(active_receipt, replacement_receipt=None):
-        from packages.core.services.voice.work_queue import interrupt_voice_work
-
-        async with async_session() as db:
-            current = await db.get(TwilioVoiceCallSession, call_session_id)
-            if (
-                current is None
-                or current.conversation_id != conversation_id
-                or active_receipt.scope_id != current.id
-                or (
-                    replacement_receipt is not None
-                    and replacement_receipt.scope_id != current.id
-                )
-            ):
-                return False
-            return await interrupt_voice_work(
-                db,
-                active_receipt,
-                conversation_id=conversation_id,
-                reason=(
-                    "Replaced by a newer Twilio Voice instruction."
-                    if replacement_receipt is not None
-                    else "Cancelled by an explicit Twilio Voice instruction."
-                ),
-                superseded_by=(
-                    replacement_receipt.id
-                    if replacement_receipt is not None
-                    else None
-                ),
-            )
-
-    async def _record_control_turn(user_text: str, assistant_text: str) -> None:
-        from packages.core.models.task import Conversation
-        from packages.core.services.channel_conversations import (
-            add_channel_assistant_message,
-            add_channel_inbound_message,
-        )
-
-        async with async_session() as db:
-            conversation = await db.get(Conversation, conversation_id)
-            if conversation is None:
-                raise RuntimeError("Twilio Voice conversation is missing")
-            conversation_meta = dict(conversation.meta or {})
-            remote_number = str(
-                conversation_meta.get("sender_id")
-                or conversation_meta.get("chat_id")
-                or ""
-            )
-            chat_id = conversation_meta.get("chat_id") or remote_number
-            if user_text:
-                await add_channel_inbound_message(
-                    db,
-                    conversation_id=conversation_id,
-                    channel_type="twilio_voice",
-                    sender_id=remote_number,
-                    sender_name=conversation_meta.get("sender_name"),
-                    chat_id=chat_id,
-                    content=user_text,
-                    meta={"voice_control": True},
-                )
-            if assistant_text:
-                assistant = await add_channel_assistant_message(
-                    db,
-                    conversation_id=conversation_id,
-                    channel_type="twilio_voice",
-                    chat_id=chat_id,
-                    content=assistant_text,
-                    runtime_meta={"voice_control": True},
-                    author_kind="agent",
-                    author_subscription_id=agent_subscription_id,
-                )
-                assistant.meta = {
-                    **dict(assistant.meta or {}),
-                    "voice_control": True,
-                }
-            await db.commit()
-
     session = TwilioVoiceSession(
         ws=ws,
         agent_callable=_voice_agent_call,
         call_session_id=call_session_id,
         channel_config_id=channel_config_id,
         entity_id=entity_id,
-        conversation_id=conversation_id,
         billing_user_id=billing_user_id,
         billing_workspace_id=billing_workspace_id,
         billing_agent_id=billing_agent_id,
@@ -478,11 +119,6 @@ async def voice_stream(ws: WebSocket, session_token: str):
         agent_subscription_id=agent_subscription_id,
         realtime_route=realtime_route,
         on_connected=_on_connected,
-        admit_work=_admit_work,
-        execute_work=_execute_work,
-        route_followup=_route_followup,
-        cancel_work=_cancel_work,
-        record_control_turn=_record_control_turn,
     )
     terminal_status = "completed"
     error_message: str | None = None
@@ -537,8 +173,6 @@ async def _voice_agent_call(
     call_sid: str,
     from_number: str,
     text: str,
-    origin_message_id: str | None = None,
-    call_session_id: str | None = None,
 ) -> VoiceAgentOutcome:
     """Run the gateway inline and return the constrained Voice outcome.
 
@@ -561,19 +195,6 @@ async def _voice_agent_call(
         sender_name=None,
         chat_id=from_number,
         content=text,
-        runtime_metadata={
-            "voice_session_mode": "chat_gateway",
-            **(
-                {"voice_origin_message_id": origin_message_id}
-                if origin_message_id
-                else {}
-            ),
-            **(
-                {"twilio_call_session_id": call_session_id}
-                if call_session_id
-                else {}
-            ),
-        },
         deliver_reply=False,
     )
     # The conversation/agent are resolved by the normal channel gateway on
@@ -626,13 +247,6 @@ async def _voice_agent_call(
     if status == "no_reply":
         return VoiceAgentOutcome(
             status="no_reply",
-            spoken_reply="",
-            conversation_id=conversation_id,
-            agent_id=resolved_agent_id,
-        )
-    if status == "cancelled":
-        return VoiceAgentOutcome(
-            status="cancelled",
             spoken_reply="",
             conversation_id=conversation_id,
             agent_id=resolved_agent_id,

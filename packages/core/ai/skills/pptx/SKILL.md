@@ -73,7 +73,7 @@ This package is the built-in `pptx` skill, mounted in the sandbox at `/skill/`.
 - Treat `/skill` as `SKILL_DIR`. Before running commands, use `cd /skill` and set `SKILL_DIR=/skill` when needed.
 - Use `/skill/projects/...` for generated project folders unless the user asks for a different writable path.
 - Final PPTX files are expected under `/skill/projects/<project>/exports/`; save the final artifact from there.
-- Do not require external image-generation credentials inside the built-in skill. For `Acquire Via: ai` rows, create `images/image_prompts.json`, render `images/image_prompts.md` with `${SKILL_DIR}/scripts/image_prompts.py --render-md`, call Manor's system image tool with `generate_file(kind="image")`, then call outer sandbox action `write_file` with the returned `workspace_path` and an absolute destination under `<project_path>/images/`. Use `${SKILL_DIR}/scripts/import_system_image.py` only when the generated asset is actually mounted under `/workspace`.
+- Do not require external image-generation credentials inside the built-in skill. For `Acquire Via: ai` rows, create `images/image_prompts.json`, render `images/image_prompts.md` with `${SKILL_DIR}/scripts/image_prompts.py --render-md`, call Manor's system image tool with `generate_file(kind="image")`, then call the outer `sandbox_write_file` tool with the returned `workspace_path` and an absolute destination under `<project_path>/images/`. Use `${SKILL_DIR}/scripts/import_system_image.py` only when the generated asset is actually mounted under `/workspace`.
 - Do not use local image-provider backends from this skill. The built-in package has no local AI image generation entry point; use `${SKILL_DIR}/scripts/image_prompts.py` only for prompt manifest bookkeeping.
 - User-provided video attachments exposed under `/workspace` are supported as
   embedded presentation assets. Copy each selected clip into
@@ -108,7 +108,7 @@ This package is the built-in `pptx` skill, mounted in the sandbox at `/skill/`.
      `<project_path>/qa/pptx-quality.json`. A failed machine gate is a hard
      stop: fix, re-export, re-render, and rerun the gate before delivery.
 
-Sandbox action `save_result` reruns this gate server-side for every PPTX in
+`sandbox_save_result` reruns this gate server-side for every PPTX in
 `/skill/projects/<project>/exports/`. It verifies all-slide render evidence and
 binds the report to the exact PPTX bytes by SHA-256. Missing, failing, stale, or
 manually copied evidence cannot be delivered; renaming the output does not
@@ -242,7 +242,7 @@ python3 ${SKILL_DIR}/scripts/project_manager.py init <project_name> --format <fo
 
 The canonical project directory includes the canvas format and date. Capture
 the exact path printed after `Project created:` and use that path for every
-later command, file write, quality check, and sandbox action `save_result` call. Never
+later command, file write, quality check, and `sandbox_save_result` call. Never
 reconstruct or guess it from `<project_name>`. Initialization also creates a
 `projects/<project_name>` compatibility symlink, but the printed canonical path
 remains the source of truth for delivery evidence.
@@ -440,12 +440,12 @@ Then load the AI image generation reference only when at least one row needs gen
 
 | Acquire Via | Load reference (only if any such row exists) | Run |
 |---|---|---|
-| `ai` | `references/image-generator.md` | System image generation tool; deliver the returned workspace file to `<project_path>/images/<filename>` with outer sandbox action `write_file`; use `import_system_image.py` only for `/workspace` compatibility and `image_prompts.py` for manifest state |
+| `ai` | `references/image-generator.md` | System image generation tool; deliver the returned workspace file to `<project_path>/images/<filename>` with outer `sandbox_write_file`; use `import_system_image.py` only for `/workspace` compatibility and `image_prompts.py` for manifest state |
 | `user` / `placeholder` | (skip) | (skip) |
 
 Do not use web image search in this built-in skill. If an external visual is needed, generate it through the system image tool or mark the row `Needs-Manual`.
 
-> ⚠️ **In-pipeline ai path MUST use manifest mode for planning** — even when only 1 ai row exists. Write `images/image_prompts.json` first and render `image_prompts.md` as the audit sidecar via `image_prompts.py --render-md`. In built-in Manor mode, use `generate_file(kind="image")` to create each file from the manifest prompts, then deliver it with outer `sandbox(action="write_file", params={"workspace_path": ..., "path": "<project_path>/images/<filename>"})`; use `import_system_image.py` only for an actual `/workspace` mount and do not ask for image API keys.
+> ⚠️ **In-pipeline ai path MUST use manifest mode for planning** — even when only 1 ai row exists. Write `images/image_prompts.json` first and render `image_prompts.md` as the audit sidecar via `image_prompts.py --render-md`. In built-in Manor mode, use `generate_file(kind="image")` to create each file from the manifest prompts, then deliver it with outer `sandbox_write_file(workspace_path=..., path=<project_path>/images/<filename>)`; use `import_system_image.py` only for an actual `/workspace` mount and do not ask for image API keys.
 
 Workflow:
 

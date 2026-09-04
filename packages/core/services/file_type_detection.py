@@ -6,7 +6,6 @@ import os
 import zipfile
 from dataclasses import dataclass
 
-from packages.core.contracts.file_engine import TEXT_CONTENT_TYPES
 
 @dataclass(frozen=True)
 class DetectedFileType:
@@ -21,7 +20,6 @@ _MIME_BY_EXT: dict[str, str] = {
     "md": "text/markdown",
     "txt": "text/plain",
     "csv": "text/csv",
-    "tsv": "text/tab-separated-values",
     "json": "application/json",
     "diagram.json": "application/json",
     "diagram": "application/json",
@@ -50,7 +48,6 @@ _MIME_BY_EXT: dict[str, str] = {
     "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
     "pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
     "xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    "xlsm": "application/vnd.ms-excel.sheet.macroEnabled.12",
     "pdf": "application/pdf",
     "png": "image/png",
     "jpg": "image/jpeg",
@@ -61,7 +58,11 @@ _MIME_BY_EXT: dict[str, str] = {
     "zip": "application/zip",
 }
 
-_PRESERVE_DECLARED_TEXT_EXTS = TEXT_CONTENT_TYPES
+_PRESERVE_DECLARED_TEXT_EXTS: set[str] = {
+    "md", "csv", "json", "html", "css", "scss", "sass", "less",
+    "js", "mjs", "cjs", "jsx", "ts", "tsx", "vue", "svelte",
+    "py", "sh", "sql", "xml", "yaml", "yml", "mmd", "mermaid", "drawio",
+}
 _TEXT_SNIFF_BYTES = 4096
 _MAX_JSON_VALIDATION_BYTES = 8 * 1024 * 1024
 _INVALID_JSON_SNIFF = "__invalid_json__"
@@ -147,25 +148,6 @@ def _detect_zip_office(path: str) -> str | None:
     try:
         with zipfile.ZipFile(path) as zf:
             names = set(zf.namelist())
-            if "xl/workbook.xml" in names and "[Content_Types].xml" in names:
-                # A macro-enabled workbook must not be projected as XLSX after
-                # editing. Read only the bounded content-type manifest.
-                from xml.etree import ElementTree
-
-                with zf.open("[Content_Types].xml") as manifest:
-                    content = manifest.read(1024 * 1024 + 1)
-                if len(content) > 1024 * 1024:
-                    return None
-                try:
-                    types = ElementTree.fromstring(content)
-                except ElementTree.ParseError:
-                    return None
-                for item in types:
-                    if (
-                        item.get("PartName") == "/xl/workbook.xml"
-                        and item.get("ContentType") == "application/vnd.ms-excel.sheet.macroEnabled.main+xml"
-                    ):
-                        return "xlsm"
     except zipfile.BadZipFile:
         return None
     if "word/document.xml" in names:

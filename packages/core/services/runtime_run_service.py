@@ -30,9 +30,6 @@ class RuntimeRunNotFoundError(LookupError):
 logger = logging.getLogger(__name__)
 
 
-MAX_RUNTIME_RUN_RECOVERY_ATTEMPTS = 3
-
-
 async def create_runtime_run(
     db: AsyncSession,
     *,
@@ -165,116 +162,6 @@ async def renew_runtime_run_lease(
         return False
     run.lease_expires_at = current_time + timedelta(seconds=lease_seconds)
     return True
-
-
-async def recover_expired_runtime_run_leases(
-    db: AsyncSession,
-    *,
-    now: datetime | None = None,
-    batch_size: int = 20,
-    max_recovery_attempts: int = MAX_RUNTIME_RUN_RECOVERY_ATTEMPTS,
-) -> tuple[int, int]:
-    """Requeue root Runtime runs whose executing worker stopped renewing.
-
-    Redis can retain a late-acked Celery delivery until the global visibility
-    timeout expires. Runtime leases are intentionally much shorter, so a
-    rolling deploy must create a fresh delivery instead of leaving the chat in
-    ``running`` for that entire broker window. Versioned outbox keys make the
-    recovery idempotent; a bounded attempt count prevents repeated worker loss
-    from becoming an automatic retry loop.
-    """
-
-    current_time = now or datetime.now(timezone.utc)
-    limit = max(1, min(int(batch_size), 100))
-    attempts_limit = max(0, int(max_recovery_attempts))
-    runs = list(
-        (
-            await db.execute(
-                select(RuntimeRun)
-                .where(
-                    RuntimeRun.parent_run_id.is_(None),
-                    RuntimeRun.status.in_(
-                        (
-                            RuntimeRunStatus.RUNNING.value,
-                            RuntimeRunStatus.RESUMING.value,
-                            RuntimeRunStatus.CANCEL_REQUESTED.value,
-                            RuntimeRunStatus.CANCELLING.value,
-                        )
-                    ),
-                    RuntimeRun.lease_expires_at.is_not(None),
-                    RuntimeRun.lease_expires_at <= current_time,
-                )
-                .order_by(RuntimeRun.lease_expires_at.asc(), RuntimeRun.id.asc())
-                .limit(limit)
-                .with_for_update(skip_locked=True)
-            )
-        )
-        .scalars()
-        .all()
-    )
-
-    recovery_counts: dict[str, int] = {}
-    if runs:
-        count_rows = (
-            await db.execute(
-                select(
-                    RuntimeOutboxEvent.aggregate_id,
-                    func.count(RuntimeOutboxEvent.id),
-                )
-                .where(
-                    RuntimeOutboxEvent.aggregate_id.in_([run.id for run in runs]),
-                    RuntimeOutboxEvent.event_type == "runtime.execute_run",
-                    RuntimeOutboxEvent.dedupe_key.contains(":recovery:"),
-                )
-                .group_by(RuntimeOutboxEvent.aggregate_id)
-            )
-        ).all()
-        recovery_counts = {
-            aggregate_id: int(count) for aggregate_id, count in count_rows
-        }
-
-    recovered = 0
-    failed = 0
-    for run in runs:
-        run.lease_owner = None
-        run.lease_expires_at = None
-        run.version += 1
-
-        if run.status in {
-            RuntimeRunStatus.CANCEL_REQUESTED.value,
-            RuntimeRunStatus.CANCELLING.value,
-        }:
-            run.status = RuntimeRunStatus.CANCELLED.value
-            run.status_reason = "user_cancelled"
-            run.completed_at = current_time
-            continue
-
-        recovery_attempts = recovery_counts.get(run.id, 0)
-        if recovery_attempts >= attempts_limit:
-            run.status = RuntimeRunStatus.FAILED.value
-            run.status_reason = "runtime_recovery_exhausted"
-            run.error = {
-                "code": "runtime_recovery_exhausted",
-                "message": "The runtime worker stopped before the request completed.",
-            }
-            run.completed_at = current_time
-            failed += 1
-            continue
-
-        run.status = RuntimeRunStatus.QUEUED.value
-        run.status_reason = None
-        db.add(
-            RuntimeOutboxEvent(
-                event_type="runtime.execute_run",
-                aggregate_id=run.id,
-                dedupe_key=f"runtime.execute_run:{run.id}:recovery:{run.version}",
-                payload={"run_id": run.id},
-                available_at=current_time,
-                created_at=current_time,
-            )
-        )
-        recovered += 1
-    return recovered, failed
 
 
 async def complete_runtime_run_execution(
@@ -642,7 +529,6 @@ async def cancel_runtime_run_resources(run: RuntimeRun) -> None:
 
 
 __all__ = [
-    "MAX_RUNTIME_RUN_RECOVERY_ATTEMPTS",
     "RuntimeRunNotFoundError",
     "claim_runtime_run_execution",
     "cancel_runtime_run_resources",
@@ -650,7 +536,6 @@ __all__ = [
     "complete_runtime_run_execution",
     "create_runtime_run",
     "project_runtime_run_status",
-    "recover_expired_runtime_run_leases",
     "renew_runtime_run_lease",
     "persist_runtime_run_suspension",
     "request_runtime_run_cancel",

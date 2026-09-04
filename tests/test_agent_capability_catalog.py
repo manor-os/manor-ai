@@ -292,54 +292,6 @@ def test_capability_factory_resolves_fifty_mixed_exact_ids() -> None:
     assert "actions" not in mcp_payload
 
 
-def test_chrome_server_selection_inherits_all_actions_while_email_stays_exact() -> None:
-    candidates = [
-        AgentCapabilityCandidate(
-            catalog_id="mcp:chrome",
-            kind=AgentCapabilityKind.MCP_ACTION,
-            ref="chrome",
-            name="Chrome",
-            actions=tuple(
-                {"name": action, "label": action.replace("_", " ").title()}
-                for action in (
-                    "list_tabs",
-                    "read_page",
-                    "fill_or_select",
-                    "click_element",
-                )
-            ),
-            metadata={"server_key": "chrome", "all_actions": True},
-        )
-    ]
-    selected: list[str] = []
-    for action in ("list_messages", "get_message", "create_draft", "send_email"):
-        catalog_id = f"mcp:email:{action}"
-        selected.append(catalog_id)
-        candidates.append(AgentCapabilityCandidate(
-            catalog_id=catalog_id,
-            kind=AgentCapabilityKind.MCP_ACTION,
-            ref="email",
-            name=f"email · {action}",
-            metadata={"server_key": "email", "action": action},
-        ))
-    selected.append("mcp:chrome")
-
-    catalog = AgentCapabilityCatalog(candidates=tuple(candidates))
-    plan = catalog.resolve(selected)
-
-    assert plan.mcp_allowed_tools == {
-        "chrome": None,
-        "email": ("create_draft", "get_message", "list_messages", "send_email"),
-    }
-    chrome_payload = next(
-        item for item in catalog.prompt_payload() if item["id"] == "mcp:chrome"
-    )
-    assert {action["name"] for action in chrome_payload["actions"]} == {
-        "click_element",
-        "fill_or_select",
-        "list_tabs",
-        "read_page",
-    }
 
 
 @pytest.mark.asyncio
@@ -819,11 +771,6 @@ async def test_workspace_custom_agent_resolves_exact_catalog_ids(db_session) -> 
     import json
 
     catalog = json.loads(payload)["agent_capability_catalog"]
-    chrome_candidates = [
-        item for item in catalog if item["id"].startswith("mcp:chrome")
-    ]
-    assert [item["id"] for item in chrome_candidates] == ["mcp:chrome"]
-    assert len(chrome_candidates[0]["actions"]) > 1
     selected_id = next(
         item["id"] for item in catalog if item["id"] == f"skill:{skill.id}"
     )
@@ -1206,69 +1153,6 @@ async def test_agent_capability_plans_expire_when_matching_context_changes(
     assert draft.fields["agent_capability_plans"] == []
 
 
-@pytest.mark.asyncio
-async def test_agent_setup_warning_blocks_execution_but_not_workspace_creation(
-    db_session,
-    monkeypatch,
-) -> None:
-    import copy
-
-    from packages.core.services import workspace_draft_service
-    from packages.core.services.workspace_setup_service import DEFAULT_FIELDS
-
-    fields = copy.deepcopy(DEFAULT_FIELDS)
-    fields["flagged_integrations"] = [{
-        "provider": "chrome",
-        "purpose": "Install the Chrome extension before browser execution.",
-        "required": True,
-        "linked_service_keys": ["browser_operations"],
-        "source": "agent_design",
-        "agent_name": "Browser Agent",
-        "blocks_creation": False,
-    }]
-    fields["agent_mappings"] = [{
-        "service_key": "browser_operations",
-        "strategy": "create_custom",
-        "create_agent_draft": {
-            "agent_name": "Browser Agent",
-            "missing_integrations": [{
-                "provider": "chrome",
-                "purpose": "Install the Chrome extension before browser execution.",
-                "required": True,
-            }],
-        },
-    }]
-    draft = WorkspaceDraft(
-        entity_id=generate_ulid(),
-        user_id=generate_ulid(),
-        fields=fields,
-        messages=[],
-        missing=["flagged_integrations"],
-        ready=False,
-        status="active",
-    )
-    db_session.add(draft)
-    await db_session.flush()
-
-    async def clean_lint(*_args, **_kwargs):
-        return {"ok": True, "issues": []}
-
-    monkeypatch.setattr(
-        workspace_draft_service,
-        "runtime_lint_workspace_draft",
-        clean_lint,
-    )
-
-    verified = await workspace_draft_service._refresh_missing_from_lint(
-        db_session,
-        draft,
-    )
-
-    assert verified is True
-    assert draft.ready is True
-    assert draft.status == "ready"
-    assert draft.missing == []
-    assert draft.fields["flagged_integrations"][0]["required"] is True
 
 
 @pytest.mark.asyncio

@@ -19,7 +19,8 @@ from packages.core.ai.tools.bash_tool import (
     _visible_read_paths,
     _visible_mutation_paths,
 )
-from packages.core.ai.tools.file_tools import DELETE_FILE_SCHEMA, PATCH_FILE_SCHEMA
+from packages.core.ai.tools.document_tools import GENERATE_DOCUMENT_FILE_SCHEMA
+from packages.core.ai.tools.file_tools import DELETE_FILE_SCHEMA, EDIT_FILE_SCHEMA, WRITE_FILE_SCHEMA
 from packages.core.ai.tools.generate_file_tool import GENERATE_FILE_SCHEMA
 from packages.core.ai.tools.manor_tool import MANOR_SCHEMA
 from packages.core.ai.tools.sandbox_tools import _SANDBOX_SAVE_RESULT_SCHEMA
@@ -393,7 +394,7 @@ def test_mutating_file_tools_receive_the_runtime_envelope():
         "bash",
         "manor",
     }.issubset(RUNTIME_ENVELOPE_AWARE_TOOLS)
-    assert "patch_file" not in RUNTIME_LLM_METADATA_AWARE_TOOLS
+    assert "write_file" not in RUNTIME_LLM_METADATA_AWARE_TOOLS
 
 
 def test_file_approval_reply_classifier_is_conservative():
@@ -4744,8 +4745,10 @@ async def test_post_bash_mv_into_directory_uses_child_path(monkeypatch, tmp_path
 def test_mutating_file_tool_schemas_accept_approval_token():
     schemas = [
         BASH_SCHEMA,
-        PATCH_FILE_SCHEMA,
+        WRITE_FILE_SCHEMA,
+        EDIT_FILE_SCHEMA,
         DELETE_FILE_SCHEMA,
+        GENERATE_DOCUMENT_FILE_SCHEMA,
         GENERATE_FILE_SCHEMA,
         _SANDBOX_SAVE_RESULT_SCHEMA,
         SAVE_SANDBOX_FILE_SCHEMA,

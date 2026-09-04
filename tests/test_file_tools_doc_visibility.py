@@ -18,7 +18,7 @@ import packages.core.database as db_module
 import packages.core.ai.tools.file_tools as file_tools_module
 from packages.core.ai.tools.file_tools import (
     _delete_file,
-    _patch_file,
+    _edit_file,
     _glob_files,
     _grep_files,
     _list_files,
@@ -74,7 +74,7 @@ async def _make_user(entity_id: str, name: str, role: str) -> str:
 @pytest.mark.parametrize(
     ("handler", "kwargs"),
     (
-        (_patch_file, {"operations": [{"op": "text.replace", "old_text": "protected", "new_text": "changed"}]}),
+        (_edit_file, {"old_text": "protected", "new_text": "changed"}),
         (_delete_file, {"expected_sha256": "stale"}),
     ),
 )
@@ -217,15 +217,12 @@ async def test_file_tools_hide_private_doc_from_member(fs_enabled, tmp_path, cli
         user_id=member_id,
     ))
     assert "candidates" not in missing
-    missing_edit = json.loads(
-        await _patch_file(
-            entity_id,
-            path="missing/board-comp.md",
-            content="replacement",
-            user_id=member_id,
-            operations=[{"op": "text.replace"}],
-        )
-    )
+    missing_edit = json.loads(await _edit_file(
+        entity_id,
+        path="missing/board-comp.md",
+        content="replacement",
+        user_id=member_id,
+    ))
     assert "candidates" not in missing_edit
     missing_delete = json.loads(await _delete_file(
         entity_id,

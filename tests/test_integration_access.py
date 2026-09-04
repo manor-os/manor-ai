@@ -191,13 +191,6 @@ async def test_inactive_user_cannot_own_connection_through_active_membership(
     assert decision.reason == "connection_not_found"
 
 
-def test_user_scoped_integration_migration_declares_current_schema_contract():
-    migration = importlib.import_module(
-        "packages.core.migrations.versions.20260824_01_user_scoped_integrations"
-    )
-
-    assert migration.revision == "20260824_01"
-    assert migration.down_revision == "20260823_01"
 
 
 def test_user_scoped_connection_models_expose_owner_and_source_columns():

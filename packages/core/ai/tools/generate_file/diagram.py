@@ -841,7 +841,6 @@ async def generate_diagram_file(
     approval_token: str | None,
     expected_sha256: str | None,
     runtime_envelope: Any | None = None,
-    storage_scope: str = "task",
 ) -> str:
     from packages.core.ai.runtime import runtime_generate_document_file
 
@@ -859,7 +858,6 @@ async def generate_diagram_file(
         task_id=task_id,
         agent_id=agent_id,
         runtime_envelope=runtime_envelope,
-        storage_scope=storage_scope,
     )
 
 

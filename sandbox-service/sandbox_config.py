@@ -43,15 +43,6 @@ class Config:
     IDLE_TIMEOUT_SECONDS: int = int(os.getenv("SANDBOX_IDLE_TIMEOUT", "600"))
     MAX_SANDBOXES: int = int(os.getenv("SANDBOX_MAX_SANDBOXES", "5"))
     INSTANCE_MAX_EXECUTING: int = int(os.getenv("SANDBOX_INSTANCE_MAX_EXECUTING", "0"))
-    MAX_PENDING_EXECUTIONS: int = int(
-        os.getenv("SANDBOX_MAX_PENDING_EXECUTIONS", "20")
-    )
-    MAX_EXECUTION_HISTORY: int = int(
-        os.getenv("SANDBOX_MAX_EXECUTION_HISTORY", "200")
-    )
-    EXECUTION_HISTORY_TTL_SECONDS: int = int(
-        os.getenv("SANDBOX_EXECUTION_HISTORY_TTL_SECONDS", "3600")
-    )
 
     # --- Optional Redis-backed cluster concurrency gates ---
     REDIS_URL: str = os.getenv("SANDBOX_REDIS_URL", os.getenv("REDIS_URL", ""))

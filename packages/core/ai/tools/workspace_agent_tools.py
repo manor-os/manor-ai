@@ -1,19 +1,15 @@
 """Workspace Agent tools for Manor AI in workspace chat.
 
-These handlers are the durable operation layer behind natural-language
-Workspace chat. Internal masters reach them through
-``manor(action="workspace")``; narrow historical names remain as compatibility
-or external least-privilege entries.
+These tools are the durable operation layer behind natural-language workspace
+chat. They let the master agent turn user messages into workspace-scoped tasks,
+task runtime requirements, persistent guardrails, and strategist reviews without
+going through the broad ``manor`` composite gateway.
 """
 from __future__ import annotations
 
 import json
 from typing import Any
 
-from packages.core.ai.runtime.composite_tools import WorkspaceToolAction
-from packages.core.ai.runtime.workspace_composite_actions import (
-    runtime_visualize_workspace_ledgers_action,
-)
 from packages.core.ai.runtime import (
     runtime_get_goal_status_action,
     runtime_update_goal_value_action,
@@ -31,27 +27,6 @@ from packages.core.ai.runtime import (
     runtime_workspace_update_task_runtime_action,
     runtime_workspace_update_knowledge_policy_action,
 )
-from packages.core.ai.runtime.tool_context import RUNTIME_TOOL_CONTEXT_KEYS
-
-
-_WORKSPACE_PROTECTED_CONTEXT_KEYS = frozenset(
-    {
-        "entity_id",
-        "user_id",
-        "workspace_id",
-        "conversation_id",
-        "actor_agent_id",
-    }
-    | set(RUNTIME_TOOL_CONTEXT_KEYS)
-)
-
-
-def _workspace_action_params(params: dict[str, Any]) -> dict[str, Any]:
-    return {
-        key: value
-        for key, value in params.items()
-        if key not in _WORKSPACE_PROTECTED_CONTEXT_KEYS
-    }
 
 
 WORKSPACE_AGENT_SCHEMA = {
@@ -64,7 +39,22 @@ WORKSPACE_AGENT_SCHEMA = {
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": list(WorkspaceToolAction.values()),
+                    "enum": [
+                        "search",
+                        "create_task",
+                        "update_task_runtime",
+                        "list_knowledge",
+                        "create_knowledge_folder",
+                        "add_knowledge_documents",
+                        "remove_knowledge_document",
+                        "update_knowledge_policy",
+                        "add_rule",
+                        "delegate_service",
+                        "get_goal_status",
+                        "update_goal_value",
+                        "operation",
+                        "request_strategist_review",
+                    ],
                 },
                 "params": {
                     "type": "object",
@@ -686,79 +676,45 @@ async def _workspace_agent_handler(
     conversation_id: str = "",
     **kwargs: Any,
 ) -> str:
-    raw_action = str(kwargs.get("action") or "").strip()
+    action = str(kwargs.get("action") or "").strip()
     raw_params = kwargs.get("params") or {}
     params = raw_params if isinstance(raw_params, dict) else {}
-    if not raw_action:
+    if not action:
         return _dumps({"error": "action is required"})
 
-    try:
-        action = WorkspaceToolAction(raw_action)
-    except ValueError:
-        return _dumps({"error": f"unsupported workspace_agent action: {raw_action}"})
-
-    if action is WorkspaceToolAction.SEARCH:
+    if action == "search":
         from packages.core.ai.runtime import runtime_workspace_search
 
         return await runtime_workspace_search(
             entity_id=entity_id,
             workspace_id=workspace_id,
-            **_workspace_action_params(params),
+            **params,
         )
 
     handlers = {
-        WorkspaceToolAction.CREATE_TASK: _workspace_create_task_handler,
-        WorkspaceToolAction.UPDATE_TASK_RUNTIME: _workspace_update_task_runtime_handler,
-        WorkspaceToolAction.LIST_KNOWLEDGE: _workspace_list_knowledge_handler,
-        WorkspaceToolAction.CREATE_KNOWLEDGE_FOLDER: _workspace_create_knowledge_folder_handler,
-        WorkspaceToolAction.ADD_KNOWLEDGE_DOCUMENTS: _workspace_add_knowledge_documents_handler,
-        WorkspaceToolAction.REMOVE_KNOWLEDGE_DOCUMENT: _workspace_remove_knowledge_document_handler,
-        WorkspaceToolAction.UPDATE_KNOWLEDGE_POLICY: _workspace_update_knowledge_policy_handler,
-        WorkspaceToolAction.ADD_RULE: _workspace_add_rule_handler,
-        WorkspaceToolAction.GET_GOAL_STATUS: _workspace_get_goal_status_handler,
-        WorkspaceToolAction.UPDATE_GOAL_VALUE: _workspace_update_goal_value_handler,
-        WorkspaceToolAction.OPERATION: _workspace_operation_handler,
-        WorkspaceToolAction.REQUEST_STRATEGIST_REVIEW: _workspace_request_strategist_review_handler,
-        WorkspaceToolAction.DELEGATE_SERVICE: _workspace_delegate_service_handler,
-        WorkspaceToolAction.RESOLVE_HITL: _workspace_resolve_hitl_handler,
-        WorkspaceToolAction.ANSWER_TASK_BLOCKER: _answer_task_blocker_handler,
-        WorkspaceToolAction.VISUALIZE_LEDGERS: _workspace_visualize_ledgers_handler,
+        "create_task": _workspace_create_task_handler,
+        "update_task_runtime": _workspace_update_task_runtime_handler,
+        "list_knowledge": _workspace_list_knowledge_handler,
+        "create_knowledge_folder": _workspace_create_knowledge_folder_handler,
+        "add_knowledge_documents": _workspace_add_knowledge_documents_handler,
+        "remove_knowledge_document": _workspace_remove_knowledge_document_handler,
+        "update_knowledge_policy": _workspace_update_knowledge_policy_handler,
+        "add_rule": _workspace_add_rule_handler,
+        "get_goal_status": _workspace_get_goal_status_handler,
+        "update_goal_value": _workspace_update_goal_value_handler,
+        "operation": _workspace_operation_handler,
+        "request_strategist_review": _workspace_request_strategist_review_handler,
+        "delegate_service": _workspace_delegate_service_handler,
     }
     handler = handlers.get(action)
     if not handler:
-        return _dumps({"error": f"unsupported workspace_agent action: {raw_action}"})
+        return _dumps({"error": f"unsupported workspace_agent action: {action}"})
 
     # Stamp the active agent persona so task logs/comments it writes are
     # attributed to that agent in the activity UI (not a generic
     # "workspace-agent"). The id is injected by the runtime tool harness.
-    action_params = _workspace_action_params(params)
-    context_kwargs = {
-        key: value
-        for key, value in kwargs.items()
-        if key in RUNTIME_TOOL_CONTEXT_KEYS
-    }
-    runtime_task_id = str(context_kwargs.get("task_id") or "").strip()
-    requested_task_id = str(params.get("task_id") or "").strip()
-    if (
-        action is WorkspaceToolAction.UPDATE_TASK_RUNTIME
-        and runtime_task_id
-        and requested_task_id
-        and requested_task_id != runtime_task_id
-    ):
-        return _dumps({"error": "task_id conflicts with active runtime task"})
-    if (
-        action is WorkspaceToolAction.UPDATE_TASK_RUNTIME
-        and not runtime_task_id
-        and requested_task_id
-    ):
-        # A global Workspace chat may target a task explicitly. A task-scoped
-        # Runtime requires an exact match with its injected target above.
-        action_params["task_id"] = requested_task_id
     actor_kwargs: dict[str, Any] = {}
-    if action in {
-        WorkspaceToolAction.CREATE_TASK,
-        WorkspaceToolAction.UPDATE_TASK_RUNTIME,
-    }:
+    if action in ("create_task", "update_task_runtime"):
         actor_agent_id = str(kwargs.get("_agent_id_from_context") or "").strip()
         if actor_agent_id:
             actor_kwargs["actor_agent_id"] = actor_agent_id
@@ -768,9 +724,8 @@ async def _workspace_agent_handler(
         user_id=user_id,
         workspace_id=workspace_id,
         conversation_id=conversation_id,
-        **context_kwargs,
         **actor_kwargs,
-        **action_params,
+        **params,
     )
 
 
@@ -916,23 +871,6 @@ async def _workspace_resolve_hitl_handler(
         conversation_id=conversation_id,
         user_id=user_id or None,
         params=kwargs,
-    )
-
-
-async def _workspace_visualize_ledgers_handler(
-    entity_id: str = "",
-    user_id: str = "",
-    workspace_id: str = "",
-    conversation_id: str = "",
-    **kwargs: Any,
-) -> str:
-    return await runtime_visualize_workspace_ledgers_action(
-        entity_id=entity_id,
-        tool_kwargs={
-            "workspace_id": workspace_id,
-            "conversation_id": conversation_id,
-            **kwargs,
-        },
     )
 
 

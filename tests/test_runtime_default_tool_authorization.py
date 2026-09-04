@@ -130,7 +130,7 @@ async def test_delegated_discovery_to_saved_workspace_file_uses_real_guards(db_s
     from packages.core.ai.runtime.tool_registry import runtime_registered_tool_schemas
     from packages.core.ai.runtime.tool_search import runtime_execute_search_tools_handler
     from packages.core.ai.tools.generate_file_tool import _generate_file_handler
-    from packages.core.ai.tools.manor_tool import _manor_handler
+    from packages.core.ai.tools.workspace_agent_tools import _workspace_update_task_runtime_handler
     from packages.core.config import get_settings
     from packages.core.constants.agent_capabilities import AGENT_EAGER_BOUND_TOOL_LIMIT
     from packages.core.models.document import Document
@@ -161,12 +161,11 @@ async def test_delegated_discovery_to_saved_workspace_file_uses_real_guards(db_s
     ]
     wide_bound_names = [
         "generate_file",
-        "manor",
         *[
             name
             for name in registry_names
-            if name not in {"generate_file", "manor"}
-        ][: AGENT_EAGER_BOUND_TOOL_LIMIT - 1],
+            if name != "generate_file"
+        ][:AGENT_EAGER_BOUND_TOOL_LIMIT],
     ]
     assert len(wide_bound_names) == AGENT_EAGER_BOUND_TOOL_LIMIT + 1
     unbound_name = next(
@@ -193,7 +192,6 @@ async def test_delegated_discovery_to_saved_workspace_file_uses_real_guards(db_s
         )
     await ensure_workspace_artifact_folder(db_session, scope.workspace)
     await db_session.commit()
-    generate_file_tool_id = existing_tools["generate_file"].id
     entity_root = Path(provision_entity_filesystem(scope.entity_id))
     workspace_runtime = await resolve_workspace_runtime(
         db_session,
@@ -224,14 +222,6 @@ async def test_delegated_discovery_to_saved_workspace_file_uses_real_guards(db_s
         is_master=workspace_runtime.is_master,
         mcp_allowed_names=workspace_runtime.mcp_allowed_names,
     )
-    # Production prepares the prompt in a short-lived session that is closed
-    # before Runtime tools open their own sessions.  Release any lazy built-in
-    # Skill projection transaction here as well; otherwise this test can
-    # self-deadlock when search_tools projects the same Skill rows.
-    await db_session.rollback()
-    await db_session.refresh(scope.agent)
-    await db_session.refresh(scope.workspace)
-    await db_session.refresh(scope.task)
     envelope = prepared.envelope
     prompt_tool_names = {
         schema.get("function", {}).get("name")
@@ -252,33 +242,20 @@ async def test_delegated_discovery_to_saved_workspace_file_uses_real_guards(db_s
     handlers = {
         "search_tools": search_handler,
         "generate_file": _generate_file_handler,
-        "manor": _manor_handler,
+        "workspace_update_task_runtime": _workspace_update_task_runtime_handler,
     }
 
     async def execute(name, arguments):
-        raw_result = await runtime_execute_registered_tool(
+        return json.loads(await runtime_execute_registered_tool(
             tool_name=name, arguments=arguments, handler_resolver=handlers.get,
             entity_id=scope.entity_id, agent_id=scope.agent.id,
             workspace_id=scope.workspace.id, task_id=scope.task.id,
             tool_profile="workspace_agent", runtime_envelope=envelope,
-        )
-        return json.loads(raw_result)
+        ))
 
-    updated = await execute(
-        "manor",
-        {
-            "action": "workspace",
-            "params": {
-                "action": "update_task_runtime",
-                "params": {
-                    "task_id": scope.task.id,
-                    "runtime_instructions": (
-                        "Save the diagnostic packet in this task's artifact folder."
-                    ),
-                },
-            },
-        },
-    )
+    updated = await execute("workspace_update_task_runtime", {
+        "task_id": scope.task.id, "runtime_instructions": "Save the diagnostic packet in this task's artifact folder.",
+    })
     assert updated.get("updated") is True, updated
     await db_session.refresh(scope.task)
     assert "diagnostic packet" in str(scope.task.details["runtime_context"])
@@ -309,7 +286,7 @@ async def test_delegated_discovery_to_saved_workspace_file_uses_real_guards(db_s
     await db_session.execute(
         delete(AgentToolBinding).where(
             AgentToolBinding.agent_id == scope.agent.id,
-            AgentToolBinding.tool_id == generate_file_tool_id,
+            AgentToolBinding.tool_id == existing_tools["generate_file"].id,
         )
     )
     await db_session.commit()

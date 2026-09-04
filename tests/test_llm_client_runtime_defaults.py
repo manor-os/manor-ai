@@ -219,46 +219,6 @@ async def test_llm_stream_iterator_fails_fast_when_provider_stalls(monkeypatch) 
 
 
 @pytest.mark.asyncio
-async def test_llm_stream_iterator_ignores_transport_heartbeats(monkeypatch) -> None:
-    from packages.core.ai import llm_client
-
-    class HeartbeatOnlyResponse:
-        async def aiter_lines(self):
-            for _ in range(20):
-                await asyncio.sleep(0.003)
-                yield ": keep-alive"
-                yield ""
-
-    monkeypatch.setenv("LLM_STREAM_IDLE_TIMEOUT_SECONDS", "0.01")
-
-    with pytest.raises(TimeoutError, match="stalled"):
-        async for _line in llm_client._iter_stream_lines_with_idle_timeout(
-            HeartbeatOnlyResponse()
-        ):
-            pass
-
-
-@pytest.mark.asyncio
-async def test_llm_stream_iterator_ignores_data_heartbeats(monkeypatch) -> None:
-    from packages.core.ai import llm_client
-
-    class HeartbeatOnlyResponse:
-        async def aiter_lines(self):
-            for index in range(20):
-                await asyncio.sleep(0.003)
-                event_type = "ping" if index % 2 == 0 else "heartbeat"
-                yield f'data: {{"type": "{event_type}"}}'
-
-    monkeypatch.setenv("LLM_STREAM_IDLE_TIMEOUT_SECONDS", "0.01")
-
-    with pytest.raises(TimeoutError, match="stalled"):
-        async for _line in llm_client._iter_stream_lines_with_idle_timeout(
-            HeartbeatOnlyResponse()
-        ):
-            pass
-
-
-@pytest.mark.asyncio
 async def test_llm_post_retries_cloudflare_524(monkeypatch) -> None:
     from packages.core.ai import llm_client
 

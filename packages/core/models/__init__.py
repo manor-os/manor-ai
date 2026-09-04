@@ -2,12 +2,7 @@
 # Import all models so Alembic auto-detects them
 
 from packages.core.models.base import Base, generate_ulid, TimestampMixin, SoftDeleteMixin
-from packages.core.models.user import (
-    Entity,
-    OAuthAccount,
-    User,
-    UserMembership,
-)
+from packages.core.models.user import Entity, User, OAuthAccount, UserMembership
 from packages.core.models.workspace import (
     Workspace,
     WorkspaceStaff,

@@ -1181,21 +1181,6 @@ def _plain_language_blocker(issue: str) -> str:
     return f"the “{step}” step did not complete." if step else "a step did not complete."
 
 
-def _failed_step_issue(steps: list[ExecutionStep]) -> str | None:
-    """Keep the execution failure ahead of consequential missing-output checks."""
-    failed = [step for step in steps if step.step_status == ExecutionStepStatus.FAILED]
-    if not failed:
-        return None
-    human_issue = _human_required_failure_issue(failed)
-    if human_issue:
-        return human_issue
-    return "; ".join(
-        f"{(step.step_key or 'step').replace('_', ' ')}: "
-        f"{str((step.error or {}).get('message') or (step.error or {}).get('type') or 'failed')[:500]}"
-        for step in failed[:3]
-    )
-
-
 def _hitl_request_message(
     task: Any | None,
     steps: list[ExecutionStep],
@@ -1219,28 +1204,31 @@ def _hitl_request_message(
         lines.append("")
         lines.append("**Produced so far:** " + ", ".join(produced))
 
-    failure_issue = _failed_step_issue(failed_steps)
-    if failure_issue:
+    if artifact_issue:
         lines.append("")
-        lines.append(f"**Failed:** {failure_issue}")
+        lines.append(
+            "**Missing:** the deliverable file this task was asked to produce. "
+            "No saved file path or document was recorded by any step."
+        )
     elif structured_issue:
         lines.append("")
         lines.append(
             "**Incomplete:** "
             f"{_plain_language_blocker(structured_issue)}"
         )
-    elif not artifact_issue:
+    elif failed_steps:
+        detail = "; ".join(
+            f"{(fs.step_key or 'step').replace('_', ' ')}: "
+            f"{(fs.error or {}).get('message', 'failed')[:120]}"
+            for fs in failed_steps[:3]
+        )
+        lines.append("")
+        lines.append(f"**Failed:** {detail}")
+    else:
         lines.append("")
         lines.append(
             "**Unverified:** every step reported done, but the supervisor "
             "could not confirm the task objective was met."
-        )
-
-    if artifact_issue:
-        lines.append("")
-        lines.append(
-            "**Missing:** the deliverable file this task was asked to produce. "
-            "No saved file path or document was recorded by any step."
         )
 
     said = _agent_summaries(steps)
@@ -1361,56 +1349,6 @@ def _supervisor_review_infos(verdict_logs: list) -> list[dict]:
             "plan_id": meta.get("plan_id"),
         })
     return infos
-
-
-def _supervisor_actual_result(
-    steps: list[Any],
-    *,
-    acceptance_contract: dict[str, Any] | None,
-) -> dict[str, Any]:
-    """Return only step evidence explicitly named by task acceptance criteria."""
-    criteria = (
-        acceptance_contract.get("criteria")
-        if isinstance(acceptance_contract, dict)
-        else None
-    )
-    criteria = [item for item in (criteria or []) if isinstance(item, dict)]
-    evidence_keys: list[str] = []
-    criteria_evidence: list[dict[str, Any]] = []
-    for criterion in criteria:
-        keys = [
-            str(key) for key in (criterion.get("evidence_step_keys") or [])
-            if str(key or "").strip()
-        ]
-        for key in keys:
-            if key not in evidence_keys:
-                evidence_keys.append(key)
-        criteria_evidence.append({
-            "criterion_key": criterion.get("key"),
-            "deliverable_name": criterion.get("deliverable_name"),
-            "description": criterion.get("description"),
-            "evidence_step_keys": keys,
-        })
-
-    by_key = {str(getattr(step, "step_key", "")): step for step in steps}
-    selected_steps = []
-    for key in evidence_keys:
-        step = by_key.get(key)
-        if step is None:
-            continue
-        selected_steps.append({
-            "key": key,
-            "step_key": key,
-            "kind": getattr(step, "kind", None),
-            "status": getattr(step, "step_status", None),
-            "result": getattr(step, "result", None),
-            "evidence_refs": getattr(step, "evidence_refs", None) or [],
-            "error": getattr(step, "error", None),
-        })
-    return {
-        "criteria_evidence": criteria_evidence,
-        "steps": selected_steps,
-    }
 
 
 def _supervisor_step_infos(plan: ExecutionPlan, steps: list[ExecutionStep]) -> list[dict]:
@@ -2564,10 +2502,6 @@ class PlanExecutor:
 
         from packages.core.constants.supervisor import MAX_EVIDENCE_CHARS
         from packages.core.contracts.task_output import task_expected_output_json_schema
-        from packages.core.plans.completion_contracts import (
-            completion_contract_issue,
-            hydrate_completion_artifacts,
-        )
 
         def gate(verdict: SupervisorVerdict, evidence: str) -> SupervisorDecision:
             return SupervisorDecision(
@@ -2575,16 +2509,6 @@ class PlanExecutor:
                 evidence=str(evidence)[:MAX_EVIDENCE_CHARS],
                 source=SupervisorDecisionSource.GATE,
             )
-
-        await hydrate_completion_artifacts(db, task, steps)
-        task_completion_issue = await completion_contract_issue(db, task)
-        if task_completion_issue and plan_status == ExecutionPlanStatus.COMPLETED:
-            logger.info(
-                "Supervisor requested replan for plan %s completion contract gap: %s",
-                plan.id,
-                task_completion_issue,
-            )
-            return gate(SupervisorVerdict.NEEDS_REPLAN, task_completion_issue)
 
         execution_contract_issue = _execution_output_contract_issue(plan, steps, task)
         if execution_contract_issue and plan_status == ExecutionPlanStatus.COMPLETED:
@@ -2654,29 +2578,6 @@ class PlanExecutor:
         # result in context before the task status changes.
         try:
             step_infos = _supervisor_step_infos(plan, steps)
-            acceptance_contract = (
-                ((plan.plan_dag or {}).get("metadata") or {}).get(
-                    "acceptance_contract"
-                )
-            )
-            actual_result = (
-                _supervisor_actual_result(
-                    steps,
-                    acceptance_contract=acceptance_contract,
-                )
-                if isinstance(acceptance_contract, dict)
-                else None
-            )
-            if actual_result is not None:
-                evidence_keys = {
-                    str(item.get("step_key") or "")
-                    for item in actual_result.get("steps", [])
-                    if isinstance(item, dict)
-                }
-                step_infos = [
-                    info for info in step_infos
-                    if str(info.get("key") or "") in evidence_keys
-                ]
             plan_rationale = str(
                 ((plan.plan_dag or {}).get("metadata") or {}).get("rationale") or ""
             )
@@ -2729,8 +2630,6 @@ class PlanExecutor:
                     if task is not None
                     else None
                 ),
-                acceptance_contract=acceptance_contract,
-                actual_result=actual_result,
                 done_count=done_count,
                 failed_count=failed_count,
                 skipped_count=skipped_count,
@@ -2951,13 +2850,7 @@ class PlanExecutor:
                             artifact_issue=artifact_issue,
                             failed_steps=failed_steps,
                         )
-                        attention_issue = (
-                            _failed_step_issue(failed_steps)
-                            or structured_issue
-                            or artifact_issue
-                            or decision.evidence
-                            or message
-                        )
+                        attention_issue = structured_issue or artifact_issue or message
                         await add_task_log(db, task.id, TaskLogType.AI_HITL_REQUESTED,
                             message,
                             actor=TaskActor.SUPERVISOR,

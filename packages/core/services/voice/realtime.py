@@ -14,13 +14,6 @@ from urllib.parse import urlencode, urlsplit
 import httpx
 import websockets
 
-from packages.core.services.voice.live_agent import (
-    LiveVoiceTool,
-    LiveVoiceTurnAction,
-    live_voice_session_factory,
-)
-from packages.core.services.voice.work_types import VoiceWorkAction
-
 
 DEFAULT_REALTIME_MODEL = "openai/gpt-realtime"
 DEFAULT_VERCEL_REALTIME_MODEL = "openai/gpt-realtime-mini"
@@ -35,7 +28,7 @@ SUPPORTED_VERCEL_REALTIME_MODELS = frozenset({DEFAULT_VERCEL_REALTIME_MODEL})
 OPENAI_API_BASE_URL = "https://api.openai.com/v1"
 VERCEL_GATEWAY_PROTOCOL_VERSION = "0.0.1"
 VERCEL_REALTIME_SUBPROTOCOL = "ai-gateway-realtime.v1"
-MANOR_BRIDGE_FUNCTION = LiveVoiceTool.MANOR_AGENT.value
+MANOR_BRIDGE_FUNCTION = "manor_agent_reply"
 MAX_UTTERANCE_CHARS = 4000
 
 
@@ -60,8 +53,6 @@ class BridgeCall:
     call_id: str | None
     utterance: str
     response_id: str
-    action: VoiceWorkAction | None = None
-    transcript_sent: bool = False
 
 
 VoiceOutcomeStatus = Literal[
@@ -69,7 +60,6 @@ VoiceOutcomeStatus = Literal[
     "approval_required",
     "action_handled",
     "no_reply",
-    "cancelled",
     "error",
 ]
 
@@ -598,10 +588,7 @@ def parse_completed_bridge_call(
         arguments = json.loads(str(item.get("arguments") or ""))
     except (TypeError, ValueError, json.JSONDecodeError):
         return None
-    if not isinstance(arguments, dict) or set(arguments) not in (
-        {"utterance"},
-        {"action", "utterance"},
-    ):
+    if not isinstance(arguments, dict) or set(arguments) != {"utterance"}:
         return None
     utterance_value = arguments.get("utterance")
     if not isinstance(utterance_value, str):
@@ -609,19 +596,11 @@ def parse_completed_bridge_call(
     utterance = utterance_value.strip()
     if not utterance or len(utterance) > MAX_UTTERANCE_CHARS:
         return None
-    action: VoiceWorkAction | None = None
-    if "action" in arguments:
-        try:
-            live_action = LiveVoiceTurnAction(str(arguments["action"]))
-        except (TypeError, ValueError):
-            return None
-        action = live_action.work_action
     seen_call_ids.add(call_id)
     return BridgeCall(
         call_id=call_id,
         utterance=utterance,
         response_id=response_id,
-        action=action,
     )
 
 
@@ -771,8 +750,6 @@ def build_realtime_session_update(
     model: str,
     voice: str = "alloy",
     input_transcription_model: str | None = None,
-    input_transcription_language: str | None = None,
-    live_agent: bool = False,
 ) -> dict[str, Any]:
     session: dict[str, Any] = {
         "type": "realtime",
@@ -796,18 +773,8 @@ def build_realtime_session_update(
     if input_transcription_model:
         session["audio"]["input"]["transcription"] = {
             "model": input_transcription_model,
-            **(
-                {"language": input_transcription_language}
-                if input_transcription_language
-                else {}
-            ),
         }
-    if live_agent:
-        session["output_modalities"] = ["audio"]
-        session["tools"] = live_voice_session_factory.tools()
-        session["tool_choice"] = "auto"
-        session["instructions"] = live_voice_session_factory.instructions()
-    elif not input_transcription_model:
+    else:
         session["tools"] = [
             {
                 "type": "function",
@@ -858,21 +825,6 @@ def build_function_output_event(
                 },
                 ensure_ascii=True,
             ),
-        },
-    }
-
-
-def build_function_result_event(
-    *,
-    call_id: str,
-    result: dict[str, Any],
-) -> dict[str, Any]:
-    return {
-        "type": "conversation.item.create",
-        "item": {
-            "type": "function_call_output",
-            "call_id": call_id,
-            "output": json.dumps(result, ensure_ascii=True),
         },
     }
 
@@ -1095,20 +1047,6 @@ class RealtimeVoiceEngine:
                 call_id=call.call_id,
                 status=outcome.status,
                 spoken_reply=outcome.spoken_reply,
-            )
-        )
-
-    async def send_function_result(
-        self,
-        call: BridgeCall,
-        result: dict[str, Any],
-    ) -> None:
-        if not call.call_id:
-            return
-        await self.send(
-            build_function_result_event(
-                call_id=call.call_id,
-                result=result,
             )
         )
 

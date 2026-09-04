@@ -616,22 +616,21 @@ async def test_approval_interrupt_and_gate_statuses_never_record(
     )
 
 
-async def _set_retired_discovery_flag(db, *, enabled: bool) -> None:
-    """Persist the retired flag to prove v2 no longer evaluates it."""
+async def _set_flag(db, key: str, *, enabled: bool) -> None:
+    """Canonical test-side flag setter — same helper duplicated in
+    tests/test_tool_discovery_v2.py; see that file's docstring for why
+    (no service-level set_flag(); this direct FeatureFlag row upsert +
+    cache bump is the pattern every test in this repo actually uses)."""
     from sqlalchemy import select
 
     from packages.core.models.feature_flag import FeatureFlag
     from packages.core.services import feature_flags as feature_flags_service
 
     flag = (await db.execute(
-        select(FeatureFlag).where(FeatureFlag.key == "tool_discovery_v2")
+        select(FeatureFlag).where(FeatureFlag.key == key)
     )).scalar_one_or_none()
     if flag is None:
-        db.add(FeatureFlag(
-            key="tool_discovery_v2",
-            description="retired test flag",
-            default_enabled=enabled,
-        ))
+        db.add(FeatureFlag(key=key, description="test", default_enabled=enabled))
     else:
         flag.default_enabled = enabled
     await db.commit()
@@ -704,7 +703,7 @@ def _mock_prompt_pipeline(monkeypatch, captured: dict):
 
 
 @pytest.mark.asyncio
-async def test_resolve_runtime_chat_context_surfaces_path_hint_by_default(
+async def test_resolve_runtime_chat_context_surfaces_path_hint_when_flag_on(
     client: AsyncClient, monkeypatch,
 ) -> None:
     """Uses a first-party manor_mcp_calendar tool rather than the plan's
@@ -730,6 +729,9 @@ async def test_resolve_runtime_chat_context_surfaces_path_hint_by_default(
         )
         await db.commit()
 
+    async with dbmod.async_session() as db:
+        await _set_flag(db, "tool_discovery_v2", enabled=True)
+
     captured: dict = {}
     _mock_prompt_pipeline(monkeypatch, captured)
 
@@ -748,7 +750,7 @@ async def test_resolve_runtime_chat_context_surfaces_path_hint_by_default(
 
 
 @pytest.mark.asyncio
-async def test_resolve_runtime_chat_context_ignores_retired_flag_off(
+async def test_resolve_runtime_chat_context_no_hint_when_flag_off(
     client: AsyncClient, monkeypatch,
 ) -> None:
     _, user_id, entity_id = await _register_owner(client, "tpm_ctx_off")
@@ -761,8 +763,7 @@ async def test_resolve_runtime_chat_context_ignores_retired_flag_off(
             user_message="发 x post", tool_name="mcp__manor_mcp_calendar__update_working_hours",
         )
         await db.commit()
-    async with dbmod.async_session() as db:
-        await _set_retired_discovery_flag(db, enabled=False)
+    # tool_discovery_v2 flag intentionally left unset (off by default).
 
     captured: dict = {}
     _mock_prompt_pipeline(monkeypatch, captured)
@@ -777,8 +778,8 @@ async def test_resolve_runtime_chat_context_ignores_retired_flag_off(
         (captured.get("legacy_extra_context") or "")
         + (captured.get("initial_extra_context") or "")
     )
-    assert "mcp__manor_mcp_calendar__update_working_hours" in combined
-    assert "mcp__manor_mcp_calendar__update_working_hours" in ctx.hinted_tool_names
+    assert "mcp__manor_mcp_calendar__update_working_hours" not in combined
+    assert ctx.hinted_tool_names == set()
 
 
 @pytest.mark.asyncio
@@ -795,6 +796,9 @@ async def test_resolve_runtime_chat_context_no_hint_for_non_matching_message(
             user_message="发 x post", tool_name="mcp__manor_mcp_calendar__update_working_hours",
         )
         await db.commit()
+    async with dbmod.async_session() as db:
+        await _set_flag(db, "tool_discovery_v2", enabled=True)
+
     captured: dict = {}
     _mock_prompt_pipeline(monkeypatch, captured)
 

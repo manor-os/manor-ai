@@ -95,7 +95,6 @@ DEFAULT_FIELDS: Dict[str, Any] = {
     "services": [],
     "agent_mappings": [],
     "goals": [],
-    "stats": [],
     "rules": [],
     "automations": [],
     "evaluation": {
@@ -117,7 +116,7 @@ DEFAULT_FIELDS: Dict[str, Any] = {
     },
     # Global autonomous runtime is independent from service-level autonomy
     # and from whether the workspace tracks any Goals.
-    "heartbeat_enabled": True,
+    "heartbeat_enabled": False,
     "notes": "",
 }
 
@@ -175,17 +174,9 @@ SETUP_SYSTEM_PROMPT = runtime_workspace_setup_system_prompt(
 
 async def start_setup(entity_id: str) -> WorkspaceSetupSession:
     """Initialize a new workspace setup session."""
-    from packages.core.constants.workspace_drafts import (
-        CURRENT_WORKSPACE_DRAFT_SCHEMA_VERSION,
-        WORKSPACE_DRAFT_SCHEMA_VERSION_FIELD,
-    )
-
     return WorkspaceSetupSession(
         entity_id=entity_id,
-        fields={
-            **copy.deepcopy(DEFAULT_FIELDS),
-            WORKSPACE_DRAFT_SCHEMA_VERSION_FIELD: CURRENT_WORKSPACE_DRAFT_SCHEMA_VERSION,
-        },
+        fields=copy.deepcopy(DEFAULT_FIELDS),
         messages=[],
         ready=False,
         missing=sorted(REQUIRED_FIELDS),
@@ -241,27 +232,9 @@ async def process_setup_turn(
     # Parse status block from response
     status = _extract_status_block(response_text)
     if status:
-        from packages.core.constants.workspace_drafts import (
-            WORKSPACE_DRAFT_SCHEMA_VERSION_FIELD,
-            uses_ui_runtime_mode,
-        )
-        from packages.core.services.workspace_goal_measurements import resolve_draft_goal_measurements
-
-        schema_version = session.fields.get(WORKSPACE_DRAFT_SCHEMA_VERSION_FIELD)
-        runtime_mode = session.fields.get("heartbeat_enabled")
-        preserve_runtime_mode = uses_ui_runtime_mode(session.fields)
         session.fields = status.get("fields", session.fields)
-        if preserve_runtime_mode:
-            session.fields["heartbeat_enabled"] = runtime_mode
-        if schema_version is not None:
-            session.fields[WORKSPACE_DRAFT_SCHEMA_VERSION_FIELD] = schema_version
         session.ready = status.get("ready", False)
         session.missing = status.get("missing", [])
-        try:
-            resolve_draft_goal_measurements(session.fields)
-        except ValueError:
-            session.ready = False
-            session.missing = sorted(set(session.missing) | {"goals"})
 
     # Strip the status block from the visible response
     visible_response = _strip_status_block(response_text).strip()
@@ -990,11 +963,6 @@ async def finalize_setup(
 
     fields = session.fields
 
-    from packages.core.constants.workspace_drafts import uses_ui_runtime_mode
-
-    if uses_ui_runtime_mode(fields) and not isinstance(fields.get("heartbeat_enabled"), bool):
-        raise WorkspaceProvisioningError("Choose Automatic or Manual mode before creating the Workspace")
-
     operating_rules = _enrich_operating_rules(fields.get("rules", []))
     raw_budget_policy = fields.get("budget_policy") if isinstance(fields.get("budget_policy"), dict) else {}
     monthly_budget_credits = _coerce_positive_int(raw_budget_policy.get("monthly_budget_credits"))
@@ -1017,16 +985,9 @@ async def finalize_setup(
     if not isinstance(blueprint_operating_model, dict):
         blueprint_operating_model = {}
 
-    from packages.core.services.workspace_goal_measurements import (
-        materialize_draft_stats,
-        resolve_draft_goal_measurements,
+    normalized_goals = GoalIdentityFactory.normalize_records(
+        list(fields.get("goals") or [])
     )
-
-    try:
-        measured_goals, stat_definitions = resolve_draft_goal_measurements(fields)
-    except ValueError as exc:
-        raise WorkspaceProvisioningError(str(exc)) from exc
-    normalized_goals = GoalIdentityFactory.normalize_records(measured_goals)
 
     # Build operating model
     operating_model: Dict[str, Any] = {
@@ -1814,11 +1775,6 @@ async def finalize_setup(
 
     # ── Materialize Goal DB rows from operating_model.goals[] ──────────
     # Without real Goal rows, the Strategist has nothing to reason about.
-    stats_by_key = await materialize_draft_stats(
-        db, entity_id=session.entity_id, workspace_id=workspace_id,
-        definitions=stat_definitions,
-        goal_stat_keys={goal["stat_key"] for goal in normalized_goals if goal.get("stat_key")},
-    )
     goals_data = operating_model.get("goals", [])
     goals_created = 0
     for g in goals_data:
@@ -1853,8 +1809,7 @@ async def finalize_setup(
             is_workspace_internal_measurement_source,
         )
 
-        linked_stat = stats_by_key.get(g.get("stat_key"))
-        measurement_source = None if linked_stat else default_workspace_measurement_source(
+        measurement_source = default_workspace_measurement_source(
             g.get("measurement_source"),
             workspace_id=workspace_id,
         )
@@ -1865,7 +1820,6 @@ async def finalize_setup(
             id=generate_ulid(),
             entity_id=session.entity_id,
             workspace_id=workspace_id,
-            stat_id=linked_stat.id if linked_stat else None,
             title=title,
             description=g.get("description"),
             goal_key=goal_key,
@@ -1873,7 +1827,7 @@ async def finalize_setup(
             target_value=target_val,
             baseline_value=baseline_val,
             measurement_source=measurement_source,
-            measurement_cadence=None if linked_stat else measurement_cadence,
+            measurement_cadence=measurement_cadence,
             priority=int(g.get("priority", 3)),
             status="active",
             pace_status="unknown",
@@ -1955,7 +1909,6 @@ async def finalize_setup(
         "materialized_service_count": len(materialized_service_keys),
         "worker_bound_subscription_count": len(created_subs),
         "goal_count": goals_created,
-        "stat_count": len(stats_by_key),
         "starter_document_count": len(starter_doc_requests),
         "post_commit_dispatch": "pending" if runtime_ready else "not_required",
     }
@@ -2095,30 +2048,22 @@ async def dispatch_workspace_post_commit(
             AgentSubscription.workspace_id == workspace.id,
             AgentSubscription.entity_id == workspace.entity_id,
             AgentSubscription.status == "active",
-        ).order_by(AgentSubscription.created_at.asc(), AgentSubscription.id.asc())
+        ).order_by(AgentSubscription.created_at.asc())
     )).scalars().all())
-    # Chat membership is per Agent, even when that Agent serves several roles.
-    # Keep every deployment intact, but introduce each Agent only once.
-    subscriptions_by_agent: dict[str, list[AgentSubscription]] = {}
-    for subscription in subscriptions:
-        subscriptions_by_agent.setdefault(subscription.agent_id, []).append(subscription)
-    agent_ids = list(subscriptions_by_agent)
+    agent_ids = [subscription.agent_id for subscription in subscriptions if subscription.agent_id]
     agents = list((await db.execute(
         select(Agent).where(Agent.id.in_(agent_ids))
     )).scalars().all()) if agent_ids else []
     agents_by_id = {agent.id: agent for agent in agents}
     greeting_payload = [
         {
-            "subscription_id": agent_subscriptions[0].id,
-            "agent_id": agent_id,
-            "agent_name": getattr(agents_by_id.get(agent_id), "name", None) or "Agent",
-            "service_key": ", ".join(dict.fromkeys(
-                subscription.service_key or "general"
-                for subscription in agent_subscriptions
-            )),
-            "system_prompt": getattr(agents_by_id.get(agent_id), "system_prompt", None) or "",
+            "subscription_id": subscription.id,
+            "agent_id": subscription.agent_id,
+            "agent_name": getattr(agents_by_id.get(subscription.agent_id), "name", None) or "Agent",
+            "service_key": subscription.service_key or "general",
+            "system_prompt": getattr(agents_by_id.get(subscription.agent_id), "system_prompt", None) or "",
         }
-        for agent_id, agent_subscriptions in subscriptions_by_agent.items()
+        for subscription in subscriptions
     ]
     if greeting_payload:
         try:

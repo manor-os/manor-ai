@@ -36,7 +36,8 @@ class AgentCapabilityKind(StrEnum):
     MCP_ACTION = "mcp_action"
 
 
-_SERVER_LEVEL_MCP_PROVIDERS = frozenset({"chrome"})
+_SERVER_LEVEL_MCP_PROVIDERS = frozenset({
+})
 
 
 class AgentCapabilityPlanStatus(StrEnum):

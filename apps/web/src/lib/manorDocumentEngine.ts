@@ -68,9 +68,6 @@ interface RenderContext {
   footnotes: Map<string, string>;
   fieldStack: FieldState[];
   trackParagraphs: boolean;
-  textBoxIndex: number;
-  activeTextBoxIndex: number | null;
-  sectionBreakIndex: number;
 }
 
 export interface ManorDocumentLayout {
@@ -95,21 +92,7 @@ export interface ManorDocumentRender {
   differentFirstPage: boolean;
   differentEvenPages: boolean;
   layout: ManorDocumentLayout;
-  sections: ManorDocumentSectionRender[];
   fonts: string[];
-}
-
-export interface ManorDocumentSectionRender {
-  layout: ManorDocumentLayout;
-  headerHtml: string;
-  footerHtml: string;
-  firstHeaderHtml: string;
-  firstFooterHtml: string;
-  evenHeaderHtml: string;
-  evenFooterHtml: string;
-  differentFirstPage: boolean;
-  differentEvenPages: boolean;
-  breakType: "continuous" | "nextPage" | "evenPage" | "oddPage";
 }
 
 function parseXml(value: string, label: string): XMLDocument {
@@ -543,307 +526,7 @@ function bytesToDataUrl(bytes: Uint8Array, mimeType: string): string {
   return `data:${mimeType};base64,${btoa(binary)}`;
 }
 
-function appendTransform(css: CssProperties, value: string): void {
-  css.transform = `${css.transform ? `${css.transform} ` : ""}${value}`;
-}
-
-function vmlStyleProperties(value: string): Map<string, string> {
-  return new Map(value.split(";").flatMap((entry) => {
-    const separator = entry.indexOf(":");
-    return separator < 0 ? [] : [[entry.slice(0, separator).trim().toLowerCase(), entry.slice(separator + 1).trim()]];
-  }));
-}
-
-function officeLength(value: string | undefined): string | undefined {
-  if (!value) return undefined;
-  const match = /^(-?[\d.]+)(pt|px|in|cm|mm)?$/i.exec(value.trim());
-  if (!match) return undefined;
-  const amount = Number(match[1]);
-  if (!Number.isFinite(amount)) return undefined;
-  const unit = (match[2] || "px").toLowerCase();
-  const multiplier = unit === "pt" ? 4 / 3 : unit === "in" ? 96 : unit === "cm" ? 96 / 2.54 : unit === "mm" ? 96 / 25.4 : 1;
-  return `${amount * multiplier}px`;
-}
-
-interface DrawingGroupMemberGeometry {
-  left: number;
-  top: number;
-  width: number;
-  height: number;
-  rotation: number;
-  flipHorizontal: boolean;
-  flipVertical: boolean;
-}
-
-function finiteAttribute(element: Element | undefined, name: string): number | undefined {
-  const raw = element?.getAttribute(name);
-  if (raw == null || raw === "") return undefined;
-  const value = Number(raw);
-  return Number.isFinite(value) ? value : undefined;
-}
-
-function enabledXmlFlag(value: string | null): boolean {
-  return value != null && !["0", "false", "off", "none"].includes(value.toLowerCase());
-}
-
-function drawingGroupMemberGeometry(
-  shape: Element | undefined,
-  frame: Element | undefined,
-): DrawingGroupMemberGeometry | undefined {
-  const memberTransform = firstChild(firstChild(shape, "spPr"), "xfrm");
-  const memberOffset = firstChild(memberTransform, "off");
-  const memberExtent = firstChild(memberTransform, "ext");
-  const memberX = finiteAttribute(memberOffset, "x");
-  const memberY = finiteAttribute(memberOffset, "y");
-  const memberWidth = finiteAttribute(memberExtent, "cx");
-  const memberHeight = finiteAttribute(memberExtent, "cy");
-  if ([memberX, memberY, memberWidth, memberHeight].some((value) => value == null)) return undefined;
-
-  let centerX = memberX! + memberWidth! / 2;
-  let centerY = memberY! + memberHeight! / 2;
-  let width = memberWidth!;
-  let height = memberHeight!;
-  let rotation = 0;
-  let flipHorizontal = false;
-  let flipVertical = false;
-  let groupCount = 0;
-  let outerTransform: Element | undefined;
-  let ancestor = shape?.parentElement ?? null;
-  while (ancestor && ancestor !== frame && ancestor.localName !== "drawing" && ancestor.localName !== "pict") {
-    if (ancestor.localName === "wgp" || ancestor.localName === "grpSp") {
-      const transform = firstChild(firstChild(ancestor, "grpSpPr"), "xfrm");
-      const offset = firstChild(transform, "off");
-      const extent = firstChild(transform, "ext");
-      const childOffset = firstChild(transform, "chOff");
-      const childExtent = firstChild(transform, "chExt");
-      const x = finiteAttribute(offset, "x");
-      const y = finiteAttribute(offset, "y");
-      const cx = finiteAttribute(extent, "cx");
-      const cy = finiteAttribute(extent, "cy");
-      const childX = finiteAttribute(childOffset, "x");
-      const childY = finiteAttribute(childOffset, "y");
-      const childWidth = finiteAttribute(childExtent, "cx");
-      const childHeight = finiteAttribute(childExtent, "cy");
-      if ([x, y, cx, cy, childX, childY, childWidth, childHeight].some((value) => value == null)
-        || childWidth === 0 || childHeight === 0) return undefined;
-      const scaleX = cx! / childWidth!;
-      const scaleY = cy! / childHeight!;
-      centerX = x! + (centerX - childX!) * scaleX;
-      centerY = y! + (centerY - childY!) * scaleY;
-      width *= Math.abs(scaleX);
-      height *= Math.abs(scaleY);
-      const groupCenterX = x! + cx! / 2;
-      const groupCenterY = y! + cy! / 2;
-      const currentFlipHorizontal = enabledXmlFlag(transform?.getAttribute("flipH") ?? null);
-      const currentFlipVertical = enabledXmlFlag(transform?.getAttribute("flipV") ?? null);
-      if (currentFlipHorizontal) centerX = 2 * groupCenterX - centerX;
-      if (currentFlipVertical) centerY = 2 * groupCenterY - centerY;
-      flipHorizontal = flipHorizontal !== currentFlipHorizontal;
-      flipVertical = flipVertical !== currentFlipVertical;
-      const groupRotation = (finiteAttribute(transform, "rot") ?? 0) / 60000;
-      if (groupRotation) {
-        const radians = groupRotation * Math.PI / 180;
-        const deltaX = centerX - groupCenterX;
-        const deltaY = centerY - groupCenterY;
-        centerX = groupCenterX + deltaX * Math.cos(radians) - deltaY * Math.sin(radians);
-        centerY = groupCenterY + deltaX * Math.sin(radians) + deltaY * Math.cos(radians);
-        rotation += groupRotation;
-      }
-      outerTransform = transform;
-      groupCount += 1;
-    }
-    ancestor = ancestor.parentElement;
-  }
-  if (!groupCount || !outerTransform) return undefined;
-
-  const frameExtent = firstChild(frame, "extent");
-  const frameWidth = finiteAttribute(frameExtent, "cx");
-  const frameHeight = finiteAttribute(frameExtent, "cy");
-  const outerOffset = firstChild(outerTransform, "off");
-  const outerExtent = firstChild(outerTransform, "ext");
-  const outerX = finiteAttribute(outerOffset, "x") ?? 0;
-  const outerY = finiteAttribute(outerOffset, "y") ?? 0;
-  const outerWidth = finiteAttribute(outerExtent, "cx");
-  const outerHeight = finiteAttribute(outerExtent, "cy");
-  if (frameWidth != null && frameHeight != null && outerWidth && outerHeight) {
-    const scaleX = frameWidth / outerWidth;
-    const scaleY = frameHeight / outerHeight;
-    centerX = (centerX - outerX) * scaleX;
-    centerY = (centerY - outerY) * scaleY;
-    width *= Math.abs(scaleX);
-    height *= Math.abs(scaleY);
-  }
-  return {
-    left: (centerX - width / 2) / 9525,
-    top: (centerY - height / 2) / 9525,
-    width: width / 9525,
-    height: height / 9525,
-    rotation,
-    flipHorizontal,
-    flipVertical,
-  };
-}
-
-function addPixelOffset(value: string | undefined, offset: number): string {
-  if (!value) return `${offset}px`;
-  if (!offset) return value;
-  if (value.startsWith("calc(") && value.endsWith(")")) {
-    return `calc(${value.slice(5, -1)} + ${offset}px)`;
-  }
-  return `calc(${value} + ${offset}px)`;
-}
-
-function renderTextBox(element: Element, content: Element, context: RenderContext): string {
-  const frame = descendants(element, "anchor")[0] || descendants(element, "inline")[0];
-  const vmlShape = descendants(element, "shape").find((node) => descendants(node, "txbxContent").includes(content))
-    || descendants(element, "rect").find((node) => descendants(node, "txbxContent").includes(content));
-  const shape = descendants(element, "wsp").find((node) => descendants(node, "txbxContent").includes(content));
-  const shapeProperties = firstChild(shape, "spPr");
-  const bodyProperties = firstChild(shape, "bodyPr");
-  const groupedGeometry = drawingGroupMemberGeometry(shape, frame);
-  const shapePreset = firstChild(shapeProperties, "prstGeom")?.getAttribute("prst") || "";
-  const css: CssProperties = {
-    "box-sizing": "border-box",
-    display: "flex",
-    "flex-direction": "column",
-    overflow: "hidden",
-    "white-space": "normal",
-  };
-  let paragraphOrigin = false;
-  if (frame) {
-    const extent = firstChild(frame, "extent");
-    const width = groupedGeometry?.width ?? emuToPixels(extent?.getAttribute("cx"));
-    const height = groupedGeometry?.height ?? emuToPixels(extent?.getAttribute("cy"));
-    if (width != null) css.width = `${width}px`;
-    if (height != null) css.height = `${height}px`;
-    if (frame.localName === "anchor") {
-      const horizontal = firstChild(frame, "positionH");
-      const vertical = firstChild(frame, "positionV");
-      const horizontalReference = horizontal?.getAttribute("relativeFrom") || "column";
-      const verticalReference = vertical?.getAttribute("relativeFrom") || "paragraph";
-      const horizontalOffset = emuToPixels(firstChild(horizontal, "posOffset")?.textContent);
-      const verticalOffset = emuToPixels(firstChild(vertical, "posOffset")?.textContent);
-      const headerFooter = /\/header\d*\.xml$|\/footer\d*\.xml$/.test(context.partPath);
-      const pageScoped = headerFooter && (horizontalReference === "page" || verticalReference === "page");
-      paragraphOrigin = !pageScoped && ["paragraph", "line"].includes(verticalReference);
-      css.position = "absolute";
-      css["z-index"] = ["1", "true", "on"].includes((frame.getAttribute("behindDoc") || "0").toLowerCase()) ? "0" : "2";
-      if (horizontalOffset != null) {
-        css.left = pageScoped || horizontalReference !== "page"
-          ? `${horizontalOffset}px`
-          : `calc(${horizontalOffset}px - var(--docx-margin-left))`;
-      }
-      if (verticalOffset != null) {
-        css.top = pageScoped || verticalReference !== "page"
-          ? `${verticalOffset}px`
-          : `calc(${verticalOffset}px - var(--docx-margin-top))`;
-      }
-      if (groupedGeometry) {
-        css.left = addPixelOffset(css.left, groupedGeometry.left);
-        css.top = addPixelOffset(css.top, groupedGeometry.top);
-      }
-    } else if (groupedGeometry) {
-      paragraphOrigin = true;
-      css.position = "absolute";
-      css.left = `${groupedGeometry.left}px`;
-      css.top = `${groupedGeometry.top}px`;
-    }
-  } else if (vmlShape) {
-    const style = vmlStyleProperties(vmlShape.getAttribute("style") || "");
-    css.position = style.get("position") || "absolute";
-    const vmlGeometry = {
-      left: officeLength(style.get("margin-left")),
-      top: officeLength(style.get("margin-top")),
-      width: officeLength(style.get("width")),
-      height: officeLength(style.get("height")),
-    };
-    Object.entries(vmlGeometry).forEach(([key, value]) => {
-      if (value) css[key] = value;
-    });
-    const rotation = Number(style.get("rotation"));
-    if (Number.isFinite(rotation) && rotation) appendTransform(css, `rotate(${rotation}deg)`);
-    css["background-color"] = vmlShape.getAttribute("filled") === "f"
-      ? "transparent"
-      : safeHex((vmlShape.getAttribute("fillcolor") || "").replace(/^#/, ""), "transparent");
-    const stroke = vmlShape.getAttribute("stroked") === "f"
-      ? "transparent"
-      : safeHex((vmlShape.getAttribute("strokecolor") || "").replace(/^#/, ""), "#000000");
-    css.border = `${officeLength(vmlShape.getAttribute("strokeweight") || "1pt") || "1px"} solid ${stroke}`;
-    const inset = descendants(vmlShape, "textbox")[0]?.getAttribute("inset")?.split(",") || [];
-    if (inset.length === 4) css.padding = inset.map((value) => officeLength(value) || "0px").join(" ");
-  }
-  if (shapeProperties) {
-    const noFill = firstChild(shapeProperties, "noFill");
-    const solidFill = firstChild(shapeProperties, "solidFill");
-    const fillColorNode = firstChild(solidFill, "srgbClr") || firstChild(solidFill, "schemeClr");
-    const fillColor = themeColor(fillColorNode, context) || safeHex(fillColorNode?.getAttribute("val") ?? undefined);
-    css["background-color"] = noFill ? "transparent" : fillColor;
-    const line = firstChild(shapeProperties, "ln");
-    const noLine = firstChild(line, "noFill");
-    const lineFill = firstChild(line, "solidFill");
-    const lineColorNode = firstChild(lineFill, "srgbClr") || firstChild(lineFill, "schemeClr");
-    const lineColor = themeColor(lineColorNode, context) || safeHex(lineColorNode?.getAttribute("val") ?? undefined);
-    if (line && !noLine) css.border = `${emuToPixels(line.getAttribute("w")) || 1}px solid ${lineColor || "#000000"}`;
-    else if (noLine) css.border = "0";
-    if (shapePreset === "roundRect" || shapePreset === "wedgeRoundRectCallout") css["border-radius"] = "12px";
-    else if (shapePreset === "ellipse" || shapePreset === "wedgeEllipseCallout") css["border-radius"] = "50%";
-    const transform = firstChild(shapeProperties, "xfrm");
-    const shapeRotation = Number(transform?.getAttribute("rot"));
-    const rotation = (Number.isFinite(shapeRotation) ? shapeRotation / 60000 : 0) + (groupedGeometry?.rotation ?? 0);
-    if (rotation) appendTransform(css, `rotate(${rotation}deg)`);
-    if (groupedGeometry?.flipHorizontal) appendTransform(css, "scaleX(-1)");
-    if (groupedGeometry?.flipVertical) appendTransform(css, "scaleY(-1)");
-  }
-  if (bodyProperties) {
-    const defaultInsets = { tIns: 45720, rIns: 91440, bIns: 45720, lIns: 91440 };
-    const insets = (["tIns", "rIns", "bIns", "lIns"] as const).map((attribute) => (
-      emuToPixels(bodyProperties.getAttribute(attribute)) ?? defaultInsets[attribute] / 9525
-    ));
-    const renderedWidth = Number.parseFloat(css.width || "");
-    const renderedHeight = Number.parseFloat(css.height || "");
-    if ((shapePreset === "ellipse" || shapePreset === "wedgeEllipseCallout")
-      && Number.isFinite(renderedWidth) && Number.isFinite(renderedHeight)) {
-      const geometricInset = 0.146447;
-      insets[0] += renderedHeight * geometricInset;
-      insets[1] += renderedWidth * geometricInset;
-      insets[2] += renderedHeight * geometricInset;
-      insets[3] += renderedWidth * geometricInset;
-    }
-    css.padding = insets.map((value) => `${value}px`).join(" ");
-    css["justify-content"] = ({ t: "flex-start", ctr: "center", b: "flex-end" } as Record<string, string>)[bodyProperties.getAttribute("anchor") || "t"] || "flex-start";
-    if (bodyProperties.getAttribute("wrap") === "none") css["white-space"] = "nowrap";
-  }
-  const textBoxIndex = context.trackParagraphs ? context.textBoxIndex++ : -1;
-  const paragraphContext: RenderContext = {
-    ...context,
-    paragraphIndex: 0,
-    activeTextBoxIndex: textBoxIndex,
-    trackParagraphs: false,
-    counters: new Map(),
-    fieldStack: [],
-  };
-  const tableContext: RenderContext = { ...paragraphContext, activeTextBoxIndex: null };
-  const inner = elementChildren(content).map((child) => (
-    child.localName === "p" ? renderBlock(child, paragraphContext) : renderBlock(child, tableContext)
-  )).join("");
-  const properties = descendants(shape, "cNvPr")[0] || (frame ? descendants(frame, "docPr")[0] : vmlShape);
-  const title = properties?.getAttribute("descr") || properties?.getAttribute("title") || properties?.getAttribute("name") || "";
-  const attributes = [
-    'class="manor-docx-text-box"',
-    textBoxIndex >= 0 ? `data-docx-text-box-index="${textBoxIndex}"` : 'data-manor-docx-layout="true"',
-    'contenteditable="false"',
-    title ? `aria-label="${escapeHtml(title)}"` : "",
-    `style="${styleText(css)}"`,
-  ].filter(Boolean).join(" ");
-  const box = `<div ${attributes}>${inner}</div>`;
-  return paragraphOrigin
-    ? `<span class="manor-docx-anchor-origin" contenteditable="false">${box}</span>`
-    : box;
-}
-
 function renderDrawing(element: Element, context: RenderContext): string {
-  const textBoxContents = descendants(element, "txbxContent");
-  if (textBoxContents.length) return textBoxContents.map((content) => renderTextBox(element, content, context)).join("");
   const blip = descendants(element, "blip")[0] || descendants(element, "imagedata")[0];
   const id = blip?.getAttribute("r:embed") || blip?.getAttribute("r:id") || blip?.getAttributeNS("http://schemas.openxmlformats.org/officeDocument/2006/relationships", "embed") || "";
   const relationship = context.relationships.get(id);
@@ -852,74 +535,13 @@ function renderDrawing(element: Element, context: RenderContext): string {
   const extent = descendants(element, "extent")[0] || descendants(element, "ext")[0];
   const width = emuToPixels(extent?.getAttribute("cx"));
   const height = emuToPixels(extent?.getAttribute("cy"));
-  const css: CssProperties = {
+  const style = styleText({
     width: width ? `${width}px` : "auto",
     height: height ? `${height}px` : "auto",
     "max-width": "100%",
-  };
-  const anchor = descendants(element, "anchor")[0];
-  let floatingAttributes = "";
-  let paragraphOrigin = false;
-  if (anchor) {
-    const horizontal = firstChild(anchor, "positionH");
-    const vertical = firstChild(anchor, "positionV");
-    const horizontalReference = horizontal?.getAttribute("relativeFrom") || "column";
-    const verticalReference = vertical?.getAttribute("relativeFrom") || "paragraph";
-    const horizontalOffset = emuToPixels(firstChild(horizontal, "posOffset")?.textContent);
-    const verticalOffset = emuToPixels(firstChild(vertical, "posOffset")?.textContent);
-    const horizontalAlign = firstChild(horizontal, "align")?.textContent;
-    const verticalAlign = firstChild(vertical, "align")?.textContent;
-    const headerFooter = /\/header\d*\.xml$|\/footer\d*\.xml$/.test(context.partPath);
-    const pageScoped = headerFooter && (horizontalReference === "page" || verticalReference === "page");
-    paragraphOrigin = !pageScoped && ["paragraph", "line"].includes(verticalReference);
-    css.position = "absolute";
-    css["z-index"] = ["1", "true", "on"].includes((anchor.getAttribute("behindDoc") || "0").toLowerCase()) ? "0" : "2";
-    if (horizontalOffset != null) {
-      css.left = pageScoped || horizontalReference !== "page"
-        ? `${horizontalOffset}px`
-        : `calc(${horizontalOffset}px - var(--docx-margin-left))`;
-    } else if (horizontalAlign) {
-      if (horizontalAlign === "center") css.left = "50%";
-      else if (horizontalAlign === "right" || horizontalAlign === "outside") css.right = "0";
-      else css.left = "0";
-      if (horizontalAlign === "center") css.transform = "translateX(-50%)";
-    }
-    if (verticalOffset != null) {
-      css.top = pageScoped || verticalReference !== "page"
-        ? `${verticalOffset}px`
-        : `calc(${verticalOffset}px - var(--docx-margin-top))`;
-    } else if (verticalAlign) {
-      if (verticalAlign === "center") css.top = "50%";
-      else if (verticalAlign === "bottom" || verticalAlign === "outside") css.bottom = "0";
-      else css.top = "0";
-      if (verticalAlign === "center") {
-        css.transform = `${css.transform ? `${css.transform} ` : ""}translateY(-50%)`;
-      }
-    }
-    const wrap = elementChildren(anchor).find((child) => child.localName.startsWith("wrap"));
-    const distances = {
-      top: emuToPixels(anchor.getAttribute("distT")) || 0,
-      right: emuToPixels(anchor.getAttribute("distR")) || 0,
-      bottom: emuToPixels(anchor.getAttribute("distB")) || 0,
-      left: emuToPixels(anchor.getAttribute("distL")) || 0,
-    };
-    if (wrap && wrap.localName !== "wrapNone") {
-      css.margin = `${distances.top}px ${distances.right}px ${distances.bottom}px ${distances.left}px`;
-    }
-    floatingAttributes = [
-      'class="manor-docx-floating-picture"',
-      'data-docx-floating="true"',
-      `data-docx-anchor-horizontal="${escapeHtml(horizontalReference)}"`,
-      `data-docx-anchor-vertical="${escapeHtml(verticalReference)}"`,
-      pageScoped ? 'data-docx-anchor-page-scope="true"' : "",
-    ].filter(Boolean).join(" ");
-  }
-  const style = styleText(css);
+  });
   const title = descendants(element, "docPr")[0]?.getAttribute("descr") || descendants(element, "docPr")[0]?.getAttribute("name") || "";
-  const image = `<img ${floatingAttributes} src="${source}" alt="${escapeHtml(title)}" style="${style}">`;
-  return paragraphOrigin
-    ? `<span class="manor-docx-anchor-origin" contenteditable="false">${image}</span>`
-    : image;
+  return `<img src="${source}" alt="${escapeHtml(title)}" style="${style}">`;
 }
 
 function renderHorizontalRule(element: Element, context: RenderContext): string {
@@ -1056,34 +678,25 @@ function renderParagraph(element: Element, context: RenderContext): string {
     .join("");
   const markerIsBullet = marker === "•";
   const sourceEditable = context.revisionBlockDepth === 0
-    && !["ins", "del", "moveFrom", "moveTo", "drawing", "object", "pict", "altChunk"]
-      .some((name) => descendants(element, name).length > 0);
-  const sectionAfter = context.trackParagraphs && firstChild(pPr, "sectPr")
-    ? context.sectionBreakIndex++
-    : undefined;
+    && !["ins", "del", "moveFrom", "moveTo"].some((name) => descendants(element, name).length > 0);
   const classes = [
     "manor-docx-paragraph",
     marker ? "manor-docx-list-paragraph" : "",
     markerIsBullet ? "manor-docx-list-bullet" : "",
   ].filter(Boolean).join(" ");
-  const textBoxParagraph = context.activeTextBoxIndex != null && context.activeTextBoxIndex >= 0;
   const attributes = [
     `class="${classes}"`,
-    textBoxParagraph
-      ? `data-docx-text-box-index="${context.activeTextBoxIndex}" data-docx-text-box-paragraph-index="${index}" data-docx-source-editable="${sourceEditable ? "true" : "false"}" contenteditable="${sourceEditable ? "true" : "false"}"`
-      : context.trackParagraphs ? `data-docx-paragraph-index="${index}" data-docx-source-editable="${sourceEditable ? "true" : "false"}"` : 'data-manor-docx-layout="true" contenteditable="false"',
+    context.trackParagraphs ? `data-docx-paragraph-index="${index}" data-docx-source-editable="${sourceEditable ? "true" : "false"}"` : 'data-manor-docx-layout="true" contenteditable="false"',
     context.trackParagraphs && !sourceEditable ? 'contenteditable="false"' : "",
     marker ? `data-docx-list-label="${markerIsBullet ? "bullet" : escapeHtml(marker)}"` : "",
     properties.pageBreakBefore ? 'data-docx-page-break-before="true"' : "",
     properties.keepNext ? 'data-docx-keep-next="true"' : "",
     properties.keepLines ? 'data-docx-keep-lines="true"' : "",
     properties.widowControl === false ? 'data-docx-widow-control="false"' : "",
-    sectionAfter != null ? `data-docx-section-after="${sectionAfter}"` : "",
     style?.name ? `data-docx-style-name="${escapeHtml(style.name)}"` : "",
     `style="${styleText(properties.css)}"`,
   ].filter(Boolean).join(" ");
-  const tag = textBoxParagraph || descendants(element, "txbxContent").length ? "div" : "p";
-  return `<${tag} ${attributes}>${content || '<br data-docx-placeholder="true">'}</${tag}>`;
+  return `<p ${attributes}>${content || '<br data-docx-placeholder="true">'}</p>`;
 }
 
 interface RenderedCell {
@@ -1122,10 +735,7 @@ function renderTable(element: Element, context: RenderContext): string {
     const rowHeightPx = twipsToPixels(wordAttribute(rowHeight, "val"));
     const rowCss: CssProperties = {};
     if (rowHeightPx != null) {
-      // CSS min-height is ignored on table rows. A row height is treated as a
-      // minimum by the table layout algorithm, while still allowing content
-      // to expand an at-least Word row.
-      rowCss.height = `${rowHeightPx}px`;
+      rowCss[wordAttribute(rowHeight, "hRule") === "exact" ? "height" : "min-height"] = `${rowHeightPx}px`;
     }
     let column = 0;
     for (const cellElement of elementChildren(rowElement, "tc")) {
@@ -1226,32 +836,26 @@ function renderBlock(element: Element, context: RenderContext): string {
   return "";
 }
 
-const DEFAULT_DOCUMENT_LAYOUT: ManorDocumentLayout = {
-  pageWidthPx: 816,
-  pageHeightPx: 1056,
-  marginTopPx: 96,
-  marginRightPx: 96,
-  marginBottomPx: 96,
-  marginLeftPx: 96,
-  headerDistancePx: 48,
-  footerDistancePx: 48,
-};
-
-function sectionLayout(section: Element | undefined, fallback = DEFAULT_DOCUMENT_LAYOUT): ManorDocumentLayout {
+function sectionLayout(document: XMLDocument): { layout: ManorDocumentLayout; section: Element | undefined } {
+  const sections = descendants(document, "sectPr");
+  const section = sections.at(-1);
   const size = firstChild(section, "pgSz");
   const margins = firstChild(section, "pgMar");
-  const width = twipsToPixels(wordAttribute(size, "w")) ?? fallback.pageWidthPx;
-  const height = twipsToPixels(wordAttribute(size, "h")) ?? fallback.pageHeightPx;
+  const width = twipsToPixels(wordAttribute(size, "w")) || 816;
+  const height = twipsToPixels(wordAttribute(size, "h")) || 1056;
   const landscape = wordAttribute(size, "orient") === "landscape";
   return {
-    pageWidthPx: landscape ? Math.max(width, height) : width,
-    pageHeightPx: landscape ? Math.min(width, height) : height,
-    marginTopPx: twipsToPixels(wordAttribute(margins, "top")) ?? fallback.marginTopPx,
-    marginRightPx: twipsToPixels(wordAttribute(margins, "right")) ?? fallback.marginRightPx,
-    marginBottomPx: twipsToPixels(wordAttribute(margins, "bottom")) ?? fallback.marginBottomPx,
-    marginLeftPx: twipsToPixels(wordAttribute(margins, "left")) ?? fallback.marginLeftPx,
-    headerDistancePx: twipsToPixels(wordAttribute(margins, "header")) ?? fallback.headerDistancePx,
-    footerDistancePx: twipsToPixels(wordAttribute(margins, "footer")) ?? fallback.footerDistancePx,
+    section,
+    layout: {
+      pageWidthPx: landscape ? Math.max(width, height) : width,
+      pageHeightPx: landscape ? Math.min(width, height) : height,
+      marginTopPx: twipsToPixels(wordAttribute(margins, "top")) || 96,
+      marginRightPx: twipsToPixels(wordAttribute(margins, "right")) || 96,
+      marginBottomPx: twipsToPixels(wordAttribute(margins, "bottom")) || 96,
+      marginLeftPx: twipsToPixels(wordAttribute(margins, "left")) || 96,
+      headerDistancePx: twipsToPixels(wordAttribute(margins, "header")) || 48,
+      footerDistancePx: twipsToPixels(wordAttribute(margins, "footer")) || 48,
+    },
   };
 }
 
@@ -1276,8 +880,6 @@ async function renderRelatedPart(
     paragraphIndex: 0,
     revisionBlockDepth: 0,
     trackParagraphs: false,
-    textBoxIndex: -1,
-    activeTextBoxIndex: null,
     counters: new Map(),
     relationships: parseRelationships(partRelationshipsXml),
     fieldStack: [],
@@ -1336,85 +938,46 @@ export async function renderManorDocument(buffer: ArrayBuffer): Promise<ManorDoc
     footnotes: parseFootnotes(footnotesXml),
     fieldStack: [],
     trackParagraphs: true,
-    textBoxIndex: 0,
-    activeTextBoxIndex: null,
-    sectionBreakIndex: 0,
   };
   parseStyles(stylesXml, context);
   parseNumbering(numberingXml, context);
   const document = parseXml(documentXml, "document");
   const body = descendants(document, "body")[0];
   if (!body) throw new Error("The DOCX package has no document body.");
+  const { layout, section } = sectionLayout(document);
   const html = elementChildren(body).filter((child) => child.localName !== "sectPr").map((child) => renderBlock(child, context)).join("");
+  const reference = (name: "headerReference" | "footerReference", type: string) => (
+    elementChildren(section, name).find((entry) => wordAttribute(entry, "type") === type)
+  );
+  const defaultHeaderReference = reference("headerReference", "default") || firstChild(section, "headerReference");
+  const defaultFooterReference = reference("footerReference", "default") || firstChild(section, "footerReference");
   const settings = settingsXml ? parseXml(settingsXml, "settings") : undefined;
+  const differentFirstPage = wordBoolean(firstChild(section, "titlePg")) === true;
   const evenAndOddHeaders = settings ? descendants(settings, "evenAndOddHeaders")[0] : undefined;
   const differentEvenPages = wordBoolean(evenAndOddHeaders) === true;
-  const bodyChildren = elementChildren(body);
-  const sectionElements: Array<Element | undefined> = [
-    ...bodyChildren.filter((child) => child.localName === "p")
-      .map((paragraph) => firstChild(firstChild(paragraph, "pPr"), "sectPr"))
-      .filter((section): section is Element => Boolean(section)),
-    ...bodyChildren.filter((child) => child.localName === "sectPr"),
-  ];
-  if (!sectionElements.length) sectionElements.push(undefined);
-  const inheritedReferences = new Map<string, Element>();
-  const sections: ManorDocumentSectionRender[] = [];
-  let priorLayout = DEFAULT_DOCUMENT_LAYOUT;
-  for (const section of sectionElements) {
-    for (const name of ["headerReference", "footerReference"] as const) {
-      for (const entry of elementChildren(section, name)) {
-        inheritedReferences.set(`${name}:${wordAttribute(entry, "type") || "default"}`, entry);
-      }
-    }
-    const reference = (name: "headerReference" | "footerReference", type: string) => (
-      inheritedReferences.get(`${name}:${type}`)
-    );
-    const defaultHeaderReference = reference("headerReference", "default");
-    const defaultFooterReference = reference("footerReference", "default");
-    const [headerHtml, footerHtml, firstHeaderHtml, firstFooterHtml, evenHeaderHtml, evenFooterHtml] = await Promise.all([
-      renderRelatedPart(zip, defaultHeaderReference, context),
-      renderRelatedPart(zip, defaultFooterReference, context),
-      renderRelatedPart(zip, reference("headerReference", "first"), context),
-      renderRelatedPart(zip, reference("footerReference", "first"), context),
-      renderRelatedPart(zip, reference("headerReference", "even"), context),
-      renderRelatedPart(zip, reference("footerReference", "even"), context),
-    ]);
-    const layout = sectionLayout(section, priorLayout);
-    priorLayout = layout;
-    const rawBreakType = wordAttribute(firstChild(section, "type"), "val") || "nextPage";
-    const breakType = (["continuous", "nextPage", "evenPage", "oddPage"].includes(rawBreakType)
-      ? rawBreakType
-      : "nextPage") as ManorDocumentSectionRender["breakType"];
-    sections.push({
-      layout,
-      headerHtml,
-      footerHtml,
-      firstHeaderHtml,
-      firstFooterHtml,
-      evenHeaderHtml,
-      evenFooterHtml,
-      differentFirstPage: wordBoolean(firstChild(section, "titlePg")) === true,
-      differentEvenPages,
-      breakType,
-    });
-  }
-  const firstSection = sections[0];
+  const [headerHtml, footerHtml, firstHeaderHtml, firstFooterHtml, evenHeaderHtml, evenFooterHtml] = await Promise.all([
+    renderRelatedPart(zip, defaultHeaderReference, context),
+    renderRelatedPart(zip, defaultFooterReference, context),
+    renderRelatedPart(zip, reference("headerReference", "first"), context),
+    renderRelatedPart(zip, reference("footerReference", "first"), context),
+    renderRelatedPart(zip, reference("headerReference", "even"), context),
+    renderRelatedPart(zip, reference("footerReference", "even"), context),
+  ]);
   const fonts = Array.from(new Set([
     context.defaultRun["font-family"],
     ...Array.from(context.styles.values()).map((style) => style.run["font-family"]),
   ].filter((value): value is string => Boolean(value)).map((value) => value.split(",")[0].replace(/^['"]|['"]$/g, ""))));
   return {
     html,
-    headerHtml: firstSection.headerHtml,
-    footerHtml: firstSection.footerHtml,
-    firstHeaderHtml: firstSection.firstHeaderHtml,
-    firstFooterHtml: firstSection.firstFooterHtml,
-    evenHeaderHtml: firstSection.evenHeaderHtml,
-    evenFooterHtml: firstSection.evenFooterHtml,
-    differentFirstPage: firstSection.differentFirstPage,
-    differentEvenPages: firstSection.differentEvenPages,
-    layout: firstSection.layout,
-    sections,
+    headerHtml,
+    footerHtml,
+    firstHeaderHtml,
+    firstFooterHtml,
+    evenHeaderHtml,
+    evenFooterHtml,
+    differentFirstPage,
+    differentEvenPages,
+    layout,
     fonts,
   };
 }
@@ -1663,60 +1226,29 @@ function restoreSelection(root: HTMLElement, start: number | null, end: number |
   }
 }
 
-function renderedSection(render: ManorDocumentRender, sectionIndex: number): ManorDocumentSectionRender {
-  return render.sections[sectionIndex] || render.sections.at(-1) || {
-    layout: render.layout,
-    headerHtml: render.headerHtml,
-    footerHtml: render.footerHtml,
-    firstHeaderHtml: render.firstHeaderHtml,
-    firstFooterHtml: render.firstFooterHtml,
-    evenHeaderHtml: render.evenHeaderHtml,
-    evenFooterHtml: render.evenFooterHtml,
-    differentFirstPage: render.differentFirstPage,
-    differentEvenPages: render.differentEvenPages,
-    breakType: "nextPage",
-  };
-}
-
-function pageFurniture(
-  render: ManorDocumentRender,
-  pageNumber: number,
-  sectionIndex: number,
-  sectionPageNumber: number,
-): { header: string; footer: string } {
-  const section = renderedSection(render, sectionIndex);
-  if (sectionPageNumber === 1 && section.differentFirstPage) {
+function pageFurniture(render: ManorDocumentRender, pageNumber: number): { header: string; footer: string } {
+  if (pageNumber === 1 && render.differentFirstPage) {
     return {
-      header: section.firstHeaderHtml,
-      footer: section.firstFooterHtml,
+      header: render.firstHeaderHtml,
+      footer: render.firstFooterHtml,
     };
   }
-  if (pageNumber % 2 === 0 && section.differentEvenPages) {
+  if (pageNumber % 2 === 0 && render.differentEvenPages) {
     return {
-      header: section.evenHeaderHtml || section.headerHtml,
-      footer: section.evenFooterHtml || section.footerHtml,
+      header: render.evenHeaderHtml || render.headerHtml,
+      footer: render.evenFooterHtml || render.footerHtml,
     };
   }
-  return { header: section.headerHtml, footer: section.footerHtml };
+  return { header: render.headerHtml, footer: render.footerHtml };
 }
 
-function applyPageFurniture(
-  page: HTMLElement,
-  render: ManorDocumentRender,
-  pageNumber: number,
-  pageCount?: number,
-): void {
-  const sectionIndex = Number(page.dataset.docxSectionIndex || 0);
-  const sectionPageNumber = Number(page.dataset.docxSectionPage || 1);
-  const furniture = pageFurniture(render, pageNumber, sectionIndex, sectionPageNumber);
+function applyPageFurniture(page: HTMLElement, render: ManorDocumentRender, pageNumber: number, pageCount?: number): void {
+  const furniture = pageFurniture(render, pageNumber);
   page.setAttribute("aria-label", `Document page ${pageNumber}`);
   const header = page.querySelector<HTMLElement>(":scope > .manor-docx-page__header");
   const footer = page.querySelector<HTMLElement>(":scope > .manor-docx-page__footer");
   if (header) header.innerHTML = furniture.header;
   if (footer) footer.innerHTML = furniture.footer;
-  page.querySelectorAll<HTMLElement>(":scope > .manor-docx-page__header [data-docx-anchor-page-scope], :scope > .manor-docx-page__footer [data-docx-anchor-page-scope]").forEach((picture) => {
-    page.appendChild(picture);
-  });
   page.querySelectorAll<HTMLElement>('[data-docx-field="page"]').forEach((field) => {
     field.textContent = String(pageNumber);
   });
@@ -1727,36 +1259,10 @@ function applyPageFurniture(
   }
 }
 
-function createPage(
-  root: HTMLElement,
-  render: ManorDocumentRender,
-  pageNumber: number,
-  sectionIndex: number,
-  sectionPageNumber: number,
-): HTMLElement {
+function createPage(root: HTMLElement, render: ManorDocumentRender, pageNumber: number): HTMLElement {
   const page = document.createElement("article");
   page.className = "manor-docx-page";
   page.setAttribute("data-manor-docx-page", "true");
-  page.dataset.docxSectionIndex = String(sectionIndex);
-  page.dataset.docxSectionPage = String(sectionPageNumber);
-  const layout = renderedSection(render, sectionIndex).layout;
-  page.dataset.docxPageWidth = String(layout.pageWidthPx);
-  page.dataset.docxPageHeight = String(layout.pageHeightPx);
-  for (const [property, value] of Object.entries({
-    "--docx-page-width": layout.pageWidthPx,
-    "--docx-page-height": layout.pageHeightPx,
-    "--docx-margin-top": layout.marginTopPx,
-    "--docx-margin-right": layout.marginRightPx,
-    "--docx-margin-bottom": layout.marginBottomPx,
-    "--docx-margin-left": layout.marginLeftPx,
-    "--docx-header-distance": layout.headerDistancePx,
-    "--docx-footer-distance": layout.footerDistancePx,
-  })) page.style.setProperty(property, `${value}px`);
-  page.style.width = `${layout.pageWidthPx}px`;
-  page.style.maxWidth = "none";
-  page.style.height = `${layout.pageHeightPx}px`;
-  page.style.flexBasis = `${layout.pageHeightPx}px`;
-  page.style.padding = `${layout.marginTopPx}px ${layout.marginRightPx}px ${layout.marginBottomPx}px ${layout.marginLeftPx}px`;
   const header = document.createElement("header");
   header.className = "manor-docx-page__header";
   header.setAttribute("data-manor-docx-layout", "true");
@@ -1804,21 +1310,12 @@ export function paginateManorDocument(root: HTMLElement, render: ManorDocumentRe
   const start = range ? selectionOffset(root, range.startContainer, range.startOffset) : null;
   const end = range ? selectionOffset(root, range.endContainer, range.endOffset) : null;
   const blocks = directPageContent(root);
-  const widestPage = Math.max(render.layout.pageWidthPx, ...render.sections.map((section) => section.layout.pageWidthPx));
-  root.style.setProperty("--docx-page-width", `${widestPage}px`);
   root.replaceChildren();
   let pages = 0;
   let pageContent!: HTMLElement;
-  let activeSectionIndex = 0;
-  let sectionPageNumber = 0;
-  const nextPage = (sectionIndex = activeSectionIndex) => {
-    if (sectionIndex !== activeSectionIndex) {
-      activeSectionIndex = sectionIndex;
-      sectionPageNumber = 0;
-    }
+  const nextPage = () => {
     pages += 1;
-    sectionPageNumber += 1;
-    pageContent = createPage(root, render, pages, activeSectionIndex, sectionPageNumber);
+    pageContent = createPage(root, render, pages);
     return pageContent;
   };
   nextPage();
@@ -1865,7 +1362,6 @@ export function paginateManorDocument(root: HTMLElement, render: ManorDocumentRe
     }
   };
   for (const block of blocks) {
-    const sectionAfter = Number(block.getAttribute("data-docx-section-after"));
     const breakBefore = block.getAttribute("data-docx-page-break-before") === "true";
     if (breakBefore && pageContent.childElementCount > 0) {
       nextPage();
@@ -1896,37 +1392,16 @@ export function paginateManorDocument(root: HTMLElement, render: ManorDocumentRe
           fragment.tBodies[0].appendChild(row);
         }
       }
-    } else {
-      const fragmentId = `paragraph-${paragraphFragmentIndex++}`;
-      for (const fragment of splitParagraphAtPageBreaks(block, fragmentId)) {
-        placeParagraph(fragment, fragmentId);
-        if (fragment.querySelector('[data-docx-page-break="true"]')) nextPage();
-      }
+      continue;
     }
-    if (Number.isInteger(sectionAfter) && sectionAfter >= activeSectionIndex && sectionAfter + 1 < render.sections.length) {
-      const nextSectionIndex = sectionAfter + 1;
-      const breakType = renderedSection(render, nextSectionIndex).breakType;
-      if (breakType !== "continuous") {
-        const nextPageNumber = pages + 1;
-        const needsParityPage = (breakType === "oddPage" && nextPageNumber % 2 === 0)
-          || (breakType === "evenPage" && nextPageNumber % 2 === 1);
-        if (needsParityPage) {
-          const blank = nextPage().parentElement as HTMLElement;
-          blank.dataset.docxSectionBlank = "true";
-        }
-        nextPage(nextSectionIndex);
-      } else {
-        activeSectionIndex = nextSectionIndex;
-        sectionPageNumber = 0;
-      }
+    const fragmentId = `paragraph-${paragraphFragmentIndex++}`;
+    for (const fragment of splitParagraphAtPageBreaks(block, fragmentId)) {
+      placeParagraph(fragment, fragmentId);
+      if (fragment.querySelector('[data-docx-page-break="true"]')) nextPage();
     }
   }
   Array.from(root.querySelectorAll<HTMLElement>(":scope > [data-manor-docx-page]")).forEach((page) => {
-    if (
-      root.childElementCount > 1
-      && page.dataset.docxSectionBlank !== "true"
-      && page.querySelector(".manor-docx-page__content")?.childElementCount === 0
-    ) page.remove();
+    if (root.childElementCount > 1 && page.querySelector(".manor-docx-page__content")?.childElementCount === 0) page.remove();
   });
   const renderedPages = Array.from(root.querySelectorAll<HTMLElement>(":scope > [data-manor-docx-page]"));
   renderedPages.forEach((page, index) => applyPageFurniture(page, render, index + 1, renderedPages.length));

@@ -80,20 +80,6 @@ def test_ruff_is_advisory_until_the_existing_baseline_is_clean() -> None:
     assert "::warning::" in ruff_steps["Ruff format check"]
 
 
-def test_frontend_checks_share_one_install_for_build_and_source_smoke() -> None:
-    jobs = load_ci()["jobs"]
-    frontend_job = jobs["typecheck-frontend"]
-    assert "web-source-smoke" not in jobs
-    steps = [step for step in frontend_job["steps"] if isinstance(step, dict)]
-    step_names = [step.get("name", "") for step in steps]
-    assert "Build" in step_names
-    assert "Run source smoke tests" in step_names
-    focus_step = next(
-        step for step in steps if step.get("name") == "Run File comment focus browser smoke"
-    )
-    assert focus_step["run"] == "npm run test:file-comment-focus-browser"
-    assert focus_step["env"]["PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH"] == "/usr/bin/google-chrome"
-    assert sum(step.get("run") == "npm ci" for step in frontend_job["steps"] if isinstance(step, dict)) == 1
 
 
 def test_python_smoke_tests_are_the_required_first_phase_python_gate() -> None:
@@ -141,10 +127,6 @@ def test_python_regression_suite_runs_only_for_main_or_manual_opt_in() -> None:
 
 
 
-def test_web_package_exposes_source_smoke_entrypoint() -> None:
-    package = json.loads(WEB_PACKAGE.read_text())
-
-    assert package["scripts"]["test:source"] == "node --test scripts/*.test.mjs"
 
 
 def test_release_workflow_only_creates_github_release_for_tags() -> None:

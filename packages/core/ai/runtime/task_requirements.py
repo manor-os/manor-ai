@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from copy import deepcopy
 from typing import Any
 
 from packages.core.ai.runtime.capabilities import (
@@ -32,54 +31,6 @@ STRATEGIST_TASK_CAPABILITY_IDS = (
     "manor.composite",
     "external.social",
 )
-
-
-def apply_workspace_service_task_requirements(task: Any, workspace: Any) -> bool:
-    """Copy an installed Workspace service's execution contract onto a Task.
-
-    Only the Workspace's persisted operating-model snapshot is authoritative.
-    A Blueprint slug in settings must never make an older installation inherit
-    requirements that were added to the Marketplace definition later.
-    """
-
-    operating_model = getattr(workspace, "operating_model", None)
-    if not isinstance(operating_model, dict):
-        return False
-    owner_service_key = str(getattr(task, "owner_service_key", "") or "").strip()
-    if not owner_service_key:
-        return False
-    service = next((
-        item
-        for item in (operating_model.get("services") or [])
-        if isinstance(item, dict)
-        and str(item.get("key") or "").strip() == owner_service_key
-    ), None)
-    if service is None:
-        return False
-
-    changed = False
-    required_skills = [
-        str(value).strip()
-        for value in (service.get("required_skills") or [])
-        if str(value or "").strip()
-    ]
-    if required_skills:
-        merged_skills = list(dict.fromkeys([
-            *list(getattr(task, "required_skills", None) or []),
-            *required_skills,
-        ]))
-        if merged_skills != list(getattr(task, "required_skills", None) or []):
-            task.required_skills = merged_skills
-            changed = True
-
-    completion_requirements = service.get("completion_requirements")
-    if isinstance(completion_requirements, dict) and completion_requirements:
-        details = dict(getattr(task, "details", None) or {})
-        if details.get("completion_requirements") != completion_requirements:
-            details["completion_requirements"] = deepcopy(completion_requirements)
-            task.details = details
-            changed = True
-    return changed
 
 
 def _as_clean_capability_ids(values: Any) -> tuple[str, ...]:

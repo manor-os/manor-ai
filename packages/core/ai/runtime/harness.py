@@ -553,7 +553,6 @@ async def runtime_execute_subagent_loop(
     terminal_tool_result_policy: dict[str, Any] | None = None,
     on_tool_start: Callable[[str, dict[str, Any]], Any] | None = None,
     on_tool_end: Callable[..., Any] | None = None,
-    forced_tool_calls: list[dict[str, Any]] | None = None,
 ) -> RuntimeSubAgentLoopResult:
     """Run a bounded subagent loop through the Runtime Harness adapters."""
 
@@ -583,7 +582,6 @@ async def runtime_execute_subagent_loop(
         billing_source=billing_source,
         dynamic_tool_handlers=dynamic_tool_handlers,
         terminal_tool_result_policy=terminal_tool_result_policy,
-        forced_tool_calls=forced_tool_calls,
         on_tool_start=on_tool_start,
         on_tool_end=on_tool_end,
     )

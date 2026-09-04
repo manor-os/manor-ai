@@ -3315,49 +3315,15 @@ def bind_llm_call_history(history: Optional[List[Dict[str, Any]]]):
 # HTTP retry logic
 # ---------------------------------------------------------------------------
 
-_SSE_HEARTBEAT_EVENT_TYPES = frozenset(
-    {"heartbeat", "keep_alive", "keep-alive", "keepalive", "ping"}
-)
-
-
-def _sse_data_line_is_heartbeat(line: str) -> bool:
-    """Return true for provider heartbeats encoded as SSE data payloads."""
-
-    stripped = str(line or "").strip()
-    if not stripped.startswith("data:"):
-        return False
-    payload = stripped[5:].strip()
-    if payload.lower() in _SSE_HEARTBEAT_EVENT_TYPES:
-        return True
-    try:
-        decoded = json.loads(payload)
-    except (TypeError, ValueError, json.JSONDecodeError):
-        return False
-    if not isinstance(decoded, dict):
-        return False
-    event_type = str(decoded.get("type") or decoded.get("event") or "").strip().lower()
-    return event_type in _SSE_HEARTBEAT_EVENT_TYPES
-
-
 async def _iter_stream_lines_with_idle_timeout(response: httpx.Response):
-    """Yield meaningful SSE data lines and time out when only heartbeats arrive.
-
-    Providers and gateways commonly keep an otherwise stalled stream alive with
-    blank lines or ``: keep-alive`` comments.  Those transport heartbeats are
-    not model progress and must not reset the user-facing idle timeout.
-    """
+    """Yield streaming lines, aborting when the provider accepts stream mode but stalls."""
 
     timeout = get_llm_stream_idle_timeout()
     iterator = response.aiter_lines().__aiter__()
-    loop = asyncio.get_running_loop()
-    deadline = loop.time() + timeout if timeout > 0 else None
     while True:
         try:
-            if deadline is not None:
-                remaining = deadline - loop.time()
-                if remaining <= 0:
-                    raise asyncio.TimeoutError
-                line = await asyncio.wait_for(iterator.__anext__(), timeout=remaining)
+            if timeout > 0:
+                line = await asyncio.wait_for(iterator.__anext__(), timeout=timeout)
             else:
                 line = await iterator.__anext__()
         except StopAsyncIteration:
@@ -3366,16 +3332,7 @@ async def _iter_stream_lines_with_idle_timeout(response: httpx.Response):
             raise TimeoutError(
                 f"LLM streaming response stalled for {timeout:.0f}s without a chunk"
             ) from exc
-        stripped = (line or "").strip()
-        if (
-            not stripped.startswith("data:")
-            or not stripped[5:].strip()
-            or _sse_data_line_is_heartbeat(stripped)
-        ):
-            continue
         yield line
-        if timeout > 0:
-            deadline = loop.time() + timeout
 
 async def _post_with_retry(url: str, headers: Dict[str, str], payload: Dict[str, Any]) -> httpx.Response:
     """

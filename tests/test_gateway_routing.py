@@ -22,24 +22,6 @@ def _nginx_location_blocks(nginx_conf: str) -> list[str]:
     return re.findall(r"(?ms)^    (location [^{\n]+ \{\n.*?^    \})", nginx_conf)
 
 
-def test_caddy_routes_streams_to_manor_chat_before_generic_api():
-    caddyfile = (ROOT / "caddy" / "Caddyfile").read_text()
-
-    assert "reverse_proxy manor-chat:8000" in caddyfile
-    assert "reverse_proxy manor-api:8000" in caddyfile
-    assert caddyfile.index("reverse_proxy manor-chat:8000") < caddyfile.index("handle /api/*")
-
-
-def test_caddy_restores_cloudflare_client_identity_before_proxying():
-    caddyfile = (ROOT / "caddy" / "Caddyfile").read_text()
-    cloud_compose = (ROOT / "docker-compose.cloud.yml").read_text()
-
-    assert "trusted_proxies static {$CLOUDFLARE_PROXY_REAL_IP_CIDRS}" in caddyfile
-    assert "trusted_proxies_strict" in caddyfile
-    assert "client_ip_headers CF-Connecting-IP" in caddyfile
-    assert "CLOUDFLARE_PROXY_REAL_IP_CIDRS:" in cloud_compose
-    assert "173.245.48.0/20" in cloud_compose
-    assert "2c0f:f248::/32" in cloud_compose
 
 
 def test_nginx_routes_streams_to_manor_chat_before_generic_api():
@@ -106,24 +88,6 @@ def test_nginx_custom_static_locations_preserve_app_security_headers():
         assert APP_SECURITY_HEADERS_INCLUDE in block, location
 
 
-def test_gateway_configs_cover_shared_chat_stream_route_contract():
-    caddyfile = (ROOT / "caddy" / "Caddyfile").read_text()
-    nginx_conf = (ROOT / "docker" / "nginx.conf").read_text()
-    ingresses = [
-        doc
-        for doc in yaml.safe_load_all((ROOT / "deploy" / "k8s" / "base" / "ingress.yaml").read_text())
-        if doc
-    ]
-    k8s_ingress = next(doc for doc in ingresses if doc["metadata"]["name"] == "manor-chat-streams")
-    ingress_paths = [
-        path["path"]
-        for path in k8s_ingress["spec"]["rules"][0]["http"]["paths"]
-    ]
-
-    for path in CHAT_STREAM_ROUTE_EXAMPLES:
-        assert _caddy_stream_matcher_covers(caddyfile, path)
-        assert _nginx_stream_location_covers(nginx_conf, path)
-        assert _k8s_stream_ingress_covers(ingress_paths, path)
 
 
 def test_runtime_reconnect_events_are_part_of_chat_stream_route_contract():

@@ -283,14 +283,6 @@ export default function WorkspaceDraftConfigurationPanel({
   });
 
   const draft = controlledDraft || query.data;
-  const measurementLibrary = useQuery({
-    queryKey: ["workspace-stat-library"],
-    queryFn: () => api.workspaces.stats.library(),
-    enabled: Boolean(draft && (
-      asList(draft.fields.goals).some((goal) => goal.measurement?.library_key)
-      || asList(draft.fields.stats).some((stat) => stat.library_key)
-    )),
-  });
   const channelRequirements = asList<BlueprintInstallPreflightRequirement>(
     draft?.fields._blueprint_channel_requirements,
   ).filter((requirement) => (requirement.resource_options ?? []).length > 0);
@@ -435,29 +427,10 @@ export default function WorkspaceDraftConfigurationPanel({
           ],
         );
       }),
-      goalDetails: goals.map((item, index) => {
-        const configured = item.measurement || asList(fields.stats).find(
-          (stat) => (stat.key || stat.library_key) === item.stat_key,
-        );
-        const entry = measurementLibrary.data?.items.find((candidate) => candidate.key === configured?.library_key);
-        const measurement = configured ? { ...entry, window: entry?.default_window, ...configured } : null;
-        const automatic = Boolean(measurement?.library_key
-          || (measurement?.collector_type && measurement.collector_type !== "manual"));
-        return detailItem(
-          labelFor(item, `Goal ${index + 1}`),
-          [item.target ?? item.target_value, humanize(item.cadence || item.measurement_cadence || measurement?.collection_cadence || entry?.default_cadence)],
-          [
-            { label: t("page.workspace_stats.measurement"), value: measurement?.name || humanize(measurement?.key || measurement?.library_key || item.metric_key) },
-            { label: t("page.workspace_draft_chat.measurement.definition"), value: measurement?.description },
-            { label: t("page.workspace_draft_chat.measurement.source"), value: measurement?.source || measurement?.collector_config?.source || measurement?.library_key },
-            { label: t("page.workspace_draft_chat.measurement.unit"), value: measurement?.unit },
-            { label: t("page.workspace_draft_chat.measurement.window"), value: humanize(measurement?.window) },
-            { label: t("page.workspace_draft_chat.measurement.collection"), value: !measurement
-              ? t("page.workspace_draft_chat.measurement.missing")
-              : t(automatic ? "page.workspace_draft_chat.measurement.automatic" : "page.workspace_draft_chat.measurement.manual") },
-          ],
-        );
-      }),
+      goalDetails: goals.map((item, index) => detailItem(
+        labelFor(item, `Goal ${index + 1}`),
+        [item.target, humanize(item.cadence), humanize(item.metric || item.metric_key)],
+      )),
       staffDetails: staff.map((item, index) => detailItem(
         item.staff_name || item.name || item.staff_id || `Member ${index + 1}`,
         [item.role, humanize(item.service_key), item.rationale],
@@ -549,7 +522,7 @@ export default function WorkspaceDraftConfigurationPanel({
       notes: String(fields.notes || "").trim(),
       percent: completeness(draft),
     };
-  }, [draft, measurementLibrary.data]);
+  }, [draft]);
 
   if (!draft || !view) {
     return (
@@ -657,18 +630,18 @@ export default function WorkspaceDraftConfigurationPanel({
           </section>
           <section className="workspace-draft-runtime">
             <div className="workspace-draft-runtime__copy">
-              <span>{t("page.workspace_draft_chat.runtime_mode")}</span>
+              <span>{t("page.workspace_detail.workspace_runtime")}</span>
               <strong>
                 {view.autonomousEnabled
-                  ? t("page.workspace_draft_chat.runtime_automatic")
-                  : t("page.workspace_draft_chat.runtime_manual")}
+                  ? t("page.workspace_detail.workspace_runtime_enabled")
+                  : t("page.workspace_detail.workspace_runtime_disabled")}
               </strong>
-              <small>{t("page.workspace_draft_chat.runtime_mode_desc")}</small>
+              <small>{t("page.workspace_detail.workspace_runtime_desc")}</small>
             </div>
             <Toggle
               checked={view.autonomousEnabled}
               disabled={!editable || busy}
-              aria-label={t("page.workspace_draft_chat.runtime_mode")}
+              aria-label={t("page.workspace_detail.workspace_runtime")}
               onChange={() => autonomyMutation.mutate(!view.autonomousEnabled)}
             />
           </section>

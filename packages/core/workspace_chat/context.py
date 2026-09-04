@@ -234,7 +234,7 @@ async def _build_summary(db: AsyncSession, workspace_id: str, entity_id: str) ->
                 f"  - service_key={service_key} agent=\"{agent_name}\" subscription_id={sub.id}"
             )
         if len(subs) > len(service_lines):
-            service_lines.append("  - use manor Workspace search with category='agents' for the full list")
+            service_lines.append("  - use workspace_search(category='agents') for the full list")
         parts.append(f"Agents/services ({len(subs)}):\n" + "\n".join(service_lines))
     else:
         parts.append("Agents: none assigned")
@@ -326,9 +326,9 @@ async def _build_summary(db: AsyncSession, workspace_id: str, entity_id: str) ->
         logger.debug("Workspace governance summary failed", exc_info=True)
 
     parts.append(
-        "\nUse manor(action='workspace') with its search action to look up goals, tasks, agents, "
-        "knowledge, artifacts/files, plans, rules, runtime evidence, or learning candidates. "
-        "Use the same gateway for persistent workspace changes such as tasks, rules, or knowledge bindings."
+        "\nUse workspace_search to look up goals, tasks, agents, knowledge, artifacts/files, plans, rules, "
+        "runtime evidence, or learning candidates. Use workspace_agent for persistent workspace changes "
+        "such as tasks, rules, or knowledge bindings."
     )
 
     return "\n".join(parts)

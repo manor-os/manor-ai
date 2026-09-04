@@ -213,13 +213,6 @@ celery_app.conf.beat_schedule = {
         "task": "integrations.health_tick",
         "schedule": crontab(hour=4, minute=15),  # once daily at 04:15 UTC
     },
-    "refresh-plans-cache": {
-        # Every 5 min — keeps each worker's in-process PLANS cache fresh
-        # so admin-side edits propagate across processes within 5 min
-        # without needing pub/sub. Cheap (single SELECT).
-        "task": "billing.refresh_plans_cache",
-        "schedule": 300.0,
-    },
     "sync-openrouter-pricing": {
         # Keep runtime pricing aligned with OpenRouter changes.
         # Override cadence with OPENROUTER_PRICING_SYNC_SECONDS.
@@ -326,12 +319,6 @@ celery_app.conf.beat_schedule = {
         # uploads/chat. Knowledge files and generated artifacts are excluded.
         "task": "maintenance.cleanup_chat_uploads",
         "schedule": crontab(hour=3, minute=5),
-    },
-    "maintenance-cleanup-document-upload-recovery": {
-        # Daily 03:15 UTC - removes expired browser-upload recovery markers
-        # and only the source bytes that still have no Document projection.
-        "task": "maintenance.cleanup_document_upload_recovery",
-        "schedule": crontab(hour=3, minute=15),
     },
     "maintenance-repair-missing-document-files": {
         # Periodic DB <-> filesystem consistency scan. Missing generated media

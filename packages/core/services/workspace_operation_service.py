@@ -1951,9 +1951,6 @@ async def _sync_channels_from_operation_state(
                 created_configs += 1
                 created_config_ids.add(config_row.id)
 
-        previous_channel_type = str(
-            getattr(config_row, "channel_type", "") or ""
-        )
         config_payload = _as_dict(getattr(config_row, "config", None))
         config_payload.update(_as_dict(block.get("config")))
         public_token = str(block.get("public_token") or config_payload.get("public_token") or "").strip()
@@ -2002,9 +1999,6 @@ async def _sync_channels_from_operation_state(
                 agent_ids=(resolved_agent_id,),
             )
         if binding:
-            target_subscription_id = (
-                sub.id if sub else block.get("agent_subscription_id")
-            )
             before_binding = (
                 binding.agent_id,
                 binding.agent_subscription_id,
@@ -2012,30 +2006,8 @@ async def _sync_channels_from_operation_state(
                 binding.name,
                 binding.status,
             )
-            if (
-                previous_channel_type == "twilio_voice"
-                and (
-                    binding.agent_id != resolved_agent_id
-                    or binding.agent_subscription_id != target_subscription_id
-                    or binding.workspace_id != workspace.id
-                    or binding.type != channel_type
-                    or binding.status != "active"
-                )
-            ):
-                from packages.core.services.voice.call_sessions import (
-                    cancel_unconnected_call_sessions_for_binding,
-                )
-
-                await cancel_unconnected_call_sessions_for_binding(
-                    db,
-                    channel_config_id=config_row.id,
-                    channel_binding_id=binding.id,
-                    reason=(
-                        "Twilio Voice Agent binding changed before the call connected."
-                    ),
-                )
             binding.agent_id = resolved_agent_id
-            binding.agent_subscription_id = target_subscription_id
+            binding.agent_subscription_id = sub.id if sub else block.get("agent_subscription_id")
             binding.name = block.get("name") or binding.name or config_row.name or channel_type
             binding.type = channel_type
             binding.config = _json_safe(binding_config)

@@ -15,9 +15,7 @@ from packages.core.ai.runtime.output_policy import (
 from packages.core.ai.runtime.provider_approvals import (
     normalize_provider_approval,
     normalize_provider_approval_resolution,
-    provider_tool_result_for_persistence,
 )
-from packages.core.services.sensitive_data import sanitize_approval_credentials
 from packages.core.constants.hitl_envelope import parse_hitl_envelope
 
 
@@ -135,10 +133,7 @@ class RuntimeToolStreamSink:
             # persist nested HITL payloads.  Keep it off the SSE payload so
             # large or sensitive provider responses are never exposed to the
             # browser merely to support durable server-side bookkeeping.
-            recorded_tool_call["raw_result"] = provider_tool_result_for_persistence(
-                tool_name,
-                result,
-            )
+            recorded_tool_call["raw_result"] = result
             provider_approval = normalize_provider_approval(
                 tool_name,
                 args,
@@ -589,21 +584,6 @@ def runtime_tool_result_for_chat(tool_name: str, result: str) -> str:
     """Return a UI-safe tool result without breaking media preview JSON."""
 
     result = result if isinstance(result, str) else str(result)
-    provider_resolution = normalize_provider_approval_resolution(
-        tool_name,
-        None,
-        result,
-    )
-    if provider_resolution is not None:
-        return json.dumps(
-            {
-                "ok": True,
-                "status": "approved",
-                **provider_resolution,
-            },
-            ensure_ascii=False,
-        )
-    result = str(sanitize_approval_credentials(result))
     public_result = runtime_public_tool_result(result)
     if public_result != result:
         return str(public_result)
@@ -630,8 +610,6 @@ def _short_arg_value(value, *, max_chars: int = 240):
         return {
             str(key): _short_arg_value(item, max_chars=max_chars)
             for key, item in value.items()
-            if str(key).strip().lower().replace("-", "_")
-            not in {"approval_token", "approvaltoken"}
             if str(key) not in {"prompt", "content", "input", "instructions", "messages"}
         }
     return str(value)[:max_chars]
@@ -672,62 +650,31 @@ def runtime_tool_arguments_for_chat(tool_name: str, args: dict | None) -> dict |
         skill = args.get("skill") or args.get("skill_id")
         return {"skill": skill} if skill else None
 
-    from packages.core.ai.runtime.composite_tools import (
-        RuntimeCompositeToolCallFactory,
-    )
-
-    canonical_call = RuntimeCompositeToolCallFactory.create(name, args)
-    canonical_args = canonical_call.arguments
-    if canonical_call.tool_name == "workspace_agent":
-        workspace_action = str(canonical_args.get("action") or "").strip()
-        params = (
-            canonical_args.get("params")
-            if isinstance(canonical_args.get("params"), dict)
-            else {}
-        )
+    if name == "workspace_agent" and args.get("action") == "delegate_service":
+        params = args.get("params") if isinstance(args.get("params"), dict) else {}
         compact_params = {
             key: _short_arg_value(params[key], max_chars=160)
             for key in (
-                "query",
-                "category",
-                "status",
-                "name",
-                "title",
-                "task_id",
-                "goal_id",
-                "document_id",
-                "document_ids",
-                "folder_id",
-                "folder_name",
-                "folder_path",
-                "path",
-                "contract_id",
                 "service_key",
                 "agent_subscription_id",
                 "agent_id",
                 "max_rounds",
-                "request_id",
-                "hitl_id",
-                "blocker_id",
             )
             if params.get(key) is not None
         }
-        if workspace_action == "delegate_service":
-            objective = (
-                params.get("prompt")
-                or params.get("instructions")
-                or params.get("task")
-                or params.get("message")
-                or params.get("request")
-            )
-            if objective:
-                compact_params["objective"] = _short_arg_value(objective, max_chars=240)
-        workspace_args: dict[str, Any] = {"action": workspace_action}
-        if compact_params:
-            workspace_args["params"] = compact_params
-        if name == "manor":
-            return {"action": "workspace", "params": workspace_args}
-        return workspace_args
+        objective = (
+            params.get("prompt")
+            or params.get("instructions")
+            or params.get("task")
+            or params.get("message")
+            or params.get("request")
+        )
+        if objective:
+            compact_params["objective"] = _short_arg_value(objective, max_chars=240)
+        return {
+            "action": "delegate_service",
+            "params": compact_params,
+        }
 
     if name == "manor":
         params = args.get("params") if isinstance(args.get("params"), dict) else {}
@@ -744,19 +691,11 @@ def runtime_tool_arguments_for_chat(tool_name: str, args: dict | None) -> dict |
             compact["params"] = compact_params
         return {key: value for key, value in compact.items() if value} or None
 
-    redacted_keys = {
-        "prompt",
-        "content",
-        "input",
-        "instructions",
-        "messages",
-        "approval_token",
-        "approvaltoken",
-    }
+    redacted_keys = {"prompt", "content", "input", "instructions", "messages"}
     compact = {
         str(key): _short_arg_value(value)
         for key, value in args.items()
-        if str(key).strip().lower().replace("-", "_") not in redacted_keys
+        if str(key) not in redacted_keys
     }
     return compact or None
 
@@ -802,48 +741,6 @@ def runtime_tool_error_result(message: str) -> str:
     """Encode a handler failure in the tool-result error contract."""
 
     return f"{RUNTIME_TOOL_ERROR_PREFIX}{message}"
-
-
-def runtime_tool_alternate_path_error_result(result: Any) -> str:
-    """Tag a proven pre-I/O failure without discarding structured evidence."""
-
-    payload = result if isinstance(result, dict) else None
-    if payload is None and isinstance(result, str):
-        try:
-            parsed = json.loads(result)
-        except (TypeError, ValueError):
-            parsed = None
-        if isinstance(parsed, dict):
-            payload = parsed
-    if payload is not None:
-        return json.dumps(
-            {**payload, "retry_policy": "read_only_alternate_path"},
-            ensure_ascii=False,
-            default=str,
-        )
-    return json.dumps(
-        {
-            "status": "error",
-            "error": str(result),
-            "retry_policy": "read_only_alternate_path",
-        },
-        ensure_ascii=False,
-    )
-
-
-def runtime_tool_allows_alternate_path(result: str) -> bool:
-    """Return whether a tool failure is proven safe for alternate-path work."""
-
-    text = result if isinstance(result, str) else str(result)
-    try:
-        parsed = json.loads(text)
-    except Exception:
-        return False
-    return (
-        isinstance(parsed, dict)
-        and parsed.get("retry_policy") == "read_only_alternate_path"
-        and runtime_tool_status_for_chat(text) == "error"
-    )
 
 
 def runtime_tool_status_for_chat(result: str) -> str:

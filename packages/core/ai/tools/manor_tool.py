@@ -90,9 +90,6 @@ from packages.core.ai.runtime.goal_actions import (
 from packages.core.ai.runtime.notification_actions import (
     runtime_notify_members_action,
 )
-from packages.core.ai.runtime.workspace_composite_actions import (
-    runtime_workspace_composite_action,
-)
 from packages.core.ai.runtime.tool_context import (
     RUNTIME_TOOL_CONTEXT_KEYS,
     runtime_injected_tool_context_args,
@@ -113,13 +110,7 @@ _TASK_STATUS_PARAM_GUIDANCE = (
 
 _ACTIONS: dict[str, list[tuple[str, str]]] = {
     "Tasks": [
-        (
-            "list_tasks",
-            "List Tasks with all filters in one params object. Plural values such as "
-            "statuses/priorities/assignee_ids are ORed; different filters and inclusive "
-            "*_after/*_before or priority_min/priority_max ranges are ANDed. Do not call "
-            f"once per status or priority. {_TASK_STATUS_PARAM_GUIDANCE}",
-        ),
+        ("list_tasks", f"List tasks with status/priority/assignee filters. {_TASK_STATUS_PARAM_GUIDANCE}"),
         ("get_task_details", "Get full details of a task by ID"),
         ("create_task", "Create a new task; optional assignee_id/staff_id/assignee_name/assignee_email/agent_id assigns it immediately"),
         ("update_task", f"General task update: title, description, status, priority, category, deadline, details, assignment, and other supported task fields. {_TASK_STATUS_PARAM_GUIDANCE}"),
@@ -192,12 +183,6 @@ _ACTIONS: dict[str, list[tuple[str, str]]] = {
         ("list_token_usage", "Token usage log"),
     ],
     "Workspace": [
-        (
-            "workspace",
-            "Workspace runtime gateway. Pass params.action plus optional "
-            "params.params for search, tasks, knowledge, rules, operations, "
-            "HITL/blocker resolution, service delegation, goals, and Ledger views.",
-        ),
         ("list_workspaces", "List all workspaces in the entity"),
         ("get_workspace", "Get workspace details including operating model"),
         ("get_workspace_daily_summary", "Deterministic workspace daily summary data: previous-day outcomes, current health, human handoff items, and today's focus"),
@@ -352,27 +337,6 @@ async def _dispatch_action(
         conversation_id=conversation_id,
         task_id=task_id,
     )
-
-    if action == "workspace":
-        workspace_action = str(params.get("action") or "").strip()
-        raw_workspace_params = params.get("params")
-        if isinstance(raw_workspace_params, dict):
-            workspace_params = dict(raw_workspace_params)
-        else:
-            workspace_params = {
-                key: value
-                for key, value in params.items()
-                if key not in {"action", "params", "workspace_id"}
-            }
-        return await runtime_workspace_composite_action(
-            entity_id=entity_id,
-            user_id=user_id or "",
-            workspace_id=workspace_id or "",
-            conversation_id=conversation_id or "",
-            action=workspace_action,
-            params=workspace_params,
-            runtime_tool_kwargs=runtime_tool_kwargs,
-        )
 
     try:
         async with async_session() as db:
@@ -1080,6 +1044,36 @@ def _registered_tool_schemas() -> tuple[tuple[str, dict], ...]:
     return runtime_registered_tool_schemas()
 
 
+async def _bridge_search_enabled(
+    *,
+    entity_id: str,
+    user_id: str,
+) -> bool:
+    """Gate the bridge lookup on the ``tool_discovery_v2`` flag.
+
+    The availability resolution below (resolve_usable_mcp_providers) makes
+    one sequential can_use_integration call per provider (~40+ providers),
+    which search_tools only pays when tool_discovery_v2 is on — mirror that
+    here so flag-off tenants don't pay it on every manor search or
+    unimplemented-action call. Same is_enabled pattern as the search_tools
+    handler: fallback=False, any failure degrades to no bridge.
+    """
+    try:
+        from packages.core.database import async_session
+        from packages.core.services.feature_flags import is_enabled
+
+        async with async_session() as db:
+            return await is_enabled(
+                db,
+                "tool_discovery_v2",
+                entity_id=entity_id,
+                user_id=user_id,
+                fallback=False,
+            )
+    except Exception:
+        return False
+
+
 async def _usable_mcp_providers(
     *,
     entity_id: str,
@@ -1116,12 +1110,19 @@ async def _bridge_mcp_tool_matches(
 
     Returns name + description manifests only (the model loads full schemas
     via search_tools). The availability gate always applies: without an
-    acting user there is no gate to evaluate, so nothing is returned. Tool
-    Discovery v2 is the graduated default. Provider account availability is
-    resolved from one actor-scoped registry snapshot rather than concurrent
-    calls on a shared AsyncSession.
+    acting user there is no gate to evaluate, so nothing is returned. The
+    whole lookup is additionally gated on tool_discovery_v2 (see
+    _bridge_search_enabled) purely for cost; the stub hiding and improved
+    not-implemented wording stay unconditional.
+
+    Phase-2 (not done here): parallelize resolve_usable_mcp_providers'
+    per-provider checks. It cannot be a naive asyncio.gather on the shared
+    session — AsyncSession is not concurrency-safe — so it needs either
+    per-task sessions or a batched query in the permission service.
     """
     if not query or not entity_id or not user_id:
+        return []
+    if not await _bridge_search_enabled(entity_id=entity_id, user_id=user_id):
         return []
     try:
         from packages.core.ai.runtime.tool_discovery import (
@@ -1225,8 +1226,6 @@ MANOR_SCHEMA = {
         "name": "manor",
         "description": (
             "Execute Manor platform actions; use action='search' when unsure. "
-            "In Workspace chat, use action='workspace' with nested params.action "
-            "for Workspace runtime operations. "
             "list_documents/search_documents identify visible files by metadata "
             "only; use rag for document-body evidence. Use generate_file for "
             "artifacts and create_scheduled_job for delayed or recurring work."

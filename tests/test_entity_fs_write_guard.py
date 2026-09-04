@@ -26,7 +26,6 @@ from packages.core.services.entity_fs import (
     mark_entity_editor_write_intent_committed,
     mark_entity_editor_write_intent_digest_committed,
     resolve_path,
-    unlink_entity_file_entry,
     write_entity_file_atomic,
 )
 
@@ -58,26 +57,6 @@ def test_write_entity_file_atomic_persists_verified_bytes(fs_settings):
 
     assert path.endswith(os.path.join("entity_1", "videos", "out.mp4"))
     assert open(path, "rb").read() == b"video-bytes"
-
-
-def test_unlink_entity_file_entry_removes_final_symlink_not_destination(fs_settings, tmp_path):
-    entity_root = tmp_path / "entity_1"
-    source_dir = entity_root / "uploads"
-    source_dir.mkdir(parents=True)
-    outside = tmp_path / "outside.txt"
-    outside.write_bytes(b"must survive")
-    link = source_dir / "stale-upload.txt"
-    link.symlink_to(outside)
-
-    removed = unlink_entity_file_entry(
-        "entity_1",
-        "uploads/stale-upload.txt",
-        allow_symlink=True,
-    )
-
-    assert removed is True
-    assert not link.exists()
-    assert outside.read_bytes() == b"must survive"
 
 
 def test_editor_write_fence_allows_only_identical_same_sequence_retries(tmp_path):
@@ -857,12 +836,11 @@ def test_document_creation_keeps_bytes_and_acl_inside_entity_boundary():
         assert "_rollback_database_best_effort" in source
         assert "_remove_or_quarantine_document_file" in source
 
-    assert "_commit_document_upload_with_reconciliation" in inspect.getsource(
+    for handler in (
         documents.upload_document,
-    )
-    assert "_commit_document_and_dispatch_embeddings" in inspect.getsource(
         documents.upload_from_google_drive,
-    )
+    ):
+        assert "_commit_document_and_dispatch_embeddings" in inspect.getsource(handler)
 
     for handler in (
         documents.create_blank_document,
@@ -2432,49 +2410,6 @@ def test_resolve_path_rejects_entity_root_prefix_escape(fs_settings):
     assert resolve_path("entity_1", "../entity_10/leak.txt") is None
 
 
-def test_write_entity_file_atomic_requires_mount_in_cloud(fs_settings):
-    fs_settings.DEPLOYMENT_MODE = "cloud"
-
-    with pytest.raises(EntityFilesystemError, match="not mounted"):
-        write_entity_file_atomic("entity_1", "videos/out.mp4", b"abc")
-
-
-def test_write_entity_file_atomic_requires_marker_in_cloud(fs_settings, monkeypatch):
-    fs_settings.DEPLOYMENT_MODE = "cloud"
-    monkeypatch.setattr(
-        "packages.core.services.entity_fs.os.path.ismount",
-        lambda path: True,
-    )
-
-    with pytest.raises(EntityFilesystemError, match="marker is missing"):
-        write_entity_file_atomic("entity_1", "videos/out.mp4", b"abc")
-
-
-@pytest.mark.asyncio
-async def test_runtime_generate_document_file_requires_persistent_mount_in_cloud(fs_settings, monkeypatch):
-    fs_settings.DEPLOYMENT_MODE = "cloud"
-
-    async def allow_file_mutation(**_kwargs):
-        return None
-
-    monkeypatch.setattr(
-        "packages.core.ai.runtime.file_actions.runtime_guard_file_mutation",
-        allow_file_mutation,
-    )
-
-    result = await runtime_generate_document_file(
-        entity_id="entity_1",
-        user_id="user_1",
-        conversation_id="conversation_1",
-        name="report.md",
-        content="# Report\n",
-        file_type="md",
-    )
-
-    assert "Entity filesystem is not available" in result
-    assert not os.path.exists(os.path.join(fs_settings.MANOR_FS_ROOT, "entity_1", "report.md"))
-
-
 @pytest.mark.asyncio
 async def test_runtime_generate_document_file_restores_prior_bytes_when_sync_fails(
     fs_settings,
@@ -2512,7 +2447,6 @@ async def test_runtime_generate_document_file_restores_prior_bytes_when_sync_fai
         name="report.md",
         content="# New report\n",
         file_type="md",
-        expected_sha256=hashlib.sha256(b"old report").hexdigest(),
     ))
 
     assert "rolled back" in result["error"]
@@ -2663,7 +2597,6 @@ async def test_runtime_generate_document_file_rolls_back_when_response_metadata_
         name="report.md",
         content="# New report\n",
         file_type="md",
-        expected_sha256=hashlib.sha256(b"old report").hexdigest(),
     ))
 
     assert result["error"] == "Document was not committed: metadata extraction failed"
@@ -2671,32 +2604,6 @@ async def test_runtime_generate_document_file_rolls_back_when_response_metadata_
     assert fake_db.rollbacks == 1
     with open(target, "rb") as file:
         assert file.read() == b"old report"
-
-
-@pytest.mark.asyncio
-async def test_generate_file_requires_persistent_mount_in_cloud(fs_settings, monkeypatch):
-    import packages.core.ai.tools.file_tools as file_tools
-
-    fs_settings.DEPLOYMENT_MODE = "cloud"
-
-    async def allow_file_mutation(**_kwargs):
-        return None
-
-    monkeypatch.setattr(file_tools, "runtime_guard_file_mutation", allow_file_mutation)
-    monkeypatch.setattr("packages.core.ai.runtime.file_actions.runtime_guard_file_mutation", allow_file_mutation)
-
-    result = json.loads(
-        await _generate_file(
-            "entity_1",
-            kind="document",
-            name="report.md",
-            content="# Report\n",
-            user_id="user_1",
-        )
-    )
-
-    assert "Entity filesystem root is not mounted" in result["error"]
-    assert not os.path.exists(os.path.join(fs_settings.MANOR_FS_ROOT, "entity_1", "report.md"))
 
 
 @pytest.mark.asyncio
@@ -2733,7 +2640,6 @@ async def test_generate_file_restores_prior_bytes_when_projection_fails(
             name="report.md",
             content="new report",
             user_id="user_1",
-            expected_sha256=hashlib.sha256(b"old report").hexdigest(),
         )
     )
 
@@ -2776,11 +2682,10 @@ async def test_patch_file_restores_prior_bytes_when_projection_fails(
             path="report.md",
             user_id="user_1",
             operations=[{"op": "text.replace", "old_text": "old", "new_text": "new"}],
-            expected_sha256=hashlib.sha256(b"old report").hexdigest(),
         )
     )
 
-    assert result["patched"] is False
+    assert result["edited"] is False
     assert result["knowledge_sync_reason"] == "storage_limit"
     with open(target, "rb") as file:
         assert file.read() == b"old report"
@@ -2999,7 +2904,6 @@ async def test_generate_file_retains_durable_cleanup_intent_when_backup_cleanup_
             name="report.md",
             content="new",
             _user_id_from_context="trusted_user",
-            expected_sha256=hashlib.sha256(b"old").hexdigest(),
         )
     )
 
@@ -3233,108 +3137,6 @@ async def test_delete_file_retains_durable_cleanup_intent_when_backup_cleanup_fa
 
 
 @pytest.mark.asyncio
-async def test_generate_code_bundle_requires_persistent_mount_in_cloud(fs_settings, monkeypatch):
-    from packages.core.ai.tools.generate_file import code as code_tool
-
-    fs_settings.DEPLOYMENT_MODE = "cloud"
-
-    async def allow_file_mutation(**_kwargs):
-        return None
-
-    monkeypatch.setattr(code_tool, "runtime_guard_file_mutation", allow_file_mutation)
-
-    result = json.loads(
-        await code_tool.handle_code(
-            entity_id="entity_1",
-            user_id="user_1",
-            conversation_id="conversation_1",
-            prompt="Build a small app",
-            name="demo-app",
-            params={"files": [{"path": "index.html", "content": "<!doctype html>"}]},
-            kwargs={},
-            agent_id=None,
-        )
-    )
-
-    assert "Entity filesystem is not available" in result["error"]
-    assert not os.path.exists(os.path.join(fs_settings.MANOR_FS_ROOT, "entity_1", "code/demo-app/index.html"))
-
-
-@pytest.mark.asyncio
-async def test_sandbox_save_result_requires_persistent_mount_in_cloud(fs_settings, monkeypatch):
-    import packages.core.ai.tools.sandbox_tools as sandbox_tools
-
-    fs_settings.DEPLOYMENT_MODE = "cloud"
-
-    class FakeSandboxClient:
-        async def read_file_base64(self, **_kwargs):
-            return SimpleNamespace(content_base64=base64.b64encode(b"result").decode("ascii"))
-
-        async def close(self):
-            return None
-
-    async def allow_file_mutation(**_kwargs):
-        return None
-
-    async def allow_sandbox_access(**_kwargs):
-        return None
-
-    monkeypatch.setattr(sandbox_tools, "_get_client", lambda: FakeSandboxClient())
-    monkeypatch.setattr(sandbox_tools, "runtime_guard_file_mutation", allow_file_mutation)
-    monkeypatch.setattr(
-        sandbox_tools,
-        "_sandbox_instance_access_error",
-        allow_sandbox_access,
-    )
-
-    result = await sandbox_tools._sandbox_save_result(
-        entity_id="entity_1",
-        sandbox_id="sandbox_1",
-        file_path="/tmp/result.txt",
-        filename="result.txt",
-        user_id="user_1",
-    )
-
-    assert "Entity filesystem is not available" in result
-    assert not os.path.exists(os.path.join(fs_settings.MANOR_FS_ROOT, "entity_1", "result.txt"))
-
-
-@pytest.mark.asyncio
-async def test_save_sandbox_file_requires_persistent_mount_in_cloud(fs_settings, monkeypatch):
-    import packages.core.ai.tools.sandbox_file_tools as sandbox_file_tools
-
-    fs_settings.DEPLOYMENT_MODE = "cloud"
-    monkeypatch.setenv("SANDBOX_SERVICE_URL", "http://sandbox-service")
-
-    class FakeSandboxClient:
-        async def read_file_base64(self, **kwargs):
-            assert kwargs == {"sandbox_id": "sandbox_1", "path": "/tmp/result.txt"}
-            return SimpleNamespace(content_base64=base64.b64encode(b"result").decode("ascii"))
-
-        async def close(self):
-            return None
-
-    async def allow_file_mutation(**_kwargs):
-        return None
-
-    monkeypatch.setattr(sandbox_file_tools, "_get_client", lambda: FakeSandboxClient())
-    monkeypatch.setattr(sandbox_file_tools, "runtime_guard_file_mutation", allow_file_mutation)
-
-    result = json.loads(
-        await sandbox_file_tools._save_sandbox_file(
-            "entity_1",
-            filename="result.txt",
-            sandbox_id="sandbox_1",
-            file_path="/tmp/result.txt",
-            user_id="user_1",
-        )
-    )
-
-    assert "Entity filesystem is not available" in result["error"]
-    assert not os.path.exists(os.path.join(fs_settings.MANOR_FS_ROOT, "entity_1", "result.txt"))
-
-
-@pytest.mark.asyncio
 async def test_save_sandbox_file_rolls_back_failed_knowledge_projection(
     fs_settings,
     monkeypatch,
@@ -3488,9 +3290,6 @@ async def test_sandbox_save_result_rolls_back_failed_knowledge_projection(
     async def allow_file_mutation(**_kwargs):
         return None
 
-    async def allow_sandbox_access(**_kwargs):
-        return None
-
     async def fail_sync(**_kwargs):
         return SimpleNamespace(
             synced=False,
@@ -3508,11 +3307,6 @@ async def test_sandbox_save_result_rolls_back_failed_knowledge_projection(
         "runtime_guard_file_mutation",
         allow_file_mutation,
     )
-    monkeypatch.setattr(
-        sandbox_tools,
-        "_sandbox_instance_access_error",
-        allow_sandbox_access,
-    )
     monkeypatch.setattr(knowledge_sync, "sync_file_to_knowledge", fail_sync)
 
     result = await sandbox_tools._sandbox_save_result(
@@ -3527,69 +3321,6 @@ async def test_sandbox_save_result_rolls_back_failed_knowledge_projection(
     assert not os.path.exists(
         os.path.join(fs_settings.MANOR_FS_ROOT, "entity_1", "result.txt"),
     )
-
-
-@pytest.mark.asyncio
-async def test_save_document_content_requires_persistent_mount_in_cloud(fs_settings, monkeypatch):
-    from packages.core.services import document_service
-
-    fs_settings.DEPLOYMENT_MODE = "cloud"
-    doc = SimpleNamespace(
-        id="doc_1",
-        entity_id="entity_1",
-        name="report.md",
-        fs_path="report.md",
-        file_type="md",
-        mime_type="text/markdown",
-        metadata_={},
-    )
-
-    async def fake_get_document(*_args, **_kwargs):
-        return doc
-
-    monkeypatch.setattr(document_service, "get_document", fake_get_document)
-
-    with pytest.raises(EntityFilesystemError, match="not mounted"):
-        await document_service.save_document_content(
-            SimpleNamespace(),
-            "doc_1",
-            "entity_1",
-            "# Report\n",
-        )
-
-    assert not os.path.exists(os.path.join(fs_settings.MANOR_FS_ROOT, "entity_1", "report.md"))
-
-
-@pytest.mark.asyncio
-async def test_save_document_file_requires_persistent_mount_in_cloud(fs_settings, monkeypatch):
-    from packages.core.services import document_service
-
-    fs_settings.DEPLOYMENT_MODE = "cloud"
-    doc = SimpleNamespace(
-        id="doc_1",
-        entity_id="entity_1",
-        name="report.bin",
-        fs_path="report.bin",
-        file_type="bin",
-        mime_type="application/octet-stream",
-        metadata_={},
-        vector_status="ready",
-    )
-
-    async def fake_get_document(*_args, **_kwargs):
-        return doc
-
-    monkeypatch.setattr(document_service, "get_document", fake_get_document)
-
-    with pytest.raises(EntityFilesystemError, match="not mounted"):
-        await document_service.save_document_file(
-            SimpleNamespace(),
-            "doc_1",
-            "entity_1",
-            b"binary",
-        )
-
-    assert not os.path.exists(os.path.join(fs_settings.MANOR_FS_ROOT, "entity_1", "report.bin"))
 
 
 @pytest.mark.asyncio
@@ -3751,168 +3482,6 @@ async def test_editor_save_allows_compatibility_ooxml_package_rebuild(
     assert result is not None and result.replayed is False
     with open(full_path, "rb") as file:
         assert file.read() == rebuilt
-
-
-@pytest.mark.asyncio
-async def test_editor_file_save_cas_allows_own_sequence_and_rejects_external_patch(
-    fs_settings, monkeypatch,
-):
-    from packages.core.services import document_service, version_service
-    from packages.core.services.entity_fs import EntityFilesystemStaleWriteError
-
-    document = SimpleNamespace(
-        id="doc_native_pptx",
-        entity_id="entity_1",
-        name="deck.pptx",
-        fs_path="presentations/deck.pptx",
-        file_type="pptx",
-        mime_type="application/vnd.openxmlformats-officedocument.presentationml.presentation",
-        metadata_={},
-        vector_status="ready",
-    )
-
-    async def get_document(*_args, **_kwargs):
-        return document
-
-    async def no_op(*_args, **_kwargs):
-        return None
-
-    class FakeDb:
-        async def flush(self):
-            return None
-
-        async def commit(self):
-            return None
-
-    monkeypatch.setattr(document_service, "get_document", get_document)
-    monkeypatch.setattr(document_service, "bump_tool_cache_version", no_op)
-    monkeypatch.setattr(document_service, "_invalidate_document_preview_versions", no_op)
-    monkeypatch.setattr(version_service, "create_version", no_op)
-
-    entity_root = os.path.join(fs_settings.MANOR_FS_ROOT, document.entity_id)
-    full_path = os.path.join(entity_root, document.fs_path)
-    os.makedirs(os.path.dirname(full_path), exist_ok=True)
-    original = b"PK\x03\x04original"
-    with open(full_path, "wb") as file:
-        file.write(original)
-    original_sha256 = hashlib.sha256(original).hexdigest()
-
-    for sequence, content in ((1, b"PK\x03\x04editor-one"), (2, b"PK\x03\x04editor-two")):
-        result = await document_service.save_document_file(
-            FakeDb(),
-            document.id,
-            document.entity_id,
-            content,
-            filename=document.name,
-            mime_type=document.mime_type,
-            save_session_id="editor-session",
-            save_sequence=sequence,
-            expected_source_sha256=original_sha256,
-        )
-        assert result is not None and result.replayed is False
-        if sequence == 1:
-            replay = await document_service.save_document_file(
-                FakeDb(),
-                document.id,
-                document.entity_id,
-                content,
-                filename=document.name,
-                mime_type=document.mime_type,
-                save_session_id="editor-session",
-                save_sequence=sequence,
-                expected_source_sha256=original_sha256,
-            )
-            assert replay is not None and replay.replayed is True
-
-            with pytest.raises(EntityFilesystemStaleWriteError):
-                await document_service.save_document_file(
-                    FakeDb(),
-                    document.id,
-                    document.entity_id,
-                    b"PK\x03\x04conflicting-replay",
-                    filename=document.name,
-                    mime_type=document.mime_type,
-                    save_session_id="editor-session",
-                    save_sequence=sequence,
-                    expected_source_sha256=original_sha256,
-                )
-
-    native_patch = b"PK\x03\x04native-ai-patch"
-    with open(full_path, "wb") as file:
-        file.write(native_patch)
-
-    with pytest.raises(
-        EntityFilesystemStaleWriteError,
-        match="changed after this editor snapshot",
-    ):
-        await document_service.save_document_file(
-            FakeDb(),
-            document.id,
-            document.entity_id,
-            b"PK\x03\x04late-editor-save",
-            filename=document.name,
-            mime_type=document.mime_type,
-            save_session_id="editor-session",
-            save_sequence=3,
-            expected_source_sha256=original_sha256,
-        )
-
-    with open(full_path, "rb") as file:
-        assert file.read() == native_patch
-
-    document.id = "doc_legacy_ppt"
-    document.name = "legacy-deck.ppt"
-    document.fs_path = "presentations/legacy-deck.ppt"
-    document.file_type = "ppt"
-    document.mime_type = "application/vnd.ms-powerpoint"
-    document.metadata_ = {}
-    legacy_full_path = os.path.join(entity_root, document.fs_path)
-    legacy_source = b"legacy-powerpoint-source"
-    with open(legacy_full_path, "wb") as file:
-        file.write(legacy_source)
-
-    converted_content = b"PK\x03\x04converted-editor-save"
-    converted_result = await document_service.save_document_file(
-        FakeDb(),
-        document.id,
-        document.entity_id,
-        converted_content,
-        filename=document.name,
-        mime_type="application/vnd.openxmlformats-officedocument.presentationml.presentation",
-        save_session_id="legacy-editor-session",
-        save_sequence=1,
-        expected_source_sha256=hashlib.sha256(legacy_source).hexdigest(),
-    )
-
-    assert converted_result is not None and converted_result.replayed is False
-    assert document.name == "legacy-deck.pptx"
-    assert document.fs_path == "presentations/legacy-deck.pptx"
-    assert not os.path.exists(legacy_full_path)
-    with open(os.path.join(entity_root, document.fs_path), "rb") as file:
-        assert file.read() == converted_content
-
-
-@pytest.mark.asyncio
-async def test_filesystem_write_endpoint_requires_persistent_mount_in_cloud(fs_settings):
-    from fastapi import HTTPException
-    from apps.api.routers import filesystem
-
-    fs_settings.DEPLOYMENT_MODE = "cloud"
-    user = SimpleNamespace(
-        entity_id="entity_1",
-        email="user@test.com",
-        display_name=None,
-    )
-
-    with pytest.raises(HTTPException) as exc_info:
-        await filesystem.write_file(
-            filesystem.WriteRequest(path="report.md", content="# Report\n"),
-            user=user,
-            db=SimpleNamespace(),
-        )
-
-    assert exc_info.value.status_code == 503
-    assert not os.path.exists(os.path.join(fs_settings.MANOR_FS_ROOT, "entity_1", "report.md"))
 
 
 @pytest.mark.asyncio
@@ -7270,110 +6839,6 @@ async def test_filesystem_move_refuses_implicit_destination_overwrite(
         assert file.read() == "source"
     with open(os.path.join(root, "destination.css"), encoding="utf-8") as file:
         assert file.read() == "destination"
-
-
-def test_chat_upload_requires_persistent_mount_in_cloud(fs_settings):
-    from packages.core.services.file_context import _save_chat_upload
-
-    fs_settings.DEPLOYMENT_MODE = "cloud"
-
-    with pytest.raises(EntityFilesystemError, match="not mounted"):
-        _save_chat_upload(b"image", "image.png", "entity_1", "image/png")
-
-    upload_dir = os.path.join(fs_settings.MANOR_FS_ROOT, "entity_1", "uploads", "chat")
-    assert not os.path.exists(upload_dir)
-
-
-@pytest.mark.asyncio
-async def test_task_attachment_requires_persistent_mount_in_cloud(fs_settings, monkeypatch):
-    from fastapi import HTTPException
-    from apps.api.routers import tasks
-
-    fs_settings.DEPLOYMENT_MODE = "cloud"
-
-    async def fake_get_task(*_args, **_kwargs):
-        return SimpleNamespace(id="task_1", workspace_id=None)
-
-    class FakeUpload:
-        filename = "attachment.txt"
-        content_type = "text/plain"
-
-        async def read(self):
-            return b"attachment"
-
-    monkeypatch.setattr(tasks, "get_task", fake_get_task)
-
-    with pytest.raises(HTTPException) as exc_info:
-        await tasks.upload_task_attachment(
-            "task_1",
-            file=FakeUpload(),
-            user=SimpleNamespace(entity_id="entity_1"),
-            db=SimpleNamespace(),
-        )
-
-    assert exc_info.value.status_code == 503
-    assert not os.path.exists(os.path.join(fs_settings.MANOR_FS_ROOT, "entity_1", "tasks"))
-
-
-@pytest.mark.asyncio
-async def test_avatar_upload_requires_persistent_mount_in_cloud(fs_settings, monkeypatch):
-    from fastapi import HTTPException
-    from apps.api.routers import auth
-    from packages.core.services import upload_security
-
-    fs_settings.DEPLOYMENT_MODE = "cloud"
-
-    async def accept_valid_upload(*_args, **_kwargs):
-        return None
-
-    monkeypatch.setattr(upload_security, "inspect_upload_content", accept_valid_upload)
-
-    class FakeUpload:
-        filename = "avatar.png"
-        content_type = "image/png"
-
-        async def read(self):
-            return b"\x89PNG\r\n\x1a\nimage-bytes"
-
-    class FakeDB:
-        flushed = False
-
-        async def flush(self):
-            self.flushed = True
-
-    user = SimpleNamespace(entity_id="entity_1", avatar_url=None)
-    db = FakeDB()
-
-    with pytest.raises(HTTPException) as exc_info:
-        await auth.upload_avatar(file=FakeUpload(), user=user, db=db)
-
-    assert exc_info.value.status_code == 503
-    assert user.avatar_url is None
-    assert db.flushed is False
-    assert not os.path.exists(os.path.join(fs_settings.MANOR_FS_ROOT, "entity_1", "avatars"))
-
-
-@pytest.mark.asyncio
-async def test_elevenlabs_audio_requires_persistent_mount_in_cloud(fs_settings, monkeypatch):
-    from packages.core.ai.mcp import elevenlabs
-
-    fs_settings.DEPLOYMENT_MODE = "cloud"
-    registered = False
-
-    async def fake_register_document(*_args, **_kwargs):
-        nonlocal registered
-        registered = True
-
-    monkeypatch.setattr(elevenlabs, "_register_document", fake_register_document)
-    elevenlabs.set_call_context({"entity_id": "entity_1", "user_id": "user_1"})
-    try:
-        with pytest.raises(EntityFilesystemError, match="not mounted"):
-            await elevenlabs._save_audio_bytes(b"audio", "tts")
-    finally:
-        elevenlabs.clear_call_context()
-
-    assert registered is False
-    assert not os.path.exists(os.path.join(fs_settings.MANOR_FS_ROOT, "entity_1", "audio"))
 
 
 def test_copy_entity_file_atomic_persists_verified_file(fs_settings, tmp_path):

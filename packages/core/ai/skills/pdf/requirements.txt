@@ -1,8 +1,5 @@
 fpdf2>=2.8
-pandas>=2.2
 pdfplumber>=0.11
-pdf2image>=1.17
 Pillow>=10.4
 pypdf>=6.0
-pytesseract>=0.3
 reportlab>=4.2

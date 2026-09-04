@@ -7,14 +7,7 @@
     "dev": "vite",
     "build": "tsc -b && vite build",
     "build:nocheck": "vite build",
-    "test:source": "node --test scripts/*.test.mjs",
-    "test:response-surface-browser": "node scripts/response-surface-browser-smoke.mjs",
-    "test:file-comment-focus-browser": "node scripts/file-comment-focus-browser-smoke.mjs",
-    "test:diagram-preview-browser": "node scripts/diagram-preview-browser-smoke.mjs",
-    "test:document-table-preservation-browser": "node scripts/document-table-preservation-browser-smoke.mjs",
-    "test:html-preview-browser": "node scripts/html-preview-browser-smoke.mjs",
     "test:e2e": "playwright test",
-    "test:live-edit": "node scripts/live-edit-filetype-smoke.mjs",
     "preview": "vite preview"
   },
   "dependencies": {

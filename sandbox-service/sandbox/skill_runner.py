@@ -15,9 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import json
 import logging
-import re
 import time
 import uuid
 from collections.abc import AsyncIterator
@@ -38,15 +36,9 @@ from .concurrency import (
     SandboxConcurrencyGate,
     SandboxGateConfig,
 )
-from .credential_refs import validate_sandbox_credential_ref
 from .models import (
     ContainerConfig,
     CreateSandboxResponse,
-    ExecutionEvent,
-    ExecutionEventType,
-    ExecutionResponseAck,
-    ExecutionStatus,
-    ExecutionStatusResponse,
     ExecResponse,
     FileReadBase64Response,
     FileReadResponse,
@@ -62,23 +54,12 @@ from .models import (
 from .scanner import SkillScanner
 from .security import (
     SecurityError,
-    contains_sensitive_event_key,
-    contains_sensitive_event_text,
     sanitize_env_vars,
     validate_container_path,
     validate_host_path,
 )
 
 logger = logging.getLogger(__name__)
-
-_EXECUTION_EVENT_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
-_MAX_EXECUTION_EVENTS = 100
-_MAX_EXECUTION_EVENT_BYTES = 8192
-_CREDENTIAL_RESPONSE_REFERENCE_KEYS = {
-    "credential_ref",
-    "integration_account_id",
-    "provider",
-}
 
 
 class SkillRunner:
@@ -105,17 +86,6 @@ class SkillRunner:
         ] = {}
         self._idempotency_completed: dict[str, CreateSandboxResponse] = {}
         self._sandbox_idempotency_keys: dict[str, str] = {}
-        self._execution_records: dict[
-            tuple[str, str], ExecutionStatusResponse
-        ] = {}
-        self._execution_admission_lock = asyncio.Lock()
-        self._execution_request_fingerprints: dict[tuple[str, str], str] = {}
-        self._execution_locks: dict[tuple[str, str], asyncio.Lock] = {}
-        self._execution_tasks: dict[tuple[str, str], asyncio.Task[None]] = {}
-        self._execution_cancel_requested: set[tuple[str, str]] = set()
-        self._execution_cancel_confirmed: set[tuple[str, str]] = set()
-        self._execution_responses: dict[tuple[str, str, str], bytes] = {}
-        self._execution_response_lock = asyncio.Lock()
         self._orphan_cleanup_failures: list[str] = []
         self._gate = SandboxConcurrencyGate(
             SandboxGateConfig(
@@ -358,7 +328,6 @@ class SkillRunner:
         timeout: int = 60,
         workdir: str | None = None,
         execution_id: str | None = None,
-        retain_mailbox: bool = False,
     ) -> ExecResponse:
         """Execute a command in an existing sandbox."""
         sandbox = self._get_sandbox(sandbox_id)
@@ -370,468 +339,11 @@ class SkillRunner:
                 timeout=timeout,
                 workdir=workdir,
                 execution_id=resolved_execution_id,
-                interactive=retain_mailbox,
             )
-
-    async def start_execution(
-        self,
-        sandbox_id: str,
-        command: str,
-        timeout: int = 60,
-        workdir: str | None = None,
-        execution_id: str | None = None,
-    ) -> ExecutionStatusResponse:
-        """Schedule a command and return before its process completes."""
-
-        sandbox = self._get_sandbox(sandbox_id)
-        sandbox.ensure_available()
-        resolved_execution_id = execution_id or uuid.uuid4().hex
-        key = (sandbox_id, resolved_execution_id)
-        request_fingerprint = hashlib.sha256(
-            json.dumps(
-                {
-                    "command": command,
-                    "timeout": timeout,
-                    "workdir": workdir,
-                },
-                ensure_ascii=False,
-                separators=(",", ":"),
-                sort_keys=True,
-            ).encode("utf-8")
-        ).hexdigest()
-        cleanup_ids: dict[str, list[str]] = {}
-        async with self._execution_admission_lock:
-            existing = self._execution_records.get(key)
-            if existing is not None:
-                if self._execution_request_fingerprints.get(key) != request_fingerprint:
-                    raise ValueError(
-                        "execution_id already exists with a different request"
-                    )
-                return existing.model_copy(deep=True)
-            cleanup_ids = await self._prune_execution_history()
-            pending_count = sum(
-                record.status not in ExecutionStatus.terminal()
-                for record in self._execution_records.values()
-            )
-            if pending_count >= max(1, app_config.MAX_PENDING_EXECUTIONS):
-                raise SandboxConcurrencyExceeded(
-                    "Max pending sandbox execution limit reached "
-                    f"({app_config.MAX_PENDING_EXECUTIONS}). Please poll or cancel existing work."
-                )
-
-            record = ExecutionStatusResponse(
-                sandbox_id=sandbox_id,
-                execution_id=resolved_execution_id,
-                status=ExecutionStatus.QUEUED,
-                created_at=time.time(),
-            )
-            self._execution_records[key] = record
-            self._execution_request_fingerprints[key] = request_fingerprint
-            self._execution_locks[key] = asyncio.Lock()
-            task = asyncio.create_task(
-                self._run_background_execution(
-                    key,
-                    command=command,
-                    timeout=timeout,
-                    workdir=workdir,
-                ),
-                name=f"sandbox-exec-{sandbox_id}-{resolved_execution_id}",
-            )
-            self._execution_tasks[key] = task
-            result = record.model_copy(deep=True)
-        await self._cleanup_execution_mailboxes(cleanup_ids)
-        return result
-
-    async def _prune_execution_history(self) -> dict[str, list[str]]:
-        now = time.time()
-        ttl = max(1, app_config.EXECUTION_HISTORY_TTL_SECONDS)
-        terminal = sorted(
-            (
-                (key, record)
-                for key, record in self._execution_records.items()
-                if record.status in ExecutionStatus.terminal()
-            ),
-            key=lambda item: item[1].finished_at or item[1].created_at,
-        )
-        removed: list[tuple[str, str]] = []
-        for key, record in terminal:
-            finished_at = record.finished_at or record.created_at
-            if now - finished_at > ttl:
-                self._execution_records.pop(key, None)
-                removed.append(key)
-        max_history = max(1, app_config.MAX_EXECUTION_HISTORY)
-        terminal_keys = [
-            key
-            for key, record in terminal
-            if key in self._execution_records
-            and record.status in ExecutionStatus.terminal()
-        ]
-        while len(self._execution_records) >= max_history and terminal_keys:
-            key = terminal_keys.pop(0)
-            self._execution_records.pop(key, None)
-            removed.append(key)
-        cleanup_ids: dict[str, list[str]] = {}
-        for key in removed:
-            self._execution_request_fingerprints.pop(key, None)
-            self._execution_locks.pop(key, None)
-            self._forget_execution_response_state(key)
-            cleanup_ids.setdefault(key[0], []).append(key[1])
-        return cleanup_ids
-
-    async def _cleanup_execution_mailboxes(
-        self,
-        cleanup_ids: dict[str, list[str]],
-    ) -> None:
-        """Run best-effort Docker cleanup outside the admission lock."""
-
-        cleanup_tasks: list[asyncio.Task[None]] = []
-        for sandbox_id, execution_ids in cleanup_ids.items():
-            sandbox = self._sandboxes.get(sandbox_id)
-            cleanup_many = getattr(sandbox, "cleanup_execution_mailboxes", None)
-            if cleanup_many is not None:
-                cleanup_tasks.append(asyncio.create_task(cleanup_many(execution_ids)))
-                continue
-            cleanup_one = getattr(sandbox, "cleanup_execution_mailbox", None)
-            if cleanup_one is not None:
-                cleanup_tasks.extend(
-                    asyncio.create_task(cleanup_one(execution_id))
-                    for execution_id in execution_ids
-                )
-        if cleanup_tasks:
-            await asyncio.gather(*cleanup_tasks, return_exceptions=True)
-
-    async def _run_background_execution(
-        self,
-        key: tuple[str, str],
-        *,
-        command: str,
-        timeout: int,
-        workdir: str | None,
-    ) -> None:
-        sandbox_id, execution_id = key
-        record = self._execution_records[key]
-        execution_lock = self._execution_locks[key]
-        async with execution_lock:
-            record.status = ExecutionStatus.RUNNING
-            record.started_at = time.time()
-            if key in self._execution_cancel_requested:
-                record.status = ExecutionStatus.CANCELLED
-                record.finished_at = time.time()
-                self._execution_tasks.pop(key, None)
-                self._execution_cancel_requested.discard(key)
-                self._execution_cancel_confirmed.discard(key)
-                return
-
-        try:
-            result = await self.exec_command(
-                sandbox_id=sandbox_id,
-                command=command,
-                timeout=timeout,
-                workdir=workdir,
-                execution_id=execution_id,
-                retain_mailbox=True,
-            )
-        except asyncio.CancelledError:
-            async with execution_lock:
-                record.status = ExecutionStatus.CANCELLED
-                record.error = "execution task cancelled"
-                record.finished_at = time.time()
-            raise
-        except Exception as exc:
-            async with execution_lock:
-                record.status = (
-                    ExecutionStatus.CANCELLED
-                    if key in self._execution_cancel_confirmed
-                    else ExecutionStatus.FAILED
-                )
-                record.error = str(exc)
-                record.finished_at = time.time()
-        else:
-            async with execution_lock:
-                record.stdout = result.stdout
-                record.stderr = result.stderr
-                record.exit_code = result.exit_code
-                if key in self._execution_cancel_confirmed:
-                    record.status = ExecutionStatus.CANCELLED
-                elif result.exit_code == 0:
-                    record.status = ExecutionStatus.COMPLETED
-                else:
-                    record.status = ExecutionStatus.FAILED
-                    record.error = f"command exited with code {result.exit_code}"
-                record.finished_at = time.time()
-        finally:
-            self._execution_tasks.pop(key, None)
-            self._execution_cancel_requested.discard(key)
-            self._execution_cancel_confirmed.discard(key)
-
-    async def get_execution_status(
-        self,
-        sandbox_id: str,
-        execution_id: str,
-        after_sequence: int = 0,
-    ) -> ExecutionStatusResponse:
-        sandbox = self._get_sandbox(sandbox_id)
-        key = (sandbox_id, execution_id)
-        record = self._execution_records.get(key)
-        if record is None:
-            raise KeyError(f"Execution not found: {execution_id}")
-        await self._refresh_execution_events(sandbox, record)
-        result = record.model_copy(deep=True)
-        result.events = [
-            event for event in result.events if event.sequence > max(0, after_sequence)
-        ]
-        return result
-
-    @staticmethod
-    def _contains_secret_event_key(value: object) -> bool:
-        return contains_sensitive_event_key(value)
-
-    async def _refresh_execution_events(
-        self,
-        sandbox: DockerSandbox,
-        record: ExecutionStatusResponse,
-    ) -> None:
-        reader = getattr(sandbox, "read_execution_event_lines", None)
-        if reader is None:
-            return
-        lines, _truncated = await reader(record.execution_id)
-        known_ids = {event.event_id for event in record.events}
-        for line in lines:
-            if len(record.events) >= _MAX_EXECUTION_EVENTS:
-                break
-            if len(line.encode("utf-8")) > _MAX_EXECUTION_EVENT_BYTES:
-                continue
-            try:
-                raw = json.loads(line)
-            except (TypeError, json.JSONDecodeError):
-                continue
-            if not isinstance(raw, dict):
-                continue
-            event_id = str(raw.get("event_id") or "").strip()
-            if event_id in known_ids or not _EXECUTION_EVENT_ID_RE.fullmatch(event_id):
-                continue
-            try:
-                event_type = ExecutionEventType(str(raw.get("type") or ""))
-            except ValueError:
-                continue
-            message = str(raw.get("message") or "")
-            payload = raw.get("payload") or {}
-            if len(message) > 2000 or not isinstance(payload, dict):
-                continue
-            if self._contains_secret_event_key(payload) or contains_sensitive_event_text(
-                {"message": message, "payload": payload}
-            ):
-                continue
-            try:
-                payload_size = len(
-                    json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode(
-                        "utf-8"
-                    )
-                )
-            except (TypeError, ValueError):
-                continue
-            if payload_size > _MAX_EXECUTION_EVENT_BYTES:
-                continue
-            requires_response = bool(raw.get("requires_response")) or event_type in {
-                ExecutionEventType.NEED_INPUT,
-                ExecutionEventType.NEED_FILE,
-                ExecutionEventType.NEED_TOOL,
-                ExecutionEventType.NEED_CREDENTIAL,
-            }
-            event = ExecutionEvent(
-                sequence=len(record.events) + 1,
-                event_id=event_id,
-                type=event_type,
-                message=message,
-                payload=payload,
-                requires_response=requires_response,
-                created_at=time.time(),
-            )
-            record.events.append(event)
-            known_ids.add(event_id)
-        record.next_sequence = len(record.events)
-        record.waiting_for_response = any(
-            event.requires_response and not event.responded for event in record.events
-        )
-
-    async def send_execution_response(
-        self,
-        sandbox_id: str,
-        execution_id: str,
-        event_id: str,
-        *,
-        payload: dict,
-        message: str,
-    ) -> ExecutionResponseAck:
-        sandbox = self._get_sandbox(sandbox_id)
-        if len(message) > 2000:
-            raise ValueError("Sandbox execution response message exceeds 2000 characters")
-        if not isinstance(payload, dict):
-            raise ValueError("Sandbox execution response payload must be an object")
-        if self._contains_secret_event_key(payload):
-            raise ValueError(
-                "Sandbox execution responses accept credential references, not secret values"
-            )
-        if contains_sensitive_event_text({"message": message, "payload": payload}):
-            raise ValueError(
-                "Sandbox execution responses accept credential references, not secret values"
-            )
-        key = (sandbox_id, execution_id)
-        record = self._execution_records.get(key)
-        if record is None:
-            raise KeyError(f"Execution not found: {execution_id}")
-        execution_lock = self._execution_locks.get(key)
-        if execution_lock is None:
-            raise RuntimeError("Sandbox execution response state is unavailable")
-        if not _EXECUTION_EVENT_ID_RE.fullmatch(event_id):
-            raise ValueError("Invalid sandbox execution event_id")
-        response_request = {
-            "event_id": event_id,
-            "message": message,
-            "payload": payload,
-        }
-        canonical_request = json.dumps(
-            response_request,
-            ensure_ascii=False,
-            separators=(",", ":"),
-            sort_keys=True,
-        ).encode("utf-8")
-        encoded = json.dumps(
-            {**response_request, "created_at": time.time()},
-            ensure_ascii=False,
-            separators=(",", ":"),
-            sort_keys=True,
-        ).encode("utf-8")
-        response_key = (sandbox_id, execution_id, event_id)
-        async with self._execution_response_lock:
-            existing = self._execution_responses.get(response_key)
-            if existing is not None:
-                if existing != canonical_request:
-                    raise ValueError("Execution event already has a different response")
-                event = next(
-                    (
-                        candidate
-                        for candidate in record.events
-                        if candidate.event_id == event_id
-                    ),
-                    None,
-                )
-                if event is not None:
-                    event.responded = True
-                record.waiting_for_response = any(
-                    item.requires_response and not item.responded for item in record.events
-                )
-                return ExecutionResponseAck(
-                    sandbox_id=sandbox_id,
-                    execution_id=execution_id,
-                    event_id=event_id,
-                    accepted=True,
-                    duplicate=True,
-                )
-            await self._refresh_execution_events(sandbox, record)
-            async with execution_lock:
-                if record.status in ExecutionStatus.terminal():
-                    raise RuntimeError("Cannot respond to a terminal sandbox execution")
-                event = next(
-                    (
-                        candidate
-                        for candidate in record.events
-                        if candidate.event_id == event_id
-                    ),
-                    None,
-                )
-                if event is None:
-                    raise KeyError(f"Execution event not found: {event_id}")
-                if not event.requires_response:
-                    raise ValueError("Sandbox execution event does not accept a response")
-                if event.type == ExecutionEventType.NEED_CREDENTIAL:
-                    credential_ref = payload.get("credential_ref")
-                    provider = payload.get("provider")
-                    integration_account_id = payload.get("integration_account_id")
-                    if (
-                        message.strip()
-                        or not isinstance(credential_ref, str)
-                        or not credential_ref.strip()
-                    ):
-                        raise ValueError(
-                            "need_credential responses require a signed credential_ref and no message"
-                        )
-                    unexpected_keys = set(payload) - _CREDENTIAL_RESPONSE_REFERENCE_KEYS
-                    missing_keys = _CREDENTIAL_RESPONSE_REFERENCE_KEYS - set(payload)
-                    invalid_reference_values = any(
-                        not isinstance(value, str) or not value.strip()
-                        for value in payload.values()
-                    )
-                    event_provider = event.payload.get("provider")
-                    if unexpected_keys or missing_keys or invalid_reference_values:
-                        raise ValueError(
-                            "need_credential responses accept reference fields only"
-                        )
-                    if not isinstance(event_provider, str) or provider != event_provider:
-                        raise ValueError(
-                            "need_credential response provider does not match the event"
-                        )
-                    validate_sandbox_credential_ref(
-                        credential_ref,
-                        signing_key=app_config.API_TOKEN,
-                        sandbox_id=sandbox_id,
-                        execution_id=execution_id,
-                        event_id=event_id,
-                        provider=provider,
-                        integration_account_id=integration_account_id,
-                    )
-                writer = getattr(sandbox, "write_execution_response", None)
-                if writer is None:
-                    raise RuntimeError("Sandbox runner does not support execution responses")
-                await writer(execution_id, event_id, encoded)
-                self._execution_responses[response_key] = canonical_request
-                event.responded = True
-                record.waiting_for_response = any(
-                    item.requires_response and not item.responded for item in record.events
-                )
-        return ExecutionResponseAck(
-            sandbox_id=sandbox_id,
-            execution_id=execution_id,
-            event_id=event_id,
-            accepted=True,
-        )
-
-    def _forget_execution_response_state(self, key: tuple[str, str]) -> None:
-        for response_key in [
-            response_key
-            for response_key in self._execution_responses
-            if response_key[:2] == key
-        ]:
-            self._execution_responses.pop(response_key, None)
 
     async def cancel_execution(self, sandbox_id: str, execution_id: str) -> bool:
         sandbox = self._get_sandbox(sandbox_id)
-        key = (sandbox_id, execution_id)
-        record = self._execution_records.get(key)
-        execution_lock = self._execution_locks.get(key)
-        if record is not None and execution_lock is not None:
-            async with execution_lock:
-                if record.status in ExecutionStatus.terminal():
-                    return False
-                self._execution_cancel_requested.add(key)
-                # Cancellation is an accepted state transition once the execution
-                # was observed as non-terminal. Mark it before signalling so a
-                # fast process exit cannot race the receipt into "completed".
-                self._execution_cancel_confirmed.add(key)
-
-        # A just-scheduled background task may not have installed its process
-        # group marker yet. Give it a short event-loop window so cancellation
-        # cannot be lost in that transition.
-        attempts = 20 if record is not None else 1
-        for _ in range(attempts):
-            cancelled = await sandbox.cancel_execution(execution_id)
-            if cancelled:
-                return True
-            task = self._execution_tasks.get(key)
-            if task is None or task.done():
-                break
-            await asyncio.sleep(0.01)
-        return record is not None
+        return await sandbox.cancel_execution(execution_id)
 
     async def read_file(
         self,
@@ -922,8 +434,6 @@ class SkillRunner:
             f"Memory limit: {sandbox.config.memory}\n"
             f"Image: {sandbox.config.image}\n"
             f"Python available: yes\n"
-            "Background commands receive MANOR_SANDBOX_BRIDGE. Use its emit "
-            "and wait subcommands for bounded structured Agent interaction.\n"
         )
         if skill.requirements_txt:
             sandbox_info += "Dependencies: installed from requirements.txt\n"
@@ -1021,22 +531,6 @@ class SkillRunner:
         if sandbox is None:
             return
 
-        active_execution_ids = [
-            execution_id
-            for (record_sandbox_id, execution_id), record in self._execution_records.items()
-            if record_sandbox_id == sandbox_id
-            and record.status not in ExecutionStatus.terminal()
-        ]
-        for execution_id in active_execution_ids:
-            await self.cancel_execution(sandbox_id, execution_id)
-        active_tasks = [
-            task
-            for (record_sandbox_id, _execution_id), task in self._execution_tasks.items()
-            if record_sandbox_id == sandbox_id
-        ]
-        if active_tasks:
-            await asyncio.gather(*active_tasks, return_exceptions=True)
-
         await sandbox.destroy()
         if self._sandboxes.get(sandbox_id) is not sandbox:
             return
@@ -1049,14 +543,6 @@ class SkillRunner:
 
         del self._sandboxes[sandbox_id]
         self._fs_bridges.pop(sandbox_id, None)
-        for key in [key for key in self._execution_records if key[0] == sandbox_id]:
-            self._execution_records.pop(key, None)
-            self._execution_request_fingerprints.pop(key, None)
-            self._execution_locks.pop(key, None)
-            self._execution_tasks.pop(key, None)
-            self._execution_cancel_requested.discard(key)
-            self._execution_cancel_confirmed.discard(key)
-            self._forget_execution_response_state(key)
         if active_lease is not None and self._active_leases.get(sandbox_id) is active_lease:
             del self._active_leases[sandbox_id]
         await self._local_active_capacity.release()
@@ -1076,7 +562,6 @@ class SkillRunner:
                 last_used_at=sbx.last_used_at,
                 config=sbx.config,
                 active_command=sbx.active_command,
-                active_execution_id=getattr(sbx, "active_execution_id", None),
                 expires_at=sbx.expires_at,
             ))
         return result
@@ -1093,7 +578,6 @@ class SkillRunner:
             last_used_at=sbx.last_used_at,
             config=sbx.config,
             active_command=sbx.active_command,
-            active_execution_id=getattr(sbx, "active_execution_id", None),
             expires_at=sbx.expires_at,
         )
 

@@ -61,7 +61,7 @@ def test_upload_text_document_alias_is_not_registered():
 
     names = [schema["function"]["name"] for schema, _ in document_tools.get_tools()]
     assert "upload_text_document" not in names
-    assert "generate_document_file" not in names
+    assert "generate_document_file" in names
 
 
 def test_generate_file_document_capability_mentions_editable_diagram_json():
@@ -82,9 +82,7 @@ def test_generate_file_audio_schema_exposes_task_scoped_narrator_mode():
         "random_per_task",
         "fixed_per_workspace",
     ]
-    language_description = properties["language"]["description"]
-    assert "BCP-47" in language_description
-    assert "Workspace audio language" in language_description
+    assert "Workspace settings.audio_defaults.language" in properties["language"]["description"]
     assert params_properties["workspace_asset_key"]["type"] == "string"
     assert params_properties["reuse_if_exists"]["type"] == "boolean"
 
@@ -247,17 +245,6 @@ async def test_vercel_speech_uses_gateway_v4_protocol_and_decodes_audio(monkeypa
         "outputFormat": "mp3",
         "instructions": "Warm and deliberate.",
     }
-
-    await extended_tools._vercel_speech_bytes(
-        api_key="vck-test-gateway-key",
-        base_url="https://ai-gateway.vercel.sh/v1",
-        model="openai/gpt-4o-mini-tts",
-        prompt="Read this naturally.",
-        voice="marin",
-        audio_format="mp3",
-        voice_instructions="Warm and deliberate.",
-    )
-    assert captured["json"]["instructions"] == "Warm and deliberate."
 
 
 def test_legacy_openai_tts_models_do_not_accept_delivery_instructions():

@@ -16,7 +16,6 @@ the email MCP bundle):
 """
 from __future__ import annotations
 
-import base64
 import json
 import logging
 from email.message import EmailMessage
@@ -29,65 +28,6 @@ from packages.core.services.channels.base import (
 from packages.core.services import smtp_transport
 
 logger = logging.getLogger(__name__)
-
-
-def _normalize_inbound_attachments(payload: Dict[str, Any]) -> list[dict[str, Any]]:
-    """Accept bounded inline bytes from an IMAP poller/inbound-mail webhook."""
-
-    from packages.core.services.email_attachments import (
-        EmailAttachmentError,
-        MAX_EMAIL_ATTACHMENTS,
-        MAX_EMAIL_ATTACHMENTS_TOTAL_BYTES,
-        decode_inbound_email_attachment,
-    )
-
-    raw_items = payload.get("attachments")
-    if not isinstance(raw_items, list):
-        return []
-    normalized: list[dict[str, Any]] = []
-    total_bytes = 0
-    for index, raw in enumerate(raw_items[:MAX_EMAIL_ATTACHMENTS]):
-        if not isinstance(raw, dict):
-            continue
-        item = {
-            "filename": raw.get("filename") or f"attachment-{index + 1}",
-            "content_type": raw.get("content_type") or raw.get("mime_type"),
-            "data_base64": raw.get("data_base64") or raw.get("content_base64"),
-            "attachment_id": raw.get("attachment_id") or str(index),
-            "folder": raw.get("folder"),
-            "uid": raw.get("uid"),
-            "message_id": payload.get("message_id"),
-            "from": payload.get("from"),
-            "subject": payload.get("subject"),
-        }
-        try:
-            data, filename, content_type = decode_inbound_email_attachment(item)
-            total_bytes += len(data)
-            if total_bytes > MAX_EMAIL_ATTACHMENTS_TOTAL_BYTES:
-                raise EmailAttachmentError(
-                    "Email attachments exceed the 20 MiB total limit."
-                )
-        except EmailAttachmentError as exc:
-            normalized.append({
-                "filename": str(item["filename"]),
-                "attachment_id": str(item["attachment_id"]),
-                "status": "error",
-                "error": str(exc),
-            })
-            continue
-        normalized.append({
-            **{
-                key: value
-                for key, value in item.items()
-                if key not in {"filename", "content_type", "data_base64"}
-                and value not in (None, "")
-            },
-            "filename": filename,
-            "content_type": content_type,
-            "size": len(data),
-            "data_base64": base64.b64encode(data).decode("ascii"),
-        })
-    return normalized
 
 
 class EmailChannelAdapter(ChannelAdapter):
@@ -198,12 +138,7 @@ class EmailChannelAdapter(ChannelAdapter):
               "from_name": "Alice",
               "subject": "Hi",
               "text": "...",
-              "message_id": "<abc@example.com>",
-              "attachments": [{
-                "filename": "brief.pdf",
-                "content_type": "application/pdf",
-                "data_base64": "..."
-              }]
+              "message_id": "<abc@example.com>"
             }
         """
         try:
@@ -213,8 +148,6 @@ class EmailChannelAdapter(ChannelAdapter):
         sender = (payload.get("from") or "").strip().lower()
         if not sender:
             return None
-        attachments = _normalize_inbound_attachments(payload)
-        content = payload.get("text") or payload.get("body") or ""
         return NormalizedInbound(
             channel_type="email",
             channel_config_id=cc.id,
@@ -222,9 +155,8 @@ class EmailChannelAdapter(ChannelAdapter):
             source_id=sender,
             sender_name=payload.get("from_name") or sender,
             reply_to=sender,
-            content=content,
-            message_type="file" if attachments and not content else "text",
-            attachments=attachments,
+            content=payload.get("text") or payload.get("body") or "",
+            message_type="text",
             external_message_id=payload.get("message_id"),
             raw=payload,
         )

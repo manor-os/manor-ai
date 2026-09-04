@@ -23,7 +23,6 @@ import { matchSubAgentRuns } from "../lib/subAgentDisplay";
 import { formatUserFacingStructuredText } from "../lib/taskDisplay";
 import { processSurfaceSummary, runtimeToolBadge } from "../lib/toolRuntimeSurface";
 import { normalizeResponseSurfaceBlock } from "../lib/responseSurface";
-import { PendingActionKind } from "../lib/pendingActionKinds";
 import {
   coalesceWorkspaceLedgerQueryBlocks,
   isWorkspaceLedgerOverview,
@@ -34,39 +33,6 @@ import {
 import AgentLoopStep from "./ui/AgentLoopStep";
 import InteractiveResponseSurface from "./InteractiveResponseSurface";
 import Button from "./ui/Button";
-
-export type AssistantPendingActionKind = "approval" | "input" | null;
-
-type AssistantPendingActionMessage = {
-  hitl_requests?: Array<{ resolved?: boolean; type?: string }> | null;
-  pending_action?: { kind?: string; hitl_type?: unknown } | null;
-  resolved_at?: unknown;
-};
-
-const INPUT_PENDING_ACTION_KINDS = new Set<string>([
-  PendingActionKind.HUMAN_INPUT,
-  PendingActionKind.NEEDS_INPUT,
-  PendingActionKind.NEEDS_LOGIN,
-  PendingActionKind.TASK_RECOVERY,
-  PendingActionKind.RETRY_STRATEGIST_REVIEW,
-  PendingActionKind.WORKFLOW_INPUT,
-  PendingActionKind.WORKFLOW_STARTER_INPUT,
-  PendingActionKind.WORKFLOW_RETRY,
-]);
-
-export function assistantPendingActionKindForMessage(
-  message: AssistantPendingActionMessage,
-): AssistantPendingActionKind {
-  const unresolved = (message.hitl_requests || []).filter((request) => !request.resolved);
-  if (unresolved.some((request) => request.type === "approval")) return "approval";
-  if (unresolved.length > 0) return "input";
-  if (message.resolved_at || !message.pending_action?.kind) return null;
-  const hitlType = String(message.pending_action.hitl_type || "").toLowerCase();
-  if (hitlType === "error" || hitlType === "failure") return null;
-  return INPUT_PENDING_ACTION_KINDS.has(message.pending_action.kind)
-    ? "input"
-    : "approval";
-}
 
 function processStepToToolCall(step: AssistantProcessStep): ToolCall {
   const status =
@@ -801,7 +767,7 @@ function AssistantProcessBlock({
   openingText,
   progressByStepSeq,
   minimal = false,
-  pendingActionKind = null,
+  hasPendingAction = false,
   returnTo,
   subAgentRuns = [],
 }: {
@@ -809,7 +775,7 @@ function AssistantProcessBlock({
   openingText: string;
   progressByStepSeq: Map<number, string>;
   minimal?: boolean;
-  pendingActionKind?: AssistantPendingActionKind;
+  hasPendingAction?: boolean;
   returnTo?: string;
   subAgentRuns?: SubAgentEvent[];
 }) {
@@ -836,15 +802,13 @@ function AssistantProcessBlock({
     subAgentRunByStep.size > 0
       ? ""
       : processSurfaceSummary(steps.map((step) => step.name));
-  const title = pendingActionKind === "approval"
-    ? t("component.assistant_message_blocks.process_waiting_approval")
-    : pendingActionKind === "input"
-      ? t("component.assistant_message_blocks.process_waiting_input")
-      : hasRunning
-        ? t("component.assistant_message_blocks.processing")
-         : hasError
-           ? t("component.assistant_message_blocks.process_error")
-           : t("component.assistant_message_blocks.processed");
+  const title = hasRunning
+    ? t("component.assistant_message_blocks.processing")
+    : hasPendingAction
+      ? t("component.assistant_message_blocks.process_waiting_approval")
+    : hasError
+      ? t("component.assistant_message_blocks.process_error")
+      : t("component.assistant_message_blocks.processed");
 
   useEffect(() => {
     setExpanded(autoExpand);
@@ -968,7 +932,7 @@ export default function AssistantMessageBlocks({
   onResponseSurfaceSubmit,
   responseSurfaceSubmissionReceipts = [],
   sourceMessageId,
-  pendingActionKind = null,
+  hasPendingAction = false,
 }: {
   blocks?: AssistantBlock[] | null;
   content?: string | null;
@@ -984,8 +948,8 @@ export default function AssistantMessageBlocks({
     | Promise<void | boolean | ResponseSurfaceSubmissionResult>;
   responseSurfaceSubmissionReceipts?: ResponseSurfaceSubmissionReceipt[];
   sourceMessageId: string;
-  /** The persisted HITL/action state still waiting for the user. */
-  pendingActionKind?: AssistantPendingActionKind;
+  /** A persisted HITL/action is still waiting for the user. */
+  hasPendingAction?: boolean;
   /** Workspace chat: hide tool/step technical detail (args, results,
    *  thinking) — show only the agent's final text + a quiet step summary. */
   minimal?: boolean;
@@ -1054,7 +1018,7 @@ export default function AssistantMessageBlocks({
             openingText={openingText}
             progressByStepSeq={progressByStepSeq}
             minimal={minimal}
-            pendingActionKind={pendingActionKind}
+            hasPendingAction={hasPendingAction}
             returnTo={returnTo}
             subAgentRuns={subAgentRuns}
           />

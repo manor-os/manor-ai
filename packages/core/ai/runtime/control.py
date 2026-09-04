@@ -7,21 +7,7 @@ from typing import Any
 
 
 class RuntimeTurnAborted(ValueError):
-    """Stop a stale/invalid turn unless a different tool path remains safe.
-
-    ``allow_alternate_path`` is deliberately opt-in.  Runtime callers may set
-    it only when they know the failure happened before external I/O, so the
-    agent loop can keep working without repeating the failed approved action.
-    """
-
-    def __init__(
-        self,
-        message: str,
-        *,
-        allow_alternate_path: bool = False,
-    ) -> None:
-        super().__init__(message)
-        self.allow_alternate_path = allow_alternate_path
+    """Stop a stale/invalid turn instead of offering a tool error for LLM retry."""
 
 
 @dataclass(frozen=True)
@@ -61,12 +47,10 @@ class RuntimeAgentCheckpoint:
     remaining_tool_calls: list[dict[str, Any]] = field(default_factory=list)
     pending_attempt: int = 1
     seen_tool_result_digests: dict[str, str] = field(default_factory=dict)
-    disable_followup_tools: bool = False
-    tool_continuations: dict[str, dict[str, Any]] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "schema_version": 2,
+            "schema_version": 1,
             "messages": [dict(message) for message in self.messages],
             "usage": dict(self.usage),
             "rounds": self.rounds,
@@ -75,18 +59,11 @@ class RuntimeAgentCheckpoint:
             "remaining_tool_calls": [dict(item) for item in self.remaining_tool_calls],
             "pending_attempt": self.pending_attempt,
             "seen_tool_result_digests": dict(self.seen_tool_result_digests),
-            "disable_followup_tools": self.disable_followup_tools,
-            "tool_continuations": {
-                str(key): dict(item)
-                for key, item in self.tool_continuations.items()
-                if isinstance(item, dict)
-            },
         }
 
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> "RuntimeAgentCheckpoint":
-        schema_version = int(value.get("schema_version") or 0)
-        if schema_version not in {1, 2}:
+        if int(value.get("schema_version") or 0) != 1:
             raise ValueError("unsupported Runtime checkpoint schema")
         pending = value.get("pending_tool_call")
         if not isinstance(pending, dict) or not pending.get("id") or not pending.get("name"):
@@ -106,20 +83,6 @@ class RuntimeAgentCheckpoint:
                 str(key): str(item)
                 for key, item in dict(value.get("seen_tool_result_digests") or {}).items()
             },
-            disable_followup_tools=(
-                bool(value.get("disable_followup_tools"))
-                if schema_version >= 2
-                else False
-            ),
-            tool_continuations=(
-                {
-                    str(key): dict(item)
-                    for key, item in dict(value.get("tool_continuations") or {}).items()
-                    if isinstance(item, dict)
-                }
-                if schema_version >= 2
-                else {}
-            ),
         )
 
 

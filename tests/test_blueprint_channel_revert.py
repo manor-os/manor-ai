@@ -19,7 +19,6 @@ from packages.core.blueprints.upgrade import (
     revert,
 )
 from packages.core.models.base import generate_ulid
-from packages.core.models.channel import TwilioVoiceCallSession
 from packages.core.models.document import Channel
 from packages.core.models.workspace import Agent, AgentSubscription, Workspace
 from packages.core.services.channel_bindings import (
@@ -129,109 +128,6 @@ async def test_channel_only_upgrade_and_revert_restore_live_contract(db_session,
     readiness = await evaluate_workspace_blocking_setup(db_session, workspace)
     assert readiness is None or not readiness.blocks_work
     assert (await revert(db_session, workspace=workspace))["reason"] == "nothing to revert"
-
-
-async def test_blueprint_twilio_rebind_cancels_unconnected_call(db_session):
-    from packages.core.services.voice.call_sessions import create_call_session
-
-    workspace, account, subscription, payload = await _scenario(
-        db_session,
-        channel_type="twilio_voice",
-        bound=True,
-    )
-    binding = await load_channel_binding_for_config(db_session, account)
-    replacement = AgentSubscription(
-        entity_id=workspace.entity_id,
-        workspace_id=workspace.id,
-        agent_id=subscription.agent_id,
-        service_key="sales",
-        status="active",
-    )
-    db_session.add(replacement)
-    await db_session.flush()
-    pending, _ = await create_call_session(
-        db_session,
-        entity_id=workspace.entity_id,
-        channel_config_id=account.id,
-        owner_user_id=account.owner_user_id,
-        workspace_id=workspace.id,
-        direction="inbound",
-        call_sid="CA-blueprint-rebind",
-        from_number="+14155550199",
-        to_number="+14155550110",
-        agent_id=subscription.agent_id,
-        metadata={
-            "channel_binding_id": binding.id,
-            "agent_subscription_id": subscription.id,
-        },
-    )
-    pending_id = pending.id
-    payload["contract"]["channels"][0]["linked_service_key"] = "sales"
-
-    await _upgrade(db_session, workspace, account, payload)
-
-    db_session.expire_all()
-    saved_pending = await db_session.get(TwilioVoiceCallSession, pending_id)
-    assert saved_pending is not None
-    assert saved_pending.status == "canceled"
-
-
-@pytest.mark.parametrize("existing_before_upgrade", [False, True])
-async def test_blueprint_twilio_revert_cancels_unconnected_call(
-    db_session,
-    existing_before_upgrade,
-):
-    from packages.core.services.voice.call_sessions import create_call_session
-
-    workspace, account, subscription, payload = await _scenario(
-        db_session,
-        channel_type="twilio_voice",
-        bound=existing_before_upgrade,
-    )
-    current = copy.deepcopy(payload)
-    if existing_before_upgrade:
-        replacement = AgentSubscription(
-            entity_id=workspace.entity_id,
-            workspace_id=workspace.id,
-            agent_id=subscription.agent_id,
-            service_key="sales",
-            status="active",
-        )
-        db_session.add(replacement)
-        await db_session.flush()
-        current["contract"]["channels"][0]["linked_service_key"] = "sales"
-    else:
-        current["contract"]["channels"] = [_requirement("twilio_voice")]
-    await _upgrade(db_session, workspace, account, current)
-    binding = await load_channel_binding_for_config(db_session, account)
-    pending, _ = await create_call_session(
-        db_session,
-        entity_id=workspace.entity_id,
-        channel_config_id=account.id,
-        owner_user_id=account.owner_user_id,
-        workspace_id=workspace.id,
-        direction="inbound",
-        call_sid=f"CA-blueprint-revert-{existing_before_upgrade}",
-        from_number="+14155550199",
-        to_number="+14155550110",
-        agent_id=binding.agent_id,
-        metadata={
-            "channel_binding_id": binding.id,
-            "agent_subscription_id": binding.agent_subscription_id,
-        },
-    )
-    pending_id = pending.id
-
-    await revert(
-        db_session,
-        workspace=workspace,
-        by_user_id=account.owner_user_id,
-    )
-
-    db_session.expire_all()
-    saved_pending = await db_session.get(TwilioVoiceCallSession, pending_id)
-    assert saved_pending is not None
-    assert saved_pending.status == "canceled"
 
 
 @pytest.mark.parametrize("legacy_null_timestamp", [False, True])

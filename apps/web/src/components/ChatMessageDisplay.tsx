@@ -251,6 +251,7 @@ function pushReference(
     ? `${name}:${ref.previewUrl.length}:${ref.previewUrl.slice(-32)}`
     : "";
   const key = ref.document_id || openReference || ref.url || previewKey || name;
+  const normalized = key.toLowerCase();
   const candidate: ChatMessageDisplayReference = {
     key,
     name,
@@ -264,7 +265,7 @@ function pushReference(
     fsPath: ref.fsPath,
   };
   if (
-    references.some((item) => item.key === key)
+    references.some((item) => item.key.toLowerCase() === normalized)
     || filterGeneratedFileRecordsAlreadyRepresented([candidate], references).length === 0
   ) return;
   references.push(candidate);
@@ -331,9 +332,7 @@ export function chatMessageReferencesFromAttachments(
       mimeType: attachment.mimeType == null
         ? String(attachment.mime_type || "") || undefined
         : String(attachment.mimeType),
-      // These are file addresses, not thumbnails. Keep their identity even
-      // when a Document ID or an independent preview image is also present.
-      url: String(attachment.url || attachment.public_url || attachment.file_url || attachment.document_url || "") || undefined,
+      url: String(attachment.url || attachment.public_url || "") || undefined,
       previewUrl: attachment.previewUrl == null
         ? String(attachment.preview_url || attachment.file_url || attachment.document_url || "") || undefined
         : String(attachment.previewUrl),

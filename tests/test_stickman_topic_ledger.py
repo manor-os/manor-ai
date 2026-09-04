@@ -203,26 +203,6 @@ async def test_topic_ledger_is_append_only_and_rejects_normalized_duplicates(
     assert "Topics created or reserved: 2" in markdown
 
 
-@pytest.mark.asyncio
-async def test_topic_ledger_read_does_not_initialize_storage(tmp_path, monkeypatch):
-    module = _module()
-    storage_path = "Workspaces/_by_id/folder-1/topic-ledger"
-
-    async def resolve_directory(**_kwargs):
-        return SimpleNamespace(storage_path=storage_path)
-
-    async def initialize_directory(**_kwargs):
-        pytest.fail("A ledger read tried to initialize its Workspace directory")
-
-    monkeypatch.setattr(module, "resolve_workspace_artifact_directory", resolve_directory)
-    monkeypatch.setattr(module, "ensure_workspace_artifact_directory", initialize_directory)
-    monkeypatch.setattr(module, "runtime_entity_file_root", lambda _entity_id: str(tmp_path))
-    ledger = await module.read_topic_ledger(entity_id="entity-1", workspace_id="workspace-1")
-    assert ledger["used_topic_count"] == 0
-    assert ledger["topics"] == []
-    assert not (tmp_path / storage_path).exists()
-
-
 def test_live_ledger_document_requires_exact_blueprint_provenance() -> None:
     module = _module()
     matching = SimpleNamespace(metadata_={

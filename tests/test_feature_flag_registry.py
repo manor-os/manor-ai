@@ -38,12 +38,8 @@ def test_known_flags_are_unique_and_documented():
     keys = [k.key for k in KNOWN_FLAGS]
     assert len(keys) == len(set(keys)), "duplicate key in KNOWN_FLAGS"
     assert "strategist_review_v2" in keys
-    # Tool Discovery v2 graduated to the unconditional Runtime path; keeping
-    # its retired rollout flag here would misleadingly suggest it can be
-    # disabled for one tenant while the code no longer evaluates it.
-    assert "tool_discovery_v2" not in keys
+    assert "tool_discovery_v2" in keys
     assert "flows_preview_access" in keys
-    assert "apps_preview_access" in keys
     for known in KNOWN_FLAGS:
         assert known.description.strip(), f"{known.key} needs a description"
         assert len(known.description) <= 200
@@ -117,7 +113,7 @@ async def test_seed_does_not_resurrect_an_archived_flag(db_session):
     await db_session.commit()
 
     flag = (await db_session.execute(
-        select(FeatureFlag).where(FeatureFlag.key == "flows_preview_access")
+        select(FeatureFlag).where(FeatureFlag.key == "tool_discovery_v2")
     )).scalar_one()
     flag.status = "archived"
     await db_session.commit()
@@ -130,7 +126,7 @@ async def test_seed_does_not_resurrect_an_archived_flag(db_session):
     assert flag.status == "archived"
     # And exactly one row still — no duplicate "active" twin.
     count = len(list((await db_session.execute(
-        select(FeatureFlag).where(FeatureFlag.key == "flows_preview_access")
+        select(FeatureFlag).where(FeatureFlag.key == "tool_discovery_v2")
     )).scalars().all()))
     assert count == 1
 

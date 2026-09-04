@@ -2,7 +2,6 @@ export interface PresentationTextLevelStyle {
   align?: string;
   bullet?: string | null;
   indent?: number;
-  indentRight?: number;
   hanging?: number;
   lineSpacing?: number;
   spaceBefore?: number;
@@ -24,12 +23,20 @@ interface PresentationStyleResolvers {
 }
 
 /**
- * Convert points against a canonical 540pt slide. Each imported slide supplies
- * its actual-height scale, shared by text, insets, strokes and shadows. This
- * preserves physical proportions when a deck uses another canvas height.
+ * Convert PowerPoint points to the editor's canonical 540px slide height.
+ * The canonical slide is rendered at 75% of a 96-DPI, 7.5-inch-high slide,
+ * so the CSS 4/3 point conversion and the 3/4 display scale cancel out.
  */
 export function presentationPointsToCqh(points: number): string {
-  return `calc(${(points / 5.4).toFixed(3)}cqh * var(--pptx-point-scale, 1))`;
+  return `${(points / 5.4).toFixed(3)}cqh`;
+}
+
+/** Use a metrically compatible bundled font when Office fonts are unavailable. */
+export function presentationCompatibleFontFamily(typeface: string | undefined): string | undefined {
+  if (!typeface) return undefined;
+  const normalized = typeface.trim().toLowerCase();
+  if (normalized === "calibri" || normalized === "calibri light") return "Carlito";
+  return typeface;
 }
 
 function xmlAttr(xml: string, name: string): string | undefined {
@@ -94,7 +101,6 @@ function parseTextLevel(xml: string | undefined, resolvers: PresentationStyleRes
   const linePercent = lineSpacingXml?.match(/<a:spcPct\b[^>]*\bval="(\d+)"/i)?.[1];
   const linePoints = lineSpacingXml?.match(/<a:spcPts\b[^>]*\bval="(\d+)"/i)?.[1];
   const marginLeft = xmlAttr(xml, "marL");
-  const marginRight = xmlAttr(xml, "marR");
   const firstLineIndent = xmlAttr(xml, "indent");
   let bullet: string | null | undefined;
   if (/<a:buNone\b/i.test(xml)) bullet = null;
@@ -108,7 +114,6 @@ function parseTextLevel(xml: string | undefined, resolvers: PresentationStyleRes
     align: xmlAttr(xml, "algn"),
     bullet,
     indent: marginLeft == null ? undefined : parseInt(marginLeft, 10) / 12700,
-    indentRight: marginRight == null ? undefined : parseInt(marginRight, 10) / 12700,
     hanging: firstLineIndent == null ? undefined : parseInt(firstLineIndent, 10) / 12700,
     lineSpacing: linePercent
       ? parseInt(linePercent, 10) / 100000

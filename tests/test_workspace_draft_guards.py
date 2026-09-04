@@ -349,56 +349,6 @@ async def test_stream_commits_draft_shell_and_emits_exact_id_before_architect(
 
 
 @pytest.mark.asyncio
-async def test_workspace_draft_stream_keeps_quiet_architect_turn_connected(
-    monkeypatch: pytest.MonkeyPatch,
-):
-    from apps.api.routers import workspace_drafts
-
-    architect_started = asyncio.Event()
-    keep_running = asyncio.Event()
-
-    class FakeSession:
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *_exc):
-            return None
-
-    async def fake_process_message(_db, **_kwargs):
-        architect_started.set()
-        await keep_running.wait()
-        raise AssertionError("test should close the stream before completion")
-
-    monkeypatch.setattr(workspace_drafts, "async_session", FakeSession)
-    monkeypatch.setattr(
-        workspace_drafts.draft_service,
-        "process_draft_message",
-        fake_process_message,
-    )
-    monkeypatch.setattr(
-        workspace_drafts,
-        "_DRAFT_STREAM_KEEPALIVE_SECONDS",
-        0.01,
-    )
-
-    stream = workspace_drafts._stream_turn(
-        entity_id="entity",
-        user_id="creator",
-        draft_id="draft_exact",
-        user_message="Build a collaboration workspace",
-        mode="message",
-    )
-
-    assert "event: start" in await anext(stream)
-    keepalive = await asyncio.wait_for(anext(stream), timeout=0.2)
-
-    assert architect_started.is_set()
-    assert "event: keepalive" in keepalive
-    assert '"draft_id": "draft_exact"' in keepalive
-    await stream.aclose()
-
-
-@pytest.mark.asyncio
 async def test_workspace_draft_stream_releases_request_db_before_wrapping():
     from apps.api.routers import workspace_drafts
 

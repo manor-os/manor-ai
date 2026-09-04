@@ -259,48 +259,6 @@ async def test_managed_image_generation_uses_vercel_v4_protocol(monkeypatch):
     assert captured["payload"]["aspectRatio"] == "1:1"
 
 
-@pytest.mark.asyncio
-async def test_managed_stt_uses_vercel_transcription_protocol(monkeypatch):
-    from packages.core.services import model_gateway, vercel_ai_gateway
-    from packages.core.services.voice.whisper import transcribe_blob
-
-    monkeypatch.setenv("DEPLOYMENT_MODE", "cloud")
-
-    async def route(*_args, **kwargs):
-        assert kwargs.get("provider_chain") == ("vercel", "openai")
-        return ModelGatewayRoute(
-            api_key="vck_test",
-            base_url="https://ai-gateway.vercel.sh/v1",
-            provider="vercel",
-            source="official",
-            source_detail="VERCEL_OIDC_TOKEN",
-        )
-
-    captured = {}
-
-    async def gateway_post(**kwargs):
-        captured.update(kwargs)
-        return {
-            "text": "hello",
-            "durationInSeconds": 1.25,
-            "segments": [{"text": "hello", "startSecond": 0.1, "endSecond": 1.2}],
-        }
-
-    monkeypatch.setattr(model_gateway, "resolve_official_model_route", route)
-    monkeypatch.setattr(vercel_ai_gateway, "vercel_gateway_post", gateway_post)
-
-    result = await transcribe_blob(
-        b"audio-bytes",
-        mime="audio/webm",
-        resolved_model="openai/whisper-1",
-        require_timestamps=True,
-    )
-
-    assert result.text == "hello"
-    assert result.segments == [{"start": 0.1, "end": 1.2, "text": "hello"}]
-    assert captured["protocol"] == "transcription"
-    assert captured["auth_method"] == "oidc"
-    assert base64.b64decode(captured["payload"]["audio"]) == b"audio-bytes"
 
 
 @pytest.mark.asyncio

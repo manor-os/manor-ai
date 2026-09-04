@@ -212,10 +212,6 @@ def runtime_parse_editor_context(value: str | dict | None) -> dict | None:
             "supports_image_generation",
             "supportsImageGeneration",
         ),
-        "supports_native_file_patch": _get_bool(
-            "supports_native_file_patch",
-            "supportsNativeFilePatch",
-        ),
         "current_document_content": current_document_content,
     }
     return {
@@ -223,11 +219,7 @@ def runtime_parse_editor_context(value: str | dict | None) -> dict | None:
         for key, val in context.items()
         if val
         or (
-            key in {
-                "current_document_content",
-                "supports_image_generation",
-                "supports_native_file_patch",
-            }
+            key in {"current_document_content", "supports_image_generation"}
             and val is not None
         )
     }
@@ -238,10 +230,6 @@ def file_context_mounts_for_request(request) -> list[FileContextMount]:
     mounts: list[FileContextMount] = []
     if request.surface == ChatSurface.FILE_EDITOR_CHAT:
         path = editor_file_identity_from_context(editor_context)
-        supports_native_file_patch = bool(
-            editor_context.get("supportsNativeFilePatch")
-            or editor_context.get("supports_native_file_patch")
-        )
         metadata = {
             key: editor_context[key]
             for key in (
@@ -256,8 +244,6 @@ def file_context_mounts_for_request(request) -> list[FileContextMount]:
                 "editor_type",
                 "supportsImageGeneration",
                 "supports_image_generation",
-                "supportsNativeFilePatch",
-                "supports_native_file_patch",
             )
             if editor_context.get(key) is not None
         }
@@ -266,7 +252,7 @@ def file_context_mounts_for_request(request) -> list[FileContextMount]:
                 kind="current_editor_file",
                 path=path,
                 readable=True,
-                writable=supports_native_file_patch,
+                writable=False,
                 patch_only=True,
                 metadata=metadata,
             )
@@ -398,7 +384,7 @@ def runtime_allows_file_context_reader(
 def runtime_allows_file_context_writer(
     envelope: Any,
     *,
-    tool_name: str = "patch_file",
+    tool_name: str = "write_file",
     arguments: dict[str, Any] | None = None,
 ) -> bool:
     decision = check_file_context_policy(
@@ -425,12 +411,7 @@ def check_file_context_policy(
     if envelope is None:
         return None
 
-    from packages.core.ai.runtime.composite_tools import (
-        RuntimeCompositeToolCallFactory,
-    )
-
-    canonical_call = RuntimeCompositeToolCallFactory.create(tool_name, arguments)
-    name = canonical_call.tool_name
+    name = str(tool_name or "").strip()
     if name not in FILE_READ_TOOLS and name not in FILE_WRITE_TOOLS:
         return None
 
@@ -440,7 +421,7 @@ def check_file_context_policy(
     if not mounts and not strict_file_context:
         return None
 
-    args = canonical_call.arguments
+    args = arguments or {}
     if name in FILE_WRITE_TOOLS:
         return _check_file_write_policy(name=name, arguments=args, mounts=mounts)
     return _check_file_read_policy(
@@ -470,30 +451,22 @@ def _check_file_write_policy(
             paths=paths,
         )
 
-    patch_only_mounts = tuple(mount for mount in mounts if mount.patch_only)
-    if patch_only_mounts:
-        matching_patch_mounts = tuple(
-            mount
-            for mount in patch_only_mounts
-            if paths and all(_path_matches_mount(path, mount) for path in paths)
-        )
-        native_patch_allowed = (
-            name == "patch_file"
-            and bool(paths)
-            and any(mount.writable for mount in matching_patch_mounts)
-        )
-        if not native_patch_allowed:
+    if any(mount.patch_only for mount in mounts):
+        if paths:
             patch_only_paths = tuple(
                 path
                 for path in paths
-                if any(_path_matches_mount(path, mount) for mount in patch_only_mounts)
+                if any(_path_matches_mount(path, mount) and mount.patch_only for mount in mounts)
             )
+        else:
+            patch_only_paths = ()
+        if patch_only_paths or not any(mount.writable for mount in mounts):
             return FileContextPolicyDecision(
                 allowed=False,
                 code="file_context_patch_only",
                 reason=(
-                    "This file context only permits approval-gated patch_file operations "
-                    "against the exact writable editor mount; direct file writes are blocked."
+                    "This file context is patch-only. The runtime may inspect the "
+                    "mounted file and propose changes, but direct file writes are blocked."
                 ),
                 tool_name=name,
                 paths=patch_only_paths or paths,

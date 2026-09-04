@@ -19,7 +19,11 @@ logger = logging.getLogger(__name__)
 _MANUAL_SKILL_BASE_TOOL_NAMES = (
     "invoke_skill",
     "generate_file",
-    "sandbox",
+    "sandbox_exec",
+    "sandbox_read_file",
+    "sandbox_write_file",
+    "sandbox_save_result",
+    "sandbox_destroy",
 )
 
 

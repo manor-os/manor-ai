@@ -1033,7 +1033,7 @@ async def _handle_refactor_rename(params: dict, entity_id: str) -> str:
             "occurrences": len(lines),
             "files": sorted(files),
             "preview": "\n".join(lines[:20]),
-            "hint": "Set dry_run=false to apply the rename, or use patch_file for precise control.",
+            "hint": "Set dry_run=false to apply the rename, or use write_file for precise control.",
         }, ensure_ascii=False)
 
     for fpath in sorted(files):

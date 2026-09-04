@@ -299,11 +299,10 @@ async def resolve_usable_mcp_providers(
 ) -> frozenset[str]:
     """Batch 'which MCP servers can this user use right now'.
 
-    Used by Tool Discovery v2 search-time pre-filtering. Account-backed
-    providers share one credential-free, actor-scoped registry snapshot;
-    special first-party/platform/CLI providers still reuse
-    ``can_use_integration`` so their gates cannot drift from dispatch.
-    Failures fail-open for discovery only; execution always revalidates.
+    Used by search-time pre-filtering (tool_discovery_v2). Reuses
+    can_use_integration per provider so admin gating / first-party /
+    credential logic can't drift from the dispatch-time check. Failures
+    fail-open per provider (discovery-only surface; execution still gates).
 
     ``provider_keys`` is required (no default catalog import here): this
     file is a non-runtime production module and importing
@@ -314,42 +313,12 @@ async def resolve_usable_mcp_providers(
     runtime-owned and exempt from that scan) derives the provider keys
     from its own view of the tool schemas instead.
     """
-    canonical_keys = tuple(dict.fromkeys(
-        canonical
-        for key in provider_keys
-        if (canonical := canonical_provider_key(key))
-    ))
-    account_provider_keys = tuple(
-        key for key in canonical_keys
-        if provider_requires_integration_account_registry(key)
-    )
-    integration_registry: RuntimeIntegrationRegistry | None = None
-    registry_failed = False
-    if account_provider_keys:
-        try:
-            integration_registry = await load_runtime_integration_registry(
-                db,
-                user_id=user_id,
-                entity_id=entity_id,
-                provider_keys=account_provider_keys,
-            )
-        except Exception:
-            # Search-time filtering is advisory. A registry outage must not
-            # hide a potentially usable provider; the execution gate will
-            # reload the exact account and fail closed before provider I/O.
-            registry_failed = True
-
     usable: set[str] = set()
-    for key in canonical_keys:
-        if registry_failed and key in account_provider_keys:
-            usable.add(key)
-            continue
+    for key in provider_keys:
         try:
             decision = await can_use_integration(
                 db, user_id=user_id, entity_id=entity_id,
-                provider=key,
-                integration_registry=integration_registry,
-                allow_env_fallback=False,
+                provider=key, allow_env_fallback=False,
             )
             if decision.allowed:
                 usable.add(key)

@@ -38,11 +38,7 @@ _ACTION_KEY_CAPABILITY_ALIASES: dict[str, str] = {
     "delete_file": "file.write",
     "generate_file": "file.write",
     "sandbox_create": "sandbox.execute",
-    "sandbox": "sandbox.execute",
     "sandbox_exec": "sandbox.execute",
-    "sandbox_status": "sandbox.execute",
-    "sandbox_respond": "sandbox.execute",
-    "sandbox_cancel": "sandbox.execute",
     "sandbox_read_file": "sandbox.execute",
     "sandbox_write_file": "sandbox.execute",
     "sandbox_save_result": "sandbox.execute",
@@ -181,7 +177,7 @@ def runtime_capability_id_for_action_key(
         return "external.message"
     if key == "cli.exec":
         return "cli.execute"
-    if provider_key in {"chrome", "browser_mcp"}:
+    if provider_key in {"chrome", "browser_mcp", "local_browser", "browser"}:
         return "manor.composite"
     if resource in {"file", "workspace_file"}:
         return "file.write"
@@ -445,12 +441,7 @@ def runtime_event_from_tool_block_result(
         provider_approval_runtime_event_data,
     )
 
-    # Runtime events only need the provider approval's public projection. The
-    # durable continuation path receives the original typed arguments through
-    # ProviderApprovalCollector; this result-only path does not. Use an empty
-    # argument object here so legacy provider receipts still emit a truthful
-    # approval_required event without weakening persisted replay validation.
-    provider_approval = normalize_provider_approval(tool_name, {}, payload)
+    provider_approval = normalize_provider_approval(tool_name, None, payload)
     if provider_approval is not None:
         return RuntimeToolBlockEvent(
             type="approval_required",

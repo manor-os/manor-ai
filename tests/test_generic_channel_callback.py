@@ -62,24 +62,6 @@ class _Adapter:
         )
 
 
-class _EmailAttachmentAdapter(_Adapter):
-    async def parse_inbound(self, cc, *, headers, query, body):
-        return NormalizedInbound(
-            channel_type=cc.channel_type,
-            channel_config_id=cc.id,
-            entity_id=cc.entity_id,
-            source_id="alice@example.com",
-            reply_to="alice@example.com",
-            content="Please review",
-            attachments=[{
-                "filename": "resume.txt",
-                "content_type": "text/plain",
-                "data_base64": "candidates-private-bytes",
-            }],
-            external_message_id="message-1",
-        )
-
-
 def _request(body: bytes):
     from starlette.requests import Request
 
@@ -173,57 +155,6 @@ async def test_generic_non_wechat_integrity_error_is_not_duplicate_ack(monkeypat
             _request(b"{}"),
             config_id="cc-1",
         )
-
-
-@pytest.mark.asyncio
-async def test_generic_email_callback_forwards_attachments_to_worker(monkeypatch):
-    from apps.api.routers.channels import generic
-
-    events: list[str] = []
-    captured_payload = {}
-    captured_dispatch = {}
-    config = SimpleNamespace(
-        id="cc-1",
-        entity_id="entity-1",
-        channel_type="email",
-    )
-    sessions = iter([
-        _SessionContext(_Session(events, config=config)),
-        _SessionContext(_Session(events)),
-    ])
-    monkeypatch.setattr(generic, "async_session", lambda: next(sessions))
-    monkeypatch.setattr(
-        generic,
-        "get_adapter",
-        lambda _channel_type: _EmailAttachmentAdapter(),
-    )
-    monkeypatch.setattr(
-        generic,
-        "channel_credential_source_is_available",
-        lambda _db, _cc: _async_true(),
-    )
-
-    async def handle(_db, **kwargs):
-        captured_payload.update(kwargs["payload"])
-        return SimpleNamespace(id="receipt-1")
-
-    def delay(**kwargs):
-        captured_dispatch.update(kwargs)
-        events.append("delay")
-
-    monkeypatch.setattr(generic, "handle_inbound_message", handle)
-    monkeypatch.setattr(generic.dispatch_inbound_task, "delay", delay)
-
-    response = await generic.channel_callback(
-        "email",
-        _request(b"{}"),
-        config_id="cc-1",
-    )
-
-    assert response.status_code == 200
-    assert events == ["commit", "delay"]
-    assert captured_payload["attachments"][0]["filename"] == "resume.txt"
-    assert captured_dispatch["attachments"] == captured_payload["attachments"]
 
 
 async def _async_true() -> bool:

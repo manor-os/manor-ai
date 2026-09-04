@@ -56,27 +56,19 @@ from packages.core.ai.runtime.agentic_llm import (
     runtime_execute_agentic_round_tool_completion,
 )
 from packages.core.ai.runtime.policies import is_runtime_policy_denial
-from packages.core.ai.runtime.approval_classifier import classify_runtime_tool
 from packages.core.ai.runtime.control import (
     RuntimeAgentCheckpoint,
     RuntimeToolSuspension,
     RuntimeTurnAborted,
     is_runtime_tool_suspension,
 )
-from packages.core.ai.runtime.tool_effect_classification import RuntimeToolEffect
 from packages.core.ai.runtime.token_estimate import (
     runtime_estimate_tokens_for_text,
 )
-from packages.core.ai.runtime.streams import (
-    RUNTIME_TOOL_EXECUTOR_ERROR_PREFIX,
-    runtime_tool_allows_alternate_path,
-    runtime_tool_alternate_path_error_result,
-    runtime_tool_call_error,
-)
+from packages.core.ai.runtime.streams import RUNTIME_TOOL_EXECUTOR_ERROR_PREFIX
 from packages.core.ai.runtime.agentic_loop_prompts import (
     RUNTIME_AGENTIC_LLM_COMPACTION_PREFIX,
     runtime_agentic_auto_next_calls_message,
-    runtime_agentic_tool_error_final_prompt,
     runtime_agentic_empty_response_retry_message,
     runtime_agentic_is_structural_compaction_message,
     runtime_agentic_llm_compaction_prompt,
@@ -89,10 +81,6 @@ from packages.core.ai.runtime.agentic_loop_prompts import (
 from packages.core.contracts.json_schema import (
     SchemaContractError,
     SchemaContractValidatorFactory,
-)
-from packages.core.constants.integrations import (
-    INTEGRATION_ACCOUNT_CONTINUATION_ARGUMENT,
-    INTEGRATION_ACCOUNT_SELECTION_ARGUMENT,
 )
 
 logger = logging.getLogger(__name__)
@@ -115,33 +103,8 @@ _DUPLICATE_TOOL_RESULT_MAX_PREVIEW = 240
 _TOOL_CONTINUATION_KEY = "__manor_tool_continuation"
 _SERIAL_BROWSER_TOOL_PREFIXES = (
     "mcp__chrome__",
+    "mcp__local_browser__",
 )
-
-
-def _read_only_tools_for_alternate_path(
-    tools: list[dict[str, Any]],
-) -> list[dict[str, Any]]:
-    """Keep only tools proven read-only after an approved route fails pre-I/O.
-
-    A different write route needs a fresh user approval.  The current turn may
-    still inspect state, search, and gather evidence instead of terminating.
-    Empty arguments intentionally make argument-dependent tools fail closed.
-    """
-
-    read_only: list[dict[str, Any]] = []
-    for schema in tools:
-        name = str(schema.get("function", {}).get("name") or "").strip()
-        if not name:
-            continue
-        try:
-            classification = classify_runtime_tool(name, {})
-        except Exception:
-            continue
-        if classification.effect is RuntimeToolEffect.READ_ONLY:
-            read_only.append(schema)
-    return read_only
-
-
 RECENT_CHAT_MESSAGES_TO_KEEP = int(
     os.environ.get("LOOP_RECENT_CHAT_MESSAGES_TO_KEEP", "12")
 )
@@ -429,10 +392,6 @@ from packages.core.ai.terminal_stops import (  # noqa: E402  (re-exported for ca
 )
 _CJK_RE = re.compile(r"[\u3400-\u9fff]")
 _MEDIA_GENERATION_KINDS = {"image", "video", "audio"}
-_KNOWN_STOP_PARENT_FAILURE_REASONS = frozenset({
-    "chrome_cli_worker_not_paired",
-    "chrome_cli_worker_unavailable",
-})
 
 
 @dataclass
@@ -491,34 +450,6 @@ def _tool_call_name(tool_call: dict[str, Any]) -> str:
 def _tool_call_args(tool_call: dict[str, Any]) -> dict[str, Any]:
     args = tool_call.get("arguments")
     return args if isinstance(args, dict) else {}
-
-
-def _strip_inapplicable_integration_continuations(
-    tool_calls: list[dict[str, Any]],
-) -> None:
-    """Drop model-invented MCP cursors from single-account reads.
-
-    Continuation tokens are meaningful only for an explicit all-account call.
-    Programmatic callers remain fail-closed in the MCP dispatcher; this narrow
-    normalization applies only to model-produced tool calls before execution.
-    """
-
-    for tool_call in tool_calls:
-        if not _tool_call_name(tool_call).startswith("mcp__"):
-            continue
-        arguments = tool_call.get("arguments")
-        if not isinstance(arguments, dict):
-            continue
-        continuation = str(
-            arguments.get(INTEGRATION_ACCOUNT_CONTINUATION_ARGUMENT) or ""
-        ).strip()
-        selection = str(
-            arguments.get(INTEGRATION_ACCOUNT_SELECTION_ARGUMENT) or ""
-        ).strip().lower()
-        if continuation and selection != "all":
-            normalized = dict(arguments)
-            normalized.pop(INTEGRATION_ACCOUNT_CONTINUATION_ARGUMENT, None)
-            tool_call["arguments"] = normalized
 
 
 def _json_object_from_tool_result(result: Any) -> dict[str, Any] | None:
@@ -623,13 +554,6 @@ def _detect_terminal_tool_result(
         for tool_call, result in results:
             if not _tool_call_matches_terminal_rule(tool_call, rule):
                 continue
-            if runtime_tool_call_error(str(result)) is not None:
-                logger.warning(
-                    "[agentic_loop] terminal policy matched failed tool %s; "
-                    "returning the error to the model instead of ending the loop",
-                    _tool_call_name(tool_call),
-                )
-                continue
             if is_runtime_policy_denial(result):
                 # The rule matches on the tool NAME, so a call the runtime
                 # refused used to end the loop as a success anyway — the
@@ -664,74 +588,21 @@ def _detect_stop_parent_tool_result(
         )
         if not content:
             content = _localized_policy_text(parsed.get("notice"), user_message)
-        stop_reason = str(parsed.get("stop_reason") or SKILL_TERMINAL_STOP_REASON)
-        nested_control = (
-            parsed.get("control") if isinstance(parsed.get("control"), dict) else {}
-        )
-        nested_tool_error = nested_control.get("kind") == "tool_error"
-        nested_error_reason = str(
-            nested_control.get("error_reason") or ""
-        ).strip()
-        provider = (
-            "chrome"
-            if stop_reason in _KNOWN_STOP_PARENT_FAILURE_REASONS
-            else str(
-                nested_control.get("blocked_capability")
-                or parsed.get("server")
-                or ""
-            ).strip()
-        )
-        tool_error = runtime_tool_call_error(str(result))
-        is_failure = bool(
-            tool_error
-            or nested_tool_error
-            or parsed.get("terminal_failure")
-            or stop_reason in _KNOWN_STOP_PARENT_FAILURE_REASONS
-        )
-        setup_url = ""
-        requested_setup_url = str(
-            parsed.get("setup_url")
-            or nested_control.get("setup_url")
-            or ""
-        ).strip()
-        if provider and requested_setup_url:
-            from packages.core.ai.runtime.integration_setup_links import (
-                runtime_integration_setup_link,
-            )
-
-            expected_setup_url = runtime_integration_setup_link(provider).get(
-                "setup_url", ""
-            )
-            if requested_setup_url == expected_setup_url:
-                setup_url = expected_setup_url
         control = {
-            "terminal": not is_failure,
+            "terminal": True,
             "content": content,
-            "stop_reason": stop_reason,
-            "stop_parent": not is_failure,
+            "stop_reason": str(parsed.get("stop_reason") or SKILL_TERMINAL_STOP_REASON),
+            "stop_parent": True,
             "notice_key": parsed.get("notice_key"),
             "replace_visible_text": bool(parsed.get("replace_visible_text", True)),
             "source_tool": _tool_call_name(tool_call),
-            "provider": provider or None,
-            "blocked_capability": (
-                nested_control.get("blocked_capability")
-                or (provider if setup_url else None)
-            ),
-            "setup_url": setup_url or None,
         }
+        nested_control = parsed.get("control")
         for key in ("terminal_failure", "retryable"):
             if key in parsed:
                 control[key] = parsed[key]
-            elif key in nested_control:
+            elif isinstance(nested_control, dict) and key in nested_control:
                 control[key] = nested_control[key]
-        if is_failure:
-            control["tool_error"] = tool_error or content or stop_reason
-            control["tool_error_reason"] = nested_error_reason or stop_reason
-            if not (
-                control.get("terminal_failure") is True
-                and control.get("source_tool") == "invoke_skill"
-            ):
-                control["summarize_with_model"] = True
         return {key: value for key, value in control.items() if value is not None}
     return None
 
@@ -746,63 +617,6 @@ def _terminal_control_error(control: dict[str, Any]) -> str | None:
         or control.get("stop_reason")
         or "terminal_tool_failure"
     )
-
-
-def _tool_error_final_content(
-    content: str,
-    control: dict[str, Any],
-    user_message: "str | list[dict]",
-) -> str:
-    """Keep the model summary while guaranteeing its trusted setup action."""
-
-    final_content = str(content or "").strip() or str(control.get("content") or "").strip()
-    setup_url = str(control.get("setup_url") or "").strip()
-    if setup_url and f"]({setup_url})" not in final_content:
-        provider = str(control.get("provider") or "integration").strip()
-        label = (
-            f"打开 {provider} 设置"
-            if _CJK_RE.search(_message_text(user_message))
-            else f"Open {provider} settings"
-        )
-        final_content = f"{final_content}\n\n[{label}]({setup_url})".strip()
-    return final_content
-
-
-def _tool_error_completion_control(
-    terminal_control: dict[str, Any],
-) -> dict[str, Any]:
-    """Expose a failed tool without propagating terminal child-loop control."""
-
-    control = {
-        "kind": "tool_error",
-        "blocked_capability": terminal_control.get("blocked_capability"),
-        "error_reason": (
-            terminal_control.get("tool_error_reason")
-            or terminal_control.get("stop_reason")
-        ),
-        "source_tool": terminal_control.get("source_tool"),
-        "source_tools": terminal_control.get("source_tools"),
-        "setup_url": terminal_control.get("setup_url"),
-        "replace_visible_text": bool(
-            terminal_control.get("replace_visible_text", True)
-        ),
-    }
-    return {key: value for key, value in control.items() if value is not None}
-
-
-def _consecutive_tool_error_summary_control(
-    results: list[tuple[dict[str, Any], Any]],
-) -> dict[str, Any]:
-    source_tools = [
-        _tool_call_name(tool_call)
-        for tool_call, result in results
-        if runtime_tool_call_error(str(result)) is not None
-    ]
-    return {
-        "stop_reason": "consecutive_tool_errors",
-        "source_tools": [name for name in source_tools if name],
-        "replace_visible_text": True,
-    }
 
 
 def _media_generation_default_notice(kind: str, user_message: "str | list[dict]") -> str:
@@ -825,8 +639,6 @@ def _detect_forced_media_generation_result(
     notices: list[str] = []
     for tool_call, result in results:
         if _tool_call_name(tool_call) != "generate_file":
-            return None
-        if runtime_tool_call_error(str(result)) is not None:
             return None
 
         args = _tool_call_args(tool_call)
@@ -1096,7 +908,7 @@ def _auto_tool_calls_from_result(tool_result: dict[str, Any], loaded_tool_names:
         }]
     mode = str(tool_result.get("tool_mode") or "")
     ai_guided_recovery = (
-        mode == "ai_guided_browser"
+        mode == "ai_guided_local_browser"
         or status == "recovery_allowed"
         or tool_result.get("recovery_allowed") is True
     )
@@ -1115,27 +927,6 @@ def _auto_tool_calls_from_result(tool_result: dict[str, Any], loaded_tool_names:
             args = {}
         calls.append({"name": name, "arguments": args})
     return calls
-
-
-def _invoke_skill_schema_load_names(tool_result: dict[str, Any]) -> list[str]:
-    """Return the narrow schema handoff admitted by a Sandbox Skill result.
-
-    The Skill runtime emits this payload only after it creates a sandbox and
-    grants ``sandbox`` on the active Runtime envelope.  Keep the accepted set
-    fixed so a Skill result cannot load unrelated first-party tools.
-    """
-
-    if (
-        str(tool_result.get("status") or "") != "sandbox_ready"
-        or not str(tool_result.get("sandbox_id") or "").strip()
-    ):
-        return []
-    requested = {
-        str(name).strip()
-        for name in (tool_result.get("loaded_tools") or ())
-        if str(name or "").strip()
-    }
-    return ["sandbox"] if "sandbox" in requested else []
 
 
 def _pop_tool_continuation(args: dict[str, Any]) -> dict[str, Any] | None:
@@ -1894,52 +1685,17 @@ def _compact_search_tools_result_for_context(search_result: dict, loaded_tool_na
     of prompt tokens, especially when search_tools returns 5+ matches.
     """
     matches = search_result.get("matches") or []
-    matched_tool_names = [
+    matched_names = [
         str(match.get("name") or "")
         for match in matches
-        if isinstance(match, dict)
-        and match.get("name")
-        and match.get("kind") != "skill"
+        if isinstance(match, dict) and match.get("name")
     ]
     compact: dict[str, Any] = {
         "query": search_result.get("query"),
-        "matched_tools": matched_tool_names[:20],
+        "matched_tools": matched_names[:20],
         "loaded_tools": loaded_tool_names[:20],
     }
-    for key in (
-        "error",
-        "message",
-        "matched_rule",
-        "action_key",
-        "capability_id",
-        "tool",
-    ):
-        if key in search_result:
-            compact[key] = search_result[key]
-    matched_skills = [
-        {
-            key: match[key]
-            for key in (
-                "name",
-                "skill_id",
-                "slug",
-                "display_name",
-                "description",
-                "source",
-                "category",
-                "invoke_with",
-                "capability_role",
-                "companion_for",
-                "load_before_use",
-            )
-            if key in match
-        }
-        for match in matches
-        if isinstance(match, dict) and match.get("kind") == "skill"
-    ][:20]
-    if matched_skills:
-        compact["matched_skills"] = matched_skills
-    # Tool Discovery v2 (B1): servers[] is already a compact summary
+    # tool_discovery_v2 (B1): servers[] is already a compact summary
     # ({key, name, matched_tools, top_tools}, <=8 servers) — keep it as-is
     # so the model sees which server groups matched, not just a flat tool
     # list. suppressed_mcp explains WHY a strongly-related server's tools
@@ -1982,17 +1738,6 @@ def _compact_search_tools_result_for_context(search_result: dict, loaded_tool_na
             }
             for option in mcp_options[:8]
             if isinstance(option, dict)
-        ]
-    integration_setup = search_result.get("integration_setup") or []
-    if integration_setup:
-        compact["integration_setup"] = [
-            {
-                key: item[key]
-                for key in ("setup_url", "setup_hint")
-                if key in item
-            }
-            for item in integration_setup[:10]
-            if isinstance(item, dict)
         ]
     if search_result.get("hint"):
         compact["hint"] = search_result["hint"]
@@ -3760,7 +3505,6 @@ async def agentic_loop(
     )
     seen_auto_tool_calls: set[str] = set()
     pending_browser_visual_observations: list[dict[str, Any]] = []
-    pending_tool_error_summary: dict[str, Any] | None = None
     output_schema_retries = 0
     force_output_schema_repair = False
     MAX_CONSECUTIVE_TOOL_ERRORS = 10
@@ -3873,16 +3617,8 @@ async def agentic_loop(
         t0 = time.perf_counter()
         try:
             result = await tool_executor(name, _tool_executor_args(tool_call, attempt))
-        except RuntimeTurnAborted as exc:
-            if not exc.allow_alternate_path:
-                raise
-            result = runtime_tool_alternate_path_error_result(str(exc))
-            logger.warning(
-                "[agentic_loop] Approved path %s failed before external I/O; "
-                "continuing with read-only alternate paths: %s",
-                name,
-                exc,
-            )
+        except RuntimeTurnAborted:
+            raise
         except Exception as exc:
             result = f"{RUNTIME_TOOL_EXECUTOR_ERROR_PREFIX} ({name}): {exc}"
             logger.warning("[agentic_loop] Tool %s raised: %s", name, exc)
@@ -3932,8 +3668,6 @@ async def agentic_loop(
         pending_tool_call: dict[str, Any],
         remaining_tool_calls: list[dict[str, Any]],
         pending_attempt: int,
-        disable_followup_tools: bool = False,
-        tool_continuations: dict[str, dict[str, Any]] | None = None,
     ) -> AgenticResult:
         durable_checkpoint = RuntimeAgentCheckpoint(
             messages=[dict(message) for message in messages],
@@ -3944,8 +3678,6 @@ async def agentic_loop(
             remaining_tool_calls=[dict(item) for item in remaining_tool_calls],
             pending_attempt=pending_attempt,
             seen_tool_result_digests=dict(seen_tool_result_digests),
-            disable_followup_tools=disable_followup_tools,
-            tool_continuations=dict(tool_continuations or {}),
         )
         control = suspension.to_dict()
         control["checkpoint"] = durable_checkpoint.to_dict()
@@ -3960,14 +3692,7 @@ async def agentic_loop(
         )
 
     if checkpoint is not None:
-        # The checkpoint already owns the pending and remaining calls from the
-        # original turn. Runtime metadata is rebuilt on every worker resume, so
-        # retaining its forced calls would execute the same request twice.
-        forced_tool_calls = None
         resume_calls = [checkpoint.pending_tool_call, *checkpoint.remaining_tool_calls]
-        resumed_auto_tool_calls: list[dict[str, Any]] = []
-        resumed_calls_allow_alternate_path = bool(resume_calls)
-        loaded_tool_names = {t.get("function", {}).get("name") for t in tools}
         for index, tool_call in enumerate(resume_calls):
             if await _cancel_requested():
                 return _cancelled_result()
@@ -3979,56 +3704,11 @@ async def agentic_loop(
                     pending_tool_call=tool_call,
                     remaining_tool_calls=resume_calls[index + 1 :],
                     pending_attempt=attempt,
-                    disable_followup_tools=checkpoint.disable_followup_tools,
-                    tool_continuations=checkpoint.tool_continuations,
                 )
             _append_checkpoint_tool_result(tool_call, result)
-            resumed_calls_allow_alternate_path = (
-                resumed_calls_allow_alternate_path
-                and runtime_tool_allows_alternate_path(str(result))
-            )
-            continuation = checkpoint.tool_continuations.get(
-                str(tool_call.get("id") or "")
-            )
-            result_text = str(result or "").lstrip()
-            if result_text.startswith("{"):
-                try:
-                    tool_result = json.loads(result_text)
-                except (json.JSONDecodeError, TypeError):
-                    tool_result = None
-                if isinstance(tool_result, dict):
-                    retry_call = _retry_call_after_tool_continuation(
-                        tool_result,
-                        continuation,
-                        loaded_tool_names,
-                    )
-                    if retry_call:
-                        resumed_auto_tool_calls.append(retry_call)
-                    resumed_auto_tool_calls.extend(
-                        _auto_tool_calls_from_result(tool_result, loaded_tool_names)
-                    )
-        if resumed_auto_tool_calls:
-            auto_calls = _dedupe_auto_tool_calls(
-                resumed_auto_tool_calls,
-                seen=seen_auto_tool_calls,
-            )
-            forced_tool_calls = (
-                [
-                    {**call, "disable_followup_tools": True}
-                    for call in auto_calls
-                ]
-                if checkpoint.disable_followup_tools
-                else auto_calls
-            )
-        elif checkpoint.disable_followup_tools:
-            tools = (
-                _read_only_tools_for_alternate_path(tools)
-                if resumed_calls_allow_alternate_path
-                else []
-            )
         checkpoint = None
 
-    while rounds < max_rounds or pending_tool_error_summary is not None:
+    while rounds < max_rounds:
         if await _cancel_requested():
             return _cancelled_result()
         rounds += 1
@@ -4036,12 +3716,6 @@ async def agentic_loop(
         if forced_tool_calls:
             assistant_tool_calls = []
             forced_results = []
-            forced_tool_continuations: dict[str, dict[str, Any]] = {}
-            disable_followup_tools = any(
-                bool(forced.get("disable_followup_tools"))
-                for forced in forced_tool_calls
-                if isinstance(forced, dict)
-            )
             for idx, forced in enumerate(forced_tool_calls):
                 name = str(forced.get("name") or "").strip()
                 args = forced.get("arguments") or forced.get("args") or {}
@@ -4060,8 +3734,6 @@ async def agentic_loop(
                     "name": name,
                     "arguments": args,
                 }
-                if tool_continuation is not None:
-                    forced_tool_continuations[tool_call["id"]] = tool_continuation
                 assistant_tool_calls.append({
                     "id": tool_call["id"],
                     "type": "function",
@@ -4097,7 +3769,7 @@ async def agentic_loop(
                         remaining_args = (
                             dict(remaining_args) if isinstance(remaining_args, dict) else {}
                         )
-                        remaining_continuation = _pop_tool_continuation(remaining_args)
+                        _pop_tool_continuation(remaining_args)
                         remaining_call = {
                             "id": (
                                 f"auto_{rounds}_{remaining_idx}_"
@@ -4107,10 +3779,6 @@ async def agentic_loop(
                             "arguments": remaining_args,
                         }
                         remaining_tool_calls.append(remaining_call)
-                        if remaining_continuation is not None:
-                            forced_tool_continuations[remaining_call["id"]] = (
-                                remaining_continuation
-                            )
                         assistant_tool_calls.append(
                             {
                                 "id": remaining_call["id"],
@@ -4135,8 +3803,6 @@ async def agentic_loop(
                         pending_tool_call=tool_call,
                         remaining_tool_calls=remaining_tool_calls,
                         pending_attempt=1,
-                        disable_followup_tools=disable_followup_tools,
-                        tool_continuations=forced_tool_continuations,
                     )
                 tool_calls_made.append(name)
                 forced_results.append((tool_call, safe_result, tool_continuation))
@@ -4182,21 +3848,6 @@ async def agentic_loop(
                     or _detect_stop_parent_tool_result(compact_forced_results, user_message)
                 )
                 if terminal_control:
-                    if terminal_control.get("summarize_with_model"):
-                        pending_tool_error_summary = terminal_control
-                        tools = []
-                        messages.append({
-                            "role": "user",
-                            "content": runtime_agentic_tool_error_final_prompt(
-                                setup_url=str(terminal_control.get("setup_url") or ""),
-                            ),
-                        })
-                        logger.info(
-                            "[agentic_loop] Returning a forced-tool error to the model "
-                            "for a final no-tools summary: %s",
-                            terminal_control.get("stop_reason"),
-                        )
-                        continue
                     final_content = str(terminal_control.get("content") or "")
                     messages.append({
                         "role": "assistant",
@@ -4218,31 +3869,7 @@ async def agentic_loop(
                     )
                 auto_calls = _dedupe_auto_tool_calls(pending_auto_tool_calls, seen=seen_auto_tool_calls)
                 if auto_calls:
-                    forced_tool_calls = (
-                        [
-                            {**call, "disable_followup_tools": True}
-                            for call in auto_calls
-                        ]
-                        if disable_followup_tools
-                        else auto_calls
-                    )
-                elif disable_followup_tools:
-                    alternate_path_allowed = bool(forced_results) and all(
-                        runtime_tool_allows_alternate_path(str(result))
-                        for _, result, _ in forced_results
-                    )
-                    # Approval continuations are single-attempt by contract.
-                    # A proven pre-I/O failure may keep gathering evidence via
-                    # read-only tools; every write path still requires a fresh
-                    # user approval. Results from the current provider I/O or a
-                    # successful action disable all tools so no duplicate side
-                    # effect can occur; an earlier ambiguous claim may only be
-                    # reconciled through this read-only set.
-                    tools = (
-                        _read_only_tools_for_alternate_path(tools)
-                        if alternate_path_allowed
-                        else []
-                    )
+                    forced_tool_calls = auto_calls
                 continue
 
         # Compact before the LLM call as well as after tool results. This
@@ -4373,35 +4000,6 @@ async def agentic_loop(
         finish_reason = usage.get("finish_reason", "")
         usage_error = str(usage.get("error") or "").strip()
         if usage_error and not tool_calls:
-            if (
-                pending_tool_error_summary is not None
-                and pending_tool_error_summary.get("terminal_failure") is True
-            ):
-                terminal_control = pending_tool_error_summary
-                final_content = _tool_error_final_content(
-                    "",
-                    terminal_control,
-                    user_message,
-                )
-                messages.append({"role": "assistant", "content": final_content})
-                logger.info(
-                    "[agentic_loop] Preserving terminal tool failure after final "
-                    "summary call failed: %s",
-                    terminal_control.get("stop_reason"),
-                )
-                return AgenticResult(
-                    content=final_content,
-                    messages=messages,
-                    usage=total_usage,
-                    rounds=rounds,
-                    tool_calls_made=tool_calls_made,
-                    stop_reason=str(
-                        terminal_control.get("stop_reason")
-                        or SKILL_TERMINAL_STOP_REASON
-                    ),
-                    error=_terminal_control_error(terminal_control),
-                    control=terminal_control,
-                )
             logger.warning(
                 "[agentic_loop] Round %d: LLM call failed before tool execution: %s",
                 rounds, usage_error[:300],
@@ -4505,47 +4103,6 @@ async def agentic_loop(
             }
             _attach_reasoning_content(assistant_msg, reasoning_content)
             messages.append(assistant_msg)
-            if pending_tool_error_summary is not None:
-                terminal_control = pending_tool_error_summary
-                final_content = _tool_error_final_content(
-                    content or "",
-                    terminal_control,
-                    user_message,
-                )
-                if final_content != (content or ""):
-                    assistant_msg["content"] = final_content
-                logger.info(
-                    "[agentic_loop] Completed final no-tools summary after tool error: %s",
-                    terminal_control.get("stop_reason"),
-                )
-                completion_control = _tool_error_completion_control(
-                    terminal_control
-                )
-                if output_schema is not None:
-                    return AgenticResult(
-                        content=final_content,
-                        messages=messages,
-                        usage=total_usage,
-                        rounds=rounds,
-                        tool_calls_made=tool_calls_made,
-                        stop_reason="error",
-                        error="tool_error",
-                        error_detail={
-                            "reason": completion_control.get("error_reason"),
-                            "source_tool": completion_control.get("source_tool"),
-                            "source_tools": completion_control.get("source_tools"),
-                        },
-                        control=completion_control,
-                    )
-                return AgenticResult(
-                    content=final_content,
-                    messages=messages,
-                    usage=total_usage,
-                    rounds=rounds,
-                    tool_calls_made=tool_calls_made,
-                    stop_reason="completed",
-                    control=completion_control,
-                )
             validation_error = _output_schema_validation_error(
                 content,
                 output_schema,
@@ -4602,8 +4159,6 @@ async def agentic_loop(
             )
 
         # -- Has tool calls -> execute and loop --
-        _strip_inapplicable_integration_continuations(tool_calls)
-
         # 1. Append assistant message with tool_calls (OpenAI format).
         # OpenAI tolerates content=null when tool_calls is present, but
         # several OpenRouter providers (Novita, some Anthropic routes)
@@ -4737,19 +4292,27 @@ async def agentic_loop(
         #    this round returned an error, increment the counter and
         #    circuit-break after MAX_CONSECUTIVE_TOOL_ERRORS rounds.
         all_errors = all(
-            runtime_tool_call_error(str(res)) is not None
+            ('"error"' in str(res) or str(res).startswith("Tool error"))
             for _, res in results
         )
-        tool_error_budget_exhausted = False
         if all_errors and results:
             consecutive_tool_errors += 1
             if consecutive_tool_errors >= MAX_CONSECUTIVE_TOOL_ERRORS:
                 logger.warning(
                     "[agentic_loop] Circuit breaker: %d consecutive rounds with all tool errors. "
-                    "Forcing a final no-tools summary to avoid wasting tokens.",
+                    "Aborting loop to avoid wasting tokens.",
                     consecutive_tool_errors,
                 )
-                tool_error_budget_exhausted = True
+                return AgenticResult(
+                    content="I wasn't able to complete this task — my tool calls kept failing. "
+                            "This may be a permission or environment issue.",
+                    messages=messages,
+                    usage=total_usage,
+                    rounds=rounds,
+                    tool_calls_made=tool_calls_made,
+                    stop_reason="error",
+                    error="consecutive_tool_errors",
+                )
         else:
             consecutive_tool_errors = 0
 
@@ -4848,35 +4411,6 @@ async def agentic_loop(
                 try:
                     tool_result = json.loads(result_str.lstrip())
                     if isinstance(tool_result, dict):
-                        skill_load_names = (
-                            _invoke_skill_schema_load_names(tool_result)
-                            if tc["name"] == "invoke_skill"
-                            else []
-                        )
-                        if skill_load_names:
-                            schema_resolver = tool_schema_resolver
-                            try:
-                                from packages.core.ai.runtime.tool_registry import runtime_tool_schema
-                            except Exception:
-                                runtime_tool_schema = None
-                            for name in skill_load_names:
-                                schema = schema_resolver(name) if schema_resolver else None
-                                # The turn's original scoped resolver can only
-                                # see statically bound tools.  A verified
-                                # sandbox Skill handoff grants this one schema
-                                # after the turn starts, so resolve it from the
-                                # canonical registry when the scoped resolver
-                                # correctly returns no original binding.
-                                if schema is None and runtime_tool_schema is not None:
-                                    schema = runtime_tool_schema(name)
-                                loaded_name = (
-                                    schema.get("function", {}).get("name")
-                                    if isinstance(schema, dict)
-                                    else None
-                                )
-                                if loaded_name and loaded_name not in loaded_tool_names:
-                                    tools.append(schema)
-                                    loaded_tool_names.add(loaded_name)
                         next_calls = tool_result.get("recommended_next_calls") or []
                         load_names: list[str] = []
                         seen_next_tool_names: set[str] = set()
@@ -4944,21 +4478,6 @@ async def agentic_loop(
             or _detect_stop_parent_tool_result(results, user_message)
         )
         if terminal_control:
-            if terminal_control.get("summarize_with_model"):
-                pending_tool_error_summary = terminal_control
-                tools = []
-                messages.append({
-                    "role": "user",
-                    "content": runtime_agentic_tool_error_final_prompt(
-                        setup_url=str(terminal_control.get("setup_url") or ""),
-                    ),
-                })
-                logger.info(
-                    "[agentic_loop] Returning a tool error to the model for a final "
-                    "no-tools summary: %s",
-                    terminal_control.get("stop_reason"),
-                )
-                continue
             final_content = str(terminal_control.get("content") or "")
             messages.append({
                 "role": "assistant",
@@ -4978,17 +4497,6 @@ async def agentic_loop(
                 error=_terminal_control_error(terminal_control),
                 control=terminal_control,
             )
-
-        if tool_error_budget_exhausted:
-            pending_tool_error_summary = _consecutive_tool_error_summary_control(
-                results
-            )
-            tools = []
-            messages.append({
-                "role": "user",
-                "content": runtime_agentic_tool_error_final_prompt(),
-            })
-            continue
 
         if pending_auto_tool_calls:
             auto_calls = _dedupe_auto_tool_calls(pending_auto_tool_calls, seen=seen_auto_tool_calls)

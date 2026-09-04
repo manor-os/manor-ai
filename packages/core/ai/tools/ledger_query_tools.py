@@ -1144,10 +1144,7 @@ async def _visualize_workspace_ledgers(entity_id: str = "", **kwargs: Any) -> st
     if (
         allowed_contract_ids is not None
         and not allowed_contract_ids
-        and not {
-            "manor",
-            "visualize_workspace_ledgers",
-        }.intersection(context.allowed_tool_names)
+        and "visualize_workspace_ledgers" not in context.allowed_tool_names
     ):
         return _json(
             {
@@ -1222,13 +1219,10 @@ async def _visualize_workspace_ledgers(entity_id: str = "", **kwargs: Any) -> st
 
 
 def get_tools() -> list[tuple[dict[str, Any], Any]]:
-    return [(QUERY_LEDGER_SCHEMA, _query_ledger)]
-
-
-def get_legacy_tools() -> list[tuple[dict[str, Any], Any]]:
-    """Return the legacy Workspace visualization alias for persisted calls."""
-
-    return [(VISUALIZE_WORKSPACE_LEDGERS_SCHEMA, _visualize_workspace_ledgers)]
+    return [
+        (QUERY_LEDGER_SCHEMA, _query_ledger),
+        (VISUALIZE_WORKSPACE_LEDGERS_SCHEMA, _visualize_workspace_ledgers),
+    ]
 
 
 __all__ = ["get_tools"]

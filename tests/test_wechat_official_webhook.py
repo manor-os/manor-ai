@@ -232,21 +232,3 @@ async def test_wechat_official_health_exposes_unverifiable_callback_url(monkeypa
     assert "cannot verify" in result["wiring"]["detail"].lower()
 
 
-def test_wechat_official_blueprint_only_references_available_tools() -> None:
-    from packages.core.ai.mcp import wechat_official
-    from packages.core.blueprints.solo_company import get_solo_company_blueprint
-
-    available = {tool["name"] for tool in wechat_official.list_tools()}
-    workflow = next(
-        workflow
-        for workflow in get_solo_company_blueprint(
-            "solo-content-distribution-studio-v1"
-        )["recipe"]["workflows"]
-        if workflow["slug"] == "opc-publish-wechat-official-v1"
-    )
-    references = {
-        step["tool"].removeprefix("mcp__wechat_official__")
-        for step in workflow["steps"]
-        if step.get("tool", "").startswith("mcp__wechat_official__")
-    }
-    assert references <= available

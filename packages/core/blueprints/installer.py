@@ -575,40 +575,18 @@ async def _bind_blueprint_channel_configs(
             "linked_service_key": linked_service_key,
         }
         if existing_binding is not None:
-            target_agent_id = (
-                subscription.agent_id if subscription is not None else None
-            )
-            target_subscription_id = (
-                subscription.id if subscription is not None else None
-            )
-            if channel_type == "twilio_voice" and (
-                existing_binding.agent_id != target_agent_id
-                or existing_binding.agent_subscription_id
-                != target_subscription_id
-                or existing_binding.workspace_id != workspace.id
-                or existing_binding.status != "active"
-            ):
-                from packages.core.services.voice.call_sessions import (
-                    cancel_unconnected_call_sessions_for_binding,
-                )
-
-                await cancel_unconnected_call_sessions_for_binding(
-                    db,
-                    channel_config_id=channel_config.id,
-                    channel_binding_id=existing_binding.id,
-                    reason=(
-                        "Twilio Voice Blueprint binding changed before the call "
-                        "connected."
-                    ),
-                )
             existing_binding.name = str(
                 requirement.get("label")
                 or existing_binding.name
                 or channel_config.name
                 or channel_type
             )
-            existing_binding.agent_id = target_agent_id
-            existing_binding.agent_subscription_id = target_subscription_id
+            existing_binding.agent_id = (
+                subscription.agent_id if subscription is not None else None
+            )
+            existing_binding.agent_subscription_id = (
+                subscription.id if subscription is not None else None
+            )
             # Blueprint owns routing fields, not per-Workspace runtime options
             # such as the operator's language preference.
             existing_binding.config = {

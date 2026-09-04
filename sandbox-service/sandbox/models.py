@@ -24,29 +24,6 @@ class SandboxStatus(str, Enum):
     DESTROYED = "destroyed"
 
 
-class ExecutionStatus(str, Enum):
-    QUEUED = "queued"
-    RUNNING = "running"
-    COMPLETED = "completed"
-    FAILED = "failed"
-    CANCELLED = "cancelled"
-
-    @classmethod
-    def terminal(cls) -> set["ExecutionStatus"]:
-        return {cls.COMPLETED, cls.FAILED, cls.CANCELLED}
-
-
-class ExecutionEventType(str, Enum):
-    PROGRESS = "progress"
-    WARNING = "warning"
-    ERROR = "error"
-    NEED_INPUT = "need_input"
-    NEED_FILE = "need_file"
-    NEED_TOOL = "need_tool"
-    NEED_CREDENTIAL = "need_credential"
-    RESULT = "result"
-
-
 class WorkspaceAccess(str, Enum):
     NONE = "none"
     RO = "ro"
@@ -108,7 +85,6 @@ class SandboxInfo(BaseModel):
     last_used_at: float
     config: ContainerConfig
     active_command: Optional[str] = None
-    active_execution_id: Optional[str] = None
     expires_at: Optional[float] = None
 
 
@@ -151,47 +127,6 @@ class ExecResponse(BaseModel):
     stderr: str
     exit_code: int
     execution_id: Optional[str] = None
-
-
-class ExecutionStatusResponse(BaseModel):
-    sandbox_id: str
-    execution_id: str
-    status: ExecutionStatus
-    created_at: float
-    started_at: Optional[float] = None
-    finished_at: Optional[float] = None
-    stdout: Optional[str] = None
-    stderr: Optional[str] = None
-    exit_code: Optional[int] = None
-    error: Optional[str] = None
-    events: list["ExecutionEvent"] = Field(default_factory=list)
-    next_sequence: int = 0
-    waiting_for_response: bool = False
-
-
-class ExecutionEvent(BaseModel):
-    sequence: int = Field(..., ge=1)
-    event_id: str = Field(..., min_length=1, max_length=128)
-    type: ExecutionEventType
-    message: str = Field("", max_length=2000)
-    payload: dict = Field(default_factory=dict)
-    requires_response: bool = False
-    responded: bool = False
-    created_at: float
-
-
-class ExecutionResponseRequest(BaseModel):
-    event_id: str = Field(..., min_length=1, max_length=128)
-    payload: dict = Field(default_factory=dict)
-    message: str = Field("", max_length=2000)
-
-
-class ExecutionResponseAck(BaseModel):
-    sandbox_id: str
-    execution_id: str
-    event_id: str
-    accepted: bool
-    duplicate: bool = False
 
 
 class CancelExecutionResponse(BaseModel):

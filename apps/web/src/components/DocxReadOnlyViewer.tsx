@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState, type CSSProperties } from "react";
 import LoadingSpinner from "./ui/LoadingSpinner";
-import { sanitizeDocumentHtml, sanitizeManorDocumentRender } from "../lib/sanitizeDocumentHtml";
+import { sanitizeDocumentHtml } from "../lib/sanitizeDocumentHtml";
 import {
   paginateManorDocument,
   renderManorDocument,
@@ -41,7 +41,16 @@ export default function DocxReadOnlyViewer({
           const rendered = await renderManorDocument(buffer);
           if (cancelled) return;
           const sanitizeOptions = { allowDocxEditorAttributes: true, allowDocxLayoutStyles: true };
-          const safeRender = sanitizeManorDocumentRender(rendered, sanitizeOptions);
+          const safeRender = {
+            ...rendered,
+            html: sanitizeDocumentHtml(rendered.html, sanitizeOptions),
+            headerHtml: sanitizeDocumentHtml(rendered.headerHtml, sanitizeOptions),
+            footerHtml: sanitizeDocumentHtml(rendered.footerHtml, sanitizeOptions),
+            firstHeaderHtml: sanitizeDocumentHtml(rendered.firstHeaderHtml, sanitizeOptions),
+            firstFooterHtml: sanitizeDocumentHtml(rendered.firstFooterHtml, sanitizeOptions),
+            evenHeaderHtml: sanitizeDocumentHtml(rendered.evenHeaderHtml, sanitizeOptions),
+            evenFooterHtml: sanitizeDocumentHtml(rendered.evenFooterHtml, sanitizeOptions),
+          };
           setRender(safeRender);
           setHtml(safeRender.html);
         } else {

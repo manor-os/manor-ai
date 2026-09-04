@@ -158,14 +158,3 @@ def test_forced_image_is_terminal():
     results = _gen_file_result({"kind": "image", "result_url": "/api/v1/fs/e/i.png"})
     control = _detect_forced_media_generation_result(results, "make an image")
     assert control is not None and control.get("terminal") is True
-
-
-def test_forced_media_error_is_not_terminal():
-    results = _gen_file_result(
-        {
-            "kind": "image",
-            "status": "failed",
-            "error": "image provider unavailable",
-        }
-    )
-    assert _detect_forced_media_generation_result(results, "make an image") is None

@@ -188,40 +188,6 @@ def test_browse_server_lists_one_servers_tools():
     assert len(results) == 2
 
 
-def test_browse_server_resolves_integration_skill_slug_to_provider_key():
-    """A child Skill slug such as mcp_gmail is an identity, not a server
-    key. Runtime normalizes it to gmail before availability checks so a
-    connected Gmail account is not falsely reported disconnected."""
-    from packages.core.ai.runtime.tool_search import runtime_search_tool_candidates
-
-    pool = [
-        _schema("mcp__gmail__list_messages", "Search Gmail messages."),
-        _schema("mcp__gmail__get_message", "Read one Gmail message."),
-    ]
-    server_index = {
-        "gmail": {
-            "key": "gmail",
-            "name": "Gmail",
-            "description": "Read and send Gmail.",
-            "aliases": ("google mail",),
-            "tool_count": 2,
-        }
-    }
-
-    results, suppressed = runtime_search_tool_candidates(
-        tool_schemas=pool,
-        query="browse_server:mcp_gmail",
-        usable_providers=frozenset({"gmail"}),
-        server_index=server_index,
-    )
-
-    assert suppressed == []
-    assert {item["name"] for item in results} == {
-        "mcp__gmail__list_messages",
-        "mcp__gmail__get_message",
-    }
-
-
 def test_browse_server_unknown_key_reports_close_matches():
     from packages.core.ai.runtime.tool_search import runtime_search_tool_candidates
     from packages.core.ai.runtime.tool_discovery import runtime_server_index
@@ -322,38 +288,51 @@ def test_payload_gains_servers_section():
     assert "loaded_tools" in payload
 
 
-def test_exact_selector_miss_explains_non_fuzzy_recovery_path():
-    from packages.core.ai.runtime.tool_discovery import runtime_search_tools_payload
+async def _set_flag(db, key: str, *, enabled: bool) -> None:
+    """Canonical test-side flag setter — same pattern used by
+    tests/test_proposal_items.py, tests/test_strategist_decision_loop_e2e.py,
+    etc.: upsert the FeatureFlag row directly (there is no service-level
+    set_flag helper; create_flag()/set_default() exist but this direct
+    upsert is what every other test in this repo actually uses), then bump
+    the in-process eval cache."""
+    from sqlalchemy import select
 
-    payload = runtime_search_tools_payload(
-        matches=[],
-        query="select:mcp_gmail_search_messages",
-        total_tool_count=100,
-    )
+    from packages.core.models.feature_flag import FeatureFlag
+    from packages.core.services import feature_flags as feature_flags_service
 
-    assert "do not use fuzzy matching" in payload["hint"]
-    assert "browse_server:<provider_key>" in payload["hint"]
+    flag = (await db.execute(
+        select(FeatureFlag).where(FeatureFlag.key == key)
+    )).scalar_one_or_none()
+    if flag is None:
+        db.add(FeatureFlag(key=key, description="test", default_enabled=enabled))
+    else:
+        flag.default_enabled = enabled
+    await db.commit()
+    feature_flags_service._bump_cache()
 
 
 @pytest.mark.asyncio
-async def test_handler_end_to_end_v2_is_the_default(client: AsyncClient, caplog):
-    """Real-path integration test: v2 through the real handler, invoked with
-    the same call shape tool_pool.py's
+async def test_handler_end_to_end_with_flag_on(client: AsyncClient):
+    """Real-path integration test: flag on via the real feature_flags DB
+    row + the real handler, invoked with the same call shape tool_pool.py's
     _register_search_tools uses (arguments dict, not direct query/max_results
     kwargs — the plan's pseudocode signature was wrong on this point, see
     ToolPool._register_search_tools ~packages/core/ai/tool_pool.py:170-187),
     against the REAL registered tool schemas (not a synthetic pool), so this
-    is the honest end-to-end check that prefilter -> server-score ->
+    is the honest end-to-end check that flag -> prefilter -> server-score ->
     servers[] all thread through the real entry point."""
     _, user_id, entity_id = await _register_owner(client, "tdv2_e2e")
     import json
 
+    import packages.core.database as dbmod
     from packages.core.ai.runtime.tool_search import (
         runtime_execute_search_tools_handler,
     )
     from packages.core.ai.tool_pool import ToolPool
 
-    caplog.set_level("INFO", logger="packages.core.ai.runtime.tool_search")
+    async with dbmod.async_session() as db:
+        await _set_flag(db, "tool_discovery_v2", enabled=True)
+
     pool = ToolPool()
     pool.initialize()
 
@@ -374,14 +353,6 @@ async def test_handler_end_to_end_v2_is_the_default(client: AsyncClient, caplog)
     assert all(
         not m["name"].startswith("mcp__twitter_x__") for m in result["matches"]
     )
-    assert "performance" not in result  # telemetry consumes no model tokens
-    performance_records = [
-        record.message
-        for record in caplog.records
-        if record.message.startswith("tool_discovery.performance")
-    ]
-    assert performance_records
-    assert "'version': 'v2'" in performance_records[-1]
 
 
 def test_resolve_usable_mcp_providers_requires_provider_keys():
@@ -402,111 +373,8 @@ def test_resolve_usable_mcp_providers_requires_provider_keys():
 
 
 @pytest.mark.asyncio
-async def test_resolve_usable_mcp_providers_loads_account_registry_once(
-    monkeypatch,
-):
-    """External providers share one actor-scoped registry snapshot; special
-    providers keep their canonical decision path without concurrent use of
-    the same AsyncSession."""
-    from types import SimpleNamespace
-
-    from packages.core.services import agent_permission_service as service
-
-    registry = object()
-    registry_loads: list[tuple[str, ...]] = []
-    decisions: list[tuple[str, object | None]] = []
-
-    monkeypatch.setattr(
-        service,
-        "provider_requires_integration_account_registry",
-        lambda provider: provider in {"gmail", "slack"},
-    )
-
-    async def load_registry(_db, **kwargs):
-        registry_loads.append(tuple(kwargs["provider_keys"]))
-        return registry
-
-    async def decide(_db, **kwargs):
-        decisions.append((kwargs["provider"], kwargs.get("integration_registry")))
-        return SimpleNamespace(allowed=kwargs["provider"] != "slack")
-
-    monkeypatch.setattr(service, "load_runtime_integration_registry", load_registry)
-    monkeypatch.setattr(service, "can_use_integration", decide)
-
-    usable = await service.resolve_usable_mcp_providers(
-        object(),
-        user_id="user-1",
-        entity_id="entity-1",
-        provider_keys=["gmail", "slack", "manor_mcp_calendar", "gmail"],
-    )
-
-    assert registry_loads == [("gmail", "slack")]
-    assert decisions == [
-        ("gmail", registry),
-        ("slack", registry),
-        ("manor_mcp_calendar", registry),
-    ]
-    assert usable == frozenset({"gmail", "manor_mcp_calendar"})
-
-
-@pytest.mark.asyncio
-async def test_handler_loads_provider_scope_and_skills_in_parallel(monkeypatch):
-    import asyncio
-    import json
-
-    import packages.core.database as database
-    from packages.core.ai.runtime.tool_search import (
-        runtime_execute_search_tools_handler,
-    )
-    from packages.core.services import agent_permission_service
-
-    started: set[str] = set()
-    both_started = asyncio.Event()
-
-    async def rendezvous(name: str) -> None:
-        started.add(name)
-        if len(started) == 2:
-            both_started.set()
-        await asyncio.wait_for(both_started.wait(), timeout=1)
-
-    class SessionContext:
-        async def __aenter__(self):
-            return object()
-
-        async def __aexit__(self, *_args):
-            return False
-
-    async def usable(_db, **_kwargs):
-        await rendezvous("providers")
-        return frozenset()
-
-    async def skills():
-        await rendezvous("skills")
-        return []
-
-    monkeypatch.setattr(database, "async_session", SessionContext)
-    monkeypatch.setattr(
-        agent_permission_service,
-        "resolve_usable_mcp_providers",
-        usable,
-    )
-
-    payload = json.loads(await runtime_execute_search_tools_handler(
-        arguments={"query": "calendar"},
-        entity_id="entity-1",
-        user_id="user-1",
-        tool_schemas=(),
-        available_tool_names=(),
-        skill_descriptor_loader=skills,
-    ))
-
-    assert started == {"providers", "skills"}
-    assert payload["matches"] == []
-
-
-@pytest.mark.asyncio
 async def test_suggestion_channel_surfaces_unconnected_strong_match(client: AsyncClient):
-    """Review #3 (spec §A1 suggestion channel): twitter_x
+    """Review #3 (spec §A1 suggestion channel): flag on, twitter_x
     unconnected, query strongly names it ('post a tweet' -> 'tweet' alias).
     Before this fix, the A1 pre-filter silently dropped twitter_x entirely
     -> 'No tools matched', strictly worse than v1. After the fix: zero
@@ -517,10 +385,14 @@ async def test_suggestion_channel_surfaces_unconnected_strong_match(client: Asyn
     _, user_id, entity_id = await _register_owner(client, "tdv2_suggest")
     import json
 
+    import packages.core.database as dbmod
     from packages.core.ai.runtime.tool_search import (
         runtime_execute_search_tools_handler,
     )
     from packages.core.ai.tool_pool import ToolPool
+
+    async with dbmod.async_session() as db:
+        await _set_flag(db, "tool_discovery_v2", enabled=True)
 
     pool = ToolPool()
     pool.initialize()
@@ -555,17 +427,21 @@ async def test_suggestion_channel_surfaces_unconnected_strong_match(client: Asyn
 async def test_handler_select_of_unusable_provider_surfaces_unavailable_mcp(
     client: AsyncClient,
 ) -> None:
-    """Review #4, handler level: select: of an unconnected
+    """Review #4, handler level: flag on, select: of an unconnected
     provider's exact tool name -> the tool is present in unavailable_mcp
     with the connect hint (v1-parity), not silently dropped to 'No tools
     matched'."""
     _, user_id, entity_id = await _register_owner(client, "tdv2_select_unusable")
     import json
 
+    import packages.core.database as dbmod
     from packages.core.ai.runtime.tool_search import (
         runtime_execute_search_tools_handler,
     )
     from packages.core.ai.tool_pool import ToolPool
+
+    async with dbmod.async_session() as db:
+        await _set_flag(db, "tool_discovery_v2", enabled=True)
 
     pool = ToolPool()
     pool.initialize()
@@ -606,11 +482,15 @@ async def test_handler_browse_server_reports_shown_vs_total_tool_count(
     _, user_id, entity_id = await _register_owner(client, "tdv2_browse_total")
     import json
 
+    import packages.core.database as dbmod
     from packages.core.ai.runtime.tool_discovery import runtime_server_index
     from packages.core.ai.runtime.tool_search import (
         runtime_execute_search_tools_handler,
     )
     from packages.core.ai.tool_pool import ToolPool
+
+    async with dbmod.async_session() as db:
+        await _set_flag(db, "tool_discovery_v2", enabled=True)
 
     pool = ToolPool()
     pool.initialize()
@@ -641,6 +521,7 @@ async def test_handler_v2_discovers_bound_provider_without_static_schema(
     _, user_id, entity_id = await _register_owner(client, "tdv2_semantic_scope")
     import json
 
+    import packages.core.database as dbmod
     from packages.core.ai.runtime.envelope import RuntimeEnvelope
     from packages.core.ai.runtime.principals import RuntimePrincipal
     from packages.core.ai.runtime.profiles import RuntimeProfile
@@ -653,6 +534,9 @@ async def test_handler_v2_discovers_bound_provider_without_static_schema(
     )
     from packages.core.constants.runtime_principal import RuntimePrincipalKind
     from packages.core.services import agent_permission_service
+
+    async with dbmod.async_session() as db:
+        await _set_flag(db, "tool_discovery_v2", enabled=True)
 
     async def usable_providers(_db, **kwargs):
         assert set(kwargs["provider_keys"]) == {"stripe"}
@@ -727,6 +611,7 @@ async def test_handler_v2_does_not_probe_bound_but_unusable_provider(
     _, user_id, entity_id = await _register_owner(client, "tdv2_unusable_scope")
     import json
 
+    import packages.core.database as dbmod
     from packages.core.ai.runtime.envelope import RuntimeEnvelope
     from packages.core.ai.runtime.principals import RuntimePrincipal
     from packages.core.ai.runtime.profiles import RuntimeProfile
@@ -739,6 +624,9 @@ async def test_handler_v2_does_not_probe_bound_but_unusable_provider(
     )
     from packages.core.constants.runtime_principal import RuntimePrincipalKind
     from packages.core.services import agent_permission_service
+
+    async with dbmod.async_session() as db:
+        await _set_flag(db, "tool_discovery_v2", enabled=True)
 
     async def usable_providers(_db, **_kwargs):
         return frozenset()

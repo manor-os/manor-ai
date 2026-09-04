@@ -2,13 +2,7 @@ import { useState, useRef, useCallback, useEffect, useMemo } from "react";
 import { createPortal } from "react-dom";
 import { useLocation, useNavigate, useSearchParams } from "react-router-dom";
 import { useQuery, useMutation, useQueryClient, keepPreviousData } from "@tanstack/react-query";
-import {
-  ApiError,
-  api,
-  DocumentUploadAuthChangedError,
-  DocumentUploadStalledError,
-  type DocumentUploadProgress,
-} from "../lib/api";
+import { api } from "../lib/api";
 import { useToastStore } from "../stores/toast";
 import { useUpgradeStore } from "../stores/upgrade";
 import { useWorkspaceFilter } from "../stores/workspace";
@@ -45,12 +39,6 @@ import {
   type KnowledgeSortKey,
 } from "../lib/knowledgeLayout";
 import { useAuthStore } from "../stores/auth";
-import { authPrincipalKey, getAuthToken } from "../lib/authToken";
-import {
-  knowledgeUploadControllers,
-  useKnowledgeUploadStore,
-  type KnowledgeUploadItem,
-} from "../stores/knowledgeUploads";
 import {
   canDeleteDocument,
   canEditDocument,
@@ -67,37 +55,6 @@ import { isCodeLikeFile } from "../lib/codeFiles";
 import { t } from "../lib/i18n";
 
 type WikiMapLink = NonNullable<WikiMapPage["links"]>[number];
-
-function createKnowledgeUploadId(): string {
-  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
-    return crypto.randomUUID();
-  }
-  return `upload-${Date.now()}-${Math.random().toString(36).slice(2)}`;
-}
-
-function isUploadAbortError(error: unknown): boolean {
-  return (
-    (error instanceof DOMException && error.name === "AbortError")
-    || (
-      typeof error === "object"
-      && error !== null
-      && "name" in error
-      && (error as { name?: unknown }).name === "AbortError"
-    )
-  );
-}
-
-function uploadLimitErrorMessage(error: unknown, maxUploadMb: number | null): string {
-  if (error instanceof ApiError && error.code) {
-    return t(error.code, error.vars);
-  }
-  if (maxUploadMb !== null) {
-    return t("page.knowledge.file_too_large_max_mb", { max: maxUploadMb });
-  }
-  return error instanceof Error && error.message
-    ? error.message
-    : t("page.knowledge.upload_failed");
-}
 
 function escapeRegExp(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -507,15 +464,6 @@ const STYLES = `
   background: rgba(255,255,255,0.9);
   border-color: rgba(231,229,228,0.8);
   box-shadow: 0 4px 16px rgba(0,0,0,0.04);
-}
-.knowledge-page .kb-file-card.card-uploading {
-  cursor: default;
-  pointer-events: auto;
-}
-.kb-file-card.card-upload-failed {
-  cursor: default;
-  background: var(--surface-muted);
-  border-color: var(--border-default);
 }
 .kb-file-card-body {
   padding: 12px 16px 14px;
@@ -1394,7 +1342,7 @@ function DocumentMediaPreview({ doc, media }: { doc: any; media: { type: Knowled
     if (media.type !== "video" || !isVisible || !previewRequested || previewFailed) return undefined;
     let cancelled = false;
     let objectUrl: string | null = null;
-    api.documents.preview(doc.id)
+    api.documents.download(doc.id)
       .then((url) => {
         if (cancelled) {
           if (url.startsWith("blob:")) URL.revokeObjectURL(url);
@@ -1742,7 +1690,7 @@ function QuickLookPreview({ doc }: { doc: any }) {
         return undefined;
       }
     }
-    api.documents.preview(doc.id).then((url) => {
+    api.documents.download(doc.id).then((url) => {
       if (cancelled) {
         if (url.startsWith("blob:")) URL.revokeObjectURL(url);
         return;
@@ -1877,8 +1825,6 @@ export default function Knowledge() {
   const [searchParams, setSearchParams] = useSearchParams();
   const fileInputRef = useRef<HTMLInputElement>(null);
   const filePickerFolderIdRef = useRef<string | null | undefined>(undefined);
-  const recoveryFileInputRef = useRef<HTMLInputElement>(null);
-  const recoveryUploadIdRef = useRef<string | null>(null);
   const inlineFolderRef = useRef<HTMLInputElement>(null);
 
   const [search, setSearch] = useState(searchParams.get("q") || "");
@@ -2038,13 +1984,7 @@ export default function Knowledge() {
 
   // Drag and drop for moving files/folders between folders
   const [draggingItem, setDraggingItem] = useState<{ id: string; type: "file" | "folder"; name: string } | null>(null);
-  const allUploadingFiles = useKnowledgeUploadStore((state) => state.items);
-  const setUploadingFiles = useKnowledgeUploadStore((state) => state.setItems);
-  const uploadScopeId = `${currentUser?.entity_id || "anonymous"}:${currentUser?.id || "anonymous"}`;
-  const uploadingFiles = useMemo(
-    () => allUploadingFiles.filter((item) => item.scopeId === uploadScopeId),
-    [allUploadingFiles, uploadScopeId],
-  );
+  const [uploadingFiles, setUploadingFiles] = useState<string[]>([]);
   const [dragOverTarget, setDragOverTarget] = useState<string | null>(null);
 
   // Context menu
@@ -2072,14 +2012,6 @@ export default function Knowledge() {
     // (agents, other users, editors in other tabs), so re-check on focus.
     refetchOnWindowFocus: true,
   });
-  const maxUploadMb = (
-    typeof data?.max_upload_mb === "number"
-    && Number.isFinite(data.max_upload_mb)
-    && data.max_upload_mb > 0
-  ) ? data.max_upload_mb : null;
-  const maxUploadBytes = maxUploadMb === null
-    ? null
-    : maxUploadMb * 1024 * 1024;
 
   const inProgressDocumentIds = useMemo(
     () => ((data?.items || []) as Document[])
@@ -2275,98 +2207,28 @@ export default function Knowledge() {
     onError: () => { toast.error(t("page.knowledge.failed_to_rename_document")); },
   });
 
-  const uploadOne = useCallback(async (item: KnowledgeUploadItem): Promise<Document> => {
-    if (!item.file || authPrincipalKey(getAuthToken()) !== item.principalKey) {
-      throw new DocumentUploadAuthChangedError();
-    }
-    const controller = new AbortController();
-    knowledgeUploadControllers.set(item.id, controller);
-    setUploadingFiles((current) => current.map((entry) => (
-      entry.id === item.id
-        ? { ...entry, status: "uploading", progress: 0, error: null }
-        : entry
-    )));
-
-    const opts = item.options
-      ? {
-          visibility: item.options.visibility,
-          classification: item.options.classification,
-          client_visible: item.options.client_visible,
-        }
-      : undefined;
-    const onProgress = (progress: DocumentUploadProgress) => {
-      setUploadingFiles((current) => current.map((entry) => (
-        entry.id === item.id
-          ? {
-              ...entry,
-              status: progress.phase,
-              progress: progress.percent,
-              error: null,
-            }
-          : entry
-      )));
-    };
-
-    try {
-      const document = await api.documents.upload(
-        item.file,
-        item.folderId,
-        opts,
-        {
-          signal: controller.signal,
-          onProgress,
-          idempotencyKey: item.id,
-        },
-      );
-      setUploadingFiles((current) => current.filter((entry) => entry.id !== item.id));
-      return document;
-    } catch (error) {
-      if (isUploadAbortError(error)) {
-        setUploadingFiles((current) => current.filter((entry) => entry.id !== item.id));
-      } else {
-        setUploadingFiles((current) => current.map((entry) => (
-          entry.id === item.id
-            ? {
-                ...entry,
-                status: "failed",
-                error: error instanceof DocumentUploadStalledError
-                  ? "stalled"
-                  : error instanceof DocumentUploadAuthChangedError
-                    ? "identity_changed"
-                    : "failed",
-              }
-            : entry
-        )));
-      }
-      throw error;
-    } finally {
-      knowledgeUploadControllers.delete(item.id);
-    }
-  }, [setUploadingFiles]);
-
-  const runUploadBatch = useCallback(async (items: KnowledgeUploadItem[]) => {
-    const settled = await Promise.allSettled(items.map(uploadOne));
-    const results = settled.flatMap((result) => result.status === "fulfilled" ? [result.value] : []);
-    const errors = settled.flatMap((result) => (
-      result.status === "rejected" && !isUploadAbortError(result.reason) ? [result.reason] : []
-    ));
-    const processingStalled = errors.some((error) => (
-      error instanceof DocumentUploadStalledError && error.phase === "processing"
-    ));
-    const batchPrincipalKey = items[0]?.principalKey;
-    if (!batchPrincipalKey || authPrincipalKey(getAuthToken()) !== batchPrincipalKey) {
-      return;
-    }
-
-    if (results.length > 0 || processingStalled) {
-      await invalidateDocumentBrowseAndFolderTree();
-      if (authPrincipalKey(getAuthToken()) !== batchPrincipalKey) return;
+  const uploadMutation = useMutation({
+    mutationFn: ({ files, folderId, options }: {
+      files: File[];
+      folderId?: string | null;
+      options?: UploadOptionsValue;
+    }) => {
+      setUploadingFiles(files.map((f) => f.name));
+      const opts = options
+        ? {
+            visibility: options.visibility,
+            classification: options.classification,
+            client_visible: options.client_visible,
+          }
+        : undefined;
+      return Promise.all(files.map((f) => api.documents.upload(f, folderId, opts)));
+    },
+    onSuccess: (results) => {
+      setUploadingFiles([]);
+      invalidateDocumentBrowseAndFolderTree();
       queryClient.invalidateQueries({ queryKey: ["fs-wiki-index"] });
-    }
-    if (results.length > 0) {
-      const piiUpgraded = results.filter((document) => (
-        document?.pii_detected && document?.classification === "confidential"
-      ));
+      // DLP feedback: if server auto-upgraded classification due to PII, tell the user
+      const piiUpgraded = results.filter((d) => d?.pii_detected && d?.classification === "confidential");
       if (piiUpgraded.length > 0) {
         toast.success(
           piiUpgraded.length === 1
@@ -2374,216 +2236,15 @@ export default function Knowledge() {
             : t("page.knowledge.pii_upgrade_multi", { count: piiUpgraded.length }),
         );
       } else {
-        toast.success(
-          results.length > 1
-            ? `${results.length} ${t("page.knowledge.documents_uploaded")}`
-            : t("page.knowledge.document_uploaded"),
-        );
+        toast.success(results.length > 1 ? `${results.length} ${t("page.knowledge.documents_uploaded")}` : t("page.knowledge.document_uploaded"));
       }
-    }
-
-    if (errors.length > 0) {
-      const tooLargeError = errors.find((error: any) => error?.status === 413);
-      const message = tooLargeError
-        ? uploadLimitErrorMessage(tooLargeError, maxUploadMb)
-        : errors.some((error) => error instanceof DocumentUploadStalledError)
-          ? t("page.knowledge.upload_stalled")
-          : t("page.knowledge.upload_failed");
-      toast.error(message);
-    }
-  }, [invalidateDocumentBrowseAndFolderTree, maxUploadMb, queryClient, toast, uploadOne]);
-
-  useEffect(() => {
-    const currentPrincipalKey = authPrincipalKey(getAuthToken());
-    uploadingFiles
-      .filter((item) => (
-        item.status === "processing"
-        && item.file === null
-        && item.principalKey === currentPrincipalKey
-        && !knowledgeUploadControllers.has(item.id)
-      ))
-      .forEach((item) => {
-        const controller = new AbortController();
-        knowledgeUploadControllers.set(item.id, controller);
-        void api.documents.reconcileUploadReceipt(item.id, { signal: controller.signal })
-          .then(async (document) => {
-            if (authPrincipalKey(getAuthToken()) !== item.principalKey) return;
-            setUploadingFiles((current) => current.filter((entry) => entry.id !== item.id));
-            await invalidateDocumentBrowseAndFolderTree();
-            if (authPrincipalKey(getAuthToken()) !== item.principalKey) return;
-            queryClient.invalidateQueries({ queryKey: ["fs-wiki-index"] });
-            toast.success(
-              document.pii_detected && document.classification === "confidential"
-                ? t("page.knowledge.pii_upgrade_single", { name: document.name })
-                : t("page.knowledge.document_uploaded"),
-            );
-          })
-          .catch((error) => {
-            if (
-              isUploadAbortError(error)
-              || error instanceof DocumentUploadAuthChangedError
-            ) {
-              setUploadingFiles((current) => current.filter((entry) => entry.id !== item.id));
-              return;
-            }
-            setUploadingFiles((current) => current.map((entry) => (
-              entry.id === item.id
-                ? {
-                    ...entry,
-                    status: "failed",
-                    error: error instanceof DocumentUploadStalledError ? "stalled" : "failed",
-                  }
-                : entry
-            )));
-            if (authPrincipalKey(getAuthToken()) === item.principalKey) {
-              toast.error(
-                error instanceof DocumentUploadStalledError
-                  ? t("page.knowledge.upload_stalled")
-                  : t("page.knowledge.upload_failed"),
-              );
-            }
-          })
-          .finally(() => {
-            knowledgeUploadControllers.delete(item.id);
-          });
-      });
-  }, [
-    invalidateDocumentBrowseAndFolderTree,
-    queryClient,
-    setUploadingFiles,
-    toast,
-    uploadingFiles,
-  ]);
-
-  const startUploads = useCallback((
-    files: File[],
-    folderId?: string | null,
-    options?: UploadOptionsValue,
-  ) => {
-    const accepted = maxUploadBytes === null
-      ? files
-      : files.filter((file) => file.size <= maxUploadBytes);
-    if (accepted.length !== files.length) {
-      toast.error(t("page.knowledge.file_too_large_max_mb", { max: maxUploadMb! }));
-    }
-    if (accepted.length === 0) return;
-
-    // Uploads are persisted to a concrete Knowledge folder, not to a search,
-    // Workspace filter, or library section. Reveal that target before starting
-    // so progress, failure, retry, and transfer cancellation remain reachable.
-    const targetFolderId = normalizeKnowledgeFolderId(folderId);
-    const targetIsVisible = (
-      !selectedWorkspaceId
-      && librarySection === "all"
-      && !isSearching
-      && normalizeKnowledgeFolderId(currentFolderId) === targetFolderId
-    );
-    if (!targetIsVisible) {
-      setSelectedWorkspaceId(null);
-      setLibrarySection("all");
-      setSearch("");
-      const targetFolder = targetFolderId
-        ? (folders as any[]).find((folder: any) => folder.id === targetFolderId)
-        : null;
-      setFolderPath(targetFolder ? buildFolderPath(targetFolder, folders as any[]) : []);
-      updateKnowledgeUrl({
-        folderId: targetFolderId,
-        workspaceId: null,
-        section: "all",
-        search: null,
-      }, true);
-    }
-
-    const items = accepted.map<KnowledgeUploadItem>((file) => ({
-      id: createKnowledgeUploadId(),
-      scopeId: uploadScopeId,
-      principalKey: authPrincipalKey(getAuthToken()),
-      file,
-      fileName: file.name,
-      fileSize: file.size,
-      folderId,
-      options,
-      status: "uploading",
-      progress: 0,
-      error: null,
-      createdAt: Date.now(),
-    }));
-    setUploadingFiles((current) => [...current, ...items]);
-    void runUploadBatch(items);
-  }, [
-    currentFolderId,
-    folders,
-    isSearching,
-    librarySection,
-    maxUploadBytes,
-    maxUploadMb,
-    runUploadBatch,
-    selectedWorkspaceId,
-    toast,
-    uploadScopeId,
-    updateKnowledgeUrl,
-  ]);
-
-  const handleRecoveryFileSelection = useCallback((files: FileList | null) => {
-    const uploadId = recoveryUploadIdRef.current;
-    recoveryUploadIdRef.current = null;
-    const file = files?.item(0) || null;
-    if (!uploadId || !file) return;
-    const item = uploadingFiles.find((entry) => entry.id === uploadId);
-    if (
-      !item
-      || item.status !== "failed"
-      || item.file !== null
-      || item.principalKey !== authPrincipalKey(getAuthToken())
-    ) return;
-    if (file.name !== item.fileName || file.size !== item.fileSize) {
-      toast.error(t("page.knowledge.select_original_file_mismatch", { name: item.fileName }));
-      return;
-    }
-    const retryItem: KnowledgeUploadItem = {
-      ...item,
-      file,
-      status: "uploading",
-      progress: 0,
-      error: null,
-    };
-    setUploadingFiles((current) => current.map((entry) => (
-      entry.id === retryItem.id ? retryItem : entry
-    )));
-    void runUploadBatch([retryItem]);
-  }, [runUploadBatch, setUploadingFiles, toast, uploadingFiles]);
-
-  const retryUpload = useCallback((id: string) => {
-    if (knowledgeUploadControllers.has(id)) return;
-    const item = uploadingFiles.find((entry) => entry.id === id);
-    if (!item || item.status !== "failed") return;
-    if (!item.file) {
-      recoveryUploadIdRef.current = item.id;
-      recoveryFileInputRef.current?.click();
-      return;
-    }
-    void runUploadBatch([item]);
-  }, [runUploadBatch, uploadingFiles]);
-
-  const cancelUpload = useCallback((id: string) => {
-    const controller = knowledgeUploadControllers.get(id);
-    if (controller) controller.abort();
-    else setUploadingFiles((current) => current.filter((entry) => entry.id !== id));
-  }, [setUploadingFiles]);
-
-  const dismissUpload = useCallback((id: string) => {
-    setUploadingFiles((current) => current.filter((entry) => entry.id !== id));
-  }, [setUploadingFiles]);
-
-  const visibleUploadingFiles = useMemo(() => {
-    if (selectedWorkspaceId || librarySection !== "all" || isSearching) return [];
-    const visibleFolderId = normalizeKnowledgeFolderId(currentFolderId);
-    return uploadingFiles.filter((item) => (
-      item.principalKey === authPrincipalKey(getAuthToken())
-      &&
-      normalizeKnowledgeFolderId(item.folderId) === visibleFolderId
-    ));
-  }, [currentFolderId, isSearching, librarySection, selectedWorkspaceId, uploadingFiles]);
+    },
+    onError: (err: any) => {
+      setUploadingFiles([]);
+      const msg = err?.status === 413 ? t("page.knowledge.file_too_large_max_500mb") : t("page.knowledge.upload_failed");
+      toast.error(msg);
+    },
+  });
 
   // ── Upload-options wizard (cloud-drive style: ask before upload) ──
   const [pendingUploadFiles, setPendingUploadFiles] = useState<File[]>([]);
@@ -3905,9 +3566,7 @@ export default function Knowledge() {
               {folderCount > 0 && <span>{folderCount} {t("page.knowledge.folder")}{folderCount !== 1 ? "s" : ""}</span>}
               {folderCount > 0 && fileCount > 0 && <span className="w-[3px] h-[3px] rounded-full bg-stone-300" />}
               {fileCount > 0 && <span>{fileCount} {t("page.knowledge.file")}{fileCount !== 1 ? "s" : ""}</span>}
-              {folderCount === 0 && fileCount === 0 && visibleUploadingFiles.length === 0 && !isLoading && (
-                <span>{t("page.knowledge.empty_folder")}</span>
-              )}
+              {folderCount === 0 && fileCount === 0 && !isLoading && <span>{t("page.knowledge.empty_folder")}</span>}
               {wikiIndex && (
                 <button type="button" className="kb-wiki-map-pill" onClick={() => setShowWikiMap(true)}>
                   <IconFlow size={13} />
@@ -3922,7 +3581,6 @@ export default function Knowledge() {
               ref={fileInputRef}
               type="file"
               multiple
-              aria-label="Choose upload file"
               className="hidden"
               onChange={(e) => {
                 const folderId = filePickerFolderIdRef.current === undefined
@@ -3931,16 +3589,6 @@ export default function Knowledge() {
                 handleFiles(e.target.files, folderId);
                 filePickerFolderIdRef.current = undefined;
                 e.currentTarget.value = "";
-              }}
-            />
-            <input
-              ref={recoveryFileInputRef}
-              type="file"
-              aria-label={t("page.knowledge.select_original_file")}
-              className="hidden"
-              onChange={(event) => {
-                handleRecoveryFileSelection(event.target.files);
-                event.currentTarget.value = "";
               }}
             />
 
@@ -3989,12 +3637,7 @@ export default function Knowledge() {
                 <div style={{ padding: "16px" }}>
                   <SkeletonTable rows={6} cols={4} />
                 </div>
-              ) : (
-                foldersAtLevel.length === 0
-                && allDocuments.length === 0
-                && visibleUploadingFiles.length === 0
-                && !creatingFolder
-              ) ? (
+              ) : (foldersAtLevel.length === 0 && allDocuments.length === 0 && !creatingFolder) ? (
                 <div className="kb-empty-folder-shell">
                   <div
                     className={`kb-empty-folder-panel${canAddToCurrentFolder ? " can-upload" : ""}${dragOver ? " is-drag-over" : ""}`}
@@ -4032,7 +3675,7 @@ export default function Knowledge() {
                       </svg>
                     </div>
                     <h3 className="kb-empty-folder-title">
-                      {t("page.knowledge.empty_folder")}
+                      {uploadMutation.isPending ? t("page.knowledge.uploading") : t("page.knowledge.empty_folder")}
                     </h3>
                     <p className="kb-empty-folder-copy">
                       {canAddToCurrentFolder
@@ -4188,23 +3831,15 @@ export default function Knowledge() {
                       </h3>
                       <span className="kb-section-count">{fileCount} {t("page.knowledge.file")}{fileCount !== 1 ? "s" : ""}</span>
                     </div>
-                    {allDocuments.length === 0 && visibleUploadingFiles.length === 0 ? (
+                    {allDocuments.length === 0 && uploadingFiles.length === 0 ? (
                       <p className="kb-section-empty">{t("page.knowledge.no_files_in_current_folder")}</p>
                     ) : (
                       <div className="grid grid-cols-[repeat(auto-fill,minmax(220px,1fr))] gap-4">
                         {/* Uploading placeholder cards */}
-                        {visibleUploadingFiles.map((upload) => {
-                          const typeInfo = getFileTypeInfo(upload.fileName);
-                          const isFailed = upload.status === "failed";
-                          const retryLabel = upload.file
-                            ? t("page.knowledge.retry_upload")
-                            : t("page.knowledge.select_original_file");
+                        {uploadingFiles.map((name) => {
+                          const typeInfo = getFileTypeInfo(name);
                           return (
-                            <div
-                              key={upload.id}
-                              className={`kb-file-card ${isFailed ? "card-upload-failed" : "card-uploading"}`}
-                              style={{ position: "relative" }}
-                            >
+                            <div key={`uploading-${name}`} className="kb-file-card card-uploading" style={{ position: "relative" }}>
                               <div
                                 className="w-full flex items-center justify-center"
                                 style={{ aspectRatio: "16/10", background: typeInfo.bg }}
@@ -4212,72 +3847,12 @@ export default function Knowledge() {
                                 <span className="text-2xl font-black tracking-wide" style={{ color: typeInfo.color, opacity: 0.7 }}>{typeInfo.icon}</span>
                               </div>
                               <div className="kb-file-card-body">
-                                <p className="text-[13px] font-semibold text-stone-800 mb-1 truncate">{upload.fileName}</p>
+                                <p className="text-[13px] font-semibold text-stone-800 mb-1 truncate">{name}</p>
                                 <div className="flex items-center gap-2 mb-2">
-                                  <span className="text-[11px] text-stone-400">{formatFileSize(upload.fileSize)}</span>
-                                  {!isFailed && upload.status === "uploading" && (
-                                    <>
-                                      <span className="w-[3px] h-[3px] rounded-full bg-stone-300" />
-                                      <span className="text-[11px] font-mono text-stone-500">{upload.progress}%</span>
-                                    </>
-                                  )}
+                                  <span className="text-[11px] text-stone-400">--</span>
                                 </div>
-                                {isFailed ? (
-                                  <div className="flex items-center justify-between gap-2">
-                                    <StatusBadge type="danger" dot>
-                                      {upload.error === "stalled"
-                                        ? t("page.knowledge.upload_stalled_short")
-                                        : t("page.knowledge.upload_failed")}
-                                    </StatusBadge>
-                                    <div className="flex items-center gap-1">
-                                      <Button size="sm" variant="ghost" onClick={() => retryUpload(upload.id)}>
-                                        {upload.file ? <IconRefresh size={13} /> : <IconUpload size={13} />}
-                                        {retryLabel}
-                                      </Button>
-                                      <Button
-                                        size="sm"
-                                        variant="ghost"
-                                        ariaLabel={t("action.close")}
-                                        title={t("action.close")}
-                                        onClick={() => dismissUpload(upload.id)}
-                                      >
-                                        <IconClose size={13} />
-                                      </Button>
-                                    </div>
-                                  </div>
-                                ) : (
-                                  <div className="flex items-center justify-between gap-2">
-                                    <div className="card-status-chip">
-                                      <div className="status-spinner" style={{ width: 12, height: 12, borderWidth: 2 }} />
-                                      <span>
-                                        {upload.status === "processing"
-                                          ? t("page.knowledge.processing_upload")
-                                          : t("page.knowledge.uploading")}
-                                      </span>
-                                    </div>
-                                    {upload.status === "uploading" && (
-                                      <Button size="sm" variant="ghost" onClick={() => cancelUpload(upload.id)}>
-                                        {t("action.cancel")}
-                                      </Button>
-                                    )}
-                                  </div>
-                                )}
+                                <CardStatusOverlay variant="uploading" />
                               </div>
-                              {!isFailed && (
-                                <div
-                                  className={`card-progress-bar${upload.status === "uploading" ? " determinate" : ""}`}
-                                  role="progressbar"
-                                  aria-label={`${upload.fileName} ${upload.status === "processing"
-                                    ? t("page.knowledge.processing_upload")
-                                    : t("page.knowledge.uploading")}`}
-                                  aria-valuemin={upload.status === "uploading" ? 0 : undefined}
-                                  aria-valuemax={upload.status === "uploading" ? 100 : undefined}
-                                  aria-valuenow={upload.status === "uploading" ? upload.progress : undefined}
-                                  style={upload.status === "uploading"
-                                    ? { "--progress": upload.progress } as React.CSSProperties
-                                    : undefined}
-                                />
-                              )}
                             </div>
                           );
                         })}
@@ -4507,7 +4082,7 @@ export default function Knowledge() {
                       </h3>
                       <span className="kb-section-count">{fileCount} {t("page.knowledge.file")}{fileCount !== 1 ? "s" : ""}</span>
                     </div>
-                    {(allDocuments.length > 0 || visibleUploadingFiles.length > 0) ? (
+                    {(allDocuments.length > 0 || uploadingFiles.length > 0) ? (
                       <table className="glass-table">
                         <thead>
                           <tr>
@@ -4521,14 +4096,10 @@ export default function Knowledge() {
                           </tr>
                         </thead>
                         <tbody>
-                          {visibleUploadingFiles.map((upload) => {
-                            const typeInfo = getFileTypeInfo(upload.fileName);
-                            const isFailed = upload.status === "failed";
-                            const retryLabel = upload.file
-                              ? t("page.knowledge.retry_upload")
-                              : t("page.knowledge.select_original_file");
+                          {uploadingFiles.map((name) => {
+                            const typeInfo = getFileTypeInfo(name);
                             return (
-                              <tr key={upload.id} style={{ opacity: isFailed ? 1 : 0.72 }}>
+                              <tr key={`uploading-${name}`} style={{ opacity: 0.55 }}>
                                 {selectMode && <td />}
                                 <td>
                                   <div className="flex items-center gap-3">
@@ -4536,61 +4107,16 @@ export default function Knowledge() {
                                       <span className="text-[10px] font-extrabold" style={{ color: typeInfo.color }}>{typeInfo.icon}</span>
                                     </div>
                                     <div className="flex items-center gap-2">
-                                      {!isFailed && <div className="status-spinner" style={{ width: 14, height: 14, borderWidth: 2 }} />}
-                                      <span className="text-sm font-semibold text-stone-600">{upload.fileName}</span>
+                                      <div className="status-spinner" style={{ color: "#4a7d96", width: 14, height: 14, borderWidth: 2 }} />
+                                      <span className="text-sm font-semibold text-stone-500">{name}</span>
                                     </div>
                                   </div>
                                 </td>
                                 <td className="text-center"><span className="text-[10px] font-extrabold py-0.5 px-1.5 rounded" style={{ background: typeInfo.bg, color: typeInfo.color }}>{typeInfo.icon}</span></td>
-                                <td className="text-right text-xs font-mono text-stone-500">{formatFileSize(upload.fileSize)}</td>
-                                <td className="text-right text-xs font-mono text-stone-500">
-                                  {upload.status === "uploading" ? `${upload.progress}%` : "--"}
-                                </td>
-                                <td className="text-center">
-                                  <StatusBadge type={isFailed ? "danger" : "info"} dot>
-                                    {isFailed
-                                      ? upload.error === "stalled"
-                                        ? t("page.knowledge.upload_stalled_short")
-                                        : t("page.knowledge.upload_failed")
-                                      : upload.status === "processing"
-                                        ? t("page.knowledge.processing_upload")
-                                        : t("page.knowledge.uploading")}
-                                  </StatusBadge>
-                                </td>
-                                <td>
-                                  {isFailed ? (
-                                    <div className="flex items-center gap-1">
-                                      <Button
-                                        size="sm"
-                                        variant="ghost"
-                                        ariaLabel={retryLabel}
-                                        title={retryLabel}
-                                        onClick={() => retryUpload(upload.id)}
-                                      >
-                                        {upload.file ? <IconRefresh size={13} /> : <IconUpload size={13} />}
-                                      </Button>
-                                      <Button
-                                        size="sm"
-                                        variant="ghost"
-                                        ariaLabel={t("action.close")}
-                                        title={t("action.close")}
-                                        onClick={() => dismissUpload(upload.id)}
-                                      >
-                                        <IconClose size={13} />
-                                      </Button>
-                                    </div>
-                                  ) : upload.status === "uploading" ? (
-                                    <Button
-                                      size="sm"
-                                      variant="ghost"
-                                      ariaLabel={t("action.cancel")}
-                                      title={t("action.cancel")}
-                                      onClick={() => cancelUpload(upload.id)}
-                                    >
-                                      <IconClose size={13} />
-                                    </Button>
-                                  ) : null}
-                                </td>
+                                <td className="text-right text-xs text-stone-400">--</td>
+                                <td className="text-right text-xs text-stone-400">--</td>
+                                <td className="text-center"><StatusBadge type="info" dot>{t("page.knowledge.uploading")}</StatusBadge></td>
+                                <td />
                               </tr>
                             );
                           })}
@@ -5295,7 +4821,7 @@ export default function Knowledge() {
           const folderId = pendingUploadFolderId;
           setPendingUploadFiles([]);
           setPendingUploadFolderId(null);
-          startUploads(files, folderId, opts);
+          uploadMutation.mutate({ files, folderId, options: opts });
         }}
       />
 

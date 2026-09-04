@@ -21,8 +21,6 @@ import { IconArrowLeft, IconEdit, IconDownload, IconClose, IconDocument, IconPlu
 import CommentThread from "../components/CommentThread";
 import SitePublishAction from "../components/SitePublishAction";
 import SpreadsheetChartPreview from "../components/SpreadsheetChartPreview";
-import SpreadsheetImageLayer from "../components/SpreadsheetImageLayer";
-import PresentationShapeOutline from "../components/PresentationShapeOutline";
 import {
   ClassificationBadge,
   VisibilityIcon,
@@ -54,7 +52,6 @@ import { isCodeLikeFile } from "../lib/codeFiles";
 import { getFilePreviewKind, type FilePreviewKind } from "../lib/filePreviewKind";
 import { useHtmlPreviewDocument } from "../lib/useHtmlPreviewDocument";
 import {
-  presentationColorWithAlpha,
   presentationMediaMime,
   presentationRelationshipsPart,
   presentationShapeFillScope,
@@ -62,11 +59,6 @@ import {
   resolvePresentationPartTarget,
 } from "../lib/presentationOoxml";
 import { presentationPointsToCqh } from "../lib/presentationStyleInheritance";
-import { presentationRoundRectRadius, presentationStrokeDash } from "../lib/presentationShapeStyle";
-import {
-  presentationPresetClipPath,
-  presentationPresetPointsAttribute,
-} from "../lib/presentationPresetGeometry";
 import { offsetPdfPlacement, pdfOverlayPlacement, pdfOverlayPoint } from "../lib/pdfOverlayGeometry";
 import { imageCanvasPoint, imageOutputSize, normalizeImageQuarterTurn } from "../lib/imageEditorGeometry";
 import { parseDelimitedText } from "../lib/delimitedText";
@@ -76,7 +68,7 @@ import {
   fileReferenceKind,
   isEditableDiagramReference,
 } from "../lib/fileReferences";
-import { sanitizeDocumentHtml, sanitizeManorDocumentRender } from "../lib/sanitizeDocumentHtml";
+import { sanitizeDocumentHtml } from "../lib/sanitizeDocumentHtml";
 import {
   commentActionLabel,
   commentSearchKey,
@@ -97,8 +89,8 @@ import {
 } from "../lib/diagram/previewLimits";
 import {
   spreadsheetMergeAt,
-  spreadsheetSheetsFromFile,
-  spreadsheetCellVisualStyle,
+  spreadsheetChartsFromFile,
+  spreadsheetSheetsFromWorkbook,
   type SpreadsheetSheetModel,
 } from "../lib/spreadsheetOoxml";
 
@@ -794,7 +786,7 @@ function markQuoteCommentsInElement(root: HTMLElement, comments: Comment[], acti
 }
 
 async function readDocumentTextViaDownload(docId: string): Promise<string> {
-  const blob = await api.documents.previewBlob(docId);
+  const blob = await api.documents.downloadBlob(docId);
   return decodeTextFile(await blob.arrayBuffer()).text;
 }
 
@@ -1017,7 +1009,16 @@ function DocxViewer({
           const rendered = await renderManorDocument(buf);
           if (cancelled) return;
           const sanitizeOptions = { allowDocxEditorAttributes: true, allowDocxLayoutStyles: true };
-          const safeRender = sanitizeManorDocumentRender(rendered, sanitizeOptions);
+          const safeRender = {
+            ...rendered,
+            html: sanitizeDocumentHtml(rendered.html, sanitizeOptions),
+            headerHtml: sanitizeDocumentHtml(rendered.headerHtml, sanitizeOptions),
+            footerHtml: sanitizeDocumentHtml(rendered.footerHtml, sanitizeOptions),
+            firstHeaderHtml: sanitizeDocumentHtml(rendered.firstHeaderHtml, sanitizeOptions),
+            firstFooterHtml: sanitizeDocumentHtml(rendered.firstFooterHtml, sanitizeOptions),
+            evenHeaderHtml: sanitizeDocumentHtml(rendered.evenHeaderHtml, sanitizeOptions),
+            evenFooterHtml: sanitizeDocumentHtml(rendered.evenFooterHtml, sanitizeOptions),
+          };
           setRender(safeRender);
           setHtml(safeRender.html);
         } else {
@@ -1343,9 +1344,10 @@ export function XlsxViewer({ url, blob }: { url: string; blob?: Blob | null }) {
             cellStyles: true,
             cellText: true,
           });
-          const parsedSheets = await spreadsheetSheetsFromFile(XLSX, wb, buf);
+          const chartsBySheet = await spreadsheetChartsFromFile(buf, XLSX, wb);
           if (cancelled) return;
-          const parsed = parsedSheets
+          const parsed = spreadsheetSheetsFromWorkbook(XLSX, wb)
+            .map((sheet) => ({ ...sheet, charts: chartsBySheet.get(sheet.name) || [] }))
             .filter((sheet) => !sheet.hidden && sheet.name !== "_manor_charts");
           if (!cancelled) setSheets(parsed);
         } else {
@@ -1363,7 +1365,6 @@ export function XlsxViewer({ url, blob }: { url: string; blob?: Blob | null }) {
             rowHeights: Array(rows.length).fill(32),
             merges: [],
             charts: [],
-            images: [],
             hidden: false,
           }]);
         }
@@ -1412,7 +1413,6 @@ export function XlsxViewer({ url, blob }: { url: string; blob?: Blob | null }) {
 
       {/* Table */}
       <div style={{ overflow: "auto", maxHeight: 600, borderRadius: 12, border: "1px solid rgba(28,25,23,0.06)" }}>
-        <div style={{ position: "relative", width: "max-content", minWidth: "100%" }}>
         <table style={{ width: "max-content", minWidth: "100%", tableLayout: "fixed", borderCollapse: "collapse", fontSize: 13 }}>
           <colgroup>
             <col style={{ width: 48 }} />
@@ -1446,9 +1446,14 @@ export function XlsxViewer({ url, blob }: { url: string; blob?: Blob | null }) {
                       title={typeof raw === "string" && raw.startsWith("=") ? raw : undefined}
                       style={{
                         ...tdStyle,
-                        ...(sheet.showGridlines === false ? { borderTop: "1px solid transparent", borderBottom: "1px solid transparent", borderLeft: "1px solid transparent", borderRight: "1px solid transparent" } : {}),
-                        ...spreadsheetCellVisualStyle(cellStyle),
+                        color: cellStyle.color,
                         background: cellStyle.fill,
+                        fontWeight: cellStyle.bold ? 700 : undefined,
+                        fontStyle: cellStyle.italic ? "italic" : undefined,
+                        fontFamily: cellStyle.fontFamily,
+                        fontSize: cellStyle.fontSize,
+                        textAlign: cellStyle.align,
+                        whiteSpace: "nowrap",
                         overflow: "hidden",
                         textOverflow: "ellipsis",
                       }}
@@ -1461,13 +1466,6 @@ export function XlsxViewer({ url, blob }: { url: string; blob?: Blob | null }) {
             ))}
           </tbody>
         </table>
-        <SpreadsheetImageLayer
-          images={sheet.images}
-          columnWidths={sheet.columnWidths}
-          rowHeights={sheet.rowHeights}
-          columnHeaderHeight={34}
-        />
-        </div>
       </div>
       {sheet.charts.length > 0 && (
         <div style={{ marginTop: 16 }}>
@@ -1540,7 +1538,7 @@ interface PptxParagraph {
   text: string; // concatenated plain text (backward compat)
   bold?: boolean; italic?: boolean; underline?: boolean;
   fontSize?: number; color?: string; align?: string; fontFamily?: string;
-  bullet?: string; indent?: number; indentRight?: number; hanging?: number;
+  bullet?: string; indent?: number;
   lineSpacing?: number; // multiplier (1.0 = single)
   spaceBefore?: number; // pt
   spaceAfter?: number; // pt
@@ -1558,17 +1556,14 @@ interface PptxShape {
   flipV?: boolean;
   stroke?: string;
   strokeWidth?: number;
-  strokeDash?: string;
   presetGeom?: string;
   texts: PptxParagraph[];
   imgUrl?: string;
-  altText?: string;
   videoUrl?: string;
   imgCrop?: { l: number; t: number; r: number; b: number }; // percentages
   opacity?: number;
   shadow?: { blur: number; dist: number; angle: number; color: string; alpha: number };
   vAlign?: "top" | "middle" | "bottom"; // text vertical alignment
-  wordWrap?: boolean;
   padding?: { l: number; t: number; r: number; b: number }; // text insets in %
   tableRows?: { text: string; bold?: boolean; color?: string; fill?: string }[][];
   tableColWidths?: number[]; // column widths in EMU
@@ -1581,7 +1576,6 @@ interface PptxSlide {
   bgImgUrl?: string;
   shapes: PptxShape[];
   aspectRatio?: string;
-  heightPoints?: number;
   theme?: PptxThemeSnapshot;
 }
 
@@ -1871,11 +1865,7 @@ function parseTextRuns(spXml: string): PptxShape["texts"] {
     const align = pPr ? (xmlAttr(pPr, "algn") || undefined) : undefined;
     const lvl = pPr ? parseInt(xmlAttr(pPr, "lvl") || "0", 10) : 0;
     const marL = pPr ? xmlAttr(pPr, "marL") : null;
-    const indent = marL != null ? parseInt(marL, 10) / 12700 : lvl > 0 ? lvl * 18 : undefined;
-    const marR = pPr ? xmlAttr(pPr, "marR") : null;
-    const indentRight = marR != null ? parseInt(marR, 10) / 12700 : undefined;
-    const firstLineIndent = pPr ? xmlAttr(pPr, "indent") : null;
-    const hanging = firstLineIndent != null ? parseInt(firstLineIndent, 10) / 12700 : undefined;
+    const indent = marL ? parseInt(marL, 10) / 12700 : lvl * 18;
 
     let bullet: string | undefined;
     if (pPr) {
@@ -2002,30 +1992,24 @@ function parseTextRuns(spXml: string): PptxShape["texts"] {
         bold: firstBold, italic: firstItalic, underline: firstUnderline,
         fontSize: firstFontSize, color: firstColor, fontFamily: firstFontFamily,
         align: align === "ctr" ? "center" : align === "r" ? "right" : align === "just" ? "justify" : undefined,
-        bullet, indent, indentRight, hanging,
+        bullet, indent: indent > 0 ? indent : undefined,
         lineSpacing, spaceBefore, spaceAfter,
         runs: runs.length > 1 ? runs : undefined, // only include runs if mixed formatting
       });
     } else {
-      texts.push({
-        text: "", fontSize: firstFontSize || defFontSize || 12,
-        bold: firstBold, italic: firstItalic, underline: firstUnderline,
-        color: firstColor, fontFamily: firstFontFamily,
-        align: align === "ctr" ? "center" : align === "r" ? "right" : align === "just" ? "justify" : undefined,
-        bullet, indent, indentRight, hanging, lineSpacing, spaceBefore, spaceAfter,
-      });
+      texts.push({ text: "", fontSize: firstFontSize || defFontSize || 12 });
     }
   }
   return texts;
 }
 
-function viewerParseStroke(xml: string): { color?: string; width?: number; dash?: string } {
+function viewerParseStroke(xml: string): { color?: string; width?: number } {
   const ln = xmlInner(xml, "a:ln");
   if (!ln || ln.includes("<a:noFill")) return {};
   const color = parseColor(ln);
   const wAttr = xmlAttr(ln, "w");
   const width = wAttr ? parseInt(wAttr, 10) / 12700 : 1;
-  return { color: color ? presentationColorWithAlpha(color, ln) : undefined, width: color ? width : undefined, dash: presentationStrokeDash(ln) };
+  return { color: color || undefined, width: color ? width : undefined };
 }
 
 function viewerParseTable(xml: string): { rows: { text: string; bold?: boolean; color?: string; fill?: string; gridSpan?: number; vMerge?: boolean }[][]; cols: number; colWidths?: number[] } | null {
@@ -2105,9 +2089,6 @@ function parseShape(spXml: string, relsMap: Map<string, string>, phMap?: Map<str
   if (!pos) return null;
 
   const shape: PptxShape = { ...pos, type: "shape", texts: [] };
-  const nonVisualProperties = spXml.match(/<p:cNvPr\b[^>]*\/?\s*>/);
-  const altText = nonVisualProperties ? xmlAttr(nonVisualProperties[0], "descr") : null;
-  if (altText != null) shape.altText = decodePptxText(altText);
 
   // Rotation + flip
   const xfrm = xmlInner(spXml, "a:xfrm");
@@ -2127,10 +2108,7 @@ function parseShape(spXml: string, relsMap: Map<string, string>, phMap?: Map<str
   const shapeFillScope = spPr ? presentationShapeFillScope(spPr) : "";
   if (spPr && !shapeFillScope.includes("<a:noFill")) {
     const solidFill = xmlInner(shapeFillScope, "a:solidFill");
-    if (solidFill) {
-      const color = parseColor(solidFill);
-      if (color) shape.fill = presentationColorWithAlpha(color, solidFill);
-    }
+    if (solidFill) shape.fill = parseColor(solidFill) || undefined;
     shape.gradFill = parseGradient(shapeFillScope);
 
     // Blip fill (texture/image fill on shapes)
@@ -2145,10 +2123,10 @@ function parseShape(spXml: string, relsMap: Map<string, string>, phMap?: Map<str
 
   // Stroke/border — scope to spPr
   const stroke = viewerParseStroke(spPr || spXml);
-  if (stroke.color) { shape.stroke = stroke.color; shape.strokeWidth = stroke.width; shape.strokeDash = stroke.dash; }
+  if (stroke.color) { shape.stroke = stroke.color; shape.strokeWidth = stroke.width; }
 
-  // Fill, stroke and shadow alpha belong to their own colors, never the text.
-  const alphaM = spXml.match(/<a:alphaModFix\b[^>]*\bamt="(\d+)"/);
+  // Alpha
+  const alphaM = spXml.match(/<a:alpha val="(\d+)"/);
   if (alphaM) shape.opacity = parseInt(alphaM[1], 10) / 100000;
 
   // Shadow (outer shadow)
@@ -2165,15 +2143,13 @@ function parseShape(spXml: string, relsMap: Map<string, string>, phMap?: Map<str
   // Border radius (roundRect preset)
   if (spXml.includes('prst="roundRect"')) {
     const adjM = spXml.match(/name="adj" fmla="val (\d+)"/);
-    shape.borderRadius = adjM ? Math.min(50, parseInt(adjM[1], 10) / 1000) : 16.667;
+    shape.borderRadius = adjM ? Math.min(50, parseInt(adjM[1], 10) / 1000) : 8;
   }
 
   // Text body properties (vertical alignment + insets)
   const bodyPr = xmlInner(spXml, "a:bodyPr");
   if (bodyPr) {
     const anchor = xmlAttr(bodyPr, "anchor");
-    const wrap = xmlAttr(bodyPr, "wrap");
-    if (wrap === "none" || wrap === "square") shape.wordWrap = wrap === "square";
     if (anchor === "t") shape.vAlign = "top";
     else if (anchor === "b") shape.vAlign = "bottom";
     else if (anchor === "ctr") shape.vAlign = "middle";
@@ -2208,7 +2184,6 @@ function parseShape(spXml: string, relsMap: Map<string, string>, phMap?: Map<str
       if (imgUrl) { shape.imgUrl = imgUrl; shape.type = "image"; }
     }
   }
-  if (shape.imgUrl && /^\s*<p:pic\b/.test(spXml)) shape.type = "image";
   shape.videoUrl = presentationVideoSource(spXml, relsMap);
   // Image cropping (srcRect)
   if (shape.imgUrl) {
@@ -2600,7 +2575,6 @@ async function parsePptxUnlocked(buf: ArrayBuffer, options?: PptxParseOptions): 
       } catch { /* master shapes non-fatal */ }
 
       slide.aspectRatio = `${SLIDE_W}/${SLIDE_H}`;
-      slide.heightPoints = SLIDE_H / 12700;
       slide.theme = {
         colors: { ..._viewerTheme },
         majorFont: _viewerMajorFont || undefined,
@@ -2733,6 +2707,27 @@ function parseTextSlides(text: string): PptxSlide[] {
   }
 
   return slides;
+}
+
+/** Map preset geometry names to CSS clip-path polygons */
+function _presetClipPath(geom?: string): string | undefined {
+  switch (geom) {
+    case "triangle": return "polygon(50% 0%, 0% 100%, 100% 100%)";
+    case "rtTriangle": return "polygon(0% 0%, 0% 100%, 100% 100%)";
+    case "diamond": return "polygon(50% 0%, 100% 50%, 50% 100%, 0% 50%)";
+    case "pentagon": return "polygon(50% 0%, 100% 38%, 82% 100%, 18% 100%, 0% 38%)";
+    case "hexagon": return "polygon(25% 0%, 75% 0%, 100% 50%, 75% 100%, 25% 100%, 0% 50%)";
+    case "parallelogram": return "polygon(15% 0%, 100% 0%, 85% 100%, 0% 100%)";
+    case "trapezoid": return "polygon(20% 0%, 80% 0%, 100% 100%, 0% 100%)";
+    case "chevron": return "polygon(0% 0%, 85% 0%, 100% 50%, 85% 100%, 0% 100%, 15% 50%)";
+    case "rightArrow": return "polygon(0% 20%, 70% 20%, 70% 0%, 100% 50%, 70% 100%, 70% 80%, 0% 80%)";
+    case "leftArrow": return "polygon(30% 0%, 30% 20%, 100% 20%, 100% 80%, 30% 80%, 30% 100%, 0% 50%)";
+    case "upArrow": return "polygon(50% 0%, 100% 30%, 80% 30%, 80% 100%, 20% 100%, 20% 30%, 0% 30%)";
+    case "downArrow": return "polygon(20% 0%, 80% 0%, 80% 70%, 100% 70%, 50% 100%, 0% 70%, 20% 70%)";
+    case "star5": return "polygon(50% 0%, 61% 35%, 98% 35%, 68% 57%, 79% 91%, 50% 70%, 21% 91%, 32% 57%, 2% 35%, 39% 35%)";
+    case "ribbon": case "ribbon2": return undefined; // too complex for simple clip-path
+    default: return undefined;
+  }
 }
 
 function PreviewDownloadFallback({
@@ -5502,16 +5497,16 @@ function PptxCssSlidePreview({
         aspectRatio: slide.aspectRatio || "16/9",
         ...slideBg,
         ...(thumbnail ? pptxThumbnailFitStyle(slide.aspectRatio) : undefined),
-        "--pptx-point-scale": slide.heightPoints ? 540 / slide.heightPoints : 1,
-      } as React.CSSProperties}
+      }}
       aria-hidden={thumbnail || undefined}
     >
       {slide.shapes.map((shape, shapeIndex) => {
-        let borderRadius: string | number | undefined;
+        let borderRadius: string | number | undefined = shape.borderRadius ? `${shape.borderRadius}%` : undefined;
         if (shape.presetGeom === "ellipse" || shape.presetGeom === "oval") borderRadius = "50%";
-        else if (shape.presetGeom === "roundRect") borderRadius = presentationRoundRectRadius(shape.w, shape.h, shape.borderRadius);
-        else if (shape.presetGeom === "flowChartTerminator") borderRadius = "999px";
-        else if (shape.presetGeom === "wedgeRoundRectCallout") borderRadius = "8%";
+        else if (shape.presetGeom === "roundRect" && !borderRadius) borderRadius = "8%";
+        const borderStyle = shape.stroke
+          ? `${presentationPointsToCqh(Math.max(0.5, shape.strokeWidth || 1))} solid ${shape.stroke}`
+          : undefined;
 
         if (shape.type === "table" && shape.tableRows) {
           const totalColWidth = shape.tableColWidths?.reduce((sum, width) => sum + width, 0) || 1;
@@ -5556,19 +5551,27 @@ function PptxCssSlidePreview({
         }
 
         if (shape.type === "line") {
+          const lineColor = shape.stroke || "#57534e";
+          const lineWidth = presentationPointsToCqh(Math.max(1, shape.strokeWidth || 1));
           return (
-            <div key={shapeIndex} style={{
+            <svg key={shapeIndex} style={{
               position: "absolute", left: `${shape.x}%`, top: `${shape.y}%`,
-              width: `${Math.max(0.5, shape.w)}%`, height: `${Math.max(0.5, shape.h)}%`, overflow: "visible", opacity: shape.opacity,
-              transform: [shape.rotation ? `rotate(${shape.rotation}deg)` : "", shape.flipH ? "scaleX(-1)" : "", shape.flipV ? "scaleY(-1)" : ""].filter(Boolean).join(" ") || undefined,
+              width: `${shape.w}%`, height: `${shape.h}%`, overflow: "visible", opacity: shape.opacity,
+              transform: shape.rotation ? `rotate(${shape.rotation}deg)` : undefined,
             }}>
-              <PresentationShapeOutline {...shape} presetGeom="line" />
-            </div>
+              <line
+                x1="0"
+                y1={shape.h > shape.w ? "0" : "50%"}
+                x2="100%"
+                y2={shape.h > shape.w ? "100%" : "50%"}
+                stroke={lineColor}
+                strokeWidth={lineWidth}
+              />
+            </svg>
           );
         }
 
-        const clipPath = presentationPresetClipPath(shape.presetGeom);
-        const polygonPoints = presentationPresetPointsAttribute(shape.presetGeom);
+        const clipPath = _presetClipPath(shape.presetGeom);
         const verticalJustify = shape.vAlign === "top"
           ? "flex-start"
           : shape.vAlign === "bottom"
@@ -5622,6 +5625,7 @@ function PptxCssSlidePreview({
               height: `${shape.h}%`,
               background: shape.gradFill ? gradientToCss(shape.gradFill) : shape.fill || undefined,
               borderRadius,
+              border: borderStyle,
               opacity: shape.opacity,
               overflow: "hidden",
               display: "flex",
@@ -5634,7 +5638,6 @@ function PptxCssSlidePreview({
               boxShadow,
             }}
           >
-            <PresentationShapeOutline {...shape} points={polygonPoints} />
             {shape.videoUrl && !thumbnail ? (
               <video
                 className="pptx-native-video pptx-native-video--css"
@@ -5645,7 +5648,7 @@ function PptxCssSlidePreview({
                 preload="metadata"
                 aria-label={`Video on ${t("page.file_viewer.slide")} ${slideIndex + 1}`}
               />
-            ) : shape.imgUrl ? <img src={shape.imgUrl} alt={shape.altText || ""} style={imageStyle} /> : null}
+            ) : shape.imgUrl ? <img src={shape.imgUrl} alt="" style={imageStyle} /> : null}
             {(() => {
               let autoNumberCounter = 0;
               return shape.texts.map((paragraph, paragraphIndex) => {
@@ -5669,12 +5672,10 @@ function PptxCssSlidePreview({
                     style={{
                       position: "relative",
                       margin: 0,
-                      marginTop: paragraph.spaceBefore != null ? presentationPointsToCqh(paragraph.spaceBefore) : paragraph.text === "" ? "0.3em" : "0.05em",
-                      marginBottom: paragraph.spaceAfter != null ? presentationPointsToCqh(paragraph.spaceAfter) : "0.05em",
+                      marginTop: paragraph.spaceBefore ? presentationPointsToCqh(paragraph.spaceBefore) : paragraph.text === "" ? "0.3em" : "0.05em",
+                      marginBottom: paragraph.spaceAfter ? presentationPointsToCqh(paragraph.spaceAfter) : "0.05em",
                       minHeight: paragraph.text === "" ? "0.5em" : undefined,
-                      paddingLeft: paragraph.indent != null ? presentationPointsToCqh(paragraph.indent) : displayBullet ? presentationPointsToCqh(18) : undefined,
-                      paddingRight: paragraph.indentRight != null ? presentationPointsToCqh(paragraph.indentRight) : undefined,
-                      textIndent: !displayBullet && paragraph.hanging != null ? presentationPointsToCqh(paragraph.hanging) : undefined,
+                      paddingLeft: paragraph.indent ? presentationPointsToCqh(paragraph.indent) : displayBullet ? presentationPointsToCqh(18) : undefined,
                       fontSize: paragraph.fontSize ? presentationPointsToCqh(paragraph.fontSize) : "2.6cqh",
                       fontWeight: paragraph.bold ? 700 : 400,
                       fontStyle: paragraph.italic ? "italic" : undefined,
@@ -5684,7 +5685,7 @@ function PptxCssSlidePreview({
                       lineHeight: paragraph.lineSpacing || 1.35,
                       wordBreak: "normal",
                       overflowWrap: "break-word",
-                      whiteSpace: shape.wordWrap === false ? "pre" : "pre-wrap",
+                      whiteSpace: "pre-wrap",
                       zIndex: 1,
                       fontFamily: paragraph.fontFamily
                         ? `"${paragraph.fontFamily}", sans-serif`
@@ -5692,7 +5693,7 @@ function PptxCssSlidePreview({
                     }}
                   >
                     {displayBullet && (
-                      <span style={{ position: "absolute", left: presentationPointsToCqh(paragraph.indent != null ? paragraph.indent + (paragraph.hanging ?? (paragraph.indent === 0 ? 0 : -14)) : 2) }}>
+                      <span style={{ position: "absolute", left: presentationPointsToCqh(paragraph.indent ? paragraph.indent - 14 : 2) }}>
                         {displayBullet}
                       </span>
                     )}
@@ -7763,7 +7764,6 @@ export default function FileViewer() {
   const watermarkDensity: "normal" | "dense" =
     doc?.classification === "restricted" ? "dense" : "normal";
   const restrictDownload =
-    (!isTaskOutputPreview && !doc?.current_user_capabilities?.includes("download")) ||
     doc?.classification === "restricted" ||
     (doc?.quarantine_status && doc.quarantine_status !== "clean");
   const bannerReason: "quarantine" | "pii" | null =
@@ -7792,7 +7792,7 @@ export default function FileViewer() {
       if (cat === "diagram") {
         try {
           assertDiagramPreviewFileSize(meta.file_size);
-          const response = await api.documents.previewResponse(resolvedDocumentId);
+          const response = await api.documents.downloadResponse(resolvedDocumentId);
           const text = await readDiagramPreviewText(response);
           if (!isCurrentRequest()) return;
           setContent(text);
@@ -7838,7 +7838,7 @@ export default function FileViewer() {
               if (!isCurrentRequest()) return;
               replaceDownloadUrl(streamUrl);
             } else {
-              const url = await api.documents.preview(resolvedDocumentId);
+              const url = await api.documents.download(resolvedDocumentId);
               if (!isCurrentRequest()) {
                 if (url.startsWith("blob:")) URL.revokeObjectURL(url);
                 return;
@@ -7846,7 +7846,7 @@ export default function FileViewer() {
               replaceDownloadUrl(url);
             }
           } else {
-            const blob = await api.documents.previewBlob(resolvedDocumentId);
+            const blob = await api.documents.downloadBlob(resolvedDocumentId);
             if (!isCurrentRequest()) return;
             const url = URL.createObjectURL(blob);
             setDownloadBlob(blob);
@@ -7998,7 +7998,7 @@ export default function FileViewer() {
 
 
   const handleDownload = async () => {
-    if (!currentDocumentId || restrictDownload) return;
+    if (!currentDocumentId) return;
     try {
       if (isTaskOutputPreview && taskOutputPreview) {
         const url = URL.createObjectURL(
@@ -8011,13 +8011,13 @@ export default function FileViewer() {
         window.setTimeout(() => URL.revokeObjectURL(url), 0);
         return;
       }
-      // Re-authorize the download action; never reuse bytes cached for preview.
-      const url = await api.documents.download(currentDocumentId, { cache: false });
+      const ownsDownloadUrl = !downloadUrl;
+      const url = downloadUrl || await api.documents.download(currentDocumentId);
       const a = document.createElement("a");
       a.href = url;
       a.download = doc?.name || "download";
       a.click();
-      if (url.startsWith("blob:")) {
+      if (ownsDownloadUrl && url.startsWith("blob:")) {
         window.setTimeout(() => URL.revokeObjectURL(url), 0);
       }
     } catch {
@@ -8254,7 +8254,7 @@ export default function FileViewer() {
             onClick={restrictDownload ? undefined : handleDownload}
             disabled={!!restrictDownload}
             aria-label={t("page.file_viewer.download")}
-            title={restrictDownload ? (doc?.classification === "restricted" ? t("page.file_viewer.download_blocked.restricted") : doc?.quarantine_status && doc.quarantine_status !== "clean" ? t("page.file_viewer.download_blocked.quarantine") : t("permissions.banner.viewer_only")) : t("page.file_viewer.download")}
+            title={restrictDownload ? (doc?.classification === "restricted" ? t("page.file_viewer.download_blocked.restricted") : t("page.file_viewer.download_blocked.quarantine")) : t("page.file_viewer.download")}
             className={editorToolButtonClass({ icon: true })}
             style={{
               opacity: restrictDownload ? 0.45 : 1,

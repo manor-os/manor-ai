@@ -887,6 +887,7 @@ from packages.core.ai.mcp import gmail as _gmail_module  # noqa: E402
 from packages.core.ai.mcp import email as _email_module  # noqa: E402
 from packages.core.ai.mcp import google_calendar as _gcal_module  # noqa: E402
 from packages.core.ai.mcp import manor_mcp_calendar as _manor_calendar_module  # noqa: E402
+from packages.core.ai.mcp import manor_mcp_file_engine as _manor_file_engine_module  # noqa: E402
 from packages.core.ai.mcp import manor_mcp_minutes as _manor_minutes_module  # noqa: E402
 from packages.core.ai.mcp import google_drive as _gdrive_module  # noqa: E402
 from packages.core.ai.mcp import notion as _notion_module  # noqa: E402
@@ -937,6 +938,7 @@ _SERVER_TOOL_SCHEMAS["gmail"] = _adapt_module_tools(_gmail_module)
 _SERVER_TOOL_SCHEMAS["email"] = _adapt_module_tools(_email_module)
 _SERVER_TOOL_SCHEMAS["google_calendar"] = _adapt_module_tools(_gcal_module)
 _SERVER_TOOL_SCHEMAS["manor_mcp_calendar"] = _adapt_module_tools(_manor_calendar_module)
+_SERVER_TOOL_SCHEMAS["manor_mcp_file_engine"] = _adapt_module_tools(_manor_file_engine_module)
 _SERVER_TOOL_SCHEMAS["manor_mcp_minutes"] = _adapt_module_tools(_manor_minutes_module)
 _SERVER_TOOL_SCHEMAS["google_drive"] = _adapt_module_tools(_gdrive_module)
 _SERVER_TOOL_SCHEMAS["notion"] = _adapt_module_tools(_notion_module)

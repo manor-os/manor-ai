@@ -17,7 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from apps.api.deps import get_current_user
 from packages.core.database import get_db
-from packages.core.models.feature_flag import FeatureFlag
+from packages.core.models.feature_flag import FeatureFlag, FeatureFlagOverride
 from packages.core.models.user import User
 from packages.core.services.feature_flags import is_enabled
 

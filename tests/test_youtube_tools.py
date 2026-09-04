@@ -38,12 +38,10 @@ def test_youtube_tool_schemas_do_not_expose_paths_or_arbitrary_metric_urls() -> 
     }
 
     assert set(schemas) == {
-        "check_youtube_publication_setup",
         "record_youtube_publication",
         "read_youtube_public_metrics",
         "record_youtube_workspace_metrics",
     }
-    assert schemas["check_youtube_publication_setup"]["properties"] == {}
     assert set(schemas["record_youtube_publication"]["properties"]) == {
         "public_url",
         "expected_title",
@@ -71,115 +69,6 @@ def test_verified_publication_count_includes_current_backfill_without_duplicates
     ) == 1
 
 
-@pytest.mark.asyncio
-async def test_publication_preflight_is_bounded_and_model_free(
-    monkeypatch,
-) -> None:
-    module = _module()
-    calls: list[tuple[str, dict]] = []
-
-    async def call_chrome(tool_name, arguments, **_kwargs):
-        calls.append((tool_name, arguments))
-        if tool_name == "status":
-            return {"ok": True, "driver": "chrome-extension"}
-        if tool_name == "open_or_reuse":
-            return {"ok": True, "tabId": 42}
-        return {
-            "ok": True,
-            "url": "https://studio.youtube.com/channel/UC123",
-            "title": "Channel dashboard - YouTube Studio",
-            "pageContent": '- button "Account menu: Example Channel"',
-        }
-
-    monkeypatch.setattr(module, "_call_chrome_mcp_tool", call_chrome)
-
-    result = json.loads(
-        await module._check_youtube_publication_setup(
-            entity_id="entity-1",
-            workspace_id="workspace-1",
-            conversation_id="conversation-1",
-            _user_id_from_context="user-1",
-        )
-    )
-
-    assert result["ok"] is True
-    assert result["ready"] is True
-    assert result["runtime_ready"] is True
-    assert result["studio_authenticated"] is True
-    assert result["channel"] == "Example Channel"
-    assert calls == [
-        ("status", {}),
-        (
-            "open_or_reuse",
-            {"url": "https://studio.youtube.com", "active": False},
-        ),
-        ("read_page", {"tabId": 42, "filter": "all"}),
-    ]
-
-
-@pytest.mark.asyncio
-async def test_publication_preflight_returns_setup_blocker_instead_of_failing(
-    monkeypatch,
-) -> None:
-    module = _module()
-
-    async def call_chrome(*_args, **_kwargs):
-        return {
-            "status": "failed",
-            "error": "no_paired_cli_worker",
-        }
-
-    monkeypatch.setattr(module, "_call_chrome_mcp_tool", call_chrome)
-
-    result = json.loads(
-        await module._check_youtube_publication_setup(
-            entity_id="entity-1",
-            workspace_id="workspace-1",
-            _user_id_from_context="user-1",
-        )
-    )
-
-    assert result["ok"] is True
-    assert result["ready"] is False
-    assert result["runtime_ready"] is False
-    assert result["blocker_code"] == "manor_cli_unavailable"
-
-
-@pytest.mark.asyncio
-async def test_publication_preflight_detects_youtube_sign_in(
-    monkeypatch,
-) -> None:
-    module = _module()
-    responses = iter(
-        [
-            {"ok": True, "driver": "chrome-extension"},
-            {"ok": True, "tabId": 42},
-            {
-                "ok": True,
-                "url": "https://accounts.google.com/ServiceLogin",
-                "title": "Sign in",
-                "pageContent": "Sign in to continue to YouTube",
-            },
-        ]
-    )
-
-    async def call_chrome(*_args, **_kwargs):
-        return next(responses)
-
-    monkeypatch.setattr(module, "_call_chrome_mcp_tool", call_chrome)
-
-    result = json.loads(
-        await module._check_youtube_publication_setup(
-            entity_id="entity-1",
-            workspace_id="workspace-1",
-            _user_id_from_context="user-1",
-        )
-    )
-
-    assert result["ready"] is False
-    assert result["runtime_ready"] is True
-    assert result["studio_authenticated"] is False
-    assert result["blocker_code"] == "youtube_not_signed_in"
 
 
 @pytest.mark.asyncio

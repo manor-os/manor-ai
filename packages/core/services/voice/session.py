@@ -7,7 +7,6 @@ import base64
 import json
 import logging
 import uuid
-from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Dict
 
@@ -24,11 +23,6 @@ from packages.core.services.voice.realtime import (
     build_spoken_response_event,
     event_dict,
     open_realtime_connection,
-)
-from packages.core.services.voice.work_queue import VoiceWorkReceipt
-from packages.core.services.voice.work_types import (
-    VoiceWorkAction,
-    VoiceWorkDecision,
 )
 
 logger = logging.getLogger(__name__)
@@ -62,20 +56,6 @@ class _PlaybackState:
     acknowledged_audio_ms: int = 0
 
 
-@dataclass
-class _DurableAgentWork:
-    call: BridgeCall
-    receipt: VoiceWorkReceipt
-    task: asyncio.Task[VoiceAgentOutcome]
-    suppress_delivery: bool = False
-
-
-@dataclass(frozen=True)
-class _QueuedDurableCall:
-    call: BridgeCall
-    receipt: VoiceWorkReceipt
-
-
 class TwilioVoiceSession:
     """Own one authenticated Twilio stream and one OpenAI Realtime socket."""
 
@@ -88,7 +68,6 @@ class TwilioVoiceSession:
         call_session_id: str | None,
         channel_config_id: str,
         entity_id: str,
-        conversation_id: str | None = None,
         billing_user_id: str | None = None,
         billing_workspace_id: str | None = None,
         billing_agent_id: str | None = None,
@@ -97,24 +76,10 @@ class TwilioVoiceSession:
         on_connected: Callable[..., Awaitable[None]] | None = None,
         realtime_connection_factory: Callable[[RealtimeRoute], Any] | None = None,
         hold_message: str = _HOLD_MESSAGE_DEFAULT,
-        admit_work: Callable[[str], Awaitable[VoiceWorkReceipt]] | None = None,
-        execute_work: Callable[[VoiceWorkReceipt], Awaitable[VoiceAgentOutcome]] | None = None,
-        route_followup: Callable[
-            [str, VoiceWorkReceipt], Awaitable[VoiceWorkDecision]
-        ] | None = None,
-        cancel_work: Callable[
-            [VoiceWorkReceipt, VoiceWorkReceipt | None], Awaitable[bool]
-        ] | None = None,
-        record_control_turn: Callable[[str, str], Awaitable[None]] | None = None,
     ) -> None:
         self._ws = ws
         self._realtime_route = realtime_route
         self._agent = agent_callable
-        self._admit_work = admit_work
-        self._execute_work = execute_work
-        self._route_followup = route_followup
-        self._cancel_work = cancel_work
-        self._record_control_turn = record_control_turn
         self._hold_message = hold_message
         self._state = _CallState(
             channel_config_id=channel_config_id,
@@ -145,14 +110,8 @@ class TwilioVoiceSession:
         self._bridge_calls: asyncio.Queue[BridgeCall | None] = asyncio.Queue(
             maxsize=_MAX_QUEUED_TURNS
         )
-        self._detached_agent_tasks: set[asyncio.Task[Any]] = set()
-        self._active_durable_work: _DurableAgentWork | None = None
-        self._queued_durable_calls: deque[_QueuedDurableCall] = deque()
-        self._durable_work_lock = asyncio.Lock()
-        self._response_create_lock = asyncio.Lock()
-        self._response_idle = asyncio.Event()
-        self._response_idle.set()
-        self._conversation_id = conversation_id
+        self._detached_agent_tasks: set[asyncio.Task[VoiceAgentOutcome]] = set()
+        self._conversation_id: str | None = None
         self._latest_twilio_media_ms = 0
         self._twilio_media_frames = 0
         self._twilio_media_payload_chars = 0
@@ -437,7 +396,6 @@ class TwilioVoiceSession:
             return
         if event_type != "response.done":
             return
-        self._response_idle.set()
         self._responses_done_count += 1
         try:
             inspected = await self._engine.inspect_provider_event(
@@ -470,157 +428,9 @@ class TwilioVoiceSession:
             try:
                 if call is None:
                     return
-                if self._admit_work is not None and self._execute_work is not None:
-                    await self._start_durable_agent_turn(call)
-                else:
-                    await self._run_agent_turn(call)
+                await self._run_agent_turn(call)
             finally:
                 self._bridge_calls.task_done()
-
-    async def _start_durable_agent_turn(self, call: BridgeCall) -> None:
-        async with self._durable_work_lock:
-            active_work = self._active_durable_work
-            decision = None
-            if active_work is not None and self._route_followup is not None:
-                decision = await self._route_followup(
-                    call.utterance,
-                    active_work.receipt,
-                )
-                if decision.action is not VoiceWorkAction.QUEUE:
-                    await self._handle_durable_control_locked(
-                        call,
-                        active_work,
-                        decision,
-                    )
-                    return
-
-            receipt = await self._admit_work(call.utterance)
-            if active_work is not None:
-                self._queued_durable_calls.append(
-                    _QueuedDurableCall(call=call, receipt=receipt)
-                )
-                await self._send_voice_outcome(
-                    call,
-                    VoiceAgentOutcome(
-                        status="action_handled",
-                        spoken_reply=(
-                            decision.reply
-                            if decision is not None and decision.reply
-                            else "Got it. I'll handle that after the current request."
-                        ),
-                        conversation_id=self._conversation_id,
-                        agent_id=self._billing_agent_id,
-                    ),
-                )
-                return
-            await self._launch_durable_agent_turn_locked(call, receipt)
-
-    async def _handle_durable_control_locked(
-        self,
-        call: BridgeCall,
-        active_work: _DurableAgentWork,
-        decision: VoiceWorkDecision,
-    ) -> None:
-        replacement = None
-        superseded_by = decision.superseded_by
-        if decision.action is VoiceWorkAction.REPLACE:
-            replacement = await self._admit_work(call.utterance)
-        if decision.action in {VoiceWorkAction.CANCEL, VoiceWorkAction.REPLACE}:
-            if self._cancel_work is None:
-                raise RuntimeError("Twilio Voice cancellation is unavailable")
-            interrupted = await self._cancel_work(
-                active_work.receipt,
-                replacement,
-            )
-            if interrupted:
-                active_work.suppress_delivery = True
-            elif self._route_followup is not None:
-                decision = await self._route_followup(
-                    call.utterance,
-                    active_work.receipt,
-                )
-            if interrupted and superseded_by:
-                self._queued_durable_calls = deque(
-                    queued
-                    for queued in self._queued_durable_calls
-                    if queued.receipt.id != superseded_by
-                )
-            if replacement is not None:
-                self._queued_durable_calls.append(
-                    _QueuedDurableCall(call=call, receipt=replacement)
-                )
-        if self._record_control_turn is not None:
-            await self._record_control_turn(
-                "" if replacement is not None else call.utterance,
-                decision.reply,
-            )
-        await self._send_voice_outcome(
-            call,
-            VoiceAgentOutcome(
-                status="action_handled",
-                spoken_reply=decision.reply,
-                conversation_id=self._conversation_id,
-                agent_id=self._billing_agent_id,
-            ),
-        )
-
-    async def _launch_durable_agent_turn_locked(
-        self,
-        call: BridgeCall,
-        receipt: VoiceWorkReceipt,
-    ) -> None:
-        work = _DurableAgentWork(
-            call=call,
-            receipt=receipt,
-            task=asyncio.create_task(self._execute_work(receipt)),
-        )
-        self._active_durable_work = work
-        try:
-            await self._send_voice_outcome(
-                call,
-                VoiceAgentOutcome(
-                    status="action_handled",
-                    spoken_reply=self._hold_message,
-                    conversation_id=self._conversation_id,
-                    agent_id=self._billing_agent_id,
-                ),
-            )
-        finally:
-            completion = asyncio.create_task(
-                self._complete_durable_agent_turn(work)
-            )
-            self._detached_agent_tasks.add(completion)
-            completion.add_done_callback(self._observe_detached_agent_task)
-
-    async def _complete_durable_agent_turn(
-        self,
-        work: _DurableAgentWork,
-    ) -> None:
-        try:
-            outcome = await work.task
-        except Exception:
-            logger.exception("Twilio Voice durable Agent turn failed")
-            outcome = VoiceAgentOutcome(
-                status="error",
-                spoken_reply=_GENERIC_VOICE_ERROR,
-            )
-        if outcome.conversation_id:
-            self._conversation_id = outcome.conversation_id
-        async with self._durable_work_lock:
-            if self._active_durable_work is not work:
-                return
-            if not self._closed and not work.suppress_delivery:
-                await self._send_voice_outcome(
-                    BridgeCall(None, "", ""),
-                    outcome,
-                )
-            self._active_durable_work = None
-            if self._queued_durable_calls:
-                queued = self._queued_durable_calls.popleft()
-                await self._launch_durable_agent_turn_locked(
-                    queued.call,
-                    queued.receipt,
-                )
 
     async def _run_agent_turn(self, call: BridgeCall) -> None:
         agent_task = asyncio.create_task(
@@ -697,7 +507,7 @@ class TwilioVoiceSession:
 
     def _observe_detached_agent_task(
         self,
-        task: asyncio.Task[Any],
+        task: asyncio.Task[VoiceAgentOutcome],
     ) -> None:
         self._detached_agent_tasks.discard(task)
         try:
@@ -712,8 +522,6 @@ class TwilioVoiceSession:
         call: BridgeCall,
         outcome: VoiceAgentOutcome,
     ) -> None:
-        if self._closed:
-            return
         await self._engine.send_function_outcome(call, outcome)
         if outcome.spoken_reply:
             await self._create_realtime_response(
@@ -721,14 +529,7 @@ class TwilioVoiceSession:
             )
 
     async def _create_realtime_response(self, event: dict[str, Any]) -> None:
-        async with self._response_create_lock:
-            await self._response_idle.wait()
-            self._response_idle.clear()
-            try:
-                await self._engine.create_response(event)
-            except BaseException:
-                self._response_idle.set()
-                raise
+        await self._engine.create_response(event)
 
     async def _send_realtime(self, event: dict[str, Any]) -> None:
         await self._engine.send(event)

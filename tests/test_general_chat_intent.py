@@ -722,7 +722,7 @@ def test_workspace_ledger_query_uses_the_read_only_ledger_catalog():
         "read_recruiting_ledger",
         "read_relationship_ledger",
         "query_ledger",
-        "manor",
+        "visualize_workspace_ledgers",
     )
 
 

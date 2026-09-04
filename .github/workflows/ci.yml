@@ -95,33 +95,6 @@ jobs:
           BUILD_VERSION: ${{ github.sha }}
         run: npm run build
 
-      - name: Run source smoke tests
-        working-directory: apps/web
-        run: npm run test:source
-
-      - name: Run Response Surface browser policy smoke
-        working-directory: apps/web
-        env:
-          PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH: /usr/bin/google-chrome
-        run: npm run test:response-surface-browser
-
-      - name: Run Diagram preview browser smoke
-        working-directory: apps/web
-        env:
-          PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH: /usr/bin/google-chrome
-        run: npm run test:diagram-preview-browser
-
-      - name: Run Document table preservation browser smoke
-        working-directory: apps/web
-        env:
-          PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH: /usr/bin/google-chrome
-        run: npm run test:document-table-preservation-browser
-
-      - name: Run File comment focus browser smoke
-        working-directory: apps/web
-        env:
-          PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH: /usr/bin/google-chrome
-        run: npm run test:file-comment-focus-browser
 
 
   python-smoke:

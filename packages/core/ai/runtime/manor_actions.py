@@ -1000,30 +1000,14 @@ async def runtime_manor_list_tasks(
         ).isoformat()
 
     allowed_filters = {
-        "query",
         "status",
-        "statuses",
         "workspace_id",
-        "workspace_ids",
-        "category_id",
-        "category_ids",
         "assignee_id",
-        "assignee_ids",
-        "task_type",
-        "task_types",
-        "priority",
-        "priorities",
-        "priority_min",
-        "priority_max",
-        "created_after",
-        "created_before",
-        "updated_after",
-        "updated_before",
         "completed_after",
         "completed_before",
-        "deadline_after",
-        "deadline_before",
         "parent_task_id",
+        "limit",
+        "offset",
         "include_automations",
     }
     service_params = {
@@ -1031,32 +1015,10 @@ async def runtime_manor_list_tasks(
         for key, value in raw_params.items()
         if key in allowed_filters and value not in (None, "", [], ())
     }
-    try:
-        limit = max(1, min(int(raw_params.get("limit") or 50), 100))
-        offset = max(0, int(raw_params.get("offset") or 0))
-    except (TypeError, ValueError):
-        return json.dumps({
-            "error": "invalid_task_filters",
-            "message": "limit and offset must be integers",
-        })
-    service_params.update({"limit": limit, "offset": offset})
 
-    try:
-        tasks, total = await list_tasks(db, entity_id, **service_params)
-    except (TypeError, ValueError) as exc:
-        return json.dumps({
-            "error": "invalid_task_filters",
-            "message": str(exc),
-        })
-    next_offset = offset + len(tasks)
-    has_more = next_offset < total
+    tasks, total = await list_tasks(db, entity_id, **service_params)
     return json.dumps({
         "total": total,
-        "count": len(tasks),
-        "limit": limit,
-        "offset": offset,
-        "has_more": has_more,
-        "next_offset": next_offset if has_more else None,
         "tasks": [
             {
                 "id": t.id,

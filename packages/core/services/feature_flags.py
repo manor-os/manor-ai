@@ -99,6 +99,14 @@ KNOWN_FLAGS: tuple[KnownFlag, ...] = (
         ),
         default_enabled=False,
     ),
+    KnownFlag(
+        key="tool_discovery_v2",
+        description=(
+            "On: agents use server-first tool search plus intent-path memory "
+            "when picking tools. Off (default): the legacy tool catalog."
+        ),
+        default_enabled=False,
+    ),
 )
 
 

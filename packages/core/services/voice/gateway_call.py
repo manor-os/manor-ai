@@ -19,11 +19,7 @@ from collections.abc import Awaitable, Callable
 from fastapi import WebSocketDisconnect
 import webrtcvad
 
-from packages.core.services.voice.browser import (
-    MAX_CALL_SECONDS,
-    RECENT_WORK_STATUS_SECONDS,
-    SAMPLE_RATE,
-)
+from packages.core.services.voice.browser import MAX_CALL_SECONDS, SAMPLE_RATE
 from packages.core.services.voice.latency import (
     VoiceTurnTiming,
     log_voice_latency,
@@ -37,18 +33,6 @@ from packages.core.services.voice.profiles import (
     normalize_voice_profile,
 )
 from packages.core.services.voice.speech_request import SpeechRequestState, speech_request_scope
-from packages.core.services.voice.work_queue import (
-    VoiceWorkReceipt,
-    is_voice_progress_query,
-    voice_call_control_kind,
-)
-from packages.core.services.voice.work_router import voice_work_reply_factory
-from packages.core.services.voice.work_types import (
-    VoiceControlReplyKind,
-    VoiceWorkAction,
-    VoiceWorkDecision,
-    VoiceWorkUiStatus,
-)
 
 logger = logging.getLogger(__name__)
 # Covers the shared speech provider's bounded retries and format conversion.
@@ -188,16 +172,6 @@ class GatewayVoiceSession:
         transcribe: Callable[[bytes], Awaitable[str]],
         speak: Callable[[str, VoiceProfile], Awaitable[bytes]],
         agent: Callable[[str], Awaitable[VoiceAgentOutcome]],
-        admit_work: Callable[[str], Awaitable[VoiceWorkReceipt]] | None = None,
-        execute_work: Callable[[VoiceWorkReceipt], Awaitable[VoiceAgentOutcome]] | None = None,
-        recover_work: Callable[[], Awaitable[list[VoiceWorkReceipt]]] | None = None,
-        route_followup: Callable[
-            [str, VoiceWorkReceipt], Awaitable[VoiceWorkDecision]
-        ] | None = None,
-        cancel_work: Callable[
-            [VoiceWorkReceipt, VoiceWorkReceipt | None], Awaitable[bool]
-        ] | None = None,
-        record_control_turn: Callable[[str, str], Awaitable[None]] | None = None,
         on_ready: Callable[[], None] | None = None,
         voice: VoiceProfile = DEFAULT_VOICE_PROFILE,
     ):
@@ -205,12 +179,6 @@ class GatewayVoiceSession:
         self.call_id = uuid.uuid4().hex[:12]
         self.check_access, self.prepare = check_access, prepare
         self.transcribe, self.speak, self.agent = transcribe, speak, agent
-        self.admit_work = admit_work
-        self.execute_work = execute_work
-        self.recover_work = recover_work
-        self.route_followup = route_followup
-        self.cancel_work = cancel_work
-        self.record_control_turn = record_control_turn
         self.on_ready = on_ready
         self.voice = normalize_voice_profile(voice)
         self.detector = SpeechDetector()
@@ -218,7 +186,7 @@ class GatewayVoiceSession:
         # Accepted transcripts are small and must not disappear after the UI has
         # shown them. The call duration bounds this queue; raw audio remains
         # bounded separately above to protect memory under capture overload.
-        self.turns: asyncio.Queue[tuple] = asyncio.Queue()
+        self.turns: asyncio.Queue[tuple[int, str]] = asyncio.Queue()
         self.turn_available = asyncio.Event()
         self.input_id = 0
         self.input_resolved = asyncio.Event()
@@ -234,14 +202,6 @@ class GatewayVoiceSession:
         self.input_timings: dict[int, VoiceTurnTiming] = {}
         self.turn_timings: dict[int, VoiceTurnTiming] = {}
         self.stt_model = self.tts_model = "-"
-        self.agent_active = False
-        self.agent_active_receipt: VoiceWorkReceipt | None = None
-        self.acknowledged_work_ids: set[str] = set()
-        self.suppressed_work_ids: set[str] = set()
-        self.control_tasks: set[asyncio.Task] = set()
-        self.speech_lock = asyncio.Lock()
-        self.last_work_completed_at: float | None = None
-        self.last_work_status: str | None = None
 
     def log_latency(
         self,
@@ -365,7 +325,7 @@ class GatewayVoiceSession:
                 pass
         self.inputs.put_nowait(item)
 
-    def queue_turn(self, item: tuple) -> None:
+    def queue_turn(self, item: tuple[int, str]) -> None:
         """Preserve every accepted transcript until Chat handles it."""
 
         self.turns.put_nowait(item)
@@ -406,16 +366,7 @@ class GatewayVoiceSession:
         finally:
             for task in pending:
                 task.cancel()
-            # A provider coroutine that mishandles cancellation must not keep
-            # the closed WebSocket and its concurrency lease alive forever.
-            settlement.cancel()
-            try:
-                await asyncio.wait_for(
-                    asyncio.shield(settlement),
-                    timeout=1,
-                )
-            except (TimeoutError, asyncio.CancelledError):
-                pass
+            await settlement
             self.pending_audio.clear()
 
     async def run(self):
@@ -452,15 +403,6 @@ class GatewayVoiceSession:
         self.log_latency("call_ready", run_started_at)
         if self.on_ready:
             self.on_ready()
-        if self.recover_work is not None:
-            for receipt in await self.recover_work():
-                self.generation += 1
-                generation = self.generation
-                self.turn_timings[generation] = VoiceTurnTiming(
-                    turn_id=generation,
-                    agent_queued_at=time.monotonic(),
-                )
-                self.queue_turn((generation, receipt.text, receipt))
         tasks = [asyncio.create_task(fn()) for fn in (self.receive, self.transcribe_inputs, self.run_turns, self.monitor)]
         try:
             async with asyncio.timeout(MAX_CALL_SECONDS):
@@ -486,8 +428,6 @@ class GatewayVoiceSession:
             for task in tasks:
                 if task is not turn_worker:
                     task.cancel()
-            for task in tuple(self.control_tasks):
-                task.cancel()
             cleanup = asyncio.create_task(self.finish(tasks))
             try:
                 await asyncio.shield(cleanup)
@@ -508,24 +448,7 @@ class GatewayVoiceSession:
             logger.error("Voice turn settlement exceeded its deadline")
             for task in tasks:
                 task.cancel()
-            settlement.cancel()
-            done, pending = await asyncio.wait(tasks, timeout=1)
-            for task in pending:
-                task.cancel()
-            for task in done:
-                try:
-                    task.result()
-                except BaseException:
-                    pass
-        if self.control_tasks:
-            done, pending = await asyncio.wait(tuple(self.control_tasks), timeout=1)
-            for task in pending:
-                task.cancel()
-            for task in done:
-                try:
-                    task.result()
-                except BaseException:
-                    pass
+            await settlement
         while not self.turns.empty():
             self.turns.get_nowait()
         while not self.inputs.empty():
@@ -628,134 +551,6 @@ class GatewayVoiceSession:
                     self.queue_input((self.input_id, utterance))
                     await self.ws.send_json({"type": "transcribing", "generation": self.generation})
 
-    def _track_control_task(self, task: asyncio.Task) -> None:
-        self.control_tasks.add(task)
-        task.add_done_callback(self.control_tasks.discard)
-
-    def _schedule_control_reply(
-        self,
-        generation: int,
-        user_text: str,
-        kind: VoiceControlReplyKind,
-        *,
-        record: bool,
-        reply: str | None = None,
-        record_user_text: bool = True,
-    ) -> None:
-        task = asyncio.create_task(
-            self._send_control_reply(
-                generation,
-                user_text,
-                kind,
-                record=record,
-                reply=reply,
-                record_user_text=record_user_text,
-            )
-        )
-        self._track_control_task(task)
-
-    async def _send_control_reply(
-        self,
-        generation: int,
-        user_text: str,
-        kind: VoiceControlReplyKind,
-        *,
-        record: bool,
-        reply: str | None = None,
-        record_user_text: bool = True,
-    ) -> None:
-        """Speak a short foreground status while the Chat Agent keeps running."""
-
-        spoken_reply = (
-            reply
-            if reply is not None
-            else voice_work_reply_factory.create_control(user_text, kind)
-        )
-        try:
-            if record and self.record_control_turn is not None:
-                await self.record_control_turn(
-                    user_text if record_user_text else "",
-                    spoken_reply,
-                )
-            if not spoken_reply:
-                return
-            async with self.speech_lock:
-                if self.closed:
-                    return
-                delivery_generation = generation
-                await self.input_resolved.wait()
-                if self.closed or delivery_generation != self.generation:
-                    return
-                item_id = str(uuid.uuid4())
-                # The foreground controller already owns this text. Expose it
-                # before TTS so a slow provider never leaves the caller staring
-                # at an unexplained Thinking state.
-                await self.ws.send_json(
-                    {
-                        "type": "caption",
-                        "item_id": item_id,
-                        "delta": spoken_reply,
-                        "generation": delivery_generation,
-                    }
-                )
-                await self.ws.send_json(
-                    {"type": "synthesizing", "generation": delivery_generation}
-                )
-                tts_started_at = time.monotonic()
-                with voice_latency_span(
-                    self.log_latency,
-                    "control_tts",
-                    generation=delivery_generation,
-                    model=self.tts_model,
-                ):
-                    audio = await self.audio_request(
-                        self.speak(spoken_reply, self.voice)
-                    )
-                await self.input_resolved.wait()
-                if self.closed or delivery_generation != self.generation:
-                    return
-                if self.clip_id is not None:
-                    await self.wait_for_playback(
-                        generation=delivery_generation,
-                        segment=0,
-                    )
-                    await self.input_resolved.wait()
-                    if self.closed or delivery_generation != self.generation:
-                        return
-                self.clip_id = item_id
-                self.clip_outcome = None
-                self.clip_done.clear()
-                await self.ws.send_json(
-                    {
-                        "type": "audio_clip",
-                        "item_id": item_id,
-                        "audio": base64.b64encode(audio).decode("ascii"),
-                        "generation": delivery_generation,
-                    }
-                )
-                if self.closed or delivery_generation != self.generation:
-                    return
-                self.log_latency(
-                    "control_first_audio",
-                    tts_started_at,
-                    generation=delivery_generation,
-                    model=self.tts_model,
-                )
-                await self.ws.send_json(
-                    {
-                        "type": "turn",
-                        "conversation_id": self.conversation_id,
-                        "text": spoken_reply,
-                        "status": "action_handled",
-                        "generation": delivery_generation,
-                    }
-                )
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            if not self.closed:
-                logger.exception("Gateway voice foreground reply failed")
-
     async def transcribe_inputs(self):
         # Recognition must continue while Chat/TTS is working or playback is
         # paused; otherwise an empty barge-in can never release that pause.
@@ -832,183 +627,18 @@ class GatewayVoiceSession:
             timing.agent_queued_at = time.monotonic()
             self.turn_timings[generation] = timing
             self.input_timings.pop(input_id, None)
-            progress_kind: VoiceControlReplyKind | None = None
-            if is_voice_progress_query(text):
-                if self.agent_active and self.route_followup is None:
-                    progress_kind = VoiceControlReplyKind.PROGRESS
-                elif (
-                    self.last_work_completed_at is not None
-                    and time.monotonic() - self.last_work_completed_at
-                    <= RECENT_WORK_STATUS_SECONDS
-                ):
-                    progress_kind = (
-                        VoiceControlReplyKind.ERROR
-                        if self.last_work_status == "error"
-                        else VoiceControlReplyKind.COMPLETED
-                    )
-            control_kind = progress_kind
-            if control_kind is None and self.agent_active:
-                control_kind = voice_call_control_kind(text)
-            receipt = None
-            routed_reply: str | None = None
-            queued_reply: str | None = None
-            record_routed_user = True
-            routed_work_status: VoiceWorkUiStatus | None = None
-            active_receipt = self.agent_active_receipt
-            if (
-                control_kind is None
-                and self.agent_active
-                and active_receipt is not None
-                and self.route_followup is not None
-            ):
-                with voice_latency_span(
-                    self.log_latency,
-                    "foreground_route",
-                    generation=input_id,
-                ):
-                    decision = await self.route_followup(text, active_receipt)
-                if (
-                    self.agent_active
-                    and self.agent_active_receipt is active_receipt
-                    and decision.action is VoiceWorkAction.QUEUE
-                ):
-                    queued_reply = decision.reply
-                if (
-                    self.agent_active
-                    and self.agent_active_receipt is active_receipt
-                    and decision.action is not VoiceWorkAction.QUEUE
-                ):
-                    control_kind = VoiceControlReplyKind.PROGRESS
-                    routed_reply = decision.reply
-                    if decision.action in {
-                        VoiceWorkAction.CANCEL,
-                        VoiceWorkAction.REPLACE,
-                    }:
-                        if self.cancel_work is None:
-                            control_kind = None
-                            routed_reply = None
-                        else:
-                            if decision.action is VoiceWorkAction.REPLACE:
-                                with voice_latency_span(
-                                    self.log_latency,
-                                    "work_persist",
-                                    generation=input_id,
-                                ):
-                                    receipt = await self.admit_work(text) if self.admit_work else None
-                            with voice_latency_span(
-                                self.log_latency,
-                                "work_cancel",
-                                generation=input_id,
-                            ):
-                                interrupted = await self.cancel_work(
-                                    active_receipt,
-                                    receipt,
-                                )
-                            if decision.superseded_by:
-                                self.suppressed_work_ids.add(
-                                    decision.superseded_by
-                                )
-                            if not interrupted:
-                                decision = await self.route_followup(
-                                    text,
-                                    active_receipt,
-                                )
-                                routed_reply = decision.reply
-                            self.suppressed_work_ids.add(active_receipt.id)
-                            self.acknowledged_work_ids.discard(active_receipt.id)
-                            record_routed_user = receipt is None
-                            routed_work_status = (
-                                VoiceWorkUiStatus.QUEUED
-                                if receipt
-                                else VoiceWorkUiStatus.CANCELLED
-                                if interrupted
-                                else VoiceWorkUiStatus.COMPLETED
-                            )
-                elif (
-                    decision.action
-                    in {
-                        VoiceWorkAction.STATUS,
-                        VoiceWorkAction.CANCEL,
-                        VoiceWorkAction.CLARIFY,
-                    }
-                    and not self.agent_active
-                    and self.last_work_completed_at is not None
-                    and time.monotonic() - self.last_work_completed_at
-                    <= RECENT_WORK_STATUS_SECONDS
-                ):
-                    # The worker can finish while the foreground router is
-                    # reading its durable context. Do not turn a now-stale
-                    # status/cancel utterance into a new Chat instruction.
-                    control_kind = (
-                        VoiceControlReplyKind.ERROR
-                        if self.last_work_status == "error"
-                        else VoiceControlReplyKind.COMPLETED
-                    )
-            if control_kind is None and self.admit_work is not None:
-                with voice_latency_span(
-                    self.log_latency,
-                    "work_persist",
-                    generation=input_id,
-                ):
-                    receipt = await self.admit_work(text)
             self.finish_clip("interrupted")
             if input_id == self.input_id:
                 self.input_resolved.set()
             await self.ws.send_json({"type": "interrupt", "generation": self.generation})
+            # Admission happens before exposing the transcript to the UI. Once
+            # visible, a hangup must drain this turn through Chat rather than
+            # leave a message that exists only inside the call dialog.
+            self.queue_turn((generation, text))
             await self.ws.send_json(
                 {"type": "transcript", "role": "user", "text": text, "generation": generation}
             )
-            if control_kind is not None:
-                if routed_work_status is not None:
-                    await self.ws.send_json(
-                        {"type": "work", "status": routed_work_status.value}
-                    )
-                    if receipt is not None:
-                        self.acknowledged_work_ids.add(receipt.id)
-                        self.queue_turn((generation, text, receipt))
-                elif (
-                    control_kind is VoiceControlReplyKind.PROGRESS
-                    and routed_reply is None
-                ):
-                    current_receipt = self.agent_active_receipt
-                    if current_receipt is not None:
-                        self.acknowledged_work_ids.add(current_receipt.id)
-                    await self.ws.send_json(
-                        {"type": "work", "status": VoiceWorkUiStatus.RUNNING.value}
-                    )
-                self._schedule_control_reply(
-                    generation,
-                    text,
-                    control_kind,
-                    record=True,
-                    reply=routed_reply,
-                    record_user_text=record_routed_user,
-                )
-                self.finish_turn_timing(generation, outcome="action_handled")
-            else:
-                # The durable receipt is committed before the UI says this
-                # instruction is queued. The worker remains serial so external
-                # actions cannot overlap.
-                self.queue_turn(
-                    (generation, text, receipt)
-                    if receipt is not None
-                    else (generation, text)
-                )
-                if self.agent_active and self.admit_work is not None:
-                    if receipt is not None:
-                        self.acknowledged_work_ids.add(receipt.id)
-                    await self.ws.send_json(
-                        {"type": "work", "status": VoiceWorkUiStatus.QUEUED.value}
-                    )
-                    self._schedule_control_reply(
-                        generation,
-                        text,
-                        VoiceControlReplyKind.QUEUED,
-                        record=False,
-                        reply=queued_reply,
-                    )
-                else:
-                    await self.ws.send_json({"type": "thinking", "generation": generation})
+            await self.ws.send_json({"type": "thinking", "generation": generation})
             if not self.input_resolved.is_set():
                 await self.ws.send_json({"type": "input_started", "generation": generation})
 
@@ -1021,21 +651,12 @@ class GatewayVoiceSession:
                 if self.closed and self.turns.empty():
                     return
             try:
-                queued_turn = self.turns.get_nowait()
-                generation, text = queued_turn[:2]
-                receipt = queued_turn[2] if len(queued_turn) > 2 else None
+                generation, text = self.turns.get_nowait()
             except asyncio.QueueEmpty:
                 self.turn_available.clear()
                 continue
             if self.turns.empty():
                 self.turn_available.clear()
-            if (
-                receipt is not None
-                and receipt.id in self.suppressed_work_ids
-            ):
-                self.suppressed_work_ids.discard(receipt.id)
-                self.finish_turn_timing(generation, outcome="interrupted")
-                continue
             timing = self.turn_timings.setdefault(
                 generation,
                 VoiceTurnTiming(turn_id=generation, agent_queued_at=time.monotonic()),
@@ -1059,22 +680,8 @@ class GatewayVoiceSession:
                         generation=trace_turn,
                         ended_at=agent_started_at,
                     )
-                self.agent_active = True
-                self.agent_active_receipt = receipt
-                if receipt is not None:
-                    self.acknowledged_work_ids.add(receipt.id)
-                    await self.ws.send_json(
-                        {"type": "work", "status": VoiceWorkUiStatus.RUNNING.value}
-                    )
-                    await self.ws.send_json(
-                        {"type": "listening", "generation": generation}
-                    )
                 try:
-                    outcome = await (
-                        self.execute_work(receipt)
-                        if receipt is not None and self.execute_work is not None
-                        else self.agent(text)
-                    )
+                    outcome = await self.agent(text)
                 except BaseException as error:
                     self.log_latency(
                         "agent",
@@ -1083,9 +690,6 @@ class GatewayVoiceSession:
                         outcome=voice_latency_outcome(error),
                     )
                     raise
-                finally:
-                    self.agent_active = False
-                    self.agent_active_receipt = None
                 timing.agent_completed_at = time.monotonic()
                 self.log_latency(
                     "agent",
@@ -1094,30 +698,6 @@ class GatewayVoiceSession:
                     outcome=outcome.status,
                     ended_at=timing.agent_completed_at,
                 )
-                self.last_work_completed_at = timing.agent_completed_at
-                self.last_work_status = outcome.status
-                suppressed = bool(
-                    receipt is not None
-                    and receipt.id in self.suppressed_work_ids
-                ) or outcome.status == "cancelled"
-                if (
-                    receipt is not None
-                    and receipt.id in self.acknowledged_work_ids
-                    and not suppressed
-                ):
-                    await self.ws.send_json(
-                        {
-                            "type": "work",
-                            "status": (
-                                VoiceWorkUiStatus.FAILED.value
-                                if outcome.status == "error"
-                                else VoiceWorkUiStatus.CANCELLED.value
-                                if outcome.status == "cancelled"
-                                else VoiceWorkUiStatus.COMPLETED.value
-                            ),
-                        }
-                    )
-                    self.acknowledged_work_ids.discard(receipt.id)
             except BaseException as error:
                 self.finish_turn_timing(
                     generation,
@@ -1133,18 +713,18 @@ class GatewayVoiceSession:
             if outcome.conversation_id != self.conversation_id:
                 self.finish_turn_timing(generation, outcome="error")
                 raise RuntimeError("Voice conversation changed during call")
-            if suppressed:
-                if receipt is not None:
-                    self.suppressed_work_ids.discard(receipt.id)
-                self.finish_turn_timing(generation, outcome="interrupted")
-                continue
             if self.closed:
                 self.finish_turn_timing(generation, outcome="closed")
                 continue
-            await self.speech_lock.acquire()
             try:
-                delivery_generation = (
-                    self.generation if self.admit_work is not None else generation
+                await self.ws.send_json(
+                    {
+                        "type": "turn",
+                        "conversation_id": self.conversation_id,
+                        "text": outcome.spoken_reply,
+                        "status": outcome.status,
+                        "generation": generation,
+                    }
                 )
                 if self.closed:
                     self.finish_turn_timing(generation, outcome="closed")
@@ -1153,11 +733,10 @@ class GatewayVoiceSession:
                 # during synthesis or playback applies to the next reply.
                 turn_voice = self.voice
                 chunks = list(speech_chunks(outcome.spoken_reply))
-                caption_item_id = f"turn-{self.call_id}-{trace_turn}"
                 first_audio_sent = False
                 for chunk_index, chunk in enumerate(chunks, start=1):
                     await self.input_resolved.wait()
-                    if delivery_generation != self.generation:
+                    if generation != self.generation:
                         break
                     with voice_latency_span(
                         self.log_latency,
@@ -1169,10 +748,10 @@ class GatewayVoiceSession:
                         await self.check_access()
                     # The shared callback settles usage even when the user
                     # interrupts while the provider generates this chunk.
-                    if delivery_generation != self.generation:
+                    if generation != self.generation:
                         break
-                    await self.ws.send_json({"type": "synthesizing", "generation": delivery_generation})
-                    if delivery_generation != self.generation:
+                    await self.ws.send_json({"type": "synthesizing", "generation": generation})
+                    if generation != self.generation:
                         break
                     tts_started_at = time.monotonic()
                     try:
@@ -1197,7 +776,7 @@ class GatewayVoiceSession:
                         ended_at=tts_completed_at,
                     )
                     await self.input_resolved.wait()
-                    if delivery_generation != self.generation:
+                    if generation != self.generation:
                         break
                     if len(audio) > 4 * 1024 * 1024:
                         raise ValueError("Voice response too large")
@@ -1209,32 +788,26 @@ class GatewayVoiceSession:
                             segment=chunk_index - 1,
                         )
                         await self.input_resolved.wait()
-                        if delivery_generation != self.generation:
+                        if generation != self.generation:
                             break
                     item_id = str(uuid.uuid4())
                     self.clip_id = item_id
                     self.clip_outcome = None
                     self.clip_done.clear()
                     await self.ws.send_json(
+                        {"type": "caption", "item_id": item_id, "delta": chunk, "generation": generation}
+                    )
+                    if generation != self.generation:
+                        self.clip_id = None
+                        break
+                    await self.ws.send_json(
                         {
                             "type": "audio_clip",
                             "item_id": item_id,
                             "audio": base64.b64encode(audio).decode("ascii"),
-                            "generation": delivery_generation,
+                            "generation": generation,
                         }
                     )
-                    if delivery_generation != self.generation:
-                        break
-                    await self.ws.send_json(
-                        {
-                            "type": "caption",
-                            "item_id": caption_item_id,
-                            "delta": chunk,
-                            "generation": delivery_generation,
-                        }
-                    )
-                    if delivery_generation != self.generation:
-                        break
                     audio_sent_at = time.monotonic()
                     if not first_audio_sent:
                         first_audio_sent = True
@@ -1263,7 +836,7 @@ class GatewayVoiceSession:
                             ended_at=audio_sent_at,
                         )
                     logger.info("Voice clip sent call=%s turn=%s bytes=%s", self.call_id, generation, len(audio))
-                if not chunks and delivery_generation == self.generation:
+                if not chunks and generation == self.generation:
                     self.finish_turn_timing(
                         generation,
                         outcome=outcome.status,
@@ -1271,7 +844,7 @@ class GatewayVoiceSession:
                     )
                 # The final clip must finish before the next Chat turn starts.
                 # Interruption releases this wait without replaying the action.
-                if self.clip_id is not None and delivery_generation == self.generation:
+                if self.clip_id is not None and generation == self.generation:
                     await self.wait_for_playback(
                         generation=trace_turn,
                         segment=len(chunks),
@@ -1279,22 +852,12 @@ class GatewayVoiceSession:
                 self.clip_id = None
                 if self.closed:
                     self.finish_turn_timing(generation, outcome="closed")
-                elif delivery_generation == self.generation:
-                    if first_audio_sent:
-                        await self.ws.send_json(
-                            {
-                                "type": "turn",
-                                "conversation_id": self.conversation_id,
-                                "text": outcome.spoken_reply,
-                                "status": outcome.status,
-                                "generation": delivery_generation,
-                            }
-                        )
+                elif generation == self.generation:
                     self.finish_turn_timing(
                         generation,
                         outcome=outcome.status,
                     )
-                    await self.ws.send_json({"type": "listening", "generation": delivery_generation})
+                    await self.ws.send_json({"type": "listening", "generation": generation})
                 else:
                     self.finish_turn_timing(generation, outcome="interrupted")
             except BaseException as error:
@@ -1310,5 +873,3 @@ class GatewayVoiceSession:
                     raise
                 if not self.closed:
                     raise
-            finally:
-                self.speech_lock.release()

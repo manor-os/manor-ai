@@ -217,9 +217,8 @@ async def resolve_runtime_chat_context(
         except Exception:
             logger.debug("Agent workspace provisioning failed", exc_info=True)
 
-    # Tool Discovery v2 (A3 intent-path memory, spec §A3): cache-first
-    # lookup + hint. v2 is the graduated default, so this no longer depends
-    # on a rollout flag. Reuses the SAME extra_context channel
+    # tool_discovery_v2 (A3 intent-path memory, spec §A3): cache-first
+    # lookup + hint, flag-gated. Reuses the SAME extra_context channel
     # approval_resume_guidance already merges into just above (mirrors that
     # seam) rather than threading a brand-new kwarg through
     # runtime_assemble_prompt_for_turn's call chain. Recording
@@ -236,23 +235,28 @@ async def resolve_runtime_chat_context(
         and not disable_tools_for_turn
     ):
         try:
-            from packages.core.services import tool_path_memory as tpm
-            paths = await tpm.lookup_paths(
-                entity_id=entity_id, user_id=user_id,
-                user_message=active_user_message_text,
-            )
-            if paths:
-                from packages.core.services.agent_permission_service import (
-                    resolve_usable_mcp_providers,
+            from packages.core.services.feature_flags import is_enabled
+            if await is_enabled(
+                db, "tool_discovery_v2",
+                entity_id=entity_id, user_id=user_id, fallback=False,
+            ):
+                from packages.core.services import tool_path_memory as tpm
+                paths = await tpm.lookup_paths(
+                    entity_id=entity_id, user_id=user_id,
+                    user_message=active_user_message_text,
                 )
-                usable = await resolve_usable_mcp_providers(
-                    db, user_id=user_id, entity_id=entity_id,
-                    provider_keys=sorted({p.provider for p in paths if p.provider}),
-                )
-                paths = [p for p in paths if p.provider in usable]
-            if paths:
-                path_hint = tpm.format_hint(paths)
-                hinted_tool_names = {p.tool_name for p in paths}
+                if paths:
+                    from packages.core.services.agent_permission_service import (
+                        resolve_usable_mcp_providers,
+                    )
+                    usable = await resolve_usable_mcp_providers(
+                        db, user_id=user_id, entity_id=entity_id,
+                        provider_keys=sorted({p.provider for p in paths if p.provider}),
+                    )
+                    paths = [p for p in paths if p.provider in usable]
+                if paths:
+                    path_hint = tpm.format_hint(paths)
+                    hinted_tool_names = {p.tool_name for p in paths}
         except Exception:
             logger.debug("tool_path_memory hint resolution failed", exc_info=True)
             path_hint = None

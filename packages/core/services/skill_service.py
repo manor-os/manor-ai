@@ -17,7 +17,6 @@ from packages.core.ai.runtime import (
     RUNTIME_SANDBOX_IDLE_THRESHOLD,
     runtime_init_sandbox_context,
     runtime_load_sandbox_context,
-    runtime_sandbox_context_owner_matches,
     runtime_binding_owner_matches,
     runtime_public_failure_payload,
     runtime_skill_binding_ref,
@@ -49,24 +48,6 @@ def _sandbox_skill_error_response(skill: Skill, message: str) -> dict:
         "stop_reason": "error",
         "error": message,
     }
-
-
-async def _destroy_unadmitted_sandbox(client: Any, sandbox_id: str) -> bool:
-    """Compensate a Sandbox that cannot receive its authorization context."""
-
-    from packages.core.services.sandbox_sdk.exceptions import SandboxNotFoundError
-
-    try:
-        await client.destroy(sandbox_id=sandbox_id)
-    except SandboxNotFoundError:
-        pass
-    except Exception:
-        logger.exception(
-            "[skill_service] failed to destroy unadmitted sandbox=%s",
-            sandbox_id,
-        )
-        return False
-    return True
 
 
 def _instructions_only_skill_response(skill: Skill, instructions: str) -> dict:
@@ -113,7 +94,7 @@ def _sandbox_skill_runtime_contract(
         "- Follow the packaged skill workflow, scripts, templates, references, gates, and quality checks described by `/skill/SKILL.md`.",
         "- Do not replace the skill workflow with an ad-hoc generator or direct output script unless `/skill/SKILL.md` explicitly instructs that route.",
         "- Helper files may only support the workflow described by `/skill/SKILL.md`; they must not substitute a different output pipeline.",
-        "- `sandbox` action `exec` is available for commands, but the expected path is to run bundled skill scripts or explicit helper files.",
+        "- `sandbox_exec` is available for sandbox commands, but the expected path is to run bundled skill scripts or explicit helper files.",
         "- Before saving a final artifact, verify that the artifact path, intermediate evidence, and quality gates match `/skill/SKILL.md`.",
         "- If a required dependency, script, or workflow gate is missing, stop and report the blocker instead of inventing a shortcut.",
         "",
@@ -127,13 +108,13 @@ def _sandbox_skill_runtime_contract(
             if expected_workspace_volume
             else (
                 "- No entity filesystem mount is available in this sandbox. "
-                "Use `sandbox` action `write_file` with `workspace_path` or direct content "
+                "Use `sandbox_write_file` with `workspace_path` or direct content "
                 "to inject required inputs before execution."
             )
         ),
         "- Never use `/mnt/user-data` for Manor uploads. It is not the upload mount.",
-        "- Read skill files with `sandbox(action='read_file', params={'sandbox_id': ..., 'path':'/skill/SKILL.md'})` or targeted `exec` commands.",
-        "- Write new files with `sandbox` action `write_file`; do not use `cat >`, `echo >`, `printf >`, `tee >`, or heredoc writes.",
+        "- Read skill files with `sandbox_read_file(path=\"/skill/SKILL.md\")` or targeted `sandbox_exec` commands such as `sed -n '1,160p' /skill/SKILL.md`.",
+        "- Write new files with `sandbox_write_file`; do not use `cat >`, `echo >`, `printf >`, `tee >`, or heredoc writes.",
         "- Do not use host shell/file tools such as `bash`, `read_file`, or root filesystem searches to inspect sandbox or workspace files.",
         "- `/tmp/` is writable for temporary files and npm cache.",
         "",
@@ -145,21 +126,20 @@ def _sandbox_skill_runtime_contract(
         "## Skill Input",
         skill_input or "Use the latest user request and conversation context as the skill input.",
         "",
-        "## Next Tool Guidance",
-        f"- Use `sandbox(action='exec', params={{'sandbox_id':'{sandbox_id}','command':'...'}})` or action `read_file` for additional targeted inspection when needed.",
-        "- For long text files, paginate `read_file` with `offset` and `limit`; continue from `next_offset` instead of rereading the whole file.",
-        "- Run the bundled scripts/workflow required by `/skill/SKILL.md`.",
-        (
-            "- After the final artifact exists, call `sandbox` action `save_result` with "
-            "`artifact_role=\"final\"` so Chat receives a clickable file card; use "
-            "`artifact_role=\"intermediate\"` for supporting files that should stay hidden."
-        ),
-        "- Call `sandbox` action `destroy` once after the final artifact has been saved to release the sandbox.",
-        "",
         "## Skill Instructions",
         "The following is the complete `/skill/SKILL.md` loaded for this run. Follow it exactly.",
         "",
         skill_instructions,
+        "",
+        "## Next Tool Guidance",
+        f"- Use `sandbox_exec(sandbox_id=\"{sandbox_id}\", command=\"...\")` or `sandbox_read_file` for additional targeted inspection when needed.",
+        "- Run the bundled scripts/workflow required by `/skill/SKILL.md`.",
+        (
+            "- After the final artifact exists, call `sandbox_save_result` with "
+            "`artifact_role=\"final\"` so Chat receives a clickable file card; use "
+            "`artifact_role=\"intermediate\"` for supporting files that should stay hidden."
+        ),
+        "- Call `sandbox_destroy` once after the final artifact has been saved to release the sandbox.",
     ])
     return "\n".join(lines)
 
@@ -1089,7 +1069,6 @@ async def _invoke_sandbox_skill(
     user_id: Optional[str],
     input_text: str,
     *,
-    agent_id: Optional[str] = None,
     conversation_id: Optional[str] = None,
     on_sub_tool_start=None,
     on_sub_tool_end=None,
@@ -1219,8 +1198,6 @@ async def _invoke_sandbox_skill(
     config_overrides = None
     expected_workspace_volume: str | None = None
 
-    from packages.core.services.sandbox_sdk import SandboxClient
-
     context = dict(runtime_tool_context or {})
     runtime_run_id = str(context.get("_runtime_run_id_from_context") or "")
     runtime_tool_call_id = str(context.get("_runtime_tool_call_id_from_context") or "")
@@ -1234,16 +1211,7 @@ async def _invoke_sandbox_skill(
     }
 
     existing_ctx = await runtime_load_sandbox_context(conversation_id or "")
-    existing_sandbox_id = (
-        (existing_ctx or {}).get("sandbox_id")
-        if runtime_sandbox_context_owner_matches(
-            existing_ctx,
-            entity_id=entity_id,
-            user_id=user_id,
-        )
-        and str((existing_ctx or {}).get("agent_id") or "") == str(agent_id or "")
-        else None
-    )
+    existing_sandbox_id = (existing_ctx or {}).get("sandbox_id")
     reservation = None
     if durable_external and runtime_run_id and runtime_tool_call_id:
         if db is None:
@@ -1293,56 +1261,18 @@ async def _invoke_sandbox_skill(
                 skill_info_parts.append(
                     f"credentials_injected ({len(env)}): {_compact_skill_items(set(env.keys()))}"
                 )
-            was_allocated = reservation.status == SandboxReservationStatus.ALLOCATED.value
-            if conversation_id:
-                try:
-                    await runtime_init_sandbox_context(
-                        conversation_id,
-                        result_sandbox_id,
-                        skill.id,
-                        entity_id=entity_id,
-                        user_id=user_id,
-                        agent_id=agent_id,
-                    )
-                except Exception as exc:
-                    if was_allocated:
-                        from packages.core.services.sandbox_queue_service import (
-                            release_sandbox_instance,
-                        )
-
-                        cleanup_client = SandboxClient(
-                            base_url=sandbox_url,
-                            timeout=180.0,
-                            api_token=sandbox_api_token,
-                        )
-                        try:
-                            destroyed = await _destroy_unadmitted_sandbox(
-                                cleanup_client,
-                                result_sandbox_id,
-                            )
-                        finally:
-                            await cleanup_client.close()
-                        reservation.last_error = "sandbox_context_persistence_failed"
-                        if destroyed:
-                            await release_sandbox_instance(
-                                db,
-                                sandbox_id=result_sandbox_id,
-                            )
-                        else:
-                            reservation.status = SandboxReservationStatus.RELEASE_PENDING.value
-                            reservation.version += 1
-                        await db.commit()
-                    return _sandbox_skill_error_response(
-                        skill,
-                        "Sandbox owner context could not be persisted; no Sandbox "
-                        f"tool access was granted. Details: {exc}",
-                    )
-            if was_allocated:
+            if reservation.status == SandboxReservationStatus.ALLOCATED.value:
                 from datetime import datetime, timezone
 
                 reservation.status = SandboxReservationStatus.CONSUMED.value
                 reservation.consumed_at = datetime.now(timezone.utc)
                 reservation.version += 1
+            if conversation_id:
+                await runtime_init_sandbox_context(
+                    conversation_id,
+                    result_sandbox_id,
+                    skill.slug or skill.name,
+                )
             await db.commit()
             return {
                 "skill": skill.name,
@@ -1410,6 +1340,7 @@ async def _invoke_sandbox_skill(
             )
 
     # ── 4. Create or reuse sandbox ──────────────────────────────────
+    from packages.core.services.sandbox_sdk import SandboxClient
     from packages.core.services.sandbox_sdk.exceptions import SandboxCapacityError, SandboxError
     client = SandboxClient(
         base_url=sandbox_url,
@@ -1462,22 +1393,6 @@ async def _invoke_sandbox_skill(
                     "[skill_service] sandbox reused: skill=%s sandbox=%s",
                     skill.name, existing_sandbox_id,
                 )
-                if conversation_id:
-                    try:
-                        await runtime_init_sandbox_context(
-                            conversation_id,
-                            result_sandbox_id,
-                            skill.id,
-                            entity_id=entity_id,
-                            user_id=user_id,
-                            agent_id=agent_id,
-                        )
-                    except Exception as exc:
-                        return _sandbox_skill_error_response(
-                            skill,
-                            "Sandbox owner context could not be persisted; no Sandbox "
-                            f"tool access was granted. Details: {exc}",
-                        )
             except SandboxError as busy_exc:
                 if busy_exc.status_code == 409:
                     await client.close()
@@ -1544,22 +1459,11 @@ async def _invoke_sandbox_skill(
                     f"{_compact_skill_items(create_result.env_blocked)}"
                 )
             if conversation_id:
-                try:
-                    await runtime_init_sandbox_context(
-                        conversation_id,
-                        result_sandbox_id,
-                        skill.id,
-                        entity_id=entity_id,
-                        user_id=user_id,
-                        agent_id=agent_id,
-                    )
-                except Exception as exc:
-                    await _destroy_unadmitted_sandbox(client, result_sandbox_id)
-                    return _sandbox_skill_error_response(
-                        skill,
-                        "Sandbox owner context could not be persisted; the newly "
-                        f"created Sandbox was destroyed. Details: {exc}",
-                    )
+                await runtime_init_sandbox_context(
+                    conversation_id,
+                    result_sandbox_id,
+                    skill.slug or skill.name,
+                )
             logger.info(
                 "[skill_service] sandbox created: skill=%s sandbox=%s entity=%s",
                 skill.name, result_sandbox_id, entity_id or "(none)",
@@ -1620,7 +1524,7 @@ async def invoke_skill(
     2. Detect skill type (prompt vs sandbox)
     3a. Sandbox skill → create/reuse a Sandbox Service sandbox via SandboxClient; return a
         context block (sandbox_id + SKILL.md) for the parent LLM to drive via
-        sandbox exec / destroy actions.
+        sandbox_exec / sandbox_destroy tool calls.
     3b. Prompt skill  → agentic_loop with skill's declared tools only.
     4. Return {content, usage, tools_used, rounds}
     """
@@ -1787,7 +1691,6 @@ async def invoke_skill(
     if skill_type == "sandbox":
         return await _invoke_sandbox_skill(
             skill, entity_id, user_id, input_text,
-            agent_id=agent_id,
             conversation_id=conversation_id,
             on_sub_tool_start=on_sub_tool_start,
             on_sub_tool_end=on_sub_tool_end,
@@ -1963,7 +1866,6 @@ async def invoke_skill(
             content=result.content,
             stop_reason=result.stop_reason,
             error=getattr(result, "error", None),
-            control=control,
         )
         commit_chrome_runtime_state(
             getattr(runtime_envelope, "metadata", None),

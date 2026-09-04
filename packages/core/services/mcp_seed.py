@@ -335,31 +335,6 @@ async def seed_mcp_catalog(engine: Engine) -> int:
             "SELECT pg_advisory_xact_lock(hashtext('manor.mcp_seed_catalog'), 0)"
         ))
 
-        # File operations use native tools; retire the duplicate internal MCP.
-        await conn.execute(text(
-            "DELETE FROM mcp_servers WHERE server_key = 'manor_mcp_file_engine'"
-        ))
-
-        # The old generic local-browser MCP was superseded by the explicit
-        # Chrome MCP. Remove the catalog row and any stale private bindings;
-        # no runtime alias remains after this migration.
-        await conn.execute(text(
-            "DELETE FROM agent_mcp_bindings WHERE mcp_server_id IN ("
-            "SELECT id FROM mcp_servers WHERE server_key = 'local_browser')"
-        ))
-        await conn.execute(text(
-            "DELETE FROM mcp_account_tool_catalogs WHERE provider = 'local_browser'"
-        ))
-        await conn.execute(text(
-            "DELETE FROM integrations WHERE provider = 'local_browser'"
-        ))
-        await conn.execute(text(
-            "DELETE FROM oauth_accounts WHERE provider = 'local_browser'"
-        ))
-        await conn.execute(text(
-            "DELETE FROM mcp_servers WHERE server_key = 'local_browser'"
-        ))
-
         # One-time migration: the SMTP-only provider was merged into a
         # combined IMAP+SMTP provider keyed ``email``. Drop any stale row
         # and re-point existing Integration rows to the new provider key.

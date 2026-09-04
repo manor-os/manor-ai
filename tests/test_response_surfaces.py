@@ -527,29 +527,6 @@ async def test_render_response_surface_tool_returns_bounded_surface() -> None:
 
 
 @pytest.mark.asyncio
-async def test_render_response_surface_accepts_serialized_interactive_surface() -> None:
-    envelope = SimpleNamespace(
-        surface=ChatSurface.WORKSPACE_CHAT.value,
-        profile=RuntimeProfile.WORKSPACE_OPERATOR,
-        conversation_id="conv_string_surface",
-    )
-    result = json.loads(await _render_response_surface(
-        title="Choose a direction",
-        render_kind="template",
-        template_id="response.choice",
-        template_props={
-            "prompt": "Choose",
-            "options": [{"id": "a", "label": "A"}, {"id": "b", "label": "B"}],
-        },
-        fallback_markdown="Choose A or B.",
-        conversation_id="conv_string_surface",
-        _runtime_envelope_from_context=envelope,
-    ))
-
-    assert result["ok"] is True
-
-
-@pytest.mark.asyncio
 async def test_render_response_surface_tool_fails_closed_without_runtime_envelope() -> None:
     result = json.loads(await _render_response_surface(
         title="Hidden",
@@ -565,12 +542,6 @@ async def test_render_response_surface_tool_fails_closed_without_runtime_envelop
 
     assert result["ok"] is False
     assert result["error"]["code"] == "response_surface_not_available_on_runtime_surface"
-
-
-def test_render_response_surface_receives_the_runtime_envelope() -> None:
-    from packages.core.ai.runtime.tool_execution import RUNTIME_ENVELOPE_AWARE_TOOLS
-
-    assert "render_response_surface" in RUNTIME_ENVELOPE_AWARE_TOOLS
 
 
 def test_response_surface_submission_is_bounded_and_server_canonicalized() -> None:

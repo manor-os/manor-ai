@@ -59,9 +59,7 @@ import { useAuthStore } from "../stores/auth";
 import { useToastStore } from "../stores/toast";
 import ChatMarkdown from "./ChatMarkdown";
 import WorkflowResultCard from "./WorkflowResultCard";
-import AssistantMessageBlocks, {
-  assistantPendingActionKindForMessage,
-} from "./AssistantMessageBlocks";
+import AssistantMessageBlocks from "./AssistantMessageBlocks";
 import FloatingPanel from "./FloatingPanel";
 import PanelHeader from "./chat/PanelHeader";
 import MessageRow from "./chat/MessageRow";
@@ -147,7 +145,6 @@ import {
   EDITOR_LIVE_CHAT_UPDATE_EVENT,
   AiEditApplyPhase,
   AiEditPatchStreamEventKind,
-  AiEditPreviewStatus,
   AiEditSessionCleanupStatus,
   aiEditConversationOwnerKey,
   containsEditorLivePatchProtocol,
@@ -163,13 +160,11 @@ import {
   isEditorLivePatchCommitAlreadyPreviewed,
   isSameAiEditConversationOwner,
   isSameEditorLiveTarget,
-  nativeFilePatchResultFromSseFrame,
   shouldAttachEditorLiveSourceDocument,
   shouldStreamEditorLiveDeltaPreview,
   stripEditorLiveEditBlocks,
   type AiEditConversationOwnerScope,
   type EditorLiveChatDetail,
-  type EditorNativeFilePatchResult,
 } from "../lib/editorLiveChat";
 import { decodeAuthTokenClaims, getAuthToken } from "../lib/authToken";
 import type { Agent, UserSummary } from "../lib/types";
@@ -655,9 +650,6 @@ function pipeEditorLiveEditStream(
     let sawStreamError = false;
     let lastAppliedPatch = "";
     let appliedGeneratedImageUrl = "";
-    let persistedNativePatchKey = "";
-    let reloadedNativePatchKey = "";
-    let nativePatchReloadError = "";
     let lastDeltaOperationIndex: number | null = null;
     const patchStream = createEditorLivePatchStream();
     // The caller reads once at turn start. Re-reading here could retarget a
@@ -761,98 +753,6 @@ function pipeEditorLiveEditStream(
       );
       onCompleteApplied?.();
       return true;
-    };
-
-    const finishNativeFilePatch = () => {
-      if (completeNotified || !persistedNativePatchKey || !reloadedNativePatchKey) return false;
-      if (!isActive() || signal?.aborted) return false;
-      completeNotified = true;
-      appliedRef.current = {
-        sessionKey,
-        turnId,
-        content: baselineContent,
-        phase: "complete",
-        operationCount: 1,
-        appliedPatchCount: 1,
-        basePatchCount: turnBasePatchCount,
-        abortController: appliedRef.current.abortController,
-      };
-      onProgress?.(
-        makeEditorLiveProgressTool(
-          "verify_patch",
-          "success",
-          { file: detail.documentName || "current file", stage: "persisted bytes reloaded" },
-          { status: "ok", source: "native patch_file" },
-        ),
-      );
-      onCompleteApplied?.();
-      return true;
-    };
-
-    const applyNativeFilePatchResult = async (result: EditorNativeFilePatchResult) => {
-      if (!detail.applyNativeFilePatch || !isActive() || signal?.aborted) return false;
-      const key = String(result.source_sha256 || `${result.document_id || ""}:${result.path}`);
-      if (key === persistedNativePatchKey) return key === reloadedNativePatchKey;
-      persistedNativePatchKey = key;
-      nativePatchReloadError = "";
-      onProgress?.(
-        makeEditorLiveProgressTool(
-          "apply_patch",
-          "pending",
-          { file: detail.documentName || result.path, patch: 1 },
-          { status: "persisted", source: "native patch_file" },
-        ),
-      );
-      try {
-        const accepted = await detail.applyNativeFilePatch(result, {
-          complete: true,
-          phase: AiEditApplyPhase.Complete,
-          source: "assistant-stream",
-          turnId,
-          turnBasePatchCount,
-          mode: "patch",
-          patchCount: 1,
-          sourceLabel: "native patch_file",
-          signal,
-        });
-        if (accepted === false) throw new Error("The editor rejected the persisted file reload.");
-        if (!isActive() || signal?.aborted) return false;
-        reloadedNativePatchKey = key;
-        appliedRef.current = {
-          sessionKey,
-          turnId,
-          content: baselineContent,
-          phase: "streaming",
-          operationCount: 1,
-          appliedPatchCount: 1,
-          basePatchCount: turnBasePatchCount,
-          abortController: appliedRef.current.abortController,
-        };
-        onProgress?.(
-          makeEditorLiveProgressTool(
-            "apply_patch",
-            "success",
-            { file: detail.documentName || result.path, patch: 1 },
-            { status: "ok", source: "native patch_file", path: result.path },
-          ),
-        );
-        return true;
-      } catch (error) {
-        nativePatchReloadError = error instanceof Error ? error.message : String(error);
-        onProgress?.(
-          makeEditorLiveProgressTool(
-            "verify_patch",
-            "error",
-            { file: detail.documentName || result.path, stage: "reload failed" },
-            {
-              status: "failed",
-              error: nativePatchReloadError,
-              recovery: "Reload the document to read the already-persisted native patch.",
-            },
-          ),
-        );
-        return false;
-      }
     };
 
     const applyGeneratedImageUrl = async (imageUrl: string) => {
@@ -1209,9 +1109,6 @@ function pipeEditorLiveEditStream(
       sawStreamError = false;
       lastAppliedPatch = "";
       appliedGeneratedImageUrl = "";
-      persistedNativePatchKey = "";
-      reloadedNativePatchKey = "";
-      nativePatchReloadError = "";
       lastDeltaOperationIndex = null;
       workingContent = baselineContent;
       lastPreviewContent = baselineContent;
@@ -1252,8 +1149,6 @@ function pipeEditorLiveEditStream(
       if (currentEvent === "error") sawStreamError = true;
       const generatedImageUrl = generatedImageUrlFromSseFrame(parsedFrame);
       if (generatedImageUrl) await applyGeneratedImageUrl(generatedImageUrl);
-      const nativeFilePatchResult = nativeFilePatchResultFromSseFrame(parsedFrame);
-      if (nativeFilePatchResult) await applyNativeFilePatchResult(nativeFilePatchResult);
       const token = parseLiveEditStreamFrame(rawData, currentEvent);
       if (!token) return;
       assistantText += token;
@@ -1278,30 +1173,7 @@ function pipeEditorLiveEditStream(
       const hasGeneratedImageOnly = Boolean(appliedGeneratedImageUrl)
         && processedOperationCount === 0
         && !containsEditorLivePatchProtocol(assistantText);
-      if (persistedNativePatchKey && reloadedNativePatchKey) {
-        finishNativeFilePatch();
-      } else if (persistedNativePatchKey) {
-        completeNotified = true;
-        appliedRef.current = {
-          ...appliedRef.current,
-          phase: "failed",
-          operationCount: 1,
-          appliedPatchCount: 1,
-        };
-        if (!nativePatchReloadError) {
-          onProgress?.(
-            makeEditorLiveProgressTool(
-              "verify_patch",
-              "error",
-              { file: detail.documentName || "current file", stage: "reload unavailable" },
-              {
-                status: "failed",
-                error: "The native patch was saved, but the editor could not reload it.",
-              },
-            ),
-          );
-        }
-      } else if (sawStreamError) {
+      if (sawStreamError) {
         await deltaPreviewQueue.cancel();
         await rollbackFailedLiveEdit();
       } else if (
@@ -1975,7 +1847,7 @@ export default function FloatingChat() {
       }
       if (!refItem.document_id) return;
       try {
-        const blobUrl = await api.documents.preview(refItem.document_id);
+        const blobUrl = await api.documents.download(refItem.document_id);
         window.open(blobUrl, "_blank", "noopener,noreferrer");
         window.setTimeout(() => URL.revokeObjectURL(blobUrl), 60_000);
       } catch {
@@ -3297,10 +3169,6 @@ export default function FloatingChat() {
                         liveEditDetail?.supportsImageGeneration ||
                         liveEditDetail?.applyGeneratedImage,
                       ),
-                      supportsNativeFilePatch: Boolean(
-                        liveEditDetail?.supportsNativeFilePatch
-                        && liveEditDetail?.applyNativeFilePatch,
-                      ),
                       currentDocumentContent:
                         typeof liveEditContent === "string" ? liveEditContent : undefined,
                     }
@@ -3577,15 +3445,15 @@ export default function FloatingChat() {
 
   useEffect(() => {
     if (!editorLiveSessionActive) return;
-    const routePath = editorLiveInfo?.routePath;
-    if (!routePath || location.pathname === routePath) return;
+    const sourcePath = editorLiveInfo?.sourcePath;
+    if (!sourcePath || location.pathname === sourcePath) return;
     void (async () => {
       const cleaned = await closeEditorLiveSession();
       setOpen(!cleaned);
     })();
   }, [
     closeEditorLiveSession,
-    editorLiveInfo?.routePath,
+    editorLiveInfo?.sourcePath,
     editorLiveSessionActive,
     location.pathname,
   ]);
@@ -3719,9 +3587,6 @@ export default function FloatingChat() {
   /* ---- HITL action handler ---- */
   const handleHITLAction = useCallback(
     async (hitlId: string, action: string, review?: unknown) => {
-      const targetHitl = messages
-        .flatMap((message) => message.hitl_requests || [])
-        .find((hitl) => hitl.id === hitlId);
       const markResolved = (items: ChatMessage[]) =>
         items.map((msg) => ({
           ...msg,
@@ -3753,66 +3618,8 @@ export default function FloatingChat() {
         setDraftSessionKey(sessionKey);
       }
 
-      const activeEditorDetail = (
-        editorLiveSessionActive
-        && targetHitl?.tool === "patch_file"
-        && editorLiveDetailRef.current?.applyNativeFilePatch
-      )
-        ? {
-            ...editorLiveDetailRef.current,
-            ...(editorLiveDetailRef.current.getTurnMetadata?.() || {}),
-          }
-        : null;
-      const liveEditContent = activeEditorDetail?.adapter.read() || "";
-      const liveEditTurnId = activeEditorDetail
-        ? `approval-${Date.now()}-${Math.random().toString(36).slice(2)}`
-        : undefined;
-      const liveEditTurnBasePatchCount = Math.max(
-        0,
-        activeEditorDetail?.adapter.getTurnPreviewState().changeCount || 0,
-      );
-      if (activeEditorDetail && liveEditTurnId) {
-        editorLiveAppliedRef.current.abortController?.abort();
-        editorLiveAppliedRef.current = {
-          sessionKey,
-          turnId: liveEditTurnId,
-          content: liveEditContent,
-          phase: "pending",
-          operationCount: 0,
-          appliedPatchCount: 0,
-          basePatchCount: liveEditTurnBasePatchCount,
-          abortController: new AbortController(),
-        };
-      }
-
       await startStream(
-        async (streamSignal) => {
-          const response = await api.chat.stream(hitlMessage, currentConvId, {
-            signal: streamSignal,
-          });
-          if (!activeEditorDetail || !liveEditTurnId) return response;
-          return pipeEditorLiveEditStream(
-            response,
-            activeEditorDetail,
-            sessionKey,
-            liveEditTurnId,
-            editorLiveAppliedRef,
-            () => Boolean(
-              editorLiveDetailRef.current
-              && isSameEditorLiveTarget(editorLiveDetailRef.current, activeEditorDetail)
-              && editorLiveAppliedRef.current.turnId === liveEditTurnId
-              && !editorLiveAppliedRef.current.abortController?.signal.aborted
-            ),
-            (tool) => setSessionMessages(sessionKey, (previous) => (
-              withEditorLiveProgress(previous, tool)
-            )),
-            undefined,
-            undefined,
-            liveEditContent,
-            hasReviewableEditorLivePreview({ changeCount: liveEditTurnBasePatchCount }),
-            liveEditTurnBasePatchCount,
-          );
-        },
+        () => api.chat.stream(hitlMessage, currentConvId),
         currentConvId,
         msgsForHitl,
         (newConvId) => {
@@ -3827,10 +3634,8 @@ export default function FloatingChat() {
     },
     [
       currentConvId,
-      editorLiveSessionActive,
       queryClient,
       messages,
-      setSessionMessages,
       startStream,
       createDraftSession,
       setMessages,
@@ -3854,14 +3659,6 @@ export default function FloatingChat() {
             }
           : undefined);
       if (!retryRequest?.message?.trim()) return;
-
-      // Retrying inside AI Edit must re-enter the editor-aware send pipeline.
-      // A plain chat retry drops editorContext, the patch-only tool surface,
-      // and the persisted-file reload callback.
-      if (editorLiveSessionActive) {
-        await handleSend(retryRequest.message, [], [], null);
-        return;
-      }
 
       const now = new Date().toISOString();
       const sessionKey =
@@ -3929,8 +3726,6 @@ export default function FloatingChat() {
     [
       currentConvId,
       createDraftSession,
-      editorLiveSessionActive,
-      handleSend,
       messages,
       queryClient,
       setMessages,
@@ -4013,10 +3808,6 @@ export default function FloatingChat() {
   const editorLiveExamples = editorLiveInfo?.examples?.length
     ? editorLiveInfo.examples
     : ["Rewrite", "Format", "Add content", "Fix layout"];
-  const editorLivePreviewReady = editorLiveInfo?.previewStatus === AiEditPreviewStatus.Ready
-    && Boolean(editorLiveInfo.acceptPreview || editorLiveInfo.discardPreview);
-  const editorLivePreviewBusy = Boolean(editorLiveInfo?.previewAccepting)
-    || editorLiveCleanupStatus === AiEditSessionCleanupStatus.Closing;
 
   /* ================================================================ */
   /*  Render                                                           */
@@ -4565,7 +4356,6 @@ export default function FloatingChat() {
                             streaming={assistantWorking && i === messages.length - 1}
                             onResponseSurfaceSubmit={handleResponseSurfaceSubmit}
                             sourceMessageId={msg.id || ""}
-                            pendingActionKind={assistantPendingActionKindForMessage(msg)}
                             responseSurfaceSubmissionReceipts={responseSurfaceSubmissionReceipts}
                           />
                           <ChatMessageReferenceStrip
@@ -4745,37 +4535,6 @@ export default function FloatingChat() {
 
           <div ref={messagesEndRef} />
         </div>
-
-        {editorLiveSessionActive && editorLivePreviewReady && (
-          <div
-            role="group"
-            aria-label={t("page.doc_editor.ai_edit_preview_controls")}
-            style={{
-              display: "flex",
-              justifyContent: "flex-end",
-              gap: 8,
-              padding: "10px 14px 0",
-              borderTop: "1px solid var(--panel-border, rgba(120, 113, 108, 0.14))",
-            }}
-          >
-            <button
-              type="button"
-              className="floating-chat-suggestion"
-              disabled={editorLivePreviewBusy}
-              onClick={() => { void editorLiveInfo?.discardPreview?.(); }}
-            >
-              {t("page.doc_editor.ai_edit_discard")}
-            </button>
-            <button
-              type="button"
-              className="floating-chat-suggestion"
-              disabled={editorLivePreviewBusy}
-              onClick={() => { void editorLiveInfo?.acceptPreview?.(); }}
-            >
-              {editorLiveInfo?.previewAccepting ? t("status.saving") : t("page.doc_editor.ai_edit_accept")}
-            </button>
-          </div>
-        )}
 
         {/* Sticky approval bar (same component used by EmbeddedChat). The
             "floating" variant matches the 12 px padding and 100% width that

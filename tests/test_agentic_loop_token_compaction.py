@@ -13,7 +13,6 @@ from packages.core.ai.agentic_loop import (
     _compact_tool_result_for_context,
     _context_compaction_token_threshold,
     _estimate_context_attribution,
-    _strip_inapplicable_integration_continuations,
     LOOP_COMPACT_RATIO,
     MAX_CONTEXT_TOKENS,
 )
@@ -222,27 +221,6 @@ def test_compact_search_tools_result_preserves_mcp_option_status():
     assert options["linkedin"]["ready"] is False
     assert options["linkedin"]["authorization_method"] == "oauth"
     assert options["linkedin"]["execution_mode"] == "official_api"
-
-
-def test_compact_search_tools_result_preserves_permission_failure():
-    compact = json.loads(
-        _compact_search_tools_result_for_context(
-            {
-                "error": "blocked_by_permission",
-                "message": "The delegated agent's current tool binding has been revoked.",
-                "matched_rule": "permission.agent_tool_binding",
-                "action_key": "runtime.discovery",
-                "capability_id": "runtime.discovery",
-                "tool": "search_tools",
-            },
-            [],
-        )
-    )
-
-    assert compact["error"] == "blocked_by_permission"
-    assert compact["matched_rule"] == "permission.agent_tool_binding"
-    assert compact["message"].endswith("revoked.")
-    assert compact["tool"] == "search_tools"
 
 
 def test_compact_search_tools_result_keeps_servers_and_bounded_suppressed_mcp():
@@ -715,30 +693,6 @@ async def test_agentic_loop_preserves_executor_failure_in_model_context_for_reco
     )
     assert "mcp__other__action" in observed_tool_content
     assert "registered handler" in observed_tool_content
-
-
-@pytest.mark.parametrize(
-    ("arguments", "expected"),
-    [
-        ({"integration_account_continuation": "invented"}, {}),
-        (
-            {
-                "integration_account_selection": "all",
-                "integration_account_continuation": "signed-token",
-            },
-            {
-                "integration_account_selection": "all",
-                "integration_account_continuation": "signed-token",
-            },
-        ),
-    ],
-)
-def test_agentic_loop_normalizes_model_integration_continuations(arguments, expected):
-    calls = [{"name": "mcp__email__list_folders", "arguments": arguments}]
-
-    _strip_inapplicable_integration_continuations(calls)
-
-    assert calls[0]["arguments"] == expected
 
 
 def test_prompt_cache_counts_reusable_history_prefix():

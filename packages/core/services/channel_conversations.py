@@ -221,7 +221,6 @@ async def add_channel_inbound_message(
     chat_id: Optional[str],
     content: str,
     attachments: list[dict] | None = None,
-    meta: dict | None = None,
 ) -> Message:
     """Persist an inbound channel turn in the conversation transcript."""
     message = Message(
@@ -234,7 +233,6 @@ async def add_channel_inbound_message(
             "sender_id": sender_id,
             "sender_name": sender_name,
             "chat_id": chat_id,
-            **dict(meta or {}),
         },
     )
     db.add(message)

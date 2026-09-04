@@ -1242,7 +1242,7 @@ async def channel_reply_route_is_active(
             binding=binding,
             contact=(
                 None
-                if channel_type in {"slack", "discord", "twilio_voice"}
+                if channel_type in {"slack", "discord"}
                 else contact
             ),
         )

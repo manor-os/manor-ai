@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from typing import Iterable, Optional
+from typing import Optional
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -79,7 +79,6 @@ async def build_agent_context(
     extra_system_prompt: Optional[str] = None,
     runtime_surface: ChatSurface | str = ChatSurface.SCHEDULED_AGENT_RUN,
     runtime_metadata: Optional[dict] = None,
-    skill_refs: Iterable[dict] | None = None,
 ) -> AgentExecutionContext:
     """Build a complete execution context for any LLM call.
 
@@ -189,8 +188,6 @@ async def build_agent_context(
             ),
             mode=mode if mode != "task" else "full",
             active_user_message=active_user_message,
-            manual_skill_selected=bool(skill_refs),
-            skill_refs=skill_refs,
             legacy_extra_context=runtime.extra_context,
             initial_extra_context=runtime.extra_context,
         )

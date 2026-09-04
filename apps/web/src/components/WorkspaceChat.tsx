@@ -51,9 +51,7 @@ import {
   WorkspaceSimulationRuntimeBar,
   useWorkspaceSimulationRuntime,
 } from "./WorkspaceSimulationRuntime";
-import AssistantMessageBlocks, {
-  assistantPendingActionKindForMessage,
-} from "./AssistantMessageBlocks";
+import AssistantMessageBlocks from "./AssistantMessageBlocks";
 import CollapsibleSentMessage from "./chat/CollapsibleSentMessage";
 import ChatMessageActions, {
   chatMessageActionText,
@@ -75,7 +73,6 @@ import AgentActivityOrb, { inferAgentActivity } from "./ui/AgentActivityOrb";
 import { agentAvatarSeed } from "./ui/AgentAvatar";
 import UserAvatar from "./ui/UserAvatar";
 import WorkspaceIconTile from "./ui/WorkspaceIcon";
-import WorkspaceConnectionNotice from "./workspaces/WorkspaceConnectionNotice";
 import WorkspaceStatsQuickAccess from "./workspaces/WorkspaceStatsQuickAccess";
 import WorkspaceLedgerConfigurationDialog from "./workspaces/WorkspaceLedgerConfigurationDialog";
 import ChatActionCard, { ApprovalSummary } from "./ui/ChatActionCard";
@@ -3685,7 +3682,6 @@ export default function WorkspaceChat({
 
   const chatSurface = (
     <div className="embedded-chat-root">
-      {!isTaskSession && <WorkspaceConnectionNotice workspaceId={workspaceId} />}
       {taskSession && (
         <details
           className="task-session-chat-header"
@@ -4419,7 +4415,6 @@ export default function WorkspaceChat({
                       subAgentRuns={delegatedRuns}
                       onResponseSurfaceSubmit={handleResponseSurfaceSubmit}
                       sourceMessageId={msg.id || ""}
-                      pendingActionKind={assistantPendingActionKindForMessage(msg)}
                       responseSurfaceSubmissionReceipts={responseSurfaceSubmissionReceipts}
                       onConfigureWorkspaceLedgers={
                         canToggleWorkspace && !threadRef
@@ -5068,7 +5063,10 @@ export function WsMessageRow({
               subAgentRuns={delegatedRuns}
               onResponseSurfaceSubmit={onResponseSurfaceSubmit}
               sourceMessageId={msg.id}
-              pendingActionKind={assistantPendingActionKindForMessage(msg)}
+              hasPendingAction={Boolean(
+                hitlCards.some((hitl) => !hitl.resolved) ||
+                (msg.pending_action?.kind && !msg.resolved_at)
+              )}
               responseSurfaceSubmissionReceipts={responseSurfaceSubmissionReceipts}
               onConfigureWorkspaceLedgers={onConfigureLedgers}
             />

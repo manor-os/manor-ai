@@ -38,10 +38,6 @@ from packages.core.ai.runtime.tool_search import (
 from packages.core.ai.runtime.tool_execution import (
     runtime_execute_registered_tool,
     runtime_preflight_tool_resolution,
-    runtime_settle_provider_approval_preflight_failure,
-)
-from packages.core.ai.runtime.tool_input_validation import (
-    runtime_tool_input_validation_result,
 )
 from packages.core.ai.runtime.tool_visibility import (
     runtime_tool_is_deferred,
@@ -87,51 +83,21 @@ class ToolPool:
             sum(1 for n in self._tools if is_deferred(n)),
         )
 
-    def register(
-        self,
-        name: str,
-        schema: dict,
-        handler,
-        deferred: bool = False,
-        *,
-        discoverable: bool = True,
-    ):
-        self._tools[name] = {
-            "schema": schema,
-            "handler": handler,
-            "deferred": deferred,
-            "discoverable": discoverable,
-        }
+    def register(self, name: str, schema: dict, handler, deferred: bool = False):
+        self._tools[name] = {"schema": schema, "handler": handler, "deferred": deferred}
 
     @property
     def tool_count(self) -> int:
         return len(self._tools)
 
-    def registered_tool_names(
-        self,
-        *,
-        prefix: str | None = None,
-        include_undiscoverable: bool = False,
-    ) -> tuple[str, ...]:
-        names = tuple(
-            name
-            for name, entry in self._tools.items()
-            if include_undiscoverable or entry.get("discoverable", True)
-        )
+    def registered_tool_names(self, *, prefix: str | None = None) -> tuple[str, ...]:
+        names = tuple(self._tools.keys())
         if prefix is None:
             return names
         return tuple(name for name in names if name.startswith(prefix))
 
-    def registered_tool_schemas(
-        self,
-        *,
-        include_undiscoverable: bool = False,
-    ) -> tuple[tuple[str, dict], ...]:
-        return tuple(
-            (name, copy.deepcopy(entry.get("schema") or {}))
-            for name, entry in self._tools.items()
-            if include_undiscoverable or entry.get("discoverable", True)
-        )
+    def registered_tool_schemas(self) -> tuple[tuple[str, dict], ...]:
+        return tuple((name, copy.deepcopy(entry.get("schema") or {})) for name, entry in self._tools.items())
 
     def _prune_dynamic_mcp_tools(self, *, now: float | None = None) -> None:
         """Remove expired actor-scoped handlers from the process-local cache."""
@@ -158,39 +124,6 @@ class ToolPool:
             if schema is not None:
                 schemas.append(schema)
         return schemas
-
-    async def get_schema_for_actor(
-        self,
-        name: str,
-        *,
-        entity_id: str,
-        user_id: str,
-    ) -> Optional[dict]:
-        """Resolve the exact current schema at an actor-scoped runtime boundary.
-
-        Static tools come from the process registry. Dynamically discovered MCP
-        actions are rehydrated against the actor's current account registry, so
-        approval resolution never treats a stale or missing schema as valid.
-        """
-
-        registered = self.get_schema(name)
-        if registered is not None:
-            return registered
-        resolution = await self._ensure_dynamic_mcp_tool_binding(
-            name,
-            entity_id=entity_id,
-            user_id=user_id,
-            allowed_tool_names={name},
-            runtime_envelope=None,
-        )
-        if (
-            resolution is None
-            or resolution.status is not RuntimeDynamicMCPRehydrationStatus.BOUND
-            or resolution.binding is None
-            or not isinstance(resolution.binding.schema, dict)
-        ):
-            return None
-        return copy.deepcopy(resolution.binding.schema)
 
     async def execute(
         self,
@@ -227,33 +160,8 @@ class ToolPool:
             task_id=task_id,
             runtime_envelope=runtime_envelope,
         )
-
-        async def settle_early_failure(result: str) -> str:
-            """Close a provider grant before any handler or provider I/O runs."""
-
-            harness = resolution_preflight.harness
-            envelope = harness.envelope if harness is not None else runtime_envelope
-            context = resolution_preflight.context
-            return await runtime_settle_provider_approval_preflight_failure(
-                harness=harness,
-                tool_name=name,
-                arguments=arguments,
-                result=result,
-                entity_id=(
-                    getattr(envelope, "entity_id", None)
-                    or (context.entity_id if context is not None else None)
-                    or entity_id
-                    or ""
-                ),
-                conversation_id=(
-                    getattr(envelope, "conversation_id", None)
-                    or (context.conversation_id if context is not None else None)
-                    or conversation_id
-                ),
-            )
-
         if resolution_preflight.blocked_result is not None:
-            return await settle_early_failure(resolution_preflight.blocked_result)
+            return resolution_preflight.blocked_result
         dynamic_resolution = await self._ensure_dynamic_mcp_tool_binding(
             name,
             entity_id=entity_id,
@@ -281,35 +189,13 @@ class ToolPool:
 
         blocked_result = blocked_dynamic_result(dynamic_resolution)
         if blocked_result is not None:
-            return await settle_early_failure(blocked_result)
+            return blocked_result
         dynamic_binding = (
             dynamic_resolution.binding
             if dynamic_resolution is not None
             and dynamic_resolution.status is RuntimeDynamicMCPRehydrationStatus.BOUND
             else None
         )
-
-        selected_schema = (
-            dynamic_binding.schema
-            if dynamic_binding is not None
-            else self.get_schema(name)
-        )
-        validation_result = (
-            runtime_tool_input_validation_result(
-                tool_name=name,
-                arguments=arguments,
-                tool_schema=selected_schema,
-            )
-            if selected_schema is not None
-            else None
-        )
-        if validation_result is not None:
-            if resolution_preflight.harness is not None:
-                resolution_preflight.harness.record_tool_block_result(
-                    name,
-                    validation_result,
-                )
-            return await settle_early_failure(validation_result)
 
         async def execute_registered(
             binding: RuntimeDynamicMCPToolBinding | None,
@@ -364,25 +250,13 @@ class ToolPool:
         )
         blocked_result = blocked_dynamic_result(refreshed_resolution)
         if blocked_result is not None:
-            return await settle_early_failure(blocked_result)
+            return blocked_result
         if (
             refreshed_resolution is None
             or refreshed_resolution.status is not RuntimeDynamicMCPRehydrationStatus.BOUND
             or refreshed_resolution.binding is None
         ):
             return result
-        validation_result = runtime_tool_input_validation_result(
-            tool_name=name,
-            arguments=arguments,
-            tool_schema=refreshed_resolution.binding.schema,
-        )
-        if validation_result is not None:
-            if resolution_preflight.harness is not None:
-                resolution_preflight.harness.record_tool_block_result(
-                    name,
-                    validation_result,
-                )
-            return await settle_early_failure(validation_result)
         return await execute_registered(refreshed_resolution.binding)
 
     def search(
@@ -453,8 +327,8 @@ class ToolPool:
                 entity_id=entity_id,
                 user_id=user_id,
                 tool_schemas=self.registered_tool_schemas(),
-                available_tool_names=self.registered_tool_names(),
-                total_tool_count=len(self.registered_tool_names()),
+                available_tool_names=self._tools.keys(),
+                total_tool_count=len(self._tools),
                 live_mcp_schema_loader=_load_live_schemas,
             )
             try:

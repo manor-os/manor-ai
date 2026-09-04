@@ -475,17 +475,7 @@ _MCP_READ_ONLY_ACTIONS_BY_SERVER: dict[str, frozenset[str]] = {
     "claude_code": frozenset({"check_path"}),
     "codex_cli": frozenset({"check_path"}),
     "elevenlabs": frozenset({"list_voices"}),
-    "email": frozenset({
-        "download_attachment",
-        "get_draft",
-        "get_message",
-        "get_thread",
-        "list_attachments",
-        "list_drafts",
-        "list_folders",
-        "list_messages",
-        "list_threads",
-    }),
+    "email": frozenset({"get_message", "list_folders", "list_messages"}),
     "facebook": frozenset({
         "get_instagram_account", "get_instagram_insights", "get_instagram_media", "get_live_video",
         "get_page", "get_page_insights", "get_post", "get_post_insights", "list_comments",
@@ -638,7 +628,6 @@ _READ_ONLY_TOOLS = {
     "workspace_search",
     "workspace_list_knowledge",
     "sandbox_read_file",
-    "sandbox_status",
     "list_skills",
     "get_skill_details",
     "list_workflows",
@@ -729,8 +718,6 @@ _FIXED_TOOL_ACTIONS: dict[str, RuntimeApprovalAction] = {
     "record_youtube_workspace_metrics": _fixed_action("workspace.knowledge.update", "medium", "record YouTube metrics", "knowledge", "modify"),
     "render_frame_samples": _fixed_action("workspace.file.create", "medium", "render frame samples", "file", "create"),
     "sandbox_destroy": _fixed_action("sandbox.destroy", "high", "destroy sandbox", "sandbox", "delete"),
-    "sandbox_cancel": _fixed_action("sandbox.cancel", "medium", "cancel sandbox command", "sandbox", "cancel"),
-    "sandbox_respond": _fixed_action("sandbox.respond", "low", "respond to sandbox command", "sandbox", "execute"),
     "send_channel_attachment": _fixed_action(
         "channel.reply",
         "high",
@@ -814,9 +801,6 @@ _WORKSPACE_AGENT_ACTION_MAP = {
     "delegate_service": ("workspace.service.delegate", "medium", "delegate workspace service agent", "workspace_service", "execute"),
     "operation": ("workspace.operation.update", "medium", "update workspace operation draft", "workspace_operation", "modify"),
     "request_strategist_review": ("workspace.strategist.run", "medium", "request strategist review", "workspace", "execute"),
-    "resolve_hitl": ("workspace.hitl.resolve", "medium", "resolve Workspace request", "workspace", "modify"),
-    "answer_task_blocker": ("workspace.task.update", "medium", "answer task blocker", "workspace_task", "modify"),
-    "update_goal_value": ("workspace.goal.update", "medium", "update goal", "goal", "modify"),
     "workspace_create_task": ("workspace.task.create", "medium", "create workspace task", "workspace_task", "create"),
     "workspace_update_task_runtime": ("workspace.task.update", "medium", "update task runtime requirements", "workspace_task", "modify"),
     "workspace_create_knowledge_folder": ("workspace.knowledge.update", "medium", "create workspace Knowledge Net", "knowledge", "create"),
@@ -861,8 +845,6 @@ def _classify_known_runtime_tool_action(
     if fixed_action is not None:
         return fixed_action
 
-    # Historical approval records still need classification. These retired
-    # names have no registered handler and cannot execute new file writes.
     if name == "generate_document_file":
         from packages.core.ai.runtime.authorization_receipts import (
             WorkspaceFileAuthorizationResourceFactory,
@@ -1186,20 +1168,6 @@ def _runtime_tool_classifier() -> RuntimeToolClassifier:
     )
 
 
-def _canonical_composite_tool_call(
-    tool_name: str,
-    arguments: dict[str, Any] | None,
-) -> tuple[str, dict[str, Any]]:
-    """Project composite gateway calls onto their governed legacy action."""
-
-    from packages.core.ai.runtime.composite_tools import (
-        RuntimeCompositeToolCallFactory,
-    )
-
-    call = RuntimeCompositeToolCallFactory.create(tool_name, arguments)
-    return call.tool_name, call.arguments
-
-
 def classify_runtime_tool(
     tool_name: str,
     arguments: dict[str, Any] | None = None,
@@ -1219,13 +1187,9 @@ def classify_runtime_tool(
     calls all have no action object there.
     """
 
-    canonical_name, canonical_arguments = _canonical_composite_tool_call(
+    request = RuntimeToolClassificationRequest.create(
         tool_name,
         arguments,
-    )
-    request = RuntimeToolClassificationRequest.create(
-        canonical_name,
-        canonical_arguments,
         entity_id=entity_id,
         workspace_id=workspace_id,
         task_id=task_id,
@@ -1315,12 +1279,7 @@ def _runtime_tool_is_explicitly_read_only(
         action = str(args.get("action") or "").strip()
         return ManorReadCapabilityFactory.supports(action)
     if tool_name == "workspace_agent":
-        return str(args.get("action") or "").strip() in {
-            "search",
-            "list_knowledge",
-            "get_goal_status",
-            "visualize_ledgers",
-        }
+        return str(args.get("action") or "").strip() in {"search", "list_knowledge"}
     if tool_name == "workspace_operation":
         from packages.core.ai.runtime.workspace_operation_actions import (
             _normalise_workspace_operation_action,
@@ -1464,15 +1423,6 @@ def _classify_mcp_tool_action(tool_name: str, args: dict[str, Any]) -> RuntimeAp
             return RuntimeApprovalAction("action", f"social_post.{suffix}", risk, f"{suffix} social content", "external_account", operation)
 
     if server in {"gmail", "outlook", "email"}:
-        if server == "email" and action == "save_attachment_to_workspace":
-            return RuntimeApprovalAction(
-                "action",
-                "workspace.knowledge.update",
-                "medium",
-                "save email attachment to Workspace Knowledge",
-                "knowledge",
-                "create",
-            )
         if action in _EMAIL_SEND_ACTIONS:
             return RuntimeApprovalAction("action", "email.send", "high", "send email", "external_account", "send")
         if action.startswith("delete_"):
@@ -1649,12 +1599,7 @@ async def resolve_runtime_workspace_file_scope(
     effect.
     """
 
-    from packages.core.ai.runtime.composite_tools import (
-        RuntimeCompositeToolCallFactory,
-    )
-
-    canonical_call = RuntimeCompositeToolCallFactory.create(tool_name, arguments)
-    normalized_tool = canonical_call.tool_name
+    normalized_tool = str(tool_name or "").strip()
     normalized_workspace_id = str(workspace_id or "").strip()
     normalized_entity_id = str(entity_id or "").strip()
     from packages.core.ai.runtime.authorization_receipts import (
@@ -1701,7 +1646,7 @@ async def resolve_runtime_workspace_file_scope(
     if not artifact_folder_id:
         return RuntimeWorkspaceFileScope(WorkspaceFileExistence.UNKNOWN)
 
-    args = canonical_call.arguments
+    args = arguments or {}
     raw_params = args.get("params")
     params = raw_params if isinstance(raw_params, dict) else {}
     generate_file_workspace_asset = (
@@ -1712,7 +1657,7 @@ async def resolve_runtime_workspace_file_scope(
     )
     workspace_base = workspace_artifact_storage_base(str(artifact_folder_id))
     workspace_shared = (
-        normalized_tool in {"write_file", "generate_file"}
+        normalized_tool == "write_file"
         and str(args.get("storage_scope") or "task").strip().lower() == "workspace"
     ) or bool(args.get("workspace_shared")) or (
         normalized_tool == "generate_image"

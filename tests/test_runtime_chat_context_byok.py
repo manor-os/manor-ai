@@ -158,7 +158,7 @@ async def test_workspace_ledger_tool_scope_keeps_the_tenant_byok_route(monkeypat
             "read_recruiting_ledger",
             "read_relationship_ledger",
             "query_ledger",
-            "manor",
+            "visualize_workspace_ledgers",
         )
         assert request.metadata["turn_execution_plan"]["tool_catalog_mode"] == (
             "ledger_query"

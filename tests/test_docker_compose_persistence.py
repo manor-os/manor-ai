@@ -23,12 +23,6 @@ def test_api_and_worker_receive_cloud_model_routing_environment():
         )
 
 
-def test_dev_api_and_workers_receive_cloud_model_routing_environment():
-    compose = yaml.safe_load((ROOT / "docker-compose.dev.yml").read_text(encoding="utf-8"))
-
-    assert compose["services"]["manor-api"]["environment"]["CREDENTIAL_BACKEND"] == "dev"
-    for service_name in ("manor-worker", "manor-worker-heavy"):
-        assert compose["services"][service_name]["environment"]["CREDENTIAL_BACKEND"] == "dev"
 
 
 def test_env_example_omits_dev_credential_key():

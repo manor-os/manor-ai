@@ -48,17 +48,3 @@ def test_sandbox_runner_api_token_protects_api_routes_but_not_health(monkeypatch
         "/api/v1/sandbox",
         headers={"X-Manor-Sandbox-Token": "runner-secret"},
     ).status_code != 401
-
-
-def test_sandbox_runner_api_fails_closed_when_token_is_unconfigured(monkeypatch) -> None:
-    sandbox_main = _load_sandbox_main_module()
-    monkeypatch.setattr(sandbox_main.config, "API_TOKEN", "", raising=False)
-
-    client = TestClient(sandbox_main.app, raise_server_exceptions=False)
-
-    assert client.get("/health").status_code == 200
-    response = client.get("/api/v1/sandbox")
-    assert response.status_code == 503
-    assert response.json() == {
-        "detail": "Sandbox API token is not configured",
-    }

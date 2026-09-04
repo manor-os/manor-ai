@@ -61,19 +61,11 @@ from packages.core.ai.runtime.skill_invocation_policy import (
     render_skill_invocation_policy,
     trusted_skill_invocation_policy,
 )
-from packages.core.ai.runtime.skill_capability_companion import (
-    trusted_integration_provider_keys,
-    trusted_skill_capability_companion,
-)
 from packages.core.ai.runtime.chrome_routing import detect_chrome_local_browser_route
 from packages.core.ai.runtime.surfaces import ChatSurface
 from packages.core.ai.runtime.tool_context import (
     RUNTIME_TOOL_CONTEXT_KEYS,
     runtime_tool_call_context_from_kwargs,
-)
-from packages.core.ai.runtime.tool_bindings import (
-    RuntimeDynamicMCPDiscoveryScopeFactory,
-    RuntimeSearchToolBindingScope,
 )
 from packages.core.services.skill_bundle import parse_clarifying_questions
 
@@ -423,11 +415,6 @@ async def runtime_invoke_skill_action(
     if is_runtime_tool_suspension(result):
         return result
 
-    if runtime_activate_sandbox_skill_handoff(runtime_context, result):
-        result = {
-            **result,
-            "loaded_tools": ["sandbox"],
-        }
     runtime_record_nested_usage(result.get("usage") if isinstance(result, dict) else None)
     if runtime_manual_skill_result_stops_parent(runtime_context, result):
         result = {
@@ -437,34 +424,6 @@ async def runtime_invoke_skill_action(
             "replace_visible_text": True,
         }
     return runtime_format_invoke_skill_result(skill_key, result)
-
-
-def runtime_activate_sandbox_skill_handoff(
-    runtime_context: Any | None,
-    result: Any,
-) -> bool:
-    """Grant the composite Sandbox tool after a verified Skill admission.
-
-    This is deliberately run-local.  ``invoke_skill`` has already checked the
-    Skill's current visibility/binding and created a conversation-owned
-    sandbox.  The execution gate still revalidates that Skill context and the
-    sandbox handler checks the exact sandbox id before every action.
-    """
-
-    if not isinstance(result, dict):
-        return False
-    if (
-        str(result.get("stop_reason") or "") != "sandbox_ready"
-        or not str(result.get("sandbox_id") or "").strip()
-    ):
-        return False
-    envelope = getattr(runtime_context, "runtime_envelope", None)
-    grants = getattr(envelope, "discovered_tool_grants", None)
-    grant = getattr(grants, "grant", None)
-    if not callable(grant):
-        return False
-    grant(["sandbox"])
-    return True
 
 
 async def runtime_manual_skill_execution_model(
@@ -548,15 +507,6 @@ async def runtime_manual_skill_execution_model(
         return current_model or None
 
 
-def _runtime_skill_tool_error_control(result: Any) -> dict[str, Any] | None:
-    if not isinstance(result, dict):
-        return None
-    control = result.get("control")
-    if not isinstance(control, dict) or control.get("kind") != "tool_error":
-        return None
-    return control
-
-
 def runtime_manual_skill_result_stops_parent(
     runtime_context: Any | None,
     result: Any,
@@ -565,12 +515,7 @@ def runtime_manual_skill_result_stops_parent(
 
     if not bool(getattr(runtime_context, "manual_skill_selected", False)):
         return False
-    if (
-        not isinstance(result, dict)
-        or result.get("error")
-        or result.get("sandbox_id")
-        or _runtime_skill_tool_error_control(result) is not None
-    ):
+    if not isinstance(result, dict) or result.get("error") or result.get("sandbox_id"):
         return False
     if not str(result.get("content") or "").strip():
         return False
@@ -1502,12 +1447,12 @@ def runtime_external_action_skill_skip_result(
                 "This turn asks for an external platform workflow. "
                 "Do not invoke a writing skill as the primary route; call "
                 "search_tools for publish/send actions, or create a durable "
-                "draft bundle with generate_file for copy/image "
+                "draft bundle with write_file/generate_file for copy/image "
                 "requests. Use a skill only if the user manually selected it "
                 "or explicitly named it."
             ),
             "suggested_next_tool": "search_tools",
-            "suggested_next_tools": ["generate_file", "search_tools"],
+            "suggested_next_tools": ["write_file", "generate_file", "search_tools"],
         },
         ensure_ascii=False,
     )
@@ -1526,38 +1471,6 @@ def runtime_format_invoke_skill_result(skill: str, result: dict) -> str:
         return json.dumps(payload, ensure_ascii=False)
 
     stop_reason = result.get("stop_reason")
-    tool_error_control = _runtime_skill_tool_error_control(result)
-    if tool_error_control is not None:
-        normalized_stop_reason = str(stop_reason or "").strip()
-        if not normalized_stop_reason or normalized_stop_reason == "completed":
-            normalized_stop_reason = "tool_error"
-        return json.dumps(
-            {
-                "status": "failed",
-                "skill": result.get("skill") or skill,
-                "content": result.get("content") or "",
-                "error": (
-                    result.get("error")
-                    or tool_error_control.get("error_reason")
-                    or "tool_error"
-                ),
-                "stop_parent": False,
-                "stop_reason": normalized_stop_reason,
-                "control": tool_error_control,
-            },
-            ensure_ascii=False,
-        )
-    if stop_reason == "sandbox_ready" and result.get("sandbox_id"):
-        return json.dumps(
-            {
-                "status": "sandbox_ready",
-                "skill": result.get("skill") or skill,
-                "content": result.get("content") or "",
-                "sandbox_id": result.get("sandbox_id"),
-                "loaded_tools": ["sandbox"],
-            },
-            ensure_ascii=False,
-        )
     if result.get("stop_parent"):
         return json.dumps(
             {
@@ -1644,33 +1557,6 @@ async def runtime_skill_descriptors_from_tool_kwargs(
     )
 
 
-async def runtime_searchable_skill_descriptors_from_tool_kwargs(
-    db: AsyncSession | None,
-    kwargs: dict[str, Any],
-    *,
-    limit: int = 200,
-) -> list[SkillDescriptor]:
-    """Resolve the authorized lightweight Skill catalog for search_tools.
-
-    The query is intentionally not used during authorization. Search ranking
-    happens afterward over descriptors, and invoke_skill revalidates the same
-    runtime boundaries at execution time.
-    """
-
-    runtime_context = runtime_tool_call_context_from_kwargs(kwargs)
-    if runtime_context.runtime_envelope is None:
-        return []
-    return await resolve_skill_descriptors_for_envelope(
-        db,
-        runtime_context.runtime_envelope,
-        allowed_tool_names=runtime_context.allowed_tool_names,
-        active_user_message=None,
-        manual_skill_selected=False,
-        limit=limit,
-        raise_on_error=True,
-    )
-
-
 def _mcp_server_prefixes(tool_names: Iterable[str] | None) -> set[str]:
     """Collapse ``mcp__<server>__<tool>`` names to their ``mcp__<server>__`` prefix."""
     prefixes: set[str] = set()
@@ -1726,13 +1612,10 @@ def render_runtime_available_skills_section(
     manual_skill_selected: bool = False,
     loaded_tool_names: Iterable[str] | None = None,
     available_tool_names: Iterable[str] | None = None,
-    include_ordinary: bool = True,
 ) -> str | None:
-    """Render bounded Skill descriptors without loading their instructions.
+    """Render prompt-visible skill descriptors without loading full instructions.
 
-    Runtime prompt assembly passes ``include_ordinary=False`` because ordinary
-    Skills are discovered through ``search_tools``. The default remains useful
-    for explicit catalog and diagnostic rendering. ``available_tool_names`` is the connectable tool surface for the turn
+    ``available_tool_names`` is the connectable tool surface for the turn
     (loaded ∪ allowed). When provided, per-MCP guidance packs (``mcp_*`` slugs)
     are listed only if their MCP's tools are available — so a pack never shows
     for an MCP the agent has not connected. When ``None``, no MCP gating is
@@ -1762,17 +1645,6 @@ def render_runtime_available_skills_section(
             skill
             for skill in filtered
             if not _is_mcp_guidance_pack(skill) or _mcp_pack_tools_available(skill, available_prefixes)
-        ]
-
-    if not manual_skill_selected and not include_ordinary:
-        required = retain_required_skill_invocation_policies(filtered, ())
-        required_ids = {id(skill) for skill in required}
-        filtered = [
-            skill
-            for skill in filtered
-            if id(skill) in required_ids
-            or str(getattr(skill, "source", "") or "")
-            in {"agent_binding", "workspace_operation"}
         ]
 
     if not filtered:
@@ -1895,39 +1767,6 @@ def _prompt_skill_declared_tool_names(skill) -> tuple[str, ...]:
     return tuple(declared)
 
 
-def _prompt_skill_discovery_policy(
-    skill,
-) -> tuple[tuple[str, ...], tuple[str, ...]]:
-    config = getattr(skill, "config", None) or {}
-    configured_providers = (
-        tuple(
-            str(provider).strip()
-            for provider in (config.get("discoverable_provider_keys") or ())
-            if str(provider or "").strip()
-        )
-        if isinstance(config, dict)
-        else ()
-    )
-    configured_prefixes = (
-        tuple(
-            str(prefix).strip()
-            for prefix in (config.get("discoverable_tool_prefixes") or ())
-            if str(prefix or "").strip()
-        )
-        if isinstance(config, dict)
-        else ()
-    )
-    providers = tuple(
-        dict.fromkeys((*configured_providers, *trusted_integration_provider_keys(skill)))
-    )
-    prefixes = tuple(
-        dict.fromkeys(
-            (*configured_prefixes, *(f"mcp__{provider}__" for provider in providers))
-        )
-    )
-    return providers, prefixes
-
-
 def _prompt_skill_discoverable_tool_names(
     skill,
     allowed_tool_names: Iterable[str] | None,
@@ -1935,9 +1774,21 @@ def _prompt_skill_discoverable_tool_names(
     runtime_envelope: RuntimeEnvelope | None = None,
     registered_tool_names: Iterable[str] = (),
 ) -> tuple[str, ...]:
-    provider_keys, prefixes = _prompt_skill_discovery_policy(skill)
+    config = getattr(skill, "config", None) or {}
+    if not isinstance(config, dict):
+        return ()
+    prefixes = tuple(
+        str(prefix).strip()
+        for prefix in (config.get("discoverable_tool_prefixes") or ())
+        if str(prefix or "").strip()
+    )
     if not prefixes:
         return ()
+    provider_keys = {
+        str(provider).strip()
+        for provider in (config.get("discoverable_provider_keys") or ())
+        if str(provider or "").strip()
+    }
     declared = set(_prompt_skill_declared_tool_names(skill))
     candidates = {
         str(tool_name).strip()
@@ -1946,14 +1797,7 @@ def _prompt_skill_discoverable_tool_names(
     }
     allowed = _runtime_allowed_tool_name_set(allowed_tool_names)
     if allowed is not None:
-        candidates &= set(allowed) | set(
-            _prompt_skill_semantically_authorized_mcp_tools(
-                skill,
-                candidates,
-                allowed_tool_names=allowed,
-                runtime_envelope=runtime_envelope,
-            )
-        )
+        candidates &= set(allowed)
     if provider_keys:
         from packages.core.ai.runtime.tool_discovery import runtime_mcp_provider_from_tool_name
 
@@ -1977,89 +1821,16 @@ def _runtime_allowed_tool_name_set(
     return frozenset(str(tool_name) for tool_name in allowed_tool_names if str(tool_name or "").strip())
 
 
-def _prompt_skill_semantically_authorized_mcp_tools(
-    skill,
-    candidate_tool_names: Iterable[str],
-    *,
-    allowed_tool_names: Iterable[str] | None,
-    runtime_envelope: RuntimeEnvelope | None,
-) -> frozenset[str]:
-    """Materialize an existing parent MCP scope for one trusted child Skill."""
-
-    if runtime_envelope is None or not trusted_integration_provider_keys(skill):
-        return frozenset()
-    provider_keys, prefixes = _prompt_skill_discovery_policy(skill)
-    if not provider_keys or not prefixes:
-        return frozenset()
-
-    allowed = _runtime_allowed_tool_name_set(allowed_tool_names)
-    concrete_allowed = frozenset(allowed or ())
-    binding_scope = RuntimeSearchToolBindingScope(
-        bound_tool_names=concrete_allowed,
-        mcp_allowed_names=frozenset(
-            name for name in concrete_allowed if name.startswith("mcp__")
-        ),
-        mcp_provider_scopes=tuple(
-            getattr(runtime_envelope, "mcp_provider_scopes", ()) or ()
-        ),
-        is_master=bool(
-            getattr(runtime_envelope, "mcp_scope_unrestricted", False)
-        ),
-        source="prompt_skill_parent",
-    )
-    dynamic_scope = RuntimeDynamicMCPDiscoveryScopeFactory.create(
-        binding_scope,
-        runtime_envelope,
-    )
-
-    from packages.core.ai.runtime.tool_discovery import (
-        runtime_mcp_provider_from_tool_name,
-    )
-
-    materialized: set[str] = set()
-    for raw_name in candidate_tool_names:
-        tool_name = str(raw_name or "").strip()
-        provider = runtime_mcp_provider_from_tool_name(tool_name)
-        if (
-            not tool_name
-            or provider not in provider_keys
-            or not tool_name.startswith(prefixes)
-        ):
-            continue
-        action = tool_name.split("__", 2)[2]
-        if dynamic_scope.allows(
-            tool_name,
-            provider=provider,
-            action=action,
-        ):
-            materialized.add(tool_name)
-    return frozenset(materialized)
-
-
 def _prompt_skill_effective_allowed_tools(
-    skill,
     declared_tool_names: Iterable[str],
     allowed_tool_names: Iterable[str] | None,
     runtime_envelope: RuntimeEnvelope | None = None,
 ) -> frozenset[str] | None:
     # A Skill describes how to use tools; it is never an authorization grant.
-    # ``None`` means the parent runtime is intentionally unrestricted. A
-    # concrete allowlist may be extended only by the parent's existing semantic
-    # MCP scope, and only for the repository-owned Integration child Skill.
-    allowed = _runtime_allowed_tool_name_set(allowed_tool_names)
-    if allowed is None:
-        return None
-    return frozenset(
-        set(allowed)
-        | set(
-            _prompt_skill_semantically_authorized_mcp_tools(
-                skill,
-                declared_tool_names,
-                allowed_tool_names=allowed,
-                runtime_envelope=runtime_envelope,
-            )
-        )
-    )
+    # ``None`` means the parent runtime is intentionally unrestricted.  Any
+    # concrete allowlist, including an empty one, must pass through unchanged
+    # so the child cannot gain a declared tool that its parent could not use.
+    return _runtime_allowed_tool_name_set(allowed_tool_names)
 
 
 def _runtime_visible_declared_tools(
@@ -2158,7 +1929,6 @@ def runtime_prepare_prompt_skill_tool_surface(
 
     declared = _prompt_skill_declared_tool_names(skill)
     parent_allowed = _prompt_skill_effective_allowed_tools(
-        skill,
         declared,
         allowed_tool_names,
         runtime_envelope,
@@ -2178,14 +1948,20 @@ def runtime_prepare_prompt_skill_tool_surface(
         runtime_envelope=runtime_envelope,
         registered_tool_names=get_registered_tool_names(),
     )
-    discovery_provider_keys, discovery_tool_prefixes = (
-        _prompt_skill_discovery_policy(skill)
-    )
+    config = getattr(skill, "config", None) or {}
     discovery_policy = None
-    if discoverable or discovery_tool_prefixes:
+    if discoverable or (isinstance(config, dict) and config.get("discoverable_tool_prefixes")):
         discovery_policy = {
-            "provider_keys": discovery_provider_keys,
-            "tool_prefixes": discovery_tool_prefixes,
+            "provider_keys": tuple(
+                str(value).strip()
+                for value in (config.get("discoverable_provider_keys") or ())
+                if str(value or "").strip()
+            ),
+            "tool_prefixes": tuple(
+                str(value).strip()
+                for value in (config.get("discoverable_tool_prefixes") or ())
+                if str(value or "").strip()
+            ),
         }
         allowed = frozenset((*skill_tool_names, *discoverable))
     else:
@@ -2357,7 +2133,7 @@ _STICKMAN_PROMPT_EXECUTION_CONTRACT: dict[str, Any] = {
             "normalize_audio_loudness": "audio/normalized",
             "render_frame_samples": "qa",
             "still_to_video": "video",
-            "patch_file": "technical",
+            "write_file": "technical",
         },
         "default_directory_rules": [
             {"tool": "generate_file", "when": {"kind": "audio"}, "directory": "audio"},
@@ -2984,21 +2760,6 @@ def runtime_prompt_skill_registered_tool_executor(
             relative_path = str(rule.get("path") or "").strip("/")
             receipt_path = f"{run_prefix}/{relative_path}"
             receipt_max_chars = int(rule.get("max_chars") or 4096)
-            await runtime_execute_tool(
-                "generate_file",
-                {"kind": "document", "name": receipt_path, "content": source_value, **context_args},
-                entity_id=entity_id,
-                user_id=user_id,
-                agent_id=agent_id,
-                workspace_id=workspace_id,
-                conversation_id=conversation_id,
-                task_id=task_id,
-                active_user_message=active_user_message,
-                manual_skill_selected=manual_skill_selected,
-                tool_profile=tool_profile,
-                allowed_tool_names=allowed_tool_names,
-                runtime_envelope=runtime_envelope,
-            )
             read_result = await runtime_execute_tool(
                 "read_file",
                 {
@@ -3191,16 +2952,16 @@ def descriptor_from_skill(
         "category": str(getattr(skill, "category", "") or ""),
         "output_format": str(getattr(skill, "output_format", "") or ""),
     }
-    discovery_provider_keys, discovery_tool_prefixes = (
-        _prompt_skill_discovery_policy(skill)
-    )
-    if discovery_provider_keys:
-        metadata["discoverable_provider_keys"] = discovery_provider_keys
-    if discovery_tool_prefixes:
-        metadata["discoverable_tool_prefixes"] = discovery_tool_prefixes
-    capability_companion = trusted_skill_capability_companion(skill)
-    if capability_companion is not None:
-        metadata["capability_companion"] = capability_companion.to_dict()
+    config = getattr(skill, "config", None)
+    if isinstance(config, dict):
+        for key in ("discoverable_provider_keys", "discoverable_tool_prefixes"):
+            values = tuple(
+                str(value).strip()
+                for value in (config.get(key) or ())
+                if str(value or "").strip()
+            )
+            if values:
+                metadata[key] = values
     invocation_policy = trusted_skill_invocation_policy(skill, source=source)
     if invocation_policy is not None:
         metadata["invocation_policy"] = invocation_policy.to_dict()
@@ -3451,7 +3212,6 @@ async def resolve_skill_descriptors(
     user_id: str | None = None,
     enforce_user_access: bool = False,
     limit: int = 8,
-    raise_on_error: bool = False,
 ) -> list[SkillDescriptor]:
     """Resolve lightweight skill descriptors for a runtime surface.
 
@@ -3530,8 +3290,6 @@ async def resolve_skill_descriptors(
                 eligible_skills.append(skill)
         skills = eligible_skills
     except Exception:
-        if raise_on_error:
-            raise
         return []
 
     skills = filter_skills_for_runtime_turn(
@@ -3544,8 +3302,6 @@ async def resolve_skill_descriptors(
     try:
         agent_bound_skill_ids = await runtime_agent_bound_skill_ids(db, agent_id)
     except Exception:
-        if raise_on_error:
-            raise
         agent_bound_skill_ids = set()
     if public_customer_surface:
         if not agent_id:
@@ -3642,7 +3398,6 @@ async def resolve_skill_descriptors_for_envelope(
     active_user_message: str | None = None,
     manual_skill_selected: bool = False,
     limit: int = 8,
-    raise_on_error: bool = False,
 ) -> list[SkillDescriptor]:
     """Resolve descriptors from the RuntimeEnvelope instead of entrypoint args.
 
@@ -3687,7 +3442,6 @@ async def resolve_skill_descriptors_for_envelope(
             or (envelope.user_id and not envelope.agent_id)
         ),
         limit=limit,
-        raise_on_error=raise_on_error,
     )
 
 

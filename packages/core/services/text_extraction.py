@@ -52,7 +52,7 @@ async def extract_text(file_path: str, mime_type: str = None, file_type: str = N
             return _extract_docx(file_path)
         elif effective_type in ("doc",):
             return await _extract_legacy_doc(file_path)
-        elif effective_type in ("xlsx", "xlsm", "xls", "et"):
+        elif effective_type in ("xlsx", "xls", "et"):
             return _extract_xlsx(file_path)
         elif effective_type in ("pptx", "ppt", "dps"):
             return _extract_pptx(file_path)
@@ -241,12 +241,13 @@ def _extract_legacy_doc_sync(path: str) -> str:
 
 
 def _extract_xlsx(path: str) -> str:
-    """Extract bounded text from OOXML workbooks, including macro-enabled ones."""
+    """Extract text from .xlsx/.et files using openpyxl."""
     try:
         from openpyxl import load_workbook
         # ``openpyxl`` validates filename extensions when given a path. The
-        # legacy aliases and descriptor paths may not have a supported suffix;
-        # pass the binary stream so the declared type chooses the extractor.
+        # optimistic-concurrency guard intentionally reads through an already
+        # opened ``/dev/fd`` descriptor, whose path has no suffix; pass the
+        # binary stream so the declared file type remains authoritative.
         with open(path, "rb") as source:
             wb = load_workbook(source, read_only=True, data_only=True)
             try:

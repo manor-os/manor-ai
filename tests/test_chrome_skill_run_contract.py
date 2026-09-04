@@ -1,15 +1,12 @@
 from __future__ import annotations
 
 import json
-from pathlib import Path
-from types import SimpleNamespace
 
 from packages.core.ai.runtime.chrome_run import (
     ChromeSkillOutcome,
     ChromeSkillRunState,
     chrome_outcome_for_result,
     commit_chrome_runtime_state,
-    chrome_outcome_for_result,
     chrome_runtime_state_for_child,
 )
 from packages.core.ai.runtime.envelope import RuntimeEnvelope
@@ -19,38 +16,10 @@ from packages.core.ai.runtime.skills import (
     _prompt_skill_runtime_envelope,
     runtime_format_invoke_skill_result,
 )
-from packages.core.ai.runtime.skill_capability_companion import (
-    trusted_skill_capability_companion,
-)
 from packages.core.ai.runtime.surfaces import ChatSurface
 from packages.core.ai.runtime.tool_availability import (
     runtime_mcp_credentials_unavailable_result,
 )
-
-
-ROOT = Path(__file__).parents[1]
-
-
-def test_chrome_skill_is_a_capability_companion_not_a_required_policy() -> None:
-    config = json.loads(
-        (ROOT / "packages/core/ai/skills/chrome/config.json").read_text(
-            encoding="utf-8"
-        )
-    )
-
-    assert "invocation_policy" not in config
-    assert "capability_companion" not in config
-
-    companion = trusted_skill_capability_companion(
-        SimpleNamespace(
-            entity_id=None,
-            slug="chrome",
-            name="chrome",
-            config={"source": "builtin"},
-        )
-    )
-    assert companion is not None
-    assert companion.tool_prefixes == ("mcp__chrome__",)
 
 
 def _envelope(metadata: dict) -> RuntimeEnvelope:
@@ -166,54 +135,37 @@ def test_runtime_format_chrome_outcome_preserves_terminal_harness_control() -> N
     assert payload["control"]["source_tool"] == "mcp__chrome__read_page"
 
 
-def test_runtime_format_chrome_outcome_does_not_propagate_capability_blocker() -> None:
-    result = runtime_format_invoke_skill_result(
-        "chrome",
-        {
-            "skill": "chrome",
-            "stop_reason": "completed",
-            "stop_parent": False,
-            "control": {
-                "kind": "tool_error",
-                "blocked_capability": "chrome",
-                "error_reason": "chrome_cli_worker_not_paired",
-                "setup_url": "/integrations?provider=chrome",
-            },
-            "chrome_outcome": {
-                "status": "blocked",
-                "run_id": "chrome-run-blocked",
-            },
-        },
-    )
-
-    payload = json.loads(result)
-
-    assert payload["status"] == "blocked"
-    assert payload["stop_parent"] is False
-    assert payload["stop_reason"] == "completed"
-    assert payload["control"]["kind"] == "tool_error"
-
-
-def test_completed_chrome_turn_preserves_blocked_capability_outcome() -> None:
+def test_chrome_terminal_failure_never_becomes_completed() -> None:
     outcome = chrome_outcome_for_result(
         {},
         skill="chrome",
-        goal="打开网页",
-        content="请先重新连接 Chrome。",
-        stop_reason="completed",
-        control={
-            "kind": "tool_error",
-            "blocked_capability": "chrome",
-            "error_reason": "chrome_cli_worker_not_paired",
-            "setup_url": "/integrations?provider=chrome",
-        },
+        goal="检查 LinkedIn",
+        content="Chrome requires a paired local worker.",
+        stop_reason="chrome_cli_worker_not_paired",
+        error="Chrome requires a paired local worker.",
     )
 
-    assert outcome.status == "blocked"
-    assert outcome.goal_status == "blocked"
-    assert outcome.resume_context["stop_reason"] == "completed"
-    assert outcome.resume_context["block_reason"] == "chrome_cli_worker_not_paired"
-    assert outcome.resume_context["setup_url"] == "/integrations?provider=chrome"
+    payload = outcome.to_dict()
+
+    assert payload["status"] == "failed"
+    assert payload["goal_status"] == "failed"
+    assert payload["error"] == "Chrome requires a paired local worker."
+
+
+def test_chrome_credentials_unavailable_is_an_explicit_terminal_failure() -> None:
+    payload = json.loads(
+        runtime_mcp_credentials_unavailable_result(
+            provider="chrome",
+            tool_name="open_or_reuse",
+            reason="Chrome requires a paired local worker.",
+        )
+    )
+
+    assert payload["status"] == "failed"
+    assert payload["stop_parent"] is True
+    assert payload["stop_reason"] == "chrome_cli_worker_not_paired"
+    assert payload["terminal_failure"] is True
+    assert payload["retryable"] is False
 
 
 def test_chrome_child_state_is_committed_back_to_the_parent_harness() -> None:

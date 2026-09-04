@@ -5593,14 +5593,7 @@ async def test_workspace_chat_uses_workspace_agent_tool_profile(client: AsyncCli
 
     assert ctx.runtime_profile == RuntimeProfile.WORKSPACE_OPERATOR.value
     assert ctx.tool_profile == WORKSPACE_AGENT_TOOL_PROFILE
-    assert {"search_tools", "manor", "rag"} <= eager_names
-    assert not {
-        "workspace_agent",
-        "workspace_resolve_hitl",
-        "answer_task_blocker",
-        "workspace_search",
-        "workspace_create_task",
-    }.intersection(eager_names)
+    assert {"search_tools", "workspace_agent", "workspace_resolve_hitl", "answer_task_blocker", "workspace_search", "rag"} <= eager_names
     assert "bash" in eager_names
     assert "bash" in ctx.allowed_tool_names
     assert "browse_web" in ctx.allowed_tool_names
@@ -6176,7 +6169,7 @@ async def test_workspace_agent_creates_workspace_task_with_runtime_context(clien
 
 
 @pytest.mark.asyncio
-async def test_public_webchat_explicit_ticket_binding_can_create_customer_ticket(client: AsyncClient, db_session):
+async def test_public_webchat_broad_agent_binding_can_create_customer_ticket(client: AsyncClient, db_session):
     import json
 
     from sqlalchemy import select
@@ -6220,13 +6213,7 @@ async def test_public_webchat_explicit_ticket_binding_can_create_customer_ticket
     surface = runtime_prepare_agent_tool_surface_for_turn(
         request,
         agent_id=agent_body["id"],
-        bound_tool_names={
-            "rag",
-            "workspace_agent",
-            "workspace_operation",
-            "workspace_create_task",
-            "manor",
-        },
+        bound_tool_names={"rag", "workspace_agent", "workspace_operation", "manor"},
     )
 
     assert surface.allowed_tool_names == {"rag", "workspace_create_task"}
@@ -7798,21 +7785,16 @@ async def test_non_streaming_workspace_chat_persists_operation_review_card(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("tool_name", "tool_args", "visualization_kind"),
+    ("tool_name", "visualization_kind"),
     [
-        (
-            "manor",
-            {"action": "workspace", "params": {"action": "visualize_ledgers"}},
-            "workspace_ledger_overview",
-        ),
-        ("query_ledger", {}, "ledger_query_result"),
+        ("visualize_workspace_ledgers", "workspace_ledger_overview"),
+        ("query_ledger", "ledger_query_result"),
     ],
 )
 async def test_non_streaming_workspace_chat_persists_ledger_visualization(
     client: AsyncClient,
     monkeypatch,
     tool_name: str,
-    tool_args: dict,
     visualization_kind: str,
 ):
     import importlib
@@ -7881,12 +7863,12 @@ async def test_non_streaming_workspace_chat_persists_ledger_visualization(
                 "data": visualization_data,
             },
         })
-        kwargs["on_tool_start"](tool_name, tool_args)
+        kwargs["on_tool_start"](tool_name, {})
         kwargs["on_tool_end"](
             tool_name,
             tool_result,
             duration_ms=1,
-            args=tool_args,
+            args={},
         )
         return SimpleNamespace(
             content="Here is the current recruiting Ledger overview.",

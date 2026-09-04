@@ -240,58 +240,6 @@ def test_sandbox_save_result_can_opt_into_final_chat_attachment():
     ]
 
 
-def test_composite_sandbox_save_result_is_not_chat_attachment_by_default():
-    tool_results = [
-        {
-            "name": "sandbox",
-            "arguments": {
-                "action": "save_result",
-                "params": {"sandbox_id": "sb_123", "path": "file.txt"},
-            },
-            "raw_result": {
-                "saved": True,
-                "saved_to_knowledge": True,
-                "document_id": "doc_txt",
-                "name": "file.txt",
-                "fs_path": "file.txt",
-                "result_url": "/api/v1/fs/ent/file.txt",
-                "mime_type": "text/plain",
-            },
-        }
-    ]
-
-    assert chat_attachments_from_tool_results(tool_results) == []
-
-
-def test_composite_sandbox_save_result_can_opt_into_final_chat_attachment():
-    tool_results = [
-        {
-            "name": "sandbox",
-            "arguments": {
-                "action": "save_result",
-                "params": {"sandbox_id": "sb_123", "path": "final-report.pdf"},
-            },
-            "raw_result": {
-                "saved": True,
-                "saved_to_knowledge": True,
-                "display_as_artifact": True,
-                "artifact_role": "final",
-                "document_id": "doc_pdf",
-                "name": "final-report.pdf",
-                "fs_path": "reports/final-report.pdf",
-                "result_url": "/api/v1/fs/ent/reports/final-report.pdf",
-                "mime_type": "application/pdf",
-            },
-        }
-    ]
-
-    attachments = chat_attachments_from_tool_results(tool_results)
-
-    assert len(attachments) == 1
-    assert attachments[0]["document_id"] == "doc_pdf"
-    assert attachments[0]["open_url"] == "/viewer/doc_pdf"
-
-
 def test_chat_attachments_open_document_id_without_filesystem_reference():
     tool_results = [
         {

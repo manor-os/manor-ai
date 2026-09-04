@@ -6,8 +6,6 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from packages.core.ai.runtime.integration_setup_links import runtime_integration_setup_link
-
 if TYPE_CHECKING:
     from packages.core.ai.runtime.dynamic_mcp import (
         RuntimeDynamicMCPAccountRegistrySnapshot,
@@ -47,15 +45,14 @@ def runtime_mcp_credentials_unavailable_result(
     reason: str,
     scope: str = "none",
     suggested_tool: str | None = None,
-    offer_setup: bool = False,
 ) -> str:
     """Return the canonical unavailable-credentials tool result.
 
     Chrome is backed by a paired local CLI worker rather than a reconnectable
-    vendor token. Its raw tool result stops the unusable Chrome execution path
-    so the active loop can request one final model summary. The loop then
-    normalizes that result to a non-terminal tool error; nested Skills
-    must not propagate this raw ``stop_parent`` signal to the parent Agent.
+    vendor token. Treat that missing worker as a terminal browser condition so
+    nested ``invoke_skill(skill_id=<Chrome Skill.id>)`` runs propagate the real stop reason to
+    the parent chat instead of converting ``credentials_unavailable`` into a
+    successful ``completed`` answer.
     """
 
     payload: dict[str, object] = {
@@ -67,8 +64,6 @@ def runtime_mcp_credentials_unavailable_result(
     }
     if suggested_tool:
         payload["suggested_tool"] = suggested_tool
-    if offer_setup:
-        payload.update(runtime_integration_setup_link(provider))
     if provider == "chrome":
         payload.update({
             "status": "failed",
@@ -601,7 +596,6 @@ async def runtime_preflight_mcp_call(
             tool_name=tool_name,
             reason=decision.reason,
             scope=decision.scope,
-            offer_setup=True,
             suggested_tool=(
                 "generate_file" if tool_name == "generate_video" else None
             ),

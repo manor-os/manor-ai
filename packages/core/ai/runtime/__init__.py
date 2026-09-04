@@ -751,7 +751,6 @@ from packages.core.ai.runtime.strategist import (
 from packages.core.ai.runtime.task_requirements import (
     STRATEGIST_TASK_CAPABILITY_IDS,
     TASK_RUNTIME_CAPABILITY_KEYS,
-    apply_workspace_service_task_requirements,
     merge_task_runtime_capabilities,
     normalize_task_runtime_capability_ids,
     strategist_task_capability_descriptors,
@@ -1022,7 +1021,6 @@ __all__ = [
     "runtime_strategist_user_prompt_v2",
     "STRATEGIST_TASK_CAPABILITY_IDS",
     "TASK_RUNTIME_CAPABILITY_KEYS",
-    "apply_workspace_service_task_requirements",
     "merge_task_runtime_capabilities",
     "normalize_task_runtime_capability_ids",
     "strategist_task_capability_descriptors",

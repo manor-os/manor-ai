@@ -10,7 +10,7 @@ Schema that the model-provider enforces:
   * ``ws_commit_basics``           name + kind + context + primary_work
   * ``ws_propose_service``         service decomposition (1-5x)
   * ``ws_propose_goal``            target/cadence required, no defaults
-  * ``ws_confirm_creation_preferences`` confirmed Goal choice
+  * ``ws_confirm_creation_preferences`` explicit Goal/autonomous choices
   * ``ws_propose_agent_mapping``   ULID-checked + entity-scoped
   * ``ws_request_custom_agent``    fallback when no entity agent fits
   * ``ws_propose_channel``         primary external / internal / etc.
@@ -34,9 +34,7 @@ across surfaces.
 from __future__ import annotations
 
 import inspect
-import json
 import logging
-from packages.core.constants.workspace_drafts import uses_ui_runtime_mode
 import time
 from typing import Any, Awaitable, Callable, List, Optional
 
@@ -88,22 +86,16 @@ HARD RULES
    ``ws_propose_agent_mapping``. If no good match exists, call
    ``ws_request_custom_agent`` instead.
 3. Goals are optional. Before readiness, explicitly confirm in the conversation
-   whether the user wants to configure a Goal. If they want
-   a Goal, propose and confirm its title, target, cadence AND measurement:
-   the metric definition/formula, evidence source, and manual or automatic
-   recording mode. Then call ``ws_propose_goal`` with ``measurement``.
+   whether the user wants to configure a Goal and whether autonomous mode should
+   start after creation. Ask this as one concise combined question. If they want
+   a Goal, confirm its title, target, and cadence and call ``ws_propose_goal``.
    After any new Goal tool call has completed, call
-   ``ws_confirm_creation_preferences`` with the Goal answer and omit
-   ``autonomous_enabled`` for new drafts. Use
+   ``ws_confirm_creation_preferences`` with both explicit answers. Use
    ``goal_choice=none`` when they decline a Goal, or ``configured`` when they
    want to keep the Goal(s) already in the draft.
    Never describe this as choosing a "with-Goal" or "without-Goal" runtime:
-   Goal configuration and autonomous operation are independent. New drafts
-   default to automatic operation after creation. The creation panel's
-   Automatic/Manual switch owns this choice; never change it or invent a
-   previous user confirmation. If they want manual mode, direct them to that
-   switch. Preserve an existing draft or Blueprint's configured mode.
-   If the user already stated their Goal choice, record it without asking again.
+   Goal configuration and autonomous operation are independent. If the user
+   already stated both choices explicitly, record them without asking again.
 4. Service / goal / rule / automation keys are snake_case
    (``content_creation``, ``follower_growth``).
 5. Do NOT claim the workspace is created. You are drafting -- the user
@@ -111,7 +103,7 @@ HARD RULES
    "operational".
 6. Do NOT ask the user to author rules / automations / scorecards
    field-by-field. Infer reasonable operational defaults from what they've
-   said, except measurable goal targets, cadences and measurement contracts, which require user
+   said, except measurable goal targets and cadences, which require user
    confirmation.
 7. When ``ws_lint_draft`` returns no P0 issues, call ``ws_mark_ready``
    and tell the user "The draft is ready -- click **Create Workspace**
@@ -209,17 +201,7 @@ ALL of the following in this turn before replying to the user:
           binding cannot do real work. Always bind something.
   STEP E. Extract goals only when the user supplied or asked to track an
           explicit measurable target -- ``ws_propose_goal``, one per target.
-          Always supply target + cadence + measurement. The provided
-          ``goal_measurement_library`` lists supported automatic internal metrics.
-          Use one only when its definition actually measures the requested outcome.
-          Otherwise propose a manual metric with key, name, description (formula
-          and pass criteria), source (who records it and evidence used), unit,
-          value_type and window. Explain manual recording and get confirmation;
-          do not claim that a formula or Knowledge document creates a collector.
-          For readiness/quality/rates, define the population, numerator/denominator
-          or scoring rubric, and handling of missing evidence. Unmeasured is not zero.
-          Never replace readiness, revenue or quality with completed-task impact.
-          Never invent an initial score. If the user did not ask for a Goal,
+          Always supply target + cadence. If the user did not ask for a Goal,
           leave goals empty for now; do not assume that silence means they
           declined one.
   STEP F. Add an internal channel with ``ws_propose_channel``
@@ -265,18 +247,17 @@ ALL of the following in this turn before replying to the user:
   STEP K. If the user gave a monthly credit budget or asked to control
           spend → ``ws_set_budget``. Use credits. Do not invent a cap
           from nothing.
-  STEP K2. Before linting, verify that the user decided whether to configure
-           a Goal. If that choice is still unknown, ask one concise question
-           and STOP this turn before
+  STEP K2. Before linting, verify that the user explicitly decided both:
+           (1) whether to configure a Goal, and (2) whether autonomous mode
+           starts after creation. If either choice is still unknown, ask one
+           concise combined question covering both and STOP this turn before
            ``ws_lint_draft`` or ``ws_mark_ready``. When the user replies, call
            ``ws_propose_goal`` for a new confirmed Goal and WAIT for that tool
            result. Then call ``ws_confirm_creation_preferences`` with the Goal
-           choice, preserving the creation panel's runtime mode. New drafts
-           default to automatic; do not require another autonomy confirmation
-           or turn automation off because a Goal answer omitted it. The user
-           may switch to Manual in the creation panel before creating.
-           Legacy drafts that request autonomy confirmation retain their
-           existing choice; do not silently upgrade their runtime mode.
+           choice and explicit autonomous true/false answer. Autonomous mode is
+           OFF when the user chooses
+           manual operation; this choice is independent of Goals and each
+           service's autonomy_level.
   STEP L. ``ws_lint_draft`` and inspect issues.
           - If P0 issues exist, fix them via more tool calls then
             re-lint. If an unfixable P0 needs user input, ask that one question
@@ -309,8 +290,8 @@ QUALITY BAR
 * Every service has a real ``name`` (not just service_key).
 * Every service has an agent_mapping (real or custom).
 * The user explicitly confirmed whether to configure a Goal; no Goal is valid.
-* Every configured Goal has a user-confirmed target + cadence + measurement definition.
-* The creation panel's runtime mode is preserved; new drafts default to automatic.
+* Every configured Goal has a user-confirmed target + cadence.
+* The user explicitly confirmed whether autonomous mode starts after creation.
 * Any explicitly requested external channel has channel_type and purpose.
 * The visible reply is short, plain, and human -- no JSON, no XML,
   no enumerated tool names.
@@ -390,16 +371,13 @@ async def architect_run_turn(
             creation_preferences = f.get("_creation_preferences")
             if isinstance(creation_preferences, dict):
                 summary_parts.append(
-                    f"Goal choice confirmed: {bool(creation_preferences.get('goal_confirmed'))}"
+                    "creation choices confirmed: "
+                    f"goal={bool(creation_preferences.get('goal_confirmed'))}, "
+                    f"autonomy={bool(creation_preferences.get('autonomy_confirmed'))}"
                 )
-                if not uses_ui_runtime_mode(f):
-                    summary_parts.append(
-                        f"legacy autonomy confirmed: {bool(creation_preferences.get('autonomy_confirmed'))}"
-                    )
-            mode = "Automatic" if f.get("heartbeat_enabled") else "Manual"
-            summary_parts.append(f"runtime mode after creation: {mode}")
-            if uses_ui_runtime_mode(f):
-                summary_parts.append("Runtime mode belongs to the creation panel; preserve it without another confirmation.")
+            summary_parts.append(
+                f"autonomous after creation: {bool(f.get('heartbeat_enabled'))}"
+            )
             channels = (f.get("channel_config") or {}).get("channels") or []
             if channels:
                 ch_strs = [c.get("channel_type", "?") for c in channels]
@@ -413,14 +391,11 @@ async def architect_run_turn(
     except Exception:
         pass
 
-    from packages.core.services.workspace_goal_measurements import draft_measurement_library
-
     framed_user_message = (
         f"<draft_id>{draft_id}</draft_id>\n"
         f"<entity_id>{entity_id}</entity_id>\n"
         "Pass the draft_id above to every tool call.\n\n"
         f"{draft_snapshot}"
-        f"<goal_measurement_library>{json.dumps(draft_measurement_library())}</goal_measurement_library>\n"
         f"{user_message}"
     )
 

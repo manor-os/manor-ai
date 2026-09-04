@@ -379,7 +379,7 @@ test("real WorkspaceChat keeps the call and audible reply across persisted messa
   });
   // This fixture mounts the complete WorkspaceChat with its real query and
   // stream stores, unlike the small composer fixture used in unit flows.
-  await page.goto("/e2e/fixtures/workspace-proposal-approval.html");
+  await page.goto("/e2e/fixtures/chat-voice-workspace.html");
   await expect(page.locator("#workspace-chat-message-welcome").getByText("Workspace ready.", { exact: true })).toBeVisible();
   await page.evaluate(() => {
     const connect = AudioNode.prototype.connect;
@@ -422,7 +422,7 @@ test("real browser PCM and gateway WebSocket suppress echo and resume after manu
   test.skip(!process.env.VOICE_GATEWAY_E2E, "Requires the isolated tests.voice_browser_server fixture");
   await setup(page, "workspace", true);
   await page.unroute("**/api/v1/**");
-  await page.goto("/e2e/fixtures/workspace-proposal-approval.html");
+  await page.goto("/e2e/fixtures/chat-voice-workspace.html");
   await expect(page.locator("#workspace-chat-message-welcome").getByText("Workspace ready.", { exact: true })).toBeVisible();
   await page.evaluate(() => {
     const connect = AudioNode.prototype.connect;

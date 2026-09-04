@@ -201,7 +201,7 @@ export function useLiveChatCall({ scope, disabled, onConversation }: {
               }
               break;
             case "work":
-              setBackgroundWorking(event.status === "running" || event.status === "queued");
+              setBackgroundWorking(event.status === "running");
               break;
             case "interrupt": {
               if (Number.isSafeInteger(event.generation)) {

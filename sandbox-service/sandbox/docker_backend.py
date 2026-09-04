@@ -25,7 +25,6 @@ from typing import Optional
 from sandbox_config import config as app_config
 
 from .models import ContainerConfig, ExecResponse, SandboxStatus, SkillManifest
-from .security import EVENT_SECRET_TEXT_PATTERNS, EVENT_SENSITIVE_KEYS
 
 logger = logging.getLogger(__name__)
 
@@ -35,136 +34,6 @@ _HOT_WINDOW_SECONDS = 300
 _CANCEL_GRACE_SECONDS = 1.0
 _CANCEL_POLL_INTERVAL_SECONDS = 0.1
 _EXECUTION_PID_WAIT_SECONDS = 0.5
-_EXECUTION_EVENT_BYTES_LIMIT = 128 * 1024
-_EXECUTION_RESPONSE_BYTES_LIMIT = 16 * 1024
-
-_SANDBOX_BRIDGE_SOURCE = r'''#!/usr/bin/env python3
-import argparse
-import hashlib
-import json
-import os
-import re
-import time
-import uuid
-
-EVENT_TYPES = {
-    "progress", "warning", "error", "need_input", "need_file",
-    "need_tool", "need_credential", "result",
-}
-SECRET_KEYS = __EVENT_SENSITIVE_KEYS__
-SECRET_TEXT_PATTERNS = tuple(
-    re.compile(pattern) for pattern in __EVENT_SECRET_TEXT_PATTERNS__
-)
-MAX_EVENT_BYTES = 8192
-MAX_STREAM_BYTES = 128 * 1024
-
-
-def _response_path(event_id):
-    digest = hashlib.sha256(event_id.encode("utf-8")).hexdigest()[:32]
-    return os.path.join(os.environ["MANOR_SANDBOX_RESPONSE_DIR"], digest + ".json")
-
-
-def _normalize_key(key):
-    value = str(key or "").strip().replace("-", "_")
-    value = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", value)
-    return value.casefold()
-
-
-def _has_secret_key(value):
-    if isinstance(value, dict):
-        return any(_normalize_key(key) in SECRET_KEYS or _has_secret_key(item) for key, item in value.items())
-    if isinstance(value, list):
-        return any(_has_secret_key(item) for item in value)
-    return False
-
-
-def _has_secret_text(value):
-    if isinstance(value, str):
-        return any(pattern.search(value) for pattern in SECRET_TEXT_PATTERNS)
-    if isinstance(value, dict):
-        return any(_has_secret_text(item) for item in value.values())
-    if isinstance(value, list):
-        return any(_has_secret_text(item) for item in value)
-    return False
-
-
-def emit(args):
-    if args.type not in EVENT_TYPES:
-        raise SystemExit("unsupported event type")
-    try:
-        payload = json.loads(args.payload)
-    except json.JSONDecodeError as exc:
-        raise SystemExit(f"invalid payload JSON: {exc}")
-    if not isinstance(payload, dict):
-        raise SystemExit("payload must be a JSON object")
-    if _has_secret_key(payload) or _has_secret_text({"message": args.message, "payload": payload}):
-        raise SystemExit("sandbox events accept references only, not secret values")
-    event_id = args.event_id or uuid.uuid4().hex
-    if len(event_id) > 128 or not event_id or any(not (char.isalnum() or char in "_.:-") for char in event_id):
-        raise SystemExit("invalid event id")
-    event = {
-        "event_id": event_id,
-        "type": args.type,
-        "message": args.message[:2000],
-        "payload": payload,
-        "requires_response": bool(args.requires_response or args.type.startswith("need_")),
-    }
-    encoded = (json.dumps(event, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
-    if len(encoded) > MAX_EVENT_BYTES:
-        raise SystemExit("event exceeds 8192 bytes")
-    event_file = os.environ["MANOR_SANDBOX_EVENT_FILE"]
-    try:
-        current_size = os.path.getsize(event_file)
-    except FileNotFoundError:
-        current_size = 0
-    if current_size + len(encoded) > MAX_STREAM_BYTES:
-        raise SystemExit("execution event stream exceeds 131072 bytes")
-    fd = os.open(event_file, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
-    try:
-        os.write(fd, encoded)
-    finally:
-        os.close(fd)
-    print(event_id)
-
-
-def wait(args):
-    path = _response_path(args.event_id)
-    deadline = time.monotonic() + args.timeout
-    while True:
-        try:
-            with open(path, "r", encoding="utf-8") as handle:
-                print(handle.read())
-            return
-        except FileNotFoundError:
-            if time.monotonic() >= deadline:
-                raise SystemExit("timed out waiting for Agent response")
-            time.sleep(0.1)
-
-
-parser = argparse.ArgumentParser(description="Sandbox-to-Agent event bridge")
-subparsers = parser.add_subparsers(dest="action", required=True)
-emit_parser = subparsers.add_parser("emit")
-emit_parser.add_argument("--type", required=True)
-emit_parser.add_argument("--message", default="")
-emit_parser.add_argument("--payload", default="{}")
-emit_parser.add_argument("--event-id")
-emit_parser.add_argument("--requires-response", action="store_true")
-emit_parser.set_defaults(handler=emit)
-wait_parser = subparsers.add_parser("wait")
-wait_parser.add_argument("--event-id", required=True)
-wait_parser.add_argument("--timeout", type=float, default=300.0)
-wait_parser.set_defaults(handler=wait)
-arguments = parser.parse_args()
-arguments.handler(arguments)
-'''
-
-_SANDBOX_BRIDGE_SOURCE = _SANDBOX_BRIDGE_SOURCE.replace(
-    "__EVENT_SENSITIVE_KEYS__",
-    repr(tuple(sorted(EVENT_SENSITIVE_KEYS))),
-).replace(
-    "__EVENT_SECRET_TEXT_PATTERNS__",
-    repr(EVENT_SECRET_TEXT_PATTERNS),
-)
 
 
 def _run_docker(
@@ -375,7 +244,6 @@ class DockerSandbox:
         timeout: int | None = None,
         workdir: str | None = None,
         execution_id: str | None = None,
-        interactive: bool = False,
     ) -> ExecResponse:
         """Execute a command inside the running container."""
         self.ensure_available()
@@ -400,7 +268,6 @@ class DockerSandbox:
                 workdir=wd,
                 mark_status=SandboxStatus.EXECUTING,
                 execution_id=resolved_execution_id,
-                interactive=interactive,
             )
 
         return result
@@ -413,7 +280,6 @@ class DockerSandbox:
         workdir: str,
         mark_status: SandboxStatus,
         execution_id: str | None = None,
-        interactive: bool = False,
     ) -> ExecResponse:
         """Internal docker exec helper. Caller must already hold _state_lock."""
         self.status = mark_status
@@ -425,13 +291,7 @@ class DockerSandbox:
         if execution_id is not None:
             pid_file = self._execution_pid_file(execution_id)
             await self._set_active_execution(execution_id)
-            args = self._execution_command_args(
-                command,
-                workdir,
-                pid_file,
-                execution_id,
-                interactive,
-            )
+            args = self._execution_command_args(command, workdir, pid_file)
         else:
             args = [
                 "docker", "exec", "-i",
@@ -517,189 +377,27 @@ class DockerSandbox:
         command: str,
         workdir: str,
         pid_file: str,
-        execution_id: str,
-        interactive: bool,
     ) -> list[str]:
-        event_file, response_dir, bridge_file = self._execution_mailbox_paths(
-            execution_id=execution_id
+        launcher = (
+            "import os,subprocess,sys;"
+            "proc=subprocess.Popen(['sh','-c',sys.argv[1]],start_new_session=True);"
+            "fd=os.open(sys.argv[2],os.O_WRONLY|os.O_CREAT|os.O_TRUNC,0o600);"
+            "os.write(fd,str(proc.pid).encode('ascii'));"
+            "os.close(fd);"
+            "code=proc.wait();"
+            "raise SystemExit(code if code>=0 else 128-code)"
         )
-        launcher = """
-import os
-import shutil
-import subprocess
-import sys
-
-command, pid_file, event_file, response_dir, bridge_file, bridge_source, execution_id, interactive = sys.argv[1:]
-for path in (pid_file, event_file, bridge_file):
-    try:
-        os.unlink(path)
-    except FileNotFoundError:
-        pass
-shutil.rmtree(response_dir, ignore_errors=True)
-env = dict(os.environ)
-if interactive == "1":
-    os.makedirs(response_dir, mode=0o700, exist_ok=True)
-    fd = os.open(bridge_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o700)
-    try:
-        os.write(fd, bridge_source.encode("utf-8"))
-    finally:
-        os.close(fd)
-    env.update({
-        "MANOR_EXECUTION_ID": execution_id,
-        "MANOR_SANDBOX_EVENT_FILE": event_file,
-        "MANOR_SANDBOX_RESPONSE_DIR": response_dir,
-        "MANOR_SANDBOX_BRIDGE": bridge_file,
-    })
-proc = subprocess.Popen(["sh", "-c", command], start_new_session=True, env=env)
-fd = os.open(pid_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-try:
-    os.write(fd, str(proc.pid).encode("ascii"))
-finally:
-    os.close(fd)
-code = proc.wait()
-raise SystemExit(code if code >= 0 else 128 - code)
-"""
         return [
             "docker", "exec", "-i",
             "-w", workdir,
             self.container_name,
-            "python", "-c", launcher, command, pid_file, event_file,
-            response_dir, bridge_file,
-            _SANDBOX_BRIDGE_SOURCE if interactive else "", execution_id,
-            "1" if interactive else "0",
+            "python", "-c", launcher, command, pid_file,
         ]
 
     @staticmethod
     def _execution_pid_file(execution_id: str) -> str:
         safe_id = hashlib.sha256(execution_id.encode("utf-8")).hexdigest()[:24]
         return f"/tmp/manor-exec-{safe_id}.pid"
-
-    @staticmethod
-    def _execution_mailbox_paths(execution_id: str) -> tuple[str, str, str]:
-        safe_id = hashlib.sha256(execution_id.encode("utf-8")).hexdigest()[:24]
-        prefix = f"/tmp/manor-exec-{safe_id}"
-        return f"{prefix}.events.jsonl", f"{prefix}.responses", f"{prefix}.bridge.py"
-
-    async def read_execution_event_lines(
-        self,
-        execution_id: str,
-    ) -> tuple[list[str], bool]:
-        """Read the bounded structured event stream without taking the command lock."""
-
-        event_file, _response_dir, _bridge_file = self._execution_mailbox_paths(
-            execution_id
-        )
-        reader = (
-            "import pathlib,sys;"
-            "path=pathlib.Path(sys.argv[1]);limit=int(sys.argv[2]);"
-            "data=path.open('rb').read(limit+1) if path.exists() else b'';"
-            "sys.stdout.buffer.write(data)"
-        )
-        result = await asyncio.to_thread(
-            _run_docker,
-            [
-                "docker", "exec", self.container_name, "python", "-c", reader,
-                event_file, str(_EXECUTION_EVENT_BYTES_LIMIT),
-            ],
-            timeout=5,
-            allow_failure=True,
-        )
-        if result.returncode != 0:
-            stderr = result.stderr.decode("utf-8", errors="replace").strip()
-            raise RuntimeError(f"Failed to read sandbox execution events: {stderr}")
-        truncated = len(result.stdout) > _EXECUTION_EVENT_BYTES_LIMIT
-        data = result.stdout[:_EXECUTION_EVENT_BYTES_LIMIT]
-        return data.decode("utf-8", errors="replace").splitlines(), truncated
-
-    async def write_execution_response(
-        self,
-        execution_id: str,
-        event_id: str,
-        response_json: bytes,
-    ) -> None:
-        """Atomically deliver one bounded response to the running process."""
-
-        if len(response_json) > _EXECUTION_RESPONSE_BYTES_LIMIT:
-            raise ValueError("Sandbox execution response exceeds 16384 bytes")
-        _event_file, response_dir, _bridge_file = self._execution_mailbox_paths(
-            execution_id
-        )
-        digest = hashlib.sha256(event_id.encode("utf-8")).hexdigest()[:32]
-        response_file = f"{response_dir}/{digest}.json"
-        temp_file = f"{response_file}.{uuid.uuid4().hex}.tmp"
-        writer = """
-import os
-import sys
-
-target, temporary, limit = sys.argv[1], sys.argv[2], int(sys.argv[3])
-data = sys.stdin.buffer.read(limit + 1)
-if len(data) > limit:
-    raise SystemExit(2)
-fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-try:
-    os.write(fd, data)
-    os.fsync(fd)
-finally:
-    os.close(fd)
-os.replace(temporary, target)
-"""
-        result = await asyncio.to_thread(
-            _run_docker,
-            [
-                "docker", "exec", "-i", self.container_name, "python", "-c",
-                writer, response_file, temp_file, str(_EXECUTION_RESPONSE_BYTES_LIMIT),
-            ],
-            input_data=response_json,
-            timeout=5,
-            allow_failure=True,
-        )
-        if result.returncode != 0:
-            stderr = result.stderr.decode("utf-8", errors="replace").strip()
-            raise RuntimeError(f"Failed to deliver sandbox execution response: {stderr}")
-
-    async def cleanup_execution_mailbox(self, execution_id: str) -> None:
-        await self.cleanup_execution_mailboxes([execution_id])
-
-    async def cleanup_execution_mailboxes(self, execution_ids: list[str]) -> None:
-        if not execution_ids:
-            return
-        paths: list[str] = []
-        for execution_id in execution_ids:
-            event_file, response_dir, bridge_file = self._execution_mailbox_paths(
-                execution_id
-            )
-            paths.extend((event_file, bridge_file, response_dir))
-        cleanup = """
-import os
-import shutil
-import sys
-
-paths = sys.argv[1:]
-for index in range(0, len(paths), 3):
-    event_file, bridge_file, response_dir = paths[index:index + 3]
-    for path in (event_file, bridge_file):
-        try:
-            os.unlink(path)
-        except FileNotFoundError:
-            pass
-    shutil.rmtree(response_dir, ignore_errors=True)
-"""
-        try:
-            result = await asyncio.to_thread(
-                _run_docker,
-                [
-                    "docker", "exec", self.container_name, "python", "-c", cleanup,
-                    *paths,
-                ],
-                timeout=5,
-                allow_failure=True,
-            )
-            if result.returncode != 0:
-                logger.debug(
-                    "Execution mailbox cleanup failed for %s", execution_ids
-                )
-        except Exception:
-            logger.debug("Failed to clean execution mailbox", exc_info=True)
 
     async def _set_active_execution(self, execution_id: str) -> None:
         async with self._execution_state_lock:

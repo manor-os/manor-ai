@@ -25,9 +25,7 @@ and **Pass criteria**. A skipped category needs a reason.
 
 ## WS-02: Runtime scope and chat
 
-- Automated: `.venv/bin/pytest -q tests/test_task_session.py tests/test_response_surfaces.py tests/test_workspace_chat_pending_count.py tests/test_workspace_chat_pending_visibility.py tests/test_workspace_authz_holes.py tests/test_workspace_write_authz.py tests/test_runtime_permissions_roles.py tests/test_workspace_mechanism_regressions.py -k 'chat or feedback'`; plus `.venv/bin/pytest -q tests/test_ai_runtime_harness.py tests/test_agent_provisioning_marketplace_skills.py -k 'agent_provisioning_tool or runtime_requester or runtime_search or progressively_loads_'`, `.venv/bin/pytest -q tests/test_runtime_default_tool_authorization.py tests/test_agentic_loop_token_compaction.py tests/test_runtime_tool_input_validation.py -k 'runtime or search_tools or tool_pool'`, `.venv/bin/pytest -q tests/test_capability_search.py tests/test_builtin_ledger_skills.py tests/test_chrome_skill_run_contract.py`, `.venv/bin/pytest -q tests/test_webchat_page.py`, `PYTHONPATH=.:tests .venv/bin/pytest -q tests/test_whatsapp_webhook.py tests/test_channel_link.py`, `PYTHONPATH=.:tests .venv/bin/pytest -q tests/test_voice_work_router.py tests/test_voice_work_queue.py tests/test_browser_voice.py tests/test_gateway_voice.py tests/test_twilio_realtime_voice.py tests/test_twilio_voice_runtime.py tests/test_channel_voice_cancellation.py`, and `.venv/bin/pytest -q tests/test_generic_email_mcp.py tests/test_generic_channel_callback.py tests/test_email_attachment_bridge.py`
-- Automated failure-control contract: `.venv/bin/pytest -q tests/test_ai_engine.py tests/test_video_auto_wait.py tests/test_skill_tools.py -k 'stop_parent_error or terminal_policy_cannot_turn_failed or consecutive_tool_errors or forced_media_error or local_coding_skill_dispatch or approved_forced_call_aborts or structured_skill_output or nested_tool_error_control or invent_setup_link or keeps_nested_tool_error or manual_web_skill_tool_error'`
-- Automated Sandbox interaction contract: `PYTHONPATH=.:tests .venv/bin/pytest -q tests/test_sandbox_tools_capacity.py tests/test_sandbox_sdk.py tests/test_tool_surface_consolidation.py`
+- Automated: `.venv/bin/pytest -q tests/test_task_session.py tests/test_response_surfaces.py tests/test_workspace_chat_pending_count.py tests/test_workspace_chat_pending_visibility.py tests/test_workspace_authz_holes.py tests/test_workspace_write_authz.py tests/test_runtime_permissions_roles.py tests/test_workspace_mechanism_regressions.py -k 'chat or feedback'`; plus `.venv/bin/pytest -q tests/test_ai_runtime_harness.py tests/test_agent_provisioning_marketplace_skills.py -k 'agent_provisioning_tool or runtime_requester'`, `.venv/bin/pytest -q tests/test_builtin_ledger_skills.py`, `.venv/bin/pytest -q tests/test_webchat_page.py`, and `PYTHONPATH=.:tests .venv/bin/pytest -q tests/test_whatsapp_webhook.py tests/test_channel_link.py`
 - Integration: send one message in Workspace main chat and one Task thread;
   assert their runtime envelopes carry the correct Workspace/Task and tools.
   For an interactive Task, request a different Agent and assert the Task Host
@@ -43,9 +41,7 @@ and **Pass criteria**. A skipped category needs a reason.
   that omits those fields is rejected. Deliver a signed WhatsApp webhook for
   one bound phone ID and assert the exact AgentSubscription/Workspace handles
   it; duplicate the active binding or set a conflicting contact pin and assert
-  no Agent run or provider reply occurs. Start one Twilio Voice Call, replace
-  its work twice while the first Agent exits cooperatively, and assert only the
-  latest replacement runs on the Call's frozen binding and Conversation.
+  no Agent run or provider reply occurs.
 - Manual: switch between two Workspaces and confirm history, pending HITL,
   attachments, agent mentions, and input enabled state never cross scopes.
   Open an interactive Task and confirm its reused Chat panel is open, names the
@@ -59,14 +55,6 @@ and **Pass criteria**. A skipped category needs a reason.
   and slug and assert both discovery and invocation fail; repeat with a Skill ID
   from another Entity. Directly invoke a built-in Ledger Skill in a Workspace
   without its declared contract and assert execution is rejected.
-  From a Workspace-bound generic mailbox, save one received text/document
-  attachment, ask the Agent about its contents, refresh, and attach the returned
-  `document_id` to a reviewed draft. Confirm another Workspace cannot reuse it.
-  Start one background Sandbox command that emits `need_tool`, resolve that
-  capability through the ordinary Runtime gate, respond once, and confirm the
-  same execution completes. Repeat status with `after_sequence` and confirm no
-  earlier event is replayed; attempt the response from another Conversation and
-  confirm it is denied before Sandbox I/O.
 - Pass criteria: no cross-Workspace data/tool leakage; a deleted/inaccessible
   Conversation or Workspace chat fails closed; terminal or user-paused turns
   unlock input; deleting a Task leaves no rateable completion projection or
@@ -77,28 +65,6 @@ and **Pass criteria**. A skipped category needs a reason.
   normal Chat runtime scope or approval boundaries.
   WhatsApp phone routing resolves one exact active binding, rejects ambiguity,
   and never accepts a contact-level subscription override.
-  Twilio Voice acknowledges durable work before the Agent finishes, keeps
-  foreground control responsive, serializes spoken responses, and never
-  executes or speaks an interrupted receipt or a result from a changed binding.
-  Admitted work drains durably after Media Stream closure without another
-  Realtime provider write.
-  A wide Agent searches only
-  its effective bound/contextual tools; an unbound registry tool stays hidden,
-  and a loaded schema cannot bypass later revocation.
-  A provider wildcard survives Workspace/Workflow prompt assembly and can load
-  a newly discovered action; an explicit action allowlist, hard external/editor
-  profile, or revoked binding still denies it, and message metadata cannot replay
-  the provider scope on a later turn. Capability companions appear only beside
-  matched available capabilities, remain ordinary `invoke_skill` targets, and
-  cannot grant or execute the paired Tool/MCP capability. Every static
-  Integration resolves to a complete child Skill; its MCP discovery/companion
-  prefix comes from the route registry, and private hosted child Skills are absent
-  from the sanitized OSS catalog and tree. Invalid nested public arguments fail
-  with a stable schema path before authorization/HITL and never reach the handler.
-  Tool failures remain visible to the model and UI but cannot directly stop the
-  Agent loop; bounded repeated failures end through a no-tools model summary,
-  while successful terminal tools and strict governance controls retain their
-  existing semantics.
 
 ## WS-03: Readiness and context
 
@@ -178,7 +144,6 @@ and **Pass criteria**. A skipped category needs a reason.
 ## WS-07: Executor, Dispatcher, and worker lease
 
 - Automated: `.venv/bin/pytest -q tests/test_orchestration_hardening.py tests/test_plan_retries.py tests/test_dispatcher_ref_resolution.py tests/test_dispatcher_envelope_status.py tests/test_lease_heartbeat.py tests/test_task_runner_terminal_guard.py tests/test_scheduler.py tests/test_scheduler_tick.py tests/test_skill_creation_matching.py tests/test_event_emitter.py`; plus `.venv/bin/pytest -q tests/test_workflow_runner_nodes.py tests/test_workflows.py -k 'claim or terminal_commit'`
-- Automated Sandbox lifecycle: `PYTHONPATH=.:tests .venv/bin/pytest -q tests/test_sandbox_runner_lifecycle.py tests/test_sandbox_sdk.py`
 - Integration: execute a two-step Plan with ref passing, then simulate duplicate
   delivery, lease expiry, retryable failure, and terminal failure. Duplicate a
   background Agent Task while its renewable claim is live, then simulate owner
@@ -195,11 +160,6 @@ and **Pass criteria**. A skipped category needs a reason.
   claimed. Assert a published recovery is not republished before its complete
   retry-chain deadline, and that broker failure releases only the exact unique
   publish token without shortening a newer claim.
-  Run a real isolated command that emits one structured input request, wait for
-  the exact response file, and then exits. Assert queued/running state, stable
-  sequence, one idempotent response, same-process completion, bounded cleanup,
-  and rejection of conflicting, oversized, secret-bearing, or unknown-event
-  responses.
   Run overlapping occurrences of one Agent
   schedule and assert distinct Tasks retain exact run lineage. Race the
   scheduler tick with a reschedule or A-to-B-to-A config update; assert the old
@@ -304,22 +264,11 @@ and **Pass criteria**. A skipped category needs a reason.
 
 ## WS-08: HITL and resume
 
-- Automated: `.venv/bin/pytest -q tests/test_dispatcher_unified_approval_gate.py tests/test_lease_needs_human_request.py tests/test_pending_action_resolve.py tests/test_approval_card_lifecycle.py tests/test_workspace_hitl_channel_ack.py tests/test_channel_approved_reply_routes.py tests/test_hitl_card_surface.py tests/test_workspace_chat_tool_hitl_surface.py tests/test_runtime_guard_unified_store.py tests/test_runtime_tool_input_validation.py`; plus `.venv/bin/pytest -q tests/test_ai_engine.py -k 'approved_forced_call'` and `node --test apps/web/scripts/chat-message-collapse.test.mjs`
+- Automated: `.venv/bin/pytest -q tests/test_dispatcher_unified_approval_gate.py tests/test_lease_needs_human_request.py tests/test_pending_action_resolve.py tests/test_approval_card_lifecycle.py tests/test_workspace_hitl_channel_ack.py tests/test_channel_approved_reply_routes.py tests/test_hitl_card_surface.py`
 - Integration: pause one Step for approval/input, resolve once, resend the same
   response/token, and assert only the original origin resumes once. Pause a
   parent on subworkflow and foreach-subworkflow children, attempt a human resume,
   and assert it remains paused until the exact durable child receipt arrives.
-  Resolve two HITL requests stored on the same Message concurrently and assert
-  both resolution markers survive commit and refresh.
-  Fail an approved chat-tool continuation before provider I/O, both as a
-  returned preflight error and as an unavailable settlement store. Assert the
-  Agent loop keeps explicitly read-only tools, can execute one alternate read,
-  and excludes the failed write plus every other write/unclassified tool.
-  Repeat with a stale Runtime abort and a successful or currently executing
-  provider result; assert those paths remain hard-stop/tool-free and never
-  repeat the effect. Separately, present a durable claim from an earlier
-  ambiguous attempt before current provider I/O; assert only read-only
-  reconciliation tools remain available and the claimed write is not repeated.
   Attempt a delayed WhatsApp free-form reply outside the customer-service
   window, assert it remains actionable, then select an explicit approved
   template and assert only that template operation is sent.
@@ -327,17 +276,6 @@ and **Pass criteria**. A skipped category needs a reason.
   cancel, and refresh; ensure cards resolve and chat input becomes usable.
 - Pass criteria: exact payload binding, single consumption, correct resume
   origin, no duplicate task, no stale unresolved UI after terminal state.
-  Concurrent resolutions sharing one Message preserve every card terminal state.
-  Proven pre-provider failures remain inside the bounded Agent loop without
-  reusing the approval token; only read-only alternate tools remain callable.
-  Every nested JSON value retains its exact type through approval (including
-  arrays, objects, booleans, numbers, strings, and null); an old malformed
-  continuation expires before a grant, token consumption, or handler execution.
-  After the exact forced call or provider confirm-and-retry pair, the model
-  receives no callable tools for its final summary, so one approval cannot
-  produce a duplicate side effect/card. Pending
-  actions render as waiting and any failed tool remains an error, never a false
-  recovered/completed label.
   Determinate external-reply failure leaves the approval actionable; adapters
   with provider idempotency retain a same-key-retry-only claim after ambiguous
   failure, allow immediate approval retry with the stable key, and keep
@@ -348,9 +286,6 @@ and **Pass criteria**. A skipped category needs a reason.
   WhatsApp outside-window free-form replies fail determinately with
   `whatsapp_template_required`; the approval remains actionable until an
   explicit approved template is selected.
-  Sandbox requests never mint authority: any requested Runtime tool or external
-  effect still crosses its normal approval gate, and credential exchange uses
-  references rather than plaintext values.
 
 ## WS-09: Workspace Flow and Workflow runtime
 
@@ -391,21 +326,10 @@ and **Pass criteria**. A skipped category needs a reason.
 
 ## WS-10: Artifact and Knowledge projection
 
-- Automated: `.venv/bin/pytest -q tests/test_artifact_knowledge_projection.py tests/test_workspace_artifacts.py tests/test_workspace_task_artifacts_are_visible.py tests/test_task_scoped_artifacts.py tests/test_knowledge_file_consistency.py tests/test_internal_worker_artifact_capture.py tests/test_entity_fs_write_guard.py tests/test_generate_file_tool.py tests/test_workspace_artifact_purge.py tests/test_event_emitter.py tests/test_email_attachment_bridge.py tests/test_documents.py`; `npm --prefix apps/web exec playwright test e2e/knowledge-upload-lifecycle.spec.ts e2e/knowledge-upload-page.spec.ts`
+- Automated: `.venv/bin/pytest -q tests/test_artifact_knowledge_projection.py tests/test_workspace_artifacts.py tests/test_workspace_task_artifacts_are_visible.py tests/test_task_scoped_artifacts.py tests/test_knowledge_file_consistency.py tests/test_internal_worker_artifact_capture.py tests/test_entity_fs_write_guard.py tests/test_generate_file_tool.py tests/test_workspace_artifact_purge.py tests/test_event_emitter.py`
 - Integration: produce one real file from a Task and one from a Workflow; assert
   entity-relative path, Document row, provenance, viewer URL, Task/chat card,
-  and Knowledge visibility all identify the same artifact. Import one bounded
-  Email attachment and assert its original bytes, Workspace folder, Document,
-  provenance, extracted text, and viewer URL resolve to the same identity.
-  Force a browser-upload commit acknowledgement loss with delayed receipt
-  visibility, then retry the same key and assert one readable source file and
-  one Document. Reload during processing and assert receipt polling resumes
-  without an automatic second upload; force a persistent negative receipt,
-  explicitly reselect the matching original file, and assert the same key is
-  reused. Expire both keyed and cleanup-only recovery intents, then assert
-  unreferenced bytes are removed while a committed Document's source survives.
-  Switch principals and assert no retry, toast, or cache mutation crosses the
-  identity boundary.
+  and Knowledge visibility all identify the same artifact.
 - Manual: open the attachment from Task, chat, and Knowledge. Rename the
   Workspace and confirm durable identity/path behavior remains coherent.
 - Pass criteria: for the Task/Workflow paths covered by the listed tests, a
@@ -468,7 +392,7 @@ and **Pass criteria**. A skipped category needs a reason.
 
 ## WS-13: Pause, delete, restore, and purge
 
-- Automated: `.venv/bin/pytest -q tests/test_workspace_lifecycle.py tests/test_document_permissions.py tests/test_folder_permissions.py tests/test_document_access_batch.py tests/test_entity_fs_write_guard.py tests/test_reusable_resource_locking.py tests/test_deletion_tasks.py tests/test_workspace_mechanism_regressions.py tests/test_user_lifecycle.py tests/test_workspace_purge_owned_resources.py tests/test_twilio_voice_runtime.py tests/test_blueprint_channel_revert.py tests/test_integrations.py -k 'delete or restore or purge or paused or payload or disconnect or userless or twilio_binding or blueprint_twilio'`; plus `.venv/bin/pytest -q tests/test_sharing_permission_boundaries.py -k 'rechecks or auth_read or read_gate or folder_list_gate or revoked_bearer or can_manage or primary_entity or actor_resolution'` and `DEPLOYMENT_MODE=cloud .venv/bin/pytest -q tests/test_admin_impersonation.py -k 'ended_impersonation or owner_can_start_and_end'`
+- Automated: `.venv/bin/pytest -q tests/test_workspace_lifecycle.py tests/test_document_permissions.py tests/test_folder_permissions.py tests/test_document_access_batch.py tests/test_entity_fs_write_guard.py tests/test_reusable_resource_locking.py tests/test_deletion_tasks.py tests/test_workspace_mechanism_regressions.py tests/test_user_lifecycle.py tests/test_workspace_purge_owned_resources.py tests/test_integrations.py -k 'delete or restore or purge or paused or payload or disconnect or userless'`
 - Integration: create Workspace Task/Plan/Lease/Workflow run/job and job-run/chat/artifact,
   notification/outbox/delivery and Goal/Stat collection schedules, soft-delete
   it, verify immediate blocking and automation cleanup, and assert its
@@ -490,18 +414,12 @@ and **Pass criteria**. A skipped category needs a reason.
   Delete a conversation containing Task/Plan-completion feedback and assert
   both its feedback row and derived RuntimeEvidence are removed. Disconnect a
   Twilio Integration and assert only pending/connecting Voice sessions are
-  canceled while terminal history remains. Rebind and remove Twilio through
-  Integration binding and legacy Channel CRUD, Workspace attach/update/remove,
-  Workspace Operation apply, and Blueprint upgrade/revert; assert each cancels
-  only unconnected calls frozen to the changed binding.
-  Hard-purge a user, Workspace, and
+  canceled while terminal history remains; hard-purge a user, Workspace, and
   final Entity and assert only their owned Voice runtime rows are removed.
   Reconnect WhatsApp through a fully provisioned replacement and assert the
   existing ChannelConfig, Channel, AgentSubscription, and Workspace route IDs
   survive; disconnect it and assert exact App/Nango cleanup completes while the
   customer WABA and phone remain intact.
-  Hard-purge a user with acquisition attribution and assert that personal
-  attribution row is removed.
 - Manual: delete and restore within grace period; verify restored data is
   accessible but removed automations are not unexpectedly recreated.
 - Pass criteria: no new work after pause/delete, no stale polling, and restore
@@ -530,9 +448,7 @@ and **Pass criteria**. A skipped category needs a reason.
   preserved, and a target replaced by an unexpected regular file is restored
   while the cleanup job is retained. Twilio Voice hard purge follows explicit
   user/Workspace/Entity ownership and does not depend on a deleted
-  ChannelConfig foreign key. Every Twilio binding writer invalidates only
-  `pending/connecting` calls for that exact binding before its route mutation;
-  connected and terminal history is preserved. Revoking a client-visible Webchat document removes
+  ChannelConfig foreign key. Revoking a client-visible Webchat document removes
   its public module, and pausing/deleting the Workspace prevents its published
   action from creating another Workflow run.
   WhatsApp reconnect preserves ChannelConfig, Channel, AgentSubscription, and

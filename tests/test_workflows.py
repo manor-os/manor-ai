@@ -435,56 +435,6 @@ def test_execution_trace_records_transition_metadata_and_enforces_caps():
     assert len(run.execution_trace) == 2000
 
 
-def test_workflow_history_summary_migration_backfills_existing_runs():
-    from importlib import import_module
-
-    migration = import_module(
-        "packages.core.migrations.versions.20260731_13_workflow_history_summary"
-    )
-    summary = migration._history_summary({
-        "definition_snapshot": {
-            "nodes": [
-                {"id": "start", "type": "trigger", "chat_projection": "progress"},
-                {"id": "persist", "type": "transform", "chat_projection": "hidden"},
-                {"id": "capture", "type": "agent", "chat_projection": "progress"},
-                {"id": "end", "type": "end", "chat_projection": "progress"},
-            ],
-        },
-        "step_results": {
-            "start": {"status": "completed"},
-            "persist": {"status": "completed"},
-            "capture": {
-                "status": "failed",
-                "output": {"artifacts": [{"document_id": "nested-shot"}]},
-            },
-        },
-        "variables": {
-            "project": {
-                "state": {
-                    "business_outcome": "needs_input",
-                    "retry_state": {
-                        "observed_problem": {
-                            "message": "Browser disconnected" + ("!" * 12_000),
-                            "api_key": "migration-secret",
-                        },
-                    },
-                },
-            },
-        },
-        "execution_trace": [
-            {"artifact_refs": [{"document_id": "video-1"}]},
-            {"artifact_refs": [{"document_id": "video-1"}, {"document_id": "shot-1"}]},
-        ],
-        "error": None,
-    })
-
-    assert summary["business_outcome"] == "needs_input"
-    assert summary["processed_count"] == 2
-    assert summary["total_count"] == 2
-    assert summary["artifact_count"] == 3
-    assert summary["blocker"]["truncated"] is True
-    assert len(json.dumps(summary["blocker"]).encode("utf-8")) <= 8 * 1024
-    assert "migration-secret" not in json.dumps(summary["blocker"])
 
 
 def test_workflow_run_trigger_data_drops_caller_supplied_history_summary():
@@ -513,61 +463,6 @@ def test_workflow_run_trigger_data_drops_caller_supplied_history_summary():
     assert "_workflow_history_summary" not in trigger_data
 
 
-def test_workflow_history_summary_migration_overwrites_existing_summary(monkeypatch):
-    from importlib import import_module
-
-    migration = import_module(
-        "packages.core.migrations.versions.20260731_13_workflow_history_summary"
-    )
-    row = {
-        "id": "run-forged-summary",
-        "definition_snapshot": {"nodes": [{"id": "start", "type": "trigger"}]},
-        "step_results": {},
-        "variables": {},
-        "execution_trace": [],
-        "error": None,
-        "trigger_data": {
-            "_workflow_history_summary": {
-                "processed_count": 999,
-                "total_count": 1,
-            },
-        },
-    }
-
-    class Result:
-        def __init__(self, rows):
-            self.rows = rows
-
-        def mappings(self):
-            return self
-
-        def all(self):
-            return self.rows
-
-    class Bind:
-        def __init__(self):
-            self.selected = False
-            self.updates = []
-
-        def execute(self, statement, parameters):
-            sql = str(statement)
-            if "SELECT" in sql:
-                if self.selected or "? :summary_key" in sql:
-                    return Result([])
-                self.selected = True
-                return Result([row])
-            self.updates.extend(parameters)
-            return Result([])
-
-    bind = Bind()
-    monkeypatch.setattr(migration.op, "get_bind", lambda: bind)
-
-    migration.upgrade()
-
-    assert len(bind.updates) == 1
-    summary = json.loads(bind.updates[0]["summary"])
-    assert summary["processed_count"] == 0
-    assert summary["total_count"] == 1
 
 
 def test_execution_trace_compacts_and_byte_caps_artifact_and_child_refs():

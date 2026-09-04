@@ -45,15 +45,6 @@ class Document(Base, TimestampMixin):
         Index("ix_documents_name", "entity_id", "name"),
         Index("ix_documents_fs_path", "fs_path"),
         Index(
-            "uq_documents_upload_idempotency",
-            "entity_id",
-            "owner_id",
-            "upload_idempotency_key",
-            unique=True,
-            postgresql_where=text("upload_idempotency_key IS NOT NULL"),
-            sqlite_where=text("upload_idempotency_key IS NOT NULL"),
-        ),
-        Index(
             "uq_documents_entity_fs_path_active",
             "entity_id",
             "fs_path",
@@ -79,10 +70,6 @@ class Document(Base, TimestampMixin):
     metadata_: Mapped[dict] = mapped_column("metadata", JSONB, server_default="{}")
     created_by: Mapped[Optional[str]] = mapped_column(String(100))
     folder_id: Mapped[Optional[str]] = mapped_column(String(26))
-    # Stable browser-upload receipt. A retry with the same key and fingerprint
-    # returns this row instead of creating a second filesystem projection.
-    upload_idempotency_key: Mapped[Optional[str]] = mapped_column(String(128))
-    upload_request_fingerprint: Mapped[Optional[str]] = mapped_column(String(64))
 
     # Trash / soft-delete fields
     is_trashed: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")

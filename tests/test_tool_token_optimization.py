@@ -2,24 +2,23 @@ from __future__ import annotations
 
 import base64
 import json
-from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
 
-from packages.core.ai.tools.generate_file.tool import _generate_file_handler as _generate_file
-
 from packages.core.ai.tools import file_tools as file_tools_module
 from packages.core.ai.tools.document_tools import _cache_key as document_cache_key
 from packages.core.ai.tools.document_tools import _doc_to_dict
+from packages.core.ai.tools.document_tools import _generate_document_file
 from packages.core.ai.tools.file_tools import (
     _delete_file,
+    _edit_file,
     _glob_files,
     _grep_files,
     _list_files,
-    _patch_file,
     _read_file,
+    _write_file,
 )
 from packages.core.ai.tools.extended_tools import _web_fetch_handler
 from packages.core.ai.tools.generate_file_tool import GENERATE_FILE_SCHEMA
@@ -34,8 +33,6 @@ from packages.core.ai.tools.bash_tool import _execute_local
 from packages.core.ai.tool_pool import ToolPool
 from packages.core.ai.runtime.tool_registry import runtime_registered_tool_surface_from_schemas
 from packages.core.config import get_settings
-from packages.core.models.base import generate_ulid
-from packages.core.models.user import Entity
 
 
 @pytest.fixture(autouse=True)
@@ -53,59 +50,11 @@ def _isolate_low_level_file_tool_tests_from_permission_policy(monkeypatch):
     async def allow_resource_access(**_kwargs):
         return None
 
-    async def allow_mutation(**_kwargs):
-        return None
-
-    async def fake_commit_file_projection(**kwargs):
-        rel_path = str(kwargs["rel_path"])
-        abs_path = Path(str(kwargs["entity_root"])) / rel_path
-        abs_path.parent.mkdir(parents=True, exist_ok=True)
-        abs_path.write_bytes(kwargs["data"])
-        runtime_context = kwargs["runtime_context"]
-        if runtime_context.workspace_id:
-            from packages.core.ai.runtime.file_actions import runtime_sync_entity_file_to_knowledge
-
-            sync = await runtime_sync_entity_file_to_knowledge(
-                abs_path=str(abs_path),
-                entity_root=str(kwargs["entity_root"]),
-                source="agent",
-                created_by=runtime_context.user_id or "ai-agent",
-                force=True,
-                workspace_id=runtime_context.workspace_id,
-                task_id=runtime_context.task_id,
-                agent_id=runtime_context.agent_id,
-                conversation_id=runtime_context.conversation_id,
-                user_id=runtime_context.user_id,
-                tool_name=str(kwargs["tool_name"]),
-                expected_content_sha256=None,
-            )
-        else:
-            sync = SimpleNamespace(synced=True, document_id="doc_123", reason=None)
-        content = await file_tools_module._read_supported_text(
-            str(abs_path),
-            file_type_path=rel_path,
-        )
-        return (
-            str(abs_path),
-            sync,
-            file_tools_module._file_meta(str(abs_path), content),
-        )
-
     monkeypatch.setattr(file_tools_module, "_blocked_doc_paths", allow_test_paths)
     monkeypatch.setattr(
         file_tools_module,
         "runtime_guard_file_resource_access",
         allow_resource_access,
-    )
-    monkeypatch.setattr(
-        file_tools_module,
-        "runtime_guard_file_mutation",
-        allow_mutation,
-    )
-    monkeypatch.setattr(
-        file_tools_module,
-        "_commit_file_projection",
-        fake_commit_file_projection,
     )
 
 
@@ -120,19 +69,19 @@ def _minimal_schema(name: str) -> dict:
     }
 
 
-def test_file_tools_expose_patch_tool_for_text_and_spreadsheets():
+def test_file_tools_expose_single_edit_tool_for_text_and_spreadsheets():
     names = [schema["function"]["name"] for schema, _handler in file_tools_module.get_tools()]
-    patch_schema = next(
-        schema for schema, _handler in file_tools_module.get_tools() if schema["function"]["name"] == "patch_file"
+    edit_schema = next(
+        schema for schema, _handler in file_tools_module.get_tools() if schema["function"]["name"] == "edit_file"
     )
-    operation_props = patch_schema["function"]["parameters"]["properties"]["operations"]["items"]["properties"]
+    props = edit_schema["function"]["parameters"]["properties"]
 
-    assert names.count("patch_file") == 1
-    assert "edit_file" not in names
+    assert names.count("edit_file") == 1
     assert "edit_spreadsheet" not in names
-    assert {"op", "sheet", "cell", "match_column", "updates", "row", "new_sheet", "new_sheet_name"} <= set(
-        operation_props
-    )
+    assert props["operation"]["enum"] == [
+        "replace_text", "set_cell", "update_row", "append_row", "add_sheet",
+    ]
+    assert {"sheet", "cell", "match_column", "updates", "row"} <= set(props)
 
 
 def _tool_surface_for_pool(pool: ToolPool, *, is_master: bool = False) -> tuple[list[dict], list[str]]:
@@ -306,7 +255,7 @@ async def test_read_file_extracts_xlsx_as_text(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_patch_file_rejects_xlsx_without_corrupting_workbook(tmp_path):
+async def test_edit_file_rejects_xlsx_without_corrupting_workbook(tmp_path):
     from openpyxl import Workbook, load_workbook
 
     settings = get_settings()
@@ -326,14 +275,15 @@ async def test_patch_file_rejects_xlsx_without_corrupting_workbook(tmp_path):
         wb.save(workbook_path)
 
         result = json.loads(
-            await _patch_file(
+            await _edit_file(
                 entity_id=entity_id,
                 path=workbook_path.name,
-                operations=[{"op": "text.replace", "old_text": "待验证", "new_text": "已验证"}],
+                old_text="待验证",
+                new_text="已验证",
             )
         )
 
-        assert result["error"] == "unsupported_operation_for_file_type"
+        assert result["error"] == "unsupported_binary_edit"
         reopened = load_workbook(workbook_path)
         assert reopened.active["B2"].value == "待验证"
         reopened.close()
@@ -343,7 +293,7 @@ async def test_patch_file_rejects_xlsx_without_corrupting_workbook(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_patch_file_updates_matched_spreadsheet_status_row(tmp_path, monkeypatch):
+async def test_edit_file_updates_matched_spreadsheet_status_row(tmp_path, monkeypatch):
     from openpyxl import Workbook, load_workbook
 
     settings = get_settings()
@@ -378,25 +328,23 @@ async def test_patch_file_updates_matched_spreadsheet_status_row(tmp_path, monke
 
         read_result = json.loads(await _read_file(entity_id=entity_id, path=workbook_path.name))
         result = json.loads(
-            await _patch_file(
+            await _edit_file(
                 entity_id=entity_id,
                 path=workbook_path.name,
-                operations=[{
-                    "op": "row.update",
-                    "sheet": "验证列表",
-                    "header_row": 1,
-                    "match_column": "功能",
-                    "match_value": "Public chat stream",
-                    "updates": {"状态": "已验证", "验证备注": "stream out and replying verified"},
-                }],
+                sheet="验证列表",
+                operation="update_row",
+                header_row=1,
+                match_column="功能",
+                match_value="Public chat stream",
+                updates={"状态": "已验证", "验证备注": "stream out and replying verified"},
                 expected_sha256=read_result["source_sha256"],
             )
         )
 
         assert result["updated"] is True
-        assert result["operation_results"][0]["row_number"] == 2
-        assert result["operation_results"][0]["updated_cells"]["C2"]["old"] == "待验证"
-        assert result["operation_results"][0]["updated_cells"]["C2"]["new"] == "已验证"
+        assert result["row_number"] == 2
+        assert result["updated_cells"]["C2"]["old"] == "待验证"
+        assert result["updated_cells"]["C2"]["new"] == "已验证"
         assert result["source_sha256"] != read_result["source_sha256"]
         assert result["knowledge_synced"] is True
 
@@ -412,7 +360,7 @@ async def test_patch_file_updates_matched_spreadsheet_status_row(tmp_path, monke
 
 
 @pytest.mark.asyncio
-async def test_patch_file_appends_header_mapped_spreadsheet_row(tmp_path, monkeypatch):
+async def test_edit_file_appends_header_mapped_spreadsheet_row(tmp_path, monkeypatch):
     from openpyxl import Workbook, load_workbook
 
     settings = get_settings()
@@ -444,18 +392,16 @@ async def test_patch_file_appends_header_mapped_spreadsheet_row(tmp_path, monkey
         wb.save(workbook_path)
 
         result = json.loads(
-            await _patch_file(
+            await _edit_file(
                 entity_id=entity_id,
                 path=workbook_path.name,
-                operations=[{
-                    "op": "row.append",
-                    "row": {"编号": 2, "功能": "Excel update tool", "状态": "待验证"},
-                }],
+                operation="append_row",
+                row={"编号": 2, "功能": "Excel update tool", "状态": "待验证"},
             )
         )
 
         assert result["updated"] is True
-        assert result["operation_results"][0]["row_number"] == 3
+        assert result["row_number"] == 3
         reopened = load_workbook(workbook_path)
         ws = reopened.active
         assert [ws["A3"].value, ws["B3"].value, ws["C3"].value] == [2, "Excel update tool", "待验证"]
@@ -466,7 +412,7 @@ async def test_patch_file_appends_header_mapped_spreadsheet_row(tmp_path, monkey
 
 
 @pytest.mark.asyncio
-async def test_real_user_patch_file_updates_docx_document(tmp_path, monkeypatch):
+async def test_real_user_edit_file_updates_docx_document(tmp_path, monkeypatch):
     docx = pytest.importorskip("docx")
     Document = docx.Document
 
@@ -503,14 +449,11 @@ async def test_real_user_patch_file_updates_docx_document(tmp_path, monkeypatch)
         assert "Draft for owner review" in read_result["content"]
 
         result = json.loads(
-            await _patch_file(
+            await _edit_file(
                 entity_id=entity_id,
                 path=document_path.name,
-                operations=[{
-                    "op": "text.replace",
-                    "old_text": "Draft for owner review",
-                    "new_text": "Ready for guest replies",
-                }],
+                old_text="Draft for owner review",
+                new_text="Ready for guest replies",
                 expected_sha256=read_result["source_sha256"],
             )
         )
@@ -533,7 +476,7 @@ async def test_real_user_patch_file_updates_docx_document(tmp_path, monkeypatch)
 
 
 @pytest.mark.asyncio
-async def test_real_user_patch_file_updates_pptx_deck(tmp_path, monkeypatch):
+async def test_real_user_edit_file_updates_pptx_deck(tmp_path, monkeypatch):
     pptx = pytest.importorskip("pptx")
     Presentation = pptx.Presentation
     from pptx.util import Inches
@@ -572,14 +515,11 @@ async def test_real_user_patch_file_updates_pptx_deck(tmp_path, monkeypatch):
         assert "Draft narrative" in read_result["content"]
 
         result = json.loads(
-            await _patch_file(
+            await _edit_file(
                 entity_id=entity_id,
                 path=deck_path.name,
-                operations=[{
-                    "op": "text.replace",
-                    "old_text": "Draft narrative",
-                    "new_text": "Client-ready narrative",
-                }],
+                old_text="Draft narrative",
+                new_text="Client-ready narrative",
                 expected_sha256=read_result["source_sha256"],
             )
         )
@@ -636,7 +576,7 @@ async def test_read_file_rejects_stale_continuation_sha(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_generate_file_rejects_stale_expected_sha_without_overwrite(tmp_path):
+async def test_write_file_rejects_stale_expected_sha_without_overwrite(tmp_path):
     settings = get_settings()
     old_enabled = settings.MANOR_FS_ENABLED
     old_root = settings.MANOR_FS_ROOT
@@ -652,10 +592,9 @@ async def test_generate_file_rejects_stale_expected_sha_without_overwrite(tmp_pa
 
         target.write_text("changed by someone else\n", encoding="utf-8")
         write_result = json.loads(
-            await _generate_file(
-                kind="document",
+            await _write_file(
                 entity_id=entity_id,
-                name="draft.md",
+                path="draft.md",
                 content="ai overwrite\n",
                 expected_sha256=read_result["source_sha256"],
             )
@@ -669,13 +608,7 @@ async def test_generate_file_rejects_stale_expected_sha_without_overwrite(tmp_pa
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("storage_scope", ["task", "workspace"])
-async def test_generate_file_scopes_new_workspace_files_to_workspace_folder(
-    tmp_path,
-    monkeypatch,
-    storage_scope,
-    db_session,
-):
+async def test_write_file_scopes_new_workspace_files_to_workspace_folder(tmp_path, monkeypatch):
     settings = get_settings()
     old_enabled = settings.MANOR_FS_ENABLED
     old_root = settings.MANOR_FS_ROOT
@@ -694,11 +627,9 @@ async def test_generate_file_scopes_new_workspace_files_to_workspace_folder(
 
     async def fake_workspace_base_dir(**kwargs):
         assert kwargs["workspace_id"] == "ws_1"
-        assert kwargs["task_id"] == (None if storage_scope == "workspace" else "task_1")
         return "Workspaces/Launch Workspace"
 
     monkeypatch.setattr(file_tools_module, "runtime_guard_file_mutation", fake_guard_file_mutation)
-    monkeypatch.setattr("packages.core.ai.runtime.file_actions.runtime_guard_file_mutation", fake_guard_file_mutation)
     monkeypatch.setattr(
         "packages.core.ai.runtime.file_actions.runtime_sync_entity_file_to_knowledge",
         fake_sync_file_to_knowledge,
@@ -708,28 +639,23 @@ async def test_generate_file_scopes_new_workspace_files_to_workspace_folder(
         fake_workspace_base_dir,
     )
     try:
-        entity_id = generate_ulid()
-        db_session.add(Entity(id=entity_id, name="Generated file scope test"))
-        await db_session.commit()
+        entity_id = "ent_1"
         entity_root = tmp_path / entity_id
         entity_root.mkdir()
 
         result = json.loads(
-            await _generate_file(
-                kind="document",
+            await _write_file(
                 entity_id=entity_id,
-                name="brief.md",
+                path="brief.md",
                 content="# Brief\n",
                 workspace_id="ws_1",
-                task_id="task_1",
-                storage_scope=storage_scope,
                 _user_id_from_context="user_1",
             )
         )
 
         expected_path = "Workspaces/Launch Workspace/documents/brief.md"
-        assert result["created"] is True
-        assert result["document"]["fs_path"] == expected_path
+        assert result["written"] is True
+        assert result["path"] == expected_path
         scoped_file = entity_root / "Workspaces" / "Launch Workspace" / "documents" / "brief.md"
         assert scoped_file.read_text(encoding="utf-8") == "# Brief\n"
         assert not (entity_root / "brief.md").exists()
@@ -781,10 +707,9 @@ async def test_read_file_falls_back_to_current_workspace_artifact_path(tmp_path,
 
 
 @pytest.mark.asyncio
-async def test_generate_file_does_not_overwrite_entity_root_file_from_workspace(
+async def test_write_file_does_not_overwrite_entity_root_file_from_workspace(
     tmp_path,
     monkeypatch,
-    db_session,
 ):
     settings = get_settings()
     old_enabled = settings.MANOR_FS_ENABLED
@@ -802,7 +727,6 @@ async def test_generate_file_does_not_overwrite_entity_root_file_from_workspace(
         return "Workspaces/Launch Workspace"
 
     monkeypatch.setattr(file_tools_module, "runtime_guard_file_mutation", fake_guard_file_mutation)
-    monkeypatch.setattr("packages.core.ai.runtime.file_actions.runtime_guard_file_mutation", fake_guard_file_mutation)
     monkeypatch.setattr(
         "packages.core.ai.runtime.file_actions.runtime_sync_entity_file_to_knowledge",
         fake_sync_file_to_knowledge,
@@ -812,27 +736,24 @@ async def test_generate_file_does_not_overwrite_entity_root_file_from_workspace(
         fake_workspace_base_dir,
     )
     try:
-        entity_id = generate_ulid()
-        db_session.add(Entity(id=entity_id, name="Generated file isolation test"))
-        await db_session.commit()
+        entity_id = "ent_1"
         entity_root = tmp_path / entity_id
         entity_root.mkdir()
         target = entity_root / "draft.md"
         target.write_text("old\n", encoding="utf-8")
 
         result = json.loads(
-            await _generate_file(
-                kind="document",
+            await _write_file(
                 entity_id=entity_id,
-                name="draft.md",
+                path="draft.md",
                 content="new\n",
                 workspace_id="ws_1",
             )
         )
 
         scoped = entity_root / "Workspaces" / "Launch Workspace" / "documents" / "draft.md"
-        assert result["created"] is True
-        assert result["document"]["fs_path"] == "Workspaces/Launch Workspace/documents/draft.md"
+        assert result["written"] is True
+        assert result["path"] == "Workspaces/Launch Workspace/documents/draft.md"
         assert target.read_text(encoding="utf-8") == "old\n"
         assert scoped.read_text(encoding="utf-8") == "new\n"
     finally:
@@ -841,7 +762,7 @@ async def test_generate_file_does_not_overwrite_entity_root_file_from_workspace(
 
 
 @pytest.mark.asyncio
-async def test_patch_file_uses_expected_sha_for_safe_mutation(tmp_path, monkeypatch):
+async def test_edit_file_uses_expected_sha_for_safe_mutation(tmp_path, monkeypatch):
     settings = get_settings()
     old_enabled = settings.MANOR_FS_ENABLED
     old_root = settings.MANOR_FS_ROOT
@@ -859,29 +780,26 @@ async def test_patch_file_uses_expected_sha_for_safe_mutation(tmp_path, monkeypa
         target.write_text("hello world\n", encoding="utf-8")
         read_result = json.loads(await _read_file(entity_id=entity_id, path="draft.md"))
 
-        patch_result = json.loads(
-            await _patch_file(
+        edit_result = json.loads(
+            await _edit_file(
                 entity_id=entity_id,
                 path="draft.md",
-                operations=[{
-                    "op": "text.replace",
-                    "old_text": "hello",
-                    "new_text": "hi",
-                }],
+                old_text="hello",
+                new_text="hi",
                 expected_sha256=read_result["source_sha256"],
             )
         )
 
-        assert patch_result["edited"] is True
+        assert edit_result["edited"] is True
         assert target.read_text(encoding="utf-8") == "hi world\n"
-        assert patch_result["source_sha256"] != read_result["source_sha256"]
+        assert edit_result["source_sha256"] != read_result["source_sha256"]
     finally:
         settings.MANOR_FS_ENABLED = old_enabled
         settings.MANOR_FS_ROOT = old_root
 
 
 @pytest.mark.asyncio
-async def test_patch_file_rejects_stale_expected_sha_without_edit(tmp_path):
+async def test_edit_file_rejects_stale_expected_sha_without_edit(tmp_path):
     settings = get_settings()
     old_enabled = settings.MANOR_FS_ENABLED
     old_root = settings.MANOR_FS_ROOT
@@ -897,11 +815,12 @@ async def test_patch_file_rejects_stale_expected_sha_without_edit(tmp_path):
 
         target.write_text("hello changed\n", encoding="utf-8")
         edit_result = json.loads(
-            await _patch_file(
+            await _edit_file(
                 entity_id=entity_id,
                 path="draft.md",
+                old_text="hello",
+                new_text="hi",
                 expected_sha256=read_result["source_sha256"],
-                operations=[{"op": "text.replace", "old_text": "hello", "new_text": "hi"}],
             )
         )
 
@@ -1200,7 +1119,7 @@ def test_manor_document_details_include_fs_path_only_when_requested():
 
 
 @pytest.mark.asyncio
-async def test_generate_document_rejects_stale_expected_sha(tmp_path):
+async def test_generate_document_file_rejects_stale_expected_sha(tmp_path):
     settings = get_settings()
     old_enabled = settings.MANOR_FS_ENABLED
     old_root = settings.MANOR_FS_ROOT
@@ -1216,8 +1135,7 @@ async def test_generate_document_rejects_stale_expected_sha(tmp_path):
 
         target.write_text("v2\n", encoding="utf-8")
         result = json.loads(
-            await _generate_file(
-                kind="document",
+            await _generate_document_file(
                 entity_id=entity_id,
                 name="deliverable.md",
                 content="new generated content\n",
@@ -1275,7 +1193,7 @@ def test_generate_file_schema_stays_compact_but_keeps_video_refs():
 
     # Task-stable segmented narration is exposed in both the flat compatibility
     # surface and params, while keeping the composite schema bounded.
-    assert schema_size < 4900  # Shared Workspace scope and Office operation creation.
+    assert schema_size < 4400
     assert "code" in props["kind"]["enum"]
     assert props["duration"]["enum"] == props["params"]["properties"]["duration"]["enum"]
     assert "files" in props["params"]["properties"]
@@ -1364,27 +1282,28 @@ def test_master_always_loaded_tool_schema_budget():
     schemas, _ = _tool_surface_for_pool(pool, is_master=True)
     schema_size = sum(len(json.dumps(schema, ensure_ascii=False)) for schema in schemas)
     names = {schema["function"]["name"] for schema in schemas}
+    response_surface_size = next(
+        len(json.dumps(schema, ensure_ascii=False))
+        for schema in schemas
+        if schema["function"]["name"] == "render_response_surface"
+    )
     patch_file_size = next(
         len(json.dumps(schema, ensure_ascii=False))
         for schema in schemas
         if schema["function"]["name"] == "patch_file"
     )
-    baseline_size = schema_size - patch_file_size
+    baseline_size = schema_size - response_surface_size - patch_file_size
 
-    # Keep the core eager surface and file patcher independently bounded so
-    # growth is attributable. Response surfaces load through search_tools.
+    # Keep the original eager surface and the intentionally eager response
+    # renderer/file patcher independently bounded so growth is attributable.
     assert baseline_size < 20_500
-    # JSON pointers, Office structure/format selectors and PDF rotation now
-    # share this one native schema rather than separate eager tools.
-    assert patch_file_size < 3_900  # Includes native Word/PPT table cell selectors.
-    assert schema_size < 30_900
+    assert response_surface_size < 6_500
+    assert patch_file_size < 1_900
+    assert schema_size < 28_900
     assert "generate_file" in names
     assert "patch_file" in names
     assert "rag" in names
-    assert "render_response_surface" not in names
-    assert "render_response_surface" in {
-        match["name"] for match in pool.search("select:render_response_surface")
-    }
+    assert "render_response_surface" in names
     assert "search_tools" in names
 
 

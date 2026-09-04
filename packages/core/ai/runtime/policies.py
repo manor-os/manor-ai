@@ -41,11 +41,7 @@ _ALWAYS_DENIED_FOR_EXTERNAL = {
     "toggle_scheduled_job",
     "run_scheduled_job_now",
     "sandbox_create",
-    "sandbox",
     "sandbox_exec",
-    "sandbox_status",
-    "sandbox_respond",
-    "sandbox_cancel",
     "sandbox_write_file",
     "sandbox_save_result",
     "sandbox_destroy",
@@ -297,9 +293,8 @@ def check_runtime_tool_policy(
                 False,
                 code=RuntimeToolPolicyCode.FILE_EDITOR_TOOL_DENIED.value,
                 reason=(
-                    "File editor chat can only inspect its mounted context or use the "
-                    "approval-gated native patch tool; business side effects, shell, "
-                    "sandbox, and unrestricted write tools are blocked."
+                    "File editor chat can only inspect context and propose patches; "
+                    "it cannot execute business side-effect, shell, sandbox, or write tools."
                 ),
                 tool_name=name,
             )

@@ -469,10 +469,6 @@ async def available_skills_section(ctx: Any) -> str | None:
             manual_skill_selected=bool(getattr(ctx, "manual_skill_selected", False)),
             loaded_tool_names=loaded_tool_names,
             available_tool_names=visible_tool_names,
-            # Runtime descriptors use deferred discovery for ordinary Skills.
-            # The DB-backed fallback is the legacy prompt catalog and must
-            # still render its intent-filtered ordinary entries.
-            include_ordinary=not bool(runtime_skill_descriptors),
         )
     except Exception:
         logger.debug("Failed to load skills for prompt", exc_info=True)

@@ -633,27 +633,6 @@ async def upsert_channel_binding(
         )
 
     if existing:
-        binding_scope_changed = (
-            cc.channel_type == "twilio_voice"
-            and (
-                existing.agent_id != agent_id
-                or existing.agent_subscription_id
-                != (resolved_subscription.id if resolved_subscription else None)
-                or existing.workspace_id
-                != (
-                    resolved_subscription.workspace_id
-                    if resolved_subscription
-                    else None
-                )
-                or existing.status != "active"
-            )
-        )
-        if binding_scope_changed:
-            await _cancel_unconnected_twilio_channel_binding(
-                db,
-                channel=existing,
-                reason="Twilio Voice Agent binding changed before the call connected.",
-            )
         existing.agent_id = agent_id
         existing.agent_subscription_id = (
             resolved_subscription.id if resolved_subscription else None
@@ -712,12 +691,6 @@ async def delete_channel_binding(
     )).scalar_one_or_none()
     if not config:
         return False
-    if config.channel_type == "twilio_voice":
-        await _cancel_unconnected_twilio_channel_binding(
-            db,
-            channel=row,
-            reason="Twilio Voice Agent binding was removed before the call connected.",
-        )
     await db.delete(row)
     await db.flush()
     return True
@@ -766,27 +739,6 @@ def _channel_config_id(config: dict | None) -> str | None:
     if not isinstance(channel_config_id, str):
         return None
     return channel_config_id.strip() or None
-
-
-async def _cancel_unconnected_twilio_channel_binding(
-    db: AsyncSession,
-    *,
-    channel: Channel,
-    reason: str,
-) -> None:
-    channel_config_id = _channel_config_id(channel.config)
-    if channel.type != "twilio_voice" or not channel_config_id:
-        return
-    from packages.core.services.voice.call_sessions import (
-        cancel_unconnected_call_sessions_for_binding,
-    )
-
-    await cancel_unconnected_call_sessions_for_binding(
-        db,
-        channel_config_id=channel_config_id,
-        channel_binding_id=channel.id,
-        reason=reason,
-    )
 
 
 def _channel_visible_to_user(user_id: str):
@@ -913,29 +865,6 @@ async def update_channel(
             entity_id=entity_id,
             agent_ids=(next_agent_id,),
         )
-    routing_changed = any(
-        key in kwargs
-        and kwargs[key] is not None
-        and kwargs[key] != getattr(channel, key)
-        for key in (
-            "agent_id",
-            "agent_subscription_id",
-            "workspace_id",
-            "type",
-            "status",
-        )
-    ) or (
-        "config" in kwargs
-        and kwargs["config"] is not None
-        and _channel_config_id(kwargs["config"])
-        != _channel_config_id(channel.config)
-    )
-    if routing_changed:
-        await _cancel_unconnected_twilio_channel_binding(
-            db,
-            channel=channel,
-            reason="Twilio Voice Agent binding changed before the call connected.",
-        )
     for key, value in kwargs.items():
         if value is not None and hasattr(channel, key):
             setattr(channel, key, value)
@@ -950,11 +879,6 @@ async def delete_channel(
     channel = await get_channel(db, channel_id, entity_id, user_id)
     if not channel:
         return False
-    await _cancel_unconnected_twilio_channel_binding(
-        db,
-        channel=channel,
-        reason="Twilio Voice Agent binding was removed before the call connected.",
-    )
     await db.delete(channel)
     await db.flush()
     return True

@@ -127,61 +127,6 @@ async def test_registered_tool_fails_closed_before_start_on_scope_conflict() -> 
 
 
 @pytest.mark.asyncio
-async def test_workspace_task_target_conflict_fails_before_approval(monkeypatch) -> None:
-    envelope = RuntimeResolver().resolve_trace_envelope(
-        AIRuntimeRequest(
-            surface=ChatSurface.WORKSPACE_CHAT,
-            entity_id="ent_1",
-            user_id="user_1",
-            agent_id="agent_1",
-            workspace_id="ws_1",
-            conversation_id="conv_1",
-            task_id="task_1",
-        ),
-        tool_schemas=[{"type": "function", "function": {"name": "manor"}}],
-        allowed_tool_names={"manor"},
-    )
-    approval_called = False
-    handler_called = False
-
-    async def allow_tool_request(self, request):
-        nonlocal approval_called
-        approval_called = True
-        return RuntimeApprovalDecision.allow(
-            self.approval_middleware.classify_request(request)
-        )
-
-    def handler(**_kwargs) -> str:
-        nonlocal handler_called
-        handler_called = True
-        return "unexpected"
-
-    monkeypatch.setattr(RuntimeHarness, "guard_tool_request", allow_tool_request)
-
-    result = await runtime_execute_registered_tool(
-        tool_name="manor",
-        arguments={
-            "action": "workspace",
-            "params": {
-                "action": "update_task_runtime",
-                "params": {"task_id": "task_2", "runtime_instructions": "forged"},
-            },
-        },
-        handler_resolver=lambda _name: handler,
-        runtime_envelope=envelope,
-    )
-
-    assert result == "Error: Conflicting runtime scope for task_id."
-    assert approval_called is False
-    assert handler_called is False
-    assert envelope.metadata["runtime_events"] == [{
-        "type": "error",
-        "tool_name": "manor",
-        "message": "Conflicting runtime scope for task_id.",
-    }]
-
-
-@pytest.mark.asyncio
 async def test_workspace_search_recovers_entity_scope_from_runtime_envelope(monkeypatch) -> None:
     from packages.core import database
     from packages.core.workspace_chat import context as workspace_context

@@ -3,7 +3,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from collections.abc import Callable, Iterable
 import inspect
-import json
 import logging
 from typing import TYPE_CHECKING, Any
 
@@ -30,12 +29,7 @@ from packages.core.ai.runtime.authorization_receipts import (
 )
 from packages.core.ai.runtime.envelope import RuntimeDiscoveredToolGrant
 from packages.core.ai.runtime.dynamic_mcp import runtime_dynamic_mcp_result_is_stale
-from packages.core.ai.runtime.control import RuntimeTurnAborted
-from packages.core.ai.runtime.streams import (
-    runtime_tool_alternate_path_error_result,
-    runtime_tool_error_result,
-    runtime_tool_status_for_chat,
-)
+from packages.core.ai.runtime.streams import runtime_tool_error_result
 from packages.core.ai.runtime.harness import RuntimeHarness
 from packages.core.ai.runtime.chrome_routing import (
     runtime_blocked_chrome_action_shortcut,
@@ -65,7 +59,6 @@ RUNTIME_LLM_METADATA_AWARE_TOOLS = frozenset(
         "list_skills",
         "get_skill_details",
         "manor",
-        "sandbox",
         "rag",
         "workspace_search",
         "workspace_create_task",
@@ -77,7 +70,6 @@ RUNTIME_LLM_METADATA_AWARE_TOOLS = frozenset(
 RUNTIME_ENVELOPE_AWARE_TOOLS = RUNTIME_LLM_METADATA_AWARE_TOOLS | frozenset(
     {
         "search_tools",
-        "render_response_surface",
         "inspect_file_engine",
         "write_file",
         "edit_file",
@@ -87,7 +79,6 @@ RUNTIME_ENVELOPE_AWARE_TOOLS = RUNTIME_LLM_METADATA_AWARE_TOOLS | frozenset(
         "generate_document_file",
         "save_sandbox_file",
         "sandbox_save_result",
-        "sandbox",
         "bash",
         "record_content_ledger",
         "record_finance_ledger",
@@ -95,83 +86,6 @@ RUNTIME_ENVELOPE_AWARE_TOOLS = RUNTIME_LLM_METADATA_AWARE_TOOLS | frozenset(
         "record_relationship_ledger",
     }
 )
-
-_RUNTIME_TOOL_EVIDENCE_FIELDS = (
-    "kind",
-    "duration_seconds",
-    "fs_path",
-    "result_url",
-    "video_url",
-    "file_url",
-    "document_id",
-    "name",
-)
-
-
-def _tool_start_event_data(
-    tool_name: str,
-    arguments: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    data: dict[str, Any] = {"tool_name": str(tool_name or "")}
-    if tool_name == "invoke_skill":
-        args = arguments if isinstance(arguments, dict) else {}
-        skill_ref = str(args.get("skill_id") or args.get("skill") or "").strip()
-        if skill_ref:
-            data["skill_ref"] = skill_ref
-    return data
-
-
-def _tool_end_event_data(
-    tool_name: str,
-    result: Any,
-    arguments: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    data = _tool_start_event_data(tool_name, arguments)
-    payload = result if isinstance(result, dict) else None
-    if payload is None and isinstance(result, str):
-        try:
-            decoded = json.loads(result)
-        except (TypeError, ValueError):
-            decoded = None
-        payload = decoded if isinstance(decoded, dict) else None
-
-    from packages.core.ai.runtime.events import RuntimeToolResultStatus
-
-    raw_status = payload.get("status") if payload else None
-    status = RuntimeToolResultStatus.parse(raw_status)
-    if status is None:
-        text_result_failed = (
-            isinstance(result, str)
-            and (
-                runtime_tool_status_for_chat(result) == "error"
-                or (
-                    tool_name == "invoke_skill"
-                    and result.lstrip().startswith("Error invoking skill")
-                )
-            )
-        )
-        failed = bool(
-            raw_status is not None
-            or (
-                payload
-                and (
-                    payload.get("ok") is False
-                    or payload.get("error")
-                )
-            )
-            or text_result_failed
-        )
-        status = (
-            RuntimeToolResultStatus.FAILED
-            if failed
-            else RuntimeToolResultStatus.COMPLETED
-        )
-    data["status"] = status.value
-    if payload:
-        for field in _RUNTIME_TOOL_EVIDENCE_FIELDS:
-            if payload.get(field) is not None:
-                data[field] = payload[field]
-    return data
 
 
 def _runtime_policy_arguments(
@@ -185,32 +99,6 @@ def _runtime_policy_arguments(
     if tool_name.startswith("mcp__chrome__") and active_user_message:
         policy_arguments.setdefault("active_user_message", active_user_message)
     return policy_arguments
-
-
-def _runtime_workspace_task_scope_conflicts(
-    tool_name: str,
-    arguments: dict[str, Any],
-    *,
-    task_id: str | None,
-) -> bool:
-    runtime_task_id = str(task_id or "").strip()
-    if not runtime_task_id:
-        return False
-
-    from packages.core.ai.runtime.composite_tools import (
-        RuntimeCompositeToolCallFactory,
-        WorkspaceToolAction,
-    )
-
-    call = RuntimeCompositeToolCallFactory.create(tool_name, arguments)
-    if call.tool_name != "workspace_agent":
-        return False
-    if str(call.arguments.get("action") or "").strip() != WorkspaceToolAction.UPDATE_TASK_RUNTIME:
-        return False
-    raw_params = call.arguments.get("params")
-    params = raw_params if isinstance(raw_params, dict) else {}
-    requested_task_id = str(params.get("task_id") or "").strip()
-    return bool(requested_task_id and requested_task_id != runtime_task_id)
 
 
 @dataclass(frozen=True)
@@ -252,14 +140,6 @@ def runtime_preflight_tool_resolution(
             task_id=task_id,
             runtime_envelope=runtime_envelope,
         )
-        if _runtime_workspace_task_scope_conflicts(
-            tool_name,
-            arguments,
-            task_id=context.task_id,
-        ):
-            raise RuntimeToolContextConflictError(
-                "Conflicting runtime scope for task_id."
-            )
     except RuntimeToolContextConflictError as exc:
         if harness is not None:
             harness.record_event("error", tool_name=tool_name, message=str(exc))
@@ -371,205 +251,6 @@ def _record_tool_result_for_workflow_recovery(
     )
 
 
-def _provider_approval_execution_for_tool(
-    harness: RuntimeHarness | None,
-    tool_name: str,
-) -> dict[str, Any] | None:
-    if harness is None:
-        return None
-    execution = harness.envelope.metadata.get("provider_approval_execution")
-    if not isinstance(execution, dict) or tool_name not in {
-        str(execution.get("confirmation_tool") or "").strip(),
-        str(execution.get("retry_tool") or "").strip(),
-    }:
-        return None
-    return execution
-
-
-async def _persist_provider_approval_result(
-    *,
-    harness: RuntimeHarness,
-    tool_name: str,
-    arguments: dict[str, Any],
-    result: Any,
-    entity_id: str,
-    conversation_id: str | None,
-) -> None:
-    from packages.core.ai.runtime.approval_service import (
-        settle_provider_runtime_approval_execution,
-    )
-    from packages.core.database import async_session
-
-    async with async_session() as db:
-        changed = await settle_provider_runtime_approval_execution(
-            db,
-            runtime_metadata=harness.envelope.metadata,
-            entity_id=entity_id,
-            conversation_id=conversation_id,
-            tool_name=tool_name,
-            arguments=arguments,
-            result=result,
-        )
-        if changed:
-            await db.commit()
-
-
-async def runtime_settle_provider_approval_preflight_failure(
-    *,
-    harness: RuntimeHarness | None,
-    tool_name: str,
-    arguments: dict[str, Any],
-    result: Any,
-    entity_id: str,
-    conversation_id: str | None,
-) -> Any:
-    """Durably close a provider grant when execution stops before provider I/O.
-
-    The returned result is tagged as safe for a different tool path when this
-    call owns a provider approval.  Callers must return that value rather than
-    the untagged input so the agent loop can continue without replaying the
-    approved action.
-    """
-
-    execution = _provider_approval_execution_for_tool(harness, tool_name)
-    if execution is None or harness is None:
-        return result
-
-    from packages.core.ai.runtime.control import is_runtime_tool_suspension
-
-    if is_runtime_tool_suspension(result):
-        return result
-    # No provider effect has happened yet.  Settlement is part of the
-    # fail-closed boundary, so persistence errors must abort the continuation
-    # instead of returning a terminal tool result with a live grant.
-    try:
-        await _persist_provider_approval_result(
-            harness=harness,
-            tool_name=tool_name,
-            arguments=arguments,
-            result=result,
-            entity_id=entity_id,
-            conversation_id=conversation_id,
-        )
-    except Exception as settlement_error:
-        raise RuntimeTurnAborted(
-            "The approved provider action could not be durably settled; "
-            "use another available path and do not repeat this approval.",
-            allow_alternate_path=True,
-        ) from settlement_error
-    return runtime_tool_alternate_path_error_result(result)
-
-
-async def runtime_settle_provider_approval_result(
-    *,
-    harness: RuntimeHarness | None,
-    tool_name: str,
-    arguments: dict[str, Any],
-    result: Any,
-    entity_id: str,
-    conversation_id: str | None,
-) -> None:
-    """Best-effort settlement after a provider result may already exist."""
-
-    execution = _provider_approval_execution_for_tool(harness, tool_name)
-    if execution is None or harness is None:
-        return
-
-    from packages.core.ai.runtime.control import is_runtime_tool_suspension
-
-    if is_runtime_tool_suspension(result):
-        return
-    try:
-        await _persist_provider_approval_result(
-            harness=harness,
-            tool_name=tool_name,
-            arguments=arguments,
-            result=result,
-            entity_id=entity_id,
-            conversation_id=conversation_id,
-        )
-    except Exception:
-        # The provider result has already happened.  Never turn a successful
-        # external action into an apparent failure (and invite a duplicate)
-        # merely because audit persistence was temporarily unavailable.
-        logging.getLogger(__name__).exception(
-            "Failed to settle provider approval %s after %s",
-            execution.get("hitl_id"),
-            tool_name,
-        )
-
-
-async def _prepare_provider_approval_call(
-    *,
-    harness: RuntimeHarness | None,
-    tool_name: str,
-    arguments: dict[str, Any],
-    entity_id: str,
-    conversation_id: str | None,
-) -> str | None:
-    """Claim provider execution before I/O or replay a durable confirmation."""
-
-    if harness is None:
-        return None
-    execution = harness.envelope.metadata.get("provider_approval_execution")
-    if not isinstance(execution, dict) or tool_name not in {
-        str(execution.get("confirmation_tool") or "").strip(),
-        str(execution.get("retry_tool") or "").strip(),
-    }:
-        return None
-    try:
-        from packages.core.ai.runtime.approval_service import (
-            prepare_provider_runtime_approval_execution,
-        )
-        from packages.core.database import async_session
-
-        async with async_session() as db:
-            preflight = await prepare_provider_runtime_approval_execution(
-                db,
-                runtime_metadata=harness.envelope.metadata,
-                entity_id=entity_id,
-                conversation_id=conversation_id,
-                tool_name=tool_name,
-                arguments=arguments,
-            )
-            if preflight.changed:
-                await db.commit()
-            if (
-                preflight.result is not None
-                and runtime_tool_status_for_chat(str(preflight.result)) == "error"
-            ):
-                return runtime_tool_alternate_path_error_result(preflight.result)
-            return preflight.result
-    except Exception:
-        # This is still before provider I/O. Fail closed unless the execution
-        # claim or reusable confirmation receipt is durably readable/writable.
-        logging.getLogger(__name__).exception(
-            "Failed to prepare provider approval %s before %s",
-            execution.get("hitl_id"),
-            tool_name,
-        )
-        error_result = runtime_tool_alternate_path_error_result(
-            "The approved provider action could not be durably claimed. "
-            "No external action was executed."
-        )
-        try:
-            await _persist_provider_approval_result(
-                harness=harness,
-                tool_name=tool_name,
-                arguments=arguments,
-                result=error_result,
-                entity_id=entity_id,
-                conversation_id=conversation_id,
-            )
-        except Exception as settlement_error:
-            raise RuntimeTurnAborted(
-                "The approved provider action could not be durably recovered; "
-                "use another available path and do not repeat this approval.",
-                allow_alternate_path=True,
-            ) from settlement_error
-        return error_result
-
-
 async def runtime_execute_prepared_tool_handler(
     *,
     tool_name: str,
@@ -594,19 +275,11 @@ async def runtime_execute_prepared_tool_handler(
             harness.record_event("error", tool_name=tool_name, message=str(exc))
         if logger is not None:
             logger.error("Tool %s failed: %s", tool_name, exc)
-        error_result = runtime_tool_error_result(str(exc))
-        return await runtime_settle_provider_approval_preflight_failure(
-            harness=harness,
-            tool_name=tool_name,
-            arguments=arguments,
-            result=error_result,
-            entity_id=(harness.envelope.entity_id or "") if harness else "",
-            conversation_id=(harness.envelope.conversation_id if harness else None),
-        )
+        return runtime_tool_error_result(str(exc))
     entity = context.entity_id or ""
     user = context.user_id or ""
     if harness is not None:
-        harness.record_event("tool_start", **_tool_start_event_data(tool_name, arguments))
+        harness.record_event("tool_start", tool_name=tool_name)
     authorization_token = runtime_begin_tool_authorization_scope(
         prepared.authorization_lease,
         arguments=arguments,
@@ -616,34 +289,8 @@ async def runtime_execute_prepared_tool_handler(
         message = _authorization_scope_error_message(authorization_token.failure)
         if harness is not None:
             harness.record_event("error", tool_name=tool_name, message=message)
-        error_result = runtime_tool_error_result(message)
-        return await runtime_settle_provider_approval_preflight_failure(
-            harness=harness,
-            tool_name=tool_name,
-            arguments=arguments,
-            result=error_result,
-            entity_id=entity,
-            conversation_id=context.conversation_id,
-        )
+        return runtime_tool_error_result(message)
     try:
-        provider_preflight_result = await _prepare_provider_approval_call(
-            harness=harness,
-            tool_name=tool_name,
-            arguments=arguments,
-            entity_id=entity,
-            conversation_id=context.conversation_id,
-        )
-        if provider_preflight_result is not None:
-            if harness is not None:
-                harness.record_event(
-                    "tool_end",
-                    **_tool_end_event_data(
-                        tool_name,
-                        provider_preflight_result,
-                        arguments,
-                    ),
-                )
-            return provider_preflight_result
         invocation = RuntimeToolHandlerInvocationFactory.keyword_arguments(
             handler,
             arguments=arguments,
@@ -673,19 +320,8 @@ async def runtime_execute_prepared_tool_handler(
             if harness is not None:
                 harness.record_event("tool_suspended", tool_name=tool_name)
             return result
-        await runtime_settle_provider_approval_result(
-            harness=harness,
-            tool_name=tool_name,
-            arguments=arguments,
-            result=result,
-            entity_id=entity,
-            conversation_id=context.conversation_id,
-        )
         if harness is not None:
-            harness.record_event(
-                "tool_end",
-                **_tool_end_event_data(tool_name, result, arguments),
-            )
+            harness.record_event("tool_end", tool_name=tool_name)
         _record_successful_tool_workflow_step(
             harness=harness,
             tool_name=tool_name,
@@ -698,23 +334,12 @@ async def runtime_execute_prepared_tool_handler(
             result=result,
         )
         return result if isinstance(result, str) else str(result)
-    except RuntimeTurnAborted:
-        raise
     except Exception as exc:
         if harness is not None:
             harness.record_event("error", tool_name=tool_name, message=str(exc))
         if logger is not None:
             logger.error("Tool %s failed: %s", tool_name, exc, exc_info=True)
-        error_result = runtime_tool_error_result(str(exc))
-        await runtime_settle_provider_approval_result(
-            harness=harness,
-            tool_name=tool_name,
-            arguments=arguments,
-            result=error_result,
-            entity_id=entity,
-            conversation_id=context.conversation_id,
-        )
-        return error_result
+        return runtime_tool_error_result(str(exc))
     finally:
         runtime_end_tool_authorization_scope(authorization_token)
 
@@ -766,31 +391,12 @@ async def runtime_execute_scoped_dynamic_tool_handler(
         inject_runtime_context=False,
     )
     if prepared.blocked_result is not None:
-        envelope = (
-            prepared.harness.envelope if prepared.harness is not None else None
-        )
-        return await runtime_settle_provider_approval_preflight_failure(
-            harness=prepared.harness,
-            tool_name=tool_name,
-            arguments=arguments,
-            result=prepared.blocked_result,
-            entity_id=(
-                envelope.entity_id or entity_id or ""
-                if envelope
-                else entity_id or ""
-            ),
-            conversation_id=(
-                envelope.conversation_id if envelope is not None else conversation_id
-            ),
-        )
+        return prepared.blocked_result
 
     harness = prepared.harness
     prepared_arguments = prepared.arguments
     if harness is not None:
-        harness.record_event(
-            "tool_start",
-            **_tool_start_event_data(tool_name, prepared_arguments),
-        )
+        harness.record_event("tool_start", tool_name=tool_name)
     authorization_token = runtime_begin_tool_authorization_scope(
         prepared.authorization_lease,
         arguments=prepared_arguments,
@@ -800,64 +406,17 @@ async def runtime_execute_scoped_dynamic_tool_handler(
         message = _authorization_scope_error_message(authorization_token.failure)
         if harness is not None:
             harness.record_event("error", tool_name=tool_name, message=message)
-        error_result = runtime_tool_error_result(message)
-        return await runtime_settle_provider_approval_preflight_failure(
-            harness=harness,
-            tool_name=tool_name,
-            arguments=prepared_arguments,
-            result=error_result,
-            entity_id=envelope_value("entity_id", entity_id) or "",
-            conversation_id=envelope_value("conversation_id", conversation_id),
-        )
+        return runtime_tool_error_result(message)
     try:
-        provider_preflight_result = await _prepare_provider_approval_call(
-            harness=harness,
-            tool_name=tool_name,
-            arguments=prepared_arguments,
-            entity_id=envelope_value("entity_id", entity_id) or "",
-            conversation_id=envelope_value("conversation_id", conversation_id),
-        )
-        if provider_preflight_result is not None:
-            if harness is not None:
-                harness.record_event(
-                    "tool_end",
-                    **_tool_end_event_data(
-                        tool_name,
-                        provider_preflight_result,
-                        prepared_arguments,
-                    ),
-                )
-            return provider_preflight_result
         result = handler(prepared_arguments)
         if hasattr(result, "__await__"):
             result = await result
-        await runtime_settle_provider_approval_result(
-            harness=harness,
-            tool_name=tool_name,
-            arguments=prepared_arguments,
-            result=result,
-            entity_id=envelope_value("entity_id", entity_id) or "",
-            conversation_id=envelope_value("conversation_id", conversation_id),
-        )
         if harness is not None:
-            harness.record_event(
-                "tool_end",
-                **_tool_end_event_data(tool_name, result, prepared_arguments),
-            )
+            harness.record_event("tool_end", tool_name=tool_name)
         return result if isinstance(result, str) else str(result)
-    except RuntimeTurnAborted:
-        raise
     except Exception as exc:
         if harness is not None:
             harness.record_event("error", tool_name=tool_name, message=str(exc))
-        await runtime_settle_provider_approval_result(
-            harness=harness,
-            tool_name=tool_name,
-            arguments=prepared_arguments,
-            result=runtime_tool_error_result(str(exc)),
-            entity_id=envelope_value("entity_id", entity_id) or "",
-            conversation_id=envelope_value("conversation_id", conversation_id),
-        )
         raise
     finally:
         runtime_end_tool_authorization_scope(authorization_token)
@@ -1171,20 +730,7 @@ async def runtime_execute_registered_tool(
 
     handler = handler_resolver(tool_name)
     if handler is None:
-        error_result = runtime_tool_error_result(f"unknown tool '{tool_name}'")
-        return await runtime_settle_provider_approval_preflight_failure(
-            harness=(RuntimeHarness(runtime_envelope) if runtime_envelope else None),
-            tool_name=tool_name,
-            arguments=arguments,
-            result=error_result,
-            entity_id=(
-                getattr(runtime_envelope, "entity_id", None) or entity_id or ""
-            ),
-            conversation_id=(
-                getattr(runtime_envelope, "conversation_id", None)
-                or conversation_id
-            ),
-        )
+        return runtime_tool_error_result(f"unknown tool '{tool_name}'")
 
     prepared = await runtime_prepare_tool_execution(
         tool_name=tool_name,
@@ -1209,23 +755,7 @@ async def runtime_execute_registered_tool(
         discovered_tool_grant=discovered_tool_grant,
     )
     if prepared.blocked_result is not None:
-        envelope = (
-            prepared.harness.envelope if prepared.harness is not None else None
-        )
-        return await runtime_settle_provider_approval_preflight_failure(
-            harness=prepared.harness,
-            tool_name=tool_name,
-            arguments=arguments,
-            result=prepared.blocked_result,
-            entity_id=(
-                envelope.entity_id or entity_id or ""
-                if envelope
-                else entity_id or ""
-            ),
-            conversation_id=(
-                envelope.conversation_id if envelope is not None else conversation_id
-            ),
-        )
+        return prepared.blocked_result
 
     return await runtime_execute_prepared_tool_handler(
         tool_name=tool_name,

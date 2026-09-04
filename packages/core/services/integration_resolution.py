@@ -28,6 +28,7 @@ _BROWSER_PROVIDER = "chrome"
 _NON_USER_FACING_PROVIDER_KEYS = {
     "knowledge_local",
     "chrome_knowledge_local",
+    "local_browser",
     "nango",
 }
 
@@ -35,6 +36,7 @@ _BROWSER_COVERAGE_PROVIDER_KEYS = {
     "browser",
     "browser_use",
     "chrome_browser",
+    "local_browser",
     "web_browser",
     "instagram",
     "instagram_browser",
@@ -47,6 +49,11 @@ _BROWSER_COVERAGE_PROVIDER_KEYS = {
     "boss_zhipin",
     "boss",
 }
+
+_PREFERRED_PROVIDER_BY_DUPLICATE = {
+    "local_browser": _BROWSER_PROVIDER,
+}
+
 
 @dataclass(frozen=True)
 class MissingIntegrationResolution:
@@ -240,6 +247,16 @@ def resolve_missing_integration_provider_key(
     connected_provider_keys = connected_provider_keys or set()
     if original in connected_provider_keys:
         return None
+
+    preferred = _PREFERRED_PROVIDER_BY_DUPLICATE.get(original)
+    if preferred and preferred in supported_provider_keys:
+        if preferred in connected_provider_keys:
+            return None
+        return MissingIntegrationResolution(
+            provider=preferred,
+            original_provider=original,
+            covered_provider=original,
+        )
 
     if original in supported_provider_keys:
         return MissingIntegrationResolution(provider=original, original_provider=original)

@@ -21,12 +21,10 @@ shape ``apps/api/routers/chat.py`` already returns for the main chat surface.
 """
 from __future__ import annotations
 
-import asyncio
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from httpx import AsyncClient
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from packages.core.models.base import generate_ulid
 from packages.core.models.task import Conversation, Message
@@ -149,98 +147,6 @@ async def test_resolved_state_survives_the_round_trip(client: AsyncClient, db_se
     row = next(item for item in resp.json() if item["id"] == msg_id)
     assert row["hitl_requests"][0]["resolved"] is True
     assert row["hitl_requests"][0]["resolution"] == "approve"
-
-
-@pytest.mark.asyncio
-async def test_concurrent_hitl_resolutions_preserve_every_card(
-    client: AsyncClient,
-    db_session,
-):
-    """Two card clicks must not lose one another in the shared JSONB blob.
-
-    A single assistant message can carry more than one tool approval.  Each
-    resolution updates ``Message.meta`` with a read/modify/write cycle, so the
-    message row must serialize those updates.  Otherwise both workers can read
-    the same original list and the last commit reopens the other card.
-    """
-
-    headers = await _register(client, "ws_tool_hitl_concurrent")
-    first_id = generate_ulid()
-    second_id = generate_ulid()
-    _workspace_id, message_id = await _seed(
-        db_session,
-        client,
-        headers,
-        meta={
-            "hitl_requests": [
-                {**EMAIL_HITL_REQUEST, "id": first_id},
-                {**EMAIL_HITL_REQUEST, "id": second_id},
-            ]
-        },
-    )
-    message = await db_session.get(Message, message_id)
-    assert message is not None
-    conversation_id = message.conversation_id
-
-    session_factory = async_sessionmaker(
-        db_session.bind,
-        class_=AsyncSession,
-        expire_on_commit=False,
-    )
-    first_updated = asyncio.Event()
-    allow_first_commit = asyncio.Event()
-
-    async def resolve_first() -> None:
-        from packages.core.services.hitl_requests import mark_hitl_request_resolved
-
-        async with session_factory() as worker_db:
-            assert await mark_hitl_request_resolved(
-                worker_db,
-                conversation_id=conversation_id,
-                hitl_id=first_id,
-                choice="approve",
-            ) == 1
-            first_updated.set()
-            await allow_first_commit.wait()
-            await worker_db.commit()
-
-    async def resolve_second() -> None:
-        from packages.core.services.hitl_requests import mark_hitl_request_resolved
-
-        await first_updated.wait()
-        async with session_factory() as worker_db:
-            update = asyncio.create_task(
-                mark_hitl_request_resolved(
-                    worker_db,
-                    conversation_id=conversation_id,
-                    hitl_id=second_id,
-                    choice="reject",
-                )
-            )
-            try:
-                # Without a row lock this finishes against the same stale
-                # metadata snapshot.  With the lock it waits for the first
-                # resolution to commit, then observes that committed update.
-                await asyncio.wait_for(asyncio.shield(update), timeout=0.25)
-            except TimeoutError:
-                pass
-            finally:
-                allow_first_commit.set()
-            assert await update == 1
-            await worker_db.commit()
-
-    await asyncio.gather(resolve_first(), resolve_second())
-
-    async with session_factory() as check_db:
-        persisted = await check_db.get(Message, message_id)
-        assert persisted is not None
-        requests = {
-            str(item.get("id")): item
-            for item in (persisted.meta or {}).get("hitl_requests") or []
-            if isinstance(item, dict)
-        }
-        assert requests[first_id]["resolution"] == "approve"
-        assert requests[second_id]["resolution"] == "reject"
 
 
 @pytest.mark.asyncio

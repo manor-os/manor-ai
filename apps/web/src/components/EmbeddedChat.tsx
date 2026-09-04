@@ -58,7 +58,7 @@ import {
 import { chatMessageAnchorId } from "../lib/chatMessageAnchor";
 import { createdChatResourceReferences } from "../lib/chatResourceReferences";
 import { invalidateKnowledgeQueries } from "../lib/knowledgeInvalidation";
-import { sanitizeDocumentHtml, sanitizeManorDocumentRender } from "../lib/sanitizeDocumentHtml";
+import { sanitizeDocumentHtml } from "../lib/sanitizeDocumentHtml";
 import {
   paginateManorDocument,
   renderManorDocument,
@@ -78,9 +78,7 @@ import type { Agent, Document, UserSummary, Workspace } from "../lib/types";
 import ChatMarkdown from "./ChatMarkdown";
 import WorkflowResultCard from "./WorkflowResultCard";
 import CreatedResourceCard from "./CreatedResourceCard";
-import AssistantMessageBlocks, {
-  assistantPendingActionKindForMessage,
-} from "./AssistantMessageBlocks";
+import AssistantMessageBlocks from "./AssistantMessageBlocks";
 import ChatMessageActions, {
   chatMessageActionText,
   type ChatMessageFeedbackRating,
@@ -213,13 +211,12 @@ import { useChatAutoFollow } from "../lib/useChatAutoFollow";
 import { isCodeLikeFile } from "../lib/codeFiles";
 import { parseDelimitedText } from "../lib/delimitedText";
 import {
-  spreadsheetCellVisualStyle,
+  spreadsheetChartsFromFile,
   spreadsheetMergeAt,
-  spreadsheetSheetsFromFile,
+  spreadsheetSheetsFromWorkbook,
   type SpreadsheetSheetModel,
 } from "../lib/spreadsheetOoxml";
 import SpreadsheetChartPreview from "./SpreadsheetChartPreview";
-import SpreadsheetImageLayer from "./SpreadsheetImageLayer";
 import {
   pickRandomSoloBusinessIdeas,
   soloBusinessIdeaExecutionKey,
@@ -352,7 +349,6 @@ type WorkspaceCapabilityConfig = {
     prompt: string;
     preview?: WorkspaceCapability;
     previewContent?: WorkspaceSamplePreviewContent;
-    sourceBlueprintSlug?: string;
     chatModePayloadPatch?: ChatModePayload;
   }>;
 };
@@ -1074,7 +1070,6 @@ type SideHustleSampleDefinition = {
   id: string;
   preview: WorkspaceCapability;
   coverTemplate?: BlueprintCoverTemplate;
-  sourceBlueprintSlug?: string;
   imageSrc?: string;
   sampleSrc?: string;
   videoSrc?: string;
@@ -1106,44 +1101,20 @@ const SIDE_HUSTLE_SAMPLE_DEFINITIONS: Record<
       preview: "workspace",
       coverTemplate: {
         motif: "service",
-        palette: "stone",
-        variant: 1,
-        seed: 2061640672,
+      palette: "stone",
+      variant: 1,
+      seed: 2061640672,
       },
-      sourceBlueprintSlug: "solo-productized-service-os-v1",
-    },
-    {
-      id: "product_video_studio",
-      preview: "workspace",
-      coverTemplate: {
-        motif: "video",
-        palette: "stone",
-        variant: 0,
-        seed: 1797814050,
-      },
-      sourceBlueprintSlug: "product-video-studio-v1",
     },
     {
       id: "digital_product_store_os",
       preview: "workspace",
       coverTemplate: {
         motif: "commerce",
-        palette: "blue",
-        variant: 0,
-        seed: 2495511228,
+      palette: "blue",
+      variant: 0,
+      seed: 2495511228,
       },
-      sourceBlueprintSlug: "solo-digital-product-store-v1",
-    },
-    {
-      id: "content_distribution_studio",
-      preview: "workspace",
-      coverTemplate: {
-        motif: "content",
-        palette: "sage",
-        variant: 0,
-        seed: 883597494,
-      },
-      sourceBlueprintSlug: "solo-content-distribution-studio-v1",
     },
   ],
   slides: [
@@ -2976,7 +2947,6 @@ function createSideHustleSample(
     id,
     preview,
     coverTemplate,
-    sourceBlueprintSlug,
     imageSrc,
     sampleSrc,
     videoSrc: explicitVideoSrc,
@@ -3044,7 +3014,6 @@ function createSideHustleSample(
     prompt: sampleText("prompt"),
     preview,
     previewContent,
-    sourceBlueprintSlug,
     chatModePayloadPatch,
   };
 }
@@ -4071,7 +4040,8 @@ function WorkspaceSampleQuickPreview({
   const blueprintDescription = blueprint?.description?.trim();
   const blueprintSummary = blueprint?.summary?.trim() || sample?.outcome;
   const isSpreadsheetPreview = sample?.preview === "sheets";
-  const isInstallableWorkspace = Boolean(sample?.sourceBlueprintSlug);
+  const isInstallableWorkspace = Boolean(
+  );
   const renderPageControls = () =>
     pages.length > 1 ? (
       <div
@@ -4276,13 +4246,13 @@ function WorkspaceSampleQuickPreview({
 
             <div className="workspace-sample-quick-preview-meta">
               <div className="workspace-sample-quick-preview-copy">
-                {sample.sourceBlueprintSlug && installationStatus === "loading" && (
+                {isInstallableWorkspace && installationStatus === "loading" && (
                   <span className="workspace-sample-installation-status" role="status">
                     <LoadingSpinner size={12} />
                     {t("component.embedded_chat.checking_installation")}
                   </span>
                 )}
-                {sample.sourceBlueprintSlug && installationStatus === "error" && (
+                {isInstallableWorkspace && installationStatus === "error" && (
                   <span className="workspace-sample-installation-status workspace-sample-installation-status--error">
                     {t("component.embedded_chat.installation_status_unavailable")}
                   </span>
@@ -4818,38 +4788,15 @@ function WorkspaceWelcome({
   const hasTemplateCatalog =
     selected.key === "slides" || selected.key === "sheets";
   const featuredSamples = selected.samples.slice(0, 4);
-  const previewBlueprintSlug = previewSample?.sourceBlueprintSlug;
+  const previewBlueprintSlug = (
+    undefined
+  );
 
   const handleSampleInstall = useCallback(
-    async (sample: WorkspaceSample) => {
-      const blueprintSlug = sample.sourceBlueprintSlug;
-      if (!blueprintSlug || installingSampleSlug) return;
-
-      setInstallingSampleSlug(blueprintSlug);
-      try {
-        const blueprints = await queryClient.fetchQuery({
-          queryKey: ["blueprints", "published"],
-          queryFn: () => api.blueprints.list("published"),
-          staleTime: 60_000,
-        });
-        const blueprint = blueprints.find(
-          (candidate) => candidate.slug === blueprintSlug,
-        );
-        if (!blueprint) {
-          throw new Error(`Blueprint not found: ${blueprintSlug}`);
-        }
-
-        navigate(`/blueprints/${encodeURIComponent(blueprint.id)}?install=1`);
-      } catch (error) {
-        toast.error(
-          t("component.embedded_chat.workspace_details_unavailable"),
-          error instanceof Error ? error.message : undefined,
-        );
-      } finally {
-        setInstallingSampleSlug(null);
-      }
+    async (_sample: WorkspaceSample) => {
     },
-    [installingSampleSlug, navigate, queryClient, toast],
+    [
+    ],
   );
 
   const prepareSampleRemix = useCallback(
@@ -4893,42 +4840,6 @@ function WorkspaceWelcome({
     }
   }, [selected.key]);
 
-  const installedWorkspaces = useQuery<Workspace[]>({
-    queryKey: ["workspaces"],
-    queryFn: () => api.workspaces.list(),
-    enabled: Boolean(previewBlueprintSlug),
-  });
-  const marketplaceBlueprints = useQuery({
-    queryKey: ["blueprints", "published"],
-    queryFn: () => api.blueprints.list("published"),
-    enabled: Boolean(previewBlueprintSlug),
-    staleTime: 60_000,
-  });
-  const previewBlueprintSummary = useMemo(() => {
-    if (!previewBlueprintSlug) return null;
-    return (
-      marketplaceBlueprints.data?.find(
-        (blueprint) => blueprint.slug === previewBlueprintSlug,
-      ) || null
-    );
-  }, [marketplaceBlueprints.data, previewBlueprintSlug]);
-  const previewBlueprint = useQuery<BlueprintDetail>({
-    queryKey: ["blueprint", previewBlueprintSummary?.id, undefined],
-    queryFn: () => api.blueprints.get(previewBlueprintSummary!.id),
-    enabled: Boolean(previewBlueprintSummary?.id),
-    staleTime: 60_000,
-  });
-  const installedPreviewWorkspace = useMemo(() => {
-    const blueprintSlug = previewBlueprintSlug;
-    if (!blueprintSlug) return null;
-    return (
-      installedWorkspaces.data?.find(
-        (workspace) =>
-          workspace.blueprint_update?.blueprint_slug === blueprintSlug &&
-          workspace.blueprint_update.status !== "not_from_blueprint",
-      ) || null
-    );
-  }, [installedWorkspaces.data, previewBlueprintSlug]);
   const focusedIdea = quickActions.find((action) => action.id === railFocusKey);
   const activeIndex = WORKSPACE_RAIL_ORDER.indexOf(railFocusKey);
   const modeRailRef = useRef<HTMLDivElement | null>(null);
@@ -5324,11 +5235,12 @@ function WorkspaceWelcome({
             className="workspace-sample-grid workspace-sample-grid--previewable"
           >
             {featuredSamples.map((sample, index) => {
-              const isInstallableWorkspace =
-                selected.key === "workspace" && Boolean(sample.sourceBlueprintSlug);
+              const isInstallableWorkspace = Boolean(
+              );
               const isInstalling =
                 isInstallableWorkspace &&
-                installingSampleSlug === sample.sourceBlueprintSlug;
+                Boolean(
+                );
 
               return (
                 <article
@@ -5360,7 +5272,7 @@ function WorkspaceWelcome({
                         isInstallableWorkspace
                           ? Boolean(
                               installingSampleSlug &&
-                                installingSampleSlug !== sample.sourceBlueprintSlug,
+                                !isInstalling,
                             )
                           : Boolean(
                               remixingSampleTitle &&
@@ -5475,31 +5387,19 @@ function WorkspaceWelcome({
         remixDisabled={Boolean(
           remixingSampleTitle && remixingSampleTitle !== previewSample?.title,
         )}
-        blueprint={previewBlueprint.data || null}
-        blueprintStatus={
-          !previewBlueprintSlug
-            ? "idle"
-            : marketplaceBlueprints.isLoading || previewBlueprint.isLoading
-              ? "loading"
-              : marketplaceBlueprints.isError ||
-                  previewBlueprint.isError ||
-                  (!previewBlueprintSummary && marketplaceBlueprints.isSuccess)
-                ? "error"
-                : "idle"
+        blueprint={
+          null
         }
-        installedWorkspace={installedPreviewWorkspace}
+        blueprintStatus={
+          "idle"
+        }
+        installedWorkspace={
+          null
+        }
         installationStatus={
-          !previewSample?.sourceBlueprintSlug
-            ? "idle"
-            : installedWorkspaces.isLoading
-              ? "loading"
-              : installedWorkspaces.isError
-                ? "error"
-                : "idle"
+          "idle"
         }
         onInstall={(blueprint) => {
-          setPreviewSample(null);
-          navigate(`/blueprints/${encodeURIComponent(blueprint.id)}?install=1`);
         }}
         onOpenInstalled={(workspace) => navigate(`/workspaces/${workspace.id}`)}
       />
@@ -7845,7 +7745,7 @@ function PresentationArtifactViewer({
           previewAbortController.abort();
           revokeTrackedObjectUrls([...objectUrls]);
           if (cancelled) return;
-          const url = trackObjectUrl(await api.documents.preview(doc.id));
+          const url = trackObjectUrl(await api.documents.download(doc.id));
           if (cancelled) return;
           setCanvasUrl(url);
         }
@@ -7933,7 +7833,7 @@ async function loadDocxFallbackRender(
   documentId: string,
   signal?: AbortSignal,
 ): Promise<ManorDocumentRender> {
-  const response = await api.documents.previewResponse(documentId, { signal });
+  const response = await api.documents.downloadResponse(documentId, { signal });
   const blob = await response.blob();
   const buf = await blob.arrayBuffer();
   const rendered = await renderManorDocument(buf);
@@ -7941,7 +7841,16 @@ async function loadDocxFallbackRender(
     allowDocxEditorAttributes: true,
     allowDocxLayoutStyles: true,
   };
-  return sanitizeManorDocumentRender(rendered, sanitizeOptions);
+  return {
+    ...rendered,
+    html: sanitizeDocumentHtml(rendered.html, sanitizeOptions),
+    headerHtml: sanitizeDocumentHtml(rendered.headerHtml, sanitizeOptions),
+    footerHtml: sanitizeDocumentHtml(rendered.footerHtml, sanitizeOptions),
+    firstHeaderHtml: sanitizeDocumentHtml(rendered.firstHeaderHtml, sanitizeOptions),
+    firstFooterHtml: sanitizeDocumentHtml(rendered.firstFooterHtml, sanitizeOptions),
+    evenHeaderHtml: sanitizeDocumentHtml(rendered.evenHeaderHtml, sanitizeOptions),
+    evenFooterHtml: sanitizeDocumentHtml(rendered.evenFooterHtml, sanitizeOptions),
+  };
 }
 
 function DocxFallbackArtifactViewer({
@@ -8282,7 +8191,7 @@ function FileArtifactViewer({ artifact }: { artifact: OutputArtifact }) {
 
         if (nextCategory === "diagram") {
           assertDiagramPreviewFileSize(doc.file_size);
-          const response = await api.documents.previewResponse(doc.id, {
+          const response = await api.documents.downloadResponse(doc.id, {
             signal: abortController.signal,
           });
           const rawContent = await readDiagramPreviewText(response);
@@ -8316,7 +8225,7 @@ function FileArtifactViewer({ artifact }: { artifact: OutputArtifact }) {
           )
         ) {
           if (nextCategory === "xlsx") {
-            const blob = await api.documents.previewBlob(doc.id);
+            const blob = await api.documents.downloadBlob(doc.id);
             if (cancelled) return;
             const buf = await blob.arrayBuffer();
             if (cancelled) return;
@@ -8329,9 +8238,10 @@ function FileArtifactViewer({ artifact }: { artifact: OutputArtifact }) {
               cellStyles: true,
               cellText: true,
             });
-            const parsed = await spreadsheetSheetsFromFile(XLSX, wb, buf);
+            const chartsBySheet = await spreadsheetChartsFromFile(buf, XLSX, wb);
             if (cancelled) return;
-            const parsedSheets = parsed
+            const parsedSheets = spreadsheetSheetsFromWorkbook(XLSX, wb)
+              .map((sheet) => ({ ...sheet, charts: chartsBySheet.get(sheet.name) || [] }))
               .filter((sheet) => !sheet.hidden && sheet.name !== "_manor_charts");
             setSheets(parsedSheets);
             return;
@@ -8362,7 +8272,7 @@ function FileArtifactViewer({ artifact }: { artifact: OutputArtifact }) {
             return;
           }
 
-          const downloadedUrl = await api.documents.preview(doc.id);
+          const downloadedUrl = await api.documents.download(doc.id);
           if (cancelled) {
             if (downloadedUrl.startsWith("blob:")) URL.revokeObjectURL(downloadedUrl);
             return;
@@ -8582,7 +8492,6 @@ function FileArtifactViewer({ artifact }: { artifact: OutputArtifact }) {
           </div>
         )}
         <div className="chat-output-table-frame">
-          <div style={{ position: "relative", width: "max-content", minWidth: "100%" }}>
           <table style={{ width: "max-content", minWidth: "100%", tableLayout: "fixed" }}>
             <colgroup>
               <col style={{ width: 44 }} />
@@ -8615,10 +8524,14 @@ function FileArtifactViewer({ artifact }: { artifact: OutputArtifact }) {
                         colSpan={merge.columnSpan}
                         title={typeof raw === "string" && raw.startsWith("=") ? raw : undefined}
                         style={{
-                          ...(sheet.showGridlines === false ? { borderTop: "1px solid transparent", borderBottom: "1px solid transparent", borderLeft: "1px solid transparent", borderRight: "1px solid transparent" } : {}),
-                          ...spreadsheetCellVisualStyle(style),
                           color: style.color || "var(--text-default)",
                           background: style.fill || "var(--surface-panel)",
+                          fontWeight: style.bold ? 700 : 400,
+                          fontStyle: style.italic ? "italic" : "normal",
+                          fontFamily: style.fontFamily,
+                          fontSize: style.fontSize,
+                          textAlign: style.align,
+                          whiteSpace: "pre-wrap",
                           overflowWrap: "anywhere",
                         }}
                       >
@@ -8630,14 +8543,6 @@ function FileArtifactViewer({ artifact }: { artifact: OutputArtifact }) {
               ))}
             </tbody>
           </table>
-          <SpreadsheetImageLayer
-            images={sheet.images}
-            columnWidths={sheet.columnWidths}
-            rowHeights={sheet.rowHeights}
-            rowHeaderWidth={44}
-            columnHeaderHeight={35}
-          />
-          </div>
         </div>
         {sheet.charts.length > 0 && (
           <div style={{ marginTop: 12 }}>
@@ -11367,7 +11272,6 @@ export default function EmbeddedChat({
                           returnTo={messageReturnTo}
                           onResponseSurfaceSubmit={handleResponseSurfaceSubmit}
                           sourceMessageId={msg.id || ""}
-                          pendingActionKind={assistantPendingActionKindForMessage(msg)}
                           responseSurfaceSubmissionReceipts={responseSurfaceSubmissionReceipts}
                         />
                         {createdResources.map((resource) => (
