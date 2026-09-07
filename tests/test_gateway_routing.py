@@ -88,6 +88,17 @@ def test_nginx_custom_static_locations_preserve_app_security_headers():
         assert APP_SECURITY_HEADERS_INCLUDE in block, location
 
 
+def test_nginx_domain_root_sitemap_redirects_to_public_marketplace_sitemap():
+    nginx_conf = (ROOT / "docker" / "nginx.conf").read_text()
+    robots = (ROOT / "apps" / "web" / "public" / "robots.txt").read_text()
+
+    root_sitemap = nginx_conf.split("location = /sitemap.xml", 1)[1].split("}", 1)[0]
+    assert "return 308 /marketplace/sitemap.xml;" in root_sitemap
+    assert nginx_conf.index("location = /sitemap.xml") < nginx_conf.index("location / {")
+    assert "Allow: /sitemap.xml" in robots
+    assert "Sitemap: https://app.manorai.xyz/marketplace/sitemap.xml" in robots
+
+
 
 
 def test_runtime_reconnect_events_are_part_of_chat_stream_route_contract():
