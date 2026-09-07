@@ -93,10 +93,20 @@ def test_nginx_domain_root_sitemap_redirects_to_public_marketplace_sitemap():
     robots = (ROOT / "apps" / "web" / "public" / "robots.txt").read_text()
 
     root_sitemap = nginx_conf.split("location = /sitemap.xml", 1)[1].split("}", 1)[0]
-    assert "return 308 /marketplace/sitemap.xml;" in root_sitemap
+    assert (
+        "return 308 $manor_forwarded_scheme://$host/marketplace/sitemap.xml;"
+        in root_sitemap
+    )
     assert nginx_conf.index("location = /sitemap.xml") < nginx_conf.index("location / {")
     assert "Allow: /sitemap.xml" in robots
     assert "Sitemap: https://app.manorai.xyz/marketplace/sitemap.xml" in robots
+
+
+def test_nginx_marketplace_redirect_uses_external_scheme_without_internal_port():
+    nginx_conf = (ROOT / "docker" / "nginx.conf").read_text()
+
+    marketplace = nginx_conf.split("location = /marketplace", 1)[1].split("}", 1)[0]
+    assert "return 308 $manor_forwarded_scheme://$host/marketplace/;" in marketplace
 
 
 
