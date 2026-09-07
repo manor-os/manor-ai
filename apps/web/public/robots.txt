@@ -1,6 +1,7 @@
 # Manor's application remains private and noindex by default. Only the
 # server-rendered, platform-reviewed Workspace Marketplace is public.
 User-agent: *
+Allow: /sitemap.xml
 Allow: /marketplace/
 Disallow: /
 Sitemap: https://app.manorai.xyz/marketplace/sitemap.xml
